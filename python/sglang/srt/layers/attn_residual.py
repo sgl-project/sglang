@@ -24,6 +24,7 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
@@ -67,6 +68,8 @@ def get_cw(
     proj: ReplicatedLinear,
     norm: RMSNorm,
     dtype: torch.dtype = torch.float32,
+    *,
+    refresh: bool = False,
 ) -> torch.Tensor:
     """Cached product norm_weight ⊙ proj_weight (both [H]) in `dtype`.
 
@@ -77,9 +80,10 @@ def get_cw(
         cache = {}
         proj._attn_res_cw_cache = cache
     cw = cache.get(dtype)
-    if cw is None:
-        cw = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
-        cw = cache[dtype] = cw.to(dtype)
+    if cw is None or refresh:
+        # Refresh in place: captured graphs retain the original cache storage.
+        updated = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
+        cw = cache[dtype] = bind_or_assign(cw, updated.to(dtype))
     return cw
 
 
@@ -133,7 +137,7 @@ def _score_kernel(
     BLOCK_H: tl.constexpr,
 ):
     """One CTA per (token, row): scan H, output one scalar score."""
-    pid_t = tl.program_id(0)
+    pid_t = tl.program_id(0).to(tl.int64)  # pid_t * stride_bm overflows int32
     j = tl.program_id(1)
     if j > NVB:
         return
@@ -174,7 +178,7 @@ def _combine_kernel(
     Softmax is redundantly computed by each H-chunk CTA (≤16 elements, trivial).
     This gives full H-parallelism: 7 CTAs for H=7168/1024.
     """
-    pid_t = tl.program_id(0)
+    pid_t = tl.program_id(0).to(tl.int64)  # pid_t * stride_bm overflows int32
     pid_h = tl.program_id(1)
     h0 = pid_h * BLOCK_H
 
@@ -460,6 +464,9 @@ class AttnResidual:
             (num_tokens, block_num, hidden_size)
         )
         self.num_valid_blocks = 0
+        # Whether a write snapshotted only this rank's slice of the rows, which
+        # leaves the bank's other rows stale on this rank.
+        self.written_on_slice = False
         if block_residual is not None:  # inherited from the previous PP rank
             self.num_valid_blocks = block_residual.size(1)
             self.block_residual[:, : self.num_valid_blocks, :].copy_(block_residual)
@@ -472,7 +479,11 @@ class AttnResidual:
         """
         bank = self.block_residual if rows is None else self.block_residual[rows]
         bank[:, self.num_valid_blocks, :].copy_(prefix_sum)
+        self._count_write(rows)
+
+    def _count_write(self, rows: Optional[slice]) -> None:
         self.num_valid_blocks += 1
+        self.written_on_slice |= rows is not None
 
     def forward(
         self,
@@ -488,6 +499,11 @@ class AttnResidual:
         (the second return value) into the next bank row — fused into the
         fast kernel (the row streams through its score pass anyway), a
         standalone .write() copy on every other path."""
+        if rows is None and self.written_on_slice:
+            raise RuntimeError(
+                "a read of every row after a write of this rank's slice of "
+                "them would aggregate stale snapshots"
+            )
         nvb = self.num_valid_blocks
         # Layer 0 attention side: nothing banked yet
         if nvb == 0:
@@ -533,7 +549,7 @@ class AttnResidual:
                 write_bank_row=fused_write,
             )
         if fused_write:
-            self.num_valid_blocks += 1  # row nvb written in-kernel
+            self._count_write(rows)  # row nvb written in-kernel
         elif write:
             self.write(prefix, rows)
         return normed, prefix
@@ -572,7 +588,7 @@ class AttnResidual:
         if normed is None:
             return None
         if write:
-            self.num_valid_blocks += 1
+            self._count_write(rows)
         return normed, prefix
 
     def forward_sp_reduce_scatter(

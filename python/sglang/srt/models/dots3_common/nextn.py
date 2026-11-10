@@ -9,11 +9,14 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -24,7 +27,7 @@ from sglang.srt.models.dots3_common.modeling import (
     Dots3LanguageModelForCausalLM,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import BumpAllocator, add_prefix
+from sglang.srt.utils import BumpAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +51,14 @@ class Dots3MTPHead(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("eh_proj", prefix),
         )
-        self.decoder = Dots3DecoderLayer(
-            config,
-            layer_id=0,
-            quant_config=quant_config,
-            is_nextn=True,
-            prefix=add_prefix("decoder", prefix),
-        )
+        with layer_stack():
+            self.decoder = Dots3DecoderLayer(
+                config,
+                layer_id=0,
+                quant_config=quant_config,
+                is_nextn=True,
+                prefix=add_prefix("decoder", prefix),
+            )
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -156,7 +160,7 @@ class Dots3NoteForCausalLMNextN(Dots3LanguageModelForCausalLM):
                 "g_proj",
             ]
         }
-        self.determine_num_fused_shared_experts()
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
 
         self.model = Dot3NoteModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)

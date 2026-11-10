@@ -2,35 +2,56 @@
 
 from __future__ import annotations
 
-import functools
 import logging
 import re
 from pathlib import Path, PurePosixPath
+from stat import S_ISDIR
 
 import psutil
 
-from sglang.srt.environ import envs
-
 logger = logging.getLogger(__name__)
-
-_BUDGET_ENV = "SGLANG_HICACHE_HOST_MEMORY_BYTES"
-
-
-@functools.cache
-def _warn_no_cgroup_mount() -> None:
-    logger.warning(
-        "The process belongs to a cgroup but no cgroup filesystem is mounted; "
-        "sizing HiCache against host available memory. If the process runs "
-        "under a memory limit, set %s to its host memory budget.",
-        _BUDGET_ENV,
-    )
 
 
 def _unescape_mount_path(value: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), value)
 
 
-def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
+def _memory_stat(directory: Path) -> dict[str, int]:
+    lines = (directory / "memory.stat").read_text().splitlines()
+    return {key: int(value) for key, value in map(str.split, lines)}
+
+
+def _protected_children_bytes(directory: Path) -> int | None:
+    """Usage that reclaim at ``directory`` must leave to its children's memory.min.
+
+    The kernel caps a child's protection at its usage, and a deeper cgroup's at
+    its ancestors', so only direct children count. A child without memory.min
+    has no memory controller and no protection. None when a value is unreadable.
+    """
+    protected = 0
+    try:
+        for child in directory.iterdir():
+            if not S_ISDIR(child.stat().st_mode):
+                continue
+            try:
+                minimum = (child / "memory.min").read_text().strip()
+            except FileNotFoundError:
+                continue
+            usage = int((child / "memory.current").read_text())
+            protected += usage if minimum == "max" else min(int(minimum), usage)
+    except (OSError, ValueError):
+        return None
+    return protected
+
+
+def _cgroup_headroom(
+    controller: str,
+    limits_v2: tuple[str, ...],
+    usage_v2: str,
+    limits_v1: tuple[str, ...],
+    usage_v1: str,
+    proc_root: Path = Path("/proc"),
+) -> int | None:
     memberships = {}
     try:
         cgroups = (proc_root / "self/cgroup").read_text()
@@ -42,19 +63,17 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
         _, controllers, path = line.split(":", 2)
         if not controllers:
             memberships["cgroup2"] = PurePosixPath(path)
-        elif "memory" in controllers.split(","):
+        elif controller in controllers.split(","):
             memberships["cgroup"] = PurePosixPath(path)
 
     headroom = None
     resolved = False
-    cgroup_mounted = False
     for line in mounts.splitlines():
         before, after = line.split(" - ", 1)
         filesystem, _, options = after.split()[:3]
-        cgroup_mounted |= filesystem in ("cgroup", "cgroup2")
         if filesystem not in memberships:
             continue
-        if filesystem == "cgroup" and "memory" not in options.split(","):
+        if filesystem == "cgroup" and controller not in options.split(","):
             continue
         fields = before.split()
         root = PurePosixPath(_unescape_mount_path(fields[3]))
@@ -69,64 +88,127 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
         else:
             continue
         if ".." in relative.parts:
-            raise ValueError(f"Cannot resolve cgroup memory path: {membership}")
+            raise ValueError(f"Cannot resolve cgroup {controller} path: {membership}")
         directory = mount / relative
         if not directory.is_dir():
             continue
         resolved = True
-        limits = (
-            ("memory.max", "memory.high")
-            if filesystem == "cgroup2"
-            else ("memory.limit_in_bytes",)
-        )
-        usage_name = (
-            "memory.current" if filesystem == "cgroup2" else "memory.usage_in_bytes"
+        limits = limits_v2 if filesystem == "cgroup2" else limits_v1
+        usage_name = usage_v2 if filesystem == "cgroup2" else usage_v1
+        # File LRU pages, as MemAvailable counts; shmem sits on the anon LRU.
+        # v1's unprefixed counters omit descendants, unlike its usage.
+        # Only the memory controller charges reclaimable page cache.
+        page_cache_keys = (
+            (
+                ("active_file", "inactive_file")
+                if filesystem == "cgroup2"
+                else ("total_active_file", "total_inactive_file")
+            )
+            if controller == "memory"
+            else ()
         )
         while True:
+            usage = None
             for name in limits:
                 try:
                     value = (directory / name).read_text().strip()
                 except FileNotFoundError:
-                    # The hierarchy root may not have memory controller files.
+                    # The hierarchy root may not have controller files.
                     continue
                 if value == "max":
                     continue
                 limit = int(value)
                 # Do not silently ignore an unreadable usage file for a known
                 # limit: falling back to host RAM could overrun the container.
-                usage = int((directory / usage_name).read_text())
+                if usage is None:
+                    usage = int((directory / usage_name).read_text())
+                    if page_cache_keys:
+                        stat = _memory_stat(directory)
+                        page_cache = sum(stat[key] for key in page_cache_keys)
+                        # Protection is relative to the reclaim target: its own
+                        # min does not prevent reclaim, but its children's min
+                        # can. Unknown protection only disables cache credit.
+                        if filesystem == "cgroup2" and page_cache > 0:
+                            protected = _protected_children_bytes(directory)
+                            page_cache = (
+                                0
+                                if protected is None
+                                else max(0, page_cache - protected)
+                            )
+                        # Charged page cache is reclaimed under the limit, not used.
+                        usage = max(0, usage - page_cache)
                 remaining = max(0, limit - usage)
                 headroom = remaining if headroom is None else min(headroom, remaining)
             if directory == mount:
                 break
             directory = directory.parent
     if memberships and not resolved:
-        if not cgroup_mounted:
-            # E.g. a container sharing the host cgroup namespace without
-            # cgroupfs: no limit is visible, so size against host memory.
-            _warn_no_cgroup_mount()
-            return None
-        # A mounted but unmatched hierarchy may hide a real limit.
         raise RuntimeError(
-            "Cannot locate the process memory cgroup in mounted cgroup "
-            f"filesystems; set {_BUDGET_ENV} to the host memory budget to skip "
-            "cgroup discovery"
+            f"Cannot locate the process {controller} cgroup in mounted cgroup "
+            "filesystems"
         )
     return headroom
 
 
-def available_host_memory_bytes() -> int:
-    """Conservative allocatable RAM; charged file cache is not assumed reclaimable.
+def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
+    return _cgroup_headroom(
+        "memory",
+        ("memory.max", "memory.high"),
+        "memory.current",
+        ("memory.limit_in_bytes",),
+        "memory.usage_in_bytes",
+        proc_root,
+    )
 
-    An explicit SGLANG_HICACHE_HOST_MEMORY_BYTES replaces both probes.
+
+def cgroup_hugetlb_headroom_bytes(
+    page_size: int, proc_root: Path = Path("/proc")
+) -> int | None:
+    """Bytes the hugetlb allowed by the cgroup controller.
+
+    None when no limit applies (controller unmounted, or every ancestor unlimited).
     """
-    budget = envs.SGLANG_HICACHE_HOST_MEMORY_BYTES.get()
-    if budget is not None:
-        if budget <= 0:
-            raise ValueError(f"{_BUDGET_ENV} must be positive, got {budget}")
-        return budget
+    if page_size % 1024**3 == 0:
+        label = f"{page_size // 1024**3}GB"
+    else:
+        label = f"{page_size // 1024**2}MB"
+    prefix = f"hugetlb.{label}"
+    return _cgroup_headroom(
+        "hugetlb",
+        (f"{prefix}.max",),
+        f"{prefix}.current",
+        (f"{prefix}.limit_in_bytes",),
+        f"{prefix}.usage_in_bytes",
+        proc_root,
+    )
+
+
+def host_memory_headroom_bytes() -> int:
+    """Allocatable RAM now, bounded by visible cgroup limits; logs nothing."""
     available = psutil.virtual_memory().available
     cgroup_headroom = _cgroup_memory_headroom()
+    return available if cgroup_headroom is None else min(available, cgroup_headroom)
+
+
+def available_host_memory_bytes(*, allow_cgroup_fallback: bool = False) -> int:
+    """Allocatable RAM, counting reclaimable page cache as free."""
+    available = psutil.virtual_memory().available
+    try:
+        cgroup_headroom = _cgroup_memory_headroom()
+    except (OSError, RuntimeError) as exc:
+        if not allow_cgroup_fallback:
+            raise RuntimeError(
+                "Cannot automatically size HiCache host memory; "
+                "set --hicache-size explicitly (GB per rank), leaving room "
+                "for other memory use within the container limit."
+            ) from exc
+        logger.warning(
+            "Cannot determine cgroup memory headroom: %s. Checking explicitly "
+            "sized HiCache pools against host available memory; ensure all "
+            "local ranks' pools fit within the container memory limit.",
+            exc,
+        )
+        return available
     if cgroup_headroom is not None:
         logger.info(
             "HiCache memory headroom: host %.1f GiB, cgroup %.1f GiB",

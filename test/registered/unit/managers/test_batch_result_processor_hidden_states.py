@@ -1,5 +1,7 @@
 import unittest
-from types import SimpleNamespace
+from array import array
+from dataclasses import replace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -10,21 +12,26 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskOutput,
     SamplingMaskStatus,
 )
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.logprob_result_processor import (
+    SchedulerLogprobResultProcessor,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _make_processor(
-    case, server_mode: str = "full", *, logprob_result_processor=None
-) -> SchedulerBatchResultProcessor:
+def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProcessor:
     # The server-side hidden-state ceiling is a bag leaf.
     override = get_context().override_server_args(
         enable_return_hidden_states=True,
@@ -38,23 +45,91 @@ def _make_processor(
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
-        enable_overlap=False,
-        enable_overlap_mlx=False,
-        model_config=SimpleNamespace(think_end_ids=None),
+        model_config=SimpleNamespace(
+            think_end_ids=None, self_opened_think_start_ids=None
+        ),
         token_to_kv_pool_allocator=Mock(),
         tree_cache=None,
         hisparse_coordinator=None,
         req_to_token_pool=None,
+        kv_weight_version_tracker=None,
         decode_offload_manager=None,
         metrics_collector=None,
         metrics_reporter=metrics_reporter,
         draft_worker=None,
         model_worker=Mock(),
-        logprob_result_processor=logprob_result_processor,
+        logprob_result_processor=None,
         output_streamer=Mock(),
         beam_coordinator=Mock(),
+        request_retirer=release_only_retirer(),
         abort_request=lambda *args, **kwargs: None,
+        still_in_batch=lambda req: True,
     )
+
+
+class TestPrefillEmbeddingResults(CustomTestCase):
+    def test_failed_kv_load_discarded_with_mixed_embedding_formats(self):
+        reason = FINISH_ABORT("External KV cache load failed", 503)
+        reqs = [
+            SimpleNamespace(
+                encoding_format=encoding_format,
+                discard_output_reason=discard_reason,
+                is_retracted=False,
+                embedding=None,
+                pooled_hidden_state=None,
+                return_pooled_hidden_states=True,
+                output_ids=[],
+                time_stats=Mock(),
+                update_finish_state=Mock(),
+                finished_reason=None,
+                exit_via=None,
+                finished=lambda: True,
+                kv=SimpleNamespace(
+                    holds_kv=True, holds_mamba=False, retraction_backup=None
+                ),
+            )
+            for encoding_format, discard_reason in (
+                ("tensor", reason),
+                ("tensor", None),
+                ("float", None),
+            )
+        ]
+        for req in reqs:
+            req.request_finish = MethodType(Req.request_finish, req)
+        batch = SimpleNamespace(
+            reqs=reqs,
+            chunked_req=None,
+            return_logprob=False,
+            prefill_stats=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            embeddings=torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+            pooled_hidden_states=torch.tensor([[7.0], [8.0], [9.0]]),
+            can_run_cuda_graph=False,
+        )
+        processor = replace(_make_processor(self), is_generation=False)
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+        ) as release:
+            processor.process_batch_result_prefill(batch, result)
+
+        discarded, tensor_req, float_req = reqs
+        self.assertIs(discarded.to_finish, reason)
+        self.assertIsNone(discarded.embedding)
+        self.assertIsNone(discarded.pooled_hidden_state)
+        self.assertEqual(discarded.output_ids, [])
+        discarded.update_finish_state.assert_called_once_with(0)
+        release.assert_any_call(discarded, processor.tree_cache, checkpoint=False)
+        torch.testing.assert_close(tensor_req.embedding, torch.tensor([3.0, 4.0]))
+        self.assertEqual(float_req.embedding, [5.0, 6.0])
+        for req, hidden_state in ((tensor_req, [8.0]), (float_req, [9.0])):
+            torch.testing.assert_close(
+                req.pooled_hidden_state, torch.tensor(hidden_state)
+            )
+            self.assertEqual(req.output_ids, [0])
+            release.assert_any_call(req, processor.tree_cache, checkpoint=True)
 
 
 class TestSamplingMaskMaterialization(CustomTestCase):
@@ -156,54 +231,48 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         self.assertIsNone(output.sampling_mask_output)
 
 
-class _PrefillReq:
-    def __init__(
-        self,
-        *,
-        rid: str,
-        inflight_middle_chunks: int,
-        return_hidden_states,
-        return_logprob: bool = False,
-        to_finish=None,
-    ):
+class _PrefillReq(FakeReq):
+    def __init__(self, *, rid: str, return_hidden_states):
         self.rid = rid
-        self.inflight_middle_chunks = inflight_middle_chunks
         self.return_hidden_states = return_hidden_states
         self.hidden_states = []
         self.is_retracted = False
         self.output_ids = []
-        self.to_finish = to_finish
-        self.finished_reason = None
         self.time_stats = Mock()
-        self.return_logprob = return_logprob
+        self.return_logprob = False
         self.return_sampling_mask = False
         self.grammar = None
         self.require_reasoning = False
         self.customized_info = None
         self.beam_group = None
-        self.return_routed_experts = False
+        self.discard_output_reason = None
+        self.finished_reason = None
 
     def finished(self):
-        return self.finished_reason is not None
+        return False
 
-    def update_finish_state(self, new_accepted_len=1):
-        if self.to_finish is not None:
-            self.finished_reason = self.to_finish
-            self.to_finish = None
+    def update_finish_state(self):
+        return None
 
 
-class _DecodeReq:
+class _DecodeReq(FakeReq):
+    request_finish = Req.request_finish
+
     def __init__(self):
         self.return_hidden_states = "last"
         self.hidden_states = []
         self.output_ids = []
         self.finished_len = None
+        self.finished_reason = None
         self.is_retracted = False
         self.return_logprob = False
         self.return_sampling_mask = False
         self.grammar = None
         self.beam_group = None
         self.time_stats = Mock()
+        self.kv = SimpleNamespace(
+            holds_kv=True, holds_mamba=False, retraction_backup=None
+        )
 
     def finished(self):
         return self.finished_len is not None
@@ -230,18 +299,11 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
 
         for server_mode, capture_mode, hidden_states in cases:
             with self.subTest(server_mode=server_mode):
-                middle = _PrefillReq(
-                    rid="middle",
-                    inflight_middle_chunks=1,
-                    return_hidden_states=False,
-                )
-                last = _PrefillReq(
-                    rid="last",
-                    inflight_middle_chunks=0,
-                    return_hidden_states="last",
-                )
+                middle = _PrefillReq(rid="middle", return_hidden_states=False)
+                last = _PrefillReq(rid="last", return_hidden_states="last")
                 batch = SimpleNamespace(
                     reqs=[middle, last],
+                    chunked_req=middle,
                     decoding_reqs=[],
                     return_logprob=False,
                     return_hidden_states=True,
@@ -255,6 +317,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                     auxiliary_host_output=None,
                     routed_experts_output=None,
                     indexer_topk_output=None,
+                    kv_weight_version_record=None,
                     logits_output=SimpleNamespace(
                         hidden_states=hidden_states,
                         customized_info=None,
@@ -285,123 +348,241 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                 self.assertEqual(middle.hidden_states, [])
                 self.assertEqual(last.hidden_states, [[22.0]])
 
-    def test_aborted_final_prefill_drops_metadata_but_advances_logprob_offset(self):
-        self._assert_aborted_final_prefill()
 
-    def test_pending_abort_wins_over_sampling_mask_overflow(self):
-        self._assert_aborted_final_prefill(SamplingMaskStatus.OVERFLOW)
+class TestAbortedFinalPrefill(CustomTestCase):
+    def test_discard_drops_metadata_but_keeps_the_next_rows_packed_offsets(self):
+        """Dropping an aborted prefill must neither attach its metadata nor shift
+        the next live row's hidden states or input logprobs."""
+        for sampling_status in (None, SamplingMaskStatus.OVERFLOW):
+            with self.subTest(sampling_status=sampling_status):
+                aborted, live = [
+                    Req(
+                        rid=rid,
+                        origin_input_text="",
+                        origin_input_ids=array("q", ids),
+                        sampling_params=SamplingParams(max_new_tokens=8),
+                        return_logprob=True,
+                        return_hidden_states="last",
+                    )
+                    for rid, ids in (("aborted", [1, 2]), ("live", [3, 4, 5]))
+                ]
+                for req in (aborted, live):
+                    req.sampling_params.normalize(None)
+                    req.logprob_start_len = 0
+                reason = FINISH_ABORT("Running request timeout", 503)
+                aborted.request_finish(reason)
+                aborted.request_discard(reason)
+                aborted.kv.req_pool_idx = 0
+                aborted.return_sampling_mask = sampling_status is not None
+                aborted.grammar = Mock()
+                batch = SimpleNamespace(
+                    reqs=[aborted, live],
+                    chunked_req=None,
+                    decoding_reqs=[],
+                    return_logprob=True,
+                    return_hidden_states=True,
+                    return_hidden_states_mode=CaptureHiddenMode.LAST,
+                    spec_info=None,
+                    prefill_stats=None,
+                    dp_cooperation_info=None,
+                )
+                result = GenerationBatchResult(
+                    logits_output=LogitsProcessorOutput(
+                        next_token_logits=None,
+                        hidden_states=torch.tensor([[10.0], [20.0]]),
+                        customized_info={"tag": ["abort-meta", "live-meta"]},
+                        next_token_logprobs=torch.tensor([-0.5, -0.25]),
+                        input_token_logprobs=torch.tensor(
+                            [-1.0, -2.0, -10.0, -11.0, -12.0]
+                        ),
+                        next_token_sampling_mask_status=[sampling_status, None],
+                    ),
+                    next_token_ids=torch.tensor([101, 202]),
+                    extend_input_len_per_req=[2, 3],
+                    extend_logprob_start_len_per_req=[0, 0],
+                )
+                cache = Mock()
+                processor = replace(
+                    _make_processor(self, "last"),
+                    tree_cache=cache,
+                    request_retirer=release_only_retirer(cache),
+                    logprob_result_processor=SchedulerLogprobResultProcessor(
+                        model_config=SimpleNamespace(vocab_size=1000)
+                    ),
+                )
 
-    def _assert_aborted_final_prefill(self, sampling_status=None):
-        aborted = _PrefillReq(
-            rid="aborted",
-            inflight_middle_chunks=0,
-            return_hidden_states="last",
-            return_logprob=True,
-            to_finish=object(),
+                def assert_clean_before_stream(*_):
+                    self.assertFalse(aborted.output_ids)
+                    self.assertFalse(aborted.hidden_states)
+                    self.assertIsNone(aborted.customized_info)
+
+                processor.output_streamer.stream_output.side_effect = (
+                    assert_clean_before_stream
+                )
+                with (
+                    patch(
+                        "sglang.srt.managers.scheduler_components."
+                        "request_retirer.release_kv_cache"
+                    ) as release,
+                    patch(
+                        "sglang.srt.managers.scheduler_components."
+                        "batch_result_processor.checkpoint_kv_cache"
+                    ),
+                ):
+                    processor.process_batch_result_prefill(batch, result)
+
+                self.assertIs(aborted.finished_reason, reason)
+                self.assertFalse(aborted.output_ids)
+                self.assertFalse(aborted.hidden_states)
+                self.assertIsNone(aborted.customized_info)
+                self.assertIsNone(aborted.logprob.input_token_logprobs_val)
+                self.assertEqual(aborted.logprob.output_token_logprobs_val, [])
+                aborted.grammar.accept_token.assert_not_called()
+                release.assert_called_once_with(aborted, cache, checkpoint=False)
+                self.assertEqual(list(live.output_ids), [202])
+                self.assertEqual(live.hidden_states, [[20.0]])
+                self.assertEqual(live.customized_info, {"tag": ["live-meta"]})
+                self.assertEqual(
+                    live.logprob.input_token_logprobs_val, [None, -10.0, -11.0]
+                )
+                self.assertEqual(live.logprob.output_token_logprobs_val, [-0.25])
+                self.assertEqual(live.logprob.output_token_logprobs_idx, [202])
+
+
+class TestRowsStillInBatch(CustomTestCase):
+    def test_only_rows_still_in_batch_commit(self):
+        """A request that left the batch after launch gets no token, hidden state,
+        logprob or streamed row, yet the row still in the batch reads its own slice
+        of the step's result."""
+        self._check_prefill()
+        self._check_decode()
+
+    def _check_prefill(self):
+        cases = (
+            (
+                "full",
+                CaptureHiddenMode.FULL,
+                torch.tensor([[10.0], [11.0], [20.0], [21.0], [22.0]]),
+            ),
+            ("last", CaptureHiddenMode.LAST, torch.tensor([[11.0], [22.0]])),
         )
-        abort_reason = aborted.to_finish
-        aborted.return_sampling_mask = sampling_status is not None
-        live = _PrefillReq(
-            rid="live",
-            inflight_middle_chunks=0,
-            return_hidden_states="last",
-            return_logprob=True,
-        )
+
+        for server_mode, capture_mode, hidden_states in cases:
+            with self.subTest(server_mode=server_mode):
+                left = _PrefillReq(rid="left", return_hidden_states="last")
+                kept = _PrefillReq(rid="kept", return_hidden_states="last")
+                batch = SimpleNamespace(
+                    reqs=[left, kept],
+                    chunked_req=None,
+                    decoding_reqs=[],
+                    return_logprob=False,
+                    return_hidden_states=True,
+                    return_hidden_states_mode=capture_mode,
+                    spec_info=None,
+                    prefill_stats=None,
+                    dp_cooperation_info=None,
+                )
+                result = SimpleNamespace(
+                    copy_done=None,
+                    auxiliary_host_output=None,
+                    routed_experts_output=None,
+                    indexer_topk_output=None,
+                    kv_weight_version_record=None,
+                    logits_output=SimpleNamespace(
+                        hidden_states=hidden_states,
+                        customized_info=None,
+                        sampling_mask_output=None,
+                    ),
+                    next_token_ids=torch.tensor([7, 8]),
+                    extend_input_len_per_req=[2, 3],
+                    extend_logprob_start_len_per_req=None,
+                    grammar_advanced=False,
+                    can_run_cuda_graph=False,
+                    skipped_output_comm=False,
+                )
+                processor = replace(
+                    _make_processor(self, server_mode),
+                    still_in_batch=lambda req, kept=kept: req is kept,
+                )
+
+                with (
+                    patch(
+                        "sglang.srt.managers.scheduler_components."
+                        "batch_result_processor.checkpoint_kv_cache"
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler_components."
+                        "batch_result_processor.get_memory",
+                        return_value=SimpleNamespace(enable_hisparse=False),
+                    ),
+                ):
+                    processor.process_batch_result_prefill(batch, result)
+
+                self.assertEqual(left.output_ids, [])
+                self.assertEqual(left.hidden_states, [])
+                self.assertEqual(kept.output_ids, [8])
+                self.assertEqual(kept.hidden_states, [[22.0]])
+                processor.output_streamer.stream_output.assert_called_once_with(
+                    [kept], False, None
+                )
+
+    def _check_decode(self):
+        left = _DecodeReq()
+        kept = _DecodeReq()
+        for req in (left, kept):
+            req.return_hidden_states = False
+            req.return_logprob = True
         batch = SimpleNamespace(
-            reqs=[aborted, live],
-            decoding_reqs=[],
+            reqs=[left, kept],
             return_logprob=True,
-            return_hidden_states=True,
-            return_hidden_states_mode=CaptureHiddenMode.LAST,
-            spec_info=None,
-            prefill_stats=None,
-            dp_cooperation_info=None,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            batch_size=lambda: 2,
+            forward_iter=1,
         )
-        logits_output = SimpleNamespace(
-            sampling_mask_output=None,
-            next_token_sampling_mask_status=[sampling_status, None],
-            hidden_states=torch.tensor([[10.0], [20.0]]),
-            customized_info={"tag": ["abort-meta", "live-meta"]},
-            next_token_logprobs=None,
-            input_token_logprobs=torch.tensor([-1.0, -2.0, -10.0, -11.0, -12.0]),
-            next_token_top_logprobs_val=[],
-            next_token_top_logprobs_idx=[],
-            next_token_token_ids_logprobs_val=[],
+        result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=None,
+                next_token_logprobs=torch.tensor([-1.0, -2.0]),
+            ),
+            next_token_ids=torch.tensor([7, 8]),
         )
-        result = SimpleNamespace(
-            copy_done=None,
-            auxiliary_host_output=None,
-            routed_experts_output=None,
-            indexer_topk_output=None,
-            logits_output=logits_output,
-            next_token_ids=torch.tensor([101, 202]),
-            extend_input_len_per_req=[2, 3],
-            extend_logprob_start_len_per_req=[0, 0],
-            grammar_advanced=False,
-            can_run_cuda_graph=False,
-            skipped_output_comm=False,
+        processor = replace(
+            _make_processor(self),
+            still_in_batch=lambda req: req is kept,
+            logprob_result_processor=Mock(),
         )
-        logprob_processor = Mock()
-        logprob_processor.calculate_num_input_logprobs.side_effect = [2, 3]
-        processor = _make_processor(
-            self, "last", logprob_result_processor=logprob_processor
-        )
-
-        def assert_clean_before_stream(reqs, *_):
-            self.assertEqual(reqs[0].output_ids, [])
-            self.assertEqual(reqs[0].hidden_states, [])
-            self.assertIsNone(reqs[0].customized_info)
-
-        processor.output_streamer.stream_output.side_effect = assert_clean_before_stream
 
         with (
-            patch(
-                "sglang.srt.managers.scheduler_components."
-                "batch_result_processor.release_kv_cache"
+            patch.object(
+                SchedulerBatchResultProcessor, "_maybe_update_reasoning_tokens"
             ),
-            patch(
-                "sglang.srt.managers.scheduler_components."
-                "batch_result_processor.maybe_cache_unfinished_req"
-            ),
-            patch(
-                "sglang.srt.managers.scheduler_components."
-                "batch_result_processor.get_memory",
-                return_value=SimpleNamespace(enable_hisparse=False),
+            patch.object(
+                SchedulerBatchResultProcessor, "_handle_finish_state_updated_req"
             ),
         ):
-            processor.process_batch_result_prefill(batch, result)
+            processor.process_batch_result_decode(batch, result)
 
-        self.assertTrue(aborted.finished())
-        self.assertIs(aborted.finished_reason, abort_reason)
-        self.assertEqual(aborted.output_ids, [])
-        self.assertEqual(aborted.hidden_states, [])
-        self.assertIsNone(aborted.customized_info)
-        self.assertEqual(live.output_ids, [202])
-        self.assertEqual(live.hidden_states, [[20.0]])
-        self.assertEqual(live.customized_info, {"tag": ["live-meta"]})
-
-        self.assertEqual(logprob_processor.calculate_num_input_logprobs.call_count, 2)
-        logprob_processor.add_logprob_return_values.assert_called_once_with(
-            1,
-            live,
-            2,
-            [101, 202],
-            3,
-            logits_output,
+        self.assertEqual(left.output_ids, [])
+        self.assertEqual(kept.output_ids, [8])
+        append = processor.logprob_result_processor.append_output_token_logprobs
+        append.assert_called_once()
+        args, kwargs = append.call_args
+        self.assertEqual(args, (kept, 8, -2.0))
+        self.assertEqual(kwargs["row"], 1)
+        processor.beam_coordinator.commit_decode.assert_called_once_with(
+            [kept], batch.forward_iter
         )
+        processor.output_streamer.stream_output.assert_called_once_with([kept], True)
 
 
 class TestPrefillSkippedOutput(CustomTestCase):
     def test_sampling_mask_middle_chunk_does_not_require_logits_output(self):
         """A non-token-producing PP chunk may omit its logits output."""
-        req = _PrefillReq(
-            rid="middle",
-            inflight_middle_chunks=1,
-            return_hidden_states=False,
-        )
+        req = _PrefillReq(rid="middle", return_hidden_states=False)
         req.return_sampling_mask = True
         batch = SimpleNamespace(
             reqs=[req],
+            chunked_req=req,
             return_logprob=False,
             return_hidden_states=False,
             return_hidden_states_mode=CaptureHiddenMode.NULL,
@@ -415,6 +596,7 @@ class TestPrefillSkippedOutput(CustomTestCase):
             routed_experts_output=None,
             indexer_topk_output=None,
             logits_output=None,
+            kv_weight_version_record=None,
             next_token_ids=torch.zeros(1, dtype=torch.int64),
             extend_input_len_per_req=None,
             extend_logprob_start_len_per_req=None,
@@ -431,10 +613,72 @@ class TestPrefillSkippedOutput(CustomTestCase):
         ):
             processor.process_batch_result_prefill(batch, result)
 
-        self.assertEqual(req.inflight_middle_chunks, 0)
         self.assertEqual(req.output_ids, [])
         processor.output_streamer.stream_output.assert_called_once_with(
             [req], False, req
+        )
+
+
+class TestMixedBatchKvRelease(CustomTestCase):
+    def test_decode_req_finishing_in_mixed_batch_gets_release_hook(self):
+        """A decode req that finishes inside a mixed batch goes through the
+        worker's pre-release hook, as it would in a decode batch; a prefill
+        req finishing on its first token does not."""
+        prefill_req = _PrefillReq(rid="prefill", return_hidden_states=False)
+        decode_req = _PrefillReq(rid="decode", return_hidden_states=False)
+        for req in (prefill_req, decode_req):
+            req.finished = lambda req=req: bool(req.output_ids)
+            req.kv = SimpleNamespace(
+                kv_committed_len=0,
+                holds_kv=True,
+                holds_mamba=False,
+                retraction_backup=None,
+            )
+        batch = SimpleNamespace(
+            reqs=[prefill_req, decode_req],
+            chunked_req=None,
+            decoding_reqs=[decode_req],
+            return_logprob=False,
+            return_hidden_states=False,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            spec_info=None,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            kv_weight_version_record=None,
+            logits_output=SimpleNamespace(
+                hidden_states=None, customized_info=None, sampling_mask_output=None
+            ),
+            next_token_ids=torch.tensor([5, 6]),
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            grammar_advanced=False,
+            can_run_cuda_graph=False,
+            skipped_output_comm=False,
+        )
+        processor = _make_processor(self)
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components."
+                "request_retirer.release_kv_cache"
+            ) as release,
+            patch.object(
+                SchedulerBatchResultProcessor, "_maybe_collect_routed_experts"
+            ),
+            patch.object(SchedulerBatchResultProcessor, "_maybe_collect_indexer_topk"),
+        ):
+            processor.process_batch_result_prefill(batch, result)
+
+        self.assertEqual(release.call_count, 2)
+        processor.model_worker.prepare_for_kv_cache_release.assert_called_once_with(
+            decode_req
         )
 
 
@@ -482,6 +726,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
             return_logprob=False,
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             batch_size=lambda: 1,
+            forward_iter=1,
         )
         result = GenerationBatchResult(
             logits_output=LogitsProcessorOutput(
@@ -491,7 +736,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
             next_token_ids=torch.tensor([8]),
         )
         with patch(
-            "sglang.srt.managers.scheduler_components.batch_result_processor.release_kv_cache"
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
         ) as release:
             processor.process_batch_result_decode(batch, result)
 
@@ -499,7 +744,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
         self.assertEqual(req.to_finish.status_code, 400)
         req.update_finish_state.assert_called_once_with(0)
         processor.model_worker.prepare_for_kv_cache_release.assert_called_once_with(req)
-        release.assert_called_once_with(req, processor.tree_cache, is_insert=False)
+        release.assert_called_once_with(req, processor.tree_cache, checkpoint=False)
         processor.output_streamer.stream_output.assert_called_once_with([req], False)
 
     def test_overflow_and_invalid_have_distinct_http_errors(self):
@@ -535,7 +780,9 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
         def result(hidden_states):
             return GenerationBatchResult(
                 logits_output=SimpleNamespace(
-                    hidden_states=hidden_states, sampling_mask_output=None
+                    hidden_states=hidden_states,
+                    customized_info=None,
+                    sampling_mask_output=None,
                 ),
                 speculative_num_draft_tokens=4,
             )

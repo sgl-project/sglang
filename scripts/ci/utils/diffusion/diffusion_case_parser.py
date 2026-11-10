@@ -2,8 +2,8 @@
 """
 AST-based parser for diffusion test cases.
 
-This module parses the diffusion case source and run_suite.py using AST to
-extract test case information without requiring sglang dependencies. The case
+This module parses the diffusion case source using AST to extract test case
+and standalone-file information without requiring sglang dependencies. The case
 source file is discovered from ONE_GPU_CASES/TWO_GPU_CASES imports in
 run_suite.py so CI keeps a single source of truth.
 
@@ -11,7 +11,7 @@ Usage:
     # From sibling scripts in this directory:
     from diffusion_case_parser import collect_diffusion_suites, resolve_case_config_path
     case_config_path = resolve_case_config_path(repo_root, run_suite_path)
-    suites = collect_diffusion_suites(case_config_path, run_suite_path, baseline_path)
+    suites = collect_diffusion_suites(case_config_path, baseline_path)
 """
 
 import ast
@@ -285,9 +285,9 @@ def resolve_case_config_path(repo_root: Path, run_suite_path: Path) -> Path:
     return case_config_path
 
 
-class RunSuiteVisitor(ast.NodeVisitor):
+class StandaloneFilesVisitor(ast.NodeVisitor):
     """
-    AST visitor to extract standalone metadata from run_suite.py.
+    AST visitor to extract standalone metadata from the case config.
 
     Parses:
         STANDALONE_FILES = {
@@ -412,22 +412,22 @@ def parse_testcase_configs(config_path: Path) -> Dict[str, List[str]]:
     return visitor.cases
 
 
-def parse_run_suite_standalone_data(
-    run_suite_path: Path,
+def parse_standalone_data(
+    case_config_path: Path,
 ) -> tuple[Dict[str, List[str]], Dict[str, Dict[str, float]]]:
     """
-    Parse run_suite.py to extract standalone file metadata.
+    Parse the case config to extract standalone file metadata.
 
     Returns:
         Tuple of:
           - suite -> standalone file list
           - suite -> standalone file -> estimated seconds
     """
-    with open(run_suite_path, "r", encoding="utf-8") as f:
+    with open(case_config_path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    tree = ast.parse(content, filename=str(run_suite_path))
-    visitor = RunSuiteVisitor()
+    tree = ast.parse(content, filename=str(case_config_path))
+    visitor = StandaloneFilesVisitor()
     visitor.visit(tree)
 
     return visitor.standalone_files, visitor.standalone_est_times
@@ -452,7 +452,6 @@ def validate_standalone_est_times(
 
 def collect_diffusion_suites(
     case_config_path: Path,
-    run_suite_path: Path,
     baseline_path: Path,
 ) -> Dict[str, DiffusionSuiteInfo]:
     """
@@ -460,7 +459,6 @@ def collect_diffusion_suites(
 
     Args:
         case_config_path: Path to case config (resolved from run_suite.py)
-        run_suite_path: Path to run_suite.py
         baseline_path: Path to perf_baselines/ or a single baseline JSON file
 
     Returns:
@@ -469,10 +467,8 @@ def collect_diffusion_suites(
     # Parse case IDs from the single source case config.
     case_lists = parse_testcase_configs(case_config_path)
 
-    # Parse standalone files from run_suite.py
-    standalone_files, standalone_est_times = parse_run_suite_standalone_data(
-        run_suite_path
-    )
+    # STANDALONE_FILES is defined next to the cases.
+    standalone_files, standalone_est_times = parse_standalone_data(case_config_path)
     missing_standalone_estimates = validate_standalone_est_times(
         standalone_files, standalone_est_times
     )

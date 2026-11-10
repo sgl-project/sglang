@@ -5,19 +5,31 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import torch
-
-from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import (
+    NextBatchPlan,
+    Req,
+    ReqKvInfo,
+    ScheduleBatch,
+)
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.utils.common import Range
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.test.scheduler_test_utils import empty_request_lists
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -26,8 +38,7 @@ def _make_req(
     *,
     req_pool_idx: int,
     fill_ids: list,
-    prefix_indices: torch.Tensor,
-    extend_input_len: int,
+    prefix_len: int,
     fill_len: int,
 ) -> Req:
     req = Req.__new__(Req)
@@ -35,15 +46,14 @@ def _make_req(
     req.origin_input_ids = array("q", fill_ids)
     req.output_ids = array("q")
     req.full_untruncated_fill_ids = array("q", fill_ids)
-    req.prefix_indices = prefix_indices
-    req.extend_range = Range(fill_len - extend_input_len, fill_len)
-    req.inflight_middle_chunks = 0
+    req.prefix_len = prefix_len
+    req.extend_end = fill_len
     req.host_hit_length = 0
     req.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
     req.skip_radix_cache_insert = False
     req.finished_reason = None
     req.last_node = None
-    req.lock_receipt = DecLockRefParams()
+    req.lock = None
     req.session = None
     req.return_logprob = False
     req.logprob_start_len = -1
@@ -55,25 +65,9 @@ def _make_req(
     return req
 
 
-def _make_req_to_token_pool(num_slots: int, max_context: int) -> SimpleNamespace:
-    # Slot s contains a recognizable fingerprint [s*1000, s*1000+1, ...]
-    # so we can tell a corrupted prefix_indices from a healthy one by content.
-    pool = SimpleNamespace()
-    pool.req_to_token = (
-        torch.arange(max_context, dtype=torch.int32).unsqueeze(0).repeat(num_slots, 1)
-        + torch.arange(num_slots, dtype=torch.int32).unsqueeze(1) * 1000
-    )
-    return pool
-
-
-def _make_chunk_cache(req_to_token_pool) -> ChunkCache:
-    return ChunkCache(
-        SimpleNamespace(
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=None,
-            page_size=1,
-        )
-    )
+def _make_tree_cache() -> BasePrefixCache:
+    # The gate under test lives in the scheduler; the cache is a stub.
+    return MagicMock(spec=BasePrefixCache)
 
 
 def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
@@ -91,9 +85,10 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.last_batch = None
     s.require_mlp_sync = False
     s.spec_algorithm = MagicMock()
-    s.server_args = MagicMock(speculative_skip_dp_mlp_sync=True)
+    s.server_args = MagicMock()
     s.running_batch = MagicMock()
     s.running_batch.is_empty.return_value = True
+    s.running_batch.batch_size.return_value = 0
     s.running_batch.is_prefill_only = False
     s.running_batch.batch_is_full = False
     s.running_batch.reqs = []
@@ -113,150 +108,138 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.update_running_batch = MagicMock(side_effect=lambda batch: batch)
     tree_cache.check_hicache_events = MagicMock()
     s.tree_cache = tree_cache
+    s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
     s.chunked_req = chunked_req
     s._pending_chunked_abort_req = None
-    s.result_queue = []
+    s.running_reqs = KeyedReqList(ListKind.DECODING)
+    s.invariant_checker = MagicMock()
     return s
 
 
-class TestStashGatePreservesPrefixIndices(CustomTestCase):
-    """Consumer side: real ChunkCache.checkpoint mutates
-    req.prefix_indices iff stash actually runs, so prefix_indices content
-    is the bug-detection signal. The stash gate is content-based:
-    `fill_len > len(prefix_indices)` means there is freshly computed KV to
-    cache; otherwise the chunk was parked and stashing must be skipped."""
+class TestStashGatePreservesPrefix(CustomTestCase):
+    """The stash gate advances prefix_len iff `fill_len > prefix_len`, i.e. the
+    chunk computed new KV; a parked chunk must be left untouched."""
 
     POOL_IDX = 4
     INITIAL_PREFIX_LEN = 8  # what was really cached last iter
     POST_RESET_FILL_LEN = 32  # length after init_next_round_input rebuilds
-    NUM_SLOTS = 8
-    MAX_CONTEXT = 64
 
     def _build(self, *, fill_len: int):
-        pool = _make_req_to_token_pool(self.NUM_SLOTS, self.MAX_CONTEXT)
-        cache = _make_chunk_cache(pool)
-        initial_prefix = pool.req_to_token[self.POOL_IDX, : self.INITIAL_PREFIX_LEN].to(
-            dtype=torch.int64, copy=True
-        )
+        cache = _make_tree_cache()
         req = _make_req(
             req_pool_idx=self.POOL_IDX,
             fill_ids=list(range(self.POST_RESET_FILL_LEN)),
-            prefix_indices=initial_prefix,
-            extend_input_len=fill_len - self.INITIAL_PREFIX_LEN,
+            prefix_len=self.INITIAL_PREFIX_LEN,
             fill_len=fill_len,
         )
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=req)
-        return s, req, initial_prefix, pool
+        return s, req
 
-    def test_parked_chunked_req_keeps_real_prefix_indices(self):
-        # A parked chunk has fill_len == len(prefix_indices): no new KV was
-        # computed, so the gate must skip stash and leave prefix_indices intact.
-        s, req, initial_prefix, _ = self._build(fill_len=self.INITIAL_PREFIX_LEN)
+    def test_parked_chunked_req_keeps_its_prefix(self):
+        # A parked chunk has fill_len == prefix_len: no new KV was computed,
+        # so the gate must skip stash and leave the prefix intact.
+        s, req = self._build(fill_len=self.INITIAL_PREFIX_LEN)
 
         Scheduler.get_next_batch_to_run(
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
 
-        self.assertEqual(req.prefix_indices.shape[0], self.INITIAL_PREFIX_LEN)
-        self.assertTrue(torch.equal(req.prefix_indices, initial_prefix))
+        self.assertEqual(req.prefix_len, self.INITIAL_PREFIX_LEN)
+        s.tree_cache.checkpoint.assert_not_called()
 
-    def test_scheduled_chunked_req_advances_prefix_indices_via_real_stash(self):
+    def test_scheduled_chunked_req_advances_prefix_via_real_stash(self):
         # Symmetric guard against over-gating: when fill_len has advanced past
-        # the cached prefix, stash must run and advance prefix_indices.
-        s, req, _, pool = self._build(fill_len=self.POST_RESET_FILL_LEN)
+        # the cached prefix, stash must run and advance prefix_len.
+        s, req = self._build(fill_len=self.POST_RESET_FILL_LEN)
 
         Scheduler.get_next_batch_to_run(
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
 
-        expected = pool.req_to_token[self.POOL_IDX, : self.POST_RESET_FILL_LEN].to(
-            dtype=torch.int64
+        self.assertEqual(req.prefix_len, self.POST_RESET_FILL_LEN)
+        s.tree_cache.checkpoint.assert_called_once_with(
+            req, up_to=self.POST_RESET_FILL_LEN
         )
-        self.assertEqual(req.prefix_indices.shape[0], self.POST_RESET_FILL_LEN)
-        self.assertTrue(torch.equal(req.prefix_indices, expected))
-
-    def test_no_chunked_req_never_mutates_state(self):
-        # The outer `if chunked_req is not None` guard must hold on the retract
-        # path that clears chunked_req.
-        pool = _make_req_to_token_pool(self.NUM_SLOTS, self.MAX_CONTEXT)
-        cache = _make_chunk_cache(pool)
-        s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=None)
-
-        Scheduler.get_next_batch_to_run(
-            s, running_batch=s.running_batch, last_batch=s.last_batch
-        )
-        self.assertIsNone(s.chunked_req)
 
 
 class TestPendingPrefillAbortGate(CustomTestCase):
-    @staticmethod
-    def _make_last_batch():
-        aborted_prefill = MagicMock(rid="aborted-prefill", to_finish=object())
-        live_prefill = MagicMock(rid="live-prefill", to_finish=None)
-        aborted_decode = MagicMock(rid="aborted-decode", to_finish=object())
-        for req in (aborted_prefill, live_prefill, aborted_decode):
-            req.finished.return_value = False
-
-        last_batch = MagicMock()
-        last_batch.forward_mode.is_extend.return_value = True
-        last_batch.reqs = [aborted_prefill, live_prefill, aborted_decode]
-        last_batch.decoding_reqs = [aborted_decode]
-        last_batch.chunked_req = None
-        last_batch.is_prefill_only = False
-        last_batch.batch_size.side_effect = lambda: len(last_batch.reqs)
-        last_batch.is_empty.side_effect = lambda: not last_batch.reqs
-
-        def filter_batch(*, chunked_req_to_exclude):
-            excluded = set(chunked_req_to_exclude)
-            last_batch.reqs = [req for req in last_batch.reqs if req not in excluded]
-
-        last_batch.filter_batch.side_effect = filter_batch
-        return last_batch, aborted_prefill, live_prefill, aborted_decode
-
-    def _scheduled_reqs(self, *, has_pending_result):
-        scheduler = _scheduler_for_get_next_batch(
-            tree_cache=MagicMock(), chunked_req=None
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args(model_path="dummy")
+        override.install()
+        self.addCleanup(override.restore)
+        self.scheduler = Scheduler.__new__(Scheduler)
+        empty_request_lists(self.scheduler)
+        self.scheduler.disaggregation_mode = DisaggregationMode.NULL
+        self.scheduler.enable_continuous_input_polling = False
+        self.scheduler.enable_skip_finishing_decode = True
+        self.scheduler.mm_receiver = None
+        self.reqs = [
+            Req(
+                rid=rid,
+                origin_input_text="",
+                origin_input_ids=array("q", [1, 2, 3]),
+                sampling_params=SamplingParams(max_new_tokens=8),
+            )
+            for rid in ("aborted-prefill", "live-prefill", "aborted-decode")
+        ]
+        self.reqs[2].output_ids.append(7)
+        for req in self.reqs:
+            req.sampling_params.normalize(None)
+        self.scheduler.running_reqs.join([self.reqs[2]])
+        self.scheduler.running_batch = ScheduleBatch(reqs=[self.reqs[2]])
+        self.batch = ScheduleBatch(
+            reqs=self.reqs,
+            forward_mode=ForwardMode.EXTEND,
+            decoding_reqs=[self.reqs[2]],
         )
-        scheduler.result_queue = [object()] if has_pending_result else []
-        last_batch, aborted_prefill, live_prefill, aborted_decode = (
-            self._make_last_batch()
-        )
-        scheduler.get_new_batch_prefill.side_effect = lambda running_batch: (
-            NextBatchPlan(batch_to_run=None, running_batch=running_batch)
-        )
-        scheduled_reqs = []
+        self.batch.add_inflight_step()
+        self.scheduler._join_prefill_launched(self.batch)
+        self.scheduler.last_batch = self.batch
 
-        def update_running_batch(batch):
-            scheduled_reqs.extend(batch.reqs)
-            return batch
+    def test_abort_discards_only_the_inflight_prefill_before_decode(self):
+        """An abort between final-prefill launch and commit must not schedule
+        another step; a decode row in the same batch keeps its partial output."""
+        for message in (None, "Running request timeout"):
+            with self.subTest(message=message):
+                self.scheduler.abort_request(
+                    AbortReq(rid="aborted", abort_message=message)
+                )
+                prefill, live, decode = self.reqs
+                self.assertIsInstance(prefill.discard_output_reason, FINISH_ABORT)
+                self.assertIs(prefill.discard_output_reason, prefill.to_finish)
+                self.assertEqual(prefill.to_finish.message, message or "Aborted")
+                self.assertEqual(
+                    prefill.to_finish.status_code, 503 if message else None
+                )
+                self.assertIsNone(live.to_finish)
+                self.assertIsNone(decode.discard_output_reason)
+                self.assertIsInstance(decode.to_finish, FINISH_ABORT)
+                self.assertEqual(list(decode.output_ids), [7])
+                self.assertFalse(prefill.finished())
+                self.assertEqual(
+                    self.scheduler._reqs_finishing_inflight(self.batch), [prefill]
+                )
+                next_batch = self.scheduler.update_running_batch(
+                    ScheduleBatch(reqs=[prefill])
+                )
+                self.assertTrue(next_batch.is_empty())
+                self.assertEqual(prefill.decode_batch_idx, 0)
 
-        scheduler.update_running_batch.side_effect = update_running_batch
-
-        Scheduler.get_next_batch_to_run(
-            scheduler,
-            running_batch=scheduler.running_batch,
-            last_batch=last_batch,
-        )
-
-        return scheduled_reqs, aborted_prefill, live_prefill, aborted_decode
-
-    def test_abort_is_excluded_before_optimistic_decode(self):
-        scheduled_reqs, aborted_prefill, live_prefill, aborted_decode = (
-            self._scheduled_reqs(has_pending_result=True)
-        )
-
-        self.assertNotIn(aborted_prefill, scheduled_reqs)
-        self.assertIn(live_prefill, scheduled_reqs)
-        self.assertIn(aborted_decode, scheduled_reqs)
-
-    def test_abort_is_not_excluded_after_prefill_result_was_processed(self):
-        scheduled_reqs, aborted_prefill, live_prefill, aborted_decode = (
-            self._scheduled_reqs(has_pending_result=False)
-        )
-
-        self.assertIn(aborted_prefill, scheduled_reqs)
-        self.assertIn(live_prefill, scheduled_reqs)
-        self.assertIn(aborted_decode, scheduled_reqs)
+    def test_processed_prefill_and_pd_keep_existing_abort_semantics(self):
+        """A committed prefill or a PD transfer must not acquire discard semantics."""
+        for mode, inflight_steps in (
+            (DisaggregationMode.NULL, 0),
+            (DisaggregationMode.PREFILL, 1),
+            (DisaggregationMode.DECODE, 1),
+        ):
+            with self.subTest(mode=mode):
+                self.scheduler.disaggregation_mode = mode
+                prefill = self.reqs[0]
+                prefill.inflight_steps = inflight_steps
+                self.scheduler.abort_request(AbortReq(rid=prefill.rid))
+                self.assertIsInstance(prefill.to_finish, FINISH_ABORT)
+                self.assertIsNone(prefill.discard_output_reason)
 
 
 if __name__ == "__main__":
