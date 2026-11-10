@@ -212,7 +212,9 @@ def test_predictor_cost_excluded_from_cpu_overhead(mode):
             StateManager.inc_hicache_l2_load_dur(0.0)
             _run_offline_iteration(target, batch, clock, run_cost, process_cost)
 
-        cpu_overheads = [item["cpu_overhead"] for item in C_SchedulerHook.ITERATION_STATS]
+        cpu_overheads = [
+            item["cpu_overhead"] for item in C_SchedulerHook.ITERATION_STATS
+        ]
         # Non-predictor CPU work per iter = gap(0.02) + run(0.03) + process(0.04) = 0.09.
         # The 0.3s predictor query must NOT appear here in either mode.
         assert cpu_overheads == pytest.approx([0.09, 0.09])
@@ -223,6 +225,7 @@ def test_predictor_cost_excluded_from_cpu_overhead(mode):
         StateManager.reset()
         request_stats_manager.reset()
         import time as real_time
+
         scheduler.time = real_time
 
 
@@ -275,6 +278,7 @@ def test_offline_token_latency_independent_of_predictor_query_duration():
             StateManager.reset()
             request_stats_manager.reset()
             import time as real_time
+
             scheduler.time = real_time
 
     ttfts = [first_token_latency_for(d) for d in (0.0, 0.1, 0.5, 1.0)]
