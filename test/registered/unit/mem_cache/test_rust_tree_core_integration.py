@@ -2,6 +2,7 @@
 
 import hashlib
 import math
+import random
 import sys
 from array import array
 from itertools import pairwise
@@ -87,15 +88,18 @@ from sglang.srt.mem_cache.utils import (
     hash_str_to_int64,
 )
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
 from sglang.test.tree_slots import (
     CUSTOM_WINDOW_COMPONENT,
     FAMILY_OF,
     index_slots,
     slot_of,
+    storage_tree_slots,
     tree_slots_of,
 )
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 
 def _slots(*components):
@@ -830,6 +834,218 @@ def test_tlru_host_refill_raises_device_ancestor_history(backend):
 def test_eviction_config_rejects_unknown_constructor_options(policy, config):
     with pytest.raises(TypeError):
         _tree_core(eviction_policy=policy, eviction_policy_config=config)
+
+
+@pytest.fixture
+def published_server_args():
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="tokenizer")
+    yield
+    reset_context()
+
+
+def _joint_lru_cache(backend):
+    bundle = build_test_unified_pools(
+        device="cpu",
+        kv_cache_dtype=torch.float16,
+        page_size=1,
+        start_layer=0,
+        end_layer=8,
+        full_attention_layer_ids=[0, 1],
+        swa_attention_layer_ids=list(range(2, 8)),
+        head_num=2,
+        head_dim=4,
+        swa_head_num=2,
+        swa_head_dim=4,
+        sliding_window_size=4,
+        full_max_total_num_tokens=48,
+        swa_max_total_num_tokens=48,
+        total_bytes=48 * (2 + 6) * 2 * 2 * 4 * 2,
+        lazy_compaction=True,
+    )
+    allocator = bundle.token_to_kv_pool_allocator
+    cache = UnifiedRadixCache(
+        CacheInitParams(
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            disable=False,
+            sliding_window_size=4,
+            tree_slots=storage_tree_slots(allocator.storage, window=4),
+            tree_core_backend=backend,
+            eviction_policy="joint_lru",
+        )
+    )
+    assert cache._tree_core_backend == backend
+    allocator.lazy_compaction = True
+    for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
+        sub_pool.lazy_compaction = True
+    victims = []
+    select = cache.tree_core.next_joint_eviction_victim
+
+    def recorded():
+        victim = select()
+        victims.append(None if victim is None else victim[0])
+        return victim
+
+    cache.tree_core.next_joint_eviction_victim = recorded
+    return cache, allocator, victims
+
+
+def _joint_lru_block_moves(allocator, blocked):
+    # A fixed page forbids the moves compaction needs.
+    for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
+        sub_pool.unfix_pages("blocked")
+        if blocked:
+            sub_pool.fix_pages("blocked", [sub_pool.min_page_index])
+
+
+def _joint_lru_state(cache, allocator, seqs):
+    core = cache.tree_core
+    components = (ComponentType.FULL, core.slot_id(TREE_WINDOW))
+    return (
+        allocator.full_attn_allocator.allocated_count(),
+        allocator.swa_attn_allocator.allocated_count(),
+        tuple(core.component_evictable_size(ct) for ct in components),
+        tuple(core.component_protected_size(ct) for ct in components),
+        tuple(core.match_full_device_prefix(_key(s))[0] for s in seqs),
+    )
+
+
+@pytest.mark.usefixtures("published_server_args")
+@pytest.mark.parametrize("seed", range(10))
+def test_joint_eviction_matches_the_python_tree_core(seed):
+    rng = random.Random(seed)
+    sides = {backend: _joint_lru_cache(backend) for backend in ("python", "rust")}
+    seqs, locks = [], {backend: [] for backend in sides}
+    prefixes = [[1, 2], [1, 2, 3], [10, 11], [20], [1, 5]]
+    for step in range(60):
+        r = rng.random()
+        if r < 0.5:
+            tail = [rng.randint(30, 60) for _ in range(rng.randint(0, 5))]
+            op = ("insert", rng.choice(prefixes) + tail)
+        elif r < 0.7 and seqs:
+            s = rng.choice(seqs)
+            op = ("match", s[: rng.randint(1, len(s))])
+        elif r < 0.8 and seqs:
+            op = ("lock", rng.choice(seqs), rng.random() < 0.5)
+        else:
+            op = ("evict", rng.randint(1, 24), rng.randint(0, 24), rng.random() < 0.7)
+        outcome = {}
+        for backend, (cache, allocator, victims) in sides.items():
+            start = len(victims)
+            if op[0] == "insert":
+                value = allocator.alloc(len(op[1]))
+                if value is None:
+                    _joint_lru_block_moves(allocator, False)
+                    allocator.evict_to_free_tokens(cache, len(op[1]))
+                    value = allocator.alloc(len(op[1]))
+                if value is not None:
+                    cache.insert(InsertParams(key=_key(op[1]), value=value))
+                outcome[backend] = (value is not None, victims[start:])
+            elif op[0] == "match":
+                outcome[backend] = cache.match_prefix(
+                    MatchPrefixParams(_key(op[1]))
+                ).device_prefix_len
+            elif op[0] == "lock":
+                if op[2] and locks[backend]:
+                    cache.unlock(locks[backend].pop(0))
+                    outcome[backend] = "unlocked"
+                else:
+                    result = cache.match_prefix(MatchPrefixParams(_key(op[1])))
+                    locks[backend].append(cache.lock(result.last_device_node))
+                    outcome[backend] = result.device_prefix_len
+            else:
+                _, full_tokens, swa_tokens, moves = op
+                _joint_lru_block_moves(allocator, not moves)
+                window = allocator.swa_attn_allocator.sub_pool_name
+                result = cache.evict(
+                    EvictParams(
+                        num_tokens=full_tokens,
+                        window_num_tokens={window: swa_tokens} if swa_tokens else {},
+                    )
+                )
+                outcome[backend] = (
+                    result.num_tokens_evicted,
+                    result.window_num_tokens_evicted.get(window, 0),
+                    victims[start:],
+                )
+        if op[0] == "insert" and all(o[0] for o in outcome.values()):
+            if op[1] not in seqs:
+                seqs.append(op[1])
+        states = {b: _joint_lru_state(c, a, seqs) for b, (c, a, _) in sides.items()}
+        assert outcome["python"] == outcome["rust"], (step, op)
+        assert states["python"] == states["rust"], (step, op)
+    # The workload reaches both sides of the joint walk.
+    window = sides["python"][0].tree_core.slot_id(TREE_WINDOW)
+    assert {ComponentType.FULL, window} <= set(sides["python"][2])
+
+
+def _joint_lru_node_paths(core, seqs):
+    """Map each node that ends on a prefix of ``seqs`` to its root path."""
+    paths = {}
+    for seq in seqs:
+        for end in range(1, len(seq) + 1):
+            matched, node_id, pinned = core.match_full_device_prefix(_key(seq[:end]))
+            if matched == pinned == end:
+                paths[node_id] = tuple(seq[:end])
+    return paths
+
+
+def _joint_lru_split_tree(cache, allocator):
+    # SWA keeps 4 tokens, all in the 5-token tail, so the split prefix keeps its access.
+    seqs = [list(range(1, 11)), [1, 2, 3, 4, 5, 6, 7, 8, 50, 51, 52, 53, 54]]
+    for tokens in seqs:
+        cache.insert(InsertParams(key=_key(tokens), value=allocator.alloc(len(tokens))))
+    return seqs
+
+
+def _joint_lru_refreshed_tree(cache, allocator):
+    # Matching [1..10] refreshes SWA only on [7..10]; [1..4] gets Full access, not SWA.
+    for tokens in ([1, 2, 3, 4], list(range(1, 11)), [20, 21]):
+        cache.insert(InsertParams(key=_key(tokens), value=allocator.alloc(len(tokens))))
+    cache.match_prefix(MatchPrefixParams(_key(list(range(1, 11)))))
+    return [list(range(1, 11)), [20, 21]]
+
+
+@pytest.mark.usefixtures("published_server_args")
+@pytest.mark.parametrize("build", [_joint_lru_split_tree, _joint_lru_refreshed_tree])
+def test_joint_eviction_order_matches_the_python_tree_core(build):
+    orders = {}
+    for backend in ("python", "rust"):
+        cache, allocator, _ = _joint_lru_cache(backend)
+        seqs = build(cache, allocator)
+        core = cache.tree_core
+        paths = _joint_lru_node_paths(core, seqs)
+        core.start_joint_eviction()
+        try:
+            orders[backend] = [
+                (component, paths[node_id])
+                for component, node_id in iter(core.next_joint_eviction_victim, None)
+            ]
+        finally:
+            core.end_joint_eviction()
+    assert orders["python"] == orders["rust"]
+    assert orders["python"]
+
+
+@pytest.mark.parametrize(
+    "binding_cls",
+    [mem_cache.RustUnifiedTreeCoreBinding, mem_cache.RustBigramUnifiedTreeCoreBinding],
+)
+def test_unified_bindings_forward_the_joint_walk(binding_cls):
+    binding = binding_cls(
+        mem_cache.TreeCoreInitParamsBinding(
+            page_size=1,
+            swa_sliding_window_size=4,
+            eviction_policy="joint_lru",
+            joint_lru=True,
+        ),
+        _slots(ComponentType.FULL, ComponentType.SWA),
+    )
+    binding.start_joint_eviction()
+    assert binding.next_joint_eviction_victim() is None
+    binding.end_joint_eviction()
 
 
 def test_stale_handle_reads_raise_key_error_without_poisoning_the_core():
