@@ -255,6 +255,36 @@ class TestExternalLinkerFactory(unittest.TestCase):
             _CONFIG["linker_extra_config"]["nested"]["directory"], "/tmp/kv"
         )
 
+    def test_prefetch_policy_defaults_to_hicache_storage_flag_and_json_overrides(self):
+        for cli_policy in ("best_effort", "wait_complete", "timeout"):
+            with (
+                self.subTest(cli_policy=cli_policy),
+                get_context().override_server_args(
+                    enable_unified_cache_external_linker=True,
+                    unified_cache_external_linker_backend="dynamic",
+                    hicache_storage_prefetch_policy=cli_policy,
+                    unified_cache_external_linker_config=dict(_CONFIG),
+                ),
+            ):
+                linker = _create_startup_linker(
+                    get_context().server_args, "params", components={"full"}
+                )
+                self.assertEqual(linker.prefetch_policy, cli_policy)
+
+        with get_context().override_server_args(
+            enable_unified_cache_external_linker=True,
+            unified_cache_external_linker_backend="dynamic",
+            hicache_storage_prefetch_policy="best_effort",
+            unified_cache_external_linker_config={
+                **_CONFIG,
+                "prefetch_policy": "wait_complete",
+            },
+        ):
+            linker = _create_startup_linker(
+                get_context().server_args, "params", components={"full"}
+            )
+            self.assertEqual(linker.prefetch_policy, "wait_complete")
+
     def test_invalid_class(self):
         for name in ("Missing", "not_a_class", "AbstractLinker"):
             with (

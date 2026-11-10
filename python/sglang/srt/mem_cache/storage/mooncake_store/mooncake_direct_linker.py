@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -27,6 +28,7 @@ from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
+    PrefetchStatus,
     UnifiedCacheLinker,
 )
 from sglang.srt.runtime_context import (
@@ -118,6 +120,8 @@ def _storage_sharing(
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
+    pending_prefetches: dict[str, list[str]] | None = None
+
     def __init__(
         self,
         server_args,
@@ -236,6 +240,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self._broadcast_loaded_layers if self.mla_broadcaster else None,
         )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
+        self.pending_prefetches = {}
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object]
@@ -279,7 +284,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"error code: {result}."
                     )
 
-    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+    def lookup(
+        self, rid: str, transfers: list[PoolTransfer], prefetch: bool = False
+    ) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
@@ -287,8 +294,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         page_keys = list(kv.keys)
         if not page_keys:
             return []
-        result = self.storage.batch_exists_v2(page_keys, expanded)
+        should_prefetch = prefetch and self.load_mode == "layer_wise"
+        result = self.storage.batch_exists_v2(
+            page_keys, expanded, prefetch_to_memory=should_prefetch
+        )
         restorable = result.restorable_prefix_pages or []
+        if should_prefetch:
+            if restorable:
+                self._track_prefetch_keys(rid, page_keys, expanded, restorable[-1])
+            else:
+                self.cancel_prefetch(rid)
         self.stats["lookup"] += 1
         if restorable:
             logger.info(
@@ -299,7 +314,48 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         return restorable
 
+    def _track_prefetch_keys(
+        self,
+        rid: str,
+        page_keys: list[str],
+        expanded: list[PoolTransfer],
+        pages: int,
+    ) -> None:
+        target_keys: list[str] = []
+        for transfer in expanded:
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                selected = page_keys[max(0, pages - trailing) : pages]
+            else:
+                selected = page_keys[:pages]
+            component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                selected, transfer
+            )
+            target_keys.extend(self.storage._tag_keys(component_keys))
+        if self.pending_prefetches is None:
+            self.pending_prefetches = {}
+        self.pending_prefetches[rid] = list(dict.fromkeys(target_keys))
+
+    def prefetch_status(self, rid: str) -> PrefetchStatus:
+        if not self.pending_prefetches:
+            return PrefetchStatus.READY
+        keys = self.pending_prefetches.get(rid)
+        if not keys:
+            self.pending_prefetches.pop(rid, None)
+            return PrefetchStatus.READY
+        remaining = self.storage.filter_pending_memory_keys(keys)
+        if not remaining:
+            self.pending_prefetches.pop(rid, None)
+            return PrefetchStatus.READY
+        self.pending_prefetches[rid] = remaining
+        return PrefetchStatus.PENDING
+
+    def cancel_prefetch(self, rid: str) -> None:
+        if self.pending_prefetches is not None:
+            self.pending_prefetches.pop(rid, None)
+
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        self.cancel_prefetch(rid)
         # Query establishes a boundary at which every component is restorable;
         # insert then removes pages already resident in L1. Loading is therefore
         # intentionally partial and may contain only a side pool such as SWA.
@@ -667,6 +723,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def reset(self) -> None:
         self.pending_loads.clear()
+        if self.pending_prefetches is not None:
+            self.pending_prefetches.clear()
         # Both load modes must stop writing before any destination is recycled.
         self.load_queue.join()
         self.offload_queue.join()

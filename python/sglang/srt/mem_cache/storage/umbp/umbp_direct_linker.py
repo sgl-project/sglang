@@ -446,7 +446,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             ]
         raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
 
-    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+    def lookup(
+        self, rid: str, transfers: list[PoolTransfer], prefetch: bool = False
+    ) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []

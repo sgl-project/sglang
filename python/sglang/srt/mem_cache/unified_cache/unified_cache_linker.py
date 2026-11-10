@@ -12,9 +12,9 @@ each backend owns its device-pool layout and physical I/O.
 The tree only needs a handful of guarded hooks:
 
 * ``match_prefix``      -> :meth:`UnifiedCacheLinkerWrapper.match`
-* ``_prefetch_kvcache`` -> full-layer device prefetch before admission
+* ``_prefetch_kvcache`` -> queue-time store-DRAM or full-layer device prefetch
 * ``init_load_back``    -> :meth:`UnifiedCacheLinkerWrapper.load_back`
-* ``check_hicache_events`` -> full-layer prefetch publication before admission
+* ``check_hicache_events`` -> poll offloads and queued prefetch readiness
 * ``BackupKV`` actions  -> :meth:`UnifiedCacheLinkerWrapper.offload_nodes`
 
 A layer-wise load lands in device slots private to the loading request and joins the tree
@@ -25,6 +25,7 @@ Prefetch publishes complete KV before admission and recomputes failed reads.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 from abc import ABC, abstractmethod
@@ -32,14 +33,17 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
     InsertParams,
+    MatchPrefixParams,
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
@@ -54,6 +58,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.runtime_context import get_context, get_disagg
 from sglang.srt.session.streaming_session import is_virtual_node
 from sglang.srt.utils import get_device_module
 
@@ -152,6 +157,11 @@ class TransferReady(NamedTuple):
             stream.wait_event(event)
 
 
+class PrefetchStatus(Enum):
+    READY = "ready"
+    PENDING = "pending"
+
+
 class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools.
 
@@ -189,7 +199,9 @@ class UnifiedCacheLinker(ABC):
         return None
 
     @abstractmethod
-    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+    def lookup(
+        self, rid: str, transfers: list[PoolTransfer], prefetch: bool = False
+    ) -> list[int]:
         """Return every prefix length (in pages) that is fully restorable.
 
         A length is included only when *all* pools satisfy their hit policy at
@@ -199,8 +211,19 @@ class UnifiedCacheLinker(ABC):
         and generally non-contiguous -- returning just the local maximum would
         let the tree pick a length that is invalid on another rank.
 
+        When ``prefetch`` is True, backends with a multi-tier store may start an
+        asynchronous promotion into store DRAM for matched pages.
+
         Local to this rank; the tree intersects the sets across ranks.
         """
+
+    def prefetch_status(self, rid: str) -> PrefetchStatus:
+        """Return whether a queued store-memory prefetch for ``rid`` is ready."""
+        return PrefetchStatus.READY
+
+    def cancel_prefetch(self, rid: str) -> None:
+        """Drop backend tracking for a queued store-memory prefetch."""
+        pass
 
     @abstractmethod
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
@@ -273,6 +296,12 @@ class _ExternalCachePrefetch:
     discard: bool = False
 
 
+class _QueuedStorePrefetch(msgspec.Struct):
+    rid: str
+    timeout_s: float
+    wait_started: float | None = None
+
+
 class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
@@ -317,10 +346,15 @@ class UnifiedCacheLinkerWrapper:
             for component in cache._components_tuple
             if not any(component is window for window in self._skipped_windows)
         )
+        lookup_params = inspect.signature(cache_linker.lookup).parameters
+        self._lookup_accepts_prefetch = "prefetch" in lookup_params or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in lookup_params.values()
+        )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         self.prefetches: dict[CacheRequestHandle, _ExternalCachePrefetch] = {}
-        # Requests loading in the batch being built, then its counter index once
+        self.store_prefetches: dict[CacheRequestHandle, _QueuedStorePrefetch] = {}
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
         # Loaded tails stay outside the tree until their forward completes.
@@ -340,6 +374,16 @@ class UnifiedCacheLinkerWrapper:
 
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
+
+    def has_pending_prefetches(self) -> bool:
+        return bool(self.prefetches or self.store_prefetches)
+
+    def _lookup(
+        self, rid: str, transfers: list[PoolTransfer], *, prefetch: bool = False
+    ) -> list[int]:
+        if prefetch and self._lookup_accepts_prefetch:
+            return self.cache_linker.lookup(rid, transfers, prefetch=True)
+        return self.cache_linker.lookup(rid, transfers)
 
     # ---- match: probe the remote store and report host_hit_length ----
 
@@ -401,9 +445,13 @@ class UnifiedCacheLinkerWrapper:
         )
 
     def prefetch(self, req: Req) -> None:
+        if self.load_mode == "prefetch":
+            self._prefetch_to_device(req)
+        elif self.load_mode == "layer_wise":
+            self._prefetch_to_store_memory(req)
+
+    def _prefetch_to_device(self, req: Req) -> None:
         """Stage a queued request; publish only after all ranks succeed."""
-        if self.load_mode != "prefetch":
-            return
         request = req.cache_request_handle
         for previous in self.prefetches:
             if previous.rid == request.rid and previous != request:
@@ -434,7 +482,7 @@ class UnifiedCacheLinkerWrapper:
             return
         try:
             # TODO: Run storage lookup asynchronously to avoid blocking scheduling.
-            restorable = self.cache_linker.lookup(req.rid, lookups)
+            restorable = self._lookup(req.rid, lookups)
         except Exception:
             logger.warning("External linker prefetch lookup failed", exc_info=True)
             restorable = []
@@ -473,7 +521,103 @@ class UnifiedCacheLinkerWrapper:
             self._cancel_prefetch(request)
             self.check_prefetch_events()
 
+    def _prefetch_to_store_memory(self, req: Req) -> None:
+        """Promote SSD-only KV hits into the external store's DRAM while queued."""
+        request = req.cache_request_handle
+        for previous in list(self.store_prefetches):
+            if previous.rid == request.rid and previous != request:
+                self._cancel_store_prefetch(previous)
+        if (
+            self.cache.disable
+            or self.cache.pp_size > 1
+            or request in self.store_prefetches
+            or req.rid in self.hit_markers
+        ):
+            return
+        if (
+            get_context().is_config_namespace_published("disagg")
+            and get_disagg().disaggregation_mode == "decode"
+        ):
+            return
+        if (
+            self.cache.session.will_lend_record(req)
+            or req.positional_embed_overrides is not None
+        ):
+            return
+        if req.is_dllm():
+            req._init_fill_ids_for_dllm()
+        else:
+            req.refresh_fill_ids()
+        token_ids = req.full_untruncated_fill_ids
+        key_limit = req._compute_max_prefix_len(len(token_ids))
+        reprefill_tail = self.cache.window_reprefill_tail_tokens(req)
+        if reprefill_tail:
+            tail_limit = max(0, len(token_ids) - reprefill_tail)
+            key_limit = tail_limit if key_limit is None else min(key_limit, tail_limit)
+        key = RadixKey(
+            token_ids,
+            extra_key=req.extra_key,
+            cache_salt=req.cache_salt,
+            limit=key_limit,
+        )
+        # Match only the device tree here (req=None skips match()) so enqueue
+        # probes the external store once, with prefetch=True.
+        result = self.cache.match_prefix(MatchPrefixParams(key=key, cow_mamba=False))
+        if is_virtual_node(result.last_device_node):
+            return
+        key, _ = key.maybe_to_bigram_view(self.cache.tree_core.is_eagle)
+        if result.device_prefix_len >= len(key):
+            return
+        tail_hashes = self._tail_hashes(key, result, result.device_prefix_len)
+        if not tail_hashes:
+            return
+        lookups = [
+            c.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, tail_hashes
+            )
+            for c in self._components
+        ]
+        if any(t is None for t in lookups):
+            return
+        try:
+            restorable = self._lookup(req.rid, lookups, prefetch=True)
+        except Exception:
+            logger.warning("External linker prefetch lookup failed", exc_info=True)
+            restorable = []
+        pages = self._sync_restorable_prefix(
+            restorable, num_pages=len(tail_hashes), device_hit_pages=0
+        )
+        if not pages or self.cache.prefetch_stop_policy == "best_effort":
+            self.cache_linker.cancel_prefetch(req.rid)
+            return
+        try:
+            ready = self.cache_linker.prefetch_status(req.rid) == PrefetchStatus.READY
+        except Exception:
+            logger.warning(
+                "External linker prefetch status check failed", exc_info=True
+            )
+            ready = True
+        verdict = torch.tensor([int(ready)], dtype=torch.int)
+        self.cache._all_reduce_attn_groups(verdict, torch.distributed.ReduceOp.MIN)
+        if verdict.item():
+            self.cache_linker.cancel_prefetch(req.rid)
+            return
+        self.store_prefetches[request] = _QueuedStorePrefetch(
+            rid=req.rid,
+            timeout_s=self.cache.prefetch_timeout_base
+            + pages * self.cache.prefetch_timeout_per_page,
+        )
+
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        store_state = self.store_prefetches.get(request)
+        if store_state is not None:
+            if self.cache.prefetch_stop_policy == "best_effort":
+                self._cancel_store_prefetch(request)
+                return True
+            if store_state.wait_started is None:
+                store_state.wait_started = time.perf_counter()
+            return False
+
         state = self.prefetches.get(request)
         if state is None or state.discard:
             return True
@@ -505,6 +649,11 @@ class UnifiedCacheLinkerWrapper:
             if state.future is not None:
                 state.future.cancel()
 
+    def _cancel_store_prefetch(self, request: CacheRequestHandle) -> None:
+        state = self.store_prefetches.pop(request, None)
+        if state is not None:
+            self.cache_linker.cancel_prefetch(state.rid)
+
     def prefetch_size(self, pool: PoolName) -> int:
         """Device slots still owned by prefetch, including discarded writes."""
         return sum(
@@ -515,6 +664,10 @@ class UnifiedCacheLinkerWrapper:
         )
 
     def check_prefetch_events(self) -> None:
+        self._check_device_prefetch_events()
+        self._check_store_prefetch_events()
+
+    def _check_device_prefetch_events(self) -> None:
         if not self.prefetches:
             return
         pending = list(self.prefetches.items())
@@ -536,6 +689,39 @@ class UnifiedCacheLinkerWrapper:
         for (request, _), (done, landed) in zip(pending, verdicts.tolist()):
             if done:
                 self._finish_prefetch(request, publish=bool(landed))
+
+    def _check_store_prefetch_events(self) -> None:
+        if not self.store_prefetches:
+            return
+        pending = list(self.store_prefetches.items())
+        policy = self.cache.prefetch_stop_policy
+        now = time.perf_counter() if policy == "timeout" else 0.0
+        progress = []
+        for _, state in pending:
+            try:
+                ready = (
+                    self.cache_linker.prefetch_status(state.rid) == PrefetchStatus.READY
+                )
+            except Exception:
+                logger.warning(
+                    "External linker prefetch status check failed", exc_info=True
+                )
+                ready = True
+            expired = (
+                policy == "timeout"
+                and state.wait_started is not None
+                and now - state.wait_started > state.timeout_s
+            )
+            progress.append([int(ready), int(not expired)])
+        # MIN across ranks yields (all_ready, none_expired) in a single collective.
+        verdicts = torch.tensor(progress, dtype=torch.int)
+        self.cache._all_reduce_attn_groups(verdicts, torch.distributed.ReduceOp.MIN)
+        for (request, state), (all_ready, none_expired) in zip(
+            pending, verdicts.tolist()
+        ):
+            if all_ready or not none_expired or policy == "best_effort":
+                self.store_prefetches.pop(request, None)
+                self.cache_linker.cancel_prefetch(state.rid)
 
     def _finish_prefetch(self, request: CacheRequestHandle, *, publish: bool) -> None:
         state = self.prefetches.pop(request, None)
@@ -646,6 +832,10 @@ class UnifiedCacheLinkerWrapper:
         the load.
         """
         cache = self.cache
+        for handle, state in list(self.store_prefetches.items()):
+            if state.rid == req.rid:
+                self.store_prefetches.pop(handle, None)
+        self.cache_linker.cancel_prefetch(req.rid)
         hit = self.hit_markers.pop(req.rid, None)
         if hit is None:
             return 0, req.last_node
@@ -891,6 +1081,8 @@ class UnifiedCacheLinkerWrapper:
     def _clear_state(self) -> None:
         for request in list(self.prefetches):
             self._finish_prefetch(request, publish=False)
+        for request in list(self.store_prefetches):
+            self._cancel_store_prefetch(request)
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
@@ -906,7 +1098,8 @@ class UnifiedCacheLinkerWrapper:
         rid = request.rid
         self.hit_markers.pop(rid, None)
         self._cancel_prefetch(request)
-        # A queued load targets slots the request owns and is about to free.
+        self._cancel_store_prefetch(request)
+        self.cache_linker.cancel_prefetch(rid)
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
             self.inflight_load_rids.remove(rid)

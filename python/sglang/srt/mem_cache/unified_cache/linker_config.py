@@ -12,6 +12,8 @@ from typing import Any
 
 def parse_linker_load_options(
     config: dict[str, Any] | None,
+    *,
+    default_prefetch_policy: str = "timeout",
 ) -> tuple[str, str, dict[str, Any]]:
     """Separate common load options from backend-specific configuration."""
     if config is not None and not isinstance(config, dict):
@@ -20,7 +22,7 @@ def parse_linker_load_options(
         )
     backend_config = dict(config or {})
     load_mode = backend_config.pop("load_mode", "layer_wise")
-    prefetch_policy = backend_config.pop("prefetch_policy", "timeout")
+    prefetch_policy = backend_config.pop("prefetch_policy", default_prefetch_policy)
     if load_mode not in ("layer_wise", "prefetch"):
         raise ValueError(f"Invalid linker load_mode: {load_mode!r}.")
     if prefetch_policy not in ("best_effort", "wait_complete", "timeout"):

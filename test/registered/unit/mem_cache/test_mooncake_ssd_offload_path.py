@@ -179,6 +179,45 @@ class TestMooncakeSsdOffloadPath(CustomTestCase):
             }
             self.assertEqual(len(paths), 8)
 
+    def test_enable_ssd_prefetch_passes_dict_setup_with_private_rank_offload_path(self):
+        fake_store_cls = _fake_store_class()
+        with tempfile.TemporaryDirectory() as base:
+            cfg = _make_config(tp_rank=2, pp_rank=0, ssd_offload_path=base, dp_rank=1)
+            cfg.extra_config["enable_ssd_prefetch"] = True
+            cfg.extra_config["ssd_prefetch_cooldown_sec"] = 3
+            cfg.extra_config["ssd_prefetch_dedup_ttl_sec"] = 15
+            captured = []
+            orig_setup = fake_store_cls.setup
+
+            def record_setup(store_self, *args, **kwargs):
+                captured.append((args, kwargs))
+                return orig_setup(store_self, *args, **kwargs)
+
+            fake_store_cls.setup = record_setup
+            with patch.dict(
+                "sys.modules",
+                {
+                    **_fake_mooncake_modules(fake_store_cls),
+                    **_fake_host_pool_modules(),
+                },
+            ):
+                from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                    MooncakeStore,
+                )
+
+                MooncakeStore(cfg)
+
+            self.assertEqual(len(captured), 1)
+            (setup_dict,), kwargs = captured[0]
+            self.assertEqual(kwargs, {})
+            self.assertTrue(setup_dict["enable_ssd_prefetch"])
+            self.assertEqual(setup_dict["ssd_prefetch_cooldown_sec"], 3)
+            self.assertEqual(setup_dict["ssd_prefetch_dedup_ttl_sec"], 15)
+            self.assertEqual(
+                setup_dict["ssd_offload_path"],
+                os.path.join(base, "rank_1_2_0_0"),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
