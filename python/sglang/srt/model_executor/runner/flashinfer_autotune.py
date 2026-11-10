@@ -149,7 +149,14 @@ def should_run_flashinfer_autotune(
     else:
         fp8_gemm_needs_autotune = _serves_block_fp8_as_mxfp8_on_flashinfer(mr)
 
-    if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
+    from sglang.srt.layers.quantization.unquant import bf16_gemm_needs_autotune
+
+    if not (
+        moe_needs_autotune
+        or fp4_gemm_needs_autotune
+        or fp8_gemm_needs_autotune
+        or bf16_gemm_needs_autotune()
+    ):
         return False
 
     if torch.cuda.get_device_capability()[0] < 9:
