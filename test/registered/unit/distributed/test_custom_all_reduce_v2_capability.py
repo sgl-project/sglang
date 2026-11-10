@@ -5,6 +5,7 @@ import pytest
 from sglang.srt.distributed.device_communicators import (
     custom_all_reduce_utils,
     custom_all_reduce_v2,
+    dpx_hier_all_reduce,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -181,11 +182,11 @@ def test_hier_sizing(max_size, sizes_own_push, hier_max, two_shot):
     )
 
     config = cfg._rocm_gfx1250_configs.__wrapped__(96)[16]
-    got = custom_all_reduce_v2._hier_max_bytes(
+    got = dpx_hier_all_reduce._hier_max_bytes(
         config, max_size, sizes_own_push=sizes_own_push
     )
     assert got == hier_max
-    fitted = custom_all_reduce_v2._fit_hier(config, got)
+    fitted = dpx_hier_all_reduce._fit_hier(config, got)
     for heuristic in (fitted.graph, fitted.eager):
         assert heuristic.hier_2shot_push.max_bytes == hier_max
         assert heuristic.two_shot_push_threshold == two_shot
@@ -213,12 +214,12 @@ def test_pick_config_hier_at_default_cap(nbytes, expected):
     )
 
     config = cfg._rocm_gfx1250_configs.__wrapped__(96)[16]
-    hier_max = custom_all_reduce_v2._hier_max_bytes(
+    hier_max = dpx_hier_all_reduce._hier_max_bytes(
         config, 16 * _MB, sizes_own_push=False
     )
     comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
     comm.disabled = True
-    comm.config = custom_all_reduce_v2._fit_hier(config, hier_max)
+    comm.config = dpx_hier_all_reduce._fit_hier(config, hier_max)
     assert _choice_name(comm._pick_config(nbytes, False)) == expected
 
 
