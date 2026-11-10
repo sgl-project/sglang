@@ -2687,7 +2687,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
             on_publish = getattr(operation, "native_on_publish", None)
             if on_publish is not None:
-                on_publish()
+                on_publish(insert_result.inserted_host_node)
 
             self.cache_controller.mem_pool_host.free(
                 host_indices[: insert_result.prefix_len]
@@ -2698,9 +2698,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 and on_publish is None
                 and hasattr(operation, "control_prefix")
                 and self.prefetch_stop_policy == "wait_complete"
-                and not self.is_write_back
-                and self.tree_core.component_types == (BASE_COMPONENT_TYPE,)
-                and insert_result.inserted_host_node is not None
                 and (reads := self._native_storage_reads()) is not None
             ):
                 reads.hold_for_admission(

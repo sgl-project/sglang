@@ -1748,7 +1748,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
     def test_native_demand_coalesces_backend_io(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
-        with hicache(self, namespace_keys=True) as owner:
+        with hicache(self, namespace_keys=True, write_policy="write_through") as owner:
             cache, service, dma = cold_prefix(owner)
             cc = cache.cache_controller
             entered, release = threading.Event(), threading.Event()
@@ -1800,6 +1800,9 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     )
                     self.assertEqual(counts, {"query": 1, "get": 1})
                     self.assertEqual(span, (4, 0))
+                    self.assertEqual(cache.evict_host(4), 0)
+                    cache.finish_storage_prefetch_admission(demand, 4, None)
+                    self.assertEqual(cache.evict_host(4), 4)
             finally:
                 release.set()
                 cache.release_aborted_request(demand)
@@ -1811,7 +1814,9 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
         for abort_both in (False, True):
             with (
                 self.subTest(abort_both=abort_both),
-                hicache(self, namespace_keys=True) as owner,
+                hicache(
+                    self, namespace_keys=True, write_policy="write_through"
+                ) as owner,
             ):
                 cache, service, _ = cold_prefix(owner)
                 cc = cache.cache_controller
@@ -1871,6 +1876,9 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                                 self._consume_ordinary_prefetch(cache, service, second),
                                 (4, 0),
                             )
+                            self.assertEqual(cache.evict_host(4), 0)
+                            cache.release_aborted_request(second)
+                            self.assertEqual(cache.evict_host(4), 4)
                         self.assertEqual(calls, ["get"])
                         self.assertEqual(reads.stats["demand_coalesced"], 1)
                 finally:

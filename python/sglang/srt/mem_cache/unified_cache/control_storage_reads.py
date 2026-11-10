@@ -47,6 +47,7 @@ class _Read:
     demands: set[CacheRequestHandle] = field(default_factory=set)
     retired: bool = False
     loaded_span: tuple[int, int | None] = (0, None)
+    published_host_node: int | None = None
     reserved_host_tokens: int = 0
     created_at: float = field(default_factory=time.monotonic)
     started_at: float | None = None
@@ -148,6 +149,12 @@ class StorageCacheReads:
         return tokens, extra_key, cache_salt
 
     def hold_for_admission(self, request, node_id, end_token):
+        if (
+            node_id is None
+            or self.cache.is_write_back
+            or self.cache.tree_core.component_types != (FULL,)
+        ):
+            return
         old = self._admission_holds.get(request)
         previous_end = old[2] if old is not None else 0
         if end_token <= previous_end:
@@ -237,6 +244,10 @@ class StorageCacheReads:
         left = max(start or 0, demand.storage_start)
         right = (start or 0) + count
         span = (right - left, left) if right > left else (0, None)
+        if not aborted and span[0]:
+            # The scheduler reads this span before it can commit admission.
+            # Keep just the bounded Host hold when releasing the shared job.
+            self.hold_for_admission(request, job.published_host_node, right)
         if job.retired and not job.demands:
             self._release(job)
         return span
@@ -281,11 +292,12 @@ class StorageCacheReads:
             job.anchor = rows[-1][0].id
         self.executor._hold_host(job.host_locks, [n for n, _, _ in rows])
 
-    def _published(self, job):
+    def _published(self, job, inserted_host_node):
         # Called on the owner thread inside actual host publication, before
         # ordinary admissions/eviction can consume the newly inserted prefix.
         try:
             self._hold(job)
+            job.published_host_node = inserted_host_node
         except Exception as error:
             job.failure = ("publication_error", str(error)[:512])
 
@@ -362,7 +374,7 @@ class StorageCacheReads:
 
     def _observe_publication(self, job):
         job.operation.native_quiescent = False
-        job.operation.native_on_publish = lambda: self._published(job)
+        job.operation.native_on_publish = lambda node: self._published(job, node)
 
     def start(self, work):
         tokens, compatibility = self._scope(work)
