@@ -104,7 +104,7 @@ def _cache():
 
 
 def _multi_window_state_allocator(
-    *, lazy_compaction=True, extra_buffer=False, lazy_tracking=False
+    *, lazy_compaction=True, extra_buffer=False, lazy_tracking=False, tokens=16
 ):
     from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
     from sglang.srt.mem_cache.kv.decl import MHAGeometry, StateGeometry, kv_layer_decls
@@ -165,12 +165,12 @@ def _multi_window_state_allocator(
     sized = size_plan(
         plan,
         KVSizingInputs(
-            full_tokens=16,
-            window_tokens=16,
+            full_tokens=tokens,
+            window_tokens=tokens,
             state_slots=4 * (1 + strategy.initial_tracking_slots),
             state_strategy=strategy,
             max_running_requests=4,
-            context_len=32,
+            context_len=2 * tokens,
             alignment=1,
         ),
     )
@@ -184,7 +184,7 @@ def _multi_window_state_allocator(
             enable_memory_saver=False,
             need_sort=False,
             max_num_reqs=4,
-            model_context_len=32,
+            model_context_len=2 * tokens,
             lazy_compaction=lazy_compaction,
             state_cache_params=SimpleNamespace(layers=(2,)),
         ),
@@ -516,8 +516,11 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
 
     def test_shared_stats_pair_available_tokens_with_current_capacity(self):
         self.assertIsNotNone(self.allocator.alloc(12))
+        owner, (window,), _ = self.allocator.sub_pool_roles()
+        usage = self.allocator.usage()
         (full_capacity, full_free), (swa_capacity, swa_free) = (
-            self.allocator.swa_capacity_and_available(full_capacity=1, swa_capacity=1)
+            usage[owner],
+            usage[window],
         )
         self.assertEqual(full_capacity - full_free, 12)
         self.assertEqual(swa_capacity - swa_free, 12)
@@ -728,6 +731,7 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         from sglang.srt.runtime_context import reset_context
         from sglang.test.unified_allocator_fixtures import (
             build_tri_cache,
+            largest_take,
             setup_allocator_context,
         )
 
@@ -735,14 +739,14 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         self.addCleanup(reset_context)
         bundle, allocator, cache = build_tri_cache(state_cache=False)
         states = allocator.state_slots.alloc(8)
-        slots = allocator.alloc(allocator.available_size())
+        slots = allocator.alloc(largest_take(allocator))
         self.assertIsNotNone(states)
         self.assertIsNotNone(slots)
         for i in range(slots.numel()):
             cache.insert(
                 InsertParams(key=RadixKey(array("q", [i])), value=slots[i : i + 1])
             )
-        self.assertLess(allocator.available_size(), 8)
+        self.assertFalse(allocator.ensure_capacity(KVDemand.same_tokens(allocator, 8)))
         self.assertTrue(evict_from_tree_cache(cache, 8))
         self.assertIsNotNone(allocator.alloc(8))
         self.assertFalse(allocator.verify_byte_accounting())

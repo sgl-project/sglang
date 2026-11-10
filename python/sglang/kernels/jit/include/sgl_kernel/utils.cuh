@@ -10,7 +10,7 @@
 /// - PDL (Programmatic Dependent Launch) helpers for Hopper (sm_90+).
 /// - Typed `load_as` / `store_as` for void-pointer access.
 /// - `pointer::offset` for safe void-pointer arithmetic.
-/// - `host::LaunchKernel` - kernel launcher with optional PDL.
+/// - `host::LaunchKernel` - kernel launcher with optional PDL, cluster and cooperative launch.
 /// - `host::RuntimeDeviceCheck` - CUDA error checking.
 
 #pragma once
@@ -420,6 +420,7 @@ struct LaunchKernel {
   struct KernelConfig {
     bool use_pdl = false;
     std::optional<dim3> cluster_dim = std::nullopt;
+    bool cooperative = false;
   };
 
  public:
@@ -475,6 +476,26 @@ struct LaunchKernel {
   }
 
   /**
+   * \brief Launch as a cooperative grid: every CTA is co-resident, or the launch fails.
+   *
+   * For kernels whose CTAs wait on each other (grid-wide barriers, cross-CTA exchanges): without it a grid larger
+   * than what fits on the device at once hangs instead of returning an error.
+   */
+  auto enable_cooperative(bool enabled = true) -> LaunchKernel& {
+#ifdef USE_ROCM
+    RuntimeCheck(!enabled, "LaunchKernel: cooperative launch is not supported on ROCm");
+#else
+    if (enabled) {
+      auto& attr = m_attrs[m_config.numAttrs++];
+      attr.id = cudaLaunchAttributeCooperative;
+      attr.val.cooperative = 1;
+      m_config.attrs = m_attrs;
+    }
+#endif
+    return *this;
+  }
+
+  /**
    * \brief Configure the kernel launch with the given options.
    * \param config The kernel configuration options.
    * \return A reference to this `LaunchKernel` for chaining.
@@ -485,6 +506,7 @@ struct LaunchKernel {
   auto config(const KernelConfig& config) -> LaunchKernel& {
     if (config.use_pdl) this->enable_pdl(true);
     if (config.cluster_dim) this->enable_cluster(*config.cluster_dim);
+    if (config.cooperative) this->enable_cooperative(true);
     return *this;
   }
 
@@ -526,7 +548,7 @@ struct LaunchKernel {
 
   cudaLaunchConfig_t m_config;
   const DebugInfo m_location;
-  cudaLaunchAttribute m_attrs[2];
+  cudaLaunchAttribute m_attrs[3];  // one slot per attribute kind: PDL, cluster, cooperative
 };
 
 #define CHECK_CUDA(COND)                                                                    \

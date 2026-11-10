@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+import time
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from copy import deepcopy
@@ -49,6 +50,9 @@ def _storage_suffix(
         parts.append(f"tp{tp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
+
+
+_LEASE_RENEW_ATTEMPTS = 4
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
@@ -481,10 +485,54 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 offsets[start : start + step],
             )
 
+    def _get_layer_ranges(self, keys, ptrs, sizes, offsets):
+        store = self.storage.store
+        result = store.batch_get_into_multi_buffer_ranges(keys, ptrs, sizes, offsets)
+        if result is None or isinstance(result, int):
+            return result
+        result = list(result)
+        if len(result) != len(keys):
+            return result
+        expected = [sum(item) for item in sizes]
+        # A long load can outlive its read leases: the first read of a lapsed key
+        # reports -707, later reads -600. A renewal can race reads still in flight
+        # on the old lease, so renew and retry a few times with backoff.
+        for attempt in range(_LEASE_RENEW_ATTEMPTS):
+            expired = [
+                i
+                for i, (value, want) in enumerate(zip(result, expected))
+                if value != want
+            ]
+            if not expired or any(result[i] not in (-707, -600) for i in expired):
+                return result
+            if attempt:
+                time.sleep(0.05 * 2 ** (attempt - 1))
+            lapsed = list(dict.fromkeys(keys[i] for i in expired))
+            renewed = list(store.batch_get_session_start(lapsed))
+            if renewed != [0] * len(lapsed):
+                raise RuntimeError(
+                    f"Mooncake get session renewal failed: keys={len(lapsed)}, "
+                    f"result_sample={renewed[:8]}"
+                )
+            retried = store.batch_get_into_multi_buffer_ranges(
+                [keys[i] for i in expired],
+                [ptrs[i] for i in expired],
+                [sizes[i] for i in expired],
+                [offsets[i] for i in expired],
+            )
+            if retried is None or isinstance(retried, int):
+                return retried
+            retried = list(retried)
+            if len(retried) != len(expired):
+                raise RuntimeError(
+                    "Mooncake renewed range get returned wrong result count"
+                )
+            for index, value in zip(expired, retried):
+                result[index] = value
+        return result
+
     def _range_get(self, name: PoolName, keys, ptrs, sizes, offsets) -> None:
-        result = self.storage.store.batch_get_into_multi_buffer_ranges(
-            keys, ptrs, sizes, offsets
-        )
+        result = self._get_layer_ranges(keys, ptrs, sizes, offsets)
         expected = [sum(item) for item in sizes]
         if result is None or isinstance(result, int) or list(result) != expected:
             raise RuntimeError(

@@ -1459,6 +1459,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
+            self._validate_top_logprobs_num(obj)
             requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
             )
@@ -1599,6 +1600,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"{token_id}; valid range is [0, {vocab_size})."
                 )
 
+    def _validate_top_logprobs_num(self, obj: GenerateReqInput) -> None:
+        # Invalid counts can corrupt the batch or fail torch.topk past the vocab size.
+        top_logprobs_num = obj.top_logprobs_num
+        if not obj.return_logprob or top_logprobs_num is None:
+            return
+        vocab_size = self.model_config.vocab_size
+        if type(top_logprobs_num) is not int or not 0 <= top_logprobs_num <= vocab_size:
+            raise ValueError(
+                f"top_logprobs must be an integer in [0, {vocab_size}], "
+                f"got {top_logprobs_num!r}."
+            )
+
     def _create_tokenized_object(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1663,7 +1676,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 sampling_params=sampling_params,
                 return_logprob=obj.return_logprob,
                 logprob_start_len=obj.logprob_start_len,
-                top_logprobs_num=obj.top_logprobs_num,
+                # A logprob batch gathers every request's count, including disabled ones.
+                top_logprobs_num=obj.top_logprobs_num if obj.return_logprob else 0,
                 token_ids_logprob=obj.token_ids_logprob,
                 return_sampling_mask=obj.return_sampling_mask,
                 sampling_logprobs_mode=obj.sampling_logprobs_mode or "selected",
