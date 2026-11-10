@@ -13,12 +13,6 @@ import { config } from '/src/snippets/configs/OpenMOSS/moss-image.jsx';
 ## 1. Quick start
 
 Use a [SGLang Diffusion Docker environment](/docs/sglang-diffusion/installation).
-Until your image includes this integration, install the model-support PR inside
-the container:
-
-```bash Install model support
-pip install 'sglang[diffusion] @ git+https://github.com/sgl-project/sglang.git@refs/pull/44325/head#subdirectory=python'
-```
 
 You need access to the selected Hugging Face checkpoint. The picker distinguishes
 available implementation paths from hardware recipes that have not been measured.

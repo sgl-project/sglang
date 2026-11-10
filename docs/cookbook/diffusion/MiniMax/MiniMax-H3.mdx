@@ -310,7 +310,7 @@ do not use it to generate consistency ground truth.
 
 The [ComfyUI plugin](/docs/sglang-diffusion/comfyui) can run H3 as a per-step
 DiT backend. ComfyUI keeps CLIP, VAE, and the sampler loop. SGLang loads only
-the transformer under `--comfyui-mode`.
+the transformer in ComfyUI integrated mode (the plugin sets `comfyui_mode`; there is no CLI flag).
 
 Copy `python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion` into ComfyUI
 `custom_nodes/`. Load a shipped graph and set `SGLDOptions.model_type` to
@@ -420,7 +420,7 @@ rank), so mixed-schedule serving does not re-read the checkpoint. Plan sets
 that exceed the host budget are simply recomputed on their next occurrence.
 Expert escape hatches live in environment variables:
 `SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS` resizes the GPU slab (needed
-only beyond 65 inference steps) and `SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32`
+only above 64 inference steps) and `SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32`
 computes the one-time projections in fp32 (experimental; not bit-comparable
 to resident weights, validate end-to-end before production). LoRA adapters
 that modify `adaln_proj` are rejected in both cache modes rather than

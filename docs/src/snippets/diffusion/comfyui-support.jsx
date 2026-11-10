@@ -1,7 +1,7 @@
 // ComfyUI support statement for a diffusion cookbook page.
 //
 // The per-model facts live here rather than in each page so they stay in sync
-// with the plugin. `integrated` must match a key in `executor_class_dict`
+// with the plugin. `integratedKey` must match a key in `executor_class_dict`
 // (python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion/core/generator.py);
 // a model absent from that dict has no integrated mode.
 
@@ -32,12 +32,13 @@ export const ComfyUISupport = ({ model = "video", note }) => {
       note: "Image editing through the integrated path is experimental.",
     },
     "minimax-h3": {
-      serverNode: "SGLDiffusion Generate H3",
+      serverNode: "SGLDiffusion Generate MiniMax-H3",
+      integratedKey: "minimax_h3",
+      workflow: "minimax_h3_t2v_sgld.json",
       verified: true,
-      integratedBlockedBecause:
-        "H3 denoises a packed video-and-audio sequence in one pass and routes " +
-        "conditioning by task, while ComfyUI's KSampler drives a single latent " +
-        "tensor and has no audio branch",
+      note:
+        "Integrated T2V / I2VA / FL2VA need an fl2va checkpoint and R2V needs " +
+        "ref2va. FastH3 and VDN-H3 load through SGLDiffusion Native Model Loader.",
     },
     image: { serverNode: "SGLDiffusion Generate Image" },
     video: { serverNode: "SGLDiffusion Generate Video" },
