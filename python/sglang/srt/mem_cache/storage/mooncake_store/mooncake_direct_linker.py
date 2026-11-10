@@ -390,8 +390,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         list(transfer.keys), transfer
                     )
                     keys.extend(self.storage._tag_keys(component_keys))
+            # Locations need only the page indices, so resolving them overlaps
+            # the forward that may still use the slots.
+            if ready_event is not None:
+                ready_event.synchronize_indices()
+            for transfers in request_transfers:
+                for transfer in transfers:
+                    batches[transfer.name][1].extend(
+                        self.pools[transfer.name].prepare_locations(
+                            transfer.host_indices
+                        )
+                    )
             # Wait before opening sessions so the slot fence does not consume
-            # their leases. Key preparation above still overlaps the GPU work.
+            # their leases.
             if ready_event is not None:
                 ready_event.synchronize()
             # Track every submitted key: a failed batch can still open some sessions.
@@ -402,13 +413,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     raise RuntimeError(
                         f"Mooncake get session start failed: keys={len(session_keys)}, "
                         f"results={result}"
-                    )
-            for transfers in request_transfers:
-                for transfer in transfers:
-                    batches[transfer.name][1].extend(
-                        self.pools[transfer.name].prepare_locations(
-                            transfer.host_indices
-                        )
                     )
             batches = {
                 name: (keys, np.asarray(locations, dtype=np.int64))

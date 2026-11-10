@@ -249,7 +249,7 @@ class TestMooncakePrefetch(CustomTestCase):
         transfer = PoolTransfer(
             name=PoolName.KV, keys=["page"], device_indices=torch.tensor(indices)
         )
-        ready = TransferReady([SimpleNamespace(synchronize=synchronize)])
+        ready = TransferReady(SimpleNamespace(synchronize=synchronize))
         with patch.object(linker, "record_transfer_ready", return_value=ready):
             return linker.prefetch([transfer])
 
@@ -2298,15 +2298,17 @@ class TestTransferReadyEvents(CustomTestCase):
 
     def test_transfer_waits_on_the_forward_using_the_pages(self):
         forward_stream = MagicMock(name="forward_stream")
-        indices_ready, forward_done = self._record(forward_stream).events
+        ready = self._record(forward_stream)
+        indices_ready, forward_done = ready.indices_ready, ready.forward_done
         indices_ready.record.assert_called_once_with()
         forward_done.record.assert_called_once_with(forward_stream)
         # The transfer thread waits; the forward stream's own order is untouched.
         self.assertEqual(forward_stream.mock_calls, [])
 
     def test_transfer_without_a_forward_stream_waits_on_the_current_one(self):
-        (indices_ready,) = self._record(None).events
-        indices_ready.record.assert_called_once_with()
+        ready = self._record(None)
+        ready.indices_ready.record.assert_called_once_with()
+        self.assertIsNone(ready.forward_done)
 
     def test_mooncake_offload_thread_waits_on_every_event(self):
         linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
@@ -2320,7 +2322,7 @@ class TestTransferReadyEvents(CustomTestCase):
             (
                 ["transfer"],
                 1,
-                TransferReady([order.indices_ready, order.forward_done]),
+                TransferReady(order.indices_ready, order.forward_done),
                 "session-a",
             )
         )
@@ -2345,7 +2347,7 @@ class TestTransferReadyEvents(CustomTestCase):
                 linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
                 order = MagicMock()
                 linker.record_transfer_ready = order.record_transfer_ready
-                ready = TransferReady([order.indices_ready, order.forward_done])
+                ready = TransferReady(order.indices_ready, order.forward_done)
                 order.record_transfer_ready.return_value = ready
                 linker.load_layer_wise = order.load_layer_wise
                 linker.load_all_layers = order.load_all_layers
@@ -2395,7 +2397,7 @@ class TestTransferReadyEvents(CustomTestCase):
         order = MagicMock()
         linker.mla_broadcaster = order.broadcaster
         linker.num_layers = 2
-        ready = TransferReady([order.indices_ready, order.forward_done])
+        ready = TransferReady(order.indices_ready, order.forward_done)
         linker.broadcast_loads = {3: (0, "prepared", ready)}
         device = MagicMock(name="device_module")
         device.current_stream.return_value = order.stream
