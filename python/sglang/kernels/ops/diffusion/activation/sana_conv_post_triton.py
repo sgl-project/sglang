@@ -7,7 +7,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-from sglang.kernels.ops.diffusion.common.numerics import round_bf16_to_fp32
+from sglang.kernels.numerics import round_bf16_to_fp32
 
 
 @triton.jit
@@ -72,31 +72,30 @@ def _bias_glu_kernel(
     tl.store(out_ptr + offsets, hidden * gate, mask=mask)
 
 
-def _is_dense_bf16(x: torch.Tensor) -> bool:
-    return (
+def _validate_conv_post(x: torch.Tensor, bias: torch.Tensor | None) -> None:
+    if not (
         x.is_cuda
         and x.dtype is torch.bfloat16
-        and x.dim() == 4
+        and x.ndim == 4
         and x.numel() > 0
         and (x.is_contiguous() or x.is_contiguous(memory_format=torch.channels_last))
-    )
-
-
-def can_use_fused_bias_silu(x: torch.Tensor, bias: torch.Tensor) -> bool:
-    return (
-        _is_dense_bf16(x)
-        and bias.is_cuda
-        and bias.dtype is x.dtype
+    ):
+        raise RuntimeError(
+            "Sana conv post-processing expects a dense BF16 CUDA NCHW tensor"
+        )
+    if bias is not None and not (
+        bias.dtype == x.dtype
         and bias.device == x.device
-        and bias.dim() == 1
-        and bias.shape[0] == x.shape[1]
+        and bias.shape == (x.shape[1],)
         and bias.is_contiguous()
-    )
+    ):
+        raise RuntimeError(
+            "bias must be a contiguous channel vector matching x's dtype and device"
+        )
 
 
 def fused_bias_silu(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-    if not can_use_fused_bias_silu(x, bias):
-        raise RuntimeError("unsupported input for Sana fused bias-SiLU")
+    _validate_conv_post(x, bias)
     out = torch.empty_like(x, memory_format=torch.preserve_format)
     with torch.cuda.device(x.device):
         _bias_silu_kernel[(triton.cdiv(x.numel(), 1024),)](
@@ -111,32 +110,15 @@ def fused_bias_silu(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def can_use_fused_bias_glu(x: torch.Tensor, bias: torch.Tensor | None) -> bool:
-    return (
-        _is_dense_bf16(x)
-        and x.shape[1] % 2 == 0
-        and (
-            bias is None
-            or (
-                bias.is_cuda
-                and bias.dtype is x.dtype
-                and bias.device == x.device
-                and bias.dim() == 1
-                and bias.shape[0] == x.shape[1]
-                and bias.is_contiguous()
-            )
-        )
-    )
-
-
 def fused_bias_glu(x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
     """Apply optional bias then ``hidden * silu(gate)`` along the channel axis.
 
     Pass no bias for an already biased native depthwise-convolution output:
     splitting that convolution's bias can change its accumulation rounding.
     """
-    if not can_use_fused_bias_glu(x, bias):
-        raise RuntimeError("unsupported input for Sana fused bias-GLU")
+    _validate_conv_post(x, bias)
+    if x.shape[1] % 2:
+        raise RuntimeError("Sana GLU requires an even channel count")
     batch, double_channels, height, width = x.shape
     channels = double_channels // 2
     channels_last = x.is_contiguous(memory_format=torch.channels_last)
@@ -161,8 +143,6 @@ def fused_bias_glu(x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
 
 
 __all__ = [
-    "can_use_fused_bias_glu",
-    "can_use_fused_bias_silu",
     "fused_bias_glu",
     "fused_bias_silu",
 ]

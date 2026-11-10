@@ -7,7 +7,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestServerArgsMigratedCliMetadata(CustomTestCase):
@@ -15,6 +15,16 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
     def setUpClass(cls):
         cls.parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(cls.parser)
+
+    def test_prefix_affinity_default_gap_is_conservative_and_cli_matches(self):
+        args = self.parser.parse_args(["--model", "dummy"])
+        self.assertEqual(args.prefix_affinity_min_load_diff, 4)
+        self.assertEqual(
+            ServerArgs.from_cli_args(args).prefix_affinity_min_load_diff, 4
+        )
+        self.assertEqual(
+            ServerArgs(model_path="dummy").prefix_affinity_min_load_diff, 4
+        )
 
     def test_data_parallel_aliases_keep_old_usage(self):
         for option in ("--data-parallel-size", "--dp-size"):
@@ -29,6 +39,18 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 args = self.parser.parse_args(["--model", "dummy", *flags])
                 self.assertIs(
                     ServerArgs.from_cli_args(args).trust_request_chat_template, expected
+                )
+
+    def test_http_worker_reuseport_requires_explicit_opt_in(self):
+        for flags, expected in (
+            ([], False),
+            (["--enable-http-worker-reuseport"], True),
+        ):
+            with self.subTest(flags=flags):
+                args = self.parser.parse_args(["--model", "dummy", *flags])
+                self.assertIs(
+                    ServerArgs.from_cli_args(args).enable_http_worker_reuseport,
+                    expected,
                 )
 
     def test_prefill_max_context_accepts_human_readable_values(self):
@@ -84,6 +106,8 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 "total_requests",
                 "--prefix-affinity-max-load-skew",
                 "2.0",
+                "--prefix-affinity-min-load-diff",
+                "16",
                 "--prefix-affinity-hash-tokens",
                 "2048",
                 "--prefix-affinity-disable-token-fallback",
@@ -94,6 +118,7 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
         self.assertEqual(server_args.load_balance_method, "prefix_affinity")
         self.assertEqual(server_args.prefix_affinity_fallback, "total_requests")
         self.assertEqual(server_args.prefix_affinity_max_load_skew, 2.0)
+        self.assertEqual(server_args.prefix_affinity_min_load_diff, 16)
         self.assertEqual(server_args.prefix_affinity_hash_tokens, 2048)
         self.assertTrue(server_args.prefix_affinity_disable_token_fallback)
 

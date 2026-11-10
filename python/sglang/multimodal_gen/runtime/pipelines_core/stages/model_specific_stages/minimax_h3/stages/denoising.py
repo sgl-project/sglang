@@ -5,6 +5,7 @@ single-branch execution, and payload validation.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import partial
@@ -20,6 +21,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn im
     CubeSparseAttentionMetadata,
     CubeSparseAttentionMetadataBuilder,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
 )
@@ -29,6 +33,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
+    minimax_h3_plan_from_batch,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES,
@@ -82,6 +89,43 @@ def minimax_h3_condition_noise_aug(sampling: Any) -> tuple[float, float]:
     if audio_noise_aug is None:
         audio_noise_aug = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP
     return float(imgvid_noise_aug), float(audio_noise_aug)
+
+
+def _image_packed_seq_len(used_rows: int) -> int:
+    """Used rows (text + target + references) rounded up to 16, plus 16 rows."""
+    return ((used_rows + 15) // 16) * 16 + 16
+
+
+def _image_branch_inputs(
+    embedding: Mapping[str, Any],
+    ref_blocks: list[dict[str, Any]],
+    latent_h: int,
+    latent_w: int,
+):
+    """Pack one image branch: ref2va block layout (no reference blocks for t2i)."""
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
+        PackedBranchInputs,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
+        minimax_h3_packed_sequence_ref2va_blocks,
+    )
+
+    length = embedding["text_len"]
+    hidden, text_tags = embedding["hidden_states"], embedding["text_token_tags"]
+    used_rows = length + latent_h * latent_w // 4
+    used_rows += sum(block["latent_h"] * block["latent_w"] // 4 for block in ref_blocks)
+    packed = minimax_h3_packed_sequence_ref2va_blocks(
+        text_len=length,
+        latent_t=1,
+        latent_h=latent_h,
+        latent_w=latent_w,
+        audio_t=0,
+        ref_blocks=ref_blocks,
+        seq_len=_image_packed_seq_len(used_rows),
+    )
+    tags = packed["token_tags"].clone()
+    tags[packed["text_pos"].view(-1)] = text_tags
+    return PackedBranchInputs(packed=packed, text_embeddings=hidden, token_tags=tags)
 
 
 def _validate_keyframe_payload(plan: Any, keyframe: Any) -> None:
@@ -443,27 +487,35 @@ def _precompute_rope_cache(
 
 
 class MiniMaxH3DenoisingStage(DenoisingStage):
-    def default_workload_iterations(
-        self, batch: Req, num_inference_steps: int
-    ) -> int | None:
-        # one denoise per sigma interval: steps - 1
-        return max(1, num_inference_steps - 1)
-
-    def __init__(self, transformer, pipeline=None) -> None:
+    def __init__(
+        self, transformer, pipeline=None, stochastic_sampling: bool = False
+    ) -> None:
         super().__init__(
             transformer=transformer,
             scheduler=None,
             pipeline=pipeline,
         )
-        self._minimax_h3_quality = "lossless"
+        # the release's few-step re-noising update (release metadata)
+        self.stochastic_sampling = stochastic_sampling
+        self._minimax_h3_quality = "exact"
         self._minimax_h3_cache_mode: str | None = None
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        pipeline = self.pipeline() if self.pipeline else None
+        if pipeline is not None and not pipeline.is_video_pipeline:
+            # Image releases have no residency plan: a plain DiT use, with no
+            # phase, prefetch or keep-ready-after-request policy.
+            return [ComponentUse(self._component_stage_name(stage_name), "transformer")]
+        return super().component_uses(server_args, stage_name)
 
     def _owns_compile_warmup_lifecycle(self) -> bool:
         return True
 
     def _cache_dit_requested(self) -> bool:
         return (
-            getattr(self, "_minimax_h3_quality", "lossless") == "high"
+            getattr(self, "_minimax_h3_quality", "exact") == "high"
             or super()._cache_dit_requested()
         )
 
@@ -560,7 +612,6 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         # would send the next request down the refresh path with nothing
         # mounted.
         self._cache_dit_enabled = False
-        self._cached_num_steps = None
         self._cache_dit_active_key = None
         self._minimax_h3_cache_mode = None
         self._set_cache_dit_input_preservation(False)
@@ -592,7 +643,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     def _cache_dit_scm_masks(
         self, primary_num_steps: int, secondary_num_steps: int | None = None
     ) -> tuple[str, str, list[int] | None, list[int] | None]:
-        if getattr(self, "_minimax_h3_quality", "lossless") == "high":
+        if getattr(self, "_minimax_h3_quality", "exact") == "high":
             return "none", "dynamic", None, None
         return super()._cache_dit_scm_masks(primary_num_steps, secondary_num_steps)
 
@@ -604,7 +655,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         *,
         secondary: bool = False,
     ) -> CacheDitConfig:
-        if secondary or getattr(self, "_minimax_h3_quality", "lossless") != "high":
+        if secondary or getattr(self, "_minimax_h3_quality", "exact") != "high":
             return super()._build_cache_dit_config(
                 num_inference_steps,
                 steps_computation_mask,
@@ -647,7 +698,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     raise ValueError(
                         f"direct full-loop denoise requires batch.extra[{required!r}]"
                     )
-            self._run_full_loop(batch, server_args)
+            plan = minimax_h3_plan_from_batch(batch)
+            if plan is not None and plan.output_modality == "image":
+                self._run_image_loop(batch, plan, server_args)
+            else:
+                self._run_full_loop(batch, server_args)
             return batch
         if (
             batch.latents is not None
@@ -679,13 +734,16 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         if not (
             current_platform.is_cuda()
+            or current_platform.is_hip()
             or current_platform.is_cpu()
             or current_platform.is_mps()
             or current_platform.is_npu()
             or current_platform.is_xpu()
+            or current_platform.is_out_of_tree()
         ):
             raise RuntimeError(
-                "MiniMax H3 full-loop denoise requires CPU, CUDA, MPS, XPU, or Ascend NPU"
+                "MiniMax H3 full-loop denoise requires CPU, CUDA, ROCm, MPS, XPU, "
+                "Ascend NPU, or an out-of-tree platform"
             )
 
         device = current_platform.get_local_torch_device()
@@ -748,7 +806,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             build_vsa_h3_step_metadata = _maybe_prepare_vsa_h3_step_metadata(
                 model=model,
                 packed=packed,
-                ctx=ctx,
+                is_ref2va=ctx.is_ref2va,
+                latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
                 server_args=server_args,
                 device=device,
             )
@@ -783,6 +842,10 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device=device,
             )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
+            if model.final_layer._pdd_heads is not None:
+                initial_video, initial_audio = _scale_pdd_initial_noise(
+                    ctx, positive, initial_video, initial_audio
+                )
             rollout_ctx = None
             if getattr(batch, "rollout", False):
                 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
@@ -821,6 +884,14 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     collector=collector,
                 )
                 batch.rollout_trajectory_data = RolloutTrajectoryData()
+            renoise_generator = None
+            if self.stochastic_sampling:
+                # The plan carries this output's own seed after output expansion
+                # (42 is latent preparation's default). A device generator keeps
+                # the stream independent of the CPU generators seeded with the
+                # same value for the initial and condition noise.
+                seed = 42 if ctx.plan.seed is None else int(ctx.plan.seed)
+                renoise_generator = torch.Generator(device=device).manual_seed(seed)
             with (
                 maybe_nvtx_range("denoising_loop", self.current_use_nvtx),
                 self.progress_bar(
@@ -831,6 +902,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             ):
 
                 def on_step(_step, _video_rows, _audio_rows):
+                    self.check_cancelled(batch)
                     progress_bar.update()
                     if not batch.is_warmup:
                         self.step_profile()
@@ -860,6 +932,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         batch=batch,
                     ),
                     rollout_ctx=rollout_ctx,
+                    renoise_generator=renoise_generator,
                 )
                 if rollout_ctx is not None:
                     batch.rollout_trajectory_data = (
@@ -873,6 +946,101 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             positive=positive,
             video_rows=video_rows,
             audio_rows=audio_rows,
+        )
+
+    def _run_image_loop(self, batch: Req, plan: Any, server_args: ServerArgs) -> None:
+        """Run the image loop over the published latent and reference rows."""
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+            MINIMAX_H3_DENOISE_STATE_EXTRA_KEY,
+            MINIMAX_H3_REFERENCE_IMAGE_ROWS_EXTRA_KEY,
+            MINIMAX_H3_SIGMAS_EXTRA_KEY,
+            MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
+            MINIMAX_H3_VIDEO_ROW_WIDTH,
+            minimax_h3_image_denoise_loop,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.image_noise import (
+            minimax_h3_image_anchor_rows,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_tokens import (
+            minimax_h3_unpatchify_video_tokens,
+        )
+
+        self._maybe_enable_cache_dit_and_torch_compile(len(batch.sigmas) - 1, batch)
+        state = batch.extra[MINIMAX_H3_DENOISE_STATE_EXTRA_KEY]
+        latent_h, latent_w = state["latent_h"], state["latent_w"]
+        # Clean reference rows from visual encoding; absent for t2i.
+        payload = batch.extra.get(MINIMAX_H3_REFERENCE_IMAGE_ROWS_EXTRA_KEY)
+        references = [] if payload is None else payload["images"]
+        blocks = [
+            {"kind": "image", "latent_h": ref["latent_h"], "latent_w": ref["latent_w"]}
+            for ref in references
+        ]
+        rows = [ref["rows"] for ref in references]
+        embeddings = batch.extra[MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY]
+        positive = _image_branch_inputs(
+            embeddings["positive"], blocks, latent_h, latent_w
+        )
+        anchors = torch.empty((0, MINIMAX_H3_VIDEO_ROW_WIDTH), dtype=torch.float32)
+        if rows:
+            # Noised anchors from draw 2 of the request generator (image_noise.py).
+            anchors = minimax_h3_image_anchor_rows(batch, rows)
+        initial_rows = torch.cat((anchors, state["initial_video_rows"]), dim=0)
+        with self.use_declared_component(
+            component_name="transformer", module=self.transformer
+        ) as transformer:
+            self.transformer = transformer
+            if transformer.final_layer._pdd_heads is None:
+                raise ValueError(
+                    "MiniMax H3 image serves PDD releases only, but the "
+                    "transformer has no fused PDD output heads"
+                )
+
+            def prepare_branch(branch):
+                _precompute_refined_prompt_embeds(
+                    transformer, branch, device=self.device
+                )
+                _precompute_rope_cache(transformer, branch, device=self.device)
+
+            with self.progress_bar(
+                total=len(batch.sigmas) - 1,
+                batch=batch,
+                desc="minimax_h3 image denoise",
+            ) as progress_bar:
+
+                def on_step(_step):
+                    progress_bar.update()
+                    if not batch.is_warmup:
+                        self.step_profile()
+
+                output = minimax_h3_image_denoise_loop(
+                    model=transformer,
+                    model_forward=partial(
+                        self._forward_dit,
+                        batch=batch,
+                        attn_metadata=positive.attn_metadata,
+                    ),
+                    positive=positive,
+                    initial_video_rows=initial_rows,
+                    keyframe_cond_rows=anchors,
+                    sigmas=batch.sigmas,
+                    adaln_sigmas=batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY].get("full")
+                    if batch.is_warmup
+                    else None,
+                    prewarm_both_tasks=batch.is_warmup
+                    and len(server_args.pipeline_config.get_supported_task_types())
+                    == 2,
+                    prepare_branch=prepare_branch,
+                    device=self.device,
+                    on_step=on_step,
+                    step_profiler=partial(self._profile_denoising_step, batch=batch),
+                )
+        target = output[positive.packed["update_mask"].to(output.device)]
+        batch.latents = minimax_h3_unpatchify_video_tokens(
+            target,
+            latent_shape=(1, latent_h // 2, latent_w // 2, 24),
+            patch_size=(1, 2, 2),
         )
 
     @contextmanager
@@ -922,14 +1090,45 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 return model(**call_kwargs)
             return self._bcg_run(runner, call_kwargs, model)
 
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        # The base checks minus batch.generator: H3 seeds its own noise from
+        # plan.seed, and image releases skip InputValidationStage, so
+        # batch.generator may be None.
+        result = VerificationResult()
+        result.add_check("timesteps", batch.timesteps, [V.is_tensor, V.min_dims(1)])
+        result.add_check(
+            "prompt_embeds",
+            batch.prompt_embeds,
+            self._get_prompt_embeds_validator(batch),
+        )
+        result.add_check("image_embeds", batch.image_embeds, V.is_list)
+        result.add_check(
+            "num_inference_steps", batch.num_inference_steps, V.positive_int
+        )
+        result.add_check("guidance_scale", batch.guidance_scale, V.non_negative_float)
+        result.add_check("eta", batch.eta, V.non_negative_float)
+        result.add_check(
+            "do_classifier_free_guidance",
+            batch.do_classifier_free_guidance,
+            V.bool_value,
+        )
+        result.add_check(
+            "negative_prompt_embeds",
+            batch.negative_prompt_embeds,
+            self._get_negative_prompt_embeds_validator(batch),
+        )
+        return result
+
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
         result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
-        result.add_check(
-            "audio_latents",
-            batch.audio_latents,
-            [V.is_tensor, V.with_dims(3)],
-        )
+        plan = minimax_h3_plan_from_batch(batch)
+        if plan is None or plan.output_modality != "image":
+            result.add_check(
+                "audio_latents",
+                batch.audio_latents,
+                [V.is_tensor, V.with_dims(3)],
+            )
         return result
 
 
@@ -978,9 +1177,6 @@ def _resolve_full_loop_context(batch: Req) -> _FullLoopContext:
         MINIMAX_H3_REFERENCE_VIDEO_ROWS_EXTRA_KEY,
         MINIMAX_H3_SIGMAS_EXTRA_KEY,
         MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY,
-    )
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
-        minimax_h3_plan_from_batch,
     )
 
     ctx = _FullLoopContext()
@@ -1050,33 +1246,38 @@ def _maybe_prepare_vsa_h3_step_metadata(
     *,
     model: Any,
     packed: Mapping[str, torch.Tensor],
-    ctx: _FullLoopContext,
+    is_ref2va: bool,
+    latent_shape: tuple[int, int, int],
     server_args: ServerArgs,
     device: torch.device,
+    native_layout: bool = True,
 ) -> Callable[[int], Any] | None:
     """Per-step VSA-H3 metadata builder over the request-static packed layout,
-    or None off the VSA path."""
+    or None off the VSA path.
+
+    Ref2VA regions are read from the native packed layout's stream_layout;
+    ``native_layout=False`` marks a layout serialized by ComfyUI, whose
+    stream_layout does not tell reference images from reference videos."""
     model._resolve_attention_backend_once()
     if (
         model._resolved_attention_backend
         is not AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
     ):
         return None
-    if ctx.is_ref2va:
+    if is_ref2va and not native_layout:
         raise NotImplementedError(
-            "VSA-H3 supports the t2va/fl2va packed layout; the ref2va "
-            "reference-block layout is not tiled yet. Use --attention-backend "
-            "fa for ref2va."
+            "VSA-H3 tiles Ref2VA references on SGLang's native packed layout; "
+            "a ComfyUI-serialized Ref2VA layout is not tiled. Use "
+            "--attention-backend fa for it."
         )
-
     config = server_args.attention_backend_config or {}
-    tile_size = int(config.get("vsa_tile_size", 64))
-    if tile_size != 64:
-        raise ValueError(
-            "VSA-H3 in SGLang serves the trained 64-token (4, 4, 4) tile "
-            f"geometry; got vsa_tile_size={tile_size}."
-        )
-    sparsity = float(config.get("VSA_sparsity", config.get("sparsity", 0.9)))
+    pipeline_config = server_args.pipeline_config
+    tile_size = int(config.get("vsa_tile_size", pipeline_config.vsa_tile_size))
+    ref_keep_rate = config.get("vsa_ref_keep_rate", pipeline_config.vsa_ref_keep_rate)
+    default_sparsity = pipeline_config.vsa_sparsity
+    sparsity = float(
+        config.get("VSA_sparsity", config.get("sparsity", default_sparsity))
+    )
     if not 0.0 <= sparsity < 1.0:
         raise ValueError(f"VSA sparsity must be in [0, 1), got {sparsity}")
     mode = str(config.get("vsa_mode", "exempt"))
@@ -1090,6 +1291,9 @@ def _maybe_prepare_vsa_h3_step_metadata(
     cond_rows = int(packed["img_pos"].numel()) - video_rows
     audio_rows = int(packed["audio_pos"].numel())
     patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
+    packed_segments = (
+        _ref2va_vsa_segments(packed, latent_shape, patch_size) if is_ref2va else None
+    )
 
     from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
         VideoSparseAttentionH3MetadataBuilder,
@@ -1100,7 +1304,7 @@ def _maybe_prepare_vsa_h3_step_metadata(
     def build(step_index: int):
         return builder.build(
             current_timestep=step_index,
-            raw_latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
+            raw_latent_shape=latent_shape,
             patch_size=patch_size,
             VSA_sparsity=sparsity,
             prefix_segments=(text_len, cond_rows, audio_rows),
@@ -1108,9 +1312,42 @@ def _maybe_prepare_vsa_h3_step_metadata(
             exempt=mode == "exempt",
             dense_layers=dense_layers,
             dense_first_n_steps=dense_first_n_steps,
+            packed_segments=packed_segments,
+            tile_size=tile_size,
+            ref_keep_rate=None if ref_keep_rate is None else float(ref_keep_rate),
         )
 
     return build
+
+
+def _ref2va_vsa_segments(
+    packed: Mapping[str, Any],
+    latent_shape: tuple[int, int, int],
+    patch_size: tuple[int, int, int],
+) -> tuple[int | tuple[int, int, int], ...]:
+    """Ref2VA packed order as VSA-H3 segments: text, keyframes, then each
+    reference (images and audio dense, videos as their own token-grid
+    regions), target audio, and the generated video's token grid last."""
+    layout = packed["stream_layout"]
+    shapes = layout["cond_image_shapes"]
+    roles = layout["cond_image_roles"]
+    audio_lens = layout["cond_audio_stream_lens"]
+    reference_visual_rows = sum(math.prod(shape) for shape in shapes)
+    cond_rows = int(packed["img_pos"].numel()) - int(packed["update_mask"].sum())
+    segments: list[int | tuple[int, int, int]] = [
+        int(packed["text_pos"].numel()),
+        cond_rows - reference_visual_rows,
+    ]
+    for kind, index in layout["cond_event_orders"]:
+        if kind == "audio":
+            segments.append(int(audio_lens[index]))
+        elif roles[index] == "independent_cube":
+            segments.append(tuple(int(v) for v in shapes[index]))
+        else:
+            segments.append(math.prod(shapes[index]))
+    segments.append(int(packed["audio_pos"].numel()) - sum(audio_lens))
+    segments.append(tuple(int(n) // int(p) for n, p in zip(latent_shape, patch_size)))
+    return tuple(segments)
 
 
 def _build_packed_layout(
@@ -1265,6 +1502,22 @@ def _expand_initial_rows(
         )
         full_audio[positive.audio_update_mask] = initial_audio
         initial_audio = full_audio
+    return initial_video, initial_audio
+
+
+def _scale_pdd_initial_noise(
+    ctx: _FullLoopContext,
+    positive: Any,
+    initial_video: torch.Tensor,
+    initial_audio: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Start PDD targets at the first node's noise level, as the students are
+    trained (``sigma_0 * eps``); condition rows stay as they are. A no-op on
+    grids that start at sigma 1."""
+    initial_video = initial_video.clone()
+    initial_audio = initial_audio.clone()
+    initial_video[positive.video_target_slice] *= float(ctx.sigmas["video"][0])
+    initial_audio[positive.audio_target_slice] *= float(ctx.sigmas["audio"][0])
     return initial_video, initial_audio
 
 

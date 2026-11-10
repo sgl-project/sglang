@@ -234,7 +234,7 @@ impl PyBridge {
             ));
         }
 
-        let should_call_python = if abort_all {
+        if abort_all {
             let mut state = lock_or_recover(self.state.as_ref(), "state");
             let rids = state
                 .channels
@@ -252,24 +252,17 @@ impl PyBridge {
                 );
             }
             tracing::debug!(affected, "gRPC abort_all cleared active response channels");
-            true
         } else {
             let mut state = lock_or_recover(self.state.as_ref(), "state");
-            let was_active = remove_channel_refs_locked(&mut state, rid);
-            if was_active {
+            if remove_channel_refs_locked(&mut state, rid) {
                 state
                     .terminal_errors
                     .insert(rid.to_string(), TerminalError::Aborted { rid: rid.into() });
-            } else {
-                tracing::debug!(rid, "Ignoring abort for inactive gRPC request id");
             }
-            was_active
-        };
-
-        if !should_call_python {
-            return Ok(());
         }
 
+        // Abort by engine rid even when no gRPC stream here carries it, as HTTP
+        // /abort_request does: an OpenAI RPC's request runs under its body's rid.
         Python::attach(|py| {
             self.runtime_handle
                 .call_method1(py, "abort", (rid, abort_all))?;

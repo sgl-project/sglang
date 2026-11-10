@@ -83,6 +83,26 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
         }
     )
 
+    # Kohya `networks.lora_minimax_h3` uses lora_unet_blocks_* + lora_down/up.
+    # The format adapter rewrites these first; keep the aliases here in case a
+    # raw key still reaches the loader.
+    lora_param_names_mapping: dict = field(
+        default_factory=lambda: {
+            r"^lora_unet_blocks_(\d+)_attn_qkv_proj\.lora_down$": r"blocks.\1.attn.qkv_proj.lora_A",
+            r"^lora_unet_blocks_(\d+)_attn_qkv_proj\.lora_up$": r"blocks.\1.attn.qkv_proj.lora_B",
+            r"^lora_unet_blocks_(\d+)_attn_qkv_proj\.(lora_[AB]|alpha)$": r"blocks.\1.attn.qkv_proj.\2",
+            r"^lora_unet_blocks_(\d+)_attn_out_proj\.lora_down$": r"blocks.\1.attn.out_proj.lora_A",
+            r"^lora_unet_blocks_(\d+)_attn_out_proj\.lora_up$": r"blocks.\1.attn.out_proj.lora_B",
+            r"^lora_unet_blocks_(\d+)_attn_out_proj\.(lora_[AB]|alpha)$": r"blocks.\1.attn.out_proj.\2",
+            r"^lora_unet_blocks_(\d+)_mlp_fc1\.lora_down$": r"blocks.\1.mlp.fc1.lora_A",
+            r"^lora_unet_blocks_(\d+)_mlp_fc1\.lora_up$": r"blocks.\1.mlp.fc1.lora_B",
+            r"^lora_unet_blocks_(\d+)_mlp_fc1\.(lora_[AB]|alpha)$": r"blocks.\1.mlp.fc1.\2",
+            r"^lora_unet_blocks_(\d+)_mlp_fc2\.lora_down$": r"blocks.\1.mlp.fc2.lora_A",
+            r"^lora_unet_blocks_(\d+)_mlp_fc2\.lora_up$": r"blocks.\1.mlp.fc2.lora_B",
+            r"^lora_unet_blocks_(\d+)_mlp_fc2\.(lora_[AB]|alpha)$": r"blocks.\1.mlp.fc2.\2",
+        }
+    )
+
     num_layers: int = 50
     token_refiner_num_layers: int = 2
     hidden_size: int = 5376
@@ -91,6 +111,9 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     ffn_hidden_size: int = 14336
     latents_dim: int = 24
     audio_latents_dim: int = 32
+    # False for an image checkpoint without the audio input/output projections
+    # (audio_patch_proj, final_layer.audio_out); it serves no audio rows.
+    audio_enabled: bool = True
     patch_size: tuple[int, int, int] = (1, 2, 2)
     text_dim: int = 5120
     timestep_input_dim: int = 256
@@ -106,6 +129,7 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     final_norm_eps: float = 1e-5
     qkv_checkpoint_grouped: bool = True
     checkpoint_uses_diffusers_layout: bool = False
+    checkpoint_qkv_layout: str | None = None
     adaln_affine_input_dim: int | None = None
     has_gate_compress: bool = False
     # VDN-H3: None for the dense model; set from transformer/config.json
@@ -113,6 +137,10 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if type(self.audio_enabled) is not bool:
+            raise ValueError(
+                f"audio_enabled must be a bool, got {self.audio_enabled!r}"
+            )
         if isinstance(self.patch_size, list):
             self.patch_size = tuple(self.patch_size)
         if len(self.patch_size) != 3:

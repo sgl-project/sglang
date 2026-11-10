@@ -5,6 +5,7 @@ from collections.abc import Iterator
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
@@ -40,7 +41,7 @@ def _resolve_profiler_log_dir(log_dir: str | None) -> str:
     if log_dir is not None:
         return log_dir
 
-    diffusion_profiler_dir = os.getenv("SGLANG_DIFFUSION_TORCH_PROFILER_DIR")
+    diffusion_profiler_dir = envs.SGLANG_DIFFUSION_TORCH_PROFILER_DIR
     if diffusion_profiler_dir:
         return diffusion_profiler_dir
 
@@ -106,7 +107,7 @@ class SGLDiffusionProfiler:
             self.profile_mode_id = "full stages"
         else:
             # profile denoising stage only
-            warmup = 1
+            warmup = 0 if num_steps == -1 else 1
             num_actual_steps = num_inference_steps if num_steps == -1 else num_steps
             self.num_active_steps = num_actual_steps + warmup
             self.profiler = torch.profiler.profile(
@@ -115,7 +116,7 @@ class SGLDiffusionProfiler:
                     skip_first=0,
                     wait=0,
                     warmup=warmup,
-                    active=self.num_active_steps,
+                    active=num_actual_steps,
                     repeat=1,
                 ),
             )

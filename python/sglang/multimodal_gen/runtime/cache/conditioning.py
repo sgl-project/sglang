@@ -90,6 +90,29 @@ def prefer_conditioning_cache():
         _prefer_cache.reset(token)
 
 
+# Image-to-video VAE inputs are one image followed by all-zero frames, so most
+# blocks of large CUDA inputs are zero. Hashing the nonzero-block bitmap and only
+# those blocks still identifies every byte, without copying the zeros to host.
+_SPARSE_HASH_BLOCK_BYTES = 64 * 1024
+_SPARSE_HASH_MIN_BYTES = 16 * 1024 * 1024
+
+
+def _tensor_digest(tensor):
+    data = tensor.reshape(-1).view(torch.uint8)
+    if not data.is_cuda or data.numel() < _SPARSE_HASH_MIN_BYTES:
+        return hashlib.sha256(data.cpu().numpy()).digest()
+    num_blocks = data.numel() // _SPARSE_HASH_BLOCK_BYTES
+    split = num_blocks * _SPARSE_HASH_BLOCK_BYTES
+    blocks = data[:split].view(num_blocks, _SPARSE_HASH_BLOCK_BYTES)
+    nonzero = blocks.amax(dim=1).ne(0).cpu().numpy()
+    digest = hashlib.sha256(nonzero.tobytes())
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], nonzero.view(np.int8), [0]))))
+    for start, end in zip(edges[::2], edges[1::2]):
+        digest.update(blocks[start:end].cpu().numpy())
+    digest.update(data[split:].cpu().numpy())
+    return digest.digest()
+
+
 def _fingerprint(value):
     if isinstance(value, torch.Tensor):
         if (
@@ -98,15 +121,13 @@ def _fingerprint(value):
             or value.requires_grad
         ):
             raise Uncacheable("only dense inference tensors can be cached")
-        tensor = value.detach().cpu().contiguous()
-        data = tensor.reshape(-1).view(torch.uint8).numpy()
         return (
             "tensor",
             str(value.dtype),
             str(value.device),
             tuple(value.shape),
             tuple(value.stride()),
-            hashlib.sha256(data).digest(),
+            _tensor_digest(value.detach().contiguous()),
         )
     if isinstance(value, Image.Image):
         return (
@@ -154,6 +175,8 @@ class _CacheEntry:
     owner: int
     preferred: bool
     device_resident: bool = False
+    # stored by warmup and not yet hit by a served request
+    provisional: bool = False
 
     @classmethod
     def snapshot(cls, output, size, owner, preferred, device_resident):
@@ -295,6 +318,19 @@ class ConditioningCache:
             entry.wait()
         self._entries.clear()
         self.bytes = 0
+
+    def _recycle_provisional_entries(self):
+        """Free warmup-only entries so served snapshots reuse their pinned blocks
+        instead of pinning fresh pages (~0.3 ms/MB). Seeded negatives stay."""
+        for key in [
+            key
+            for key, entry in self._entries.items()
+            if entry.provisional and not entry.preferred
+        ]:
+            removed = self._entries.pop(key)
+            removed.wait()
+            self.bytes -= removed.size
+            self.evictions += 1
 
     def invalidate(self, parameters):
         if parameters is None:
@@ -453,6 +489,8 @@ class ConditioningCache:
             self.hits += 1
             if entry is not None:
                 entry.preferred |= _prefer_cache.get()
+                if not _refresh_cache.get():
+                    entry.provisional = False
                 self._entries.move_to_end(key)
             if group_entry is not None:
                 self.group_hits += 1
@@ -511,6 +549,9 @@ class ConditioningCache:
         if old is not None:
             old.wait()
             self.bytes -= old.size
+        refresh = _refresh_cache.get()
+        if not refresh:
+            self._recycle_provisional_entries()
         preferred = _prefer_cache.get()
         evictable = [
             key
@@ -535,6 +576,7 @@ class ConditioningCache:
         self._entries[key] = _CacheEntry.snapshot(
             output, size, self._identity(model), preferred, keep_on_device
         )
+        self._entries[key].provisional = refresh
         self.bytes += size
         logger.debug(
             "Conditioning cache store: %s.%s, %d bytes",
@@ -637,40 +679,62 @@ def cached_conditioning(fn):
 def cached_vae_encode(fn):
     """Cache the posterior, before sample()/mode() and latent normalization.
 
-    Distributed VAEs currently bypass this cache: their encoding methods can
-    run on an owner rank or a model-specific subgroup, unlike encoder TP.
+    Distributed VAEs bypass this cache unless the decorated method explicitly
+    guarantees rank-local computation. A cache hit must not skip collectives
+    that another rank still enters.
     """
 
     @wraps(fn)
     def wrapped(self, *args, **kwargs):
         cache = _inference_cache(self)
-        if cache is None or (model_parallel_is_initialized() and get_world_size() > 1):
+        if cache is None or (
+            model_parallel_is_initialized()
+            and get_world_size() > 1
+            and not getattr(self, "conditioning_encode_is_rank_local", False)
+        ):
             return fn(self, *args, **kwargs)
-        # Tiling and slicing can change numerical results without changing x.
-        settings = {
-            name: value
-            for name, value in vars(self).items()
-            if name.startswith(
-                (
-                    "use_",
-                    "tile_",
-                    "blend_",
-                    "parallel_",
-                    "spatial_compression",
-                    "temporal_compression",
-                )
-            )
-            and type(value) in (int, float, bool, str, type(None))
-        }
         return cache.run(
             self,
             fn.__name__,
-            (args, settings),
+            (args, _vae_numeric_settings(self)),
             kwargs,
             lambda: fn(self, *args, **kwargs),
         )
 
     return wrapped
+
+
+def _vae_numeric_settings(vae):
+    # Tiling and slicing can change numerical results without changing x.
+    return {
+        name: value
+        for name, value in vars(vae).items()
+        if name.startswith(
+            (
+                "use_",
+                "tile_",
+                "blend_",
+                "parallel_",
+                "spatial_compression",
+                "temporal_compression",
+            )
+        )
+        and type(value) in (int, float, bool, str, type(None))
+    }
+
+
+def cached_vae_call(vae, method, args, compute, *, group=None):
+    """Cache a deterministic result derived from ``vae`` across requests.
+
+    When ``compute`` issues collectives, ``group`` must hold every rank that
+    runs it, so those ranks agree on hit or miss.
+    """
+    cache = _inference_cache(vae)
+    if cache is None:
+        return compute()
+    return cache.run(
+        vae, method, (args, _vae_numeric_settings(vae)), {}, compute, group
+    )
 
 
 class ConditioningEncoderMixin:

@@ -32,21 +32,20 @@
 
 import concurrent.futures
 import logging
+import re
 from typing import Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.gemm.bf16_fp32 import (
     linear_bf16_fp32,
     mark_hpc_bf16xfp32_gemm_enabled,
 )
-from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.configs import LongcatFlashConfig
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
+from sglang.srt.configs.longcat_flash import LongcatFlashConfig
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
@@ -55,10 +54,12 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
+    layer_stack,
 )
+from sglang.srt.layers.layer_boundary.ops import move_rows
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -72,7 +73,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.utils import (
     filter_moe_weight_param_global_expert,
-    should_skip_mlp_all_reduce,
+    get_moe_a2a_backend,
 )
 from sglang.srt.layers.n_gram_embedding import NgramEmbedding
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -86,6 +87,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -98,14 +100,14 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_stream,
 )
 from sglang.srt.utils import (
     BumpAllocator,
-    add_prefix,
-    bind_or_assign,
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_sm,
@@ -123,6 +125,13 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _device_sm = get_device_sm()
+
+if _is_npu:
+    from sgl_kernel_npu.moe.zero_experts_compute_identity import (
+        zero_experts_compute_identity_triton as zero_experts_compute_triton,
+    )
+else:
+    from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
 
 if _is_cuda:
     from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
@@ -253,6 +262,15 @@ class LongcatFlashMoE(nn.Module):
         self.top_k = config.moe_topk
         self.zero_expert_num = config.zero_expert_num
         self.zero_expert_type = config.zero_expert_type
+        if (
+            self.zero_expert_num > 0
+            and get_exec().moe.ep_dispatch_algorithm is not None
+        ):
+            raise ValueError(
+                "LongCat zero experts do not support expert placement remapping. "
+                "Disable EPLB, redundant experts, custom expert placement, and "
+                "--ep-dispatch-algorithm for this model."
+            )
 
         if config.rounter_params_dtype == "float32":
             self.rounter_params_dtype = torch.float32
@@ -298,10 +316,14 @@ class LongcatFlashMoE(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor | Tuple[torch.Tensor, Optional[torch.Tensor]]:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        zero_expert_result = None
 
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
@@ -309,33 +331,32 @@ class LongcatFlashMoE(nn.Module):
             hidden_states,
             router_logits,
         )
-        if self.zero_expert_type is not None:
+        if _is_npu:
+            topk_weights = topk_weights * self.routed_scaling_factor
+        if self.zero_expert_type is not None and num_tokens > 0:
+            zero_expert_kwargs = (
+                {"identity_mask_value": -1 if get_moe_a2a_backend().is_deepep() else 0}
+                if _is_npu
+                else {}
+            )
             zero_expert_result = zero_experts_compute_triton(
                 expert_indices=topk_idx,
                 expert_scales=topk_weights,
                 num_experts=self.num_experts,
                 zero_expert_type=self.zero_expert_type,
                 hidden_states=hidden_states,
+                **zero_expert_kwargs,
             )
         topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
+
+        if _is_npu:
+            return final_hidden_states.view(num_tokens, hidden_dim), zero_expert_result
+
         final_hidden_states *= self.routed_scaling_factor
-
-        if self.zero_expert_type is not None and hidden_states.shape[0] > 0:
+        if zero_expert_result is not None:
             final_hidden_states += zero_expert_result.to(final_hidden_states.device)
-
-        # LONGCAT_MOE_A2A_SKIP_ALLREDUCE: skip the post-experts TP all-reduce when a
-        # real EP a2a backend is active -- self.experts (DeepEPMoE) already combined
-        # expert outputs across EP ranks, so an extra all-reduce double-counts.
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend as _lc_gab
-
-        if (
-            self.tp_size > 1
-            and _lc_gab().is_none()
-            and not should_skip_mlp_all_reduce()
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -414,7 +435,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                         if "mlps" in getattr(config, "disable_quant_module", [])
                         else quant_config
                     ),
-                    reduce_results=True,
+                    reduce_results=False,
                     prefix=add_prefix(f"mlps.{i}", prefix),
                 )
                 for i in range(2)
@@ -428,7 +449,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        self.attn_boundary, self.moe_boundary = make_stages(
+        self.attn_boundary, self.moe_boundary = append_stages(
             (
                 declare_attn(),
                 self.input_layernorm[0],
@@ -438,13 +459,9 @@ class LongcatFlashDecoderLayer(nn.Module):
                 declare_ffn(sparse=True, next_layer_sparse=True),
                 self.post_attention_layernorm[0],
             ),
-            previous=declare_ffn(sparse=True, next_layer_sparse=True)
-            if self.layer_id != 0
-            else None,
-            terminal=self.layer_id == config.num_hidden_layers - 1,
         )
         self.first_ffn_boundary, self.second_attn_boundary, self.second_ffn_boundary = (
-            make_stages(
+            append_stages(
                 (
                     declare_ffn(),
                     self.post_attention_layernorm[0],
@@ -488,9 +505,16 @@ class LongcatFlashDecoderLayer(nn.Module):
         # moe
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.moe_boundary.prepare(hidden_states, forward_batch)
+        moe_hidden_states = self.mlp(hidden_states.clone())
+        if _is_npu:
+            moe_hidden_states, zero_expert_result = moe_hidden_states
         moe_hidden_states = self.moe_boundary.branch_output(
-            self.mlp(hidden_states.clone()), forward_batch
+            moe_hidden_states, forward_batch
         )
+        if _is_npu and zero_expert_result is not None:
+            # Add identity after the expert sum, on the same output token rows.
+            rows, _, to = self.moe_boundary.plan.branch_rows(forward_batch)
+            moe_hidden_states += move_rows(zero_expert_result, rows, to, forward_batch)
 
         hidden_states, prev_topk_indices = self.forward_mlp(
             hidden_states,
@@ -520,9 +544,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         hidden_states = self.first_ffn_boundary.branch_input(
             self.moe_boundary, hidden_states, forward_batch
         )
-        with self.first_ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlps[0](hidden_states)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.mlps[0](hidden_states)
+        hidden_states = self.first_ffn_boundary.finish(hidden_states, forward_batch)
 
         # second_attn_boundary
         hidden_states = self.second_attn_boundary.prepare(hidden_states, forward_batch)
@@ -542,9 +565,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         # second_mlp
         hidden_states = self.second_attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.second_ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.second_ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlps[1](hidden_states)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.mlps[1](hidden_states)
+        hidden_states = self.second_ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states, prev_topk_indices
 
@@ -579,19 +601,24 @@ class LongcatFlashModel(nn.Module):
                 use_attn_tp_group=is_dp_attention_enabled(),
             )
 
-        self.alt_stream = get_stream("alt")
-        self.layers = nn.ModuleList(
-            [
-                LongcatFlashDecoderLayer(
-                    config,
-                    layer_id,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{layer_id}", prefix),
-                    alt_stream=self.alt_stream,
-                )
-                for layer_id in range(config.num_hidden_layers)
-            ]
+        self.alt_stream = (
+            get_stream("alt")
+            if not _is_npu or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            else None
         )
+        with layer_stack():
+            self.layers = nn.ModuleList(
+                [
+                    LongcatFlashDecoderLayer(
+                        config,
+                        layer_id,
+                        quant_config=quant_config,
+                        prefix=add_prefix(f"layers.{layer_id}", prefix),
+                        alt_stream=self.alt_stream,
+                    )
+                    for layer_id in range(config.num_hidden_layers)
+                ]
+            )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture = []
 
@@ -627,7 +654,7 @@ class LongcatFlashModel(nn.Module):
         for i in range(total_num_layers):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(
-                    self.layers[i].attn_boundary.snapshot(hidden_states, forward_batch)
+                    residual_batch.snapshot(hidden_states, forward_batch)
                 )
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
@@ -772,8 +799,8 @@ class LongcatFlashForCausalLM(nn.Module):
                         ):
                             if (
                                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                                and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
-                                and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
+                                and current_arch().is_sm(9)
+                                and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                             ):
                                 block_scale = weight_scale
                                 use_deep_gemm_bmm = True
@@ -950,6 +977,17 @@ class LongcatFlashForCausalLM(nn.Module):
                 if "mtp" in name:
                     continue
                 if self.use_ngram_embedding:
+                    # Original LongCat-2.0 checkpoints number OE branches from zero.
+                    name = re.sub(
+                        r"^model\.oe_embed_tokens(\d+)\.weight$",
+                        r"model.ngram_embeddings.embedders.\1.weight",
+                        name,
+                    )
+                    name = re.sub(
+                        r"^model\.oe_embed_proj(\d+)\.weight$",
+                        r"model.ngram_embeddings.post_projs.\1.weight",
+                        name,
+                    )
                     if ".embed_tokens." in name:
                         name = "model.embed_tokens.word_embeder.weight"
                     if ".ngram_embeddings" in name:
@@ -1100,7 +1138,10 @@ class LongcatFlashForCausalLM(nn.Module):
         self.post_load_weights(weight_names=weight_names)
 
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        embed_tokens = self.model.embed_tokens
+        if isinstance(embed_tokens, NgramEmbedding):
+            embed_tokens = embed_tokens.word_embeder
+        return embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight

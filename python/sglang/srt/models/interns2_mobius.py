@@ -10,15 +10,16 @@ from sglang.srt.configs.interns2_mobius import (
     InternS2MobiusConfig,
     InternS2MobiusTextConfig,
 )
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
@@ -31,9 +32,6 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.moe import (
-    reduce_moe_output,
-)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
@@ -43,6 +41,8 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -56,8 +56,7 @@ from sglang.srt.models.qwen3_5 import (
     _linear_accepts_fp8_tuple,
 )
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import add_prefix, is_cuda, make_layers
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -342,6 +341,10 @@ class InternS2MobiusRoutedExpertBank(nn.Module):
             # The layer-local shared path consumes the same post-attention input.
             inplace=False,
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
@@ -422,7 +425,7 @@ class _InternS2MobiusDecoderMixin:
         routed = _get_mobius_routed_bank(meta_mlp, self.layer_id).forward_routed(
             hidden_states, forward_batch
         )
-        return reduce_moe_output(routed + shared)
+        return routed + shared
 
     def _forward_after_attention(
         self,
@@ -432,11 +435,8 @@ class _InternS2MobiusDecoderMixin:
     ) -> torch.Tensor:
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self._forward_mobius_mlp(
-                hidden_states, forward_batch, meta_mlp
-            )
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self._forward_mobius_mlp(hidden_states, forward_batch, meta_mlp)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
         return hidden_states
 
 
@@ -491,7 +491,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         accepts_fp8_input = _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(
                     read=NormQuantReadout(
@@ -507,10 +507,6 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(sparse=True, next_layer_sparse=True)
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -569,6 +565,11 @@ class InternS2MobiusAttentionDecoderLayer(
         self.rope_theta, rope_scaling = get_rope_config(config)
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.layer_id = layer_id
+        # Inherited forward_prepare_npu reads this. Mobius is never PP-split and its
+        # schedule is layer_types, not full_attention_interval.
+        self.refreshes_rope_cos_sin = layer_id == config.layer_types.index(
+            "full_attention"
+        )
         if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
             rope_scaling = None
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
@@ -589,8 +590,7 @@ class InternS2MobiusAttentionDecoderLayer(
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -599,8 +599,7 @@ class InternS2MobiusAttentionDecoderLayer(
             bias=False,
             quant_config=quant_config,
             reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
         self.attn = RadixAttention(
@@ -623,7 +622,7 @@ class InternS2MobiusAttentionDecoderLayer(
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         accepts_fp8_input = _linear_accepts_fp8_tuple(self.qkv_proj)
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(
                     read=NormQuantReadout(
@@ -639,10 +638,6 @@ class InternS2MobiusAttentionDecoderLayer(
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(sparse=True, next_layer_sparse=True)
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
         self.alt_stream = alt_stream
 

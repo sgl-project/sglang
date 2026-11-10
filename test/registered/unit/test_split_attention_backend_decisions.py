@@ -21,6 +21,8 @@ fallback applied. The tests below exercise the callable decisions directly.
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 from sglang.srt.runtime_context import attention_backends, get_context
 from sglang.srt.server_args import ServerArgs
@@ -29,7 +31,10 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
-from sglang.srt.arg_groups.overrides import attention_backends_of, resolved_view
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    resolved_view,
+)
 
 
 class TestSplitBackendsReachTheDecisions(CustomTestCase):
@@ -85,11 +90,11 @@ class TestSplitBackendsReachTheDecisions(CustomTestCase):
     def test_inkling_selects_the_half_serving_the_forward(self):
         from types import SimpleNamespace
 
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
             forward_context,
         )
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.models.inkling_common.attn import serving_attention_backend
 
         self._publish(
@@ -163,11 +168,16 @@ class TestSplitBackendsReachTheDecisions(CustomTestCase):
         self.assertIn("flashinfer", attention_backends_of(resolved_view(args)))
 
     def test_support_triton_is_the_regression_being_guarded(self):
-        from sglang.srt.utils.common import support_triton
+        from sglang.srt.platforms.interface import PlatformCapabilities
+        from sglang.srt.utils.triton_utils import support_triton
 
         # This is why a base-only read is not merely imprecise: the unset field
         # reads as "supported".
-        self.assertTrue(support_triton(None))
+        with mock.patch(
+            "sglang.srt.utils.triton_utils.current_platform",
+            SimpleNamespace(capabilities=PlatformCapabilities(supports_triton=True)),
+        ):
+            self.assertTrue(support_triton(None))
 
 
 class TestDraftFactoryStamping(CustomTestCase):

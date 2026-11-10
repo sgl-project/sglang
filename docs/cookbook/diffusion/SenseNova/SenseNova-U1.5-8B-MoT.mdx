@@ -1,5 +1,6 @@
 ---
 title: SenseNova-U1.5-8B-MoT
+description: "Run SenseNova-U1.5-8B-MoT text-to-image generation with SGLang's native multimodal generation runtime."
 metatags:
     description: "Run SenseNova-U1.5-8B-MoT text-to-image generation with SGLang's native multimodal generation runtime."
 ---
@@ -8,17 +9,24 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 <DiffusionModelTags tags={["image", "text-to-image", "Chinese typography", "poster layouts", "native pipeline"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/SenseNova/sensenova-u15.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-sglang-diffusion-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [SenseNova-U1.5-8B-MoT](https://huggingface.co/sensenova/SenseNova-U1.5-8B-MoT) is a text-to-image model in the SenseNova-U1 family. It is useful for high-resolution poster, infographic, and enterprise visual-generation workloads where prompt following, layout structure, and Chinese text rendering are important.
 
 Built on [NEO-Unify](https://huggingface.co/blog/sensenova/neo-unify), this release improves composition, color harmony, material rendering, and local visual detail for native high-resolution generation. It also focuses on clearer Chinese and English text rendering, stronger infographic layout structure, and more reliable execution of complex prompts with object counts, spatial relationships, styles, and multiple constraints.
-
-## 2. SGLang-diffusion Installation
-
-SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
-
-Please refer to the [official SGLang-diffusion installation guide](../../../docs/sglang-diffusion/installation) for installation instructions.
 
 ## 3. Model Deployment
 

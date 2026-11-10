@@ -3,9 +3,12 @@
 
 Encoding recipes for user-provided reference materials:
 
-- image reference: independent 2048px short-edge resize with upscale enabled,
-  LANCZOS, and nearest-32 dimensions, then the SAME keyframe tokenizer recipe
-  as fl2va (seed-42 sampled encode, normalize, [1,2,2] patchify);
+- image reference: configurable ``match``, ``max``, or ``diffusers`` resizing
+  while preserving the display ratio, followed by LANCZOS and nearest-32
+  dimensions, then the SAME keyframe tokenizer recipe as fl2va (seed-42
+  sampled encode, normalize, [1,2,2] patchify). ``match`` follows the target
+  canvas pixel area without upscaling, ``max`` caps the short edge at 2048
+  without upscaling, and ``diffusers`` forces the short edge to 2048;
 - audio reference: the audio material chain (pure
   audio is losslessly normalized
   to stereo; video soundtracks are extracted as 44.1 kHz stereo), then a
@@ -37,6 +40,8 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_replica_group
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+    MINIMAX_H3_DEFAULT_REFERENCE_RESIZE_MODE,
+    MINIMAX_H3_REFERENCE_RESIZE_MODES,
     MINIMAX_H3_SUPPORTED_FPS,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.keyframe_encoding import (
@@ -126,21 +131,27 @@ def minimax_h3_resolve_reference_image_shape(
     *,
     width: int | float,
     height: int | float,
+    canvas_width: int | float,
+    canvas_height: int | float,
+    mode: str = MINIMAX_H3_DEFAULT_REFERENCE_RESIZE_MODE,
 ) -> dict[str, Any]:
-    """Resolve a ref2va image independently from the target canvas.
+    """Resolve a ref2va image with a selectable resize policy.
 
-    The image keeps its display ratio, always targets a 2048px short edge (even
-    when that requires upscaling), and rounds both dimensions independently to
-    the nearest 32px grid. Unlike target/video ``adapt_shape_v1``, reference
-    images have no area-cap branch.
+    All modes preserve the reference display ratio and round both dimensions
+    independently to the nearest 32px grid. ``match`` follows the target canvas
+    pixel area without upscaling a smaller reference, ``max`` only downsizes a
+    reference whose short edge exceeds 2048px (the default), and ``diffusers``
+    always targets a 2048px short edge, including by upscaling.
     """
 
     try:
         source_width = float(width)
         source_height = float(height)
+        canvas_width = float(canvas_width)
+        canvas_height = float(canvas_height)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            "reference image width and height must be positive finite numbers"
+            "reference image and target canvas dimensions must be finite numbers"
         ) from exc
     if (
         not math.isfinite(source_width)
@@ -151,31 +162,94 @@ def minimax_h3_resolve_reference_image_shape(
         raise ValueError(
             "reference image width and height must be positive finite numbers"
         )
+    if (
+        not math.isfinite(canvas_width)
+        or not math.isfinite(canvas_height)
+        or canvas_width <= 0.0
+        or canvas_height <= 0.0
+    ):
+        raise ValueError(
+            "target canvas width and height must be positive finite numbers"
+        )
     if source_width > 4.0 * source_height or source_height > 4.0 * source_width:
         raise ValueError(
             "reference image ratio must be within the inclusive range "
             f"1:4 to 4:1, got {source_width:g}x{source_height:g}"
         )
+    mode = str(mode).strip().lower()
+    if mode not in MINIMAX_H3_REFERENCE_RESIZE_MODES:
+        raise ValueError(
+            "reference_resize_mode must be one of "
+            f"{sorted(MINIMAX_H3_REFERENCE_RESIZE_MODES)}, got {mode!r}"
+        )
 
-    scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(source_width, source_height)
-    target_width = _nearest_multiple(
+    short_edge = min(source_width, source_height)
+    if mode == "match":
+        scale = min(
+            1.0,
+            math.sqrt((canvas_width * canvas_height) / (source_width * source_height)),
+        )
+    elif mode == "max":
+        scale = min(1.0, MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / short_edge)
+    else:  # diffusers
+        scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / short_edge
+
+    resolved_width = _nearest_multiple(
         source_width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE
     )
-    target_height = _nearest_multiple(
+    resolved_height = _nearest_multiple(
         source_height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE
     )
+    size_mode = {
+        "match": "target_area",
+        "max": "short_edge_cap",
+        "diffusers": "short_edge",
+    }[mode]
     return {
         "geometry": "reference_image_resolved",
-        "shape_policy_version": "reference_image_short_edge_v1",
+        "shape_policy_version": (
+            "reference_image_short_edge_v1"
+            if mode == "diffusers"
+            else f"reference_image_{mode}_v1"
+        ),
+        # Keep the legacy short-edge metadata for shape-schema compatibility.
+        # ``match`` does not use this value in its scale calculation.
         "base_short_edge": MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE,
-        "effective_short_edge": min(target_width, target_height),
-        "size_mode": "short_edge",
+        "effective_short_edge": min(resolved_width, resolved_height),
+        "reference_resize_mode": mode,
+        "size_mode": size_mode,
         "multiple": MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
         "rounding": "nearest",
-        "allow_upscale": True,
-        "width": target_width,
-        "height": target_height,
+        "allow_upscale": mode == "diffusers",
+        "width": resolved_width,
+        "height": resolved_height,
     }
+
+
+def minimax_h3_image_reference_size(
+    width: int,
+    height: int,
+    *,
+    min_short_edge: int,
+    max_short_edge: int,
+) -> tuple[int, int] | None:
+    """Size of an image-release (edit) reference for one consumer (Qwen, VAE).
+
+    A short edge within ``[min_short_edge, max_short_edge]`` returns None: the
+    consumer gets the original pixels. Otherwise the image is scaled up or
+    down, keeping its ratio, so that its short edge lands on the nearer bound;
+    each side rounds to the nearest 32px multiple, as ref2va references do.
+    """
+
+    short_edge = min(width, height)
+    if min_short_edge <= short_edge <= max_short_edge:
+        return None
+    bound = min_short_edge if short_edge < min_short_edge else max_short_edge
+    scale = bound / short_edge
+    return (
+        _nearest_multiple(width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+        _nearest_multiple(height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
+    )
 
 
 def minimax_h3_resize_reference_image(
@@ -202,6 +276,26 @@ def minimax_h3_resize_reference_image(
     if (target_width, target_height) == image.size:
         return image
     return image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+
+def minimax_h3_bound_image_reference(
+    image: Any,
+    *,
+    min_short_edge: int,
+    max_short_edge: int,
+) -> Any:
+    """``image`` resized per ``minimax_h3_image_reference_size`` (itself when
+    its short edge is already within the bounds)."""
+
+    width, height = image.size
+    size = minimax_h3_image_reference_size(
+        width, height, min_short_edge=min_short_edge, max_short_edge=max_short_edge
+    )
+    if size is None:
+        return image
+    return minimax_h3_resize_reference_image(
+        image, target_width=size[0], target_height=size[1]
+    )
 
 
 def _load_waveform(
@@ -847,6 +941,11 @@ def minimax_h3_prepared_reference_image(batch: Any, plan: Any) -> dict[str, Any]
     Qwen (pixel_values) and the visual-condition tokenizer consume the identical
     prepared image. The runtime never recomputes geometry from ``plan.shape``;
     it consumes the per-material width/height admitted before queueing.
+
+    Image-release edit references keep the original geometry instead: they
+    are read upright (EXIF orientation applied) and converted to RGB, with no
+    resize. Qwen and the VAE each resize their own input from it
+    (``minimax_h3_bound_image_reference``).
     """
     cached = batch.extra.get(MINIMAX_H3_PREPARED_REFERENCE_IMAGE_EXTRA_KEY)
     if cached is not None:
@@ -862,8 +961,25 @@ def minimax_h3_prepared_reference_image(batch: Any, plan: Any) -> dict[str, Any]
         minimax_h3_localize_material_uri,
     )
 
+    original_geometry = plan.output_modality == "image"
     prepared_images = []
     for material in images:
+        if original_geometry:
+            image_path = minimax_h3_localize_material_uri(
+                batch,
+                material.uri,
+                condition_type=material.condition_type,
+                condition_index=int(material.condition_index),
+            )
+            with Image.open(image_path) as source_image:
+                # The localization probe admits JPEG/PNG/WEBP; reject animation.
+                if getattr(source_image, "n_frames", 1) != 1:
+                    raise ValueError("image reference must not be animated")
+                image = ImageOps.exif_transpose(source_image).convert("RGB")
+            prepared_images.append(
+                {"image": image, "condition_index": int(material.condition_index)}
+            )
+            continue
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.prequeue import (
             MINIMAX_H3_PROBE_FACTS_EXTRA_KEY,
             MINIMAX_H3_RESOLVED_MATERIAL_SHAPES_EXTRA_KEY,
@@ -920,11 +1036,14 @@ def minimax_h3_prepared_reference_image(batch: Any, plan: Any) -> dict[str, Any]
 
 
 __all__ = [
+    "minimax_h3_bound_image_reference",
     "minimax_h3_decode_reference_video_frames",
     "minimax_h3_encode_reference_audio_rows",
     "minimax_h3_encode_reference_video_rows",
+    "minimax_h3_image_reference_size",
     "minimax_h3_prepared_reference_image",
     "minimax_h3_prepared_reference_videos",
+    "minimax_h3_resize_reference_image",
     "minimax_h3_resolve_reference_image_shape",
     "minimax_h3_sample_reference_video_frames",
 ]

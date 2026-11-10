@@ -9,7 +9,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_req(rid, origin_input_text, origin_input_ids, sampling_params=None, **kwargs):
@@ -59,7 +59,7 @@ class TestSchedulePolicyHRRN(CustomTestCase):
         # processed_tokens=1000 -> waited_tokens is 1000 for every req here.
         # Ratios: short = 1000/1 = 1000; aged = 1000/3 ~= 333; long = 1000/10 = 100.
         # Highest ratio first -> short, aged, long.
-        policy.calc_priority(waiting_queue, processed_tokens=1000)
+        waiting_queue = policy.calc_priority(waiting_queue, processed_tokens=1000)
 
         self.assertEqual(waiting_queue[0].rid, "short")
         self.assertEqual(waiting_queue[1].rid, "aged")
@@ -90,7 +90,7 @@ class TestSchedulePolicyHRRN(CustomTestCase):
         # processed_tokens=100000 -> long_old.waited = 100000, ratio = 100000/100 = 1000.
         #                            short_new.waited = 0, ratio = 0.
         # long_old should now be first.
-        policy.calc_priority(waiting_queue, processed_tokens=100000)
+        waiting_queue = policy.calc_priority(waiting_queue, processed_tokens=100000)
 
         self.assertEqual(waiting_queue[0].rid, "long_old")
         self.assertEqual(waiting_queue[1].rid, "short_new")
@@ -139,7 +139,7 @@ class TestShortestPrefillFirst(CustomTestCase):
         req = _make_req(rid, "", list(range(uncached + cached)))
         req.full_untruncated_fill_ids = req.origin_input_ids[:]
         req.num_matched_prefix_tokens = cached
-        req.prefix_indices = list(range(cached))
+        req.prefix_len = cached
         req.time_stats.wait_queue_entry_time = arrived
         return req
 
@@ -149,7 +149,7 @@ class TestShortestPrefillFirst(CustomTestCase):
         long = self.make_req("long", 1024)
         queue = [long, short, cached]
         with patch.object(self.policy, "_compute_prefix_matches", return_value=set()):
-            self.policy.calc_priority(queue)
+            queue = self.policy.calc_priority(queue)
         self.assertEqual([req.rid for req in queue], ["cached", "short", "long"])
 
     def test_equal_work_uses_arrival_time(self):
@@ -166,7 +166,7 @@ class TestShortestPrefillFirst(CustomTestCase):
         with patch.object(
             self.policy, "_compute_prefix_matches", return_value={duplicate.rid}
         ):
-            self.policy.calc_priority(queue)
+            queue = self.policy.calc_priority(queue)
         self.assertEqual(queue, [other, duplicate])
 
     def test_retracted_output_is_part_of_uncached_work(self):
