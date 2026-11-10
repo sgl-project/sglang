@@ -134,7 +134,8 @@ class MOVAPipelineConfig(PipelineConfig):
         self, image, target_width, target_height, _vae_image_processor
     ):
         image = self._center_crop_and_resize(image, target_height, target_width)
-        return image, (target_width, target_height)
+        # ImageVAEEncodingStage takes condition tensors as [-1, 1]
+        return image * 2.0 - 1.0, (target_width, target_height)
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         spatial = self.vae_config.arch_config.spatial_compression_ratio
