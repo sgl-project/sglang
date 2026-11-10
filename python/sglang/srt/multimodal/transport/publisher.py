@@ -134,29 +134,42 @@ class BoundedFeaturePublisher:
         return list({id(item): item for item, _, _ in fields}.values())
 
     def _publish(self, tensors, reservations, events):
+        publish_started = False
+        proxies = None
         try:
             if events and self.copy_stream is None:
                 self.copy_stream = torch.cuda.Stream(
                     device=self.pool.publication_device_id
                 )
-        except BaseException:
-            self.pool.release_reserved_batch(reservations)
-            raise
-        context = (
-            torch.cuda.stream(self.copy_stream)
-            if self.copy_stream is not None
-            else nullcontext()
-        )
-        with context:
-            try:
+            context = (
+                torch.cuda.stream(self.copy_stream)
+                if self.copy_stream is not None
+                else nullcontext()
+            )
+            with context:
                 # a copy completion must not wait for unrelated preprocessing
                 # subsequently enqueued on the tokenizer's default stream
                 for _, event in events:
                     self.copy_stream.wait_event(event)
-            except BaseException:
+                # the pool owns rollback once publication starts
+                publish_started = True
+                proxies = self.pool.publish_reserved_batch(tensors, reservations)
+            return proxies
+        except BaseException as error:
+            if not publish_started:
                 self.pool.release_reserved_batch(reservations)
-                raise
-            return self.pool.publish_reserved_batch(tensors, reservations)
+            elif proxies is not None:
+                # context exit can fail with copies in flight; cancel via ready/ack
+                errors = []
+                for proxy in proxies:
+                    try:
+                        self.pool.cancel_proxy(proxy)
+                    except BaseException as cancel_error:
+                        errors.append(cancel_error)
+                if errors:
+                    logger.error("GPU publication rollback failed: %s", errors)
+                    raise error from errors[0]
+            raise
 
     def _cancel_completed(self, future):
         error = future.exception()
