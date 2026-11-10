@@ -736,6 +736,9 @@ class Envs:
     # Shortest-prefill-first: the in-progress chunk keeps at least this percent of the
     # budget when shorter waiting requests are reserved room (0 = one page).
     SGLANG_SPF_CHUNK_MIN_PCT = EnvInt(0)
+    # Shortest-prefill-first: re-match a waiting request's prefix for the sort only
+    # every N batch formations (0 or 1 = every time; admission always re-matches).
+    SGLANG_SPF_MATCH_EVERY = EnvInt(0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output

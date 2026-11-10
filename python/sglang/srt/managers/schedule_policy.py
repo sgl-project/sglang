@@ -220,6 +220,10 @@ class SchedulePolicy:
         self._spf_age_cap = envs.SGLANG_SPF_AGE_CAP.get()
         # rid -> batch formations waited; a round count, not wall time, so every TP rank orders alike
         self._spf_rounds: Dict[str, int] = {}
+        self._spf_match_every = envs.SGLANG_SPF_MATCH_EVERY.get()
+        self._spf_match_round = 0
+        # rid -> round of its last prefix match in calc_priority
+        self._spf_matched: Dict[str, int] = {}
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -382,8 +386,28 @@ class SchedulePolicy:
     ) -> Set[int]:
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
+        every = (
+            self._spf_match_every
+            if policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            else 0
+        )
+        if every > 1:
+            self._spf_match_round += 1
+            last, self._spf_matched = self._spf_matched, {}
 
         for r in waiting_queue:
+            if every > 1:
+                seen = last.get(r.rid)
+                # The sort only needs an estimate: admission re-matches every
+                # request it considers (init_next_round_input).
+                if (
+                    seen is not None
+                    and self._spf_match_round - seen < every
+                    and r.prefix_len > IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD
+                ):
+                    self._spf_matched[r.rid] = seen
+                    continue
+                self._spf_matched[r.rid] = self._spf_match_round
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             cache_salt = r.cache_salt

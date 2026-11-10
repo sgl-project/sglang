@@ -249,6 +249,30 @@ class TestShortestPrefillFirst(CustomTestCase):
             "aged",
         )
 
+    def count_matches(self, rounds, every, prefix_len=4096):
+        with envs.SGLANG_SPF_MATCH_EVERY.override(every):
+            self.setUp()
+        queue = [self.make_req("a", 32), self.make_req("b", 64)]
+        for req in queue:
+            req.prefix_len = prefix_len
+        with patch(
+            "sglang.srt.managers.schedule_policy.match_kv_cache"
+        ) as match_kv_cache:
+            for _ in range(rounds):
+                self.policy._compute_prefix_matches(
+                    queue, CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+                )
+        return match_kv_cache.call_count
+
+    def test_prefix_rematch_every_n_formations(self):
+        self.assertEqual(self.count_matches(4, every=0), 8)
+        # Matched in rounds 1 and 4 only.
+        self.assertEqual(self.count_matches(4, every=3), 4)
+
+    def test_short_prefixes_are_always_rematched(self):
+        # In-batch prefix caching needs a fresh match for short prefixes.
+        self.assertEqual(self.count_matches(4, every=3, prefix_len=0), 8)
+
     def test_chunk_limit_reserves_complete_short_prefills(self):
         continuation = self.make_req("continuation", 16384)
         waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
