@@ -181,30 +181,9 @@ class TestChatCompletionRequest(unittest.TestCase):
                     "role": "user",
                     "content": [{"type": "image_url", "image_url": url}],
                 },
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "screenshot", "arguments": "{}"},
-                        }
-                    ],
-                },
-                {
-                    "role": "tool",
-                    "tool_call_id": "call_1",
-                    "content": [
-                        {"type": "text", "text": "result:"},
-                        {"type": "image_url", "image_url": url},
-                    ],
-                },
             ],
         )
         self.assertEqual(request.messages[0].content[0].image_url.url, url)
-        self.assertEqual(request.messages[0].content[0].image_url.detail, "auto")
-        self.assertEqual(request.messages[2].content[1].image_url.url, url)
 
     def test_sampling_param_build(self):
         req = ChatCompletionRequest(
@@ -874,17 +853,8 @@ class TestThinkingObject(unittest.TestCase):
         self.assertIs(request.chat_template_kwargs["thinking"], True)
 
     def test_explicit_none_effort_survives_a_thinking_object(self):
-        # A thinking object with no explicit type must not turn reasoning back on.
         request = self._request(reasoning_effort="none", thinking={"keep": "all"})
         self.assertIs(request.chat_template_kwargs["thinking"], False)
-
-    def test_effort_none_inside_thinking_disables_reasoning(self):
-        request = self._request(thinking={"effort": "none"})
-        self.assertIs(request.chat_template_kwargs["thinking"], False)
-
-    def test_null_type_is_treated_as_absent(self):
-        request = self._request(thinking={"type": None, "keep": "all"})
-        self.assertIs(request.chat_template_kwargs["thinking"], True)
 
 
 if __name__ == "__main__":

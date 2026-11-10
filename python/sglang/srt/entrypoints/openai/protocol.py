@@ -646,7 +646,6 @@ class ChatCompletionMessageContentImagePart(BaseModel):
     @field_validator("image_url", mode="before")
     @classmethod
     def _accept_bare_url(cls, value: Any) -> Any:
-        # Some clients send "image_url": "<url>" instead of {"url": "<url>"}.
         return {"url": value} if isinstance(value, str) else value
 
 
@@ -1166,9 +1165,8 @@ class ChatCompletionRequest(PDRoutingFields):
             if enabled:
                 thinking = True
 
-        # thinking.effort outranks reasoning.effort and the top-level field.
-        # chat_template_kwargs stays above all three: the renderers only fill
-        # thinking_effort when the caller has not set it themselves.
+        # thinking.effort outranks reasoning.effort and reasoning_effort;
+        # chat_template_kwargs still wins, since renderers only fill unset keys.
         thinking_type = None
         thinking_config = values.get("thinking")
         if isinstance(thinking_config, dict):
@@ -1185,8 +1183,6 @@ class ChatCompletionRequest(PDRoutingFields):
         if thinking_type is not None:
             thinking = thinking_type != "disabled"
         elif isinstance(thinking_config, dict) and thinking is None:
-            # A thinking object with no explicit type still means "reasoning on",
-            # but never contradicts an effort that already resolved it.
             thinking = True
 
         if thinking is not None:

@@ -272,7 +272,6 @@ def _kimi_k3_levels_text(level_by_tier: dict) -> str:
 
 
 def _map_kimi_k3_effort(reasoning_effort: Any, level_by_tier: dict) -> Optional[str]:
-    """Map a request's reasoning effort onto K3's thinking_effort, or None."""
     if reasoning_effort is None or reasoning_effort == "none":
         return None
     if isinstance(reasoning_effort, str) and reasoning_effort in level_by_tier:
