@@ -747,14 +747,6 @@ class LlamaForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
                 else:
-                    if _missing_quantized_module(name):
-                        raise ValueError(
-                            "Checkpoint contains quantized tensors (qweight/qzeros/scales/g_idx) "
-                            f"for '{name}', but the target module was built without quantized "
-                            "parameters. This usually means block_name_to_quantize does not "
-                            "match the runtime module prefix. Check AutoRound "
-                            "quantization_config.block_name_to_quantize and model prefix mapping."
-                        )
                     logger.warning(f"Parameter {name} not found in params_dict")
 
     def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
