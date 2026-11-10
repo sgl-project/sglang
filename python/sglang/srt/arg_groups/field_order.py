@@ -282,7 +282,6 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_draft_attention_backend",
     "speculative_dsa_topk_backend",
     "speculative_draft_kv_cache_dtype",
-    "speculative_dspark_lm_head_dtype",
     "speculative_draft_window_size",
     "speculative_moe_runner_backend",
     "speculative_moe_a2a_backend",
@@ -564,5 +563,6 @@ POSITIONAL_FIELD_ORDER = (
     "paged_experts_enable_disk",
     "disable_normalize_embedding",
     "log_schedule_decisions",
+    "speculative_dspark_lm_head_dtype",
 )
 # fmt: on
