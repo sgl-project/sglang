@@ -674,21 +674,6 @@ _DSPARK_LM_HEAD_DTYPE_PLATFORM_PROBES = {"fp8": "is_gfx95", "mxfp8": "is_blackwe
 def _resolve_dspark_lm_head_dtype(server_args: ServerArgs) -> None:
     dtype = resolving_view(server_args).speculative_dspark_lm_head_dtype
     if dtype is None:
-        if not envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.get():
-            return
-        if not get_platform().is_gfx95:
-            logger.warning(
-                "SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD is only supported on gfx95x; "
-                "keeping the unquantized draft lm_head."
-            )
-            return
-        logger.warning(
-            "SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD is deprecated; pass "
-            "'--speculative-dspark-lm-head-dtype fp8' instead."
-        )
-        declare_resolution(
-            server_args, "_handle_dspark", speculative_dspark_lm_head_dtype="fp8"
-        )
         return
     probe = _DSPARK_LM_HEAD_DTYPE_PLATFORM_PROBES[dtype]
     if not getattr(get_platform(), probe):

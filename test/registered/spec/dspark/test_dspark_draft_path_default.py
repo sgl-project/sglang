@@ -85,10 +85,8 @@ class TestDsparkLmHeadDtype(CustomTestCase):
         self.assertEqual(self._resolve("mxfp8", is_blackwell=True), "mxfp8")
         self.assertEqual(self._resolve("fp8", is_gfx95=True), "fp8")
 
-    def test_legacy_rocm_env_maps_to_fp8_on_gfx95_only(self):
-        with envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.override(True):
-            self.assertEqual(self._resolve(None, is_gfx95=True), "fp8")
-            self.assertIsNone(self._resolve(None))
+    def test_unset_is_a_no_op(self):
+        self.assertIsNone(self._resolve(None))
 
 
 class TestDsparkDraftPathDefaulting(CustomTestCase):
