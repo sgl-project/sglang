@@ -8,13 +8,23 @@ per-expert norm before the route-weighted sum, using DeepGEMM.
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import logging
+import os
 
 import torch
 
 logger = logging.getLogger(__name__)
 
 _MEGAMOE_SYMM_BUFFERS: dict = {}
+
+# DeepGEMM reads this on every MegaMoE launch; an empty value keeps its heuristic.
+_TILES_ENV = "DG_MEGA_MOE_TILES"
+# (CTA pair, BLOCK_M, STORE_BLOCK_M, BLOCK_K bytes, epilogue warpgroups). With
+# Muse routing on GB300, BLOCK_M 240 beats the heuristic's 192 for BF16
+# prefill-sized shards; smaller heuristic tiles are kept.
+_BF16_PREFILL_TILES = "2,240,40,128,2"
 
 
 def _dimensions(layer):
@@ -306,6 +316,49 @@ def _get_symm_buffer(layer, group, capacity, device):
     return buf
 
 
+@functools.lru_cache(maxsize=4096)
+def _heuristic_block_m(num_ranks, num_experts, capacity, num_tokens, top_k, mma_type):
+    import deep_gemm
+
+    return deep_gemm.get_block_m_for_mega_moe(
+        num_ranks=num_ranks,
+        num_experts=num_experts,
+        num_max_tokens_per_rank=capacity,
+        num_tokens=num_tokens,
+        num_topk=top_k,
+        mma_type=mma_type,
+    )
+
+
+def _tile_override(buf, num_tokens):
+    """BF16 prefill tiles for this launch, or None to keep DeepGEMM's choice."""
+    if buf.mma_type != "bf16xbf16" or os.environ.get(_TILES_ENV):
+        # A user-provided DG_MEGA_MOE_TILES always wins.
+        return None
+    block_m = _heuristic_block_m(
+        buf.group.size(),
+        buf.num_experts,
+        buf.num_max_tokens_per_rank,
+        num_tokens,
+        buf.num_topk,
+        buf.mma_type,
+    )
+    return _BF16_PREFILL_TILES if block_m == 192 else None
+
+
+@contextlib.contextmanager
+def _megamoe_tiles(tiles):
+    if tiles is None:
+        yield
+        return
+    os.environ[_TILES_ENV] = tiles
+    try:
+        yield
+    finally:
+        # Keep the key (empty = heuristic) so later launches only replace values.
+        os.environ[_TILES_ENV] = ""
+
+
 @torch.no_grad()
 def forward_megamoe(layer, hidden_states, topk_scores, topk_ids, post_expert_norm):
     """Dispatch sequence shards, run both GEMMs, normalize experts, then combine.
@@ -398,5 +451,7 @@ def forward_megamoe(layer, hidden_states, topk_scores, topk_ids, post_expert_nor
         kernel = deep_gemm.nvfp4_mega_moe
     else:
         kernel = deep_gemm.bf16_mega_moe
-    kernel(y, layer.megamoe_l1_weights, layer.megamoe_l2_weights, buf, **kwargs)
+    # Match the non-null output allocation passed to DeepGEMM.
+    with _megamoe_tiles(_tile_override(buf, y.shape[0])):
+        kernel(y, layer.megamoe_l1_weights, layer.megamoe_l2_weights, buf, **kwargs)
     return y[:n]

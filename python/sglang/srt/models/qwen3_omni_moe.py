@@ -39,7 +39,8 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from sglang.srt.models.qwen3_vl_moe import (
@@ -48,7 +49,7 @@ from sglang.srt.models.qwen3_vl_moe import (
     load_fused_expert_weights,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_cpu, is_npu, logger
+from sglang.srt.utils import is_cpu, is_npu, logger
 
 _is_cpu = is_cpu()
 

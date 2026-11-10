@@ -1,30 +1,34 @@
 """Request-window copies preserve data, scales, padding and graph addresses."""
 
 import unittest
-from types import SimpleNamespace
 
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.mem_cache.dsv41_request_window import (
-    RequestWindow,
+    RequestWindowSpec,
     copy_packed_tokens,
     window_layout,
 )
+from sglang.srt.mem_cache.kv.memory.request_window import RequestWindowMemory
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def reference(src, dst, source, target, page, layout):
     # Independent scalar row slicing also checks every untouched padding byte.
     result = dst.clone()
     for s, d in zip(source.tolist(), target.tolist()):
-        for width, base in (
-            (layout.data_bytes, 0),
-            (layout.scale_bytes, page * layout.data_bytes),
-        ):
+        if layout.is_interleaved:
+            rows = ((layout.bytes_per_token, 0),)
+        else:
+            rows = (
+                (layout.data_bytes, 0),
+                (layout.scale_bytes, page * layout.data_bytes),
+            )
+        for width, base in rows:
             result[
                 d // page, base + d % page * width : base + (d % page + 1) * width
             ] = src[s // page, base + s % page * width : base + (s % page + 1) * width]
@@ -106,29 +110,16 @@ class TestRequestWindowCopy(CustomTestCase):
     def _check_commit(self, fmt, lens, graph):
         page, capacity = 64, 256
 
-        def factory(size, layers):
-            width = fmt.page_bytes(page)
-            return SimpleNamespace(
-                size=size,
-                kv_layout=fmt,
-                kv_buffer=[
-                    torch.empty(
-                        ((size + page - 1) // page, width + 64),
-                        dtype=torch.uint8,
-                        device="cuda",
-                    )[:, :width]
-                    for _ in range(layers)
-                ],
-            )
-
-        window = RequestWindow(
-            factory,
+        spec = RequestWindowSpec.create(
             num_slots=8,
             layers=2,
             page_size=page,
             capacity=capacity,
             workspace_rows=sum(lens) + len(lens) * 128,
+            kv_layout=fmt,
         )
+        memory = RequestWindowMemory(spec, dtype=torch.uint8, device="cuda")
+        window = memory.view
 
         def metadata(lengths, shift):
             req = torch.cat(
@@ -140,7 +131,13 @@ class TestRequestWindowCopy(CustomTestCase):
             pos = torch.cat(
                 [torch.arange(n, device="cuda") + 191 + shift for n in lengths]
             )
-            return window_layout(req, pos, capacity=capacity, num_groups=len(lengths))
+            return window_layout(
+                req,
+                pos,
+                zero_row=window.zero_row,
+                capacity=capacity,
+                num_groups=len(lengths),
+            )
 
         active = metadata(lens, 0)
         window.activate(active)

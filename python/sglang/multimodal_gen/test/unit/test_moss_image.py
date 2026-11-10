@@ -451,6 +451,34 @@ def small_model():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_separate_checkpoint_projections_load_in_qkv_order(small_model, dtype):
+    from sglang.multimodal_gen.runtime.loader.utils import (
+        get_param_names_mapping,
+        hf_to_custom_state_dict,
+    )
+
+    model = small_model.to(dtype)
+    checkpoint = dict(model.state_dict())
+    torch.manual_seed(42)
+    inputs = torch.randn(2, 7, 64).to(dtype)
+    expected = []
+    for index in range(len(model.layers)):
+        checkpoint.pop(f"layers.{index}.proj.qkv.weight")
+        projections = []
+        for name in ("q", "k", "v"):
+            weight = torch.randn(64, 64).to(dtype)
+            checkpoint[f"layers.{index}.proj.{name}.weight"] = weight
+            projections.append(torch.nn.functional.linear(inputs, weight))
+        expected.append(torch.cat(projections, -1))
+    mapped, _ = hf_to_custom_state_dict(
+        checkpoint, get_param_names_mapping(model.param_names_mapping), strict=True
+    )
+    model.load_state_dict(mapped, strict=True, assign=True)
+    for layer, reference in zip(model.layers, expected):
+        torch.testing.assert_close(layer.proj["qkv"](inputs), reference)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_prepared_conditioning_matches_steps_and_requests(
     small_model, dtype, monkeypatch
 ):
@@ -553,8 +581,9 @@ def test_prepared_conditioning_requires_matching_latents(small_model, shape):
 
 
 @pytest.mark.parametrize("use_cfg", [False, True])
+@pytest.mark.parametrize("quality", ["exact", "lossless", "high"])
 def test_denoising_stage_prepares_actual_cfg_branches(
-    small_model, use_cfg, monkeypatch
+    small_model, use_cfg, quality, monkeypatch
 ):
     from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.moss_image import (
@@ -563,7 +592,7 @@ def test_denoising_stage_prepares_actual_cfg_branches(
 
     batch = SimpleNamespace(
         do_classifier_free_guidance=use_cfg,
-        sampling_params=SimpleNamespace(cfg_gate_step=1.0, quality="exact"),
+        sampling_params=SimpleNamespace(cfg_gate_step=1.0, quality=quality),
     )
     latents = torch.randn(1, 8, 2, 3)
     pos = {"encoder_hidden_states": torch.randn(1, 3, 32)}
@@ -590,8 +619,12 @@ def test_denoising_stage_prepares_actual_cfg_branches(
         assert len(ctx.cfg_policy.branches) == (2 if use_cfg else 1)
         for branch in ctx.cfg_policy.branches:
             assert "prepared_conditioning" in branch.kwargs
+            assert branch.kwargs["fuse_qkv"] is (quality == "high")
             expected = small_model(
-                latents, 938.0, branch.kwargs["encoder_hidden_states"]
+                latents,
+                938.0,
+                branch.kwargs["encoder_hidden_states"],
+                fuse_qkv=quality == "high",
             )
             actual = small_model(latents, 938.0, **branch.kwargs)
             assert torch.equal(actual, expected)
@@ -723,8 +756,9 @@ def test_pipeline_residency_declares_only_components_used_by_each_stage(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("resident_layers", [0, 1])
 @pytest.mark.parametrize("skip_layers", [(), (0,), (1,), (0, 1)])
+@pytest.mark.parametrize("fuse_qkv", [False, True])
 def test_layerwise_offload_preserves_requests_and_streams(
-    small_model, resident_layers, skip_layers
+    small_model, resident_layers, skip_layers, fuse_qkv
 ):
     torch.manual_seed(0)
     model = small_model.to(device="cuda", dtype=torch.bfloat16)
@@ -735,7 +769,10 @@ def test_layerwise_offload_preserves_requests_and_streams(
         for h, w in [(2, 3), (3, 2), (2, 3)]
     ]
     with torch.inference_mode(), set_forward_context(0, None):
-        expected = [model(x, timestep, text, skip_layers=skip_layers) for x in latents]
+        expected = [
+            model(x, timestep, text, skip_layers=skip_layers, fuse_qkv=fuse_qkv)
+            for x in latents
+        ]
     model.configure_layerwise_offload(
         SimpleNamespace(
             performance_mode="manual",
@@ -770,6 +807,7 @@ def test_layerwise_offload_preserves_requests_and_streams(
                     text,
                     prepared_conditioning=prepared,
                     skip_layers=skip_layers,
+                    fuse_qkv=fuse_qkv,
                 )
                 manager.release_all()
             torch.cuda.synchronize()
