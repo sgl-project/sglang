@@ -5,7 +5,7 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -62,6 +62,7 @@ class TestSchedulerUBTreeAdmission(CustomTestCase):
         scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=Mock())
         scheduler.rust_server = None
         scheduler.output_streamer = Mock()
+        scheduler.invariant_checker = Mock()
         scheduler._add_request_to_queue = Mock()
 
         with (
