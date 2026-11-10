@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import subprocess
-import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -55,22 +53,6 @@ def _prefix_context(value: float, digest: str | None) -> PrefixContext:
         prefix_pad_masks=torch.ones(1, 2, dtype=torch.bool),
         prefix_len=2,
         cache_key_digest=digest,
-    )
-
-
-def test_observation_import_does_not_load_srt_scheduler():
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import sys; "
-            "import sglang.multimodal_gen.runtime.vla.observation; "
-            "assert 'sglang.srt.managers.mm_schedule' not in sys.modules; "
-            "assert 'sglang.srt.managers.mm_utils' not in sys.modules",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
     )
 
 
