@@ -1202,51 +1202,6 @@ def commit_mamba_states_after_verify(
         batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
     )
 
-    # UBTree KDA factorized verify: all tree-node outputs were computed without
-    # materializing per-node [V,K] states. Replay only the sampled
-    # root-to-node accept path, then perform the existing conv rollback.
-    if (
-        mamba_pool is not None
-        and getattr(mamba_pool, "factorized_kda_tree", False) is True
-    ):
-        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
-            return
-        from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
-            commit_kda_tree_after_verify,
-        )
-
-        if state_slots is None:
-            state_slots = model_runner.attn_backend.forward_state_slots(
-                bs, batch.mamba_track_indices
-            )
-        spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = state_slots.working[:bs]
-        mamba_steps_to_track = None
-        if batch.mamba_track_indices is not None:
-            _, mamba_steps_to_track = _verify_commit_step_indices(
-                batch=batch,
-                accept_index=accept_index,
-                accept_lens=accept_lens,
-                draft_token_num=draft_token_num,
-            )
-        factor_cache_indices = torch.arange(
-            accept_lens.shape[0], dtype=torch.int32, device=accept_lens.device
-        )
-        commit_kda_tree_after_verify(
-            spec_state=spec_state,
-            state_batch_indices=state_batch_indices,
-            factor_cache_indices=factor_cache_indices,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            tree_width=draft_token_num,
-            mamba_track_indices=(
-                None if batch.mamba_track_indices is None else state_slots.track[:bs]
-            ),
-            mamba_steps_to_track=mamba_steps_to_track,
-            null_block_id=-1,
-        )
-        return
-
     replay_state_indices = replay_track_indices = None
     if mamba_pool is not None and (
         mamba_pool.replayssm_spec_fold or mamba_pool.replayssm_cache_base is not None
