@@ -20,14 +20,14 @@ from sglang.test.test_utils import (
 
 def get_a2a_backend_config():
     # On Blackwell or machines where DeepEP is hard to compile, set
-    # SGLANG_EPLB_TEST_MOE_A2A_BACKEND=flashinfer to use FlashInfer A2A.
+    # SGLANG_EPLB_TEST_MOE_A2A_BACKEND=flashinfer_nvlink_one_sided to use FlashInfer A2A.
     moe_a2a_backend = os.environ.get("SGLANG_EPLB_TEST_MOE_A2A_BACKEND", "deepep")
     args = ["--moe-a2a-backend", moe_a2a_backend]
     kwargs = {"moe_a2a_backend": moe_a2a_backend}
     if moe_a2a_backend == "deepep":
         args.extend(["--deepep-mode", "normal"])
         kwargs["deepep_mode"] = "normal"
-    elif moe_a2a_backend == "flashinfer":
+    elif moe_a2a_backend == "flashinfer_nvlink_one_sided":
         args.extend(["--moe-runner-backend", "flashinfer_cutlass"])
         kwargs["moe_runner_backend"] = "flashinfer_cutlass"
     return args, kwargs

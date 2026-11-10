@@ -4,6 +4,12 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "MiniMax-H3-Image",
+      modelIds: ["MiniMaxAI/MiniMax-H3-Image"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3-Image",
+      note: "Six-step PDD text-to-image and image editing.",
+    },
+    {
       name: "MOSS-Image",
       modelIds: ["OpenMOSS-Team/MOSS-Image-Base", "OpenMOSS-Team/MOSS-Image-SFT"],
       cookbook: "/cookbook/diffusion/OpenMOSS/MOSS-Image",
