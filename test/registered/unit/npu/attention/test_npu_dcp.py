@@ -26,6 +26,13 @@ register_npu_ci(est_time=9, suite="base-a-test-npu")
 # kernel discovery during import, so temporarily force the platform probe to
 # report CPU while loading the modules under test.
 sys.modules.setdefault("sgl_kernel_npu", types.ModuleType("sgl_kernel_npu"))
+_sgl_operators = types.ModuleType("sgl_kernel_npu.operators")
+_sgl_attention = types.ModuleType("sgl_kernel_npu.operators.attention")
+# dsa_dcp imports the public operator at module load; the real function needs
+# the NPU extension, so the tests patch this placeholder per case.
+_sgl_attention.sparse_flash_attention = None
+sys.modules.setdefault("sgl_kernel_npu.operators", _sgl_operators)
+sys.modules.setdefault("sgl_kernel_npu.operators.attention", _sgl_attention)
 sys.modules.setdefault("torch_npu", MagicMock(name="torch_npu"))
 import sglang.srt.utils as _utils
 from sglang.srt.utils import device as _device_utils
@@ -36,6 +43,7 @@ _device_utils.is_npu = lambda: False
 _utils.is_npu = _device_utils.is_npu
 try:
     from sglang.srt import runtime_context as rc
+    from sglang.srt.hardware_backend.npu.attention import dsa_dcp as _dsa_dcp
     from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
         forward_dcp_sparse_attention,
     )
@@ -262,12 +270,7 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
         q, rope, k_nope, k_rope, topk = self._inputs()
         batch = SimpleNamespace(forward_mode=_Mode(False))
         metadata = self._metadata()
-        with patch.object(
-            torch.ops.npu,
-            "sgl_sparse_flash_attention",
-            self.fake_op,
-            create=True,
-        ):
+        with patch.object(_dsa_dcp, "sparse_flash_attention", self.fake_op):
             out, lse = forward_dcp_sparse_attention(
                 q_nope=q,
                 q_rope=rope,
@@ -297,12 +300,7 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
         q, rope, k_nope, k_rope, topk = self._inputs(rows)
         batch = SimpleNamespace(forward_mode=_Mode(True))
         metadata = self._metadata(rows=rows)
-        with patch.object(
-            torch.ops.npu,
-            "sgl_sparse_flash_attention",
-            self.fake_op,
-            create=True,
-        ):
+        with patch.object(_dsa_dcp, "sparse_flash_attention", self.fake_op):
             forward_dcp_sparse_attention(
                 q_nope=q,
                 q_rope=rope,

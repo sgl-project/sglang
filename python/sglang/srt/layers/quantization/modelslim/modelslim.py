@@ -72,7 +72,7 @@ def npu_wrapper_rmsnorm_forward(func):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            from sgl_kernel_npu.norm.add_rmsnorm_bias import add_rmsnorm_bias
+            from sgl_kernel_npu.operators.norm import add_rmsnorm_bias
 
             out, residual_out = add_rmsnorm_bias(
                 x,
