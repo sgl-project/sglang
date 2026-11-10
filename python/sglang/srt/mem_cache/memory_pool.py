@@ -551,12 +551,6 @@ class MambaPool:
         replayssm_rawv: Optional[torch.Tensor] = None
         replayssm_rawk: Optional[torch.Tensor] = None
         replayssm_beta: Optional[torch.Tensor] = None
-        # UBTree KDA factorized verify stores raw per-node recurrence inputs in
-        # request-local scratch rows until sampling selects the committed path.
-        tree_rawv: Optional[torch.Tensor] = None
-        tree_rawk: Optional[torch.Tensor] = None
-        tree_g: Optional[torch.Tensor] = None
-        tree_beta: Optional[torch.Tensor] = None
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -587,6 +581,15 @@ class MambaPool:
         # full-state snapshots are never produced or consumed.
         intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
+
+    @dataclass(frozen=True, kw_only=True)
+    class UBTreeSpeculativeState(SpeculativeState):
+        # UBTree KDA factorized verify stores raw per-node recurrence inputs in
+        # request-local scratch rows until sampling selects the committed path.
+        tree_rawv: torch.Tensor
+        tree_rawk: torch.Tensor
+        tree_g: torch.Tensor
+        tree_beta: torch.Tensor
 
     def _detect_conv_window_axis(
         self, conv_state_shape: List[Tuple[int, int]], win_len: int
@@ -900,30 +903,32 @@ class MambaPool:
                         device=device,
                     )
 
-            tree_rawv = tree_rawk = tree_g = tree_beta = None
+            tree_state = {}
             if self.factorized_kda_tree:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
                 tree_width = speculative_num_draft_tokens
-                tree_rawv = torch.zeros(
-                    (num_mamba_layers, spec_state_size + 1, hv, tree_width, v_dim),
-                    dtype=conv_dtype,
-                    device=device,
-                )
-                tree_rawk = torch.zeros(
-                    (num_mamba_layers, spec_state_size + 1, h_k, tree_width, k_dim),
-                    dtype=conv_dtype,
-                    device=device,
-                )
-                tree_g = torch.zeros(
-                    (num_mamba_layers, spec_state_size + 1, hv, tree_width, k_dim),
-                    dtype=torch.float32,
-                    device=device,
-                )
-                tree_beta = torch.zeros(
-                    (num_mamba_layers, spec_state_size + 1, hv, tree_width),
-                    dtype=torch.float32,
-                    device=device,
+                tree_state = dict(
+                    tree_rawv=torch.zeros(
+                        (num_mamba_layers, spec_state_size + 1, hv, tree_width, v_dim),
+                        dtype=conv_dtype,
+                        device=device,
+                    ),
+                    tree_rawk=torch.zeros(
+                        (num_mamba_layers, spec_state_size + 1, h_k, tree_width, k_dim),
+                        dtype=conv_dtype,
+                        device=device,
+                    ),
+                    tree_g=torch.zeros(
+                        (num_mamba_layers, spec_state_size + 1, hv, tree_width, k_dim),
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                    tree_beta=torch.zeros(
+                        (num_mamba_layers, spec_state_size + 1, hv, tree_width),
+                        dtype=torch.float32,
+                        device=device,
+                    ),
                 )
 
             if speculative_num_draft_tokens is not None:
@@ -1033,7 +1038,12 @@ class MambaPool:
                         for conv_shape in dense_conv_shapes
                     ]
                     self._intermediate_conv_window_phys = intermediate_conv_window_cache
-                self.mamba_cache = self.SpeculativeState(
+                spec_state_cls = (
+                    self.UBTreeSpeculativeState
+                    if self.factorized_kda_tree
+                    else self.SpeculativeState
+                )
+                self.mamba_cache = spec_state_cls(
                     conv=conv_state,
                     temporal=temporal_state,
                     intermediate_ssm=intermediate_ssm_state_cache,
@@ -1044,10 +1054,7 @@ class MambaPool:
                     replayssm_rawv=replayssm_rawv,
                     replayssm_rawk=replayssm_rawk,
                     replayssm_beta=replayssm_beta,
-                    tree_rawv=tree_rawv,
-                    tree_rawk=tree_rawk,
-                    tree_g=tree_g,
-                    tree_beta=tree_beta,
+                    **tree_state,
                 )
                 intermediate_ssm_gb = (
                     get_tensor_size_bytes(intermediate_ssm_state_cache) / GB

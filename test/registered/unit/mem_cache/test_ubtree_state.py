@@ -37,7 +37,7 @@ def _tensor_bytes(tensor):
 
 def _scratch_bytes(state):
     return sum(_tensor_bytes(t) for t in state.intermediate_conv_window) + sum(
-        _tensor_bytes(getattr(state, name))
+        _tensor_bytes(getattr(state, name, None))
         for name in (
             "intermediate_ssm",
             "tree_rawv",
@@ -147,7 +147,6 @@ class TestUBTreeState(CustomTestCase):
                         self.assertIsNone(pool.mamba_cache.intermediate_ssm)
                         expected = ubtree_spec_state_bytes_per_req(_params(), width) * 2
                     else:
-                        self.assertIsNone(pool.mamba_cache.tree_rawv)
                         expected = (
                             _params().mamba_cache_per_req * width * (requests + 1)
                         )
