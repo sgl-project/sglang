@@ -1406,12 +1406,12 @@ class TestAbortBeforeDispatch(CustomTestCase):
         )
         return SimpleNamespace(mm_items=[item])
 
-    def _assert_cuda_ipc_cancelled(self, tm, mm_inputs):
+    def _assert_cuda_ipc_cancelled(self, tm, mm_inputs, published_features):
         item = mm_inputs.mm_items[0]
         cancelled = tm.mm_processor.cudaipc_mmfeature_pool.cancel_proxy.call_args_list
-        self.assertEqual(
-            [c.args[0] for c in cancelled], [item.feature, item.precomputed_embeddings]
-        )
+        self.assertEqual([c.args[0] for c in cancelled], published_features)
+        self.assertIsNone(item.feature)
+        self.assertIsNone(item.precomputed_embeddings)
 
     def _assert_finished_as_aborted(self, tm, rid, out):
         self.assertEqual(out["meta_info"]["id"], rid)
@@ -1432,6 +1432,8 @@ class TestAbortBeforeDispatch(CustomTestCase):
                 tokenized = MagicMock()
                 tokenized.rid = rid
                 tokenized.mm_inputs = self._mm_inputs()
+                item = tokenized.mm_inputs.mm_items[0]
+                published_features = [item.feature, item.precomputed_embeddings]
                 prepared = [Mock()]
 
                 async def drive():
@@ -1461,7 +1463,9 @@ class TestAbortBeforeDispatch(CustomTestCase):
                 tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_called_once_with(
                     prepared
                 )
-                self._assert_cuda_ipc_cancelled(tm, tokenized.mm_inputs)
+                self._assert_cuda_ipc_cancelled(
+                    tm, tokenized.mm_inputs, published_features
+                )
                 sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
                 self.assertEqual([type(m) for m in sent], [AbortReq])
                 self.assertEqual(sent[0].rid, rid)
@@ -1543,6 +1547,8 @@ class TestAbortBeforeDispatch(CustomTestCase):
             tokenized.rid = rid
             tokenized.mm_inputs = self._mm_inputs()
             tokenized_objs.append(tokenized)
+        item = tokenized_objs[1].mm_inputs.mm_items[0]
+        published_features = [item.feature, item.precomputed_embeddings]
 
         async def publish(_mm_inputs):
             # The abort lands while the batch's features are being published.
@@ -1563,7 +1569,9 @@ class TestAbortBeforeDispatch(CustomTestCase):
             tokenized_objs[1].mm_inputs.mm_items
         )
         # Only the skipped request's: the scheduler acknowledges the other's.
-        self._assert_cuda_ipc_cancelled(tm, tokenized_objs[1].mm_inputs)
+        self._assert_cuda_ipc_cancelled(
+            tm, tokenized_objs[1].mm_inputs, published_features
+        )
         sent = [c.args[0] for c in tm._dispatch_to_scheduler.call_args_list]
         self.assertIsInstance(sent[0], AbortReq)
         self.assertEqual(sent[0].rid, aborted)
