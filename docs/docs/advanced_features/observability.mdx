@@ -1,7 +1,7 @@
 ---
 title: "Observability"
 metatags:
-    description: "SGLang observability: Prometheus metrics, request logging, request dump and replay, crash dump debugging."
+    description: "SGLang observability: Prometheus metrics, request logging, request dump and replay, crash dump debugging, KV cache events."
 ---
 ## Production Metrics
 SGLang exposes the following metrics via Prometheus. You can enable them by adding `--enable-metrics` when launching the server.
@@ -45,3 +45,77 @@ Set the crash diagnostics folder with `--crash-dump-folder /tmp/crash_dump`.
 When SGLang handles a crash, it writes completed requests retained by the crash-dump buffer plus in-flight requests to `/tmp/crash_dump/<hostname>/crash_dump_<timestamp>.pkl`. The file also contains the server arguments and launch command. Replay it with `scripts/playground/replay_request_dump.py`.
 
 On NVIDIA CUDA, the option also sets default environment variables before CUDA initializes. These defaults enable device coredumps on CUDA exceptions and allow SGLang to trigger device coredumps for live scheduler processes when it handles a crash. CUDA device coredumps are written to `/tmp/crash_dump/<hostname>/core.cuda.<timestamp>.<pid>`. Explicitly configured CUDA coredump environment variables take precedence, including a custom `CUDA_COREDUMP_FILE` path. This option does not configure OS process core dumps.
+
+## KV cache events
+
+SGLang can publish KV cache events: a stream of BlockStored, BlockRemoved, and AllBlocksCleared messages that describe what the engine's prefix cache did with each block. These events make cache misses attributable: a consumer can tell whether a request missed because the prefix was never written, because it was evicted, or because the request asked for a different cache key. This section documents the mechanism as it exists in current SGLang. It does not document vLLM or any other engine.
+
+### Turning publishing on
+
+Pass --kv-events-config with a JSON config to the server launch command:
+
+```bash Command
+python -m sglang.launch_server --model-path Qwen/Qwen3-4B --kv-events-config '{"publisher": "zmq"}'
+```
+
+The publisher binds one ZMQ endpoint per rank. With --dp-size > 1, the endpoint port is endpoint_port + rank, or serving port + rank when endpoint is null. Use the server's /server_info endpoint to find each rank's endpoint.
+
+### Configuration fields
+
+| Field | Default | Meaning |
+|---|---|---|
+| publisher | null | "zmq" to publish to ZMQ, "null" to disable |
+| endpoint | null | ZMQ endpoint; a port is computed per rank (endpoint_port + rank), or derived from the serving port when endpoint is null |
+| protocol | tcp | The only supported protocol |
+| num_publishers | 1 | Publishers per rank; set it to 1 when you need a single global stream |
+| buffer_size | 100 | Maximum number of event batches queued per publisher; the publisher drops the oldest batch when the queue is full |
+| topic | "kv_events" | ZMQ topic string, empty string subscribes to all topics |
+
+### Subscribing
+
+Subscribe to the ZMQ endpoint with a client that decodes the messages. The Python client below uses pyzmq and msgspec. Install the dependencies first:
+
+```bash Command
+pip install pyzmq msgspec
+```
+
+The event batch format is a three-part ZMQ multipart message: [timestamp, events, attn_dp_rank], where events is a list of BlockStored, BlockRemoved, or AllBlocksCleared messages. timestamp is a float (seconds), events is a msgpack-encoded KVEventBatch, and attn_dp_rank is the attention data-parallel rank that produced the batch.
+
+```python Example
+import zmq
+import msgspec
+from sglang.srt.disaggregation.kv_events import KVEventBatch
+
+ctx = zmq.Context()
+sock = ctx.socket(zmq.SUB)
+sock.connect("tcp://localhost:5557")
+sock.setsockopt_string(zmq.SUBSCRIBE, "")
+
+decoder = msgspec.msgpack.Decoder(KVEventBatch)
+while True:
+    topic, payload, rank = sock.recv_multipart()
+    batch = decoder.decode(payload)
+    for event in batch.events:
+        print(event)
+```
+
+### Reading events
+
+| Field | Meaning |
+|---|---|
+| BlockStored | block_hashes: list of block hashes stored. token_ids: token IDs stored with the block. medium: where the block lives. session_id: session ID of the request that stored the block, present when the request carried one. cache_salt: per-request cache salt, present when the request sets one. |
+| BlockRemoved | block_hashes: list of block hashes evicted or removed. medium: where the block was stored. |
+| AllBlocksCleared | medium: the tier that was cleared. |
+
+SGLang also emits cache events for hierarchical cache tiers. When a block is written to or restored from host memory or disk, the event's medium field names the tier:
+
+| Value | Meaning |
+|---|---|
+| GPU | Blocks stored in GPU HBM |
+| CPU_PINNED | Blocks in pinned host memory (used by HiCache and the hierarchical cache) |
+| DISK | Blocks in disk-backed storage |
+| EXTERNAL | Blocks in an external store, for example, LMCache or another remote cache |
+
+The session_id field on BlockStored is an attribution label, not a routing key. It records which session stored the block. A missing session_id means the request carried none, not that the block is unattributed.
+
+For cache hit and miss rates, use --enable-cache-report. It adds cached token counts to the usage field of chat completion responses. See the Usage section for details.
