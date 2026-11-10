@@ -167,61 +167,37 @@ def estimate_prefill_extend_tile_metrics(
     }
 
 
-# Quantization step for the UniBoost priority Phi in the rank-invariant
-# (tp_size > 1) mode: Phi is floored to this grid and ties are broken by the
-# rank-invariant arrival sequence number, so residual float noise can never
-# flip a pair of requests on one TP rank but not another.
+# UniBoost rank-invariant mode: Phi is floored to this grid and ties break on
+# the arrival sequence number, so float noise cannot reorder ranks differently.
 UNIBOOST_PHI_QUANTUM_S = 1e-4
+
+# gamma-Ada controller internals.
+UNIBOOST_GAMMA_ADA_MIN = 1.0
+UNIBOOST_GAMMA_ADA_MAX = 200.0
+UNIBOOST_GAMMA_ADA_BETA = 0.3
+UNIBOOST_GAMMA_ADA_TAIL_SENSITIVITY = 4.0
+UNIBOOST_GAMMA_ADA_INTERVAL_S = 5.0
+UNIBOOST_GAMMA_ADA_WINDOW = 2000
+UNIBOOST_GAMMA_ADA_MIN_SAMPLES = 200
+UNIBOOST_GAMMA_ADA_REFIT_EVERY_K = 256
+
+
+def uniboost_needs_rank_invariance(tp_size: int, pp_size: int) -> bool:
+    """Whether several ranks must compute the same UniBoost queue order."""
+    return tp_size > 1 or pp_size > 1
 
 
 class GammaAdaController:
-    """Online estimator for the UniBoost boost parameter ``gamma`` (gamma-Ada).
+    """Adapts the UniBoost boost rate ``gamma`` to the latency tail (gamma-Ada).
 
-    Watches the observed end-to-end response-time distribution and adapts
-    ``gamma`` to the workload's tail shape, so the scheduler need not have a
-    per-workload gamma tuned by hand:
+    With ``r = t99 / t95`` over recent latencies, the target is
+    ``gamma_max / (1 + tail_sensitivity * max(r - 1, 0))``: a heavy tail pulls
+    gamma down (more SJF), a flat tail pushes it up (more FCFS). The target is
+    EMA-smoothed by ``beta``.
 
-    * a **heavy** tail (a few requests far slower than the p95 body) means
-      shortest-job-first-style boosting helps, so gamma is pushed **down**
-      toward ``gamma_min`` (more SJF);
-    * a **light/flat** tail (p99 close to p95) means reordering buys little and
-      FCFS best protects the tail, so gamma is pushed **up** toward
-      ``gamma_max``.
-
-    The tail shape is summarized by the log-linear slope of the response-time
-    CDF over the paper's ``[t95, t99]`` band. With ``r = t99 / t95 >= 1`` the
-    excess ``r - 1`` is the slope proxy (0 for a flat tail, growing as the
-    tail fattens); a heavier tail implies a smaller target gamma via
-
-        target = gamma_max / (1 + tail_sensitivity * max(r - 1, 0)).
-
-    The target is EMA-smoothed into the live gamma so the control loop cannot
-    oscillate. Pure and side-effect free apart from its own ring buffer, so it
-    is unit-testable without a scheduler or GPU.
-
-    Threading model (async refit, off the scheduler's critical path):
-
-    * ``record()`` runs on the scheduler thread and is a single bounded
-      ``deque.append`` -- O(1), lock-free, GIL-atomic in CPython;
-    * ``start()`` spawns one daemon thread that wakes every ``interval_s``
-      seconds and does the percentile scan + EMA re-fit there;
-    * the scheduler only *reads* ``self.gamma`` -- a plain float attribute
-      load, atomic in CPython -- so the hot path takes no locks and does no
-      percentile math. ``self.gamma = ...`` in the refit thread is likewise a
-      single attribute store, so readers see either the old or the new float,
-      never a torn value.
-
-    Deterministic step-clocked mode (rank-invariant UniBoost, tp_size > 1):
-
-    * instead of ``start()``, the scheduler calls ``record_completion()`` with
-      latencies measured in *scheduler forward-step counts* (integers,
-      identical on every TP rank) and a refit runs synchronously every
-      ``refit_every_k`` completions -- a completion-count trigger instead of
-      the wall-clock daemon, so every rank refits at the same point in the
-      request stream on the same samples. ``r = t99/t95`` is scale-free, so
-      steps work as well as seconds for the tail-shape proxy, and fixed-order
-      float arithmetic over identical inputs makes the resulting gamma
-      trajectory bit-identical across ranks.
+    Wall-clock mode refits on a daemon thread every ``interval_s``. The
+    rank-invariant mode instead refits synchronously every ``refit_every_k``
+    completions with step-count latencies, so all ranks get the same gamma.
     """
 
     __slots__ = (
@@ -245,13 +221,13 @@ class GammaAdaController:
         self,
         *,
         gamma_init: float,
-        gamma_min: float = 1.0,
-        gamma_max: float = 200.0,
-        beta: float = 0.3,
-        tail_sensitivity: float = 4.0,
-        interval_s: float = 5.0,
-        window: int = 2000,
-        min_samples: int = 200,
+        gamma_min: float = UNIBOOST_GAMMA_ADA_MIN,
+        gamma_max: float = UNIBOOST_GAMMA_ADA_MAX,
+        beta: float = UNIBOOST_GAMMA_ADA_BETA,
+        tail_sensitivity: float = UNIBOOST_GAMMA_ADA_TAIL_SENSITIVITY,
+        interval_s: float = UNIBOOST_GAMMA_ADA_INTERVAL_S,
+        window: int = UNIBOOST_GAMMA_ADA_WINDOW,
+        min_samples: int = UNIBOOST_GAMMA_ADA_MIN_SAMPLES,
         refit_every_k: int = 0,
     ) -> None:
         # gamma_min must stay strictly positive: b_gamma divides by gamma.
@@ -271,24 +247,14 @@ class GammaAdaController:
         self._stop_event = threading.Event()
 
     def record(self, latency_s: float) -> None:
-        """Record one completed request's end-to-end latency (seconds).
-
-        Scheduler-thread hot path: a single bounded ``deque.append`` (O(1),
-        no lock; safe against the refit thread under the GIL).
-        """
+        """Record one completed request's end-to-end latency."""
         if latency_s > 0.0:
             self._samples.append(float(latency_s))
 
     def record_completion(self, latency: float) -> Optional[float]:
-        """Deterministic step-clocked path (rank-invariant mode, tp_size > 1).
+        """Record a step-count latency; refit every ``refit_every_k`` calls.
 
-        Records one completion latency (measured in scheduler forward-step
-        counts, though any rank-invariant unit works: ``r = t99/t95`` is
-        scale-free) and refits synchronously every ``refit_every_k``
-        completions. No daemon thread and no wall clock anywhere, so given the
-        identical completion stream every TP rank refits at the same points on
-        the same samples and computes bit-identical gammas. Returns the new
-        gamma when a refit ran, else ``None``.
+        Returns the new gamma when a refit ran, else ``None``.
         """
         self.record(latency)
         self._completions_since_refit += 1
@@ -301,8 +267,6 @@ class GammaAdaController:
             return self._refit_once()
         return None
 
-    # -- async refit thread (keeps percentile math off the scheduler) -------
-
     def start(self) -> None:
         """Start the background refit daemon thread. Idempotent."""
         if self._thread is not None and self._thread.is_alive():
@@ -314,7 +278,7 @@ class GammaAdaController:
         self._thread.start()
 
     def stop(self, timeout: float = 2.0) -> None:
-        """Stop the background refit thread (used by tests; daemon otherwise)."""
+        """Stop the background refit thread."""
         self._stop_event.set()
         thread = self._thread
         if thread is not None:
@@ -322,8 +286,7 @@ class GammaAdaController:
         self._thread = None
 
     def _run(self) -> None:
-        # Wait *first* so startup never refits an empty window; a non-positive
-        # interval still yields a short sleep instead of a busy loop.
+        # A non-positive interval still sleeps briefly instead of busy-looping.
         wait_s = self.interval_s if self.interval_s > 0.0 else 0.05
         while not self._stop_event.wait(wait_s):
             try:
@@ -347,8 +310,6 @@ class GammaAdaController:
         return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
 
     def _target_gamma(self) -> float:
-        # sorted(deque) snapshots in one C call, so concurrent appends from
-        # the scheduler thread cannot interleave mid-copy under the GIL.
         vals = sorted(self._samples)
         t95 = self._percentile(vals, 0.95)
         t99 = self._percentile(vals, 0.99)
@@ -364,21 +325,15 @@ class GammaAdaController:
         return target
 
     def _refit_once(self):
-        """One percentile scan + EMA re-fit; runs on the refit thread.
-
-        Returns the new (EMA-smoothed, clamped) gamma, or ``None`` when fewer
-        than ``min_samples`` latencies have been observed (clean no-op).
-        """
+        """Refit gamma; returns it, or ``None`` below ``min_samples``."""
         if len(self._samples) < self.min_samples:
             return None
         target = self._target_gamma()
         gamma = (1.0 - self.beta) * self.gamma + self.beta * target
-        # Stay strictly positive and in range regardless of float drift.
         if gamma < self.gamma_min:
             gamma = self.gamma_min
         elif gamma > self.gamma_max:
             gamma = self.gamma_max
-        # Single attribute store: atomic for scheduler-thread readers.
         self.gamma = gamma
         self.refit_count += 1
         logger.info(
@@ -391,12 +346,7 @@ class GammaAdaController:
         return gamma
 
     def maybe_update(self, now: float):
-        """Synchronous, interval-gated re-fit with an explicit clock.
-
-        Kept for tests and manual driving; the production path is the
-        ``start()`` daemon thread, whose wake cadence provides the interval.
-        Returns the new gamma when it updates, else ``None``.
-        """
+        """Refit if ``interval_s`` has passed since the last refit at ``now``."""
         if now - self._last_update_t < self.interval_s:
             return None
         if len(self._samples) < self.min_samples:
@@ -434,6 +384,10 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        *,
+        uniboost_gamma: float = 10.0,
+        enable_uniboost_gamma_ada: bool = False,
+        uniboost_rank_invariant: bool = False,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -447,23 +401,20 @@ class SchedulePolicy:
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
 
-        # UniBoost (tail-aware admission boosting) state; inert unless the
-        # schedule policy is "uniboost".
-        self.uniboost_gamma = envs.SGLANG_UNIBOOST_GAMMA.get()
+        # UniBoost state; inert unless the schedule policy is "uniboost".
+        self.uniboost_gamma = uniboost_gamma
         self.uniboost_alpha_s_per_token = (
             envs.SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN.get() / 1e6
         )
         self.uniboost_gamma_controller: Optional[GammaAdaController] = None
         self.uniboost_match_topk = envs.SGLANG_UNIBOOST_MATCH_TOPK.get()
-        # Rank-invariant mode (tp_size > 1): Phi is computed from a
-        # rank-invariant arrival sequence number and gamma-Ada is step-clocked
-        # instead of wall-clocked, so all TP ranks sort identically.
-        self.uniboost_tp_invariant = False
-        self.uniboost_tp_arrival_step_s = envs.SGLANG_UNIBOOST_TP_ARRIVAL_STEP_S.get()
+        # Set by _init_uniboost when several ranks must sort identically.
+        self.uniboost_rank_invariant = False
+        self.uniboost_arrival_step_s = envs.SGLANG_UNIBOOST_ARRIVAL_STEP_S.get()
         self._uniboost_next_arrival_seq = 0
         self._uniboost_step = 0
         if self.policy == CacheAwarePolicy.UNIBOOST:
-            self._init_uniboost()
+            self._init_uniboost(enable_uniboost_gamma_ada, uniboost_rank_invariant)
 
     def calc_priority(
         self,
@@ -820,93 +771,66 @@ class SchedulePolicy:
     # ------------------------------------------------------------------
     # UniBoost (tail-aware admission boosting, ICML'26 "beyond prediction")
     # ------------------------------------------------------------------
-    def _init_uniboost(self) -> None:
-        """Validate/arm UniBoost; falls back to fcfs when misconfigured.
+    def _init_uniboost(self, enable_gamma_ada: bool, rank_invariant: bool) -> None:
+        """Arm UniBoost, or fall back to fcfs when misconfigured.
 
-        tp_size > 1 selects the rank-invariant mode: Phi uses a rank-invariant
-        arrival sequence number instead of per-rank ``perf_counter`` stamps,
-        gamma-Ada is step-clocked instead of wall-clocked, and the sort key is
-        quantized with a rank-invariant tie-break -- so every TP rank computes
-        the same queue order from the same broadcast request stream without
-        any cross-rank communication. ``SGLANG_UNIBOOST_FORCE_FCFS_TP=1`` is
-        the escape hatch back to the old fcfs fallback.
+        ``rank_invariant`` (tp_size > 1 or pp_size > 1) keeps the sort key and
+        gamma-Ada off the per-rank wall clock, so every rank admits the same
+        batch from the same request stream.
         """
-        tp_size = get_parallel().tp_size
-        if tp_size > 1:
-            if envs.SGLANG_UNIBOOST_FORCE_FCFS_TP.get():
+        if rank_invariant:
+            if envs.SGLANG_UNIBOOST_FORCE_FCFS_MULTI_RANK.get():
                 logger.warning(
-                    "UniBoost disabled for tp_size=%s by "
-                    "SGLANG_UNIBOOST_FORCE_FCFS_TP=1; falling back to fcfs.",
-                    tp_size,
+                    "UniBoost disabled by SGLANG_UNIBOOST_FORCE_FCFS_MULTI_RANK=1; "
+                    "falling back to fcfs."
                 )
                 self.policy = CacheAgnosticPolicy.FCFS
                 return
-            if envs.SGLANG_UNIBOOST_ALLOW_TP.get():
-                logger.info(
-                    "SGLANG_UNIBOOST_ALLOW_TP is deprecated and now a no-op: "
-                    "rank-invariant UniBoost is the default for tp_size > 1 "
-                    "(set SGLANG_UNIBOOST_FORCE_FCFS_TP=1 to fall back to "
-                    "fcfs)."
-                )
-            self.uniboost_tp_invariant = True
+            self.uniboost_rank_invariant = True
         if self.uniboost_gamma <= 0.0:
             logger.warning(
-                "UniBoost requested but SGLANG_UNIBOOST_GAMMA=%s is not > 0; "
+                "UniBoost requested but --uniboost-gamma=%s is not > 0; "
                 "falling back to fcfs",
                 self.uniboost_gamma,
             )
             self.policy = CacheAgnosticPolicy.FCFS
             return
-        if envs.SGLANG_UNIBOOST_GAMMA_ADA.get():
+        if enable_gamma_ada:
             self.uniboost_gamma_controller = GammaAdaController(
                 gamma_init=self.uniboost_gamma,
-                gamma_min=envs.SGLANG_UNIBOOST_GAMMA_MIN.get(),
-                gamma_max=envs.SGLANG_UNIBOOST_GAMMA_MAX.get(),
-                beta=envs.SGLANG_UNIBOOST_GAMMA_ADA_BETA.get(),
-                tail_sensitivity=envs.SGLANG_UNIBOOST_TAIL_SENSITIVITY.get(),
-                interval_s=envs.SGLANG_UNIBOOST_GAMMA_ADA_INTERVAL_S.get(),
-                window=envs.SGLANG_UNIBOOST_GAMMA_ADA_WINDOW.get(),
-                min_samples=envs.SGLANG_UNIBOOST_GAMMA_ADA_MIN_SAMPLES.get(),
+                min_samples=UNIBOOST_GAMMA_ADA_MIN_SAMPLES,
                 refit_every_k=(
-                    envs.SGLANG_UNIBOOST_GAMMA_ADA_REFIT_EVERY_K.get()
-                    if self.uniboost_tp_invariant
+                    UNIBOOST_GAMMA_ADA_REFIT_EVERY_K
+                    if self.uniboost_rank_invariant
                     else 0
                 ),
             )
-            if not self.uniboost_tp_invariant:
-                # Percentile scans + refits happen on this daemon thread; the
-                # scheduler's critical path only appends samples and reads
-                # gamma. Rank-invariant mode must NOT use the daemon: per-rank
-                # refit timing would let gammas drift apart across TP ranks,
-                # so refits are step-clocked via record_completion instead.
+            if not self.uniboost_rank_invariant:
+                # A per-rank refit thread would let gammas drift across ranks,
+                # so only the wall-clock mode uses it.
                 self.uniboost_gamma_controller.start()
         logger.info(
-            "UniBoost tail-aware admission boosting ENABLED: gamma=%.4g /s, "
-            "alpha=%.1f us/token, gamma-Ada=%s, mode=%s",
+            "UniBoost enabled: gamma=%.4g /s, alpha=%.1f us/token, "
+            "gamma-Ada=%s, mode=%s",
             self.uniboost_gamma,
             self.uniboost_alpha_s_per_token * 1e6,
             "on" if self.uniboost_gamma_controller is not None else "off",
-            "rank-invariant (tp>1)" if self.uniboost_tp_invariant else "wall-clock",
+            "rank-invariant" if self.uniboost_rank_invariant else "wall-clock",
         )
 
     def _uniboost_boost_value(self, work_tokens: int) -> float:
-        """Soft priority boost b_gamma(w) in seconds (UniBoost).
+        """Boost ``b_gamma(w) = ln(1 / (1 - e^{-gamma w})) / gamma`` in seconds.
 
-        ``b_gamma(w) = (1/gamma) * ln(1 / (1 - e^{-gamma w}))`` on the effective
-        work ``w = alpha * uncached_tokens`` (in seconds). Decreasing and convex
-        in w: large when little work remains (short jobs get pulled forward),
-        decaying to ~0 as work grows (long jobs drift back to their FCFS rank so
-        they are never starved).
+        ``w = alpha * uncached_tokens``. The boost decays to ~0 for long jobs,
+        so they keep their FCFS rank and are never starved.
         """
         w = self.uniboost_alpha_s_per_token * max(work_tokens, 0)
         if w <= 0.0:
-            # No uncached work => maximal boost; clamp to a large finite value
-            # so the sort key stays orderable.
+            # No uncached work: maximal (finite) boost.
             return 1e9
         gamma = self.uniboost_gamma
         gw = gamma * w
-        # 1 - e^{-gw} in (0, 1]; guard the tiny-gw underflow with expm1.
-        denom = -math.expm1(-gw)  # == 1 - e^{-gw}, accurate for small gw
+        denom = -math.expm1(-gw)  # 1 - e^{-gw}, accurate for small gw
         if denom <= 0.0:
             return 1e9
         return -math.log(denom) / gamma
@@ -915,25 +839,15 @@ class SchedulePolicy:
         """Phi(i) = arrival_i - b_gamma(effective_work_i); lower = serve sooner."""
         arrival = req.time_stats.wait_queue_entry_time or now
         prompt_len = len(req.origin_input_ids) + len(req.output_ids)
-        # Cache-aware effective work: subtract the radix-matched prefix so a
-        # request whose prompt is mostly a cache hit is treated as short work
-        # (UniBoost cache extension w_tilde = max(w, s_pre - h)).
+        # Cache-aware effective work: a mostly cached prompt is short work.
         uncached = prompt_len - int(req.num_matched_prefix_tokens)
         return arrival - self._uniboost_boost_value(uncached)
 
     def _uniboost_assign_arrival_seq(self, waiting_queue: List[Req]) -> None:
-        """Assign each newly seen request its rank-invariant arrival stamps.
+        """Stamp newly seen requests with an arrival sequence number and step.
 
-        Rank-invariant arrival: the tokenizer-side ``created_time`` is
-        deliberately stripped before serialization to the scheduler
-        (``APIServerReqTimeStats.__getstate__``), so no pre-broadcast wall
-        stamp reaches the scheduler; instead each request gets a per-scheduler
-        monotonically increasing sequence number on first sighting. TP ranks
-        consume the same broadcast request stream, so the waiting queue holds
-        the same requests in the same order on every rank and the assigned
-        sequence numbers match. ``uniboost_enqueue_step`` (the current
-        forward-step count) is stamped at the same moment for the step-clocked
-        latency measurement.
+        Every rank sees the same request stream in the same order, so the
+        sequence numbers match across ranks.
         """
         for r in waiting_queue:
             if r.uniboost_arrival_seq is None:
@@ -942,32 +856,17 @@ class SchedulePolicy:
                 r.uniboost_enqueue_step = self._uniboost_step
 
     def _uniboost_invariant_key(self, req: Req):
-        """Rank-invariant, deterministic-in-data UniBoost sort key.
-
-        Pseudo-arrival = ``arrival_seq * SGLANG_UNIBOOST_TP_ARRIVAL_STEP_S``
-        (a fixed constant converts queue positions to pseudo-seconds so the
-        arrival term trades sanely against b_gamma). Phi is quantized to
-        ``UNIBOOST_PHI_QUANTUM_S`` and ties break on the arrival sequence
-        number, so residual float noise can never flip a pair of requests on
-        one rank but not another. No wall clock anywhere in this key.
-        """
-        arrival = req.uniboost_arrival_seq * self.uniboost_tp_arrival_step_s
+        """Rank-invariant sort key: quantized Phi, then arrival sequence."""
+        arrival = req.uniboost_arrival_seq * self.uniboost_arrival_step_s
         prompt_len = len(req.origin_input_ids) + len(req.output_ids)
         uncached = prompt_len - int(req.num_matched_prefix_tokens)
         phi = arrival - self._uniboost_boost_value(uncached)
         return (int(round(phi / UNIBOOST_PHI_QUANTUM_S)), req.uniboost_arrival_seq)
 
     def _sort_by_uniboost(self, waiting_queue: List[Req]) -> None:
-        """Reorder the prefill waiting queue by tail-aware boost priority.
-
-        Sorts in place ahead of the PrefillAdder admission loop (which consumes
-        ``waiting_queue`` order). Recomputed each pass so a waiting request's
-        boost reflects the current clock and cache state. In rank-invariant
-        mode (tp_size > 1) the key never touches the per-rank wall clock.
-        """
-        if self.uniboost_tp_invariant:
-            # Stamp before the length check: a single request can be admitted
-            # without a sort but still needs its enqueue step for gamma-Ada.
+        """Sort the waiting queue in place by UniBoost priority Phi."""
+        if self.uniboost_rank_invariant:
+            # Stamp even a lone request: gamma-Ada needs its enqueue step.
             self._uniboost_assign_arrival_seq(waiting_queue)
             if len(waiting_queue) < 2:
                 return
@@ -979,17 +878,10 @@ class SchedulePolicy:
         waiting_queue.sort(key=lambda r: self._uniboost_priority(r, now))
 
     def _uniboost_refresh_frontier(self, waiting_queue: List[Req]) -> None:
-        """Frontier-K refresh: re-match only the top-K sorted candidates.
+        """Re-match only the top-K candidates and re-sort them.
 
-        Policy-side matches are advisory (admission re-matches authoritatively
-        when building the prefill batch), and stale matches are conservative:
-        a waiting request's cached prefix can only have grown since its last
-        match (barring eviction), so a stale value under-boosts but never
-        starves. Deep-queue entries therefore keep their last-known
-        num_matched_prefix_tokens (new arrivals: 0 = all work uncached) and
-        per-pass radix walks are bounded to K regardless of queue depth.
-        Full-queue per-pass matching cost the hybrid-mamba radix cache 20-40%
-        goodput at 1000+ queued requests in real-trace replay.
+        Deeper entries keep their last match. A stale match can only
+        under-count cached tokens, so it under-boosts but never starves.
         """
         k = min(self.uniboost_match_topk, len(waiting_queue))
         if k <= 0:
@@ -997,7 +889,7 @@ class SchedulePolicy:
         for r in waiting_queue[:k]:
             match_kv_cache(r, self.tree_cache)
         if k > 1:
-            if self.uniboost_tp_invariant:
+            if self.uniboost_rank_invariant:
                 waiting_queue[:k] = sorted(
                     waiting_queue[:k], key=self._uniboost_invariant_key
                 )
@@ -1008,41 +900,25 @@ class SchedulePolicy:
                 )
 
     def _refresh_uniboost_gamma(self) -> None:
-        """gamma-Ada: pick up the latest gamma computed by the refit thread.
-
-        Called once per prefill scheduling pass. This is a single float
-        attribute read (atomic in CPython) -- no locks and no percentile math
-        on the scheduler's critical path; the heavy lifting runs on the
-        controller's daemon thread (see GammaAdaController.start).
-        """
+        """Pick up the latest gamma from the gamma-Ada controller."""
         controller = self.uniboost_gamma_controller
         if controller is None:
             return
         self.uniboost_gamma = controller.gamma
 
     def uniboost_record_finished(self, reqs: List[Req]) -> None:
-        """gamma-Ada hook: record end-to-end latencies of finished requests.
+        """Record finished, non-aborted latencies for gamma-Ada (once each).
 
-        Called from Scheduler.process_batch_result. Each request is recorded at
-        most once; aborted requests are excluded so cancellations do not skew
-        the tail estimate. No-op unless gamma-Ada is enabled. Recording is an
-        O(1) lock-free deque append per finished request; percentile math
-        happens on the controller's refit thread (wall-clock mode) or on this
-        thread every ``refit_every_k`` completions (rank-invariant mode).
-
-        Rank-invariant mode measures latency in scheduler forward-step counts
-        (``finish_step - enqueue_step``): process_batch_result runs once per
-        forward batch in lockstep on every TP rank and decode completion is
-        token-determined, so the integer latencies -- and therefore the
-        gamma-Ada trajectory -- are identical across ranks. No wall clock.
+        The rank-invariant mode measures latency in processed batch results,
+        which advance in lockstep on every rank.
         """
-        if self.uniboost_tp_invariant:
+        if self.uniboost_rank_invariant:
             # One tick per processed batch result: the shared step clock.
             self._uniboost_step += 1
         controller = self.uniboost_gamma_controller
         if controller is None:
             return
-        if self.uniboost_tp_invariant:
+        if self.uniboost_rank_invariant:
             for req in reqs:
                 if not req.finished():
                     continue
@@ -1066,7 +942,9 @@ class SchedulePolicy:
             req.uniboost_latency_recorded = True
             if isinstance(req.finished_reason, FINISH_ABORT):
                 continue
-            arrival = req.time_stats.wait_queue_entry_time
+            # Retraction resets wait_queue_entry_time; scheduler_recv_time is
+            # set once, so retracted requests keep their full latency.
+            arrival = req.time_stats.scheduler_recv_time
             if arrival <= 0.0:
                 continue
             end = req.time_stats.completion_time

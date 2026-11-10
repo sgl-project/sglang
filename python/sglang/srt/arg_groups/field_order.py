@@ -568,6 +568,8 @@ POSITIONAL_FIELD_ORDER = (
     "media_url_timeout",
     "allow_local_media_files",
     "paged_experts_host_memory_gb",
+    "uniboost_gamma",
+    "enable_uniboost_gamma_ada",
     "_max_running_requests_explicitly_set",
 )
 # fmt: on

@@ -107,6 +107,14 @@ class Schedule(msgspec.Struct):
             ],
         ),
     ] = "fcfs"
+    uniboost_gamma: A[
+        float,
+        "Boost decay rate gamma (1/s) for --schedule-policy uniboost. Larger values behave more like fcfs, smaller values more like shortest-job-first. With --enable-uniboost-gamma-ada this is the starting value. Values <= 0 fall back to fcfs.",
+    ] = 10.0
+    enable_uniboost_gamma_ada: A[
+        bool,
+        "Adapt --uniboost-gamma online to the observed latency tail (gamma-Ada): a heavy tail lowers gamma, a flat tail raises it.",
+    ] = False
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

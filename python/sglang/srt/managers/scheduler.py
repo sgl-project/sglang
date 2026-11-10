@@ -254,6 +254,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
     mamba_prefill_chunk_grid,
+    uniboost_needs_rank_invariance,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -1529,6 +1530,11 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            uniboost_gamma=get_schedule().uniboost_gamma,
+            enable_uniboost_gamma_ada=get_schedule().enable_uniboost_gamma_ada,
+            uniboost_rank_invariant=uniboost_needs_rank_invariance(
+                get_parallel().tp_size, get_parallel().pp_size
+            ),
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(

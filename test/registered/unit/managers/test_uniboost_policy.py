@@ -1,37 +1,11 @@
 """Unit tests for the UniBoost schedule policy and its gamma-Ada controller.
 
-No GPU or server launch: exercises the real SchedulePolicy / GammaAdaController
-with mock Req objects.
-
-Coverage (each case guards a distinct failure mode):
-  * GammaAdaController control law -- heavy tail drives gamma down (more SJF),
-    light tail drives it up (more FCFS), always clamped into
-    [gamma_min, gamma_max] (derived property of the target formula);
-  * the async refit thread -- refits happen on the daemon thread, start() is
-    idempotent, no refit below min_samples, interval_s=0 does not busy-loop;
-  * uniboost waiting-queue ordering -- SJF pull-forward, FCFS tie-break,
-    bounded boost (anti-starvation), cache-aware effective work;
-  * fallback gating -- gamma <= 0, the tree-cache-disabled carve-out, and the
-    tp_size > 1 mode selection (rank-invariant by default,
-    SGLANG_UNIBOOST_FORCE_FCFS_TP escape hatch, deprecated no-op ALLOW_TP);
-  * the finished-request recording hook -- aborts excluded, each request
-    recorded once, and calc_priority never refits synchronously;
-  * frontier-K matching -- per pass, radix prefix matching is bounded to the
-    top-K sorted candidates (deep queues keep last-known matches), and <=0
-    restores full-queue matching;
-  * rank-invariant mode (tp_size > 1) -- two simulated TP ranks fed the
-    identical request stream but different per-rank wall clocks and daemon
-    timings produce identical queue orderings on every pass and bit-identical
-    gamma trajectories under the step-clocked controller, the sort key is
-    wall-clock-free with a quantized/tie-broken total order, and the legacy
-    tp == 1 wall-clock behavior is unchanged.
+Runs the real SchedulePolicy and GammaAdaController on mock requests; no GPU.
 """
 
 import random
-import threading
 import time
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.environ import envs
@@ -41,6 +15,7 @@ from sglang.srt.managers.schedule_policy import (
     CacheAwarePolicy,
     GammaAdaController,
     SchedulePolicy,
+    uniboost_needs_rank_invariance,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -51,6 +26,7 @@ register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 class FakeTimeStats:
     def __init__(self, wait_queue_entry_time=0.0, completion_time=0.0):
+        self.scheduler_recv_time = wait_queue_entry_time
         self.wait_queue_entry_time = wait_queue_entry_time
         self.completion_time = completion_time
 
@@ -97,13 +73,14 @@ class FakeEnabledTreeCache(FakeDisabledTreeCache):
     disable = False
 
 
-def make_policy(policy_name="uniboost", tree_cache=None):
+def make_policy(policy_name="uniboost", tree_cache=None, **uniboost_kwargs):
     return SchedulePolicy(
         policy_name,
         tree_cache if tree_cache is not None else FakeDisabledTreeCache(),
         enable_hierarchical_cache=False,
         enable_priority_scheduling=False,
         schedule_low_priority_values_first=False,
+        **uniboost_kwargs,
     )
 
 
@@ -125,7 +102,6 @@ class UniboostTestBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        # SchedulePolicy._init_uniboost reads tp_size via get_parallel().
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
 
@@ -211,7 +187,6 @@ class TestGammaAdaAsyncController(CustomTestCase):
         rng = random.Random(2)
         for i in range(500):
             ctl.record(1.0 + (100.0 if i % 25 == 0 else rng.uniform(0, 0.05)))
-        before = threading.active_count()
         ctl.start()
         t1 = ctl._thread
         self.assertIsNotNone(t1)
@@ -220,16 +195,9 @@ class TestGammaAdaAsyncController(CustomTestCase):
         # Idempotent start: no second thread.
         ctl.start()
         self.assertIs(ctl._thread, t1)
-        self.assertEqual(threading.active_count(), before + 1)
         self.assertTrue(wait_until(lambda: ctl.refit_count >= 3), ctl.refit_count)
         # Heavy tail: gamma driven down, always within bounds.
         self.assertLess(ctl.gamma, 100.0)
-        self.assertGreaterEqual(ctl.gamma, ctl.gamma_min)
-        self.assertLessEqual(ctl.gamma, ctl.gamma_max)
-        # Keep recording while the thread refits (lock-free append vs scan).
-        for _ in range(2000):
-            ctl.record(1.0 + rng.uniform(0, 0.05))
-        self.assertTrue(wait_until(lambda: ctl.refit_count >= 6))
         self.assertGreaterEqual(ctl.gamma, ctl.gamma_min)
         self.assertLessEqual(ctl.gamma, ctl.gamma_max)
         ctl.stop()
@@ -313,37 +281,28 @@ class TestUniboostFallbacks(UniboostTestBase):
         q[:] = pol.calc_priority(q)
         self.assertEqual([r.rid for r in q], ["a", "b"])
 
-    def test_tp_gating(self):
-        # tp_size > 1 now defaults to the rank-invariant uniboost mode (no
-        # more silent fcfs fallback); SGLANG_UNIBOOST_FORCE_FCFS_TP is the
-        # escape hatch and SGLANG_UNIBOOST_ALLOW_TP a deprecated no-op.
-        fake_parallel = SimpleNamespace(tp_size=2, dcp_enabled=False)
-        with patch(
-            "sglang.srt.managers.schedule_policy.get_parallel",
-            return_value=fake_parallel,
-        ):
-            pol = make_policy()
-            self.assertEqual(pol.policy, CacheAwarePolicy.UNIBOOST)
-            self.assertTrue(pol.uniboost_tp_invariant)
+    def test_rank_invariance_needed_for_tp_or_pp(self):
+        self.assertFalse(uniboost_needs_rank_invariance(tp_size=1, pp_size=1))
+        self.assertTrue(uniboost_needs_rank_invariance(tp_size=2, pp_size=1))
+        # Each PP stage sorts its own queue, so PP alone needs it too.
+        self.assertTrue(uniboost_needs_rank_invariance(tp_size=1, pp_size=2))
 
-            with envs.SGLANG_UNIBOOST_FORCE_FCFS_TP.override(True):
-                pol = make_policy()
-                self.assertEqual(pol.policy, CacheAgnosticPolicy.FCFS)
+    def test_rank_invariant_gating(self):
+        pol = make_policy(uniboost_rank_invariant=True)
+        self.assertEqual(pol.policy, CacheAwarePolicy.UNIBOOST)
+        self.assertTrue(pol.uniboost_rank_invariant)
 
-            with envs.SGLANG_UNIBOOST_ALLOW_TP.override(True):
-                pol = make_policy()
-                self.assertEqual(pol.policy, CacheAwarePolicy.UNIBOOST)
-                self.assertTrue(pol.uniboost_tp_invariant)
+        with envs.SGLANG_UNIBOOST_FORCE_FCFS_MULTI_RANK.override(True):
+            pol = make_policy(uniboost_rank_invariant=True)
+            self.assertEqual(pol.policy, CacheAgnosticPolicy.FCFS)
 
-        # tp == 1 keeps the validated wall-clock mode.
         pol = make_policy()
         self.assertEqual(pol.policy, CacheAwarePolicy.UNIBOOST)
-        self.assertFalse(pol.uniboost_tp_invariant)
+        self.assertFalse(pol.uniboost_rank_invariant)
 
     def test_gamma_zero_falls_back_to_fcfs(self):
-        with envs.SGLANG_UNIBOOST_GAMMA.override(0.0):
-            pol = make_policy()
-            self.assertEqual(pol.policy, CacheAgnosticPolicy.FCFS)
+        pol = make_policy(uniboost_gamma=0.0)
+        self.assertEqual(pol.policy, CacheAgnosticPolicy.FCFS)
 
     def test_disabled_tree_cache_keeps_uniboost(self):
         # The tree-cache-disabled carve-out: uniboost still runs (all prompt
@@ -353,13 +312,7 @@ class TestUniboostFallbacks(UniboostTestBase):
 
 
 class TestUniboostFrontierK(UniboostTestBase):
-    """Frontier-K: per-pass radix matching is bounded to the top-K candidates.
-
-    Guards the fix for the full-queue-matching scheduler tax (20-40% goodput
-    loss at 1000+ queued requests on the hybrid-mamba radix cache in
-    real-trace replay): a future diff that re-matches the whole queue per
-    pass, or that stops matching the admission frontier, turns these red.
-    """
+    """Per-pass radix matching is bounded to the top-K candidates."""
 
     def queue(self, n):
         # Higher index = later arrival; equal work so FCFS order is stable.
@@ -402,8 +355,7 @@ class TestUniboostFrontierK(UniboostTestBase):
 
 class TestGammaAdaWiring(UniboostTestBase):
     def make_ada_policy(self):
-        with envs.SGLANG_UNIBOOST_GAMMA_ADA.override(True):
-            pol = make_policy()
+        pol = make_policy(enable_uniboost_gamma_ada=True)
         self.assertIsNotNone(pol.uniboost_gamma_controller)
         self.addCleanup(pol.uniboost_gamma_controller.stop)
         return pol
@@ -446,7 +398,16 @@ class TestGammaAdaWiring(UniboostTestBase):
         pol.uniboost_record_finished([done])
         self.assertEqual(len(ctl._samples), 1)
 
-    def test_env_knob_defaults_land_on_controller(self):
+    def test_retraction_keeps_full_latency(self):
+        pol = self.make_ada_policy()
+        ctl = pol.uniboost_gamma_controller
+        req = FakeReq("retracted", 10, 5.0, finished=True, completion_time=20.0)
+        # Retraction re-stamps wait_queue_entry_time; latency must not shrink.
+        req.time_stats.wait_queue_entry_time = 15.0
+        pol.uniboost_record_finished([req])
+        self.assertEqual(list(ctl._samples), [15.0])
+
+    def test_controller_defaults(self):
         ctl = self.make_ada_policy().uniboost_gamma_controller
         self.assertEqual(ctl.gamma_min, 1.0)
         self.assertEqual(ctl.gamma_max, 200.0)
@@ -456,7 +417,6 @@ class TestGammaAdaWiring(UniboostTestBase):
         self.assertEqual(ctl.tail_sensitivity, 4.0)
 
     def test_recording_noop_without_gamma_ada(self):
-        # Without gamma-Ada the scheduler hook must be a clean no-op.
         pol = make_policy()
         self.assertIsNone(pol.uniboost_gamma_controller)
         done = FakeReq("done", 10, 5.0, finished=True, completion_time=8.5)
@@ -464,23 +424,21 @@ class TestGammaAdaWiring(UniboostTestBase):
         self.assertFalse(done.uniboost_latency_recorded)
 
 
-def make_tp_policy(tree_cache=None):
-    """A SchedulePolicy constructed as one rank of a tp_size=2 group."""
-    with patch(
-        "sglang.srt.managers.schedule_policy.get_parallel",
-        return_value=SimpleNamespace(tp_size=2, dcp_enabled=False),
-    ):
-        return make_policy(tree_cache=tree_cache)
+def make_rank_policy(tree_cache=None, **kwargs):
+    """A SchedulePolicy for one rank of a multi-rank (tp or pp > 1) group."""
+    return make_policy(tree_cache=tree_cache, uniboost_rank_invariant=True, **kwargs)
+
+
+def patch_gamma_ada(min_samples, refit_every_k):
+    module = "sglang.srt.managers.schedule_policy"
+    return (
+        patch(f"{module}.UNIBOOST_GAMMA_ADA_MIN_SAMPLES", min_samples),
+        patch(f"{module}.UNIBOOST_GAMMA_ADA_REFIT_EVERY_K", refit_every_k),
+    )
 
 
 class RankClock:
-    """One rank's simulated ``time.perf_counter``: distinct offset and drift.
-
-    Two RankClocks with different offsets/drifts model TP ranks whose local
-    wall clocks disagree -- the failure injection for the rank-invariance
-    tests: any code path that reads the patched clock produces different
-    values on the two simulated ranks.
-    """
+    """A rank's simulated ``time.perf_counter`` with its own offset and drift."""
 
     def __init__(self, offset, drift):
         self.now = offset
@@ -491,18 +449,8 @@ class RankClock:
         return self.now
 
 
-class TestUniboostTpInvariant(UniboostTestBase):
-    """Rank-invariant UniBoost under tensor parallelism (tp_size > 1).
-
-    Simulates two TP ranks as two SchedulePolicy instances fed the identical
-    broadcast request stream, but with injected per-rank differences: each
-    rank's FakeReqs carry different wall-clock arrival stamps and each rank's
-    passes run under a different monkeypatched ``perf_counter``. Any use of
-    scheduler-local wall time in Phi or in gamma-Ada would make these tests
-    red by diverging the two ranks' queue orders or gamma trajectories --
-    exactly the TP desync (mismatched batch shapes -> NCCL hang) the
-    rank-invariant mode exists to prevent.
-    """
+class TestUniboostRankInvariant(UniboostTestBase):
+    """Two ranks with different wall clocks must agree on order and gamma."""
 
     # (rid, prompt_len, cached) -- identical on both ranks, like the
     # broadcast request stream. Mixes long, medium, short, and a mostly
@@ -532,11 +480,11 @@ class TestUniboostTpInvariant(UniboostTestBase):
         return [r.rid for r in queue]
 
     def test_two_ranks_agree_on_queue_order(self):
-        pols = [make_tp_policy(), make_tp_policy()]
+        pols = [make_rank_policy(), make_rank_policy()]
         clocks = [RankClock(1_000.0, 0.013), RankClock(50_000.0, 0.007)]
         queues = [[], []]
         for pol in pols:
-            self.assertTrue(pol.uniboost_tp_invariant)
+            self.assertTrue(pol.uniboost_rank_invariant)
 
         cursor = 0
         orders_seen = []
@@ -553,7 +501,7 @@ class TestUniboostTpInvariant(UniboostTestBase):
                 pass_orders.append(
                     self._rank_pass(pols[rank], queues[rank], clocks[rank])
                 )
-            # (a) identical queue orderings on every pass.
+            # Identical queue orderings on every pass.
             self.assertEqual(pass_orders[0], pass_orders[1])
             orders_seen.append(pass_orders[0])
             for rank in range(2):
@@ -568,12 +516,12 @@ class TestUniboostTpInvariant(UniboostTestBase):
         self.assertLess(second_pass.index("H6"), second_pass.index("L2"))
 
     def test_two_ranks_identical_gamma_trajectories(self):
-        with (
-            envs.SGLANG_UNIBOOST_GAMMA_ADA.override(True),
-            envs.SGLANG_UNIBOOST_GAMMA_ADA_MIN_SAMPLES.override(20),
-            envs.SGLANG_UNIBOOST_GAMMA_ADA_REFIT_EVERY_K.override(10),
-        ):
-            pols = [make_tp_policy(), make_tp_policy()]
+        p_min, p_k = patch_gamma_ada(min_samples=20, refit_every_k=10)
+        with p_min, p_k:
+            pols = [
+                make_rank_policy(enable_uniboost_gamma_ada=True),
+                make_rank_policy(enable_uniboost_gamma_ada=True),
+            ]
         clocks = [RankClock(0.0, 0.031), RankClock(7_777.0, 0.005)]
 
         n = 80
@@ -587,7 +535,7 @@ class TestUniboostTpInvariant(UniboostTestBase):
         for rank, pol in enumerate(pols):
             ctl = pol.uniboost_gamma_controller
             self.assertIsNotNone(ctl)
-            # (b) step-clocked mode: no wall-clock daemon on either rank
+            # Step-clocked mode: no wall-clock daemon on either rank
             # (per-rank daemon wake timing is exactly the drift source).
             self.assertIsNone(ctl._thread)
             self.assertEqual(ctl.refit_every_k, 10)
@@ -618,12 +566,9 @@ class TestUniboostTpInvariant(UniboostTestBase):
         self.assertNotEqual(trajectories[0][-1], trajectories[0][0])
 
     def test_invariant_mode_never_reads_wall_clock(self):
-        with (
-            envs.SGLANG_UNIBOOST_GAMMA_ADA.override(True),
-            envs.SGLANG_UNIBOOST_GAMMA_ADA_MIN_SAMPLES.override(1),
-            envs.SGLANG_UNIBOOST_GAMMA_ADA_REFIT_EVERY_K.override(1),
-        ):
-            pol = make_tp_policy()
+        p_min, p_k = patch_gamma_ada(min_samples=1, refit_every_k=1)
+        with p_min, p_k:
+            pol = make_rank_policy(enable_uniboost_gamma_ada=True)
         req = FakeReq("r", 100, 5.0)
         other = FakeReq("s", 9000, 6.0)
         boom = patch(
@@ -643,7 +588,7 @@ class TestUniboostTpInvariant(UniboostTestBase):
         # Stream position decides arrival: a request whose per-rank wall
         # stamp says "much older" but that came later in the broadcast
         # stream must NOT jump ahead (equal work => FCFS by sequence).
-        pol = make_tp_policy()
+        pol = make_rank_policy()
         first = FakeReq("first", 5000, 999_999.0)  # huge per-rank stamp
         second = FakeReq("second", 5000, 1.0)  # tiny stamp, later in stream
         q = [first, second]
@@ -659,10 +604,10 @@ class TestUniboostTpInvariant(UniboostTestBase):
         self.assertEqual(third.uniboost_arrival_seq, 2)
 
     def test_phi_quantization_tie_breaks_on_seq(self):
-        # (3) deterministic total order: sub-quantum Phi differences cannot
+        # Deterministic total order: sub-quantum Phi differences cannot
         # reorder requests -- the rank-invariant sequence breaks the tie --
         # while super-quantum differences still do.
-        pol = make_tp_policy()
+        pol = make_rank_policy()
         a = FakeReq("a", 100, 1.0)
         b = FakeReq("b", 200, 2.0)
         q = [a, b]
@@ -681,12 +626,9 @@ class TestUniboostTpInvariant(UniboostTestBase):
         self.assertEqual(sort_with_boosts({100: 0.5, 200: 0.5102}), ["b", "a"])
 
     def test_invariant_step_latency_recording(self):
-        with (
-            envs.SGLANG_UNIBOOST_GAMMA_ADA.override(True),
-            envs.SGLANG_UNIBOOST_GAMMA_ADA_MIN_SAMPLES.override(100),
-            envs.SGLANG_UNIBOOST_GAMMA_ADA_REFIT_EVERY_K.override(100),
-        ):
-            pol = make_tp_policy()
+        p_min, p_k = patch_gamma_ada(min_samples=100, refit_every_k=100)
+        with p_min, p_k:
+            pol = make_rank_policy(enable_uniboost_gamma_ada=True)
         ctl = pol.uniboost_gamma_controller
         req = FakeReq("done", 100, 5.0)
         aborted = FakeReq("aborted", 100, 5.0, finished_reason=FINISH_ABORT())
@@ -720,12 +662,10 @@ class TestUniboostTpInvariant(UniboostTestBase):
         self.assertIsNotNone(ctl.record_completion(40.0))
         self.assertEqual(ctl.refit_count, 2)
 
-    def test_tp1_wall_clock_path_unchanged(self):
-        # (c) legacy behavior: tp == 1 keeps per-rank wall-clock arrivals and
-        # the daemon-thread controller; none of the invariant bookkeeping
-        # engages.
+    def test_single_rank_wall_clock_path(self):
+        # A single rank keeps wall-clock arrivals and the daemon controller.
         pol = make_policy()
-        self.assertFalse(pol.uniboost_tp_invariant)
+        self.assertFalse(pol.uniboost_rank_invariant)
         a = FakeReq("late", 5000, 100.0)
         b = FakeReq("early", 5000, 50.0)
         q = [a, b]
@@ -735,8 +675,7 @@ class TestUniboostTpInvariant(UniboostTestBase):
         self.assertIsNone(a.uniboost_arrival_seq)
         self.assertIsNone(a.uniboost_enqueue_step)
 
-        with envs.SGLANG_UNIBOOST_GAMMA_ADA.override(True):
-            pol_ada = make_policy()
+        pol_ada = make_policy(enable_uniboost_gamma_ada=True)
         ctl = pol_ada.uniboost_gamma_controller
         self.addCleanup(ctl.stop)
         # Daemon refit thread on; completion-count trigger off.

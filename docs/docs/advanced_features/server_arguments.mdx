@@ -512,7 +512,19 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--schedule-policy`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The scheduling policy of the requests.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`fcfs`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>lpm</code>, <code>random</code>, <code>fcfs</code>, <code>dfs-weight</code>, <code>lof</code>, <code>priority</code>, <code>routing-key</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>lpm</code>, <code>random</code>, <code>fcfs</code>, <code>dfs-weight</code>, <code>lof</code>, <code>priority</code>, <code>routing-key</code>, <code>uniboost</code></td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--uniboost-gamma`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Boost decay rate gamma (1/s) for `--schedule-policy uniboost`. Larger values behave more like fcfs, smaller values more like shortest-job-first. With `--enable-uniboost-gamma-ada` this is the starting value. Values &lt;= 0 fall back to fcfs.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`10.0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-uniboost-gamma-ada`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Adapt `--uniboost-gamma` online to the observed latency tail (gamma-Ada): a heavy tail lowers gamma, a flat tail raises it.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-priority-scheduling`</td>

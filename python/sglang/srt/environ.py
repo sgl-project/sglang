@@ -708,37 +708,15 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
-    # UniBoost tail-aware prefill admission boosting (--schedule-policy uniboost).
-    # Boost decay rate gamma (1/s); <= 0 falls back to fcfs.
-    SGLANG_UNIBOOST_GAMMA = EnvFloat(10.0)
+    # UniBoost (--schedule-policy uniboost) expert knobs.
     # Estimated prefill cost per uncached prompt token, in microseconds.
     SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN = EnvFloat(64.0)
-    # Deprecated no-op: rank-invariant uniboost is now the default for
-    # tp_size > 1 (see schedule_policy.py). Kept so existing deployments that
-    # set it keep working; setting it only logs a deprecation notice.
-    SGLANG_UNIBOOST_ALLOW_TP = EnvBool(False)
-    # Escape hatch: force the legacy fcfs fallback for tp_size > 1 instead of
-    # the rank-invariant uniboost mode.
-    SGLANG_UNIBOOST_FORCE_FCFS_TP = EnvBool(False)
-    # Rank-invariant mode (tp_size > 1): pseudo-seconds per arrival sequence
-    # step, so the arrival term trades sanely against the boost b_gamma.
-    SGLANG_UNIBOOST_TP_ARRIVAL_STEP_S = EnvFloat(0.01)
-    # gamma-Ada: adapt gamma online to the observed latency-tail shape.
-    SGLANG_UNIBOOST_GAMMA_ADA = EnvBool(False)
-    SGLANG_UNIBOOST_GAMMA_MIN = EnvFloat(1.0)
-    SGLANG_UNIBOOST_GAMMA_MAX = EnvFloat(200.0)
-    SGLANG_UNIBOOST_GAMMA_ADA_INTERVAL_S = EnvFloat(5.0)
-    SGLANG_UNIBOOST_GAMMA_ADA_WINDOW = EnvInt(2000)
-    SGLANG_UNIBOOST_GAMMA_ADA_MIN_SAMPLES = EnvInt(200)
-    SGLANG_UNIBOOST_GAMMA_ADA_BETA = EnvFloat(0.3)
-    SGLANG_UNIBOOST_TAIL_SENSITIVITY = EnvFloat(4.0)
-    # Rank-invariant mode (tp_size > 1): gamma-Ada refits synchronously every
-    # K recorded completions (a deterministic completion-count trigger)
-    # instead of on the wall-clock daemon thread.
-    SGLANG_UNIBOOST_GAMMA_ADA_REFIT_EVERY_K = EnvInt(256)
-    # Frontier-K cheap matching: per scheduling pass, re-run radix prefix
-    # matching only for the top-K sorted candidates (the admission frontier);
-    # deeper entries keep their last-known match. <=0 = full-queue matching.
+    # Fall back to fcfs instead of the rank-invariant mode when tp or pp > 1.
+    SGLANG_UNIBOOST_FORCE_FCFS_MULTI_RANK = EnvBool(False)
+    # Rank-invariant mode: pseudo-seconds per arrival sequence step.
+    SGLANG_UNIBOOST_ARRIVAL_STEP_S = EnvFloat(0.01)
+    # Re-match the radix prefix only for the top-K candidates per pass;
+    # <= 0 re-matches the whole queue.
     SGLANG_UNIBOOST_MATCH_TOPK = EnvInt(64)
 
     # ===================================================================
