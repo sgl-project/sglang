@@ -302,21 +302,6 @@ def _restore_live_rows(output: torch.Tensor, plan: Optional[_RowPlan]) -> torch.
     return output
 
 
-def _flashmla_kv_padded_heads(num_heads: int) -> int:
-    """Use native head counts when the installed SM100 kernel supports them."""
-    if _is_cuda and get_platform().is_sm100 and 1 <= num_heads <= 128:
-        from sglang.kernels.ops.attention import flash_mla_interface
-
-        if flash_mla_interface.supports_native_heads():
-            return num_heads
-    if num_heads <= 64:
-        return 64
-    if num_heads <= 128:
-        return 128
-    # Keep original head count if it exceeds current padded variants.
-    return num_heads
-
-
 @dataclass(frozen=True)
 class DSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
@@ -707,10 +692,19 @@ class DeepseekSparseAttnBackend(
             deterministic=get_exec().deterministic.enable_deterministic_inference,
         )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
-        self.flashmla_kv_num_q_heads = _flashmla_kv_padded_heads(self.num_q_heads)
-        self.flashmla_kv_num_q_heads_prefill = _flashmla_kv_padded_heads(
-            self.local_num_q_heads
-        )
+        if self.num_q_heads <= 64:
+            self.flashmla_kv_num_q_heads = 64
+        elif self.num_q_heads <= 128:
+            self.flashmla_kv_num_q_heads = 128
+        else:
+            # Keep original head count if it exceeds current padded variants.
+            self.flashmla_kv_num_q_heads = self.num_q_heads
+        if self.local_num_q_heads <= 64:
+            self.flashmla_kv_num_q_heads_prefill = 64
+        elif self.local_num_q_heads <= 128:
+            self.flashmla_kv_num_q_heads_prefill = 128
+        else:
+            self.flashmla_kv_num_q_heads_prefill = self.local_num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
         self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
         # Keep graph-captured buffers alive per stream.
@@ -3555,9 +3549,13 @@ class DeepseekSparseAttnBackend(
         assert metadata.flashmla_metadata is not None
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
-        num_q_heads = layer.tp_q_head_num
-        target_q_heads = _flashmla_kv_padded_heads(num_q_heads)
-        q_all = q_all.view(-1, 1, num_q_heads, layer.head_dim)
+        q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        num_q_heads = q_all.shape[2]
+        target_q_heads = (
+            self.flashmla_kv_num_q_heads_prefill
+            if self.dsa_shards_index_k and not dcp_partial
+            else self.flashmla_kv_num_q_heads
+        )
         if target_q_heads != num_q_heads:
             # Pad q heads to match FlashMLA decode supported head-count variants.
             q_input = q_all.new_zeros(
