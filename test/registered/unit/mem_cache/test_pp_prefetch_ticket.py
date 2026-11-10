@@ -5,7 +5,7 @@ import tempfile
 import threading
 import unittest
 from array import array
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from queue import Empty, Queue
@@ -43,6 +43,31 @@ register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 # The pool schema a hit query over stages holding only the KV host pool
 # reduces: the host pools some stage registers.
 _SCHEMA = [str(PoolName.KV)]
+
+
+@contextmanager
+def _stop_after_transfers(c, operations):
+    """Drive the IO worker through ``operations`` transfers: the stop event
+    reads clear while they run (a transfer consults it per batch and skips
+    the backend once it is set) and set at the loop check after the last."""
+    done = []
+    real = c._page_transfer
+
+    def page_transfer(operation):
+        try:
+            return real(operation)
+        finally:
+            done.append(operation)
+
+    with (
+        patch.object(c, "_page_transfer", page_transfer),
+        patch.object(
+            c.storage_stop_event,
+            "is_set",
+            side_effect=lambda: len(done) >= operations,
+        ),
+    ):
+        yield
 
 
 class _TwoStageGroup:
@@ -118,6 +143,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.host_mem_release_queue = Queue()
         c.prefetch_buffer = Queue()
         c.storage_stop_event = threading.Event()
+        c.prefetch_io_aux_thread = None
         c.prefetch_tokens_occupied = 0
         c.mem_pool_host = Mock(page_size=4, entry_map={PoolName.KV: Mock()})
         c.mem_pool_host.available_size.return_value = 1 << 20
@@ -202,17 +228,32 @@ class TestPPPrefetchTicket(unittest.TestCase):
     def run_io(self, operations):
         with (
             patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 1),
-            patch.object(
-                self.c.storage_stop_event,
-                "is_set",
-                side_effect=[False] * operations + [True],
-            ),
+            _stop_after_transfers(self.c, operations),
         ):
             self.c.prefetch_io_aux_func()
         acks = []
         while not self.c.prefetch_sync_queue.empty():
             acks.append(self.c.prefetch_sync_queue.get_nowait())
         return acks
+
+    def test_stop_event_answers_tickets_as_misses_but_still_reduces(self):
+        """A ticket delivered after the stop event is answered without a
+        backend query or a host allocation, but its hits reduce still runs,
+        so the stages stay paired; the operation reaches prefetch_buffer
+        terminated at zero hits."""
+        self.assertTrue(self.submit("hit").decision)
+        self.c.storage_stop_event.set()
+        queries = self.c._storage_hit_query.call_count
+        reduces = self.c._all_reduce.call_count
+        with patch.object(self.c, "_allocate_pp_prefetch_buffers") as allocate:
+            self.run_commands()
+        self.assertEqual(self.c._storage_hit_query.call_count, queries)
+        allocate.assert_not_called()
+        self.assertEqual(self.c._all_reduce.call_count, reduces + 1)
+        operation = self.c.prefetch_buffer.get_nowait()
+        self.assertTrue(operation.is_terminated())
+        self.assertEqual(operation.storage_hit_count, 0)
+        self.assertTrue(self.c.prefetch_buffer.empty())
 
     def test_hit_and_miss_are_reused_across_enqueue_retract_and_retry(self):
         c, cache = self.c, self.cache
@@ -758,9 +799,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.storage_backend.batch_get_v2.return_value = {"swa": [True]}
         with (
             patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 1),
-            patch.object(
-                c.storage_stop_event, "is_set", side_effect=[False, False, True]
-            ),
+            _stop_after_transfers(c, 2),
         ):
             c.prefetch_io_aux_func()
         acks = [c.prefetch_sync_queue.get_nowait() for _ in range(6)]
