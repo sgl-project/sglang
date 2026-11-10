@@ -10,9 +10,12 @@ from collections import defaultdict
 
 import torch
 
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedLRUList,
+    UnifiedTreeNode,
+)
 
 MAMBA = ComponentType.MAMBA
 
@@ -119,6 +122,18 @@ class TestMambaHostEvictionOrder(unittest.TestCase):
         core = _FakeTreeCore()
         p, a, _stateless, tail = _chain(core, 4)
         # `a` is the deepest state of every hit that ends inside `_stateless`.
+        _seed_host_lru(core, [a, tail, p])
+
+        self.assertEqual(_drive(core, 1), [12])
+        self.assertTrue(_has_host_state(a))
+        self.assertTrue(_has_host_state(tail))
+
+    def test_state_whose_child_is_device_only_is_kept(self):
+        core = _FakeTreeCore()
+        p, a, pending, tail = _chain(core, 4)
+        # `pending` is not backed up yet and may leave the device without a
+        # host copy, so `a` may become the deepest host state of its path.
+        pending.component_data[MAMBA].value = torch.tensor([0])
         _seed_host_lru(core, [a, tail, p])
 
         self.assertEqual(_drive(core, 1), [12])

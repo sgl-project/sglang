@@ -1228,9 +1228,9 @@ class MambaComponent(TreeComponent):
         Pass-through checkpoints go first. A host prefix hit ends at the deepest
         Mamba state on the matched path, so evicting a path's last state drops
         the hit for all of its host KV. A pass-through checkpoint has one child
-        that holds its own state, so evicting it only loses hits that end
-        exactly there. Leaves, forks and states with no stateful child are kept
-        until no pass-through checkpoint is left."""
+        that holds its own host state, so evicting it only loses hits that end
+        exactly there. Leaves, forks and states whose child has no host state
+        are kept until no pass-through checkpoint is left."""
         for pass_through_only in (True, False):
             if tracker[self.component_type] >= num_tokens:
                 return
@@ -1244,12 +1244,16 @@ class MambaComponent(TreeComponent):
             )
 
     def _is_pass_through_checkpoint(self, node: UnifiedTreeNode) -> bool:
-        """One child, and that child holds its own Mamba state (device or host)."""
+        """One child, and that child holds its own Mamba state on host.
+
+        A device-only child does not count: it can leave the device without a
+        host copy (``write_through_selective`` before its threshold, or a
+        backup that finds no host slot), and the path would then lose both
+        states."""
         if len(node.children) != 1:
             return False
         (child,) = node.children.values()
-        cd = child.component_data[self.component_type]
-        return cd.value is not None or cd.host_value is not None
+        return child.component_data[self.component_type].host_value is not None
 
     def _drive_host_eviction_pass(
         self,

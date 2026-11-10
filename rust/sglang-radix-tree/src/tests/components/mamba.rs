@@ -1558,6 +1558,19 @@ fn host_eviction_keeps_a_state_whose_child_has_none() {
 }
 
 #[test]
+fn host_eviction_keeps_a_state_whose_child_is_device_only() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let [p, a, pending, tail] = chain::<4>(&mut tc);
+    // `pending` is not backed up yet and may leave the device without a host
+    // copy, so `a` may become the deepest host state of its path.
+    set_mamba_device(&mut tc, pending, 0);
+    seed_host_mamba_lru(&mut tc, &[a, tail, p]);
+    assert_eq!(drive_mamba_host_eviction(&mut tc, 1), vec![12]);
+    assert!(tc.arena.node(a).has_host_value(MAMBA));
+    assert!(tc.arena.node(tail).has_host_value(MAMBA));
+}
+
+#[test]
 fn host_eviction_falls_back_to_lru_order_once_no_pass_through_is_left() {
     let mut tc = mamba_core(/* page_size = */ 1);
     let [a, b, tail] = chain::<3>(&mut tc);

@@ -809,9 +809,9 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// Pass-through checkpoints go first. A host prefix hit ends at the deepest
     /// Mamba state on the matched path, so evicting a path's last state drops
     /// the hit for all of its host KV. A pass-through checkpoint has one child
-    /// that holds its own state, so evicting it only loses hits that end
-    /// exactly there. Leaves, forks and states with no stateful child are
-    /// kept until no pass-through checkpoint is left.
+    /// that holds its own host state, so evicting it only loses hits that end
+    /// exactly there. Leaves, forks and states whose child has no host state
+    /// are kept until no pass-through checkpoint is left.
     fn drive_host_eviction(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
@@ -839,7 +839,11 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
 }
 
 impl MambaComponent {
-    /// One child, and that child holds its own Mamba state (device or host).
+    /// One child, and that child holds its own Mamba state on host.
+    ///
+    /// A device-only child does not count: it can leave the device without a
+    /// host copy (`write_through_selective` before its threshold, or a backup
+    /// that finds no host slot), and the path would then lose both states.
     fn is_pass_through_checkpoint_<K: ChildKeyType>(
         tree_core: &UnifiedTreeCore<K>,
         node_id: NodeIdx_,
@@ -849,8 +853,7 @@ impl MambaComponent {
             return false;
         }
         let child = *node.children.values().next().expect("one child");
-        tree_core.arena.has_device_value(child, MAMBA)
-            || tree_core.arena.has_host_value(child, MAMBA)
+        tree_core.arena.has_host_value(child, MAMBA)
     }
 
     /// One LRU sweep of `drive_host_eviction`; `pass_through_only` skips every
