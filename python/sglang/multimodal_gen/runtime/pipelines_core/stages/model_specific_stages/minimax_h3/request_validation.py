@@ -21,6 +21,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MINIMAX_H3_SUPPORTED_FPS,
     warn_unverified_short_edge,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.image_canvas import (
+    MINIMAX_H3_IMAGE_PIXEL_GRID,
+    minimax_h3_validate_min_generation_area,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     MINIMAX_H3_CONDITION_ROLE_KEYFRAME,
     MINIMAX_H3_CONDITION_ROLE_REFERENCE,
@@ -71,6 +75,31 @@ def _validate_target(target: Any, *, profile: MiniMaxH3TaskProfile) -> dict[str,
     path = "target"
     if not isinstance(target, Mapping):
         raise ValueError(f"{path} is required and must be an object")
+    if profile.output_modality == "image":
+        unknown = set(target) - {"width", "height", "min_generation_area"}
+        if unknown:
+            raise ValueError(f"{path} has unknown fields: {sorted(unknown)}")
+        min_area = target.get("min_generation_area")
+        dimensions = {}
+        for name in ("width", "height"):
+            value = _require_int(target.get(name), f"{path}.{name}")
+            if min_area is not None:
+                # Generated on an aligned canvas, then resized to this size.
+                if value < 1:
+                    raise ValueError(f"{path}.{name} must be positive")
+            elif (
+                value < MINIMAX_H3_IMAGE_PIXEL_GRID
+                or value % MINIMAX_H3_IMAGE_PIXEL_GRID
+            ):
+                raise ValueError(
+                    f"{path}.{name} must be at least 32 and a multiple of 32"
+                )
+            dimensions[name] = value
+        if min_area is not None:
+            dimensions["min_generation_area"] = minimax_h3_validate_min_generation_area(
+                min_area, f"{path}.min_generation_area"
+            )
+        return dimensions
     # The canonical target has a deliberately small projection.  Transport
     # compatibility keys are ignored; only these three declared values are
     # validated and emitted below.
@@ -177,7 +206,12 @@ def _validate_conditions(
         cpath = f"{path}[{index}]"
         if not isinstance(cond, Mapping):
             raise ValueError(f"{cpath} must be an object")
-        unknown = set(cond) - _ALLOWED_CONDITION_KEYS
+        allowed_keys = (
+            {"type", "uri", "role"}
+            if profile.output_modality == "image"
+            else _ALLOWED_CONDITION_KEYS
+        )
+        unknown = set(cond) - allowed_keys
         if unknown:
             raise ValueError(f"{cpath} has unknown fields: {sorted(unknown)}")
         role = _require_str(cond.get("role"), f"{cpath}.role")
@@ -194,6 +228,8 @@ def _validate_conditions(
         except ValueError as exc:
             raise ValueError(f"{cpath}: {exc}") from exc
         uri = _require_str(cond.get("uri"), f"{cpath}.uri")
+        if profile.output_modality == "image" and not uri.strip():
+            raise ValueError(f"{cpath}.uri must be a non-empty URI")
 
         entry: dict[str, Any] = {"type": cond_type, "uri": uri, "role": role}
         if rule.requires_frame_index:
@@ -282,14 +318,33 @@ def minimax_h3_validate_canonical_request(
     path on any violation. Conditions order is preserved (it is semantic:
     prompt ordinal labels reference it). seed=0 is a legal value.
     """
-    # Accept transport wrappers and compatibility kwargs at this boundary, but
-    # never copy them into the canonical request.
-    del _extra_kwargs
     # Normalize the task name before profile lookup so offline callers match
     # the adapter behaviour.
     task_name = canonical_minimax_h3_task(_require_str(task, "task"))
     profile = minimax_h3_task_profile(task_name)
-    prompt_text = _require_str(prompt, "prompt")
+    # Video requests ignore transport-compatibility kwargs; image requests
+    # reject every extra field except ``schema``.
+    is_image = profile.output_modality == "image"
+    if is_image:
+        unknown = set(_extra_kwargs) - {"schema"}
+        if unknown:
+            raise ValueError(f"image request has unknown fields: {sorted(unknown)}")
+        if (
+            "schema" in _extra_kwargs
+            and _extra_kwargs["schema"] != MINIMAX_H3_REQUEST_SCHEMA
+        ):
+            raise ValueError(f"schema must be {MINIMAX_H3_REQUEST_SCHEMA!r}")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt must be a non-empty string")
+        for name, value in (
+            ("flow_shift", flow_shift),
+            ("audio_flow_shift", audio_flow_shift),
+        ):
+            if value is not None:
+                raise ValueError(f"{name} is unsupported for image tasks")
+        prompt_text = prompt
+    else:
+        prompt_text = _require_str(prompt, "prompt")
 
     normalized_target = _validate_target(target, profile=profile)
     requested_frame_count = None
@@ -322,7 +377,7 @@ def minimax_h3_validate_canonical_request(
                     f"conditions[{index}]: video references are not supported "
                     f"in v1 for task {profile.task!r} (image/audio only)"
                 )
-    if normalized_target.get("duration_seconds") is None:
+    if not is_image and normalized_target.get("duration_seconds") is None:
         # Only reachable for duration_from_audio_reference profiles.
         duration_sources = [
             cond

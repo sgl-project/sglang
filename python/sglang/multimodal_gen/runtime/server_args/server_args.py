@@ -224,7 +224,9 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ltx-2.3",
         "ltx-2.5-diffusers",
         "minimax-h3",
+        "minimax-h3-image",
         "minimaxai/minimax-h3",
+        "minimaxai/minimax-h3-image",
         "inclusionai/ming-image-0.1-design",
         "inclusionai/ming-image-0.1-design-layer",
         "ming-image-0.1-design",
@@ -260,6 +262,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "LongCatImagePipelineConfig",
         "LongCatImageEditPipelineConfig",
         "MiniMaxH3PipelineConfig",
+        "MiniMaxH3ImagePipelineConfig",
         "MingImagePipelineConfig",
         "MingImageLayerPipelineConfig",
         "QwenImagePipelineConfig",
@@ -426,16 +429,15 @@ class ServerArgs(DisaggServerArgsMixin):
     transformer_weights_path: str | None = None
     # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
     minimax_h3_adaln_cache_path: str | None = None
-    # Rebuild AdaLN outputs per request from the checkpoint, no sidecar needed.
-    minimax_h3_adaln_online: bool = False
-    # Widest timestep plan the rebuild slab is sized for; see
-    # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
-    minimax_h3_adaln_plan_width: int = 4
+    # None lets the model choose; False explicitly keeps resident projections.
+    minimax_h3_adaln_online: bool | None = None
+    # None chooses 2 for image releases, otherwise MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
+    minimax_h3_adaln_plan_width: int | None = None
     # Pinned-host cache for built AdaLN plans (decimal GB, 0 disables). Plans
     # evicted from the GPU slab swap back in from here instead of re-reading
     # the 24.2 GiB checkpoint. Expert knobs (GPU slot count, fp32 rebuild)
     # live in envs.py as SGLANG_DIFFUSION_MINIMAX_H3_ADALN_*.
-    minimax_h3_adaln_host_cache_gb: float = 8.0
+    minimax_h3_adaln_host_cache_gb: float | None = None
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -2323,7 +2325,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 "from the GPU slab swaps back in over PCIe instead of "
                 "re-reading the 24.2 GiB checkpoint (measured 5.8-6.7 s). One "
                 "50-step schedule needs ~0.9 (t2va) / 1.33 (fl2va) / 1.77 "
-                "(ref2va) GB; the default 8 holds several. Groups are evicted "
+                "(ref2va) GB. Auto uses 8 GB, or 0 for image releases whose "
+                "fixed timestep plans all fit on the GPU. Groups are evicted "
                 "LRU and over-cap groups just recompute. 0 disables the tier."
             ),
         )
