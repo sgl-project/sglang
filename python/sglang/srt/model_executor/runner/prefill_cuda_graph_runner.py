@@ -1841,13 +1841,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
         profile_context = empty_context()
-        # Holds the active torch profiler during capture so the backend can
-        # advance its schedule (profiler.step()) per shape. Only the scheduled
-        # per-shape profiler (SGLANG_GRAPH_BATCH_CAPTURE) needs stepping.
-        # The trace is the capture pass. Breakable attention
-        # (RadixAttention._eager_attention) is an eager graph break: capture
-        # records the call and does not run it, so attention and KV-store
-        # kernels are not in these files. They run between segments at replay.
+        # Set only for the scheduled per-shape profiler so the backend can
+        # step it. Eager graph breaks (attention, KV store) do not run during
+        # capture, so those kernels are absent from the trace.
         self._profiler = None
         profile_options = None
         if self.enable_profile_cuda_graph:
