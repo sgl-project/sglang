@@ -602,11 +602,12 @@ class PrefillBootstrapQueue:
         )
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def pop_bootstrapped(self) -> List[Req]:
-        """Pop the reqs which have finished bootstrapping."""
+    def pop_bootstrapped(self, dst: ReqList) -> List[Req]:
+        """Move the reqs which have finished bootstrapping into `dst`, and
+        return them."""
 
         bootstrapped_reqs = []
-        indices_to_remove = set()
+        failed_reqs = []
 
         if len(self.queue) == 0:
             return []
@@ -630,17 +631,16 @@ class PrefillBootstrapQueue:
                 self.scheduler.attn_tp_cpu_group,
             )
 
-        for i, (req, poll) in enumerate(zip(queue, polls)):
+        for req, poll in zip(queue, polls):
             if poll == KVPoll.Failed:
                 self.scheduler.handle_bootstrap_failure(req)
-                indices_to_remove.add(i)
+                failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
                 if not req.is_retracted and self.can_prefill_before_bootstrap(req):
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
                     bootstrapped_reqs.append(req)
-                    indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
                     req.arrival_processed_tokens = (
                         self.scheduler.processed_tokens_counter
@@ -653,7 +653,6 @@ class PrefillBootstrapQueue:
                 elif not self.finalize_bootstrap(req):
                     continue
                 bootstrapped_reqs.append(req)
-                indices_to_remove.add(i)
                 req.time_stats.set_wait_queue_entry_time()
                 req.arrival_processed_tokens = self.scheduler.processed_tokens_counter
             else:
@@ -661,7 +660,8 @@ class PrefillBootstrapQueue:
                     f"Unexpected poll state {poll} for req {req.rid} in pop_bootstrapped"
                 )
 
-        self.queue.leave([queue[i] for i in indices_to_remove])
+        self.queue.leave(failed_reqs)
+        move(bootstrapped_reqs, self.queue, dst)
 
         return bootstrapped_reqs
 
@@ -812,9 +812,7 @@ class SchedulerDisaggregationPrefillMixin:
             if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            self.waiting_queue.join(
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-            )
+            self.disagg_prefill_bootstrap_queue.pop_bootstrapped(self.waiting_queue)
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -953,11 +951,10 @@ class SchedulerDisaggregationPrefillMixin:
                 self._yield_gil_if_needed()
                 continue
             bootstrapped_reqs = (
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(self.waiting_queue)
                 if should_ingest_requests
                 else []
             )
-            self.waiting_queue.join(bootstrapped_reqs)
             # Resume batch creation on completion, new/ready requests, or an idle step.
             if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
                 skip_batch_creation = False
@@ -1621,8 +1618,7 @@ class SchedulerDisaggregationPrefillMixin:
                 ):
                     # optimistic request yields to waiting requests; with a step
                     # in flight, it is requeued once its last step is processed.
-                    self.chunked_req = None
-                    self.prefill_launched_reqs.join([req])
+                    move([req], self.chunked_reqs, self.prefill_launched_reqs)
                     if req.inflight_steps == 0:
                         self.optimistic_release_and_requeue(
                             req, self.prefill_launched_reqs
@@ -2079,5 +2075,4 @@ class SchedulerDisaggregationPrefillMixin:
                 self.metrics_collector.increment_prefill_retries(1)
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
-            src.leave([req])
-            self.waiting_queue.prepend([req])
+            move([req], src, self.waiting_queue, at=0)

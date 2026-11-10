@@ -302,7 +302,9 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 return_value=SimpleNamespace(optimistic_prefill_attempts=2),
             ),
         ):
-            result = queue.pop_bootstrapped()
+            waiting = IndexedReqList(ListKind.WAITING)
+            result = queue.pop_bootstrapped(waiting)
+        self.assertEqual(list(waiting), result)
 
         return queue, req, result
 

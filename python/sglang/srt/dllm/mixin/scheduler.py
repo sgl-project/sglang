@@ -12,6 +12,8 @@ from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    ReqList,
+    move,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
@@ -238,9 +240,9 @@ class SchedulerDllmMixin:
         num_requests_to_add = min(max_dllm_capacity, len(self.waiting_queue))
 
         if num_requests_to_add > 0:
-            requests_to_add = self.waiting_queue[:num_requests_to_add]
-            self.dllm_manager.add_waiting_reqs(requests_to_add)
-            self.waiting_queue.replace(self.waiting_queue[num_requests_to_add:])
+            self.dllm_manager.add_waiting_reqs(
+                self.waiting_queue[:num_requests_to_add], src=self.waiting_queue
+            )
 
     def _should_skip_prefill(self: Scheduler, running_batch: ScheduleBatch) -> bool:
         """Check if DLLM prefill should be skipped."""
@@ -458,17 +460,16 @@ class DllmManager:
         """Get all decode requests from waiting queue."""
         return [req for req in self.waiting_queue if not req.is_dllm_prefill()]
 
-    def add_waiting_reqs(self, reqs: Union[Req, List[Req]]) -> None:
-        """Add requests to waiting queue with redundancy check."""
+    def add_waiting_reqs(self, reqs: List[Req], src: ReqList) -> None:
+        """Move requests from `src` into the waiting queue, with a redundancy
+        check."""
         assert self.dllm_config is not None, "Diffusion LLM config is not set."
 
-        reqs_to_add = reqs if isinstance(reqs, list) else [reqs]
-
         # Check for duplicate request IDs
-        if self._has_duplicate_reqs(reqs_to_add):
+        if self._has_duplicate_reqs(reqs):
             raise RuntimeError("Redundant requests detected in dLLM requests.")
 
-        self.waiting_queue.join(reqs_to_add)
+        move(reqs, src, self.waiting_queue)
 
     def add_staging_reqs(self, reqs: Union[Req, List[Req]]) -> None:
         """Add requests to staging queue (allocated by PrefillAdder)."""

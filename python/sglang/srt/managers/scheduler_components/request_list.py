@@ -55,6 +55,10 @@ class ReqList(ABC):
     @abstractmethod
     def leave(self, reqs: Iterable[Req]) -> None: ...
 
+    def req_of(self, item) -> Req:
+        """The request an item of this list stands for."""
+        return item
+
     def abort(self, recv_req: AbortReq) -> None:
         """Abort the requests `recv_req` names."""
 
@@ -124,13 +128,12 @@ class IndexedReqList(ReqList):
         self._req_of = req_of
         self._items: List[Any] = []
 
-    def join(self, items: Iterable) -> None:
-        """Add the given items at the back, in order."""
-        self._items.extend(items)
-
-    def prepend(self, items: Iterable) -> None:
-        """Add the given items at the front, in order."""
-        self._items[:0] = items
+    def join(self, items: Iterable, *, at: Optional[int] = None) -> None:
+        """Add the given items in order: at the back, or before position `at`."""
+        if at is None:
+            self._items.extend(items)
+        else:
+            self._items[at:at] = items
 
     def replace(self, items: Iterable) -> None:
         self._items = list(items)
@@ -150,6 +153,9 @@ class IndexedReqList(ReqList):
         if self._abort is not None:
             self._abort(recv_req)
 
+    def req_of(self, item) -> Req:
+        return self._req_of(item)
+
     def items(self) -> Iterator:
         return iter(self._items)
 
@@ -166,11 +172,25 @@ class IndexedReqList(ReqList):
         return self._items[index]
 
 
-def move(reqs: Iterable[Req], src: ReqList, dst: ReqList) -> None:
-    """Move requests from `src` to `dst`; each must be in `src`."""
-    reqs = list(reqs)
-    missing = [req.rid for req in reqs if req not in src]
+def move(
+    items: Iterable, src: ReqList, dst: ReqList, *, at: Optional[int] = None
+) -> None:
+    """Move requests from `src` into `dst` in one step; each must be in `src`.
+    `items` are what `dst` holds: its wrappers for a list that wraps requests,
+    else the requests. `at` inserts them before that position of an
+    `IndexedReqList` instead of at the back."""
+    if at is not None and not isinstance(dst, IndexedReqList):
+        raise TypeError(f"{dst.kind.name} has no positions to insert at")
+    items = list(items)
+    if not items:
+        return
+    reqs = [dst.req_of(item) for item in items]
+    listed = src if isinstance(src, KeyedReqList) else set(src)
+    missing = [req.rid for req in reqs if req not in listed]
     if missing:
         raise RuntimeError(f"Requests {missing} are not in {src.kind.name}")
     src.leave(reqs)
-    dst.join(reqs)
+    if at is None:
+        dst.join(items)
+    else:
+        dst.join(items, at=at)

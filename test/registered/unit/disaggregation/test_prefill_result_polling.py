@@ -133,6 +133,7 @@ def _sending(reqs=()):
 class _Scheduler(SchedulerDisaggregationPrefillMixin):
     """Run real scheduling and result handling with controlled intake and GPU events."""
 
+    chunked_req = Scheduler.chunked_req
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     _copy_result_to_cpu = Scheduler._copy_result_to_cpu
     pause_generation = Scheduler.pause_generation
@@ -185,7 +186,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
             output_streamer=None,
             send_abort=None,
         )
-        self.chunked_req = None
+        self.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         self.decode_offload_manager = None
         self.hisparse_coordinator = None
         self.running_batch = ScheduleBatch(reqs=[])
@@ -204,7 +205,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.enable_async_d2h_copy = False
         self.enable_overlap_mlx = False
         self.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            pop_bootstrapped=lambda: []
+            pop_bootstrapped=lambda dst: []
         )
         self.ngram_embedding_manager = SimpleNamespace(
             prepare_for_forward=lambda batch, chunked_req: batch

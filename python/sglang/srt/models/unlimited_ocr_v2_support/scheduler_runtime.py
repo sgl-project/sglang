@@ -235,11 +235,7 @@ class UocrSchedulerRuntime:
             self._reuse.on_retracted(req)
         if not is_retracted and self._prefetch.park(req):
             return False
-        pos = self._reuse.queue_position(waiting_queue, req)
-        if pos is None:
-            waiting_queue.join([req])
-        else:
-            waiting_queue.replace([*waiting_queue[:pos], req, *waiting_queue[pos:]])
+        waiting_queue.join([req], at=self._reuse.queue_position(waiting_queue, req))
         return True
 
     def close(self) -> None:

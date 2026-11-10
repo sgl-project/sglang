@@ -3,6 +3,7 @@ import inspect
 import re
 import textwrap
 import unittest
+from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -19,8 +20,10 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.models.unlimited_ocr_v2_support.document_prefetch import DocPrefetch
 from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
@@ -94,6 +97,87 @@ class TestKeyedReqList(CustomTestCase):
 
         self.assertEqual(list(running), [c])
         self.assertNotIn(a, running)
+
+
+def _reqs(rids):
+    return [FakeReq(rid=rid) for rid in rids]
+
+
+class TestMove(CustomTestCase):
+    def test_move_wraps_into_a_wrapper_list_and_keeps_its_index(self):
+        a, b, c = _reqs("abc")
+        src = KeyedReqList(ListKind.PREFILL_LAUNCHED)
+        src.join([a, b, c])
+        dst = IndexedReqList(ListKind.PD_RELEASING, req_of=lambda x: x[0])
+        held = (c, "held")
+        dst.join([held])
+
+        wrapped = [(a, "a"), (b, "b")]
+        move(wrapped, src, dst)
+
+        self.assertEqual(list(src), [c])
+        self.assertEqual(list(dst.items()), [held, *wrapped])
+        self.assertEqual(list(dst), [c, a, b])
+
+    def test_move_out_of_a_wrapper_list_unwraps_by_request(self):
+        a, b = _reqs("ab")
+        src = IndexedReqList(ListKind.PD_RECEIVING, req_of=lambda x: x.req)
+        wrappers = [SimpleNamespace(req=a), SimpleNamespace(req=b)]
+        src.join(wrappers)
+        dst = IndexedReqList(ListKind.WAITING)
+
+        move([b], src, dst)
+
+        self.assertEqual(list(src.items()), [wrappers[0]])
+        self.assertEqual(list(dst), [b])
+
+    def test_at_inserts_before_a_position(self):
+        a, b, c, d, e = _reqs("abcde")
+        src = IndexedReqList(ListKind.PD_SENDING)
+        src.join([d, e])
+        dst = IndexedReqList(ListKind.WAITING)
+        dst.join([a, b, c])
+
+        move([d], src, dst, at=0)
+        move([e], src, dst, at=2)
+
+        self.assertEqual(list(dst), [d, a, e, b, c])
+        self.assertEqual(list(src), [])
+
+    def test_join_at_matches_a_rebuilt_list(self):
+        for at in (None, 0, 1, 3, 9):
+            with self.subTest(at=at):
+                reqs = _reqs("abc")
+                new = FakeReq(rid="new")
+                queue = IndexedReqList(ListKind.WAITING)
+                queue.join(reqs)
+                queue.join([new], at=at)
+                pos = len(reqs) if at is None else at
+                self.assertEqual(list(queue), [*reqs[:pos], new, *reqs[pos:]])
+
+    def test_a_request_missing_from_the_source_raises_and_moves_nothing(self):
+        a, outsider = _reqs("ax")
+        src = IndexedReqList(ListKind.PD_BOOTSTRAP)
+        src.join([a])
+        dst = IndexedReqList(ListKind.WAITING)
+
+        with self.assertRaisesRegex(RuntimeError, r"\['x'\] are not in PD_BOOTSTRAP"):
+            move([a, outsider], src, dst)
+
+        self.assertEqual(list(src), [a])
+        self.assertEqual(list(dst), [])
+
+    def test_at_into_a_keyed_list_raises_and_moves_nothing(self):
+        (a,) = _reqs("a")
+        src = IndexedReqList(ListKind.WAITING)
+        src.join([a])
+        dst = KeyedReqList(ListKind.PREFILL_LAUNCHED)
+
+        with self.assertRaisesRegex(TypeError, "PREFILL_LAUNCHED"):
+            move([a], src, dst, at=0)
+
+        self.assertEqual(list(src), [a])
+        self.assertEqual(list(dst), [])
 
 
 if __name__ == "__main__":

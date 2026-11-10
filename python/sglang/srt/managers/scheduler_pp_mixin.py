@@ -660,8 +660,7 @@ class SchedulerPPMixin:
         ] = defaultdict(deque)
 
     def process_bootstrapped_queue(self: Scheduler):
-        reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-        self.waiting_queue.join(reqs)
+        self.disagg_prefill_bootstrap_queue.pop_bootstrapped(self.waiting_queue)
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler) -> Dict[str, bool]:
         """Return {rid: failed} for the transfers every stage so far has concluded.
@@ -1907,9 +1906,8 @@ class SchedulerPPMixin:
         if retract_rids is not None:
             # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
             resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs(
-                retract_rids
+                self.waiting_queue, retract_rids
             )
-            self.waiting_queue.join(resumed_reqs)
             return [req.rid for req in resumed_reqs]
         return None
 
@@ -1927,7 +1925,6 @@ class SchedulerPPMixin:
                 pp_good_rids=good_consensus_prealloc_rids,
                 pp_bad_rids=bad_consensus_prealloc_rids,
             )
-            self.disagg_decode_transfer_queue.extend(good_reqs)
             return [
                 [req.req.rid for req in good_reqs],
                 [req.req.rid for req in failed_reqs],

@@ -105,6 +105,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
     ReqList,
+    move,
 )
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.utils import (
@@ -1322,8 +1323,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.kv_manager.register_buffer_to_engine()
 
     def resume_retracted_reqs(
-        self, rids_to_check: Optional[List[str]] = None
+        self, dst: ReqList, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
+        """Move the retracted requests that fit again into `dst`, and return them."""
         # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
 
         # allocate memory
@@ -1396,7 +1398,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 get_disagg().disaggregation_decode_retraction_backup,
             )
 
-        self.retracted_queue.leave(resumed_reqs)
+        move(resumed_reqs, self.retracted_queue, dst)
 
         return resumed_reqs
 
@@ -1636,7 +1638,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         pp_good_rids: Optional[List[str]] = None,
         pp_bad_rids: Optional[List[str]] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
-        """Pop the preallocated requests from the pending queue (FIFO)."""
+        """Move the preallocated requests from the pending queue (FIFO) into
+        the transfer queue."""
         is_pp_mode = self.pp_size > 1
         if is_pp_mode and (pp_good_rids is None or pp_bad_rids is None):
             raise ValueError("PP consensus is required when pp_size > 1")
@@ -1969,7 +1972,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 assert decode_req.metadata_buffer_index is not None
                 decode_req.awaiting_publish = True
                 decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
-                # Counted as published until extend().
+                # Counted as published until moved to the transfer queue.
                 self._num_published_destinations += 1
                 # A take of pages a forward may still use (freed while it ran)
                 # queued its wait for that forward on this stream first, so this
@@ -2019,7 +2022,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             for decode_req in failed_reqs:
                 self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
 
-        self.queue.leave([queue[i].req for i in indices_to_remove])
+        self.queue.leave([decode_req.req for decode_req in failed_reqs])
+        move(preallocated_reqs, self.queue, self.transfer_queue.queue)
+        self.note_destinations_queued(len(preallocated_reqs))
 
         return preallocated_reqs, failed_reqs
 
@@ -3338,13 +3343,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.join([decode_req])
 
-    def extend(self, decode_reqs: List[DecodeRequest]) -> None:
-        self.queue.join(decode_reqs)
-        # This queue now covers them.
-        prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
-        if prealloc_queue is not None:
-            prealloc_queue.note_destinations_queued(len(decode_reqs))
-
     def _kv_checksum_comparable(self, signature: int) -> bool:
         """Digests compare only when the prefill digested this decode's layout.
         One with another TP width or a PP stage is admitted unverified and
@@ -3821,7 +3819,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.metadata_buffers.clear_slot(idx)
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
-        self.queue.leave([queue[i].req for i in indices_to_remove])
+        self.queue.leave([queue[i].req for i in indices_to_remove - deferred_indices])
         polls = [poll for i, poll in enumerate(polls) if i not in indices_to_remove]
 
         self.publish_pending_metadata(polls)
@@ -3845,7 +3843,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Host-capable receivers own their drain tracking. Device destinations
         # snapshot the number of prefill acknowledgements required by the manager.
         # A rank that only holds for a peer has no local acknowledgements to await.
-        self._deferred_releases.join(
+        move(
             [
                 (
                     decode_req,
@@ -3854,7 +3852,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     decode_req.metadata_buffer_index,
                     self._required_abort_acks(decode_req),
                 )
-            ]
+            ],
+            self.queue,
+            self._deferred_releases,
         )
 
     def _required_abort_acks(self, decode_req: DecodeRequest) -> int:
@@ -4501,8 +4501,7 @@ class SchedulerDisaggregationDecodeMixin:
         return {id(req) for req, done in zip(pending, ready.tolist()) if done}
 
     def _preallocate_new_requests(self: Scheduler) -> None:
-        req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-        self.disagg_decode_transfer_queue.extend(req_conns)
+        self.disagg_decode_prealloc_queue.pop_preallocated()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler, defer_prealloc: bool = False) -> bool:
@@ -4526,8 +4525,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.disagg_decode_transfer_queue.publish_pending_metadata()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
-        resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
-        self.waiting_queue.join(resumed_reqs)
+        self.disagg_decode_prealloc_queue.resume_retracted_reqs(self.waiting_queue)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return False
@@ -4555,6 +4553,5 @@ class SchedulerDisaggregationDecodeMixin:
             self.waiting_queue.join(transferred_reqs)
             if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                 # Give completed host transfers device space before new arrivals.
-                req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-                self.disagg_decode_transfer_queue.extend(req_conns)
+                self.disagg_decode_prealloc_queue.pop_preallocated()
         return prealloc_deferred
