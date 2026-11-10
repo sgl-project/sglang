@@ -5,7 +5,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.dspark_binding import (
     bind_dspark_draft_strategy,
 )
