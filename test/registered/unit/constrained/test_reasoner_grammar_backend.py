@@ -37,6 +37,7 @@ from sglang.srt.parser.inkling_tokenizer import (
 )
 from sglang.srt.parser.reasoning_parser import InklingDetector
 from sglang.srt.parser.reasoning_parser import KimiK3Detector as KimiK3ReasoningDetector
+from sglang.srt.parser.reasoning_parser import Qwen3Detector
 from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -931,6 +932,31 @@ class TestImplicitToolReasoningBoundary(CustomTestCase):
                 self.assertEqual(obj.grammar.mask_calls, 1)
                 obj.accept_token(20)
                 self.assertEqual(obj.grammar.tokens, [*tool_ids, 20])
+
+    def test_constrained_text_is_what_the_reasoning_parser_returns(self):
+        """With a think end after a tool call opened in the think block, the
+        grammar constrains from the tool marker, so the reasoning parser must hand
+        that same text on as content rather than keep the call as reasoning."""
+        pieces = ["<think>", "thinking", "<tool_call>", '{"x":1}', "</tool_call>"]
+        pieces += ["</think>", "answer"]
+        token_ids = {piece: [token] for token, piece in enumerate(pieces, start=10)}
+        backend = _DummyGrammarBackend()
+        backend._dispatch_result = _RecordingGrammar()
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            SimpleNamespace(detector=Qwen3Detector()),
+            _DummyTokenizer(token_ids),
+        )
+        obj = reasoner._init_value_dispatch(
+            ("structural_tag", json.dumps({"type": "test"})), True
+        )
+        for piece in pieces:
+            obj.accept_token(token_ids[piece][0])
+
+        constrained = "".join(pieces[token - 10] for token in obj.grammar.tokens)
+        parsed = Qwen3Detector().detect_and_parse("".join(pieces))
+        self.assertEqual(constrained, '<tool_call>{"x":1}</tool_call></think>answer')
+        self.assertEqual(parsed.normal_text, constrained)
 
     def test_reasoning_in_grammar_does_not_replay_tool_start(self):
         obj = self._make_object()
