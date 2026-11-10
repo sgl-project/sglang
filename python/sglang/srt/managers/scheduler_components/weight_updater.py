@@ -5,7 +5,17 @@ import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import msgspec
 import torch
@@ -16,7 +26,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     BeginWeightUpdateReqOutput,
@@ -31,6 +41,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PluginWeightUpdateReqInput,
+    PluginWeightUpdateReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -44,8 +56,12 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.model_executor.weight_checker import overall_checksum
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
-from sglang.srt.utils.weight_checker import overall_checksum
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +94,18 @@ def _parse_runner_selector(selector: str) -> Set[str]:
     )
 
 
+class PluginWeightUpdateContext(msgspec.Struct, frozen=True):
+    """What a platform weight transport sees on one TP rank."""
+
+    # (role, model runner) of each runner the request selects: "target", then any "draft"
+    # runners; read-only, except a transport that writes parameters itself
+    runners: List[Tuple[str, ModelRunner]]
+    tp_rank: int
+    tp_size: int
+    # per-rank storage kept across calls (e.g. registered receive buffers)
+    state: Dict[str, Any]
+
+
 class _WeightUpdateSession(msgspec.Struct, frozen=True):
     # recorded at begin so end finalizes the same runners
     selector: str
@@ -97,6 +125,7 @@ class SchedulerWeightUpdaterManager:
     stashed_model_static_state: Any = None
     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
     _session: Optional[_WeightUpdateSession] = None
+    _plugin_state: Dict[str, Any] = field(default_factory=dict)
     tp_cpu_group: Any = field(init=False)
 
     def __post_init__(self) -> None:
@@ -210,13 +239,9 @@ class SchedulerWeightUpdaterManager:
                 success, message = False, f"Failed to receive weights: {e}"
                 logger.error(message)
             else:
-                success, message = True, "Succeeded to update parameter online."
-                for _, runner in self._select_runners(recv_req.selector):
-                    success, message = (
-                        runner.weight_updater.load_weights_from_distributed(weights)
-                    )
-                    if not success:
-                        break
+                success, message = self._load_into_selected_runners(
+                    weights, recv_req.selector
+                )
             if success:
                 self._session = msgspec.structs.replace(
                     self._session, loaded_weights=True
@@ -228,6 +253,19 @@ class SchedulerWeightUpdaterManager:
             return UpdateWeightsFromDistributedReqOutput(
                 success=success, message=message
             )
+
+    def _load_into_selected_runners(
+        self, weights: List[Tuple[str, torch.Tensor]], selector: str
+    ) -> Tuple[bool, str]:
+        """Load tensors the target runner received into every selected runner."""
+        success, message = True, "Succeeded to update parameter online."
+        for _, runner in self._select_runners(selector):
+            success, message = runner.weight_updater.load_weights_from_distributed(
+                weights
+            )
+            if not success:
+                break
+        return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors on the selected runners."""
@@ -314,7 +352,21 @@ class SchedulerWeightUpdaterManager:
                 message="a weight-update session is already open; "
                 "call end_weight_update() first",
             )
-        for _, runner in self._select_runners(recv_req.selector):
+        from sglang.srt.model_executor.model_runner_components.weight_updater import (
+            _unsupported_derived_weight_cache_error,
+        )
+
+        runners = self._select_runners(recv_req.selector)
+        # Restoring packed weights already mutates storage. Check every runner
+        # before touching any of them, including sessions used by P2P/RDMA
+        # writers which bypass update_weights_from_tensor/distributed.
+        for _, runner in runners:
+            error = _unsupported_derived_weight_cache_error(
+                runner.weight_updater.get_model()
+            )
+            if error is not None:
+                return BeginWeightUpdateReqOutput(success=False, message=error)
+        for _, runner in runners:
             runner.weight_updater.begin_weight_update()
         self._session = _WeightUpdateSession(selector=recv_req.selector)
         torch.distributed.barrier(group=self.tp_cpu_group)
@@ -334,11 +386,94 @@ class SchedulerWeightUpdaterManager:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=True, message="Success")
 
+    def plugin_weight_update(self, recv_req: PluginWeightUpdateReqInput):
+        """Receive weights through a platform transport, then load them as update_weights_from_distributed does."""
+        if self._session is None:
+            return PluginWeightUpdateReqOutput(
+                success=False,
+                message="plugin_weight_update must run between "
+                "begin_weight_update() and end_weight_update()",
+            )
+        handler = current_platform.get_weight_update_handlers().get(recv_req.handler)
+        if handler is None:
+            return PluginWeightUpdateReqOutput(
+                success=False,
+                message=f"this platform has no weight-update handler {recv_req.handler!r}",
+            )
+        runners = self._select_runners(recv_req.selector)
+        # The load-side guards, before the transport runs: they are startup-determined and
+        # rank-uniform, and a transport that writes parameters itself never reaches a load.
+        for _, runner in runners:
+            rejection = runner.weight_updater.load_rejection("plugin_weight_update")
+            if rejection is not None:
+                return PluginWeightUpdateReqOutput(success=False, message=rejection)
+        context = PluginWeightUpdateContext(
+            runners=runners,
+            tp_rank=get_parallel().tp_rank,
+            tp_size=get_parallel().tp_size,
+            state=self._plugin_state,
+        )
+        with self._observe_weight_load("plugin"):
+            try:
+                weights = handler(context=context, payload=recv_req.payload)
+                error = None
+            except Exception as e:
+                logger.exception("weight transport failed on this TP rank")
+                weights, error = [], f"TP rank {context.tp_rank}: {e}"
+            if error is None and weights:
+                loaded, message = self._load_into_selected_runners(
+                    weights, recv_req.selector
+                )
+                if not loaded:
+                    error = f"TP rank {context.tp_rank}: {message}"
+            # only TP rank 0 replies, so its reply must carry every rank's outcome
+            success, message, counts = self._agree_across_tp_ranks(
+                error=error, count=len(weights)
+            )
+            if success:
+                if any(counts):
+                    self._session = msgspec.structs.replace(
+                        self._session, loaded_weights=True
+                    )
+                self.record_weight_version_after_update(recv_req.weight_version)
+                success, message = self.flush_cache_after_weight_update(
+                    recv_req, success, message
+                )
+            else:
+                # each rank loads before the gather, so the ranks that did not fail already have
+                message += "; the other TP ranks have loaded the bucket, redo it or retire the engine"
+            return PluginWeightUpdateReqOutput(
+                success=success,
+                message=message,
+                received_tensor_counts=counts if success else [],
+            )
+
+    def _agree_across_tp_ranks(
+        self, *, error: Optional[str], count: int
+    ) -> Tuple[bool, str, List[int]]:
+        """Every rank reaches this gather, so one rank's failure fails all of them."""
+        outcomes: List[Tuple[int, Optional[str]]] = [(0, None)] * get_parallel().tp_size
+        torch.distributed.all_gather_object(
+            outcomes, (count, error), group=self.tp_cpu_group
+        )
+        errors = [error for _, error in outcomes if error is not None]
+        return (
+            not errors,
+            " | ".join(errors) or "Success",
+            [count for count, _ in outcomes],
+        )
+
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         scheduler = self.scheduler
-        assert self.is_fully_idle(
-            ignore_waiting=scheduler is not None and scheduler._engine_paused
-        ), "release_memory_occupation should be called only when server is idle."
+        if not self.is_fully_idle(
+            ignore_waiting=scheduler is not None and scheduler.pause_state.paused
+        ):
+            return ReleaseMemoryOccupationReqOutput(
+                success=False,
+                message="Memory was not released because requests are still "
+                "running or queued. Finish them, or pause generation in retract "
+                "mode, then retry.",
+            )
 
         tags = recv_req.tags
 
@@ -363,6 +498,7 @@ class SchedulerWeightUpdaterManager:
                     if queue is not None:
                         queue.release_memory_occupation()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            # Cannot be refused: its idle gate is the check at the top.
             self.flush_cache()
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
@@ -378,7 +514,7 @@ class SchedulerWeightUpdaterManager:
 
         torch.get_device_module().synchronize()
 
-        return ReleaseMemoryOccupationReqOutput()
+        return ReleaseMemoryOccupationReqOutput(success=True, message="Success")
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
         tags = recv_req.tags
@@ -430,6 +566,7 @@ class SchedulerWeightUpdaterManager:
                     allow_quant_error=recv_req.allow_quant_error,
                     skip_tensor_list=recv_req.skip_tensor_list,
                     role=role,
+                    names=recv_req.names,
                 )
                 if p is not None:
                     role_payloads.append((role, p))

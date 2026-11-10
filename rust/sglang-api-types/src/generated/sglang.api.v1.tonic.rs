@@ -168,6 +168,83 @@ pub mod sglang_service_client {
             ));
             self.inner.unary(req, path, codec).await
         }
+        /// `/hicache/storage-backend`: configuration snapshot and runtime attach/detach.
+        pub async fn get_hi_cache_storage(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetHiCacheStorageRequest>,
+        ) -> std::result::Result<tonic::Response<super::HiCacheStatus>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/GetHiCacheStorage",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "GetHiCacheStorage",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn attach_hi_cache_storage(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AttachHiCacheStorageRequest>,
+        ) -> std::result::Result<tonic::Response<super::HiCacheStorageResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/AttachHiCacheStorage",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "AttachHiCacheStorage",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn detach_hi_cache_storage(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DetachHiCacheStorageRequest>,
+        ) -> std::result::Result<tonic::Response<super::HiCacheStorageResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/DetachHiCacheStorage",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "DetachHiCacheStorage",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// `/hicache/storage-backend/clear`: clear the storage backend's cached entries.
+        pub async fn clear_hi_cache_storage(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ClearHiCacheStorageRequest>,
+        ) -> std::result::Result<tonic::Response<super::HiCacheStorageResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/ClearHiCacheStorage",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "ClearHiCacheStorage",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
         /// The same static model cards as HTTP `/v1/models`.
         pub async fn list_models(
             &mut self,
@@ -265,6 +342,24 @@ pub mod sglang_service_server {
             &self,
             request: tonic::Request<super::GetServerInfoRequest>,
         ) -> std::result::Result<tonic::Response<super::GetServerInfoResponse>, tonic::Status>;
+        /// `/hicache/storage-backend`: configuration snapshot and runtime attach/detach.
+        async fn get_hi_cache_storage(
+            &self,
+            request: tonic::Request<super::GetHiCacheStorageRequest>,
+        ) -> std::result::Result<tonic::Response<super::HiCacheStatus>, tonic::Status>;
+        async fn attach_hi_cache_storage(
+            &self,
+            request: tonic::Request<super::AttachHiCacheStorageRequest>,
+        ) -> std::result::Result<tonic::Response<super::HiCacheStorageResponse>, tonic::Status>;
+        async fn detach_hi_cache_storage(
+            &self,
+            request: tonic::Request<super::DetachHiCacheStorageRequest>,
+        ) -> std::result::Result<tonic::Response<super::HiCacheStorageResponse>, tonic::Status>;
+        /// `/hicache/storage-backend/clear`: clear the storage backend's cached entries.
+        async fn clear_hi_cache_storage(
+            &self,
+            request: tonic::Request<super::ClearHiCacheStorageRequest>,
+        ) -> std::result::Result<tonic::Response<super::HiCacheStorageResponse>, tonic::Status>;
         /// The same static model cards as HTTP `/v1/models`.
         async fn list_models(
             &self,
@@ -510,6 +605,174 @@ pub mod sglang_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetServerInfoSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/GetHiCacheStorage" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetHiCacheStorageSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::GetHiCacheStorageRequest>
+                        for GetHiCacheStorageSvc<T>
+                    {
+                        type Response = super::HiCacheStatus;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetHiCacheStorageRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::get_hi_cache_storage(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetHiCacheStorageSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/AttachHiCacheStorage" => {
+                    #[allow(non_camel_case_types)]
+                    struct AttachHiCacheStorageSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::AttachHiCacheStorageRequest>
+                        for AttachHiCacheStorageSvc<T>
+                    {
+                        type Response = super::HiCacheStorageResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AttachHiCacheStorageRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::attach_hi_cache_storage(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AttachHiCacheStorageSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/DetachHiCacheStorage" => {
+                    #[allow(non_camel_case_types)]
+                    struct DetachHiCacheStorageSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::DetachHiCacheStorageRequest>
+                        for DetachHiCacheStorageSvc<T>
+                    {
+                        type Response = super::HiCacheStorageResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DetachHiCacheStorageRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::detach_hi_cache_storage(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DetachHiCacheStorageSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/ClearHiCacheStorage" => {
+                    #[allow(non_camel_case_types)]
+                    struct ClearHiCacheStorageSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::ClearHiCacheStorageRequest>
+                        for ClearHiCacheStorageSvc<T>
+                    {
+                        type Response = super::HiCacheStorageResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ClearHiCacheStorageRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::clear_hi_cache_storage(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ClearHiCacheStorageSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
