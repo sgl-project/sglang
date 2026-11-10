@@ -173,7 +173,6 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(request.messages[0].content[0].image_url.detail, "auto")
 
     def test_image_url_may_be_a_bare_string(self):
-        """A bare-string image_url parses like {"url": ...} in user and tool messages."""
         url = "https://example.com/a.png"
         request = ChatCompletionRequest(
             model="test-model",
@@ -829,9 +828,7 @@ class TestValidationEdgeCases(unittest.TestCase):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
 
 
-class TestThinkingParam(unittest.TestCase):
-    """`thinking` is the K3 spelling of the reasoning controls."""
-
+class TestThinkingObject(unittest.TestCase):
     MESSAGES = [{"role": "user", "content": "hi"}]
 
     def _request(self, **kwargs):

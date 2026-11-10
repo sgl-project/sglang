@@ -33,7 +33,6 @@ class ThinkingMode(str, Enum):
 import jinja2
 import orjson
 from fastapi import Request
-from pydantic import ValidationError
 
 try:
     from mistral_common.exceptions import MistralCommonException
@@ -79,7 +78,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponseParserProtocol,
     ResponsesRequest,
     SglExt,
-    ThinkingParam,
     Tool,
     ToolCall,
     ToolCallConstraint,
@@ -253,11 +251,8 @@ KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
 
 
-# K3 exposes three thinking tiers and K3.1 adds "medium". The OpenAI tiers map
-# onto the nearest one so a standard client is neither rejected nor silently
-# upgraded to the strongest tier; a float is an sglang extension K3 cannot
-# express at all.
-_KIMI_K3_EFFORT_TIERS = {
+# OpenAI effort tiers mapped onto the nearest K3 level; K3.1 adds "medium".
+_KIMI_K3_LEVEL_BY_TIER = {
     "minimal": "low",
     "low": "low",
     "medium": "high",
@@ -266,22 +261,49 @@ _KIMI_K3_EFFORT_TIERS = {
     "ultra": "max",
     "max": "max",
 }
-_KIMI_K31_EFFORT_TIERS = {**_KIMI_K3_EFFORT_TIERS, "medium": "medium"}
+_KIMI_K31_LEVEL_BY_TIER = {**_KIMI_K3_LEVEL_BY_TIER, "medium": "medium"}
 
 
-def kimi_k3_thinking_effort(
-    reasoning_effort: Any, tiers: dict = _KIMI_K3_EFFORT_TIERS
-) -> Optional[str]:
+_KIMI_K3_THINKING_TYPES = (None, "enabled", "disabled", "adaptive")
+
+
+def _kimi_k3_levels_text(level_by_tier: dict) -> str:
+    return ", ".join(repr(level) for level in dict.fromkeys(level_by_tier.values()))
+
+
+def _map_kimi_k3_effort(reasoning_effort: Any, level_by_tier: dict) -> Optional[str]:
     """Map a request's reasoning effort onto K3's thinking_effort, or None."""
     if reasoning_effort is None or reasoning_effort == "none":
         return None
-    if isinstance(reasoning_effort, str) and reasoning_effort in tiers:
-        return tiers[reasoning_effort]
-    supported = ", ".join(repr(t) for t in dict.fromkeys(tiers.values()))
+    if isinstance(reasoning_effort, str) and reasoning_effort in level_by_tier:
+        return level_by_tier[reasoning_effort]
     raise ValueError(
-        f"Kimi K3 supports reasoning_effort {supported} (the other OpenAI tiers "
-        f"map onto them); got {reasoning_effort!r}."
+        f"Kimi K3 supports reasoning_effort {_kimi_k3_levels_text(level_by_tier)} "
+        f"(the other OpenAI tiers map onto them); got {reasoning_effort!r}."
     )
+
+
+def _validate_kimi_k3_request(
+    request: ChatCompletionRequest, level_by_tier: dict
+) -> str | None:
+    """Request rules of the K3 serving contract that the encoder cannot enforce."""
+    error = _validate_kimi_k3_message_tools(request)
+    if error:
+        return error
+    # `thinking` stays a plain dict on the request; `keep` is accepted and ignored.
+    thinking = request.thinking
+    if thinking is not None and not (
+        isinstance(thinking, dict) and thinking.get("type") in _KIMI_K3_THINKING_TYPES
+    ):
+        return (
+            f"invalid thinking: {thinking!r}; expected an object whose type is "
+            "'enabled', 'disabled' or 'adaptive'."
+        )
+    try:
+        _map_kimi_k3_effort(request.reasoning_effort, level_by_tier)
+    except ValueError as exc:
+        return str(exc)
+    return None
 
 
 def neutralize_kimi_k3_image_placeholder(text: str) -> str:
@@ -719,11 +741,11 @@ class OpenAIServingChat(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 
-    def _kimi_k3_effort_tiers(self) -> dict:
-        """K3.1 adds a native "medium" thinking tier on top of K3's three."""
+    def _kimi_k3_level_by_tier(self) -> dict:
+        """K3.1 adds a native "medium" thinking level on top of K3's three."""
         if self.tokenizer_manager.model_config.hf_config.model_type == "kimi_k31":
-            return _KIMI_K31_EFFORT_TIERS
-        return _KIMI_K3_EFFORT_TIERS
+            return _KIMI_K31_LEVEL_BY_TIER
+        return _KIMI_K3_LEVEL_BY_TIER
 
     def _effective_tools(self, request: ChatCompletionRequest) -> list[Tool]:
         tools = list(request.tools or [])
@@ -849,19 +871,18 @@ class OpenAIServingChat(OpenAIServingBase):
             if image_count:
                 template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
 
-            tiers = self._kimi_k3_effort_tiers()
-            effort = template_kwargs.get("thinking_effort")
-            if effort is not None and effort not in tiers.values():
-                supported = ", ".join(repr(t) for t in dict.fromkeys(tiers.values()))
+            level_by_tier = self._kimi_k3_level_by_tier()
+            ctk_effort = template_kwargs.get("thinking_effort")
+            if ctk_effort is not None and ctk_effort not in level_by_tier.values():
                 raise ValueError(
                     f"chat_template_kwargs.thinking_effort must be one of "
-                    f"{supported}; got {effort!r}."
+                    f"{_kimi_k3_levels_text(level_by_tier)}; got {ctk_effort!r}."
                 )
             if (
                 "thinking_effort" not in template_kwargs
                 and template_kwargs.get("thinking") is not False
             ):
-                effort = kimi_k3_thinking_effort(request.reasoning_effort, tiers)
+                effort = _map_kimi_k3_effort(request.reasoning_effort, level_by_tier)
                 if effort is not None:
                     template_kwargs["thinking_effort"] = effort
 
@@ -1225,7 +1246,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if m3_error:
                 return m3_error
         if self.chat_encoding_spec == "kimi_k3":
-            k3_error = _validate_kimi_k3_message_tools(request)
+            k3_error = _validate_kimi_k3_request(request, self._kimi_k3_level_by_tier())
             if k3_error:
                 return k3_error
         if request.return_flat_raw_output_top_logprobs and not request.return_meta_info:
@@ -1234,21 +1255,6 @@ class OpenAIServingChat(OpenAIServingBase):
         media_error = self._validate_media_content(request)
         if media_error:
             return media_error
-
-        if self.chat_encoding_spec == "kimi_k3":
-            # thinking stays a plain dict on the request (other models' templates
-            # read it as one); the K3 surface enforces the K3 shape.
-            if request.thinking is not None:
-                try:
-                    ThinkingParam.model_validate(request.thinking)
-                except ValidationError as exc:
-                    return f"invalid thinking: {exc}"
-            try:
-                kimi_k3_thinking_effort(
-                    request.reasoning_effort, self._kimi_k3_effort_tiers()
-                )
-            except ValueError as exc:
-                return str(exc)
 
         effective_tools = self._effective_tools(request)
         has_message_tools = any(

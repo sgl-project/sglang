@@ -901,21 +901,19 @@ ReasoningEffortType = Optional[
 ]
 
 
-class ThinkingParam(BaseModel):
-    """K3-style thinking control: ``type`` gates reasoning, ``effort`` outranks
-    ``reasoning_effort``. ``keep`` is accepted and ignored, and ``adaptive``
-    means enabled, so Anthropic-shaped values do not 400."""
-
-    model_config = ConfigDict(extra="allow")
-
-    type: Optional[Literal["enabled", "disabled", "adaptive"]] = None
-    keep: Optional[str] = None
-    effort: ReasoningEffortType = None
-
-    @property
-    def enabled(self) -> bool:
-        """Absent or "adaptive" both mean reasoning is on; only "disabled" is off."""
-        return self.type != "disabled"
+def _parse_effort(effort: Any, field: str) -> Union[str, float]:
+    if isinstance(effort, str) and effort in get_args(ReasoningEffortTier):
+        return effort
+    if isinstance(effort, (int, float)) and not isinstance(effort, bool):
+        return float(effort)
+    if isinstance(effort, str):
+        # Keep parity with the top-level reasoning_effort field, whose
+        # lax union coerces numeric strings; range checks then apply.
+        try:
+            return float(effort)
+        except ValueError as exc:
+            raise ValueError(f"invalid {field}: {effort!r}") from exc
+    raise ValueError(f"invalid {field}: {effort!r}")
 
 
 def _message_tools_indices(messages: Any) -> List[int]:
@@ -1025,12 +1023,10 @@ class ChatCompletionRequest(PDRoutingFields):
     )
     thinking: Optional[Any] = Field(
         default=None,
-        description="Thinking control. K3 form: {type: enabled|disabled|adaptive, "
-        "keep: all, effort: low|high|max}; 'effort' takes precedence over "
-        "reasoning_effort, 'type: disabled' turns reasoning off, 'keep' is "
-        "accepted and ignored. Other models whose chat template defines a thinking "
-        "mode read it as a plain dict (e.g. {'type': 'adaptive'}). Kept as a dict; "
-        "the K3 serving path validates it against ThinkingParam.",
+        description="Thinking config such as {'type': 'adaptive'}. 'type' "
+        "(enabled, disabled, adaptive) sets the thinking toggle and 'effort' takes "
+        "precedence over reasoning_effort; templates that define a thinking mode "
+        "also read the dict itself.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]
@@ -1157,28 +1153,8 @@ class ChatCompletionRequest(PDRoutingFields):
             effort = r.get("effort")
             if effort is None:
                 effort = r.get("reasoning_effort")
-            if isinstance(effort, str) and effort in {
-                "none",
-                "minimal",
-                "low",
-                "medium",
-                "high",
-                "xhigh",
-                "ultra",
-                "max",
-            }:
-                values["reasoning_effort"] = effort
-            elif isinstance(effort, (int, float)) and not isinstance(effort, bool):
-                values["reasoning_effort"] = float(effort)
-            elif isinstance(effort, str):
-                # Keep parity with the top-level reasoning_effort field, whose
-                # lax union coerces numeric strings; range checks then apply.
-                try:
-                    values["reasoning_effort"] = float(effort)
-                except ValueError as exc:
-                    raise ValueError(f"invalid reasoning effort: {effort!r}") from exc
-            elif effort is not None:
-                raise ValueError(f"invalid reasoning effort: {effort!r}")
+            if effort is not None:
+                values["reasoning_effort"] = _parse_effort(effort, "reasoning effort")
 
             enabled = (
                 r.get("enabled")
@@ -1198,15 +1174,9 @@ class ChatCompletionRequest(PDRoutingFields):
         if isinstance(thinking_config, dict):
             thinking_effort = thinking_config.get("effort")
             if thinking_effort is not None:
-                if not (
-                    thinking_effort in get_args(ReasoningEffortTier)
-                    or (
-                        isinstance(thinking_effort, (int, float))
-                        and not isinstance(thinking_effort, bool)
-                    )
-                ):
-                    raise ValueError(f"invalid thinking effort: {thinking_effort!r}")
-                values["reasoning_effort"] = thinking_effort
+                values["reasoning_effort"] = _parse_effort(
+                    thinking_effort, "thinking effort"
+                )
             thinking_type = thinking_config.get("type")
 
         effort = values.get("reasoning_effort")

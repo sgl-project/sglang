@@ -6422,8 +6422,6 @@ class TestRequestChatTemplateTrustGate(CustomTestCase):
 
 
 class KimiK3ThinkingTestCase(unittest.TestCase):
-    """The K3 renderer's view of `thinking` / `reasoning_effort`."""
-
     MESSAGES = [{"role": "user", "content": "hi"}]
 
     def setUp(self):
