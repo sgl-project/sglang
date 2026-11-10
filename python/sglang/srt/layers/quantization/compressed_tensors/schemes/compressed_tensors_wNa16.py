@@ -191,6 +191,8 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         layer.register_parameter("weight_packed", weight)
         layer.register_parameter("weight_scale", weight_scale)
         layer.register_parameter("weight_shape", weight_shape)
+        # Set once process_weights_after_loading repacks for the kernel.
+        layer.wna16_repacked = False
 
         if not self.symmetric:
             layer.register_parameter("weight_zero_point", qzeros)
@@ -205,9 +207,43 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                                             weight_loader=weight_loader)
             layer.register_parameter("weight_g_idx", weight_g_idx)
 
+    def dequantize_weight(self, layer: torch.nn.Module) -> torch.Tensor:
+        """The dense ``[out, in]`` weight of ``layer``, in the scale dtype.
+
+        Reads the checkpoint layout of ``weight_packed`` / ``weight_scale``,
+        so it must run before ``process_weights_after_loading`` repacks them
+        for the kernel (MLA's post-load step builds its absorbed weights from
+        it). Loaders that copy already-repacked tensors are refused.
+        """
+        if layer.wna16_repacked:
+            raise NotImplementedError(
+                "Cannot dequantize a compressed-tensors WNA16 weight after "
+                "process_weights_after_loading has repacked it for the kernel.")
+        if not self.symmetric or self.has_g_idx:
+            raise NotImplementedError(
+                "Dequantizing a compressed-tensors WNA16 weight supports "
+                "symmetric quantization without activation reordering only.")
+        num_bits = 32 // self.pack_factor
+        packed = layer.weight_packed.data  # [N, K // pack_factor] int32
+        scale = layer.weight_scale.data  # [N, K // group_size]
+        shifts = torch.arange(0, 32, num_bits, dtype=torch.int32,
+                              device=packed.device)
+        codes = (packed.unsqueeze(-1) >> shifts) & ((1 << num_bits) - 1)
+        codes = codes.reshape(packed.shape[0], -1)  # [N, K]
+        in_features = codes.shape[1]
+        group_size = (in_features
+                      if self.group_size == -1 else self.group_size)
+        assert scale.shape[1] * group_size == in_features, (
+            f"weight_scale {tuple(scale.shape)} does not cover {in_features} "
+            f"inputs in groups of {group_size}")
+        # (code - offset) and its product with the scale round once, as in fp32.
+        weight = (codes - (1 << (num_bits - 1))).to(scale.dtype)
+        return weight * scale.repeat_interleave(group_size, dim=1)
+
     # Checkpoints are serialized in compressed-tensors format, which is
     # different from the format the kernel may want. Handle repacking here.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.wna16_repacked = True
         # Default names since marlin requires empty parameters for these,
         # TODO: remove this requirement from marlin (allow optional tensors)
         self.w_q_name = "weight_packed"
@@ -387,6 +423,7 @@ class XPUCompressedTensorsWNA16(CompressedTensorsWNA16):
         return 20
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.wna16_repacked = True
         self.kernel.process_weights_after_loading(layer)
 
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,

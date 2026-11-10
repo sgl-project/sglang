@@ -169,6 +169,28 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
+    def can_fuse_shared_expert(self) -> bool:
+        """Whether shared experts can fuse into the routed-expert FusedMoE.
+
+        A shared expert that `ignore` keeps unquantized cannot share quantized
+        routed-expert buffers, unless that layer's routed experts are ignored
+        too. The shared_expert_gate is a separate linear and does not count. A
+        regex entry names no layer to compare with, so it vetoes fusion.
+        """
+        for name in self.ignore:
+            if "shared_expert" not in name.replace("shared_expert_gate", ""):
+                continue
+            if name.startswith("re:"):
+                return False
+            moe_prefix = name.split(".shared_expert")[0]
+            if not should_ignore_layer(
+                f"{moe_prefix}.experts.0.gate_proj",
+                ignore=self.ignore,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                return False
+        return True
+
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         self.target_scheme_map = hf_to_sglang_mapper.apply_dict(self.target_scheme_map)
         self.ignore = hf_to_sglang_mapper.apply_list(self.ignore)
