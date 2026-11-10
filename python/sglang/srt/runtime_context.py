@@ -520,6 +520,17 @@ def is_scheduler_io_rank() -> bool:
     )
 
 
+def is_scheduler_last_stage_io_rank() -> bool:
+    """The last pipeline stage's counterpart of the io rank: attention-TP and
+    attention-CP rank 0 on the last stage, one per attention-DP group."""
+    parallel = get_parallel()
+    return (
+        parallel.pp_rank == parallel.pp_size - 1
+        and parallel.attn_tp_rank == 0
+        and parallel.attn_cp_rank == 0
+    )
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 

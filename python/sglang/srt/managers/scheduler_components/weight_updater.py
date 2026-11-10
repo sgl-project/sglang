@@ -516,6 +516,9 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         torch.get_device_module().synchronize()
+        # Rank 0 relays the request to the next stage and sends the reply.
+        # neither may happen before this rank's TP peers have released too.
+        torch.distributed.barrier(group=self.tp_cpu_group)
 
         return ReleaseMemoryOccupationReqOutput(success=True, message="Success")
 
