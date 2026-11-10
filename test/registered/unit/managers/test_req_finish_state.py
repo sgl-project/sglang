@@ -106,30 +106,32 @@ class _StopTokenizer:
 
 
 class TestModelStopTokens(CustomTestCase):
-    def _finished_on(self, token_id, *, use_model_stop_tokens, stop_token_ids=None):
+    def _finished_on(self, token_id, *, disable_model_stop_tokens, stop_token_ids=None):
         sampling_params = SamplingParams(
             max_new_tokens=8, stop_token_ids=stop_token_ids
         )
         sampling_params.normalize(tokenizer=None)
         req = Req("r", "", array("q", [1]), sampling_params, eos_token_ids={2})
         req.tokenizer = _StopTokenizer()
-        req.use_model_stop_tokens = use_model_stop_tokens
+        req.disable_model_stop_tokens = disable_model_stop_tokens
         req.output_ids = array("q", [10, token_id])
         req.update_finish_state(new_accepted_len=1)
         return isinstance(req.finished_reason, FINISH_MATCHED_TOKEN)
 
     def test_model_stop_tokens_are_optional(self):
         """Each model EOS source (config, tokenizer, additional stops) finishes a
-        request by default and none does without use_model_stop_tokens; the request's
+        request by default and none does with disable_model_stop_tokens; the request's
         own stop_token_ids finish it either way."""
         for token_id in (2, 3, 4):
             with self.subTest(token_id=token_id):
-                self.assertTrue(self._finished_on(token_id, use_model_stop_tokens=True))
+                self.assertTrue(
+                    self._finished_on(token_id, disable_model_stop_tokens=False)
+                )
                 self.assertFalse(
-                    self._finished_on(token_id, use_model_stop_tokens=False)
+                    self._finished_on(token_id, disable_model_stop_tokens=True)
                 )
         self.assertTrue(
-            self._finished_on(5, use_model_stop_tokens=False, stop_token_ids=[5])
+            self._finished_on(5, disable_model_stop_tokens=True, stop_token_ids=[5])
         )
 
 

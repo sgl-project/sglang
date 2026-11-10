@@ -247,7 +247,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if user_params.ignore_eos:
             return []
         stop_ids = set(user_params.stop_token_ids or ())
-        if not req.use_model_stop_tokens:
+        if req.disable_model_stop_tokens:
             return sorted(stop_ids)
         stop_ids |= set(req.eos_token_ids or ())
         tokenizer = req.tokenizer

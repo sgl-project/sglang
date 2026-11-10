@@ -135,7 +135,7 @@ class TestRequestClassOverridePoints(CustomTestCase):
                         if isinstance(req, _TaggedReq):
                             self.assertEqual(req.source_rid, recv.rid)
                         self.assertEqual(req.rid, recv.rid)
-                        self.assertIs(req.use_model_stop_tokens, not disable)
+                        self.assertIs(req.disable_model_stop_tokens, disable)
 
     def test_tokenizer_manager_emits_the_subclass_wire_types(self):
         """Single and batched dispatch hand the subclass types to the scheduler."""

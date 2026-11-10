@@ -480,7 +480,7 @@ class Req(ReqDllmMixin):
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
-        use_model_stop_tokens: bool = True,
+        disable_model_stop_tokens: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -600,9 +600,9 @@ class Req(ReqDllmMixin):
         self.to_finish: Optional[BaseFinishReason] = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids
-        # False under --disable-model-stop-tokens: the model's EOS tokens (eos_token_ids
+        # True under --disable-model-stop-tokens: the model's EOS tokens (eos_token_ids
         # and the tokenizer's) don't finish the request; its stop_token_ids still do.
-        self.use_model_stop_tokens = use_model_stop_tokens
+        self.disable_model_stop_tokens = disable_model_stop_tokens
         self.vocab_size = vocab_size
         self.priority = priority
 
@@ -1303,7 +1303,7 @@ class Req(ReqDllmMixin):
         for i, token_id in enumerate(new_accepted_tokens):
             if self.sampling_params.stop_token_ids:
                 matched_eos |= token_id in self.sampling_params.stop_token_ids
-            if self.use_model_stop_tokens:
+            if not self.disable_model_stop_tokens:
                 if self.eos_token_ids:
                     matched_eos |= token_id in self.eos_token_ids
                 if self.tokenizer is not None:

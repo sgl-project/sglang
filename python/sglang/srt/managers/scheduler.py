@@ -3296,7 +3296,7 @@ class Scheduler(
                 routed_experts_start_len=recv_req.routed_experts_start_len,
                 return_indexer_topk=recv_req.return_indexer_topk,
                 eos_token_ids=self.model_config.hf_eos_token_id,
-                use_model_stop_tokens=not get_serving().disable_model_stop_tokens,
+                disable_model_stop_tokens=get_serving().disable_model_stop_tokens,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
@@ -3361,7 +3361,7 @@ class Scheduler(
                 self.tokenizer,
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
-                use_model_stop_tokens=not get_serving().disable_model_stop_tokens,
+                disable_model_stop_tokens=get_serving().disable_model_stop_tokens,
                 disagg_mode=self.disaggregation_mode,
                 req_factory=partial(self._create_generation_req, recv_req),
             )
@@ -3391,7 +3391,7 @@ class Scheduler(
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                use_model_stop_tokens=not get_serving().disable_model_stop_tokens,
+                disable_model_stop_tokens=get_serving().disable_model_stop_tokens,
                 vocab_size=self.model_config.vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
             )

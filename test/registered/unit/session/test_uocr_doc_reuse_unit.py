@@ -1607,7 +1607,7 @@ class TestRetainedWindowClaim(CustomTestCase):
             finished_reason=FINISH_MATCHED_TOKEN(matched=EOS),
             finished_len=None,
             eos_token_ids={EOS},
-            use_model_stop_tokens=True,
+            disable_model_stop_tokens=False,
             origin_input_ids=array("q", origin),
             output_ids=array("q", out),
             kv=ReqKvInfo(
@@ -1666,16 +1666,16 @@ class TestRetainedWindowClaim(CustomTestCase):
 
 class TestStopIds(CustomTestCase):
     def test_model_stop_tokens_are_optional(self):
-        """Without use_model_stop_tokens the model's EOS is an ordinary output token, so
+        """With disable_model_stop_tokens the model's EOS is an ordinary output token, so
         trimming a window's trailing stops must keep it."""
         req = SimpleNamespace(
             eos_token_ids={EOS},
             tokenizer=SimpleNamespace(eos_token_id=3),
             sampling_params=SimpleNamespace(stop_token_ids={5}),
-            use_model_stop_tokens=True,
+            disable_model_stop_tokens=False,
         )
         self.assertEqual(r._stop_ids(req), {EOS, 3, 5})
-        req.use_model_stop_tokens = False
+        req.disable_model_stop_tokens = True
         self.assertEqual(r._stop_ids(req), {5})
 
 

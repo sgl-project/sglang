@@ -165,7 +165,7 @@ class Session:
         eos_token_ids=None,
         disagg_mode: Optional[DisaggregationMode] = None,
         req_factory: Callable[..., Req] = Req,
-        use_model_stop_tokens: bool = True,
+        disable_model_stop_tokens: bool = False,
     ):
         assert req.session_params is not None
         session_params = req.session_params
@@ -258,7 +258,7 @@ class Session:
             sampling_logprobs_mode=req.sampling_logprobs_mode,
             vocab_size=vocab_size,
             eos_token_ids=eos_token_ids,
-            use_model_stop_tokens=use_model_stop_tokens,
+            disable_model_stop_tokens=disable_model_stop_tokens,
             require_reasoning=req.require_reasoning,
             return_hidden_states=req.return_hidden_states,
             return_routed_experts=req.return_routed_experts,

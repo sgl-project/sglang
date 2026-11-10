@@ -283,19 +283,19 @@ class TestNeutralParams(CustomTestCase):
 
 class TestCollectStopTokenIds(CustomTestCase):
     def test_model_stop_tokens_are_optional(self):
-        """Beams stop on the model's EOS tokens by default; without
-        use_model_stop_tokens only the request's stop_token_ids end them."""
+        """Beams stop on the model's EOS tokens by default; with
+        disable_model_stop_tokens only the request's stop_token_ids end them."""
         from sglang.srt.beam_search.coordinator import BeamCoordinator
 
         req = SimpleNamespace(
             eos_token_ids={2},
             tokenizer=SimpleNamespace(eos_token_id=3, additional_stop_token_ids={4}),
-            use_model_stop_tokens=True,
+            disable_model_stop_tokens=False,
         )
         params = SimpleNamespace(ignore_eos=False, stop_token_ids={5})
         collect = BeamCoordinator._collect_stop_token_ids
         self.assertEqual(collect(req, params), [2, 3, 4, 5])
-        req.use_model_stop_tokens = False
+        req.disable_model_stop_tokens = True
         self.assertEqual(collect(req, params), [5])
 
 

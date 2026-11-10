@@ -37,6 +37,7 @@ def _make_req(freq=0.0, presence=0.0, min_tokens=0, stop_ids=None, eos_id=2):
     req.sampling_params.min_new_tokens = min_tokens
     req.sampling_params.stop_token_ids = stop_ids
     req.eos_token_ids = None
+    req.disable_model_stop_tokens = False
     req.grammar = None
     req.tokenizer.additional_stop_token_ids = None
     req.tokenizer.eos_token_id = eos_id
@@ -377,11 +378,11 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         self.assertFalse(blocked[1].any())
 
     def test_model_eos_not_blocked_when_not_a_stop(self):
-        """Without use_model_stop_tokens only the request's stop_token_ids end it, so only
+        """With disable_model_stop_tokens only the request's stop_token_ids end it, so only
         they are blocked, and the tokenizer is never read (it may be None)."""
         req = _make_req(min_tokens=3, stop_ids={5})
         req.eos_token_ids = {6}
-        req.use_model_stop_tokens = False
+        req.disable_model_stop_tokens = True
         req.tokenizer = None
         batch = _make_batch([req])
         orch = BatchedPenalizerOrchestrator(
@@ -403,11 +404,11 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         compiled = xgr.GrammarCompiler(tokenizer_info).compile_json_schema(
             {"type": "integer"}
         )
-        for use_model_stop_tokens in (True, False):
-            with self.subTest(use_model_stop_tokens=use_model_stop_tokens):
+        for disable_model_stop_tokens in (False, True):
+            with self.subTest(disable_model_stop_tokens=disable_model_stop_tokens):
                 req = _make_req(min_tokens=5, eos_id=1)
                 req.eos_token_ids = {1}
-                req.use_model_stop_tokens = use_model_stop_tokens
+                req.disable_model_stop_tokens = disable_model_stop_tokens
                 req.grammar = xgr.GrammarMatcher(compiled)
                 batch = _make_batch([req])
                 orch = BatchedPenalizerOrchestrator(
