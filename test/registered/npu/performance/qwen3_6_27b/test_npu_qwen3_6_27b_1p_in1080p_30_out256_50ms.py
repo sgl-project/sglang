@@ -30,10 +30,11 @@ QWEN3_6_27B_1080P_ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_SET_CPU_AFFINITY": "1",
-    # A1 alone is not enough: the ViT NPU graph runner permanently caches one
-    # graph (plus block buffers, up to ~3 GB for a 37-image batch) per distinct
-    # image-batch layout, so memory grows monotonically during the benchmark.
-    "SGLANG_VIT_ENABLE_CUDA_GRAPH": "0",
+    # The ViT NPU graph runner permanently caches one graph (plus block buffers,
+    # up to ~3 GB for a 37-image batch) per distinct image-batch layout. NPU is
+    # back on the per-request ViT path (see mm_schedule.py), so only the
+    # single-image layout is ever captured and the graph can stay enabled.
+    "SGLANG_VIT_ENABLE_CUDA_GRAPH": "1",
     "SGLANG_NPU_PROFILING": "0",
     "SGLANG_NPU_PROFILING_STAGE": "prefill",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
