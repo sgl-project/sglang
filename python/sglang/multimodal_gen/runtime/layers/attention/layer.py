@@ -2477,6 +2477,7 @@ def _make_breakable_attention_forward(forward_method):
                 and self.backend
                 in (
                     AttentionBackendEnum.TORCH_SDPA,
+                    AttentionBackendEnum.TORCH_CUDNN_SDPA,
                     AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
                 )
             )
