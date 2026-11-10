@@ -679,14 +679,19 @@ def cached_conditioning(fn):
 def cached_vae_encode(fn):
     """Cache the posterior, before sample()/mode() and latent normalization.
 
-    Distributed VAEs currently bypass this cache: their encoding methods can
-    run on an owner rank or a model-specific subgroup, unlike encoder TP.
+    Distributed VAEs bypass this cache unless the decorated method explicitly
+    guarantees rank-local computation. A cache hit must not skip collectives
+    that another rank still enters.
     """
 
     @wraps(fn)
     def wrapped(self, *args, **kwargs):
         cache = _inference_cache(self)
-        if cache is None or (model_parallel_is_initialized() and get_world_size() > 1):
+        if cache is None or (
+            model_parallel_is_initialized()
+            and get_world_size() > 1
+            and not getattr(self, "conditioning_encode_is_rank_local", False)
+        ):
             return fn(self, *args, **kwargs)
         return cache.run(
             self,
