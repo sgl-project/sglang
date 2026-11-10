@@ -39,6 +39,9 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
+)
+from sglang.srt.layers.dp_attention import dp_reduce_scatterv as dp_reduce_scatterv_into
+from sglang.srt.layers.dp_attention import (
     dp_scatter,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
@@ -308,10 +311,8 @@ def dp_reduce_scatterv(
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
 ) -> None:
-    get_parallel().tp_group.reduce_scatterv(
-        hidden_states,
-        output=local_hidden_states,
-        sizes=get_dp_global_num_tokens(),
+    dp_reduce_scatterv_into(
+        local_hidden_states, hidden_states, get_dp_global_num_tokens()
     )
 
 

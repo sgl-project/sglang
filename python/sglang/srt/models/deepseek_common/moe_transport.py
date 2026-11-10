@@ -13,6 +13,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
+    dp_reduce_scatterv,
     dp_reduce_scatterv_async,
     dp_scatter,
     get_dp_global_num_tokens,
@@ -260,10 +261,8 @@ class MoeRowTransport(ComputeTransport):
                 hidden_states,
             )
             if should_use_dp_reduce_scatterv() or _use_reduce_scatterv:
-                get_parallel().tp_group.reduce_scatterv(
-                    global_hidden_states,
-                    output=hidden_states,
-                    sizes=get_dp_global_num_tokens(),
+                dp_reduce_scatterv(
+                    hidden_states, global_hidden_states, get_dp_global_num_tokens()
                 )
             elif _use_reduce_scatter:
                 dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
