@@ -29,6 +29,8 @@ from transformers.utils.chat_template_utils import _compile_jinja_template
 from xgrammar import Grammar
 from xgrammar.testing import _is_grammar_accept_string
 
+from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.entrypoints.openai.chat_encoding import resolve_chat_encoding_spec
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import encode_prompt_segments
 from sglang.srt.entrypoints.openai.protocol import (
@@ -45,6 +47,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.function_call.kimik3_structural_tag import get_kimik3_structural_tag
@@ -3745,6 +3748,136 @@ class ServingChatTestCase(CustomTestCase):
                     self.assertEqual(finish_reason["type"], "stop")
                     self.assertNotIn("Tool call parsing error", "\n".join(logs.output))
 
+    def test_native_tool_stream_preserves_text_and_argument_order(self):
+        """Text following a call must not overtake its closing argument delta."""
+        self.chat.tool_call_parser = "qwen3_coder"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "Write",
+                        "parameters": {"properties": {"content": {"type": "string"}}},
+                    },
+                }
+            ],
+            stream=True,
+        )
+        first = "Before.<tool_call><function=Write><parameter=content>first</parameter>"
+        tail = (
+            "</function></tool_call>Between.<tool_call><function=Write>"
+            "<parameter=content>second</parameter></function></tool_call>After."
+        )
+        text = first + tail
+        expected = [
+            "Before.",
+            {"content": "first"},
+            "Between.",
+            {"content": "second"},
+            "After.",
+        ]
+        chunkings = [[text], list(text)] + [
+            [text[:i], text[i:]] for i in range(1, len(text))
+        ]
+        for case, chunks in enumerate(chunkings):
+            with self.subTest(case=case, chunks=len(chunks)):
+
+                async def collect():
+                    parsers, lines = {}, []
+                    for i, chunk in enumerate(chunks):
+                        async for line in self.chat._process_tool_call_stream(
+                            index=0,
+                            delta=chunk,
+                            parser_dict=parsers,
+                            content={"meta_info": {"id": "audit"}},
+                            request=request,
+                            has_tool_calls={},
+                            created=123,
+                            flush=i == len(chunks) - 1,
+                        ):
+                            lines.append(line)
+                    return lines
+
+                lines = asyncio.run(collect())
+                ordered, calls = [], {}
+                for line in lines:
+                    delta = json.loads(line[6:])["choices"][0]["delta"]
+                    if delta.get("content"):
+                        if ordered and isinstance(ordered[-1], str):
+                            ordered[-1] += delta["content"]
+                        else:
+                            ordered.append(delta["content"])
+                    for call in delta.get("tool_calls") or []:
+                        index = call["index"]
+                        if call["function"].get("name"):
+                            calls[index] = {"raw": ""}
+                            ordered.append(calls[index])
+                        self.assertIs(ordered[-1], calls[index])
+                        calls[index]["raw"] += call["function"].get("arguments") or ""
+                self.assertEqual(
+                    [
+                        json.loads(item["raw"]) if isinstance(item, dict) else item
+                        for item in ordered
+                    ],
+                    expected,
+                )
+
+                # Feed the same real emitter output into the Anthropic adapter.
+                async def upstream(*args):
+                    for line in lines:
+                        yield line
+                    terminal = json.loads(lines[-1][6:])
+                    terminal["choices"] = [
+                        {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
+                    ]
+                    yield f"data: {json.dumps(terminal)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                serving = AnthropicServing(
+                    Mock(_generate_chat_stream=upstream, supports_inline_system=False)
+                )
+                anthropic_request = AnthropicMessagesRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi"}],
+                    max_tokens=100,
+                )
+
+                async def collect_anthropic():
+                    return [
+                        json.loads(line[6:])
+                        async for frame in serving._generate_anthropic_stream(
+                            None, request, anthropic_request, None
+                        )
+                        for line in frame.splitlines()
+                        if line.startswith("data: ")
+                    ]
+
+                blocks, closed = [], []
+                for event in asyncio.run(collect_anthropic()):
+                    self.assertNotEqual(event["type"], "error")
+                    if event["type"] == "content_block_start":
+                        blocks.append(
+                            {"type": event["content_block"]["type"], "raw": ""}
+                        )
+                    elif event["type"] == "content_block_delta":
+                        self.assertNotIn(event["index"], closed)
+                        delta = event["delta"]
+                        blocks[event["index"]]["raw"] += delta.get(
+                            "partial_json", delta.get("text", "")
+                        )
+                    elif event["type"] == "content_block_stop":
+                        closed.append(event["index"])
+                        block = blocks[event["index"]]
+                        if block["type"] == "tool_use":
+                            block["raw"] = json.loads(block["raw"])
+                self.assertEqual(closed, list(range(len(blocks))))
+                self.assertEqual(
+                    [block["raw"] for block in blocks],
+                    expected,
+                )
+
     def test_truncated_native_tool_call_logs_and_drops(self):
         """A tools section cut off before its closing tag parses to zero calls
         without raising; the sync path used to drop it with no log at all."""
@@ -3936,15 +4069,14 @@ class ServingChatTestCase(CustomTestCase):
             parser_instance = ParserMock.return_value
 
             # First call returns one ToolCallItem-like chunk (with name)
-            first_chunk_call = Mock()
-            # Kimi-K2 series models might generate fixed number tool_indx,
-            # ignoring the tool calls history and mess up all the following tool calls
-            first_chunk_call.tool_index = 0
-            first_chunk_call.name = "get_weather"
-            first_chunk_call.parameters = ""
-            parser_instance.parse_stream_chunk.side_effect = [
-                ("", [first_chunk_call]),
-                ("", []),
+            # Kimi-K2 series models might generate a fixed tool index,
+            # ignoring the tool call history.
+            first_chunk_call = ToolCallItem(
+                tool_index=0, name="get_weather", parameters=""
+            )
+            parser_instance._parse_stream_parts.side_effect = [
+                [StreamingParseResult(calls=[first_chunk_call])],
+                [],
             ]
 
             async def collect_first_tool_chunk():

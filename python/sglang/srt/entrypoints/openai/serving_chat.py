@@ -101,7 +101,7 @@ from sglang.srt.entrypoints.openai.utils import (
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
-from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -3831,101 +3831,101 @@ class OpenAIServingChat(OpenAIServingBase):
 
         parser = parser_dict[index]
 
-        # Handle both FunctionCallParser and JsonArrayParser
+        # Keep native text and tool parts in the order they were parsed.
         if isinstance(parser, JsonArrayParser):
-            result = parser.parse_streaming_increment(delta, effective_tools)
-            normal_text, calls = result.normal_text, result.calls
+            parts = [parser.parse_streaming_increment(delta, effective_tools)]
             if flush:
-                end = parser.finish(effective_tools)
-                normal_text = (normal_text or "") + end.normal_text
-                calls = list(calls) + end.calls
+                parts.append(parser.finish(effective_tools))
         else:
-            normal_text, calls = parser.parse_stream_chunk(delta)
+            parts = parser._parse_stream_parts(delta)
             if flush:
                 end_text, end_calls = parser.parse_stream_end()
-                normal_text = (normal_text or "") + end_text
-                calls = list(calls) + end_calls
+                if end_text or end_calls:
+                    parts.append(
+                        StreamingParseResult(normal_text=end_text, calls=end_calls)
+                    )
 
-        # Yield normal text
-        if normal_text:
-            choice_data = ChatCompletionResponseStreamChoice(
-                index=index,
-                delta=DeltaMessage(content=normal_text),
-                finish_reason=None,
-            )
-            chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
-                created=created,
-                choices=[choice_data],
-                model=request.model,
-            )
-
-            # Add usage stats if continuous_usage_stats is enabled
-            if continuous_usage_stats:
-                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
-                completion_tokens = content["meta_info"].get("completion_tokens", 0)
-                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
-                chunk.usage = UsageProcessor.calculate_token_usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    reasoning_tokens=reasoning_tokens,
-                    cached_tokens=self._continuous_usage_cached_details(content),
-                )
-
-            yield f"data: {chunk.model_dump_json()}\n\n"
-
-        # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
-        for call_item in calls:
-            # Mark that this choice has tool calls
-            has_tool_calls[index] = True
-
-            # Tool call ID should be generated only once per tool call
-            if call_item.name:
-                # First chunk: include ID and function name
-                tool_call_id = self._process_tool_call_id(
-                    call_item, history_tool_calls_cnt
+        for part in parts:
+            # Yield normal text
+            if part.normal_text:
+                choice_data = ChatCompletionResponseStreamChoice(
+                    index=index,
+                    delta=DeltaMessage(content=part.normal_text),
+                    finish_reason=None,
                 )
-                function_name = call_item.name
-            else:
-                # Subsequent chunks: null ID and name for argument deltas
-                tool_call_id = None
-                function_name = None
-
-            tool_call = ToolCall(
-                id=tool_call_id,
-                index=call_item.tool_index,
-                function=FunctionResponse(
-                    name=function_name,
-                    arguments=call_item.parameters,
-                ),
-            )
-
-            choice_data = ChatCompletionResponseStreamChoice(
-                index=index,
-                delta=DeltaMessage(tool_calls=[tool_call]),
-                finish_reason=None,
-            )
-            chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
-                created=created,
-                choices=[choice_data],
-                model=request.model,
-            )
-
-            # Add usage stats if continuous_usage_stats is enabled
-            if continuous_usage_stats:
-                prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
-                completion_tokens = content["meta_info"].get("completion_tokens", 0)
-                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
-                chunk.usage = UsageProcessor.calculate_token_usage(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    reasoning_tokens=reasoning_tokens,
-                    cached_tokens=self._continuous_usage_cached_details(content),
+                chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=created,
+                    choices=[choice_data],
+                    model=request.model,
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+                # Add usage stats if continuous_usage_stats is enabled
+                if continuous_usage_stats:
+                    prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
+                    completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                    reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
+                    chunk.usage = UsageProcessor.calculate_token_usage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        reasoning_tokens=reasoning_tokens,
+                        cached_tokens=self._continuous_usage_cached_details(content),
+                    )
+
+                yield f"data: {chunk.model_dump_json()}\n\n"
+
+            # Yield tool calls
+            for call_item in part.calls:
+                # Mark that this choice has tool calls
+                has_tool_calls[index] = True
+
+                # Tool call ID should be generated only once per tool call
+                if call_item.name:
+                    # First chunk: include ID and function name
+                    tool_call_id = self._process_tool_call_id(
+                        call_item, history_tool_calls_cnt
+                    )
+                    function_name = call_item.name
+                else:
+                    # Subsequent chunks: null ID and name for argument deltas
+                    tool_call_id = None
+                    function_name = None
+
+                tool_call = ToolCall(
+                    id=tool_call_id,
+                    index=call_item.tool_index,
+                    function=FunctionResponse(
+                        name=function_name,
+                        arguments=call_item.parameters,
+                    ),
+                )
+
+                choice_data = ChatCompletionResponseStreamChoice(
+                    index=index,
+                    delta=DeltaMessage(tool_calls=[tool_call]),
+                    finish_reason=None,
+                )
+                chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=created,
+                    choices=[choice_data],
+                    model=request.model,
+                )
+
+                # Add usage stats if continuous_usage_stats is enabled
+                if continuous_usage_stats:
+                    prompt_tokens = self._reported_prompt_tokens(content["meta_info"])
+                    completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                    reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
+                    chunk.usage = UsageProcessor.calculate_token_usage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        reasoning_tokens=reasoning_tokens,
+                        cached_tokens=self._continuous_usage_cached_details(content),
+                    )
+
+                yield f"data: {chunk.model_dump_json()}\n\n"
 
     def _check_for_unstreamed_tool_args(
         self,

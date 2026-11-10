@@ -15,7 +15,7 @@ from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.beam_detector import BeamDetector
 from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
-from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
@@ -237,19 +237,17 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
+        parts = self._parse_stream_parts(chunk_text)
+        return (
+            "".join(part.normal_text for part in parts),
+            [call for part in parts for call in part.calls],
+        )
+
+    def _parse_stream_parts(self, chunk_text: str) -> List[StreamingParseResult]:
+        """Preserve native event order for the streaming protocol emitter."""
         if not self.tools and not self.detector.parses_without_tools():
-            return chunk_text, []
-        final_normal_text = ""
-        final_calls = []
-
-        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
-        if sp_result.normal_text:
-            final_normal_text = sp_result.normal_text
-        if sp_result.calls:
-            final_calls.extend(sp_result.calls)
-            final_normal_text = sp_result.normal_text
-
-        return final_normal_text, final_calls
+            return [StreamingParseResult(normal_text=chunk_text)]
+        return self.detector._parse_streaming_parts(chunk_text, self.tools)
 
     def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
         """Flush detector state once the stream ends.
