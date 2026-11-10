@@ -671,7 +671,9 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             config = ServiceConfig(
                 namespace="ns",
                 engine_id="engine",
-                cache_limits=CacheLimits(max_concurrent_storage_reads=1),
+                cache_limits=CacheLimits(
+                    max_concurrent_storage_reads=1, storage_demand_priority=True
+                ),
             )
             with (
                 self.subTest(finish=finish),
@@ -808,7 +810,9 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
         config = ServiceConfig(
             namespace="ns",
             engine_id="engine",
-            cache_limits=CacheLimits(max_concurrent_storage_reads=1),
+            cache_limits=CacheLimits(
+                max_concurrent_storage_reads=1, storage_demand_priority=True
+            ),
         )
         with hicache(self, config, namespace_keys=True) as owner:
             _, cache, service, _ = owner
@@ -1150,6 +1154,60 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             finally:
                 cache.release_aborted_request(demand)
                 self._pin_pressure(service, pressure, mode="release")
+            assert_retired(cache, service)
+            cache.sanity_check()
+
+    def test_ordinary_read_does_not_wait_for_a_speculative_slot(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        config = ServiceConfig(
+            namespace="ns",
+            engine_id="engine",
+            cache_limits=CacheLimits(max_concurrent_storage_reads=1),
+        )
+        with hicache(self, config, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            first, second = [
+                cache_fixtures.target(cache_salt=salt) for salt in ("busy", "queued")
+            ]
+            self._cold_scopes(owner, (first, second))
+            cc = cache.cache_controller
+            entered, release = threading.Event(), threading.Event()
+            get = cc.page_get_func
+            reads = []
+            demand = CacheRequestHandle("queued-hint-demand", 0)
+
+            def block_first(operation, *args, **kwargs):
+                reads.append(operation.request_id)
+                if len(reads) == 1:
+                    entered.set()
+                    assert release.wait(5)
+                return get(operation, *args, **kwargs)
+
+            try:
+                with (
+                    patch.object(cc, "page_get_func", block_first),
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    active = self._restore(service, first, "active")
+                    wait_for(service, entered.is_set)
+                    queued = self._restore(service, second, "queued")
+                    self.assertEqual(queued.update.code, "storage_concurrency_limit")
+                    self._ordinary_prefetch(cache, service, second, demand)
+                    self.assertIn(demand, cache.ongoing_prefetch)
+                    terminal = wait(service, queued)
+                    self.assertEqual(terminal.status, Status.DEFERRED)
+                    self.assertEqual(terminal.update.code, "ordinary_restore")
+                    release.set()
+                    self.assertEqual(wait(service, active).status, Status.COMPLETED)
+                    self.assertEqual(
+                        self._consume_ordinary_prefetch(cache, service, demand), (4, 0)
+                    )
+                    self.assertEqual(reads[1:], [demand.rid])
+            finally:
+                release.set()
+                cache.release_aborted_request(demand)
             assert_retired(cache, service)
             cache.sanity_check()
 

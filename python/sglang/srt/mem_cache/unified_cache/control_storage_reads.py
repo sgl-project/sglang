@@ -196,8 +196,18 @@ class StorageCacheReads:
                 self._joinable[key] = job
         if job is None or job.cancel_requested or job.failure or job.retired:
             return False
-        if job.operation is None and not self._has_live_interest(job):
-            return False
+        if job.operation is None:
+            if not self._has_live_interest(job):
+                return False
+            if (
+                not self.executor.config.storage_demand_priority
+                and self._admission_wait(job) == "storage_concurrency_limit"
+            ):
+                # The speculative queue has not issued I/O for this scope.
+                # Preserve ordinary admission and retire the hint so that
+                # it cannot start a second GET after the demand proceeds.
+                self._retire(job, status=Status.DEFERRED, code="ordinary_restore")
+                return False
         self.demands[request] = _Demand(
             job, max(len(prefix or ()), self._host_length(job))
         )
