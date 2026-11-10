@@ -113,41 +113,18 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def _is_per_tensor_scale_pair(name: str, q_a: torch.Tensor, kv_a: torch.Tensor) -> bool:
-    # Per-tensor scales are stored 0-d, or [1] by compressed-tensors.
-    return (
-        name.endswith((".weight_scale", ".input_scale"))
-        and q_a.numel() == 1
-        and kv_a.numel() == 1
-    )
-
-
 def _requantize_fused_qkv_a_rows(
-    weight: torch.Tensor,
-    q_lora_rank: int,
-    q_a_scale: torch.Tensor,
-    kv_a_scale: torch.Tensor,
+    weight: torch.Tensor, q_lora_rank: int, q_a_scale: float, kv_a_scale: float
 ) -> None:
-    """Requantize the rows of fused_qkv_a_proj_with_mqa that were quantized
-    with the smaller per-tensor scale to the larger one, which the fused
-    layer loaded as its single scale."""
-    if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.int8):
+    """Rescale the rows quantized with the smaller per-tensor scale to the larger one."""
+    if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
         raise NotImplementedError(
-            "fused_qkv_a_proj_with_mqa: cannot requantize a "
-            f"{weight.dtype} weight to merge different per-tensor scales"
+            "fused_qkv_a_proj_with_mqa: cannot merge different per-tensor scales "
+            f"of a {weight.dtype} weight"
         )
-    q_a_scale, kv_a_scale = q_a_scale.item(), kv_a_scale.item()
-    max_scale = max(q_a_scale, kv_a_scale)
-    for rows, scale in (
-        (weight[:q_lora_rank], q_a_scale),
-        (weight[q_lora_rank:], kv_a_scale),
-    ):
-        if scale == max_scale:
-            continue
-        rescaled = rows.float() * (scale / max_scale)
-        if weight.dtype == torch.int8:
-            rescaled = rescaled.round_()
-        rows.copy_(rescaled.to(weight.dtype))
+    rows = weight[:q_lora_rank] if q_a_scale < kv_a_scale else weight[q_lora_rank:]
+    ratio = min(q_a_scale, kv_a_scale) / max(q_a_scale, kv_a_scale)
+    rows.copy_((rows.float() * ratio).to(weight.dtype))
 
 
 def _get_indexer_weight_block_size(
@@ -346,7 +323,7 @@ class DeepseekV2WeightLoaderMixin:
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
         # fused weight name -> (q_a_proj, kv_a_proj_with_mqa) per-tensor scales
-        fused_qkv_a_requant: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        fused_qkv_a_requant: Dict[str, Tuple[float, float]] = {}
 
         pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
 
@@ -552,8 +529,13 @@ class DeepseekV2WeightLoaderMixin:
                                 kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
 
                                 requant_scales = None
-                                if _is_per_tensor_scale_pair(
-                                    name, q_a_proj_weight, kv_a_proj_weight
+                                # Per-tensor scales are 0-d, or [1] in compressed-tensors.
+                                if name.endswith(
+                                    (".weight_scale", ".input_scale")
+                                ) and (
+                                    q_a_proj_weight.numel()
+                                    == kv_a_proj_weight.numel()
+                                    == 1
                                 ):
                                     # The fused layer has a single per-tensor
                                     # scale: load the max, and for weight scales
@@ -564,7 +546,10 @@ class DeepseekV2WeightLoaderMixin:
                                     if name.endswith(
                                         ".weight_scale"
                                     ) and not torch.equal(q_a_scale, kv_a_scale):
-                                        requant_scales = (q_a_scale, kv_a_scale)
+                                        requant_scales = (
+                                            q_a_scale.item(),
+                                            kv_a_scale.item(),
+                                        )
                                 elif q_a_proj_weight.shape == torch.Size(
                                     []
                                 ) and kv_a_proj_weight.shape == torch.Size([]):

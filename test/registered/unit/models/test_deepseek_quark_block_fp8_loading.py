@@ -1,15 +1,17 @@
-"""Regression tests for Quark block-FP8 weights in the DeepSeek loader."""
+"""Regression tests for quantized weights in the DeepSeek loader."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
     _load_fused_indexer_wk,
@@ -28,10 +30,10 @@ class _FakeParam:
 
 
 class _FakeDeepseekLoader(DeepseekV2WeightLoaderMixin):
-    def __init__(self, params):
+    def __init__(self, params, q_lora_rank=2048):
         self.config = SimpleNamespace(
             n_routed_experts=0,
-            q_lora_rank=2048,
+            q_lora_rank=q_lora_rank,
             num_hidden_layers=1,
             num_nextn_predict_layers=0,
         )
@@ -181,6 +183,77 @@ class TestQuarkBlockFp8WeightLoading(CustomTestCase):
         )
         torch.testing.assert_close(fused_param[:2], dequantized)
         self.assertEqual(pending, {})
+
+
+def _fp8(values):
+    return torch.tensor(values, dtype=torch.float32).to(torch.float8_e4m3fn)
+
+
+class TestFusedQkvAPerTensorScale(CustomTestCase):
+    """fused_qkv_a_proj_with_mqa holds one per-tensor scale, so the loader
+    loads the max of the q_a/kv_a scales and requantizes the other rows."""
+
+    prefix = "model.layers.0.self_attn"
+    fused = f"{prefix}.fused_qkv_a_proj_with_mqa"
+    # Every value stays exactly representable after scaling by 1/4.
+    q_weight = _fp8([[1.0, 2.0, -4.0, 0.5], [8.0, -1.0, 0.0, 4.0]])
+    kv_weight = _fp8(
+        [[1.0, -2.0, 3.0, 0.5], [0.25, 6.0, -8.0, 1.0], [2.0, 2.0, -0.5, 0.0]]
+    )
+
+    def _load(self, q_scale, kv_scale, q_input_scale, kv_input_scale):
+        def param(*shape, dtype):
+            p = torch.nn.Parameter(torch.zeros(shape, dtype=dtype), requires_grad=False)
+            # The fused layer is a ReplicatedLinear; keep its strict shape check.
+            p.weight_loader = partial(ReplicatedLinear.weight_loader, None)
+            return p
+
+        params = {
+            f"{self.fused}.weight": param(5, 4, dtype=torch.float8_e4m3fn),
+            f"{self.fused}.weight_scale": param(1, dtype=torch.float32),
+            f"{self.fused}.input_scale": param(1, dtype=torch.float32),
+        }
+        # Scales arrive before the weights to show the order does not matter.
+        _FakeDeepseekLoader(params, q_lora_rank=2).do_load_weights(
+            [
+                (f"{self.prefix}.q_a_proj.weight_scale", q_scale),
+                (f"{self.prefix}.kv_a_proj_with_mqa.weight_scale", kv_scale),
+                (f"{self.prefix}.q_a_proj.input_scale", q_input_scale),
+                (f"{self.prefix}.kv_a_proj_with_mqa.input_scale", kv_input_scale),
+                (f"{self.prefix}.q_a_proj.weight", self.q_weight.clone()),
+                (f"{self.prefix}.kv_a_proj_with_mqa.weight", self.kv_weight.clone()),
+            ]
+        )
+        return params
+
+    def test_per_tensor_scales_take_the_max_and_requantize(self):
+        # compressed-tensors stores per-tensor scales as [1], others as 0-d.
+        for wrap in (lambda v: torch.tensor([v]), torch.tensor):
+            for q_scale, kv_scale in ((0.5, 2.0), (4.0, 1.0)):
+                with self.subTest(
+                    shape=tuple(wrap(0.0).shape), q_scale=q_scale, kv_scale=kv_scale
+                ):
+                    params = self._load(
+                        wrap(q_scale), wrap(kv_scale), wrap(1.0), wrap(3.0)
+                    )
+                    fused_scale = params[f"{self.fused}.weight_scale"].data
+                    torch.testing.assert_close(
+                        fused_scale, torch.tensor([max(q_scale, kv_scale)])
+                    )
+                    torch.testing.assert_close(
+                        params[f"{self.fused}.input_scale"].data, torch.tensor([3.0])
+                    )
+                    torch.testing.assert_close(
+                        params[f"{self.fused}.weight"].float() * fused_scale,
+                        torch.cat(
+                            [
+                                self.q_weight.float() * q_scale,
+                                self.kv_weight.float() * kv_scale,
+                            ]
+                        ),
+                        rtol=0,
+                        atol=0,
+                    )
 
 
 if __name__ == "__main__":
