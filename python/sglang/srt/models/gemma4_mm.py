@@ -192,7 +192,15 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         # Vision/audio encoders + their projection embedders are only consumed
         # at the input-embedding stage, so they live on the first PP rank only.
-        if self.pp_group.is_first_rank:
+        # --language-model-only builds neither: multimodal requests are rejected
+        # before they reach the model. ModelConfig sets the field; a Gemma4Config
+        # built directly has none.
+        if getattr(config, "language_model_only", False):
+            self.vision_tower = None
+            self.embed_vision = None
+            self.audio_tower = None
+            self.embed_audio = None
+        elif self.pp_group.is_first_rank:
             self.vision_tower = Gemma4VisionEncoder(
                 config=config.vision_config,
                 quant_config=quant_config,
@@ -953,6 +961,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 continue
             if self.audio_tower is None and (
                 "audio_tower." in name or "embed_audio." in name
+            ):
+                continue
+            if self.vision_tower is None and (
+                "vision_tower." in name or "embed_vision." in name
             ):
                 continue
 
