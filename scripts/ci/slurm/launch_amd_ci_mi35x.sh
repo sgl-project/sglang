@@ -92,7 +92,8 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The workflow's cleanup step cancels by this prefix, so keep the two in sync.
 JOB_PREFIX="amd-ci-${RUNNER_NAME:-local}-${GITHUB_RUN_ID:-0}-"
-JOB_NAME="${JOB_PREFIX}${GITHUB_JOB:-job}"
+# The attempt keeps a re-run from deleting the run dir of the attempt before it.
+JOB_NAME="${JOB_PREFIX}${GITHUB_JOB:-job}-${GITHUB_RUN_ATTEMPT:-1}"
 RUN_DIR="${CI_SHARED_DIR:-$HOME/.amd_ci_spur}/${JOB_NAME}"
 rm -rf "$RUN_DIR"
 mkdir -p "$RUN_DIR"
