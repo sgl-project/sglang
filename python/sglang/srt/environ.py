@@ -1223,6 +1223,12 @@ class Envs:
     # explicitly for performance after validating workload accuracy.
     SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8 = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    SGLANG_NPU_DSA_DCP_FUSED_A2A = EnvBool(False)
+    SGLANG_NPU_DSA_DCP_FUSED_Q_LAYOUT = EnvBool(False)
+    SGLANG_NPU_DSA_DCP_FUSED_REMAP = EnvBool(False)
+    SGLANG_NPU_DSA_DCP_Q_GATHER_INDEXER_OVERLAP = EnvBool(False)
+    SGLANG_NPU_DSA_DCP_Q_GATHER_KV_OVERLAP = EnvBool(False)
+    SGLANG_NPU_DSA_DCP_OPTIMIZE_VERIFY_PREP = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)

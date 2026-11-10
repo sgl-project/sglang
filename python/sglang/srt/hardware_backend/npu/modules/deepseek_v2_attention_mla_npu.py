@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -401,6 +402,11 @@ def _apply_interleaved_rope_with_half_output(rotary_emb, positions, q_pe, k_pe):
     return q_pe, k_pe
 
 
+@lru_cache(maxsize=None)
+def _dsa_dcp_q_gather_stream(device: torch.device):
+    return torch.npu.Stream(device=device)
+
+
 def forward_dsa_prepare_npu(
     m: "DeepseekV2AttentionMLA",
     positions: torch.Tensor,
@@ -524,7 +530,39 @@ def forward_dsa_prepare_npu(
             )
 
     backend = get_mla_dcp_backend(forward_context.get_attn_backend())
-    if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
+    use_dcp = backend.uses_dcp_partial_attention(forward_batch)
+    run_indexer = not m.skip_topk or (m.is_nextn and prev_topk_indices is None)
+    save_kv_cache = not mla_preprocess_used
+    mode = forward_batch.forward_mode
+    decode_or_verify = mode.is_decode() or mode.is_target_verify()
+    fuse_q_layout = decode_or_verify and envs.SGLANG_NPU_DSA_DCP_FUSED_Q_LAYOUT.get()
+    overlap_indexer = (
+        run_indexer
+        and envs.SGLANG_NPU_DSA_DCP_Q_GATHER_INDEXER_OVERLAP.get()
+        # The scattered indexer can issue its own attention-TP collectives.
+        and not (_use_ag_after_qlora and input_on_attn_tp_slices)
+    )
+    overlap_kv = (
+        not run_indexer
+        and save_kv_cache
+        and envs.SGLANG_NPU_DSA_DCP_Q_GATHER_KV_OVERLAP.get()
+    )
+
+    gather_done = None
+    if use_dcp and decode_or_verify and (overlap_indexer or overlap_kv):
+        compute_stream = torch.npu.current_stream(q_pe.device)
+        gather_stream = _dsa_dcp_q_gather_stream(q_pe.device)
+        gather_stream.wait_event(compute_stream.record_event())
+        with torch.npu.stream(gather_stream):
+            q_nope_out.record_stream(gather_stream)
+            q_pe.record_stream(gather_stream)
+            q_nope_out, q_pe = dcp_comm.all_gather_q_for_mla_decode(
+                q_nope_out, q_pe, fuse_layout=fuse_q_layout
+            )
+            # The calling stream waits for HCCL before unpacking Q.
+            gather_done = gather_stream.record_event()
+
+    if run_indexer:
         topk_indices = m.indexer(
             hidden_states,
             q_lora,
@@ -537,9 +575,16 @@ def forward_dsa_prepare_npu(
         # DSA layers that skip the indexer reuse ``prev_topk_indices``. Remap
         # only when a fresh global top-k is produced so shared-index layers do
         # not repeat the same DCP partitioning work.
-        if backend.uses_dcp_partial_attention(forward_batch):
+        if use_dcp:
             parallel = runtime_context.get_parallel()
-            topk_indices = dcp_layout.remap_dcp_sparse_indices(
+            remap = dcp_layout.remap_dcp_sparse_indices
+            if decode_or_verify and envs.SGLANG_NPU_DSA_DCP_FUSED_REMAP.get():
+                from sglang.srt.hardware_backend.npu.attention.dsa_dcp_remap import (
+                    remap_dcp_sparse_indices_npu,
+                )
+
+                remap = remap_dcp_sparse_indices_npu
+            topk_indices = remap(
                 topk_indices,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
@@ -548,8 +593,21 @@ def forward_dsa_prepare_npu(
     else:
         topk_indices = prev_topk_indices
 
-    if backend.uses_dcp_partial_attention(forward_batch):
-        q_nope_out, q_pe = dcp_comm.all_gather_q_for_mla_decode(q_nope_out, q_pe)
+    if gather_done is not None:
+        if overlap_kv:
+            k_nope = k_nope.contiguous()
+            k_pe = k_pe.contiguous()
+            backend.write_sparse_attention_kv(
+                m.attn_mqa_for_dcp_decode, forward_batch, k_nope, k_pe
+            )
+            save_kv_cache = False
+        compute_stream.wait_event(gather_done)
+        q_nope_out.record_stream(compute_stream)
+        q_pe.record_stream(compute_stream)
+    elif use_dcp:
+        q_nope_out, q_pe = dcp_comm.all_gather_q_for_mla_decode(
+            q_nope_out, q_pe, fuse_layout=fuse_q_layout
+        )
 
     topk_indices = maybe_capture_indexer_topk(m.layer_id, topk_indices)
 
@@ -562,7 +620,7 @@ def forward_dsa_prepare_npu(
         forward_batch,
         zero_allocator,
         positions,
-        mla_preprocess_used,
+        save_kv_cache,
     )
 
 
@@ -576,7 +634,7 @@ def forward_dsa_core_npu(
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
-    mla_preprocess_used: bool,
+    save_kv_cache: bool,
     # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its gate
     # to inner_state, so every *_core dispatched from forward_core takes it as
     # a trailing arg. None everywhere else.
@@ -591,7 +649,7 @@ def forward_dsa_core_npu(
         k_nope.contiguous(),
         q_pe.contiguous(),
         k_pe.contiguous(),
-        save_kv_cache=not mla_preprocess_used,
+        save_kv_cache=save_kv_cache,
         topk_indices=topk_indices,
     )
 

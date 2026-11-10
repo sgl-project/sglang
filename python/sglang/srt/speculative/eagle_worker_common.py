@@ -805,6 +805,22 @@ def run_eagle_verify(
             batch,
             target_worker,
         )
+        runner = target_worker.model_runner
+        reuse_verify_inputs = (
+            _is_npu
+            and plan_stream is not None
+            and can_run_cuda_graph
+            and verify_forward_batch.forward_mode.is_target_verify()
+            and envs.SGLANG_NPU_DSA_DCP_OPTIMIZE_VERIFY_PREP.get()
+            and getattr(runner.attn_backend, "dsa_dcp_target", False)
+            and not runner.model_config.model_is_mrope
+            and not batch.has_grammar
+        )
+        if reuse_verify_inputs:
+            prefilled_inputs = (
+                verify_forward_batch.input_ids,
+                verify_forward_batch.positions,
+            )
 
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
     record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
@@ -864,12 +880,21 @@ def run_eagle_verify(
     # eagle_prepare_for_verify marked the batch in exactly that case; the
     # non-cuda-graph path stays unmarked and gets forward_extend's init
     # (post-pad).
-    forward_batch_output = target_worker.forward_batch_generation(
-        batch=None,
-        forward_batch=verify_forward_batch,
-        is_verify=True,
-        pp_proxy_tensors=pp_proxy_tensors,
-    )
+    graph_runner = runner.decode_cuda_graph_runner
+    if reuse_verify_inputs:
+        # The main stream has waited for the plan stream above. The runner
+        # re-copies either input if its source tensor changed since staging.
+        graph_runner._prefilled_inputs = prefilled_inputs
+    try:
+        forward_batch_output = target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+    finally:
+        if reuse_verify_inputs:
+            graph_runner._prefilled_inputs = None
     logits_output = forward_batch_output.logits_output
 
     kvcache = token_to_kv_pool_allocator.get_kvcache()

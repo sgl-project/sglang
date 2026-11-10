@@ -444,12 +444,15 @@ def _lse_pack_dim(output_dtype: torch.dtype) -> int:
 def _dcp_pack_a2a_send_kernel(
     out_ptr,
     lse_ptr,
+    softmax_sum_ptr,
     dst_o_ptr,
     dst_lse_ptr,
     out_stride_B,
     out_stride_H,
     lse_stride_B,
     lse_stride_H,
+    softmax_sum_stride_B,
+    softmax_sum_stride_H,
     dst_o_stride_N,
     dst_o_stride_B,
     dst_o_stride_H,
@@ -459,6 +462,7 @@ def _dcp_pack_a2a_send_kernel(
     H_PER_RANK: tl.constexpr,
     WORDS: tl.constexpr,
     BLOCK: tl.constexpr,
+    COMPUTE_LSE: tl.constexpr,
 ):
     """Scatter one (batch, head) partial into its peer's send slot."""
     b = tl.program_id(0).to(tl.int64)
@@ -479,12 +483,18 @@ def _dcp_pack_a2a_send_kernel(
         mask = offs < WORDS
         tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
 
+    lse = tl.load(lse_ptr + b * lse_stride_B + h * lse_stride_H)
+    if COMPUTE_LSE:
+        softmax_sum = tl.load(
+            softmax_sum_ptr + b * softmax_sum_stride_B + h * softmax_sum_stride_H
+        )
+        lse = lse + tl.log(softmax_sum)
     tl.store(
         dst_lse_ptr
         + peer * dst_lse_stride_N
         + b * dst_lse_stride_B
         + h_local * dst_lse_stride_H,
-        tl.load(lse_ptr + b * lse_stride_B + h * lse_stride_H),
+        lse,
     )
 
 
@@ -493,11 +503,15 @@ def dcp_pack_a2a_send(
     cp_attn_lse: torch.Tensor,
     dst_o: torch.Tensor,
     dst_lse: torch.Tensor,
+    *,
+    softmax_sum: Optional[torch.Tensor] = None,
 ) -> None:
     """Scatter ``[B, H, D]`` partials + ``[B, H]`` LSE into a transport's send slots.
 
     ``dst_o`` is ``[N, B_max, H // N, D]`` and ``dst_lse`` ``[N, B_max, H // N]``,
     in any stride order. Rows beyond ``B`` are left untouched.
+    If ``softmax_sum`` is given, ``cp_attn_lse`` holds the local softmax max
+    and the pack computes the natural-log LSE.
     """
     B, H, D = cp_attn_out.shape
     N, B_max, H_per_rank = dst_lse.shape
@@ -505,6 +519,10 @@ def dcp_pack_a2a_send(
 
     if cp_attn_lse.dtype != torch.float32 or dst_lse.dtype != torch.float32:
         raise ValueError("LSE tensors must be float32")
+    if softmax_sum is not None and (
+        softmax_sum.dtype != torch.float32 or softmax_sum.shape != cp_attn_lse.shape
+    ):
+        raise ValueError("Softmax max and sum must have matching float32 shapes")
     if D % lpd:
         raise ValueError(f"head dim {D} must be a multiple of the LSE pack dim {lpd}")
     if dst_o.shape != (N, B_max, H_per_rank, D) or H_per_rank * N != H or B > B_max:
@@ -516,16 +534,20 @@ def dcp_pack_a2a_send(
     out_words = cp_attn_out.view(torch.float32)
     dst_o_words = dst_o.view(torch.float32)
     words = D // lpd
+    sum_input = cp_attn_lse if softmax_sum is None else softmax_sum
 
     _dcp_pack_a2a_send_kernel[(B, H)](
         out_words,
         cp_attn_lse,
+        sum_input,
         dst_o_words,
         dst_lse,
         out_words.stride(0),
         out_words.stride(1),
         cp_attn_lse.stride(0),
         cp_attn_lse.stride(1),
+        sum_input.stride(0),
+        sum_input.stride(1),
         dst_o_words.stride(0),
         dst_o_words.stride(1),
         dst_o_words.stride(2),
@@ -535,6 +557,7 @@ def dcp_pack_a2a_send(
         H_PER_RANK=H_per_rank,
         WORDS=words,
         BLOCK=min(1024, triton.next_power_of_2(words)),
+        COMPUTE_LSE=softmax_sum is not None,
     )
 
 
@@ -596,6 +619,39 @@ def dcp_pack_q(q_nope: torch.Tensor, q_pe: torch.Tensor, out: torch.Tensor) -> N
 
 
 @triton.jit
+def _dcp_unpack_q_kernel(
+    gathered_ptr,
+    q_nope_ptr,
+    q_pe_ptr,
+    TOKENS: tl.constexpr,
+    HEADS: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    D_PE: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    src = gathered_ptr + (head * TOKENS + token) * (D_PE + D_NOPE)
+    row = token * HEADS + head
+    pe = tl.arange(0, D_PE)
+    nope = tl.arange(0, D_NOPE)
+    tl.store(q_pe_ptr + row * D_PE + pe, tl.load(src + pe))
+    tl.store(q_nope_ptr + row * D_NOPE + nope, tl.load(src + D_PE + nope))
+
+
+def dcp_unpack_q(
+    gathered: torch.Tensor, d_nope: int, d_pe: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unpack contiguous head-major DCP Q into two contiguous TND inputs."""
+    heads, tokens, _ = gathered.shape
+    q_nope = gathered.new_empty((tokens, heads, d_nope))
+    q_pe = gathered.new_empty((tokens, heads, d_pe))
+    _dcp_unpack_q_kernel[(tokens, heads)](
+        gathered, q_nope, q_pe, tokens, heads, d_nope, d_pe
+    )
+    return q_nope, q_pe
+
+
+@triton.jit
 def _dcp_lse_combine_kernel(
     recv_output_ptr,
     recv_lse_ptr,
@@ -615,6 +671,7 @@ def _dcp_lse_combine_kernel(
     HEAD_DIM: tl.constexpr,
     IS_BASE_E: tl.constexpr,
     RETURN_LSE: tl.constexpr,
+    NAN_IF_EMPTY: tl.constexpr,
 ):
     """Combine N partial attention outputs weighted by their LSE values.
 
@@ -670,7 +727,10 @@ def _dcp_lse_combine_kernel(
         partial_out = tl.load(recv_output_ptr + o_offsets).to(tl.float32)
         acc += partial_out * w
 
-    acc = acc / tl.maximum(weight_sum, 1.0)
+    if NAN_IF_EMPTY:
+        acc = acc / weight_sum
+    else:
+        acc = acc / tl.maximum(weight_sum, 1.0)
 
     out_offsets = (
         batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
@@ -691,6 +751,8 @@ def dcp_lse_combine_triton(
     recv_lse: torch.Tensor,
     is_lse_base_on_e: bool = True,
     return_lse: bool = False,
+    *,
+    nan_if_empty: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Launch the Triton LSE-combine kernel.
 
@@ -700,6 +762,7 @@ def dcp_lse_combine_triton(
         is_lse_base_on_e: True if LSE uses base-e (FlashAttention),
                           False if base-2 (FlashInfer).
         return_lse: If True, also return the combined global LSE.
+        nan_if_empty: Match Ascend AttentionUpdate for fully masked rows.
 
     Returns:
         (combined_output [B, H_local, D], combined_lse [B, H_local] or None)
@@ -734,6 +797,7 @@ def dcp_lse_combine_triton(
         HEAD_DIM=D,
         IS_BASE_E=is_lse_base_on_e,
         RETURN_LSE=return_lse,
+        NAN_IF_EMPTY=nan_if_empty,
     )
     return out, (out_lse if return_lse else None)
 

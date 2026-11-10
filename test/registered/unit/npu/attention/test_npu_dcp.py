@@ -38,6 +38,7 @@ try:
     from sglang.srt import runtime_context as rc
     from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
         forward_dcp_sparse_attention,
+        pinned_dcp_verify_lens,
     )
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.layers.dcp.comm import cp_lse_ag_out_rs_mla_npu
@@ -242,6 +243,23 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
 
         self.fake_op = fake_sparse_attention
 
+    def test_pinned_verify_lengths_match_reference(self):
+        lengths = torch.tensor([0, 2, 4, 128, 129, 510, 514, 131075], dtype=torch.int32)
+        make_tensor = torch.tensor
+
+        def unpinned_tensor(*args, pin_memory=False, **kwargs):
+            self.assertTrue(pin_memory)
+            return make_tensor(*args, **kwargs)
+
+        for dcp_size in (2, 4):
+            for rank in range(dcp_size):
+                expected = get_dcp_chain_spec_lens(
+                    lengths, 4, dcp_size, rank, interleave_size=128
+                )
+                with patch.object(torch, "tensor", side_effect=unpinned_tensor):
+                    actual = pinned_dcp_verify_lens(lengths, 4, dcp_size, rank, 128)
+                torch.testing.assert_close(actual, expected)
+
     def _metadata(self, rows=2):
         return SimpleNamespace(
             dcp_block_tables=torch.tensor([[10, 11]] * rows, dtype=torch.int32),
@@ -268,7 +286,7 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
             self.fake_op,
             create=True,
         ):
-            out, lse = forward_dcp_sparse_attention(
+            out, (softmax_max, softmax_sum) = forward_dcp_sparse_attention(
                 q_nope=q,
                 q_rope=rope,
                 k_nope=k_nope,
@@ -288,9 +306,8 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
         self.assertEqual(call["attention_mode"], 2)
         self.assertEqual(call["layout_kv"], "PA_BSND")
         self.assertEqual(out.shape, q.shape)
-        self.assertEqual(lse.shape, (2, 2))
-        expected_lse = torch.full((2, 2), torch.log(torch.tensor(2.0)))
-        self.assertTrue(torch.allclose(lse, expected_lse))
+        torch.testing.assert_close(softmax_max, torch.zeros(2, 2, 1))
+        torch.testing.assert_close(softmax_sum, torch.full((2, 2, 1), 2.0))
 
     def test_verify_replaces_query_lengths_and_uses_spec_metadata(self):
         rows = 4

@@ -21,6 +21,8 @@ from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
 )
 from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
     forward_dcp_sparse_attention,
+    pinned_dcp_verify_lens,
+    try_write_dcp_verify_page_tables,
 )
 from sglang.srt.hardware_backend.npu.attention.mla_cache import (
     build_mla_prefix_token_indices,
@@ -1238,6 +1240,13 @@ class AscendAttnBackend(AttentionBackend):
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         metadata = self.graph_metadata[bs]
+        optimize_dcp_verify = (
+            self.dsa_dcp_target
+            and forward_mode.is_target_verify()
+            and seq_lens_cpu is not None
+            and envs.SGLANG_NPU_DSA_DCP_OPTIMIZE_VERIFY_PREP.get()
+        )
+        wrote_dcp_tables = False
 
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
@@ -1297,7 +1306,18 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.swa_mask[:bs, 0, :].copy_(mask)
                 metadata.swa_mask[bs:, :, :].fill_(True)
 
-            if not self.dense_mla_dcp_target:
+            if optimize_dcp_verify:
+                wrote_dcp_tables = try_write_dcp_verify_page_tables(
+                    self.req_to_token,
+                    req_pool_indices[:bs],
+                    metadata.block_tables[:bs],
+                    metadata.dcp_spec_block_tables,
+                    max_seq_pages,
+                    self.speculative_num_draft_tokens,
+                    self.page_size,
+                    self.dcp_size,
+                )
+            if not self.dense_mla_dcp_target and not wrote_dcp_tables:
                 metadata.block_tables[:bs, :max_seq_pages].copy_(
                     self.req_to_token[
                         req_pool_indices[:bs], 0 : max_len : self.page_size
@@ -1366,24 +1386,45 @@ class AscendAttnBackend(AttentionBackend):
             # table whose stride is page_size * dcp_world_size. Draft attention
             # uses the ordinary full-KV metadata above instead.
             if forward_mode.is_target_verify():
-                (
-                    metadata.dcp_spec_seq_lens_cpu_int,
-                    dcp_spec_block_tables,
-                ) = self._get_kv_lens_and_block_tables(
-                    kv_lens_cpu=attention_kv_lens_cpu,
-                    req_pool_indices=req_pool_indices[:bs],
-                    is_spec=True,
-                )
-                metadata.dcp_spec_seq_lens.copy_(
-                    metadata.dcp_spec_seq_lens_cpu_int.to(
-                        device=metadata.dcp_spec_seq_lens.device
+                if optimize_dcp_verify:
+                    query_len = self.speculative_num_draft_tokens
+                    metadata.dcp_spec_seq_lens_cpu_int = pinned_dcp_verify_lens(
+                        attention_kv_lens_cpu,
+                        query_len,
+                        self.dcp_size,
+                        self.dcp_rank,
+                        self.page_size,
                     )
-                )
-                dcp_pages = dcp_spec_block_tables.shape[1]
-                metadata.dcp_spec_block_tables[:, :dcp_pages].copy_(
-                    dcp_spec_block_tables
-                )
-                metadata.dcp_spec_block_tables[:, dcp_pages:].fill_(0)
+                    # The pinned allocator tracks the outstanding H2D copy.
+                    metadata.dcp_spec_seq_lens.copy_(
+                        metadata.dcp_spec_seq_lens_cpu_int, non_blocking=True
+                    )
+                    if not wrote_dcp_tables:
+                        # One DCP group spans dcp_size pages in the ordinary table.
+                        dcp_spec_block_tables = (
+                            metadata.block_tables[:bs, : max_seq_pages : self.dcp_size]
+                            // self.dcp_size
+                        ).repeat_interleave(query_len, dim=0)
+                else:
+                    (
+                        metadata.dcp_spec_seq_lens_cpu_int,
+                        dcp_spec_block_tables,
+                    ) = self._get_kv_lens_and_block_tables(
+                        kv_lens_cpu=attention_kv_lens_cpu,
+                        req_pool_indices=req_pool_indices[:bs],
+                        is_spec=True,
+                    )
+                    metadata.dcp_spec_seq_lens.copy_(
+                        metadata.dcp_spec_seq_lens_cpu_int.to(
+                            device=metadata.dcp_spec_seq_lens.device
+                        )
+                    )
+                if not wrote_dcp_tables:
+                    dcp_pages = dcp_spec_block_tables.shape[1]
+                    metadata.dcp_spec_block_tables[:, :dcp_pages].copy_(
+                        dcp_spec_block_tables
+                    )
+                    metadata.dcp_spec_block_tables[:, dcp_pages:].fill_(0)
             else:
                 (
                     metadata.dcp_seq_lens_cpu_int,
@@ -1956,6 +1997,20 @@ class AscendAttnBackend(AttentionBackend):
         )
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def write_sparse_attention_kv(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        k: torch.Tensor,
+        k_rope: torch.Tensor,
+    ) -> None:
+        self.token_to_kv_pool.set_kv_buffer(
+            layer,
+            forward_batch.out_cache_loc,
+            k.view(-1, layer.tp_k_head_num, self.kv_lora_rank),
+            k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim),
+        )
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -1977,11 +2032,7 @@ class AscendAttnBackend(AttentionBackend):
         )
 
         if save_kv_cache:
-            k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
-            k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
-            )
+            self.write_sparse_attention_kv(layer, forward_batch, k, k_rope)
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 

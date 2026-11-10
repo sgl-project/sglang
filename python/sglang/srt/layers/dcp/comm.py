@@ -33,6 +33,7 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     dcp_lse_combine_triton,
     dcp_pack_a2a_send,
     dcp_pack_q,
+    dcp_unpack_q,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -284,9 +285,33 @@ def all_gather_q_for_mla_decode(
     q_nope_out: torch.Tensor,
     q_pe: torch.Tensor,
     dtype: Optional[torch.dtype] = None,
+    *,
+    fuse_layout: bool = False,
 ):
-    """All-gather the DCP group's query heads; ``dtype`` casts q before the wire."""
+    """All-gather query heads and optionally fuse the NPU layout copies."""
     group = get_parallel().dcp_group
+    d_nope = q_nope_out.size(-1)
+    d_pe = q_pe.size(-1)
+    use_fused_layout = (
+        fuse_layout
+        and dtype is None
+        and q_nope_out.device.type == "npu"
+        and q_nope_out.device == q_pe.device
+        and q_nope_out.dtype == q_pe.dtype == torch.bfloat16
+        and (d_nope, d_pe) == (512, 64)
+        and q_nope_out.shape[:-1] == q_pe.shape[:-1]
+        # One token needs no physical transpose on the send side.
+        and q_nope_out.size(0) > 1
+        and q_nope_out.size(1) > 0
+        and q_nope_out.stride(-1) == q_pe.stride(-1) == 1
+    )
+    if use_fused_layout:
+        tokens, heads, _ = q_nope_out.shape
+        with use_symmetric_memory(group):
+            combined = q_nope_out.new_empty((heads, tokens, d_pe + d_nope))
+        dcp_pack_q(q_nope_out, q_pe, combined)
+        gathered = group.all_gather(combined, dim=0)
+        return dcp_unpack_q(gathered, d_nope, d_pe)
     if dtype is None or dtype == q_pe.dtype:
         with use_symmetric_memory(group):
             # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
@@ -305,8 +330,6 @@ def all_gather_q_for_mla_decode(
         # no FP8 dtype: pair the bytes into fp16 when the row allows, an exact copy.
         wire = torch.float16 if combined.shape[-1] % 2 == 0 else torch.uint8
         gathered = group.all_gather(combined.view(wire), dim=0).view(dtype)
-    d_pe = q_pe.size(-1)
-    d_nope = q_nope_out.size(-1)
     q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
     q_pe = q_pe.transpose(0, 1)
     q_nope_out = q_nope_out.transpose(0, 1)
@@ -621,16 +644,22 @@ def dcp_a2a_lse_reduce(
     is_lse_base_on_e: bool = True,
     cuda_graph_buffers: Optional[dict] = None,
     comm_backend: str = "a2a",
+    *,
+    softmax_sum: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """A2A DCP reduce: all-to-all exchange of head partials, then local Triton
     combine. Output + fp32 LSE are packed into ONE all_to_all (LSE reinterpreted
     as output-dtype columns along D) -> 1 NCCL call/layer instead of 2.
     is_lse_base_on_e: True=base-e (FlashAttention), False=base-2 (FlashInfer-MLA).
+    With ``softmax_sum``, ``cp_attn_lse`` is the local softmax max and the
+    compact A2A pack computes the natural-log LSE.
     """
     if cp_group.world_size == 1:
         return cp_attn_out
 
     if comm_backend == "fi_a2a":
+        if softmax_sum is not None:
+            raise ValueError("Packing softmax stats requires the a2a backend")
         return _dcp_fi_a2a_lse_reduce(
             cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
         )
@@ -662,6 +691,7 @@ def dcp_a2a_lse_reduce(
         cp_attn_lse,
         send_combined[:, :, :, :D],
         send_words[:, :, :, D // lpd],
+        softmax_sum=softmax_sum,
     )
 
     # Transport as raw bytes (uint8): the output may be fp8 (fp8 KV cache),
@@ -675,7 +705,10 @@ def dcp_a2a_lse_reduce(
     recv_lse = recv_combined.view(torch.float32)[:, :B, :, D // lpd]
 
     combined, _ = dcp_lse_combine_triton(
-        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
+        recv_output,
+        recv_lse,
+        is_lse_base_on_e=is_lse_base_on_e,
+        nan_if_empty=softmax_sum is not None,
     )
     return combined
 
