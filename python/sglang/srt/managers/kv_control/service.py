@@ -19,7 +19,6 @@ from sglang.srt.managers.kv_control.contracts import (
     Identifier,
     Limits,
     Location,
-    LogicalTarget,
     OperationRef,
     Position,
     PublicLocation,
@@ -27,6 +26,7 @@ from sglang.srt.managers.kv_control.contracts import (
     TaskIdentity,
     TokensTarget,
     Value,
+    resolve_prefix,
     validated,
 )
 from sglang.srt.managers.kv_control.controller import KVControl
@@ -37,7 +37,6 @@ from sglang.srt.managers.kv_control.feedback import (
     FeedbackPublisherConfig,
     RequestAssociation,
 )
-from sglang.srt.managers.kv_control.index import IndexCursor
 from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.mem_cache.unified_cache.control_protection import (
     HostCacheProtection,
@@ -163,7 +162,7 @@ class Cancel(Value, tag="cancel", tag_field="kind"):
 
 class Residency(Value, tag="residency", tag_field="kind"):
     context: ControlContext
-    target: LogicalTarget
+    target: TokensTarget
     limit: PageSize = 256
     location: Location = Location(tier="gpu")
 
@@ -172,13 +171,6 @@ class StorageTargets(Value, tag="storage_targets", tag_field="kind"):
     context: ControlContext
     target: PublicTarget
     location: PublicLocation
-
-
-class Associations(Value, tag="associations", tag_field="kind"):
-    context: ControlContext
-    session_id: Identifier | None = None
-    cursor: IndexCursor | None = None
-    limit: PageSize = 256
 
 
 class Capacity(Value, tag="capacity", tag_field="kind"):
@@ -218,7 +210,6 @@ Command = (
     | Cancel
     | Residency
     | StorageTargets
-    | Associations
     | Capacity
     | Claim
     | ClaimEvents
@@ -279,7 +270,6 @@ class KVControlService:
         )
         registry.on_result = self.feedback.operation
         registry.cache_watermark = self.cache_watermark
-        self.control.association_feedback = self.feedback.association
         self._feedback_backend = self._backend_identity()
 
     def _backend_identity(self):
@@ -480,7 +470,7 @@ class KVControlService:
         # Refuse this request's physical work without removing the owner that
         # must still cancel/drain existing transfers on logical task cleanup.
         submission = self.control.submit(
-            envelope, context, execute_primitives=not unsupported, public_only=True
+            envelope, context, execute_primitives=not unsupported
         )
         req.kv_control_context = context
         req.kv_hints = msgspec.structs.replace(
@@ -581,7 +571,7 @@ class KVControlService:
                 )
             # Independent control has no external consumer. Opaque actions
             # remain in the reply for their owner to handle.
-            return control.submit(command.envelope, context, public_only=True)
+            return control.submit(command.envelope, context)
         if isinstance(command, Query):
             return registry.query(context, command.message_id)
         if isinstance(command, Lookup):
@@ -612,7 +602,7 @@ class KVControlService:
             )
         if isinstance(command, Residency):
             snapshot = control.executor.residency(
-                control.index.resolve(command.target),
+                resolve_prefix(command.target, context, self.config.limits),
                 limit=command.limit,
                 location=command.location,
             )
@@ -621,15 +611,8 @@ class KVControlService:
                 "cache_watermark": self.cache_watermark(),
                 "coverage_semantics": "requested_scope_only",
             }
-        if isinstance(command, Associations):
-            return control.index.query(
-                session_id=command.session_id,
-                cursor=command.cursor,
-                limit=command.limit,
-            )
         return {
             "operations": registry.capacity(),
-            "associations": control.index.capacity(),
             "storage_reads": self.cache.prefetch_outcome_stats_snapshot()
             if control.executor.storage_reads is not None
             else None,

@@ -64,7 +64,7 @@ def public_capabilities(caps):
         pin_attached_claim_id="returned_effective_claim_id_per_binding"
         if pins
         else None,
-        pin_owner_task="optional_local_index_identity" if pins else None,
+        pin_owner_task="optional_caller_identity" if pins else None,
         hash_only_execution=False,
         prefix=dict(
             namespace=caps.get("namespace"),
@@ -238,7 +238,4 @@ def project_result(current, update, sequence):
 
 
 def requested_outcomes(scope):
-    return tuple(
-        TargetOutcome(coverage=branch.requested, branch_index=i, status=Status.RECEIVED)
-        for i, branch in enumerate(scope.branches)
-    )
+    return (TargetOutcome(coverage=scope.requested, status=Status.RECEIVED),)

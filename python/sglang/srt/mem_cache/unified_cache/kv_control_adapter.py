@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 import threading
 from array import array
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import msgspec
 
@@ -19,13 +19,13 @@ from sglang.srt.managers.kv_control.contracts import (
     Status,
     TargetOutcome,
     TokenRange,
-    TokensTarget,
+    ResolvedTarget,
+    resolve_prefix,
     Value,
     cache_compatibility,
     validated,
 )
 from sglang.srt.managers.kv_control.controller import ExecutionRequest
-from sglang.srt.managers.kv_control.index import ResolvedTarget
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.control_state import CopySelection
@@ -63,7 +63,6 @@ class _Row:
     node_start: int
     node_end: int
     compatibility: object
-    content_id: str | None = None
     kind: str = "tokens"
     window: int | None = None
 
@@ -110,28 +109,17 @@ class UnifiedCacheExecutor:
 
     def _storage_prefix(self, work):
         self._check(work.target)
-        if len(work.target.branches) != 1:
+        scope = work.target
+        end = scope.requested.end_token
+        if scope.requested.start_token or end % self.core.page_size:
             raise ControlError(
-                "unsupported", "Storage control requires one complete prefix"
+                "unsupported", "Storage control requires a page-aligned whole prefix"
             )
-        branch = work.target.branches[0]
-        end = branch.requested.end_token
-        if (
-            not isinstance(branch.content, TokensTarget)
-            or branch.requested.start_token
-            or end % self.core.page_size
-        ):
-            raise ControlError(
-                "unsupported",
-                "Storage control requires a token-backed page-aligned prefix",
-            )
-        if branch.missing or branch.unaligned or end > len(branch.content.token_ids):
-            raise ControlError("missing", "Requested prefix history is incomplete")
         if end // self.core.page_size > self.config.max_query_nodes:
             raise ControlError(
                 "capacity", "Transfer scope exceeds its page traversal budget"
             )
-        return branch.content.token_ids[:end], self._compatibility(branch.content)
+        return scope.content.token_ids[:end], self._compatibility(scope.content)
 
     def _load_pending(self, node):
         if node.load_back_pending_id is not None:
@@ -332,7 +320,11 @@ class UnifiedCacheExecutor:
             self.capabilities(),
         )
         service = self.cache.kv_control_service
-        scope = service.control.index.resolve(payload.target)
+        scope = resolve_prefix(
+            payload.target,
+            service.control.context("storage_targets"),
+            service.config.limits,
+        )
         self._check(scope)
         # The shared path validator checks complete-prefix geometry and budgets;
         # no operation, claim or transfer interest is created by this query.
@@ -354,7 +346,7 @@ class UnifiedCacheExecutor:
         return dict(
             description_version="1.0",
             namespace=scope.namespace,
-            compatibility=cache_compatibility(scope.branches[0].content),
+            compatibility=cache_compatibility(scope.content),
             key_salt_encoding="sglang.kv.weight.v1"
             if service.namespace_keys
             else "owner_assertion",
@@ -440,8 +432,6 @@ class UnifiedCacheExecutor:
         end,
         components,
         *,
-        window=True,
-        content_id=None,
         tier="gpu",
     ):
         rows, missing = [], []
@@ -476,7 +466,6 @@ class UnifiedCacheExecutor:
                             lo,
                             hi,
                             compatibility,
-                            content_id,
                             "checkpoint",
                         )
                     )
@@ -485,7 +474,7 @@ class UnifiedCacheExecutor:
                 continue
             size = (
                 self.cache._sliding_window_size
-                if component == ComponentType.SWA and window
+                if component == ComponentType.SWA
                 else None
             )
             if size is not None:
@@ -529,7 +518,6 @@ class UnifiedCacheExecutor:
                             lo,
                             hi,
                             compatibility,
-                            content_id,
                             "window" if size is not None else "tokens",
                             size,
                         )
@@ -539,186 +527,48 @@ class UnifiedCacheExecutor:
                 missing.append(self._gap(branch, component, cursor, end))
         return rows, missing
 
-    def _descriptor_prefixes(self, content, compatibility):
-        # Explicit descriptor queries are bounded. There is no background hash
-        # index or per-page metadata for ordinary cache nodes.
-        if len(self.core._node_arena) > self.config.max_query_nodes:
-            raise ControlError("capacity", "Descriptor lookup exceeds node budget")
-        wanted = {span.content_id: span for span in content.spans}
-        found = {}
-        stack = [(child, ()) for child in self.core.root_node.children.values()]
-        while stack:
-            node, prefix = stack.pop()
-            if (
-                node.key.cache_salt != compatibility.cache_salt
-                or node.key.extra_key != compatibility.extra_key
-                or node.key.is_bigram
-            ):
-                continue
-            tokens = prefix + tuple(node.key.token_ids)
-            if len(tokens) > 65536:
-                raise ControlError("capacity", "Descriptor prefix exceeds token budget")
-            for identity, span in wanted.items():
-                if len(prefix) < span.end_token <= len(tokens):
-                    ct = self._component(span.component)
-                    if (
-                        self._content_id(tokens[: span.end_token], ct, compatibility)
-                        == identity
-                    ):
-                        found[identity] = tokens[: span.end_token]
-            stack.extend((child, tokens) for child in node.children.values())
-        return found
-
-    def _component(self, name):
-        component = {ct.name.lower(): ct for ct in self.core.component_types}.get(name)
-        if component is None:
-            raise ControlError("unsupported", "Component is not configured")
-        return component
-
     def _resolve(self, target, limit, *, tier="gpu"):
         self._check(target)
         if type(limit) is not int or not 1 <= limit <= self.config.max_result_targets:
             raise ControlError("capacity", "Invalid cache result budget")
-        rows, missing = [], []
+        start, end = target.requested.start_token, target.requested.end_token
         page = self.core.page_size
-        for branch_index, branch in enumerate(target.branches):
-            content = branch.content
-            compatibility = self._compatibility(content)
-            if isinstance(content, TokensTarget):
-                start, end = branch.requested.start_token, branch.requested.end_token
-                clipped_start, clipped_end = (
-                    (start + page - 1) // page * page,
-                    end // page * page,
+        left, right = (start + page - 1) // page * page, end // page * page
+        rows, missing = [], []
+        if (left, right) != (start, end):
+            if not target.allow_clip:
+                raise ControlError("unsupported", "Target range is not page-aligned")
+            if start < min(left, end):
+                missing.append(
+                    self._gap(
+                        0, ComponentType.FULL, start, min(left, end), code="unaligned"
+                    )
                 )
-                if (clipped_start, clipped_end) != (start, end):
-                    if not target.allow_clip:
-                        raise ControlError(
-                            "unsupported", "Target range is not page-aligned"
-                        )
-                    if start < min(clipped_start, end):
-                        missing.append(
-                            self._gap(
-                                branch_index,
-                                ComponentType.FULL,
-                                start,
-                                min(clipped_start, end),
-                                code="unaligned",
-                            )
-                        )
-                    if max(clipped_end, clipped_start) < end:
-                        missing.append(
-                            self._gap(
-                                branch_index,
-                                ComponentType.FULL,
-                                max(clipped_end, clipped_start),
-                                end,
-                                code="unaligned",
-                            )
-                        )
-                if clipped_start < clipped_end:
-                    selected, gaps = self._select(
-                        content.token_ids,
-                        compatibility,
-                        branch_index,
-                        clipped_start,
-                        clipped_end,
-                        self.core.component_types,
-                        tier=tier,
+            if max(right, left) < end:
+                missing.append(
+                    self._gap(
+                        0, ComponentType.FULL, max(right, left), end, code="unaligned"
                     )
-                    rows.extend(selected)
-                    missing.extend(gaps)
-            else:
-                for name in content.components:
-                    self._component(name)
-                prefixes = self._descriptor_prefixes(content, compatibility)
-                for span in branch.spans:
-                    component = self._component(span.component)
-                    if (component == ComponentType.MAMBA) != (
-                        span.coverage_kind == "checkpoint"
-                    ):
-                        raise ControlError(
-                            "unsupported", "Component descriptor geometry differs"
-                        )
-                    if span.coverage_kind == "window":
-                        expected = (
-                            ((self.cache._sliding_window_size or 0) + page - 1)
-                            // page
-                            * page
-                        )
-                        if (
-                            component != ComponentType.SWA
-                            or span.window_size != expected
-                        ):
-                            raise ControlError(
-                                "unsupported",
-                                "Descriptor window differs from the cache layout",
-                            )
-                    if span.start_token % page or span.end_token % page:
-                        raise ControlError(
-                            "unsupported", "Descriptor is not page-aligned"
-                        )
-                    prefix = prefixes.get(span.content_id)
-                    if prefix is None:
-                        missing.append(
-                            self._gap(
-                                branch_index,
-                                component,
-                                span.start_token,
-                                span.end_token,
-                                point=span.coverage_kind == "checkpoint",
-                            )
-                        )
-                    else:
-                        selected, gaps = self._select(
-                            prefix,
-                            compatibility,
-                            branch_index,
-                            span.start_token,
-                            span.end_token,
-                            (component,),
-                            window=False,
-                            content_id=span.content_id,
-                            tier=tier,
-                        )
-                        rows.extend(
-                            replace(
-                                row, kind=span.coverage_kind, window=span.window_size
-                            )
-                            for row in selected
-                        )
-                        missing.extend(gaps)
-                for gap in branch.missing:
-                    missing.append(
-                        self._gap(
-                            branch_index,
-                            self._component(gap.coverage.component),
-                            gap.coverage.start_token,
-                            gap.coverage.end_token,
-                        )
-                    )
-                for span in branch.unaligned:
-                    if not target.allow_clip:
-                        raise ControlError(
-                            "unsupported", "Exact range splits a logical descriptor"
-                        )
-                    missing.append(
-                        self._gap(
-                            branch_index,
-                            self._component(span.component),
-                            max(span.start_token, branch.requested.start_token),
-                            min(span.end_token, branch.requested.end_token),
-                            code="unaligned",
-                        )
-                    )
-            if len(rows) + len(missing) > limit:
-                raise ControlError("capacity", "Cache result scope exceeds budget")
+                )
+        if left < right:
+            rows, gaps = self._select(
+                target.content.token_ids,
+                self._compatibility(target.content),
+                0,
+                left,
+                right,
+                self.core.component_types,
+                tier=tier,
+            )
+            missing.extend(gaps)
+        if len(rows) + len(missing) > limit:
+            raise ControlError("capacity", "Cache result scope exceeds budget")
         return rows, missing
 
     def _descriptor(self, row):
         selected = row.selection
         return ContentSpan(
-            content_id=row.content_id
-            or self._content_id(
+            content_id=self._content_id(
                 row.prefix[: selected.end], selected.component, row.compatibility
             ),
             component=selected.component.name.lower(),
@@ -739,11 +589,6 @@ class UnifiedCacheExecutor:
         if self.protection is None:
             raise ControlError("unsupported", "L2 protection is not installed")
         return self.protection.start(ref=ref, payload=payload, scope=scope)
-
-    def release_task_protections(self, *, caller_id, tasks):
-        if self.protection is not None:
-            return self.protection.cleanup(caller_id=caller_id, tasks=tasks)
-        return ()
 
     def start(self, work: ExecutionRequest) -> ExecutionUpdate:
         try:

@@ -143,6 +143,41 @@ LogicalTarget: TypeAlias = ContentTarget | TokensTarget | SessionTarget
 Target: TypeAlias = LogicalTarget | Literal["request_cached"]
 
 
+class ResolvedTarget(Value):
+    engine_epoch: str
+    content: TokensTarget
+    requested: TokenRange
+
+    @property
+    def namespace(self):
+        return self.content.namespace
+
+    @property
+    def allow_clip(self):
+        return self.content.allow_clip
+
+
+def resolve_prefix(target, context, limits):
+    if not isinstance(target, TokensTarget):
+        raise ControlError(
+            "unsupported", "Engine control requires a concrete token prefix"
+        )
+    target = validated(target, TokensTarget)
+    validate_target(target)
+    if target.namespace != context.namespace:
+        raise ControlError("incompatible_namespace", "Target namespace differs")
+    if len(target.token_ids) > limits.max_scope_tokens:
+        raise ControlError("capacity", "Resolved prefix exceeds the token budget")
+    end = len(target.token_ids) if target.end_token is None else target.end_token
+    if not target.start_token < end <= len(target.token_ids):
+        raise ControlError("missing", "Requested range exceeds the supplied prefix")
+    return ResolvedTarget(
+        engine_epoch=context.engine_epoch,
+        content=target,
+        requested=TokenRange(start_token=target.start_token, end_token=end),
+    )
+
+
 class Location(Value, omit_defaults=True):
     tier: Literal["gpu", "host", "storage"]
     engine_id: Identifier | None = None
@@ -266,42 +301,7 @@ class MoveTo(Value):
 Primitive: TypeAlias = CopyTo | MoveTo
 
 
-class TaskReference(Value):
-    session_id: Identifier
-    expected_revision: Position
-
-
-class ParentPrefix(Value):
-    session_id: Identifier
-    continuation_id: Identifier
-    expected_revision: Position
-    end_token: Position
-
-
-class Associate(Value):
-    session_id: Identifier
-    continuation_id: Identifier
-    expected_revision: Position
-    target: ContentTarget | TokensTarget
-    task_parent: TaskReference | None = None
-    parent_prefix: ParentPrefix | None = None
-
-
-class FinishTask(Value):
-    session_id: Identifier
-    expected_revision: Position
-
-
-class Signal(Value):
-    target: LogicalTarget
-    signal: Literal["tool_wait", "resume", "importance", "resume_prediction"]
-    importance: Priority | None = None
-    resume_after_seconds: Seconds | None = None
-
-
-Payload: TypeAlias = (
-    Primitive | Associate | FinishTask | Signal | Prefetch | Demote | Pin
-)
+Payload: TypeAlias = Prefetch | Demote | Pin
 
 
 class Status(str, Enum):
@@ -576,11 +576,6 @@ def validate_public(payload):
 def parse_action(action: KvHintAction) -> Payload:
     """Interpret only native names; generic forwarding never calls this parser."""
     schemas = {
-        "sglang.copy_to": CopyTo,
-        "sglang.move_to": MoveTo,
-        "sglang.associate": Associate,
-        "sglang.finish_task": FinishTask,
-        "sglang.signal": Signal,
         "sglang.prefetch": Prefetch,
         "sglang.demote": Demote,
         "sglang.pin": Pin,
@@ -589,27 +584,7 @@ def parse_action(action: KvHintAction) -> Payload:
     if schema is None or action.action_version != ACTION_VERSION:
         raise ControlError("unsupported", "Unsupported native action or action version")
     payload = validated(action.payload, schema)
-    if hasattr(payload, "target") and payload.target != "request_cached":
+    if payload.target != "request_cached":
         validate_target(payload.target)
-    if isinstance(payload, (Prefetch, Pin)):
-        validate_public(payload)
-    if isinstance(payload, (CopyTo, MoveTo)) and any(
-        location.tier != "storage" and location.backend_namespace is not None
-        for location in (payload.src, payload.dst)
-    ):
-        raise ControlError(
-            "invalid_payload", "Only storage locations may name a backend namespace"
-        )
-    if isinstance(payload, Signal) and payload.resume_after_seconds is not None:
-        if not math.isfinite(payload.resume_after_seconds):
-            raise ControlError("invalid_payload", "Prediction must be finite")
-    if isinstance(payload, Associate):
-        if payload.target.start_token != 0 or payload.target.end_token is not None:
-            raise ControlError(
-                "invalid_payload", "Association describes a complete logical prefix"
-            )
-        if payload.target.allow_clip:
-            raise ControlError(
-                "invalid_payload", "Association cannot clip content identity"
-            )
+    validate_public(payload)
     return payload

@@ -33,6 +33,8 @@ current backend can execute.
 
 Use `GET /v1/kv/capabilities` for discovery and `POST /v1/kv/control` for commands.
 The Python Engine exposes `kv_control(command)` and `async_kv_control(command)`.
+The Engine executes concrete token prefixes. The Router resolves session and
+branch selectors before submitting control actions.
 Use the Engine ID, epoch and namespace returned by discovery in every command:
 
 ```json

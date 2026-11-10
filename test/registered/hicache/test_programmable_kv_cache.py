@@ -439,7 +439,6 @@ class TestProgrammableKVCache(CustomTestCase):
             self.assertIsNone(saved.public_result.ready_location.engine_id)
             self.assertTrue(all(v == 1 for v in backend._batch_exist(keys)))
             self.assertFalse(b.tree_core.root_node.children)
-            self.assertFalse(sb.control.index.capacity()["continuations"])
             restored = public_action(
                 sb,
                 "prefetch",

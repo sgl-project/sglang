@@ -329,17 +329,6 @@ class FeedbackJournal:
             },
         )
 
-    def association(self, ref, record):
-        self.append(
-            "association",
-            ref.context.caller_id,
-            {
-                "operation_ref": ref,
-                "continuation": record,
-                "association_state": "local_index_record",
-            },
-        )
-
     def bind_request(self, context, binding_id, association):
         self._owner()
         key = context.caller_id, binding_id

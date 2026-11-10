@@ -20,9 +20,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from sglang.srt.managers.kv_control.contracts import (
-    Associate,
     ControlError,
-    SessionTarget,
     Status,
 )
 from sglang.srt.managers.kv_control.http import install_routes
@@ -640,7 +638,7 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
                 7,
             )
             missing_selector = msgspec.to_builtins(
-                SessionTarget(namespace="ns", session_id="removed")
+                cache_fixtures.target((99, 98, 97, 96))
             )
             renewed = run_pin(
                 service,
@@ -744,9 +742,7 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
                 ],
                 8,
             )
-            missing = msgspec.to_builtins(
-                SessionTarget(namespace="ns", session_id="removed")
-            )
+            missing = msgspec.to_builtins(cache_fixtures.target((99, 98, 97, 96)))
             attached_renew = pin_hints(
                 service,
                 mode="renew",
@@ -872,7 +868,7 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
                     (
                         req.kv.holds_kv,
                         req.lock is not None,
-                        tuple(kwargs["scope"].branches[0].content.token_ids),
+                        tuple(kwargs["scope"].content.token_ids),
                     )
                 )
                 return pin(**kwargs)
@@ -1041,95 +1037,6 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
             self.assertEqual(cache.evict_host(100), 0)
             run_pin(service, caller="B", mode="release", revision=2, message="done")
             self.assertEqual(cache.evict_host(100), 4)
-            cache.sanity_check()
-
-    def test_task_ownership_is_explicit_and_cleanup_only_releases_finishing_caller(
-        self,
-    ):
-        with transfer_fixtures.hicache(self) as owner:
-            _, cache, service, _ = owner
-            node = host_copy(owner)
-            for name in ("selected", "owner", "sibling"):
-                service.control.index.associate(
-                    Associate(
-                        session_id=name,
-                        continuation_id="b",
-                        expected_revision=0,
-                        target=cache_fixtures.target(),
-                    )
-                )
-            task = service.control.index.task_identity("owner")
-            sibling = service.control.index.task_identity("sibling")
-            selection = msgspec.to_builtins(
-                SessionTarget(namespace="ns", session_id="selected")
-            )
-            run_pin(service, owner_task=task, selection=selection)
-            run_pin(service, caller="B", owner_task=task, selection=selection)
-            run_pin(service, owner_task=sibling, claim_id="sibling", message="sibling")
-            run_pin(service, claim_id="unowned", message="unowned")
-
-            def finish(name):
-                return self.submit(
-                    service.control,
-                    "finish_task",
-                    {
-                        "session_id": name,
-                        "expected_revision": service.control.index.session_revision(
-                            name
-                        ),
-                    },
-                    caller="A",
-                )
-
-            self.assertEqual(finish("selected").status, Status.COMPLETED)
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 4)
-            renewed = run_pin(
-                service,
-                claim_id="unowned",
-                message="renew-without-session",
-                mode="renew",
-                revision=2,
-                selection=selection,
-            )
-            self.assertEqual(renewed["public_result"]["claim"]["state"], "active")
-            self.assertEqual(finish("owner").status, Status.COMPLETED)
-            self.assertEqual(
-                query_claim(service, owner_task=task)["data"]["state"], "released"
-            )
-            self.assertEqual(
-                query_claim(service, caller="B", owner_task=task)["data"]["state"],
-                "active",
-            )
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 3)
-            late = run_pin(service, owner_task=task, claim_id="new", message="late")
-            self.assertEqual(late["update"]["code"], "stale_revision")
-            # Released task/session selectors no longer resolve; release still
-            # finds the independent key and retires B's protection.
-            run_pin(
-                service,
-                caller="B",
-                owner_task=task,
-                selection=selection,
-                mode="release",
-                revision=2,
-                message="b-release",
-            )
-            run_pin(
-                service,
-                owner_task=sibling,
-                claim_id="sibling",
-                mode="release",
-                revision=2,
-                message="sibling-release",
-            )
-            run_pin(
-                service,
-                claim_id="unowned",
-                mode="release",
-                revision=3,
-                message="unowned-release",
-            )
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
             cache.sanity_check()
 
     def test_idle_expiry_publishes_after_operation_completion_without_early_scans(self):

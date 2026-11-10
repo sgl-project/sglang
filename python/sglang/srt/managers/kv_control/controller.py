@@ -12,33 +12,27 @@ import msgspec
 
 from sglang.srt.managers.kv_control.contracts import (
     PROTOCOL_VERSION,
-    Associate,
-    ContentTarget,
     ControlContext,
     ControlError,
     CopyTo,
     ExecutionUpdate,
-    FinishTask,
     Limits,
-    LogicalChange,
     MoveTo,
     OperationRef,
     OperationResult,
     Pin,
     Prefetch,
+    ResolvedTarget,
     Primitive,
-    Signal,
     Status,
     Submission,
-    TaskIdentity,
     TokensTarget,
     Value,
     parse_action,
+    resolve_prefix,
     validated,
 )
-from sglang.srt.managers.kv_control.index import LogicalIndex, ResolvedTarget
 from sglang.srt.managers.kv_control.public import (
-    PUBLIC_ACTIONS,
     normalize_public,
     requested_outcomes,
 )
@@ -69,6 +63,8 @@ class Executor(Protocol):
     MOVE reports destination publication and source reclamation separately.
     Cancelling work drains outstanding backend access before releasing holds.
     """
+
+    def capabilities(self) -> dict: ...
 
     def start(self, work: ExecutionRequest) -> ExecutionUpdate: ...
 
@@ -111,10 +107,8 @@ class KVControl:
         self.registry = OperationRegistry(
             engine_id, namespace, limits=limits, clock=clock
         )
-        self.index = LogicalIndex(namespace, self.registry.engine_epoch, limits=limits)
         self._pending: dict[str, _Pending] = {}
         self._requests: dict[tuple[str, str], set[str]] = {}
-        self.association_feedback = None
 
     def context(
         self, caller_id: str, *, binding_id: str | None = None
@@ -135,7 +129,6 @@ class KVControl:
         context: ControlContext,
         *,
         execute_primitives: bool = True,
-        public_only: bool = False,
     ) -> Submission:
         if type(execute_primitives) is not bool:
             raise ControlError("invalid_payload", "Execution support must be a bool")
@@ -157,8 +150,6 @@ class KVControl:
                     raise ControlError(
                         "unsupported", "Unsupported native protocol version"
                     )
-                if public_only and frozen.action_type not in PUBLIC_ACTIONS:
-                    raise ControlError("unsupported", "Use PIN, PREFETCH, or DEMOTE")
                 payload = parse_action(frozen.thaw())
                 if frozen.invalid_numbers:
                     raise ControlError(
@@ -166,81 +157,37 @@ class KVControl:
                         "JSON numbers must be finite and within the exact integer bound",
                     )
                 scope = None
-                if isinstance(payload, (Prefetch, Pin)):
-                    public_payloads[frozen.action_id] = payload
-                    if (
-                        payload.target != "request_cached"
-                        and payload.target.namespace != context.namespace
-                    ):
-                        raise ControlError(
-                            "incompatible_namespace", "Target namespace differs"
-                        )
-                    if self.executor is None:
-                        raise ControlError(
-                            "unsupported", "No cache executor is installed"
-                        )
-                    describe = getattr(self.executor, "capabilities", None)
-                    payload = normalize_public(payload, describe() if describe else {})
-                if hasattr(payload, "target") and payload.target != "request_cached":
-                    if payload.target.namespace != context.namespace:
-                        raise ControlError(
-                            "incompatible_namespace", "Target namespace differs"
-                        )
-                if not execute_primitives and isinstance(
-                    payload, (CopyTo, MoveTo, Pin)
+                public_payloads[frozen.action_id] = payload
+                if self.executor is None or not execute_primitives:
+                    raise ControlError(
+                        "unsupported", "No cache executor for this request"
+                    )
+                payload = normalize_public(payload, self.executor.capabilities())
+                target = payload.target
+                locations = (
+                    (payload.location,)
+                    if isinstance(payload, Pin)
+                    else (payload.src, payload.dst)
+                )
+                if any(
+                    loc.engine_id not in (None, context.engine_id) for loc in locations
                 ):
                     raise ControlError(
-                        "unsupported",
-                        "This request profile cannot execute native cache operations",
+                        "unsupported", "Control must address this engine"
                     )
-                if isinstance(payload, Pin):
-                    if payload.location.engine_id not in (None, context.engine_id):
-                        raise ControlError(
-                            "unsupported", "Remote engines approve their own protection"
-                        )
-                    if payload.mode == "acquire":
-                        if payload.target == "request_cached":
-                            if context.binding_id is None:
-                                raise ControlError(
-                                    "invalid_payload",
-                                    "request_cached requires a request incarnation",
-                                )
-                        else:
-                            scope = self.index.resolve(payload.target)
-                if isinstance(payload, (CopyTo, MoveTo)):
-                    locations = (payload.src, payload.dst)
-                    if any(
-                        location.engine_id not in (None, context.engine_id)
-                        for location in locations
-                    ):
-                        raise ControlError(
-                            "unsupported",
-                            "Remote engines must approve their own resources",
-                        )
-                    if (
-                        isinstance(payload, (CopyTo, MoveTo))
-                        and payload.src == payload.dst
-                    ):
-                        raise ControlError(
-                            "invalid_payload", "Source and destination must differ"
-                        )
-                    if payload.target == "request_cached":
+                # Renew/release use the claim identity, even after its prefix is gone.
+                if not isinstance(payload, Pin) or payload.mode == "acquire":
+                    if target == "request_cached":
                         if context.binding_id is None:
                             raise ControlError(
                                 "invalid_payload",
                                 "request_cached requires a request incarnation",
                             )
                     else:
-                        scope = self.index.resolve(payload.target)
-                    if self.executor is None:
-                        raise ControlError(
-                            "unsupported", "No cache executor is installed"
-                        )
+                        scope = resolve_prefix(target, context, self.limits)
                 prepared.append((payload, scope))
             except ControlError as error:
                 prepared.append(error)
-        # A finish_task sibling must also see interests whose immutable targets
-        # have been prepared but whose dispatch has not yet been visited.
         for result, item in zip(submission.results, prepared):
             if not isinstance(item, ControlError):
                 payload, scope = item
@@ -280,83 +227,23 @@ class KVControl:
         )
 
     def _dispatch(self, ref, payload, scope):
-        if isinstance(payload, Pin):
-            if payload.mode == "acquire" and payload.target == "request_cached":
-                key = ref.context.caller_id, ref.context.binding_id
-                self._requests.setdefault(key, set()).add(ref.operation_id)
-                self.registry.update(
-                    ref,
-                    ExecutionUpdate(
-                        status=Status.QUEUED, quiescent=True, code="request_completion"
-                    ),
-                )
-            else:
-                self._execute_pin(ref, payload, scope)
-        elif isinstance(payload, Signal):
-            # No consumer: do not resolve a session or build observations.
+        if payload.target == "request_cached" and (
+            not isinstance(payload, Pin) or payload.mode == "acquire"
+        ):
+            key = ref.context.caller_id, ref.context.binding_id
+            self._requests.setdefault(key, set()).add(ref.operation_id)
             self.registry.update(
                 ref,
                 ExecutionUpdate(
-                    status=Status.UNCONSUMED, quiescent=True, code="no_policy"
+                    status=Status.QUEUED, quiescent=True, code="request_completion"
                 ),
             )
-        elif isinstance(payload, Associate):
-            record = self.index.associate(payload)
-            if self.association_feedback is not None:
-                self.association_feedback(ref, record)
-            change = LogicalChange(
-                index_generation=self.index.generation,
-                session_revision=self.index.session_revision(payload.session_id),
-                continuation_revision=record.revision,
-                incarnation=record.incarnation,
-            )
-            self.registry.update(
-                ref,
-                ExecutionUpdate(
-                    status=Status.COMPLETED, quiescent=True, logical_change=change
-                ),
-            )
-        elif isinstance(payload, FinishTask):
-            change = self.index.finish_task(
-                payload.session_id, expected_revision=payload.expected_revision
-            )
-            self._cancel_task_interests(change.removed_tasks)
-            cleanup = getattr(self.executor, "release_task_protections", None)
-            if cleanup is not None:
-                cleanup(caller_id=ref.context.caller_id, tasks=change.removed_tasks)
-            self.registry.update(
-                ref,
-                ExecutionUpdate(
-                    status=Status.COMPLETED, quiescent=True, logical_change=change
-                ),
-            )
+        elif isinstance(payload, Pin):
+            self._execute_pin(ref, payload, scope)
         else:
-            pending = self._pending[ref.operation_id]
-            wait = ref.context.binding_id is not None and (
-                payload.target == "request_cached" or payload.src.tier == "gpu"
-            )
-            if wait:
-                key = ref.context.caller_id, ref.context.binding_id
-                self._requests.setdefault(key, set()).add(ref.operation_id)
-                self.registry.update(
-                    ref,
-                    ExecutionUpdate(
-                        status=Status.QUEUED, quiescent=True, code="request_completion"
-                    ),
-                )
-            else:
-                self._start(pending)
+            self._start(self._pending[ref.operation_id])
 
     def _execute_pin(self, ref, payload, scope):
-        if (
-            payload.owner_task is not None
-            and payload.mode != "release"
-            and self.index.task_identity(payload.owner_task.session_id)
-            != payload.owner_task
-        ):
-            raise ControlError(
-                "stale_revision", "PIN demand owner task is no longer live"
-            )
         if scope is not None:
             self.registry.set_public_scope(
                 ref,
@@ -368,23 +255,12 @@ class KVControl:
         if claim is not None:
             self.registry.set_public_claim(ref, claim)
 
-    def _cancel_task_interests(self, removed_tasks: tuple[TaskIdentity, ...]) -> None:
-        removed = frozenset(removed_tasks)
-        for pending in tuple(self._pending.values()):
-            if pending.target is not None and any(
-                branch.continuation is not None and branch.continuation.task in removed
-                for branch in pending.target.branches
-            ):
-                # Content equality alone establishes no task ownership. cancel
-                # retires queued work or asks the executor to drain started work.
-                self.cancel(pending.ref)
-
     def request_event(
         self,
         context: ControlContext,
         event: Literal["success", "abort", "error", "preempt", "checkpoint"],
         *,
-        committed: ContentTarget | TokensTarget | None = None,
+        committed: TokensTarget | None = None,
     ) -> tuple[OperationResult, ...]:
         """success must run before request references are released.
 
@@ -428,7 +304,7 @@ class KVControl:
                         raise ControlError(
                             "missing", "No committed request content supplied"
                         )
-                    pending.target = self.index.resolve(committed)
+                    pending.target = resolve_prefix(committed, context, self.limits)
                 self._start(pending)
             except ControlError as error:
                 self._error(pending.ref, error)
@@ -452,13 +328,6 @@ class KVControl:
                 pending.ref,
                 requested_outcomes(pending.target),
                 self.executor.capabilities().get("cache_generation"),
-            )
-        if (
-            any(branch.unaligned for branch in pending.target.branches)
-            and not pending.target.allow_clip
-        ):
-            raise ControlError(
-                "unaligned", "Exact range splits an indivisible descriptor"
             )
         pending.started = True
         try:
@@ -575,7 +444,7 @@ class KVControl:
                 "Only MOVE can reclaim a source, after destination publication",
             )
         for outcome in update.target_outcomes:
-            if outcome.branch_index >= len(pending.target.branches):
+            if outcome.branch_index != 0:
                 raise ControlError(
                     "invalid_completion", "Unknown snapshot branch in result"
                 )
@@ -608,36 +477,15 @@ class KVControl:
                     "invalid_completion",
                     "Actual coverage must identify the requested location and component",
                 )
-            in_scope = False
-            for branch in (pending.target.branches[outcome.branch_index],):
-                if isinstance(branch.content, TokensTarget):
-                    in_scope |= (
-                        branch.requested.start_token
-                        <= coverage.start_token
-                        <= coverage.end_token
-                        <= min(
-                            branch.requested.end_token, len(branch.content.token_ids)
-                        )
-                        and (
-                            outcome.coverage_kind != "checkpoint"
-                            or coverage.end_token > branch.requested.start_token
-                        )
-                    )
-                else:
-                    in_scope |= any(
-                        span.component == coverage.component
-                        and span.content_id == outcome.content_id
-                        and span.coverage_kind == outcome.coverage_kind
-                        and span.window_size == outcome.window_size
-                        and span.start_token
-                        <= coverage.start_token
-                        <= coverage.end_token
-                        <= span.end_token
-                        for span in branch.spans
-                    )
-            if not in_scope:
+            bounds = pending.target.requested
+            if (
+                not bounds.start_token
+                <= coverage.start_token
+                <= coverage.end_token
+                <= bounds.end_token
+            ):
                 raise ControlError(
-                    "invalid_completion", "Actual coverage exceeds the bound target"
+                    "invalid_completion", "Actual coverage exceeds the bound prefix"
                 )
             successful.append(outcome)
         if update.status != Status.COMPLETED:
@@ -647,84 +495,23 @@ class KVControl:
                 "invalid_completion",
                 "Completed primitive needs actual coverage and completed stages",
             )
-        if any(
-            branch.missing or branch.unaligned for branch in pending.target.branches
-        ):
+        intervals = sorted(
+            (o.coverage.start_token, o.coverage.end_token)
+            for o in successful
+            if o.status == Status.COMPLETED
+            and set(required).issubset(o.completed_steps)
+            and o.coverage.component == "full"
+        )
+        bounds = pending.target.requested
+        cursor = bounds.start_token
+        for left, right in intervals:
+            if left > cursor:
+                break
+            cursor = max(cursor, right)
+        if cursor < bounds.end_token:
             raise ControlError(
-                "invalid_completion",
-                "Incomplete logical coverage must be reported as partial",
+                "invalid_completion", "Completed result omits required prefix coverage"
             )
-        complete = [
-            outcome
-            for outcome in successful
-            if outcome.status == Status.COMPLETED
-            and set(required).issubset(outcome.completed_steps)
-        ]
-
-        def covers(branch_index, component, content_id, start, end):
-            intervals = sorted(
-                (o.coverage.start_token, o.coverage.end_token)
-                for o in complete
-                if o.branch_index == branch_index
-                and o.coverage.component == component
-                and (content_id is None or o.content_id == content_id)
-            )
-            if start == end:
-                return (start, end) in intervals
-            cursor = start
-            for left, right in intervals:
-                if left > cursor:
-                    break
-                cursor = max(cursor, right)
-            return cursor >= end
-
-        for branch_index, branch in enumerate(pending.target.branches):
-            if isinstance(branch.content, TokensTarget):
-                # The executor certifies its required layout. Tokens alone do
-                # not enumerate components, but each reported one must be whole.
-                components = {
-                    outcome.coverage.component
-                    for outcome in complete
-                    if outcome.branch_index == branch_index
-                }
-                covered = bool(components)
-                for component in components:
-                    members = [
-                        o
-                        for o in complete
-                        if o.branch_index == branch_index
-                        and o.coverage.component == component
-                    ]
-                    kinds = {(o.coverage_kind, o.window_size) for o in members}
-                    if len(kinds) != 1:
-                        covered = False
-                        break
-                    kind, window = kinds.pop()
-                    start, end = (
-                        branch.requested.start_token,
-                        branch.requested.end_token,
-                    )
-                    if kind == "checkpoint":
-                        start = end
-                    elif kind == "window":
-                        start = max(start, end - window)
-                    covered &= covers(branch_index, component, None, start, end)
-            else:
-                covered = bool(branch.spans) and all(
-                    covers(
-                        branch_index,
-                        span.component,
-                        span.content_id,
-                        span.start_token,
-                        span.end_token,
-                    )
-                    for span in branch.spans
-                )
-            if not covered:
-                raise ControlError(
-                    "invalid_completion",
-                    "Completed result omits required logical coverage",
-                )
 
     def _finish(self, ref, update):
         result = self.registry.update(ref, update)
@@ -850,8 +637,6 @@ class KVControl:
             raise ControlError(
                 "busy", "Drain active operations before rotating the epoch"
             )
-        registry = OperationRegistry(
+        self.registry = OperationRegistry(
             self.registry.engine_id, namespace, limits=self.limits, clock=self._clock
         )
-        index = LogicalIndex(namespace, registry.engine_epoch, limits=self.limits)
-        self.registry, self.index = registry, index

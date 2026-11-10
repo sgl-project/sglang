@@ -15,7 +15,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightVersionReqInput,
 )
-from sglang.srt.managers.kv_control.contracts import TokensTarget
+from sglang.srt.managers.kv_control.contracts import TokensTarget, resolve_prefix
 from sglang.srt.managers.kv_control.key_namespace import encode_cache_salt
 from sglang.srt.managers.kv_control.service import (
     KVControlService,
@@ -138,7 +138,11 @@ class TestKVControlNamespaces(cache_fixtures.KVCacheTestCase):
             assert req.cache_salt == encode_cache_salt("ns", salt)
             assert req.kv_control_logical_cache_salt == salt
             snapshot = service.control.executor.residency(
-                service.control.index.resolve(namespace_target(service, salt))
+                resolve_prefix(
+                    namespace_target(service, salt),
+                    service.control.context("test"),
+                    service.config.limits,
+                )
             )
             assert (
                 sum(
@@ -149,7 +153,11 @@ class TestKVControlNamespaces(cache_fixtures.KVCacheTestCase):
             )
             assert not snapshot.missing
             encoded_as_logical = service.control.executor.residency(
-                service.control.index.resolve(namespace_target(service, req.cache_salt))
+                resolve_prefix(
+                    namespace_target(service, req.cache_salt),
+                    service.control.context("test"),
+                    service.config.limits,
+                )
             )
             assert not encoded_as_logical.items and encoded_as_logical.missing
             cache.sanity_check()

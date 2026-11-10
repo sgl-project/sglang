@@ -22,8 +22,6 @@ from sglang.srt.managers.kv_control.contracts import (
     Status,
     TargetOutcome,
     TaskIdentity,
-    TokenRange,
-    TokensTarget,
     Value,
 )
 from sglang.srt.managers.kv_control.protection import (
@@ -34,7 +32,7 @@ from sglang.srt.managers.kv_control.protection import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.kv_control.index import ResolvedTarget
+    from sglang.srt.managers.kv_control.contracts import ResolvedTarget
     from sglang.srt.mem_cache.unified_cache.kv_control_adapter import (
         UnifiedCacheExecutor,
     )
@@ -225,68 +223,31 @@ class HostCacheProtection:
         self._deadline = self.registry.next_deadline
         return changed
 
-    def cleanup(self, *, caller_id, tasks):
-        changed = []
-        for task in tasks:
-            key = protection_key(caller_id, "cleanup", task)
-            changed.extend(
-                self.registry.cleanup_task(
-                    caller_id=caller_id,
-                    task_id=key.task_id,
-                    task_incarnation=task.incarnation,
-                )
-            )
-        return tuple(self._publish(s) for s in changed)
-
     def _prefixes(self, scope):
         self.executor._check(scope)
-        if len(scope.branches) > self._max_result_targets:
+        end = scope.requested.end_token
+        if scope.requested.start_token or end % self.executor.core.page_size:
             raise ControlError(
-                "capacity", "Protection result scope exceeds its publication budget"
+                "unsupported", "L2 PIN requires an exact page-aligned whole prefix"
             )
-        prefixes = []
-        for branch in scope.branches:
-            if not isinstance(branch.content, TokensTarget):
-                raise ControlError(
-                    "unsupported", "L2 PIN requires complete token-backed FULL prefixes"
-                )
-            if (
-                branch.requested.start_token
-                or branch.unaligned
-                or branch.requested.end_token % self.executor.core.page_size
-            ):
-                raise ControlError(
-                    "unsupported", "L2 PIN requires an exact page-aligned whole prefix"
-                )
-            if branch.missing or branch.requested.end_token > len(
-                branch.content.token_ids
-            ):
-                raise ControlError("missing", "PIN prefix history is incomplete")
-            compatibility = self.executor._compatibility(branch.content)
-            prefixes.append(
-                HostPrefix(
-                    token_ids=branch.content.token_ids[: branch.requested.end_token],
-                    cache_salt=compatibility.cache_salt,
-                )
-            )
-        return tuple(prefixes)
+        compatibility = self.executor._compatibility(scope.content)
+        return (
+            HostPrefix(
+                token_ids=scope.content.token_ids[:end],
+                cache_salt=compatibility.cache_salt,
+            ),
+        )
 
     def outcomes(self, scope, *, status, code="", reason="", step=None):
-        return tuple(
+        return (
             TargetOutcome(
-                branch_index=i,
-                coverage=TokenRange(
-                    start_token=b.requested.start_token,
-                    end_token=b.requested.end_token,
-                    component="full",
-                ),
+                coverage=msgspec.structs.replace(scope.requested, component="full"),
                 status=status,
                 code=code,
                 reason=reason,
                 location=Location(tier="host", engine_id=self.executor.engine_id),
                 completed_steps=(step,) if step else (),
-            )
-            for i, b in enumerate(scope.branches)
+            ),
         )
 
     def start(

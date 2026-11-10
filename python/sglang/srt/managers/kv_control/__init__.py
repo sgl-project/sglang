@@ -6,14 +6,13 @@ from sglang.srt.managers.kv_control.controller import (
     Executor,
     KVControl,
 )
-from sglang.srt.managers.kv_control.index import LogicalIndex, ResolvedTarget
+from sglang.srt.managers.kv_control.contracts import ResolvedTarget
 from sglang.srt.managers.kv_control.registry import OperationRegistry
 
 __all__ = [
     "ExecutionRequest",
     "Executor",
     "KVControl",
-    "LogicalIndex",
     "OperationRegistry",
     "ResolvedTarget",
 ]

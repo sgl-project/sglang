@@ -11,6 +11,7 @@ import torch
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.managers.kv_control import KVControl
 from sglang.srt.managers.kv_control.contracts import (
+    resolve_prefix,
     ControlError,
     Limits,
     Status,
@@ -234,7 +235,11 @@ class KVCacheTestCase(CustomTestCase):
         return control.submit(env, control.context(caller)).results[0]
 
     def inspect(self, control, selection=None):
-        return control.executor.residency(control.index.resolve(selection or target()))
+        return control.executor.residency(
+            resolve_prefix(
+                selection or target(), control.context("test"), control.limits
+            )
+        )
 
 
 class TestKVControlCache(KVCacheTestCase):

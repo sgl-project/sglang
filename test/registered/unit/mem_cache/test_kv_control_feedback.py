@@ -102,7 +102,7 @@ class TestKVControlFeedback(cache_fixtures.KVCacheTestCase):
             self.assertFalse(service.has_background_work)
             cache.sanity_check()
 
-    def test_local_association_and_partial_demote_preserve_coordinates_and_actual_effects(
+    def test_partial_demote_feedback_reports_actual_effects(
         self,
     ):
         with transfer_fixtures.hicache(self, storage=True) as owner:
@@ -110,21 +110,6 @@ class TestKVControlFeedback(cache_fixtures.KVCacheTestCase):
             ancestor = transfer_fixtures.seed(cache, (1, 2))
             leaf = transfer_fixtures.seed(cache)
             transfer_fixtures.backup_prefix(cache, dma, leaf, evict=True)
-            associated = self.submit(
-                service.control,
-                "associate",
-                {
-                    "session_id": "task",
-                    "continuation_id": "branch",
-                    "expected_revision": 0,
-                    "target": msgspec.json.decode(
-                        msgspec.json.encode(cache_fixtures.target())
-                    ),
-                },
-                caller="A",
-                message="associate",
-            )
-            self.assertEqual(associated.status, Status.COMPLETED)
             lock = cache.lock(ancestor.id)
             try:
                 result = transfer_fixtures.public_transfer(
@@ -135,13 +120,6 @@ class TestKVControlFeedback(cache_fixtures.KVCacheTestCase):
                 cache.unlock(lock)
             self.assertEqual(done.status, Status.PARTIAL)
             page = events(service)
-            local = [
-                e["payload"]["continuation"]
-                for e in page["items"]
-                if e["kind"] == "association" and "continuation" in e["payload"]
-            ]
-            self.assertEqual(local[0]["task"]["session_id"], "task")
-            self.assertEqual(local[0]["continuation_id"], "branch")
             partial = [
                 e["payload"]
                 for e in page["items"]
@@ -403,7 +381,6 @@ class TestKVControlFeedback(cache_fixtures.KVCacheTestCase):
             self.assertIsNone(unknown_use["committed_prefix"])
             self.assertEqual(service.cache_watermark(), initial)
             self.assertEqual(cache.take_events(), [])
-            self.assertIsNone(service.control.index.task_identity("router-session"))
 
     def test_flush_restart_and_storage_detach_invalidate_only_owner_observations(self):
         with transfer_fixtures.hicache(self, namespace_keys=True) as owner:
