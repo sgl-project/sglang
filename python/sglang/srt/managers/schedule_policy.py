@@ -216,6 +216,10 @@ class SchedulePolicy:
         self.shortest_prefill_aging_factor = shortest_prefill_aging_factor
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
+        self._spf_age_rounds = envs.SGLANG_SPF_AGE_ROUNDS.get()
+        self._spf_age_cap = envs.SGLANG_SPF_AGE_CAP.get()
+        # rid -> batch formations waited; a round count, not wall time, so every TP rank orders alike
+        self._spf_rounds: Dict[str, int] = {}
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -261,11 +265,16 @@ class SchedulePolicy:
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
-                self._sort_by_shortest_prefill(
-                    waiting_queue,
-                    temporary_deprioritized,
-                    processed_tokens=processed_tokens,
-                )
+                if self._spf_age_rounds > 0:
+                    self._sort_by_shortest_prefill_aged(
+                        waiting_queue, temporary_deprioritized
+                    )
+                else:
+                    self._sort_by_shortest_prefill(
+                        waiting_queue,
+                        temporary_deprioritized,
+                        processed_tokens=processed_tokens,
+                    )
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
                     logger.info(
@@ -462,6 +471,47 @@ class SchedulePolicy:
                 r.rid in temporary_deprioritized,
                 self._shortest_prefill_rank(r, processed_tokens),
                 r.time_stats.wait_queue_entry_time,
+            )
+        )
+
+    def _sort_by_shortest_prefill_aged(
+        self, waiting_queue: List[Req], temporary_deprioritized: Set[int]
+    ) -> None:
+        # Requests that waited more than _spf_age_rounds batch formations go first, oldest first.
+        rounds = {r.rid: self._spf_rounds.get(r.rid, 0) + 1 for r in waiting_queue}
+        self._spf_rounds = rounds
+        limit = self._spf_age_rounds
+        cap = get_schedule().chunked_prefill_size or 0
+        if self._spf_age_cap and cap > 0:
+            # An aged request sorts as if its prefill were one batch budget: after
+            # the requests that fit in a batch, before younger long ones (oldest
+            # first), so it becomes the next chunked request without blocking
+            # the short requests ahead of it.
+            def key(r):
+                work = self._shortest_prefill_work(r)
+                aged = rounds[r.rid] > limit
+                return (
+                    r.rid in temporary_deprioritized,
+                    min(work, cap) if aged else work,
+                    not aged,
+                    -rounds[r.rid] if aged else 0,
+                    r.time_stats.wait_queue_entry_time,
+                    r.rid,
+                )
+
+            waiting_queue.sort(key=key)
+            return
+        waiting_queue.sort(
+            key=lambda r: (
+                rounds[r.rid] <= limit,
+                r.rid in temporary_deprioritized,
+                (
+                    self._shortest_prefill_work(r)
+                    if rounds[r.rid] <= limit
+                    else -rounds[r.rid]
+                ),
+                r.time_stats.wait_queue_entry_time if rounds[r.rid] <= limit else 0.0,
+                r.rid,
             )
         )
 

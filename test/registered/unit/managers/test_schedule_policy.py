@@ -1,7 +1,9 @@
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     CacheAgnosticPolicy,
@@ -180,6 +182,72 @@ class TestShortestPrefillFirst(CustomTestCase):
         queue = [replay, short]
         self.policy._sort_by_shortest_prefill(queue, set(), processed_tokens=0)
         self.assertEqual(queue, [short, replay])
+
+    def make_aged_policy(self, rounds, cap=False):
+        with (
+            envs.SGLANG_SPF_AGE_ROUNDS.override(rounds),
+            envs.SGLANG_SPF_AGE_CAP.override(cap),
+        ):
+            self.setUp()
+
+    def sort_rounds(self, queue, n, chunked_prefill_size=4096):
+        schedule = SimpleNamespace(chunked_prefill_size=chunked_prefill_size)
+        with (
+            patch.object(self.policy, "_compute_prefix_matches", return_value=set()),
+            patch(
+                "sglang.srt.managers.schedule_policy.get_schedule",
+                return_value=schedule,
+            ),
+        ):
+            for _ in range(n):
+                queue = self.policy.calc_priority(queue)
+        return [req.rid for req in queue]
+
+    def test_aging_is_off_by_default(self):
+        queue = [self.make_req("long", 8192), self.make_req("short", 32)]
+        self.assertEqual(self.sort_rounds(queue, 4), ["short", "long"])
+
+    def test_aged_request_goes_first_oldest_first(self):
+        self.make_aged_policy(2)
+        old = self.make_req("old", 8192)
+        older = self.make_req("older", 16384)
+        self.sort_rounds([older, self.make_req("s1", 32)], 1)
+        self.sort_rounds([older, old, self.make_req("s2", 32)], 1)
+        # "older" has waited three formations, "old" two.
+        self.assertEqual(
+            self.sort_rounds([old, self.make_req("s3", 32), older], 1),
+            ["older", "s3", "old"],
+        )
+        self.assertEqual(
+            self.sort_rounds([old, self.make_req("s4", 32), older], 1),
+            ["older", "old", "s4"],
+        )
+
+    def test_aging_forgets_admitted_requests(self):
+        self.make_aged_policy(1)
+        long = self.make_req("long", 8192)
+        short = self.make_req("short", 32)
+        self.sort_rounds([long, short], 1)
+        self.sort_rounds([short], 1)
+        self.assertEqual(self.sort_rounds([long, short], 1), ["short", "long"])
+
+    def test_age_cap_sorts_an_aged_request_as_one_budget(self):
+        self.make_aged_policy(1, cap=True)
+        aged = self.make_req("aged", 16384)
+        short = self.make_req("short", 32)
+        budget = self.make_req("budget", 4096)
+        young = self.make_req("young", 8192)
+        self.sort_rounds([aged], 1)
+        # aged ties with "budget" at 4096 and goes first; younger long work waits.
+        self.assertEqual(
+            self.sort_rounds([young, aged, budget, short], 1),
+            ["short", "aged", "budget", "young"],
+        )
+        # Without a chunked-prefill budget there is nothing to cap at.
+        self.assertEqual(
+            self.sort_rounds([young, aged, short], 1, chunked_prefill_size=None)[0],
+            "aged",
+        )
 
     def test_chunk_limit_reserves_complete_short_prefills(self):
         continuation = self.make_req("continuation", 16384)

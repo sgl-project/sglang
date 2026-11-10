@@ -723,6 +723,11 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # Shortest-prefill-first: requests that waited more than N batch formations go
+    # first, oldest first (0 = off). With SGLANG_SPF_AGE_CAP, an aged request sorts as
+    # if its prefill were one chunked-prefill budget instead of jumping the queue.
+    SGLANG_SPF_AGE_ROUNDS = EnvInt(0)
+    SGLANG_SPF_AGE_CAP = EnvBool(False)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
