@@ -1,0 +1,415 @@
+"""PD peers carry each window sub-pool of a unified pool as a state entry of its
+own; peers pair entries by position and refuse mismatched entries up front."""
+
+import asyncio
+import dataclasses
+import json
+import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import numpy as np
+import torch
+
+from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVBootstrapServer,
+    CommonKVManager,
+    PrefillServerInfo,
+)
+from sglang.srt.disaggregation.utils import (
+    align_window_tails,
+    check_stage_state_wires,
+    check_state_wire,
+    record_network_transfer,
+    setup_state_kv_args,
+    state_indices_per_entry,
+    state_wire,
+)
+from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
+from sglang.srt.mem_cache.kv.decl import (
+    KV_PART,
+    MHAGeometry,
+    WindowLayers,
+    kv_layer_decls,
+)
+from sglang.srt.mem_cache.kv.plan import plan_kv_storage
+from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+_MHA = MHAGeometry(head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16)
+_WINDOWS = (16, 8, 4)
+
+
+def _storage(windows):
+    setup_allocator_context()
+    decls = kv_layer_decls(
+        full_layer_ids=(0,),
+        full_geometry=_MHA,
+        windows=[
+            WindowLayers(layer_ids=(i + 1,), geometry=_MHA, window=w)
+            for i, w in enumerate(windows)
+        ],
+    )
+    plan = plan_kv_storage(decls, page_size=4)
+    sized = size_plan(
+        plan,
+        KVSizingInputs(
+            full_tokens=128,
+            window_tokens=64,
+            state_slots=0,
+            max_running_requests=3,
+            context_len=64,
+            alignment=1,
+        ),
+    )
+    ctx = UnifiedBuildContext(
+        device="cpu",
+        start_layer=0,
+        end_layer=len(windows) + 1,
+        enable_memory_saver=False,
+        need_sort=False,
+        max_num_reqs=3,
+        model_context_len=64,
+        lazy_compaction=True,
+    )
+    return build_kv_storage(plan, sized, ctx)
+
+
+def _registered(windows):
+    storage = _storage(windows)
+    kv_args = KVArgs()
+    setup_state_kv_args(kv_args, storage)
+    return storage, kv_args
+
+
+def _window_names(windows):
+    return {f"window_{w}" for w in windows}
+
+
+class TestUnifiedWindowWire(CustomTestCase):
+    def test_each_window_registers_an_entry_of_its_own(self):
+        storage, kv_args = _registered(_WINDOWS)
+        self.assertEqual(kv_args.state_types, [StateType.SWA] * len(_WINDOWS))
+        self.assertEqual(set(kv_args.state_sub_pools), _window_names(_WINDOWS))
+        self.assertEqual(
+            kv_args.state_sub_pools, [e.sub_pool for e in storage.wire_entries()]
+        )
+        for sub_pool, ptrs, item_lens in zip(
+            kv_args.state_sub_pools, kv_args.state_data_ptrs, kv_args.state_item_lens
+        ):
+            region = storage.regions(sub_pool, part=KV_PART)
+            self.assertEqual(ptrs, list(region.ptrs))
+            self.assertEqual(item_lens, list(region.item_lens))
+
+    def test_each_window_entry_carries_its_own_pages(self):
+        _, kv_args = _registered(_WINDOWS)
+        swa = Mock(return_value="type payload")
+        indices = state_indices_per_entry(
+            kv_args,
+            kv_args.state_types,
+            {StateType.SWA: swa},
+            lambda sub_pool: f"pages of {sub_pool}",
+        )
+        self.assertEqual(
+            indices, [f"pages of {sub_pool}" for sub_pool in kv_args.state_sub_pools]
+        )
+        swa.assert_not_called()
+
+        # A static pool's entries name no sub-pool: its type's payload.
+        static = SimpleNamespace(
+            state_types=[StateType.SWA, StateType.MAMBA], state_sub_pools=[None, None]
+        )
+        self.assertEqual(
+            state_indices_per_entry(
+                static, static.state_types, {StateType.SWA: swa}, lambda _: "unused"
+            ),
+            ["type payload", None],
+        )
+
+    def test_a_transfer_records_each_window_on_its_sub_pool(self):
+        storage, kv_args = _registered(_WINDOWS)
+        req = object()
+        ids = [np.array([i + 1]) for i in range(len(kv_args.state_types))]
+        with patch.object(storage, "record_network_transfer") as record:
+            record_network_transfer(
+                storage,
+                req,
+                peer="peer",
+                writes=True,
+                page_indices=np.array([0]),
+                page_size=4,
+                state_types=kv_args.state_types,
+                state_indices=ids,
+            )
+        (recorded,) = record.call_args_list
+        self.assertEqual(recorded.args, (req,))
+        self.assertEqual(recorded.kwargs["peer"], "peer")
+        self.assertTrue(recorded.kwargs["writes"])
+        self.assertEqual(
+            [(sub_pool, part.tolist()) for sub_pool, part in recorded.kwargs["states"]],
+            [
+                (sub_pool, part.tolist())
+                for sub_pool, part in zip(kv_args.state_sub_pools, ids)
+            ],
+        )
+
+    def test_peers_with_other_entries_are_refused(self):
+        _, prefill = _registered(_WINDOWS)
+        # Peers list the same entries whatever order the model declares its
+        # windows in.
+        _, decode = _registered(_WINDOWS[::-1])
+        self.assertEqual(state_wire(prefill), state_wire(decode))
+        check_state_wire(state_wire(prefill), state_wire(decode))
+        # A peer that does not report its entries is not checked.
+        check_state_wire(None, state_wire(decode))
+        _, one_window = _registered(_WINDOWS[:1])
+        with self.assertRaisesRegex(RuntimeError, "PD state entry mismatch"):
+            check_state_wire(state_wire(prefill), state_wire(one_window))
+
+
+def _wire(tails, *, sub_pools=True):
+    return [
+        ["swa", name if sub_pools else None] + ([tail] if sub_pools else [])
+        for name, tail in tails.items()
+    ]
+
+
+class _Request:
+    def __init__(self, data=None, query=None):
+        self._data = data
+        self.query = query or {}
+
+    async def json(self):
+        return self._data
+
+
+def _register(server, *, pp_rank, pp_size, wire, tp_rank=0, tp_size=1):
+    return asyncio.run(
+        server._handle_route_put(
+            _Request(
+                {
+                    "attn_tp_size": tp_size,
+                    "attn_tp_rank": tp_rank,
+                    "attn_cp_size": 1,
+                    "attn_cp_rank": 0,
+                    "attn_dp_size": 1,
+                    "attn_dp_rank": 0,
+                    "pp_size": pp_size,
+                    "pp_rank": pp_rank,
+                    "system_dp_size": 1,
+                    "system_dp_rank": 0,
+                    "rank_ip": "127.0.0.1",
+                    "rank_port": 1000 + pp_rank * tp_size + tp_rank,
+                    "page_size": 4,
+                    "kv_cache_dtype": "auto",
+                    "state_wire": wire,
+                }
+            )
+        )
+    )
+
+
+def _served_info(server):
+    response = asyncio.run(
+        server._handle_route_get(
+            _Request(
+                query={
+                    "prefill_dp_rank": "-1",
+                    "prefill_cp_rank": "-1",
+                    "target_tp_rank": "-1",
+                    "target_pp_rank": "-1",
+                }
+            )
+        )
+    )
+    return PrefillServerInfo(**json.loads(response.text))
+
+
+class TestStateEntryAgreement(CustomTestCase):
+    def test_a_prefill_keeping_more_of_a_window_pairs(self):
+        decode = _wire({"window_16": 16, "window_8": 8})
+        check_state_wire(_wire({"window_16": 16, "window_8": 13}), decode)
+        with self.assertRaisesRegex(RuntimeError, "shorter window tail"):
+            check_state_wire(decode, _wire({"window_16": 16, "window_8": 13}))
+
+    def test_unified_and_separate_pools_do_not_pair(self):
+        unified = _wire({"window_16": 16})
+        separate = _wire({"swa": None}, sub_pools=False)
+        for prefill, decode in ((unified, separate), (separate, unified)):
+            with self.assertRaisesRegex(RuntimeError, "mixed pool kinds"):
+                check_state_wire(prefill, decode)
+
+    def test_prefill_sends_the_tail_its_decode_keeps(self):
+        kv_args = SimpleNamespace(
+            state_types=[StateType.SWA, StateType.SWA, StateType.SWA],
+            state_sub_pools=["window_16", "window_8", None],
+        )
+        aligned = align_window_tails(
+            kv_args,
+            [[1, 2, 3, 4], [5, 6, 7, 8, 9], [10, 11, 12]],
+            [[0, 0, 0, 0], [0, 0, 0], [0, 0]],
+        )
+        # A sub-pool window keeps its newest pages; a static pool's entry is unchanged.
+        self.assertEqual(aligned, [[1, 2, 3, 4], [7, 8, 9], [10, 11, 12]])
+
+    def test_bootstrap_compares_each_pipeline_stage(self):
+        stage_wires = [
+            _wire({"window_16": 16, "window_8": 8}),
+            _wire({"window_16": 16}),
+        ]
+        server = CommonKVBootstrapServer("127.0.0.1", 0)
+        for pp_rank, wire in enumerate(stage_wires):
+            self.assertEqual(
+                _register(server, pp_rank=pp_rank, pp_size=2, wire=wire).status, 200
+            )
+        info = _served_info(server)
+        self.assertIsNone(info.state_wire)
+        self.assertEqual(info.state_wires, stage_wires)
+
+        def decode(pp_rank, wire, pp_size=2):
+            return SimpleNamespace(
+                pp_size=pp_size,
+                pp_rank=pp_rank,
+                kv_args=SimpleNamespace(
+                    state_types=["swa"] * len(wire),
+                    state_sub_pools=[entry[1] for entry in wire],
+                    state_wire_keys=[entry[1] for entry in wire],
+                    state_window_tails=[entry[2] for entry in wire],
+                ),
+            )
+
+        for pp_rank, wire in enumerate(stage_wires):
+            CommonKVManager._check_prefill_state_entries(decode(pp_rank, wire), info)
+        with self.assertRaisesRegex(RuntimeError, "PD state entry mismatch"):
+            CommonKVManager._check_prefill_state_entries(
+                decode(1, stage_wires[0]), info
+            )
+
+    def test_a_one_stage_decode_compares_every_prefill_stage(self):
+        """BUG REGRESSION. A one-stage decode must compare every stage of a
+        prefill whose stages register different entries, refusing misordered ones."""
+        decode_wire = [["mamba", "mamba"]] + _wire({"window_32": 32, "window_4": 4})
+        stage_wires = [
+            [["mamba", "mamba"]] + _wire({"window_4": 4, "window_32": 32}),
+            decode_wire,
+        ]
+        server = CommonKVBootstrapServer("127.0.0.1", 0)
+        for pp_rank, wire in enumerate(stage_wires):
+            self.assertEqual(
+                _register(server, pp_rank=pp_rank, pp_size=2, wire=wire).status, 200
+            )
+        info = _served_info(server)
+        self.assertIsNone(info.state_wire)
+
+        def decode(wire):
+            return SimpleNamespace(
+                pp_size=1,
+                pp_rank=0,
+                kv_args=SimpleNamespace(
+                    state_types=[entry[0] for entry in wire],
+                    state_sub_pools=[entry[1] for entry in wire],
+                    state_wire_keys=[entry[1] for entry in wire],
+                    state_window_tails=[
+                        entry[2] if len(entry) > 2 else None for entry in wire
+                    ],
+                ),
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "PD state entry mismatch"):
+            CommonKVManager._check_prefill_state_entries(decode(decode_wire), info)
+        # Stages that differ but each pair with the decode pass: one keeps
+        # more of a window than the decode does.
+        longer = [["mamba", "mamba"]] + _wire({"window_32": 32, "window_4": 8})
+        server = CommonKVBootstrapServer("127.0.0.1", 0)
+        for pp_rank, wire in enumerate([decode_wire, longer]):
+            _register(server, pp_rank=pp_rank, pp_size=2, wire=wire)
+        info = _served_info(server)
+        self.assertEqual(info.state_wires, [decode_wire, longer])
+        CommonKVManager._check_prefill_state_entries(decode(decode_wire), info)
+
+    def test_a_stage_without_trailing_state_pairs_with_a_one_stage_decode(self):
+        """BUG REGRESSION. A prefill stage registering only a leading subset of
+        the decode's entries (its own layers' state) must still pair."""
+        decode_wire = [["swa", None], ["c128_state", None]]
+        stage_wires = [[["swa", None]], decode_wire]
+        server = CommonKVBootstrapServer("127.0.0.1", 0)
+        for pp_rank, wire in enumerate(stage_wires):
+            self.assertEqual(
+                _register(server, pp_rank=pp_rank, pp_size=2, wire=wire).status, 200
+            )
+        info = _served_info(server)
+        self.assertEqual(info.state_wires, stage_wires)
+
+        def decode(wire):
+            return SimpleNamespace(
+                pp_size=1,
+                pp_rank=0,
+                kv_args=SimpleNamespace(
+                    state_types=[entry[0] for entry in wire],
+                    state_wire_keys=[None] * len(wire),
+                    state_window_tails=[None] * len(wire),
+                ),
+            )
+
+        CommonKVManager._check_prefill_state_entries(decode(decode_wire), info)
+        # Leading entries only: a stage's entry out of position is refused,
+        # and so are stages that together miss a decode entry.
+        with self.assertRaisesRegex(RuntimeError, "PD state entry mismatch"):
+            check_stage_state_wires([[["c128_state", None]], decode_wire], decode_wire)
+        with self.assertRaisesRegex(RuntimeError, "no stage registers"):
+            check_stage_state_wires([[["swa", None]]] * 2, decode_wire)
+        # A stage not registered yet leaves the coverage to be judged later.
+        check_stage_state_wires([[["swa", None]], None], decode_wire)
+
+    def test_ranks_of_one_stage_must_agree(self):
+        server = CommonKVBootstrapServer("127.0.0.1", 0)
+        self.assertEqual(
+            _register(
+                server, pp_rank=0, pp_size=1, wire=_wire({"window_16": 16}), tp_size=2
+            ).status,
+            200,
+        )
+        response = _register(
+            server,
+            pp_rank=0,
+            pp_size=1,
+            wire=_wire({"window_16": 13}),
+            tp_rank=1,
+            tp_size=2,
+        )
+        self.assertEqual(response.status, 400)
+        self.assertIn("one pipeline stage", response.text)
+
+    def test_a_dense_prefill_answers_as_before_state_entries(self):
+        """BUG REGRESSION. A prefill without state entries must answer only the
+        fields a decode that predates state entries can read."""
+        fields = {field.name for field in dataclasses.fields(PrefillServerInfo)}
+        older = fields - {"state_wire", "state_wires"}
+        for wire in ([], None):
+            with self.subTest(wire=wire):
+                server = CommonKVBootstrapServer("127.0.0.1", 0)
+                self.assertEqual(
+                    _register(server, pp_rank=0, pp_size=1, wire=wire).status, 200
+                )
+                response = asyncio.run(
+                    server._handle_route_get(
+                        _Request(
+                            query={
+                                "prefill_dp_rank": "-1",
+                                "prefill_cp_rank": "-1",
+                                "target_tp_rank": "-1",
+                                "target_pp_rank": "-1",
+                            }
+                        )
+                    )
+                )
+                self.assertLessEqual(set(json.loads(response.text)), older)
+
+
+if __name__ == "__main__":
+    unittest.main()
