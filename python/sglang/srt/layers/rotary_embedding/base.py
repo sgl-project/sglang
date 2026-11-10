@@ -89,12 +89,36 @@ if _is_xpu:
 # Head sizes sgl_kernel.rotary_embedding accepts on XPU; it raises on any other.
 _XPU_ROTARY_EMBEDDING_HEAD_SIZES = (32, 64, 96, 128, 256)
 
+_MLU_ROTARY_HEAD_SIZES = (16, 32, 64, 128, 256)
+_mlu_apply_rotary = None
+if _is_mlu:
+    try:
+        from triton.ops.apply_rotary import apply_rotary as _mlu_apply_rotary
+    except ImportError:
+        _mlu_apply_rotary = None
+
+
+# FlagTree's interleaved (GPT-J style) kernel runs one program per (token block,
+# head) and is slower than forward_native beyond this many tokens on MLU370.
+_MLU_INTERLEAVED_MAX_TOKENS = 128
+
+
+def _mlu_rope_block_m(num_tokens: int, interleaved: bool) -> int:
+    """Tokens per FlagTree program (BLOCK_M), from a sweep on MLU370-S4."""
+    if interleaved:
+        return 8 if num_tokens <= 8 else 64
+    if num_tokens <= 64:
+        return 2
+    return 8 if num_tokens <= 512 else 16
+
 
 class RotaryEmbedding(BaseFusedOp):
     """Original rotary positional embedding."""
 
     # (source cos_sin_cache, cast copy) memo for cos_sin_cache_as().
     _cos_sin_cache_cast: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # (source cos_sin_cache, cos, sin) memo for _mlu_cos_sin().
+    _mlu_cos_sin_memo: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
     def __init__(
         self,
@@ -540,6 +564,44 @@ class RotaryEmbedding(BaseFusedOp):
                 )
         return query, key
 
+    def _mlu_cos_sin(self, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Contiguous (cos, sin) halves of cos_sin_cache in ``dtype`` for FlagTree.
+
+        FlagTree indexes cos/sin as dense ``(rows, rotary_dim // 2)`` tensors in the
+        activation dtype. The split copy is reused until cos_sin_cache is replaced
+        (growth or device move), so steady-state calls launch no copy kernels.
+        """
+        cache = self.cos_sin_cache
+        memo = self._mlu_cos_sin_memo
+        if memo is None or memo[0] is not cache or memo[1].dtype != dtype:
+            cos, sin = cache.to(dtype).chunk(2, dim=-1)
+            memo = (cache, cos.contiguous(), sin.contiguous())
+            self._mlu_cos_sin_memo = memo
+        return memo[1], memo[2]
+
+    @staticmethod
+    def _mlu_apply_rotary_inplace(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        positions: torch.Tensor,
+        interleaved: bool,
+    ) -> None:
+        num_tokens = positions.shape[0]
+        token_offsets = positions.view(1, num_tokens)
+        block_m = _mlu_rope_block_m(num_tokens, interleaved)
+        for x in (q, k):
+            _mlu_apply_rotary(
+                x,
+                x,
+                cos,
+                sin,
+                BLOCK_M=block_m,
+                token_offsets=token_offsets,
+                interleaved=interleaved,
+            )
+
     def forward_mlu(
         self,
         positions: torch.Tensor,
@@ -548,56 +610,57 @@ class RotaryEmbedding(BaseFusedOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run RoPE through FlagTree's packed Cambricon Triton kernel."""
-        assert fused_set_kv_buffer_arg is None, (
-            "save kv cache is not supported by the MLU rotary kernel"
-        )
+        """In-place RoPE through FlagTree's padded Cambricon Triton kernels.
+
+        Q and K are viewed as one padded ``(1, num_tokens, heads, rotary_dim)``
+        sequence and each token's real position is passed as its offset into the
+        cos/sin cache, so batches with non-contiguous positions are handled. The
+        padded mode does not use FlagTree's packed (``cu_seqlens``) kernels.
+        """
+        interleaved = not self.is_neox_style
+        num_tokens = positions.numel()
+        if (
+            _mlu_apply_rotary is None
+            or fused_set_kv_buffer_arg is not None
+            or hasattr(self, "sin_cos_cache")
+            or self.rotary_dim not in _MLU_ROTARY_HEAD_SIZES
+            # The interleaved kernel also rotates the pass-through dims.
+            or (interleaved and self.rotary_dim != self.head_size)
+            or (interleaved and num_tokens > _MLU_INTERLEAVED_MAX_TOKENS)
+        ):
+            return self.forward_native(
+                positions, query, key, offsets, fused_set_kv_buffer_arg
+            )
+
         if offsets is not None:
             positions = positions + offsets
-        positions = positions.flatten().to(device=query.device, dtype=torch.int32)
-        cos_sin = self.cos_sin_cache.to(device=query.device, dtype=query.dtype)
-        cos, sin = (part.contiguous() for part in cos_sin.chunk(2, dim=-1))
-        try:
-            from triton.ops.apply_rotary import apply_rotary
-        except (ImportError, ModuleNotFoundError):
-            return self.forward_native(positions, query, key)
-
-        num_tokens = positions.numel()
-        cu_seqlens = torch.tensor(
-            [0, num_tokens], device=query.device, dtype=torch.int32
-        )
-        token_offsets = positions.view(1, num_tokens)
-        q = query.view(num_tokens, -1, self.head_size)
-        k = key.view(num_tokens, -1, self.head_size)
-        q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
-        k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
-        q_out = torch.empty_like(q_rot)
-        k_out = torch.empty_like(k_rot)
-        apply_rotary(
-            q_out,
-            q_rot,
-            cos,
-            sin,
-            BLOCK_M=2,
-            token_offsets=token_offsets,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=num_tokens,
-            interleaved=not self.is_neox_style,
-        )
-        apply_rotary(
-            k_out,
-            k_rot,
-            cos,
-            sin,
-            BLOCK_M=2,
-            token_offsets=token_offsets,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=num_tokens,
-            interleaved=not self.is_neox_style,
-        )
-        q_result = torch.cat((q_out, q_pass), dim=-1)
-        k_result = torch.cat((k_out, k_pass), dim=-1)
-        return q_result.view_as(query), k_result.view_as(key)
+        positions = positions.flatten()
+        if num_tokens == 0:
+            return query, key
+        cos, sin = self._mlu_cos_sin(query.dtype)
+        q = query.view(1, num_tokens, -1, self.head_size)
+        k = key.view(1, num_tokens, -1, self.head_size)
+        if self.rotary_dim != self.head_size:
+            # Rotate only the first rotary_dim lanes of each head, in place; the
+            # head stride keeps the pass-through lanes untouched.
+            q = q[..., : self.rotary_dim]
+            k = k[..., : self.rotary_dim]
+        chunk = cos.shape[0]
+        if num_tokens <= chunk:
+            self._mlu_apply_rotary_inplace(q, k, cos, sin, positions, interleaved)
+        else:
+            # FlagTree requires seqlen <= cos rows; split longer batches.
+            for start in range(0, num_tokens, chunk):
+                end = min(start + chunk, num_tokens)
+                self._mlu_apply_rotary_inplace(
+                    q[:, start:end],
+                    k[:, start:end],
+                    cos,
+                    sin,
+                    positions[start:end],
+                    interleaved,
+                )
+        return query, key
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
