@@ -21,9 +21,7 @@ Validated revisions:
 The aiter revision is the `AITER_COMMIT_DEFAULT` pinned by
 `docker/rocm.Dockerfile`; composable-kernel follows from it as a submodule.
 
-`docker/muse_spark/muse-spark-rocm.Dockerfile` applies these patches at build
-time, so an image built from it needs no runtime patching. Apply them by hand
-only when working in a container built from the plain ROCm image:
+Apply them in a container built from `docker/rocm.Dockerfile`:
 
 ```bash
 AITER_ROOT=/sgl-workspace/aiter \
@@ -39,13 +37,5 @@ optimized FlyDSL experts, or `native` for a correctness fallback. Plan C
 short-window attention remains opt-in with `SGLANG_ROCM_MUSE_FLYDSL_DECODE=1`; its
 aiter kernel is under `patches/experimental`.
 
-Launch the validated TP8/EP8 Plan B configuration:
-
-```bash
-MODEL=/data/Muse-Spark-1.2-816B-A42B-Quark-MXFP4 \
-MUSE_MOE_BACKEND=flydsl \
-scripts/serve_muse_spark_rocm.sh
-```
-
-The BF16 checkpoint lives at `/data/Muse-Spark-1.2-816B-A42B-open` and
-runs through the same script via `MODEL`.
+Launch commands for MI355X are in the Muse Spark cookbook page
+(`docs/src/snippets/configs/meta-models/muse-spark.jsx`).
