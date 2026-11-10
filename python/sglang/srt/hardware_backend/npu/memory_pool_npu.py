@@ -805,8 +805,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.indexer_kv_dtype = (
             dtype if kv_capability is None else kv_capability.indexer_kv_dtype
         )
+        # An unquantized indexer shares the main store dtype unless it has its
+        # own (BF16 under an INT8 main KV).
         self.indexer_store_dtype = (
-            self.indexer_kv_dtype if self.indexer_quant else self.store_dtype
+            self.indexer_kv_dtype
+            if self.indexer_quant or self.indexer_kv_dtype != dtype
+            else self.store_dtype
         )
         self.indexer_scale_dtype = (
             kv_capability.indexer_scale_dtype if self.indexer_quant else None
@@ -1133,13 +1137,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             2 if self.index_k_scale_buffer is not None else 1
         )
 
-    def _pack_dsa_fp8_kv_cache(self, cache_k, cache_v):
+    def _pack_dsa_quant_kv_cache(self, cache_k, cache_v):
         latent = cache_k.reshape(-1, self.kv_lora_rank)
         quantized, scale = torch_npu.npu_dynamic_quant(
             latent.reshape(-1, 128), dst_type=self.dtype
         )
         rows = latent.shape[0]
-        # Opaque record: latent FP8 | rope BF16 bytes | per-tile FP32 scales.
+        # Opaque record: quantized latent | rope BF16 bytes | per-tile FP32 scales.
         packed = torch.cat(
             (
                 quantized.reshape(rows, self.kv_lora_rank).view(torch.uint8),
@@ -1171,7 +1175,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 cache_k, cache_v = cache_k.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
-            packed = self._pack_dsa_fp8_kv_cache(cache_k, cache_v)
+            packed = self._pack_dsa_quant_kv_cache(cache_k, cache_v)
             torch_npu.npu_scatter_nd_update_(
                 self.k_buffer[layer_id - self.start_layer].view(
                     -1, 1, self.kv_cache_dim

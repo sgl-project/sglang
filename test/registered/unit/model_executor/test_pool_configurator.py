@@ -1105,6 +1105,38 @@ class TestEagleConfigurator(CustomTestCase):
             available,
         )
 
+    def test_int8_target_reserves_an_unpacked_draft(self):
+        """An INT8 target's draft falls back to an unpacked model-dtype cache;
+        scaling the draft from the target's packed rows under-reserves it."""
+        import torch
+
+        from sglang.srt.model_executor import pool_configurator
+
+        num_layers = 78
+        draft_num_layers = 1
+        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.kv_cache_dtype = torch.int8
+        mr.model_dtype = torch.bfloat16
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = draft_num_layers
+
+        with (
+            get_parallel().override(attn_tp_size=1, attn_cp_size=1),
+            patch.object(pool_configurator, "_is_npu", True),
+        ):
+            cfg = pool_configurator.create_memory_pool_configurator(mr)
+
+        # Packed INT8 record and BF16 indexer on the target; the draft keeps
+        # (512 + 64) BF16 latent/rope values per layer next to its indexer.
+        bf16_index_k = 128 * 2
+        self.assertEqual(
+            cfg._cell_size,
+            (656 + bf16_index_k) * num_layers
+            + (576 * 2 + bf16_index_k) * draft_num_layers,
+        )
+
     def test_hybrid_swa_draft_uses_swa_geometry_and_capacity(self):
         """SWA draft layers use SWA KV geometry and capacity."""
         available = 10_000_000

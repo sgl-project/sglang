@@ -2232,6 +2232,13 @@ class KVCacheConfigurator:
                 f"{kv_capability.unsupported_reason}"
             )
         main_kv_packed = kv_capability is not None and kv_capability.main_kv_packed
+        if self.kv_cache_dtype == torch.int8 and self.use_combined_kv_buffer:
+            raise ValueError(
+                "--kv-cache-dtype int8 is not supported with the combined MLA KV "
+                "buffer (SGLANG_NPU_USE_FLASH_MLA with DSPARK), whose readers "
+                "expect an unquantized cache. Unset SGLANG_NPU_USE_FLASH_MLA or "
+                "use --kv-cache-dtype bf16."
+            )
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=get_schedule().page_size,
@@ -3584,7 +3591,8 @@ def calculate_mla_kv_cache_dim(
     packed: Optional[bool] = None,
 ) -> int:
     """MLA KV row width. ``packed`` selects the DSA packed quantized record
-    (latent | rope | scales); when omitted, a float8_e4m3fn cache is packed."""
+    (latent | rope | scales); when omitted, a float8_e4m3fn or int8 cache is
+    packed."""
     is_dsa_model = is_deepseek_dsa(model_config.hf_config)
     kv_cache_dtype = kv_cache_dtype
     kv_lora_rank = model_config.kv_lora_rank
@@ -3637,7 +3645,9 @@ def calculate_mla_kv_cache_dim(
     # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
     # (excluding TRTLLM and HIP raw-layout kernels).
     if packed is None:
-        packed = kv_cache_dtype == torch.float8_e4m3fn
+        # An int8 KV cache is only accepted for DSA on non-arch35 Ascend NPUs,
+        # where it is always the packed record.
+        packed = kv_cache_dtype in (torch.float8_e4m3fn, torch.int8)
     if packed:
         assert kv_cache_dtype.itemsize == 1, (
             f"packed MLA KV cache requires a one-byte dtype, got {kv_cache_dtype}"

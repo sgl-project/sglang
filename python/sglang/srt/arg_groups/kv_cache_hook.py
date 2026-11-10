@@ -108,6 +108,70 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
         )
 
 
+def _int8_kv_cache_conflicts(cfg: Any) -> list[str]:
+    """Paths that would read or write the packed INT8 record as a plain cache."""
+    from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
+        is_fia_nz,
+        is_mla_preprocess_enabled,
+    )
+
+    conflicts = []
+    # MLAPO writes the decode KV itself and requires a BF16 cache.
+    if is_mla_preprocess_enabled():
+        conflicts.append("SGLANG_NPU_USE_MLAPO")
+    # The packed sparse attention path is PA_BSND only.
+    if is_fia_nz():
+        conflicts.append("SGLANG_USE_FIA_NZ")
+    if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+        conflicts.append("SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD")
+    # Prefill CP and decode DCP run their own BF16 sparse attention.
+    if cfg.attn_cp_size > 1:
+        conflicts.append("--attn-cp-size > 1 (DSA prefill context parallelism)")
+    if cfg.dcp_size > 1:
+        conflicts.append("--dcp-size > 1")
+    # The host KV pool mirrors the device buffers in the main KV dtype.
+    if cfg.enable_hierarchical_cache:
+        conflicts.append("--enable-hierarchical-cache")
+    if cfg.disaggregation_decode_enable_offload_kvcache:
+        conflicts.append("--disaggregation-decode-enable-offload-kvcache")
+    if cfg.disaggregation_decode_retraction_backup == "host_pool":
+        conflicts.append(
+            "--disaggregation-decode-retraction-backup host_pool "
+            "(also implied by --disaggregation-decode-host-receive-threshold < 1)"
+        )
+    return conflicts
+
+
+def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
+    """``--kv-cache-dtype int8`` stores the DSA MLA KV as a packed record
+    (INT8 latent | BF16 rope | per-tile scales) that only the Ascend sparse
+    attention path reads back; reject every other consumer at startup."""
+    cfg = resolving_view(server_args)
+    if cfg.kv_cache_dtype != "int8":
+        return
+    if not get_platform().is_npu:
+        raise ValueError(
+            "--kv-cache-dtype int8 is supported on Ascend NPUs only; no other "
+            "platform has kernels that read an INT8 KV cache."
+        )
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    hf_config = model_config_of(server_args).hf_config
+    if not is_deepseek_dsa(hf_config):
+        raise ValueError(
+            "--kv-cache-dtype int8 stores the packed DSA MLA record, which only "
+            "DSA sparse attention reads back; "
+            f"{hf_config.architectures[0]} is not a DSA model. Use "
+            "--kv-cache-dtype bf16 or auto."
+        )
+    conflicts = _int8_kv_cache_conflicts(cfg)
+    if conflicts:
+        raise ValueError(
+            "--kv-cache-dtype int8 is not supported with "
+            f"{', '.join(conflicts)}. Remove them or use --kv-cache-dtype bf16."
+        )
+
+
 def handle_kv4_compatibility(server_args: Any) -> None:
     """Check FP4 KV cache compatibility with the attention backend"""
 

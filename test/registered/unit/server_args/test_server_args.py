@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import json
 import os
 import pickle
@@ -16,6 +17,7 @@ import msgspec.structs
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import (
+    kv_cache_hook,
     parallel_hook,
     pd_disaggregation_hook,
     serving_hook,
@@ -44,6 +46,7 @@ from sglang.srt.arg_groups.hisparse_hook import (
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
+    handle_int8_kv_cache_compatibility,
     handle_kv4_compatibility,
     handle_nvfp4_prefill_kv_dequant_dtype,
     validate_prefill_only_disable_kv_cache_args,
@@ -3354,6 +3357,130 @@ class TestWaterfillArgs(CustomTestCase):
         self.assertEqual(resolution_result(server_args, "deepep_mode"), "low_latency")
         self.assertFalse(resolution_result(server_args, "disable_cuda_graph"))
         self.assertTrue(resolution_result(server_args, "enforce_shared_experts_fusion"))
+
+
+class TestInt8KvCacheCompatibility(CustomTestCase):
+    """--kv-cache-dtype int8 is the packed DSA MLA record on Ascend; anything
+    else would take it as a plain one-byte cache."""
+
+    _MLA_PREPROCESS = "sglang.srt.hardware_backend.npu.attention.mla_preprocess"
+
+    def setUp(self):
+        super().setUp()
+        # Both env readers are cached per process; patch them, not the env.
+        for name in ("is_fia_nz", "is_mla_preprocess_enabled"):
+            p = patch(f"{self._MLA_PREPROCESS}.{name}", return_value=False)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _check(self, arch="GlmMoeDsaForCausalLM", *, after_pd=False, **kwargs):
+        server_args = ServerArgs(model_path="dummy", kv_cache_dtype="int8", **kwargs)
+        hf_config = SimpleNamespace(architectures=[arch], index_topk=2048)
+        with patch.object(
+            kv_cache_hook,
+            "model_config_of",
+            return_value=SimpleNamespace(hf_config=hf_config),
+        ):
+            if after_pd:
+                pd_disaggregation_hook.handle_pd_disaggregation(server_args)
+            handle_int8_kv_cache_compatibility(server_args)
+
+    def test_the_launcher_pipeline_runs_the_check(self):
+        model_dir = tempfile.mkdtemp(prefix="int8_kv_cache_")
+        self.addCleanup(shutil.rmtree, model_dir, ignore_errors=True)
+        with open(os.path.join(model_dir, "config.json"), "w") as handle:
+            json.dump(
+                {
+                    "architectures": ["LlamaForCausalLM"],
+                    "model_type": "llama",
+                    "hidden_size": 64,
+                    "intermediate_size": 128,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 4,
+                    "num_hidden_layers": 2,
+                    "vocab_size": 128,
+                    "max_position_embeddings": 2048,
+                },
+                handle,
+            )
+        server_args = ServerArgs(
+            model_path=model_dir, device="cuda", random_seed=42, kv_cache_dtype="int8"
+        )
+        with self.assertRaisesRegex(ValueError, "Ascend NPUs only"):
+            server_args.resolve_once()
+
+    def test_hisparse_rejects_int8(self):
+        server_args = ServerArgs(
+            model_path="dummy", enable_hisparse=True, kv_cache_dtype="int8"
+        )
+        with self.assertRaisesRegex(ValueError, "int8"):
+            validate_hisparse_kv_cache_dtype(server_args)
+
+    def test_only_dsa_models_on_npu_are_accepted(self):
+        with override_platform(is_cuda=True, is_npu=False):
+            with self.assertRaisesRegex(ValueError, "Ascend NPUs only"):
+                self._check()
+        with override_platform(is_npu=True):
+            with self.assertRaisesRegex(ValueError, "not a DSA model"):
+                self._check(arch="Qwen3ForCausalLM")
+            self._check()
+
+    def test_paths_that_bypass_the_packed_record_are_rejected(self):
+        """MLAPO and FIA NZ write the cache themselves, CP/DCP and sparse KV
+        offload run BF16 sparse attention, and the host pool mirrors the main
+        dtype; each would treat the packed record as a plain cache."""
+        cases = (
+            (
+                "SGLANG_NPU_USE_MLAPO",
+                patch(
+                    f"{self._MLA_PREPROCESS}.is_mla_preprocess_enabled",
+                    return_value=True,
+                ),
+                {},
+            ),
+            (
+                "SGLANG_USE_FIA_NZ",
+                patch(f"{self._MLA_PREPROCESS}.is_fia_nz", return_value=True),
+                {},
+            ),
+            (
+                "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD",
+                envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+                {},
+            ),
+            ("--attn-cp-size", contextlib.nullcontext(), {"attn_cp_size": 2}),
+            ("--dcp-size", contextlib.nullcontext(), {"dcp_size": 2}),
+            (
+                "--enable-hierarchical-cache",
+                contextlib.nullcontext(),
+                {"enable_hierarchical_cache": True},
+            ),
+            (
+                "--disaggregation-decode-enable-offload-kvcache",
+                contextlib.nullcontext(),
+                {"disaggregation_decode_enable_offload_kvcache": True},
+            ),
+            (
+                "--disaggregation-decode-retraction-backup host_pool",
+                contextlib.nullcontext(),
+                {"disaggregation_decode_retraction_backup": "host_pool"},
+            ),
+            # The PD hook resolves a decode host receive threshold to host_pool.
+            (
+                "--disaggregation-decode-host-receive-threshold < 1",
+                contextlib.nullcontext(),
+                {
+                    "after_pd": True,
+                    "disaggregation_mode": "decode",
+                    "disaggregation_decode_host_receive_threshold": 0.5,
+                },
+            ),
+        )
+        for name, context, kwargs in cases:
+            with self.subTest(name=name), override_platform(is_npu=True), context:
+                with self.assertRaises(ValueError) as ctx:
+                    self._check(**kwargs)
+                self.assertIn(name, str(ctx.exception))
 
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):

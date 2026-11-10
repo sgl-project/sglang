@@ -1,8 +1,8 @@
 """KV cache storage capability of the DSA KV path on Ascend NPUs.
 
-The configurator and the device pool read the layout decisions from here
-instead of re-deriving them from the dtype and the SoC; the attention backend
-follows the device pool.
+The configurator, the pool sizer and the device pool read the layout decisions
+from here instead of re-deriving them from the dtype and the SoC; the attention
+backend follows the device pool.
 Pools without a DSA indexer (dense MLA, ModelSlim KV layouts) keep their own
 layouts and do not consult it.
 """
@@ -16,7 +16,10 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-_NPU_NON_ARCH35_KV_CACHE_DTYPES = "bf16, bfloat16, or auto with a non-FP8 checkpoint"
+_NPU_NON_ARCH35_KV_CACHE_DTYPES = (
+    "bf16, bfloat16, int8, or auto with a non-FP8 checkpoint"
+)
+_NPU_ARCH35_KV_CACHE_DTYPES = "bf16, bfloat16, fp8_e4m3, or auto"
 
 
 class PackedQuantKvCapability(msgspec.Struct, frozen=True, kw_only=True):
@@ -65,6 +68,32 @@ def resolve_kv_capability(
                 "arch35 NPU. Supported --kv-cache-dtype values for DSA models on "
                 f"this device: {_NPU_NON_ARCH35_KV_CACHE_DTYPES}."
             ),
+        )
+    if kv_cache_dtype == torch.int8:
+        if is_arch35:
+            return PackedQuantKvCapability(
+                kv_cache_dtype=kv_cache_dtype,
+                main_kv_packed=False,
+                main_kv_scale_dtype=None,
+                indexer_quant=False,
+                indexer_kv_dtype=kv_cache_dtype,
+                indexer_scale_dtype=None,
+                unsupported_reason=(
+                    f"DSA models cannot use a {kv_cache_dtype} KV cache on an "
+                    f"Ascend arch35 NPU ({soc_name}); use fp8_e4m3 for the packed "
+                    "DSA KV record there. Supported --kv-cache-dtype values for "
+                    f"DSA models on this device: {_NPU_ARCH35_KV_CACHE_DTYPES}."
+                ),
+            )
+        return PackedQuantKvCapability(
+            kv_cache_dtype=kv_cache_dtype,
+            main_kv_packed=True,
+            main_kv_scale_dtype=torch.float32,
+            # Only the main KV is quantized: the indexer K cache stays in the
+            # BF16 the sparse attention op reads queries in.
+            indexer_quant=False,
+            indexer_kv_dtype=torch.bfloat16,
+            indexer_scale_dtype=None,
         )
     return PackedQuantKvCapability(
         kv_cache_dtype=kv_cache_dtype,

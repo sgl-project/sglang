@@ -324,10 +324,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
-                    draft_kv_size = (
-                        int(target_kv_size * draft_num_layers / target_kv_num_layers)
-                        * draft_loc_space_scale
-                    )
+                    if kvc.kv_cache_dtype == torch.int8:
+                        draft_kv_size = (
+                            self._int8_target_draft_kv_bytes_per_layer(kvc)
+                            * draft_num_layers
+                        )
+                    else:
+                        draft_kv_size = int(
+                            target_kv_size * draft_num_layers / target_kv_num_layers
+                        )
+                    draft_kv_size *= draft_loc_space_scale
                     # _compute_dsa_indexer_cell_size already applies the
                     # HiSparse logical-space ratio to the draft indexer.
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
@@ -607,6 +613,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         return cell_size
 
     @staticmethod
+    def _int8_target_draft_kv_bytes_per_layer(kvc: KVCacheConfigurator) -> int:
+        # configure_kv_cache_dtype gives the draft the model dtype instead of
+        # the packed INT8 record, so its rows are wider than the target's.
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
+        )
+
+        return calculate_mla_kv_cache_dim(
+            model_config=kvc.model_config, kv_cache_dtype=kvc.model_dtype
+        ) * torch._utils._element_size(kvc.model_dtype)
+
+    @staticmethod
     def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
@@ -647,11 +665,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
-            dtype = kvc.kv_cache_dtype
-            # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
-            if dtype != torch.float8_e4m3fn:
+            from sglang.srt.hardware_backend.npu.kv_capability import (
+                resolve_npu_kv_capability,
+            )
+
+            # GPU sizing above assumes a quantized indexer; an unquantized NPU
+            # indexer stores index_head_dim elements in its own dtype, which
+            # stays BF16 under an INT8 main KV.
+            capability = resolve_npu_kv_capability(kvc.kv_cache_dtype)
+            if not capability.indexer_quant:
                 indexer_size_per_token = index_head_dim
-                element_size = torch._utils._element_size(dtype)
+                element_size = torch._utils._element_size(capability.indexer_kv_dtype)
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:
