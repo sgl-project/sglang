@@ -1663,31 +1663,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         num_device_preallocated = 0
         indices_to_remove = set()
 
-        # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
-        # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
-        retractable_tokens = sum(
-            len(r.origin_input_ids) + len(r.output_ids)
-            for r in self.scheduler.running_batch.reqs
-        )
-
-        uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
-        window_allocatable_tokens = None
-        if self._uses_swa_reservation():
-            retractable_window_tokens = self._running_window_retractable_tokens()
-            full_allocatable_tokens, window_allocatable_tokens = (
-                self._window_aware_allocatable_token_budgets(
-                    retractable_tokens=retractable_tokens,
-                    retractable_window_tokens=retractable_window_tokens,
-                    count_retracted=True,
-                )
-            )
-        else:
-            retractable_window_tokens = None
-            full_allocatable_tokens = self._allocatable_token_budgets(
-                retractable_tokens=retractable_tokens, count_retracted=True
-            )
-        reserved_restore_tokens = self._hicache_pending_restore_tokens()
-        full_allocatable_tokens -= reserved_restore_tokens
         # Sort by priority before any index-based bookkeeping so that both the
         # abort-scan loop and the preallocation loop operate on the same order.
         queue = list(self.queue.items())
@@ -1721,6 +1696,43 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.pending_reqs = [
                 r for r in self.pending_reqs if id(r) not in failed_ids
             ]
+
+        # Settle prefetches before admission can break on resource pressure.
+        # Completed attempts release L1 locks that other requests may need to
+        # evict. Preserve the admission order and PP eligibility for collectives.
+        for i, decode_req in enumerate(queue):
+            if i in indices_to_remove:
+                continue
+            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                continue
+            if decode_req.waiting_for_input and decode_req.hicache_prefetch_pending:
+                self._poll_hicache_prefetch(decode_req)
+
+        # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
+        # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
+        retractable_tokens = sum(
+            len(r.origin_input_ids) + len(r.output_ids)
+            for r in self.scheduler.running_batch.reqs
+        )
+
+        uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
+        window_allocatable_tokens = None
+        if self._uses_swa_reservation():
+            retractable_window_tokens = self._running_window_retractable_tokens()
+            full_allocatable_tokens, window_allocatable_tokens = (
+                self._window_aware_allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens,
+                    retractable_window_tokens=retractable_window_tokens,
+                    count_retracted=True,
+                )
+            )
+        else:
+            retractable_window_tokens = None
+            full_allocatable_tokens = self._allocatable_token_budgets(
+                retractable_tokens=retractable_tokens, count_retracted=True
+            )
+        reserved_restore_tokens = self._hicache_pending_restore_tokens()
+        full_allocatable_tokens -= reserved_restore_tokens
 
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs a padded buffer plus its speculative scratch.
@@ -1765,7 +1777,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if not decode_req.waiting_for_input:
                 continue
 
-            if not self._poll_hicache_prefetch(decode_req):
+            if decode_req.hicache_prefetch_pending:
                 continue
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:

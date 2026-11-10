@@ -567,6 +567,60 @@ class TestDeferredDestinationPublish(CustomTestCase):
         )
         self.assertEqual(list(queue.queue.items()), [pending])
 
+    def test_completed_prefetch_releases_prefix_behind_blocked_head(self):
+        """A completed read must free evictable capacity before FIFO admission."""
+        queue, head = self._storage_admission_queue(0)
+        tail = self._decode_req(_PollingReceiver())
+        tail.req.rid = "tail"
+        tail.req.cache_request_handle = "tail-storage"
+        queue.queue.join([tail])
+        locks = set()
+
+        def match(req, *, query_storage=True):
+            req.lock = req.rid
+            locks.add(req.lock)
+            return DecodePrefixMatch(
+                prefix_indices=torch.arange(2),
+                l2_host_hit_length=0,
+                l3_storage_hit_length=2 if query_storage else 0,
+                last_device_node=req.rid,
+                last_host_node=req.rid if query_storage else None,
+            )
+
+        queue._match_prefix_and_lock = match
+        queue.tree_cache.unlock.side_effect = locks.discard
+        queue.scheduler.tp_worker.is_hybrid_swa = False
+        queue.tree_cache.evictable_size.side_effect = lambda: 2 * (2 - len(locks))
+        queue.tree_cache.full_evictable_size.side_effect = lambda: 2 * (2 - len(locks))
+        queue.token_to_kv_pool_allocator.sub_pool_roles = lambda: ("full", (), None)
+        queue.token_to_kv_pool_allocator.available_size = lambda: 8
+        queue.token_to_kv_pool_allocator.prealloc_fits = (
+            lambda demand, *, evictable, full_budget_tokens, window_budget_tokens:
+            demand.full_tokens <= full_budget_tokens
+        )
+        queue.scheduler.last_batch = None
+        queue.scheduler.waiting_queue = []
+        queue._host_staged_admission_stats = None
+        for name in (
+            "_allocatable_token_budgets",
+            "_required_alloc_tokens",
+            "_required_admission_tokens",
+            "_prealloc_reservation_fits",
+        ):
+            setattr(queue, name, getattr(DecodePreallocQueue, name).__get__(queue))
+
+        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(locks, {head.req.rid, tail.req.rid})
+        # Both reads are pending with independent L1 locks. Tighten capacity:
+        # head needs seven tokens, but only six fit while tail retains its lock.
+        queue.token_to_kv_pool_allocator.available_size = lambda: 6
+        queue.tree_cache.check_prefetch_progress.return_value = True
+        admitted, failed = queue.pop_preallocated()
+        self.assertFalse(failed)
+        self.assertIn(head, admitted)
+        self.assertFalse(tail.hicache_prefetch_pending)
+        self.assertTrue(head.kv_receiver.send_metadata.called)
+
     def test_finished_prefetch_does_not_bypass_readmission(self):
         queue, dr = self._storage_admission_queue(0)
         self.assertEqual(queue.pop_preallocated(), ([], []))
