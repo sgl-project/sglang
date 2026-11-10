@@ -1761,7 +1761,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             return
 
         # KDA fused-accept: the next verify seeds itself in-kernel from the
-        # accept checkpoint slot (recurrent_kda's accept-token count), so the
+        # accepted checkpoint slot (recurrent_kda's num_accepted_tokens), so the
         # SSM state never round-trips through `temporal` and only the conv
         # windows still need the accept rollback. Recording this round's accept
         # length is what selects that seed next round; chain layout only (see
