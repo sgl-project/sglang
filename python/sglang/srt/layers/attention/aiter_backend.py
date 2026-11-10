@@ -876,6 +876,11 @@ class AiterAttnBackend(AttentionBackend):
             and self.head_dim == 64
             and self.num_head == 8 * self.num_kv_head
         )
+        # Muse: CK prefill keeps the configured paging (4D KV and a block table); other models keep
+        # the token-level page table, whose kernels every pinned CK supports.
+        self._muse_ck_block_prefill = (
+            self.use_muse_attention_paths and self.page_size > 1
+        )
         # Read once by Scheduler.init_overlap (decide_needs_cpu_seq_lens). Under
         # DFLASH a decode step reaches this backend only as TARGET_VERIFY, whose
         # unified-verify metadata is built from device seq_lens and sized by
@@ -3162,7 +3167,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
                 kv_indices = self.indices_updater_prefill.kv_indices
-                if self.page_size > 1:
+                if getattr(self, "_muse_ck_block_prefill", False):
                     # CK's 3D fallback treats every token as a one-token page.
                     # Preserve the configured paging for its 4D KV path so
                     # BUFFER_LOAD and unified_attention use the same blocks.
@@ -3214,7 +3219,7 @@ class AiterAttnBackend(AttentionBackend):
                     swa_out_cache_loc=swa_out_cache_loc,
                     prefill_seqlen_k=(
                         forward_batch.seq_lens[:bs].to(torch.int32)
-                        if self.page_size > 1
+                        if getattr(self, "_muse_ck_block_prefill", False)
                         else None
                     ),
                     paged_kv_view=paged_kv_view,
@@ -5262,7 +5267,7 @@ class AiterAttnBackend(AttentionBackend):
                 page_table = self.forward_metadata.swa_page_table
 
             extra_kwargs = {}
-            if self.page_size > 1:
+            if getattr(self, "_muse_ck_block_prefill", False):
                 if k_cache.shape[0] % self.page_size != 0:
                     raise ValueError(
                         f"KV cache size {k_cache.shape[0]} is not divisible by "
