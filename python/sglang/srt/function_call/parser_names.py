@@ -23,6 +23,7 @@ TOOL_CALL_PARSER_NAMES = [
     "glm47",
     "flint",
     "gpt-oss",
+    "granite_toolcall_parser",
     "k2_horizon",
     "kimi_k2",
     "kimi_k3",
