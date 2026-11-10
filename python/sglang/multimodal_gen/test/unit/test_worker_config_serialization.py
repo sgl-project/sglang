@@ -5,6 +5,7 @@ import pickle
 
 import pytest
 import torch
+
 from sglang.multimodal_gen.runtime.managers.worker_bootstrap import _ConfigPickler
 
 

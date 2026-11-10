@@ -2,8 +2,9 @@
 
 from unittest.mock import patch
 
-from sglang.kernels.ops.diffusion.sites.quality_gate import QualityGatedFusion
 from torch import nn
+
+from sglang.kernels.ops.diffusion.sites.quality_gate import QualityGatedFusion
 
 
 def test_rejected_fusion_can_mount_after_weights_change():

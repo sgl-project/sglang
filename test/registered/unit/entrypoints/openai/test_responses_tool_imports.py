@@ -2,6 +2,9 @@
 
 import builtins
 import importlib.util
+import sys
+
+import pytest
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -30,3 +33,7 @@ def test_non_shell_tools_import_without_shell_sdk_types(monkeypatch):
     spec.loader.exec_module(module)
     item = {"role": "user", "content": "hello"}
     assert module.BeamToolAdapter([]).input_item(item) == item
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
