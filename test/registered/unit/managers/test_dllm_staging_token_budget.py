@@ -764,6 +764,7 @@ class TestDllmStagingAdmissionLock(CustomTestCase):
             )
         )
         adder.tree_cache.lock = lambda node: ("locked", node)
+        adder.tree_cache.unlock = lambda lock: None
         return adder
 
     def test_admitted_tree_riding_row_takes_the_tree_lock(self):
@@ -795,6 +796,93 @@ class TestDllmStagingAdmissionLock(CustomTestCase):
         self.assertIn(fresh, adder.can_run_list)
         self.assertIsNone(holder.lock)
         self.assertIsNone(fresh.lock)
+
+
+class _PinningTreeCache:
+    """Tree-cache stub whose evictable size drops while a node is locked,
+    like the real cache: locking moves the path from evictable to protected."""
+
+    def __init__(self, *, evictable, prefix):
+        self._evictable = evictable
+        self._prefix = prefix
+        self.locked = 0
+
+    def evictable_size(self):
+        return self._evictable - (self._prefix if self.locked else 0)
+
+    def supports_mamba(self):
+        return False
+
+    def lock(self, node):
+        self.locked += 1
+        return ("locked", node)
+
+    def unlock(self, lock):
+        if lock is not None:
+            self.locked -= 1
+
+    def inc_host_lock_ref(self, node):  # pragma: no cover - lock_host unused
+        raise AssertionError("host lock not expected")
+
+
+class TestDllmStagingGatePinsOwnPrefix(CustomTestCase):
+    """The capacity gate must not count the row's OWN matched prefix as
+    evictable headroom: the extend it grants builds on that prefix, so a pool
+    that only fits by evicting it over-admits. Unpinned, alloc_for_extend then
+    either evicts the matched prefix under the batch (the token-accounting
+    corruption: tree slots re-inserted after being freed, evictable > total at
+    idle) or — with the admission lock — fails loudly with Prefill OOM. The
+    temporary pin mirrors add_one_req's selection pin."""
+
+    BLOCK_SIZE = 32
+
+    def _adder(self, *, available, evictable, prefix):
+        adder = _arm_admission(
+            _make_adder(
+                rem_dllm_tokens=4096,
+                dllm_block_size=self.BLOCK_SIZE,
+                available_tokens=available,
+                # Drive rem_total_tokens negative (the upfront max_new charge)
+                # so the gate takes the whole-block fallback, whose
+                # cur_rem_tokens check reads available + evictable.
+                rem_total_token_offset=1000,
+            )
+        )
+        tree = _PinningTreeCache(evictable=evictable, prefix=prefix)
+        adder.tree_cache = tree
+        adder.memory_budget = PrefillBudget(adder.token_to_kv_pool_allocator, tree)
+        adder.memory_budget.total_offset = 1000
+        return adder, tree
+
+    def _riding_req(self, prefix):
+        return _StubReq(
+            rid="riding",
+            fill_len=prefix + self.BLOCK_SIZE,
+            incomplete_len=0,
+            req_pool_idx=None,
+            prefix_len=prefix,
+        )
+
+    def test_gate_refuses_when_only_the_rows_own_prefix_would_fund_it(self):
+        # block_charge = block + per_req_token_overhead = 33 (page 1).
+        # Unpinned the gate would see 20 + 20 = 40 >= 33 and admit; pinned it
+        # sees 20 and refuses. The pin is released on refusal.
+        adder, tree = self._adder(available=20, evictable=20, prefix=20)
+        req = self._riding_req(prefix=20)
+        self.assertEqual(adder.add_dllm_staging_req(req), AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(req.lock)
+        self.assertEqual(tree.locked, 0)
+
+    def test_gate_admits_on_real_headroom_and_keeps_one_lock(self):
+        # available alone covers the block charge: admitted, and the only
+        # lock left standing is the admission lock on the matched path.
+        adder, tree = self._adder(available=40, evictable=20, prefix=20)
+        req = self._riding_req(prefix=20)
+        adder.add_dllm_staging_req(req)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual(req.lock, ("locked", req.last_node))
+        self.assertEqual(tree.locked, 1)
 
 
 class _InflightStubReq:

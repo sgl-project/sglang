@@ -1502,6 +1502,18 @@ class PrefillAdder:
     @capacity_decision
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
+        # A row whose matched prefix lives on the tree (no KV row of its own)
+        # must not have that prefix counted as evictable headroom by its own
+        # capacity gate: the extend the gate grants builds on top of the
+        # prefix, so "fitting by evicting it" over-admits — alloc_for_extend
+        # then either corrupts the prefix (unlocked) or fails loudly (locked).
+        # The temporary pin makes the gate read the pool as the admitted batch
+        # will actually see it, exactly like add_one_req's selection pin.
+        rides_tree = not req.kv.holds_kv and req.prefix_len > 0
+        with self._lock_node(req.last_node) if rides_tree else nullcontext():
+            return self._add_dllm_staging_req_pinned(req, rides_tree=rides_tree)
+
+    def _add_dllm_staging_req_pinned(self, req: Req, *, rides_tree: bool):
         # A retained incomplete block runs on the rows it holds: the extend
         # allocation reuses them (mem_cache/allocation.py `reuse_kv`, whose
         # predicate this mirrors exactly: a row with incomplete ids but a freed
@@ -1543,9 +1555,8 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.extend_end = req.prefix_len + new_len
-        if not req.kv.holds_kv and req.prefix_len > 0:
-            # The row's prefix lives on the tree, not in a row of its own, so
-            # admission must pin the matched path until the batch writes it
+        if rides_tree:
+            # Admission must pin the matched path until the batch writes it
             # into the row — eviction between here and alloc_for_extend would
             # free the matched KV under it. Mirrors _commit_prefill_admission;
             # checkpoint/release moves or drops the lock afterwards. A released
