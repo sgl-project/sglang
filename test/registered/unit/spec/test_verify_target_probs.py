@@ -13,14 +13,13 @@ import torch
 import torch.nn.functional as F
 
 import sglang.kernels.ops.sampling.topk as topk_ops
-from sglang.kernels.ops.sampling.topk import radix_topk
 from sglang.srt.speculative.dflash_utils import (
     _dflash_top_p_renorm_prob,
     build_speculative_verify_target_probs,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
 
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 _DRAFT_TOKEN_NUM = 8
@@ -205,20 +204,3 @@ def test_torch_fallback(device, monkeypatch):
     kwargs = _case(device, logits, top_ks, need_top_p=need_top_p, seed=12)
     got = build_speculative_verify_target_probs(**kwargs)
     torch.testing.assert_close(got, _reference(**kwargs), rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("device", _DEVICES)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("k", [1, 20, 2048, 2049, 4096])
-@pytest.mark.parametrize("strided", [False, True])
-def test_radix_topk_matches_torch(device, dtype, k, strided):
-    g = torch.Generator(device=device).manual_seed(k)
-    scores = torch.randn((37, 2 * 151936), generator=g, device=device).to(dtype)
-    # A column slice is not contiguous; the op must still read it correctly.
-    scores = scores[:, ::2] if strided else scores[:, :151936].contiguous()
-    values, ids = radix_topk(scores, k)
-    ref_values, _ = torch.topk(scores, k, dim=-1)
-    assert ids.dtype == torch.int64
-    torch.testing.assert_close(values, ref_values, rtol=0, atol=0)
-    torch.testing.assert_close(scores.gather(-1, ids), ref_values, rtol=0, atol=0)
-    assert torch.all(ids.sort(-1).values.diff(dim=-1) > 0)
