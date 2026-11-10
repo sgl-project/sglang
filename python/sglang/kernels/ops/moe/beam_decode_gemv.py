@@ -127,6 +127,7 @@ def beam_decode_gemv(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
+    # Launch tiles measured on B300; re-tune when the kernels change.
     _gate_up_gemv_kernel[(top_k, triton.cdiv(2 * intermediate_size, 8))](
         hidden_states,
         w13_weight,
@@ -135,8 +136,8 @@ def beam_decode_gemv(
         hidden_size,
         intermediate_size,
         8,
-        256,
-        num_warps=4,
+        1024,
+        num_warps=8,
         enable_fp_fusion=False,
     )
     _down_gemv_kernel[(top_k, triton.cdiv(hidden_size, 8))](

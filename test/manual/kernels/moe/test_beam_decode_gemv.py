@@ -1,6 +1,6 @@
 """Manual correctness test for the SM103 single-token Beam MoE decode GEMV.
 
-Run on one SM103 GPU (B300/GB300): ``python test/manual/kernels/moe/test_beam_decode_gemv.py``.
+Run on one SM103 GPU: ``python test/manual/kernels/moe/test_beam_decode_gemv.py``.
 
 Compares the weighted per-expert outputs with an independent FP64 reference that
 keeps the kernel's BF16 rounding points (gate/up, activation, weighted down
