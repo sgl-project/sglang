@@ -19,8 +19,10 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CosmosDreamsManifest,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import KVPair
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
@@ -369,7 +371,13 @@ class CosmosDreamsCausalDecodingStage(Cosmos3DecodingStage):
         if batch.block_idx == 0:
             self.vae.reset_causal_decode_state()
         with self.use_declared_component(component_name="vae", module=self.vae):
-            with torch.no_grad():
+            with (
+                torch.no_grad(),
+                use_vae_fast_path(
+                    self.vae,
+                    quality_allows(batch.sampling_params.quality, "lossless"),
+                ),
+            ):
                 video = self.vae.causal_decode(self._denormalize_latents(batch.latents))
         output = self._postprocess_tensor(video)
         self.log_debug("Decoded realtime chunk: %s", tuple(output.shape))
