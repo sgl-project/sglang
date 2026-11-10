@@ -327,7 +327,9 @@ class TestMooncakePrefetch(CustomTestCase):
 
 
 class TestLinkerDevicePrefetch(CustomTestCase):
-    def _fixture(self, *, swa=False, mamba=False, policy="wait_complete"):
+    def _fixture(
+        self, *, swa=False, mamba=False, policy="wait_complete", session=False
+    ):
         cfg = CacheConfig(
             page_size=1 if mamba else 2,
             components=(ComponentType.FULL,)
@@ -339,7 +341,9 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             full_attention_layer_ids=(0,),
         )
         with patch.object(shared_cache_suite, "get_device", return_value="cpu"):
-            cache, allocator, _ = build_fixture(cfg, tree_core_backend="python")
+            cache, allocator, _ = build_fixture(
+                cfg, enable_session_radix_cache=session, tree_core_backend="python"
+            )
         backend = _FakeLinker()
         if swa:
             backend.pools[PoolName.SWA] = object()
@@ -705,6 +709,36 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 assert self._match(cache, req).device_prefix_len == 6
                 self._assert_balanced(cache, allocator)
                 cache.sanity_check()
+
+    def test_published_prefetch_is_covered_by_its_session_while_queued(self):
+        cache, backend, req, allocator = self._fixture(session=True)
+        req.session_id = "s"
+        req.session_generation = cache.ensure_session_generation("s")
+        self._enqueue(cache, req)
+        backend.prefetch_futures[-1].set_result(True)
+        cache.linker.check_prefetch_events()
+        published = self._match(cache, req).last_device_node
+        full = cache.components[ComponentType.FULL]
+        assert full.session_ref(cache.tree_core.node_by_id(published)) == 1
+
+        # Newer and unreferenced, so plain LRU would evict the prefetch first.
+        cache.write_through_threshold = sys.maxsize
+        other = self._request("other", start=11)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(other.origin_input_ids[:6]),
+                value=allocator.alloc(6),
+                inserted_len=6,
+            )
+        )
+        cache.evict(EvictParams(num_tokens=6))
+        assert self._match(cache, req).device_prefix_len == 6
+        assert self._match(cache, other).device_prefix_len == 0
+
+        cache.release_radix_session("s")
+        assert full.session_ref(cache.tree_core.node_by_id(published)) == 0
+        self._assert_balanced(cache, allocator)
+        cache.sanity_check()
 
     def test_layer_wise_still_uses_queued_loads_without_prefetch(self):
         cache, backend, req, allocator = self._fixture()
