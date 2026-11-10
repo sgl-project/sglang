@@ -405,6 +405,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
         s.truncation_align_size = None
+        s.head_prefix_lock = None
         s._add_request_to_queue = Mock()
 
         new_batch, _ = s._get_new_batch_prefill_raw(None, running_batch)

@@ -925,6 +925,14 @@ class PrefillAdder:
         grid = self.mamba_chunk_grid
         return max(limit // grid * grid, min(grid, remaining))
 
+    def charge_head_prefix_pin(self, tokens: int) -> None:
+        """Charge pinned head-prefix KV the cache has not already taken out of
+        its evictable size, so later candidates of the pass cannot be sold it."""
+        if tokens <= 0:
+            return
+        self.memory_budget.total_offset += tokens
+        self.memory_budget.current_offset += tokens
+
     def budget_state(self):
         no_token = (
             self.chunked_req_waits

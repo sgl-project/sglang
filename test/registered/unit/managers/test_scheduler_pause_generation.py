@@ -145,6 +145,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disagg_decode_transfer_queue = None
         scheduler.dllm_config = None
         scheduler.uocr_runtime = None
+        scheduler.head_prefix_lock = None
         scheduler.server_args = MagicMock()
         scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
         # pause_generation zeros gen_throughput and flushes KV events.

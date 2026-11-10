@@ -86,6 +86,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.draft_worker = None
         scheduler.metrics_reporter = MagicMock()
         scheduler.invariant_checker = MagicMock()
+        scheduler.head_prefix_lock = None
         return scheduler
 
     def test_flush_cache_succeeds_when_only_retracted_reqs_are_waiting(self):

@@ -165,6 +165,7 @@ class TestAllPPLoras(CustomTestCase):
             priority_scheduling_preemption_threshold=0,
             max_prefill_bs=1,
             max_running_requests=2,
+            head_prefix_lock=None,
             tp_worker=SimpleNamespace(
                 model_runner=SimpleNamespace(
                     attn_backend=SimpleNamespace(), lora_manager=_lora_manager(slots=2)

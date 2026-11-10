@@ -236,6 +236,13 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
+from sglang.srt.managers.prefill_lookahead import (
+    HEADLOCK_SYNC_DENIED_CAPACITY,
+    HEADLOCK_SYNC_PINNED,
+    HeadPrefixLock,
+    PrefillLookaheadState,
+    normalize_headlock_reserve_tokens,
+)
 from sglang.srt.managers.req_types import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -343,6 +350,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+from sglang.srt.mem_cache.capacity import create_prefill_budget
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv.alloc.demand import window_retirement
@@ -390,6 +398,7 @@ from sglang.srt.rust_server.server import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.session.streaming_session import is_virtual_node
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
@@ -720,6 +729,7 @@ class Scheduler(
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
+        self.init_prefill_lookahead()
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
@@ -1555,6 +1565,40 @@ class Scheduler(
         )
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
+
+    def init_prefill_lookahead(self) -> None:
+        """Init the opt-in NO_TOKEN admission lookahead and its head prefix lock."""
+        self.prefill_lookahead = PrefillLookaheadState(
+            max_candidates=envs.SGLANG_PREFILL_NO_TOKEN_LOOKAHEAD.get(),
+            aging_passes=envs.SGLANG_PREFILL_LOOKAHEAD_AGING_PASSES.get(),
+        )
+        # None keeps admission breaking at the first NO_TOKEN.
+        self.head_prefix_lock: Optional[HeadPrefixLock] = None
+        if not self.prefill_lookahead.enabled:
+            return
+        if self.enable_priority_scheduling:
+            # Priority scheduling owns the queue order.
+            logger.warning(
+                "Ignoring SGLANG_PREFILL_NO_TOKEN_LOOKAHEAD under priority scheduling."
+            )
+            return
+        reserve_tokens = normalize_headlock_reserve_tokens(
+            envs.SGLANG_PREFILL_HEADLOCK_RESERVE_TOKENS.get(),
+            self.max_prefill_tokens,
+        )
+        self.head_prefix_lock = HeadPrefixLock(
+            self.tree_cache,
+            logger=logger,
+            headroom_fn=self._kv_pool_headroom,
+            reserve_tokens=reserve_tokens,
+        )
+        logger.info(
+            "Prefill NO_TOKEN lookahead: candidates=%d aging_passes=%d "
+            "headlock_reserve_tokens=%d",
+            self.prefill_lookahead.max_candidates,
+            self.prefill_lookahead.aging_passes,
+            reserve_tokens,
+        )
 
     def feed_watchdog(self) -> None:
         """Tell the watchdogs the scheduler is alive while it waits on the host
@@ -4418,11 +4462,40 @@ class Scheduler(
             f"picked-rids={picked_rids}{more}"
         )
 
+    def _kv_pool_headroom(self) -> Tuple[int, int]:
+        """(allocator-free, cache-evictable) tokens as prefill admission counts them."""
+        return create_prefill_budget(
+            self.token_to_kv_pool_allocator, self.tree_cache
+        ).headroom()
+
+    def _sync_head_prefix_lock(
+        self, req: Req, rejected_no_token: bool, adder: PrefillAdder
+    ) -> bool:
+        """Pin, keep or release the head prefix lock for this pass's head;
+        True when the capacity gate refused the pin."""
+        outcome = self.head_prefix_lock.sync_head(
+            rid=req.rid,
+            node=req.last_node,
+            tokens=req.prefix_len,
+            # A session's virtual node stands for a lock its slot already holds.
+            should_hold=(
+                rejected_no_token
+                and req.last_node is not None
+                and not is_virtual_node(req.last_node)
+            ),
+        )
+        if outcome == HEADLOCK_SYNC_PINNED:
+            adder.charge_head_prefix_pin(self.head_prefix_lock.last_pin_unaccounted)
+        return outcome == HEADLOCK_SYNC_DENIED_CAPACITY
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
+        if self.head_prefix_lock is not None and self.head_prefix_lock.held:
+            # The lock outlives a pass; its request may have left the queue.
+            self.head_prefix_lock.reconcile({req.rid for req in self.waiting_queue})
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -4576,6 +4649,16 @@ class Scheduler(
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Requests no memory will ever come back for; aborted after the loop.
         unschedulable: List[Req] = []
+        # NO_TOKEN lookahead: latched by the pass's first memory rejection, it
+        # lets up to lookahead_budget later requests try the ordinary budget.
+        lookahead_on = False
+        lookahead_budget = 0
+        lookahead_admitted = 0
+        lookahead_denied = 0
+        blocked_req: Optional[Req] = None
+        head_offered = False
+        head_aged_out = False
+        head_lock_denied_capacity = False
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             # A spent pass budget admits no one, even before the first
@@ -4613,6 +4696,9 @@ class Scheduler(
                 ):
                     break
 
+            if lookahead_on and lookahead_budget <= 0:
+                break
+
             if (
                 self.enable_hicache_storage
                 or self.enable_lmcache
@@ -4649,17 +4735,63 @@ class Scheduler(
                 req.time_stats.observe_storage_staging_ready(staging_ready)
                 if not staging_ready:
                     continue
+            is_lookahead_candidate = lookahead_on
+            if is_lookahead_candidate:
+                lookahead_budget -= 1
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
 
+            if is_lookahead_candidate and added:
+                lookahead_admitted += 1
+
+            if self.head_prefix_lock is not None and not head_offered:
+                # Before any candidate is offered, so its eviction cannot
+                # take the head's prefix.
+                head_offered = True
+                # A waiting chunked request rejects everyone: the head is not
+                # blocked on its own memory, and a pin could hold what the
+                # chunk waits for.
+                head_no_token = (
+                    res == AddReqResult.NO_TOKEN
+                    and not added
+                    and not adder.chunked_req_waits
+                )
+                self.prefill_lookahead.observe_head(
+                    req.rid, rejected_no_token=head_no_token
+                )
+                head_aged_out = self.prefill_lookahead.aged_out
+                head_lock_denied_capacity = self._sync_head_prefix_lock(
+                    req, head_no_token, adder
+                )
+
             if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
+                keep_scanning = False
+                if self.head_prefix_lock is not None and not added:
+                    if is_lookahead_candidate:
+                        # A candidate is judged with the head's pin held, so
+                        # UNSCHEDULABLE is not final for it: it stays queued.
+                        if res in (AddReqResult.NO_TOKEN, AddReqResult.UNSCHEDULABLE):
+                            lookahead_denied += 1
+                            keep_scanning = lookahead_budget > 0
+                    elif res == AddReqResult.NO_TOKEN:
+                        blocked_req = req
+                        # Without the pin a candidate could evict the head's
+                        # prefix.
+                        lookahead_on = (
+                            not head_aged_out
+                            and not head_lock_denied_capacity
+                            and not adder.chunked_req_waits
+                        )
+                        lookahead_budget = self.prefill_lookahead.max_candidates
+                        keep_scanning = lookahead_on
+                if res == AddReqResult.NO_TOKEN and not lookahead_on:
                     running_batch.batch_is_full = adder.batch_is_full_after_rejection(
                         req
                     )
@@ -4667,7 +4799,6 @@ class Scheduler(
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
@@ -4677,12 +4808,31 @@ class Scheduler(
                         kv_storage_of(
                             self.req_to_token_pool, self.token_to_kv_pool_allocator
                         ).release_state_slot(req)
-                if res == AddReqResult.UNSCHEDULABLE and not added:
+                if (
+                    res == AddReqResult.UNSCHEDULABLE
+                    and not added
+                    and not is_lookahead_candidate
+                ):
                     # Nothing holding memory will give it back: waiting would
                     # keep the request queued forever.
                     unschedulable.append(req)
                     continue
+                if keep_scanning:
+                    continue
                 break
+
+        if lookahead_on:
+            # Lookahead deferred the blocked request's verdict to the scan's end.
+            running_batch.batch_is_full = adder.batch_is_full_after_rejection(
+                blocked_req
+            )
+        if self.head_prefix_lock is not None and self.metrics_reporter.enable_metrics:
+            self.metrics_collector.increment_admission_lookahead(
+                admitted=lookahead_admitted,
+                denied=lookahead_denied,
+                aging_hold=head_aged_out,
+                denied_capacity=head_lock_denied_capacity,
+            )
 
         if unschedulable:
             self.waiting_queue.leave(unschedulable)
@@ -6124,6 +6274,8 @@ class Scheduler(
                         "window waited for the previous one.",
                     },
                 )
+            if self.head_prefix_lock is not None:
+                self.head_prefix_lock.release(reason="flush_cache")
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
