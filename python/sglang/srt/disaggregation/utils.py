@@ -1631,7 +1631,6 @@ def setup_state_kv_args(
         adapter = owner_view.get_pd_dcp_transfer_adapter()
         if adapter is not None:
             kv_args.dcp_transfer = adapter
-            kv_args.kv_layout = adapter.layout_id.decode("ascii")
         kv_args.kv_buf_groups = 3 if owner_view.index_head_dim is not None else 2
         kv_args.hidden_kv_layers = total_kv_layers
         kv_args.draft_kv_layers = (

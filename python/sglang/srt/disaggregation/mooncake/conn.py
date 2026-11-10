@@ -176,7 +176,6 @@ class KVArgsRegisterInfo:
     dcp_token_item_lens: Optional[List[int]] = None
     dst_draft_rows_dcp_collapsed: bool = False
     dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
-    dst_dcp_layout_id: bytes = b""
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     dst_aux_item_lens: Optional[List[int]] = None
@@ -234,7 +233,6 @@ class KVArgsRegisterInfo:
                 else []
             ),
             dst_draft_rows_dcp_collapsed=(len(msg) > 21 and msg[21] == b"1"),
-            dst_dcp_layout_id=msg[22] if len(msg) > 22 else b"",
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
         )
@@ -3287,17 +3285,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     registration_error = None
                     adapter = getattr(self.kv_args, "dcp_transfer", None)
-                    layout_id = (
-                        adapter.layout_id
-                        if adapter is not None and decode_kv_args.dst_dcp_size > 1
-                        else b""
-                    )
-                    if decode_kv_args.dst_dcp_layout_id != layout_id:
-                        registration_error = (
-                            f"PD DCP layout mismatch: prefill={layout_id!r}, "
-                            f"decode={decode_kv_args.dst_dcp_layout_id!r}"
-                        )
-                    elif adapter is not None and decode_kv_args.requires_dcp_relayout:
+                    if adapter is not None and decode_kv_args.requires_dcp_relayout:
                         try:
                             (
                                 decode_kv_args.dcp_token_item_lens,
@@ -3542,7 +3530,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def build_receiver_registration_message(self) -> List[bytes]:
         session_id = self.get_session_id()
-        adapter = getattr(self.kv_args, "dcp_transfer", None)
         packed_kv_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_args.kv_data_ptrs
         )
@@ -3614,7 +3601,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 *self.kv_args.kv_item_lens,
             ),
             b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
-            *([adapter.layout_id] if adapter is not None and self.dcp_size > 1 else []),
         ]
 
     def build_receiver_metadata_message(

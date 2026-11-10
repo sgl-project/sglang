@@ -1474,14 +1474,6 @@ class CommonKVManager(BaseKVManager):
                 )
 
         if self.dcp_size > 1:
-            if (
-                getattr(self.kv_args, "dcp_transfer", None) is not None
-                and info.kv_layout != self.kv_layout
-            ):
-                raise RuntimeError(
-                    f"PD DCP layout mismatch: prefill={info.kv_layout!r}, "
-                    f"decode={self.kv_layout!r}."
-                )
             if not (self.is_mla_backend or self.is_hybrid_mla_backend):
                 raise RuntimeError(
                     "PD decode DCP requires an MLA or hybrid-MLA KV pool."

@@ -1012,15 +1012,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         ]
 
     def get_pd_dcp_transfer_adapter(self):
-        if (
-            self.index_head_dim is None
-            or self.is_draft_worker
-            or get_disagg().disaggregation_transfer_backend
-            not in ("ascend", "mooncake")
-        ):
+        if self.index_head_dim is None or self.is_draft_worker:
+            return None
+        disagg = get_disagg()
+        if disagg.disaggregation_transfer_backend not in ("ascend", "mooncake"):
             return None
         if self.use_fia_nz and self.dcp_size > 1:
             raise ValueError("NPU DSA token PD requires a row-contiguous KV pool.")
+        if disagg.disaggregation_mode != "prefill":
+            return None
         from sglang.srt.hardware_backend.npu.mooncake_dsa_dcp import (
             build_dsa_token_dcp_transfer,
         )

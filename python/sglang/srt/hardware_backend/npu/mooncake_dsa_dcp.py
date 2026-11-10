@@ -166,7 +166,6 @@ def _send_dsa_token_dcp(
 class _DSATokenDCPTransfer:
     prepare: Callable[..., tuple[list[int], list[_PackBuffer]]]
     send: Callable[..., int]
-    layout_id = b"npu-dsa-token"
 
 
 def build_dsa_token_dcp_transfer(
