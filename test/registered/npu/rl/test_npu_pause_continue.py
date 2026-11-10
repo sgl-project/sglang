@@ -23,7 +23,6 @@ from conftest import (
     pause_generation,
     stream_generate,
     update_weights_from_tensor,
-    warmup_npu,
 )
 
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
@@ -60,7 +59,6 @@ NORM_WEIGHT = "model.norm.weight"
 class TestNpuPauseContinue(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        warmup_npu()
         cls._server = npu_server(MODEL, extra_args=SERVER_ARGS)
         cls.base_url = cls._server.__enter__()
         cls.baseline = generation_signature(cls.base_url, PROMPTS, max_new_tokens=16)

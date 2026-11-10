@@ -20,7 +20,6 @@ from conftest import (
     npu_server,
     release_memory,
     resume_memory,
-    warmup_npu,
 )
 
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
@@ -57,7 +56,6 @@ NO_MEMORY_ARGS = BASE_ARGS
 class TestNpuMemoryOccupation(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        warmup_npu()
         cls.weight_bytes = checkpoint_weight_bytes(MODEL)
         # One memory-saver server for all release/resume cases. Restarting a
         # mempool-backed server repeatedly is what stresses the NPU driver.
@@ -148,7 +146,6 @@ class TestNpuMemoryOccupationFreshServer(CustomTestCase):
 class TestNpuMemoryOccupationWithoutFlag(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        warmup_npu()
         # No --enable-memory-saver: this server is the negative control and
         # cannot share the mempool-backed server above.
         cls._server = npu_server(MODEL, extra_args=NO_MEMORY_ARGS)

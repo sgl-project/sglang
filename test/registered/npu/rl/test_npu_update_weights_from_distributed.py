@@ -22,7 +22,6 @@ from conftest import (
     npu_available,
     npu_device_count,
     npu_server,
-    warmup_npu,
 )
 
 from sglang.srt.managers.io_struct import InitWeightsUpdateGroupReqInput
@@ -65,7 +64,6 @@ NORM_WEIGHT = "model.norm.weight"
 class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        warmup_npu(0)
         with npu_server(MODEL, extra_args=BASE_ARGS) as base_url:
             cls.reference = generation_signature(base_url, PROMPTS)
         cls.manifest = checkpoint_manifest(MODEL)
