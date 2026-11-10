@@ -70,6 +70,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, reduce_moe_output
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.moe_runner import q38_fused_routing
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -161,6 +162,16 @@ _EXTEND_FUSED_FINALIZE_GATE_MAXNREG = int(
 )
 
 
+# SGLANG_QWEN_MOE_SHARED_NO_CLONE (default off): the dual-stream shared expert reads
+# hidden_states itself instead of a defensive clone. The clone guards an in-place routed
+# runner (fused_moe's inplace=True writes the routed output over hidden_states on the side
+# stream while the shared expert reads it). FlashInfer TRT-LLM sets inplace=False; the side
+# stream's router, quant and experts and the shared expert only read hidden_states, and the
+# caller's next write comes after the join. Same input bytes, same kernels: bitwise.
+_SHARED_NO_CLONE = get_bool_env_var("SGLANG_QWEN_MOE_SHARED_NO_CLONE", "false")
+_SHARED_NO_CLONE_LOGGED = [False]
+
+
 def _extend_fused_finalize_gate(num_tokens: int) -> bool:
     """Whether an extend-size MoE finalizes together with the gated shared add.
 
@@ -174,11 +185,39 @@ def _extend_fused_finalize_gate(num_tokens: int) -> bool:
     )
 
 
-def _fused_finalize_max_registers(num_tokens: int) -> int:
+def _q38_fused_routing_quantizes(
+    num_tokens: int, use_fused_gate: bool, has_shared_expert: bool
+) -> bool:
+    """The fused finalize below runs deferred, where the fused decode routing
+    (moe_runner/q38_fused_routing.py) quantizes the routed input itself."""
     return (
-        _EXTEND_FUSED_FINALIZE_GATE_MAXNREG
-        if _extend_fused_finalize_gate(num_tokens)
-        else 0
+        use_fused_gate
+        and has_shared_expert
+        and _FUSED_FINALIZE_GATE
+        and num_tokens <= _FUSED_FINALIZE_GATE_MAX_TOKENS
+        and q38_fused_routing.wants(num_tokens)
+    )
+
+
+def _fused_finalize_max_registers(num_tokens: int) -> int:
+    if not _extend_fused_finalize_gate(num_tokens):
+        return 0
+    _log_extend_finalize_once(num_tokens, "captured")
+    return _EXTEND_FUSED_FINALIZE_GATE_MAXNREG
+
+
+# Paths ("captured", "eager") whose extend-size fused finalize has logged its first use.
+_EXTEND_FINALIZE_LOGGED: set = set()
+
+
+def _log_extend_finalize_once(num_tokens: int, path: str) -> None:
+    if path in _EXTEND_FINALIZE_LOGGED:
+        return
+    _EXTEND_FINALIZE_LOGGED.add(path)
+    logger.info(
+        "MoE extend fused finalize engaged (%s): tokens=%d min_tokens=%d maxnreg=%d",
+        path, num_tokens, _EXTEND_FUSED_FINALIZE_GATE_MIN_TOKENS,
+        _EXTEND_FUSED_FINALIZE_GATE_MAXNREG,
     )
 
 
@@ -937,6 +976,25 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             return self.experts(hidden_states, topk_output)
         return self.experts(hidden_states, topk_output, pre_quant_input=pre_quant_input)
 
+    def _shared_expert_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The dual-stream shared expert's input: hidden_states itself under
+        SGLANG_QWEN_MOE_SHARED_NO_CLONE when the routed runner never writes its
+        input in place (moe_runner_config.inplace is False), else the stock clone."""
+        if (
+            _SHARED_NO_CLONE
+            and isinstance(self.experts, FusedMoE)
+            and not self.experts.moe_runner_config.inplace
+        ):
+            if not _SHARED_NO_CLONE_LOGGED[0]:
+                _SHARED_NO_CLONE_LOGGED[0] = True
+                logger.info(
+                    "Qwen MoE shared expert reads hidden_states without a clone "
+                    "(SGLANG_QWEN_MOE_SHARED_NO_CLONE; routed runner inplace=False, rows=%d)",
+                    hidden_states.shape[0],
+                )
+            return hidden_states
+        return hidden_states.clone()
+
     def _gate_shared_output_out_of_place(
         self,
         hidden_states: torch.Tensor,
@@ -997,7 +1055,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 and not torch.compiler.is_compiling()
                 and not is_in_tc_piecewise_cuda_graph()
             )
-            if nvfp4_glue and _NVFP4_PREQUANT_OVERLAP and not fn_router_prequant:
+            if (
+                nvfp4_glue
+                and _NVFP4_PREQUANT_OVERLAP
+                and not fn_router_prequant
+                and not _q38_fused_routing_quantizes(
+                    hidden_states.shape[0], use_fused_gate, self.shared_expert is not None
+                )
+            ):
                 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                     quantize_nvfp4_routed_input,
                 )
@@ -1021,7 +1086,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             shared_output = (
                 self._forward_shared_experts(
-                    hidden_states.clone(), apply_gate=not use_fused_gate
+                    self._shared_expert_input(hidden_states),
+                    apply_gate=not use_fused_gate,
                 )
                 if self.shared_expert is not None
                 else None
@@ -1134,7 +1200,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 and not torch.compiler.is_compiling()
                 and not is_in_tc_piecewise_cuda_graph()
             )
-            if nvfp4_glue and _NVFP4_PREQUANT_OVERLAP and not fn_router_prequant:
+            if (
+                nvfp4_glue
+                and _NVFP4_PREQUANT_OVERLAP
+                and not fn_router_prequant
+                and not _q38_fused_routing_quantizes(
+                    hidden_states.shape[0], use_fused_gate, self.shared_expert is not None
+                )
+            ):
                 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                     quantize_nvfp4_routed_input,
                 )
@@ -1153,7 +1226,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             shared_output = (
                 self._forward_shared_experts(
-                    hidden_states.clone(), apply_gate=not use_fused_gate
+                    self._shared_expert_input(hidden_states),
+                    apply_gate=not use_fused_gate,
                 )
                 if self.shared_expert is not None
                 else None
@@ -1333,6 +1407,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         fused_finalize=extend_fused,
                     )
                 if extend_fused and not isinstance(final_hidden_states, torch.Tensor):
+                    _log_extend_finalize_once(hidden_states.shape[0], "eager")
                     final_hidden_states = fused_moe_finalize_gate_sigmoid_mul_add(
                         hidden_states,
                         self.shared_expert_gate.weight.squeeze(0),

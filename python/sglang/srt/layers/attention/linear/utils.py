@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_memory
 from sglang.srt.utils.common import rank0_log
 
 if TYPE_CHECKING:
@@ -15,6 +15,27 @@ if TYPE_CHECKING:
 
 def pp_spec_stable_rows_enabled() -> bool:
     return envs.SGLANG_ENABLE_PP_SPEC.get()
+
+
+def gdn_ucache_track_rings_supported() -> bool:
+    # gdn_prefix_materialize reads the state and the rings at one slot id and takes
+    # bf16 k / u rings.
+    return not (
+        envs.SGLANG_ENABLE_GDN_UCACHE_REQUEST_RINGS.get()
+        or envs.SGLANG_ENABLE_GDN_UCACHE_FP16_KEY_RING.get()
+    )
+
+
+# Whether u-cache verify commits write radix decode-time track snapshots; otherwise
+# the u-cache tracks no decode-time state (extend-time track slots only).
+def gdn_ucache_track_snapshots() -> bool:
+    mamba = get_exec().mamba
+    return (
+        mamba.enable_gdn_replayssm_ucache
+        and mamba.enable_mamba_extra_buffer
+        and not get_memory().radix_cache_skip_decode_insert
+        and gdn_ucache_track_rings_supported()
+    )
 
 
 class LinearAttnKernelBackend(Enum):

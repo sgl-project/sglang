@@ -8,7 +8,8 @@ from sglang.kernels.ops.extend_fastpath import GDN_CONV_ENABLED as _Q38C_EXTEND_
 
 import functools
 import logging
-from typing import List, Optional, Union
+import os
+from typing import List, NamedTuple, Optional, Union
 
 import torch
 import triton
@@ -1390,6 +1391,140 @@ else:
 GDN_SPLIT_CONV_LAUNCH = (256, 4, 2, 8, True)
 
 
+class _PrefillConvRetile(NamedTuple):
+    tokens: int
+    threads: int
+    unroll: int
+    min_tokens: int
+
+
+# Measured on VR200 at 1K-16K prefill tokens (work/h557-h558 bench); re-tune when the kernel changes.
+_PREFILL_CONV_RETILE_DEFAULT = _PrefillConvRetile(tokens=32, threads=128, unroll=4, min_tokens=2048)
+
+
+def _parse_prefill_conv_retile(value: str) -> Optional[_PrefillConvRetile]:
+    """SGLANG_GDN_PREFILL_CONV_RETILE: "" / "0" off, "1" the default, or
+    "tokens,threads,unroll[,min_tokens]" for the token-strip kernel."""
+    value = value.strip()
+    if value in ("", "0"):
+        return None
+    if value == "1":
+        return _PREFILL_CONV_RETILE_DEFAULT
+    try:
+        parts = [int(v) for v in value.split(",")]
+    except ValueError:
+        parts = []
+    if len(parts) == 3:
+        parts.append(_PREFILL_CONV_RETILE_DEFAULT.min_tokens)
+    if not (
+        len(parts) == 4
+        and parts[0] in (8, 16, 32, 64, 128, 256)
+        and parts[1] in (64, 128, 256)
+        and parts[2] in (1, 2, 4, 8)
+        and parts[0] % parts[2] == 0
+        and parts[3] >= 1
+    ):
+        raise ValueError(
+            "SGLANG_GDN_PREFILL_CONV_RETILE must be 0, 1 or 'tokens,threads,unroll[,min_tokens]' "
+            f"(tokens 8-256 by powers of 2, threads 64/128/256, unroll 1/2/4/8 dividing tokens), got {value!r}"
+        )
+    return _PrefillConvRetile(*parts)
+
+
+# Prefill split-conv token-strip kernel (H558), read once; off keeps the Triton launch everywhere.
+_PREFILL_CONV_RETILE = _parse_prefill_conv_retile(
+    os.environ.get("SGLANG_GDN_PREFILL_CONV_RETILE", "")
+)
+_prefill_conv_retile_logged: set = set()
+
+
+def _log_prefill_conv_retile_once(key: str, message: str, *args) -> None:
+    if key in _prefill_conv_retile_logged:
+        return
+    _prefill_conv_retile_logged.add(key)
+    logger.info(message, *args)
+
+
+def warmup_prefill_conv_strip() -> None:
+    """Build the SGLANG_GDN_PREFILL_CONV_RETILE kernel before serving; a failed build keeps Triton."""
+    global _PREFILL_CONV_RETILE
+    cfg = _PREFILL_CONV_RETILE
+    if cfg is None:
+        return
+    from sglang.kernels.ops.mamba import gdn_prefill_conv_strip as strip
+
+    try:
+        strip.warmup(cfg.threads, cfg.tokens, cfg.unroll)
+    except Exception as e:
+        logger.warning("SGLANG_GDN_PREFILL_CONV_RETILE unavailable (%s); Triton launch kept", e)
+        _PREFILL_CONV_RETILE = None
+
+
+def _prefill_conv_strip(
+    *,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    conv_states: Optional[torch.Tensor],
+    query_start_loc: torch.Tensor,
+    seq_lens_cpu: Optional[List[int]],
+    q_dim: int,
+    k_dim: int,
+    kwargs: dict,
+) -> Optional[torch.Tensor]:
+    """The strip kernel's flat [q | k | v] output for a rectangular extend conv, or None to keep Triton."""
+    from sglang.kernels.ops.mamba import gdn_prefill_conv_strip as strip
+
+    cfg = _PREFILL_CONV_RETILE
+    total = x.shape[1]
+    if total < cfg.min_tokens:
+        return None
+    if kwargs.get("block_table") is not None:
+        _log_prefill_conv_retile_once(
+            "table", "SGLANG_GDN_PREFILL_CONV_RETILE: Triton launch kept for a block-table launch (%d tokens)", total
+        )
+        return None
+    cache_indices = kwargs.get("cache_indices")
+    has_initial_state = kwargs.get("has_initial_state")
+    activation = kwargs.get("activation", "silu")
+    if (
+        not seq_lens_cpu
+        or activation not in (None, "silu", "swish", True)
+        or query_start_loc.dtype != torch.int32
+        or (cache_indices is not None and cache_indices.dtype != torch.int32)
+        or (has_initial_state is not None and has_initial_state.dtype != torch.bool)
+        or (bias is not None and (bias.dtype != torch.bfloat16 or not bias.is_contiguous()))
+        or not strip.supported(x, weight, conv_states, q_dim, k_dim)
+    ):
+        _log_prefill_conv_retile_once(
+            "skip", "SGLANG_GDN_PREFILL_CONV_RETILE: Triton launch kept for an unsupported call (%d tokens)", total
+        )
+        return None
+    _log_prefill_conv_retile_once(
+        "on",
+        "SGLANG_GDN_PREFILL_CONV_RETILE engaged: token-strip conv tokens=%d threads=%d unroll=%d "
+        "min_tokens=%d, first tokens=%d seqs=%d",
+        cfg.tokens, cfg.threads, cfg.unroll, cfg.min_tokens, total, len(seq_lens_cpu),
+    )
+    return strip.conv_split_qkv(
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        max(seq_lens_cpu),
+        q_dim,
+        k_dim,
+        cache_indices,
+        has_initial_state,
+        activation is not None,
+        kwargs.get("pad_slot_id", PAD_SLOT_ID),
+        cfg.threads,
+        cfg.tokens,
+        cfg.unroll,
+    )
+
+
 def causal_conv1d_fn_split_qkv(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1408,17 +1543,31 @@ def causal_conv1d_fn_split_qkv(
     axis). q and k are adjacent in one allocation, so a [2, T, q_dim] view
     covers both when q_dim == k_dim."""
     dim, total = x.shape
-    out = causal_conv1d_fn(
-        x,
-        weight,
-        bias,
-        conv_states=conv_states,
-        query_start_loc=query_start_loc,
-        seq_lens_cpu=seq_lens_cpu,
-        split_dims=(q_dim, q_dim + k_dim),
-        launch_cfg=launch_cfg if launch_cfg is not None else GDN_SPLIT_CONV_LAUNCH,
-        **kwargs,
-    )
+    out = None
+    if launch_cfg is None and _PREFILL_CONV_RETILE is not None:
+        out = _prefill_conv_strip(
+            x=x,
+            weight=weight,
+            bias=bias,
+            conv_states=conv_states,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=seq_lens_cpu,
+            q_dim=q_dim,
+            k_dim=k_dim,
+            kwargs=kwargs,
+        )
+    if out is None:
+        out = causal_conv1d_fn(
+            x,
+            weight,
+            bias,
+            conv_states=conv_states,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=seq_lens_cpu,
+            split_dims=(q_dim, q_dim + k_dim),
+            launch_cfg=launch_cfg if launch_cfg is not None else GDN_SPLIT_CONV_LAUNCH,
+            **kwargs,
+        )
     qk_end = total * (q_dim + k_dim)
     q = out[: total * q_dim].view(total, q_dim)
     k = out[total * q_dim : qk_end].view(total, k_dim)

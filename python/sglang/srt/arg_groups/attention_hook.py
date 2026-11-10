@@ -33,7 +33,10 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.configs.model_config import uses_kda_attention
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+from sglang.srt.layers.attention.linear.utils import (
+    gdn_ucache_track_rings_supported,
+    pp_spec_stable_rows_enabled,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
@@ -310,6 +313,7 @@ def handle_linear_attn_backend(server_args: Any):
     if cfg.enable_gdn_replayssm_ucache:
         _check_gdn_replayssm_ucache(server_args)
         _pin_gdn_ucache_state_dtype_env(cfg, flag="--enable-gdn-replayssm-ucache")
+    ucache_pd_prefill = _is_gdn_ucache_pd_prefill(cfg)
 
     # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
     decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
@@ -343,6 +347,7 @@ def handle_linear_attn_backend(server_args: Any):
         decode == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
         and not cfg.enable_gdn_replayssm_ucache
+        and not ucache_pd_prefill
         and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
     ):
@@ -376,6 +381,7 @@ def handle_linear_attn_backend(server_args: Any):
         verify == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
         and not cfg.enable_gdn_replayssm_ucache
+        and not ucache_pd_prefill
         and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
     ):
@@ -535,6 +541,10 @@ def handle_linear_attn_backend(server_args: Any):
 # Branch-only Qwen3.8 GDN knobs that would route a target verify through their own
 # conv or in-projection path; read raw at their call sites, so mirrored here.
 _Q38_GDN_VERIFY_KNOBS = ("Q38_GDN_FRONT", "Q38_GDN_INPROJ_CONV", "Q38_GDN_PDL")
+# Admitted under SGLANG_ENABLE_GDN_UCACHE_FRONT: the front (projection views and the verify
+# conv) feeds the u-cache verify the same q / k / v / b / a values; Q38_GDN_PDL only picks the
+# ReplaySSM verify kernel, which the u-cache verify never calls.
+_Q38_GDN_UCACHE_FRONT_KNOBS = ("Q38_GDN_FRONT", "Q38_GDN_PDL")
 
 
 def _check_gdn_replayssm_ucache(server_args: Any) -> None:
@@ -564,7 +574,11 @@ def _pin_gdn_ucache_state_dtype_env(cfg: Any, *, flag: str) -> None:
     # from the tensors, so the other configs leave the variable alone. After
     # _check_gdn_replayssm_ucache_cache, decode inserts imply an extra_buffer
     # strategy, which is when the backend builds the track materializer.
-    if cfg.disable_radix_cache or cfg.radix_cache_skip_decode_insert:
+    if (
+        cfg.disable_radix_cache
+        or cfg.radix_cache_skip_decode_insert
+        or not gdn_ucache_track_rings_supported()
+    ):
         return
     value = os.environ.setdefault("GDN_UCACHE_STATE_DTYPE", "fp16")
     if value.strip().lower() != "fp16":
@@ -617,38 +631,46 @@ def _check_gdn_replayssm_ucache_cache(cfg: Any, *, flag: str) -> None:
     # buffer; every target extend restarts its slot's window.
     # TODO(ameynaik-hub): no_buffer decode inserts need the live slot's window
     # folded before its finish donation.
-    if (
-        not cfg.disable_radix_cache
-        and not cfg.radix_cache_skip_decode_insert
-        and cfg.mamba_radix_cache_strategy not in ("extra_buffer", "extra_buffer_lazy")
-    ):
-        raise ValueError(
-            f"{flag} with the radix cache needs --mamba-radix-cache-strategy "
-            "extra_buffer or extra_buffer_lazy, or --radix-cache-skip-decode-insert; "
-            f"got {cfg.mamba_radix_cache_strategy!r}: a no_buffer finish would "
-            "donate a checkpoint that lags its unfolded window."
-        )
+    if not cfg.disable_radix_cache:
+        decode_inserts = not cfg.radix_cache_skip_decode_insert
+        if decode_inserts and cfg.mamba_radix_cache_strategy not in (
+            "extra_buffer",
+            "extra_buffer_lazy",
+        ):
+            raise ValueError(
+                f"{flag} with the radix cache needs --mamba-radix-cache-strategy "
+                "extra_buffer or extra_buffer_lazy, or --radix-cache-skip-decode-insert; "
+                f"got {cfg.mamba_radix_cache_strategy!r}: a no_buffer finish would "
+                "donate a checkpoint that lags its unfolded window."
+            )
+        if cfg.disaggregation_mode != "null":
+            raise ValueError(
+                f"{flag} supports the radix cache in aggregated serving only; "
+                f"got --disaggregation-mode={cfg.disaggregation_mode!r}."
+            )
+        if cfg.enable_session_radix_cache:
+            raise ValueError(
+                f"{flag} does not support --enable-session-radix-cache."
+            )
     if cfg.enable_int8_mamba_checkpoint:
         raise ValueError(
             f"{flag} does not support --enable-int8-mamba-checkpoint: the "
             "u-cache keeps an fp16 checkpoint pool."
-        )
-    # TODO(ameynaik-hub): validate host offload and load-back of tree states, then
-    # lift this; the rings and cursors are not in the transfer set.
-    if cfg.enable_hierarchical_cache or cfg.enable_lmcache:
-        raise ValueError(
-            f"{flag} does not support --enable-hierarchical-cache or "
-            "--enable-lmcache yet: offload and load-back of u-cache states is "
-            "not validated."
         )
     if cfg.enable_mixed_chunk:
         raise ValueError(
             f"{flag} does not support --enable-mixed-chunk: decode rows of a mixed "
             "batch would read the checkpoint without its unfolded window."
         )
-    if cfg.disaggregation_mode != "null":
+    # A PD decode role holds its slots' rings and cursors from pre-allocation on (the
+    # prefill's state lands in a slot whose window is empty); a PD prefill runs no verify.
+    pd_decode = (
+        cfg.disaggregation_mode == "decode" and envs.SGLANG_ENABLE_GDN_UCACHE_PD.get()
+    )
+    if cfg.disaggregation_mode != "null" and not pd_decode:
         raise ValueError(
-            f"{flag} does not support PD disaggregation; got "
+            f"{flag} does not support PD disaggregation except on a decode role "
+            "with SGLANG_ENABLE_GDN_UCACHE_PD=1; got "
             f"--disaggregation-mode={cfg.disaggregation_mode!r}."
         )
     # TODO(ameynaik-hub): support sessions by folding the window into the
@@ -675,14 +697,45 @@ def _check_gdn_replayssm_ucache_megakernel(cfg: Any, *, flag: str) -> None:
             "reads the GDN pool without the u-cache rings."
         )
     # A late-joined cursor commit from a slot's previous owner can land after
-    # the forward-stream extend reset (reset_gdn_ucache_cursors).
+    # the forward-stream extend reset (reset_gdn_ucache_cursors). The guarded
+    # SGLANG_ENABLE_POST_VERIFY_LATE_JOIN joins before every prefill and orders
+    # slot hand-out after the pending commit, so it stays allowed.
     if envs.SGLANG_PLB_COMMIT_LATE_JOIN.get():
         raise ValueError(f"{flag} cannot run with SGLANG_PLB_COMMIT_LATE_JOIN.")
     if envs.SGLANG_Q38C_MK_GDN.get():
         raise ValueError(f"{flag} cannot run with SGLANG_Q38C_MK_GDN.")
     for name in _Q38_GDN_VERIFY_KNOBS:
-        if os.environ.get(name, "0") == "1":
-            raise ValueError(f"{flag} cannot run with {name}=1.")
+        if os.environ.get(name, "0") != "1":
+            continue
+        if (
+            name in _Q38_GDN_UCACHE_FRONT_KNOBS
+            and envs.SGLANG_ENABLE_GDN_UCACHE_FRONT.get()
+        ):
+            logger.info("SGLANG_ENABLE_GDN_UCACHE_FRONT: %s=1 with %s.", name, flag)
+            continue
+        raise ValueError(f"{flag} cannot run with {name}=1.")
+
+
+def _is_gdn_ucache_pd_prefill(cfg: Any) -> bool:
+    """A PD prefill feeding u-cache decoders: it ships the fp16 GDN state they keep, and
+    runs no decode or verify kernel, so the bf16-state FlashInfer checks do not apply."""
+    if (
+        not envs.SGLANG_ENABLE_GDN_UCACHE_PD.get()
+        or cfg.disaggregation_mode != "prefill"
+    ):
+        return False
+    # The transfer copies state bytes as is; a bf16 prefill would feed fp16 decoders
+    # reinterpreted bits (the PD handshake also checks it, see gdn_ucache_pd_dtype_tag).
+    if cfg.mamba_ssm_dtype != "float16":
+        raise ValueError(
+            "SGLANG_ENABLE_GDN_UCACHE_PD=1 on a PD prefill requires --mamba-ssm-dtype "
+            f"float16, the GDN state of its u-cache decoders; got {cfg.mamba_ssm_dtype!r}."
+        )
+    logger.info(
+        "SGLANG_ENABLE_GDN_UCACHE_PD: PD prefill keeps an fp16 GDN state for "
+        "u-cache decoders."
+    )
+    return True
 
 
 def handle_gdn_replayssm_ucache_spec_shape(server_args: Any) -> None:

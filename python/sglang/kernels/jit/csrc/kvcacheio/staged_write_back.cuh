@@ -2,6 +2,8 @@
 
 #include "hicache.cuh"
 #include "relayout.cuh"
+#include <cstdio>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <limits>
 #include <vector>
@@ -103,7 +105,19 @@ inline bool try_copy_page_first_pages_batch(
   return false;
 #else
   host::RuntimeCheck(src_ptrs.size() == dst_ptrs.size(), "Source and destination tensors must have the same count");
-  constexpr size_t kLargeCopyThresholdBytes = 128 * 1024;
+  // Pages below this many bytes take the per-page fallback loop instead of one
+  // cudaMemcpyBatchAsync. SGLANG_HICACHE_BATCH_COPY_THRESHOLD (bytes, read once at
+  // first use) lowers it, so small page rows (the QSA index pool's 52 KiB pages) are
+  // batched too. Unset keeps the 128 KiB default. Backport of sgl-project/sglang#40910.
+  constexpr size_t kDefaultLargeCopyThresholdBytes = 128 * 1024;
+  static const size_t kLargeCopyThresholdBytes = []() {
+    if (const char* s = std::getenv("SGLANG_HICACHE_BATCH_COPY_THRESHOLD")) {
+      if (*s != '\0') {
+        return static_cast<size_t>(std::strtoull(s, nullptr, 10));
+      }
+    }
+    return kDefaultLargeCopyThresholdBytes;
+  }();
   thread_local std::vector<CudaMemcpyBatchPtr> batch_srcs;
   thread_local std::vector<CudaMemcpyBatchPtr> batch_dsts;
   thread_local std::vector<size_t> batch_sizes;
@@ -179,6 +193,20 @@ inline bool try_copy_page_first_pages_batch(
     return false;
   }
   host::RuntimeCheck(err == cudaSuccess, "cudaMemcpyBatchAsync failed. error=", cudaGetErrorString(err));
+  if (first_page_bytes < kDefaultLargeCopyThresholdBytes) {
+    static bool logged = false;  // once per process: the lowered threshold took effect
+    if (!logged) {
+      logged = true;
+      std::fprintf(
+          stderr,
+          "HiCache staged write-back: %zu pages of %zu B in one cudaMemcpyBatchAsync "
+          "(SGLANG_HICACHE_BATCH_COPY_THRESHOLD=%zu)\n",
+          num_copies,
+          first_page_bytes,
+          kLargeCopyThresholdBytes);
+      std::fflush(stderr);
+    }
+  }
   return true;
 #endif
 }

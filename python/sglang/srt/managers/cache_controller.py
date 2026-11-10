@@ -15,6 +15,7 @@ limitations under the License.
 
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -52,8 +54,106 @@ from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.speculative import post_verify_late_join
 from sglang.srt.utils import get_device_module
+from sglang.srt.utils.common import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str) -> bool:
+    """EnvBool's spelling, read from os.environ: the switch stays out of environ.py."""
+    value = os.environ.get(name, "").strip().lower()
+    if value in ("", "false", "0", "no", "n"):
+        return False
+    if value in ("true", "1", "yes", "y"):
+        return True
+    raise ValueError(f'{name}="{value}" is not a valid boolean value')
+
+
+# Default off: start_loading's index move (HiCache load-back only) stages pageable
+# host indices through pinned memory. Backups, write_back evictions and retraction
+# moves keep the pageable copy: .pin_memory() there cost more than it saved.
+_HICACHE_PINNED_INDEX_H2D = _env_flag("SGLANG_OPT_HICACHE_PINNED_INDEX_H2D")
+_hicache_pinned_index_logged = False
+# Load-back stagings so far, their .pin_memory() seconds and the longest one.
+_hicache_pinned_index_stats = [0, 0.0, 0.0]
+_HICACHE_PINNED_INDEX_REPORT_EVERY = 1024
+
+# Default off: SGLANG_HICACHE_LOAD_BACK_DEVICE_ORDERED. start_loading only enqueues. Its index move
+# takes the pinned staging below (as SGLANG_OPT_HICACHE_PINNED_INDEX_H2D does), and the Mamba
+# side-state rows are read on the load stream (pool_host/slot_state_copy.py), so it never waits for
+# the schedule or load stream, both fenced on the in-flight forward.
+_HICACHE_LOAD_BACK_DEVICE_ORDERED = _env_flag("SGLANG_HICACHE_LOAD_BACK_DEVICE_ORDERED")
+# Host time of start_loading per load-back under that switch: [count, seconds, max seconds] over
+# the current window of _HICACHE_PINNED_INDEX_REPORT_EVERY load-backs, and the process total.
+_load_back_host_stats = [0, 0.0, 0.0, 0]
+
+
+def _note_load_back_host_time(seconds: float, num_tokens: int) -> None:
+    stats = _load_back_host_stats
+    stats[3] += 1
+    if stats[3] == 1:
+        logger.info(
+            "SGLANG_HICACHE_LOAD_BACK_DEVICE_ORDERED: load-back host indices staged through "
+            "pinned memory; start_loading enqueues only (first load-back: %d tokens, %.3f ms host)",
+            num_tokens,
+            seconds * 1e3,
+        )
+    stats[0] += 1
+    stats[1] += seconds
+    stats[2] = max(stats[2], seconds)
+    if stats[0] == _HICACHE_PINNED_INDEX_REPORT_EVERY:
+        logger.info(
+            "SGLANG_HICACHE_LOAD_BACK_DEVICE_ORDERED: %d load-backs, start_loading host "
+            "%.3f ms mean, %.3f ms max over the last %d",
+            stats[3],
+            stats[1] * 1e3 / stats[0],
+            stats[2] * 1e3,
+            stats[0],
+        )
+        stats[0], stats[1], stats[2] = 0, 0.0, 0.0
+
+
+def _stage_pinned(host_indices: torch.Tensor, device) -> bool:
+    """Whether ``host_indices`` is pageable host memory that pinned memory can
+    stage for ``device``; the first staging logs once per process."""
+    global _hicache_pinned_index_logged
+    if host_indices.device.type != "cpu" or host_indices.is_pinned():
+        return False
+    if not is_pin_memory_available(device):
+        return False
+    if not _hicache_pinned_index_logged:
+        _hicache_pinned_index_logged = True
+        logger.info(
+            "SGLANG_OPT_HICACHE_PINNED_INDEX_H2D: HiCache load-back host indices staged "
+            "through pinned memory before the H2D copy; backups and evictions keep the "
+            "pageable copy (first: %d indices, %d bytes)",
+            host_indices.numel(),
+            host_indices.numel() * host_indices.element_size(),
+        )
+    return True
+
+
+def _pin_load_indices(host_indices: torch.Tensor) -> torch.Tensor:
+    """``host_indices.pin_memory()``, timed; reports the host cost every
+    _HICACHE_PINNED_INDEX_REPORT_EVERY stagings."""
+    start = time.perf_counter()
+    pinned = host_indices.pin_memory()
+    elapsed = time.perf_counter() - start
+    stats = _hicache_pinned_index_stats
+    stats[0] += 1
+    stats[1] += elapsed
+    stats[2] = max(stats[2], elapsed)
+    if stats[0] % _HICACHE_PINNED_INDEX_REPORT_EVERY == 0:
+        logger.info(
+            "SGLANG_OPT_HICACHE_PINNED_INDEX_H2D: %d load-back stagings, "
+            "pin_memory %.1f ms total, %.3f ms mean, %.3f ms max",
+            stats[0],
+            stats[1] * 1e3,
+            stats[1] * 1e3 / stats[0],
+            stats[2] * 1e3,
+        )
+    return pinned
+
 
 device_module = get_device_module()
 
@@ -69,11 +169,17 @@ def storage_model_name(
     return f"{model_name}-{tag}" if model_name else tag
 
 
+_state_first_wait_logged = False
+
+
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
         self.load_events = [device_module.Event() for _ in range(num_layers)]
         self.start_event = device_module.Event()  # start event on controller stream
+        # Recorded by a state-first load once every state layer is issued.
+        self.state_event = device_module.Event()
+        self.state_recorded = False
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
@@ -81,6 +187,17 @@ class LayerLoadingEvent:
 
     def wait(self, layer_index: int):
         device_module.current_stream().wait_event(self.load_events[layer_index])
+
+    def complete_state(self):
+        self.state_event.record()
+        self.state_recorded = True
+
+    def wait_state(self) -> bool:
+        """Wait for the state part alone; False when this load did not record it."""
+        if not self.state_recorded:
+            return False
+        device_module.current_stream().wait_event(self.state_event)
+        return True
 
     @property
     def finish_event(self):
@@ -110,6 +227,19 @@ class LayerDoneCounter:
         if self.consumer_index < 0:
             return
         self.events[self.consumer_index].wait(threshold)
+
+    def wait_for_state(self) -> bool:
+        """Wait for the consumed load's state part; False when it was not loaded state-first."""
+        global _state_first_wait_logged
+        if self.consumer_index < 0:
+            return False
+        waited = self.events[self.consumer_index].wait_state()
+        if waited and not _state_first_wait_logged:
+            _state_first_wait_logged = True
+            logger.info(
+                "HiCache load-back: a state copy-on-write waited on the state part alone"
+            )
+        return waited
 
     def reset(self):
         self.producer_index = -1
@@ -300,6 +430,12 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
+    # True only inside start_loading's index move under SGLANG_OPT_HICACHE_PINNED_INDEX_H2D or
+    # SGLANG_HICACHE_LOAD_BACK_DEVICE_ORDERED.
+    _pinned_index_load: bool = False
+    # Set from SGLANG_ENABLE_HICACHE_STATE_FIRST_LOAD in __init__.
+    state_first_load: bool = False
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -365,6 +501,10 @@ class HiCacheController:
         self.transfer_layer_id_max = self.mem_pool_device.layer_num
         self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
+        # Load the request-state pool's layers first so a state copy-on-write waits on them alone.
+        self.state_first_load = envs.SGLANG_ENABLE_HICACHE_STATE_FIRST_LOAD.get()
+        if self.state_first_load:
+            logger.info("HiCache load-back: state layers load first")
 
         if write_policy not in [
             "write_through",
@@ -1049,6 +1189,11 @@ class HiCacheController:
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
+                if self._pinned_index_load and _stage_pinned(host_indices, self.device):
+                    # Load-back only: a pageable copy blocks the host until this
+                    # stream, fenced on the in-flight forward, drains; a pinned one
+                    # is only enqueued.
+                    host_indices = _pin_load_indices(host_indices)
                 host_indices = host_indices.to(self.device, non_blocking=True)
             return host_indices, device_indices
         elif self.io_backend == "direct":
@@ -1102,6 +1247,17 @@ class HiCacheController:
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
         return (*self.move_indices(op.host_indices, op.device_indices), None)
 
+    def _move_load_op_indices(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
+        """start_loading's index move under SGLANG_OPT_HICACHE_PINNED_INDEX_H2D: the only
+        move that stages host indices through pinned memory."""
+        self._pinned_index_load = True
+        try:
+            return self._move_op_indices(op)
+        finally:
+            self._pinned_index_load = False
+
     def _l2_transfers(
         self,
         host_indices: torch.Tensor,
@@ -1130,12 +1286,21 @@ class HiCacheController:
         if len(self.load_queue) == 0:
             return -1
 
+        timed_start = (
+            time.perf_counter() if _HICACHE_LOAD_BACK_DEVICE_ORDERED else None
+        )
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+        # The switch off keeps the stock call (and test doubles that only stub it).
+        host_indices, device_indices, pool_transfers = (
+            self._move_load_op_indices
+            if _HICACHE_PINNED_INDEX_H2D or _HICACHE_LOAD_BACK_DEVICE_ORDERED
+            else self._move_op_indices
+        )(op)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
+        producer_event.state_recorded = False
 
         if self.load_fence_stream is not None:
             # in overlap scheduling, reclaimed pages might still be written by the forward thread
@@ -1158,6 +1323,9 @@ class HiCacheController:
             self._l2_load_transfers(host_indices, device_indices, pool_transfers),
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
+            on_state_done=(
+                producer_event.complete_state if self.state_first_load else None
+            ),
             transfer_layer_id_max=self.transfer_layer_id_max,
         )
 
@@ -1176,6 +1344,10 @@ class HiCacheController:
                 num_bytes=self._transfer_num_bytes(op),
             )
         )
+        if timed_start is not None:
+            _note_load_back_host_time(
+                time.perf_counter() - timed_start, len(op.device_indices)
+            )
         return producer_id
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:

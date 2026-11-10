@@ -467,8 +467,18 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self.enable_kv_cache_events = params.enable_kv_cache_events
         has_mamba = TREE_STATE in families
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            host_only_mamba_checkpoint,
+        )
+
         mamba_max_states_per_path = (
             get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
+        )
+        # The host-only binding fields exist only in a TreeCore built with
+        # sglang#44718; with the switch off they stay unset, so an older core loads.
+        self._mamba_host_only = has_mamba and host_only_mamba_checkpoint()
+        host_only_init = (
+            {"mamba_host_only_checkpoint": True} if self._mamba_host_only else {}
         )
 
         self._binding = self._binding_class()(
@@ -498,6 +508,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                     if mamba_max_states_per_path >= 0
                     else None
                 ),
+                **host_only_init,
             ),
             # Each slot's id and family: the native core picks a slot's driver
             # by its family.
@@ -701,6 +712,29 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         return self._fill_evict_result(binding_result, result)
 
+    def mark_write_back_queued(
+        self, node_id: NodeId, copied: Sequence[NodeId] = ()
+    ) -> int:
+        return self._binding.mark_write_back_queued(node_id, list(copied))
+
+    # ---- Cache-residency switches (Rust TreeCore only) ----
+
+    def configure_cache_residency(
+        self, *, keep_backed_mamba_states: bool, host_evict_first: bool
+    ) -> None:
+        self._binding.configure_cache_residency(
+            keep_backed_mamba_states, host_evict_first
+        )
+
+    def cache_residency_stats(self) -> dict[str, int]:
+        return self._binding.cache_residency_stats()
+
+    def needs_state_backup_before_demote(self, node_id: NodeId) -> bool:
+        return self._binding.needs_state_backup_before_demote(node_id)
+
+    def mark_host_evict_first(self, node_ids: Sequence[NodeId]) -> int:
+        return self._binding.mark_host_evict_first(list(node_ids))
+
     def demote(self, node_id: NodeId) -> DemoteResult:
         binding_result = self._binding.demote(node_id)
         return self._fill_evict_result(binding_result, DemoteResult())
@@ -826,6 +860,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             # The binding always receives a value tensor; fall back to the
             # token ids materialized on the core's device.
             value = torch.tensor(key_buffer, dtype=torch.int64, device=self.device)
+        host_only_insert = (
+            {
+                "mamba_host_value": params.mamba_host_value,
+                "allow_missing_mamba": params.allow_missing_mamba,
+            }
+            if self._mamba_host_only
+            else {}
+        )
         step = self._binding.begin_insert(
             self._bindings.InsertParamsBinding(
                 key=key_buffer,
@@ -841,6 +883,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 priority=0 if params.priority is None else params.priority,
                 track_adopted_ranges=params.track_adopted_ranges,
                 rotation_base=params.rotation_base,
+                **host_only_insert,
             )
         )
         return self._insert_step_from_binding(step)

@@ -43,6 +43,14 @@ from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (  # noqa: E
     commit_gdn_ucache_cursors,
     reset_gdn_ucache_cursors,
 )
+from sglang.srt.runtime_context import get_context  # noqa: E402
+from sglang.srt.server_args import ServerArgs  # noqa: E402
+
+
+def setUpModule():
+    # GdnUcacheVerifier reads the exec config when it starts; publish a minimal one.
+    get_context().set_server_args(ServerArgs(model_path="dummy"))
+
 
 K = V = 128
 T = 4
@@ -68,6 +76,7 @@ class _Model:
             head_v_dim=V,
             max_num_draft_tokens=T,
             device="cuda",
+            track_snapshots=True,
         )
         # Poisoned rings: a record read outside the live window turns into NaN.
         for ring in (self.buffers.k_ring, self.buffers.u_ring, self.buffers.g_ring):

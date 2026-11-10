@@ -141,6 +141,8 @@ _enable_bf16_splitk_gemm = False
 _nitin_router_on = False
 # SGLANG_ENABLE_SM107_BF16_SMALLM_ROUTES: sm107_bf16_smallm serves its keys, bitwise to this dispatch.
 _sm107_smallm_on = False
+# SGLANG_BF16_GEMM_PIN_FILE: bf16_gemm_pins serves its (M, N, K) keys, each checked bitwise to this dispatch.
+_bf16_gemm_pins_on = bool(envs.SGLANG_BF16_GEMM_PIN_FILE.get())
 
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
 # Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
@@ -296,7 +298,7 @@ def precompile_splitk_tactics() -> bool:
         # Checked against this dispatch with the routes off; a mismatch keeps them off.
         _sm107_smallm_on = False
         _sm107_smallm_on = sm107_bf16_smallm.precompile(
-            stock_gemm=lambda x, w: _bf16_gemm_dispatch_impl(x, w, None)
+            stock_gemm=lambda x, w: _bf16_gemm_dispatch_unpinned(x, w, None)
         )
     device = torch.cuda.current_device()
     for m, n, k in {**_BF16_SPLITK_TUNED_TACTICS, **_BF16_WARP_SPLITK_TUNED_TACTICS}:
@@ -372,7 +374,8 @@ def initialize_bf16_gemm_config() -> None:
             prefer_direct_bf16_gemm_sm100,
             run_direct_dense,
         )
-        from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
+        # FlashInfer 0.7.2's cluster split-K with FlashInfer #7443's hand-off fix (vendored; same tactics and bits).
+        from sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk import (
             SplitKTactic,
             run_splitk_dense,
         )
@@ -389,6 +392,10 @@ def initialize_bf16_gemm_config() -> None:
         _warp_splitk_tactic = WarpSplitKTactic
         _run_warp_splitk_dense = run_warp_splitk_dense
         _enable_bf16_splitk_gemm = True
+        logger.info(
+            "BF16 cluster split-K GEMM: FlashInfer 0.7.2 kernel with the #7443 TMEM/DSMEM hand-off fix (%s)",
+            run_splitk_dense.__code__.co_filename,
+        )
 
     global _nitin_router_on
     _nitin_router_on = False
@@ -462,6 +469,21 @@ def _bf16_gemm_dispatch_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
+    addend: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if _bf16_gemm_pins_on and bias is None and addend is None:
+        from sglang.srt.layers import bf16_gemm_pins
+
+        output = bf16_gemm_pins.gemm(x, weight, _bf16_gemm_dispatch_unpinned)
+        if output is not None:
+            return output
+    return _bf16_gemm_dispatch_unpinned(x, weight, bias, addend)
+
+
+def _bf16_gemm_dispatch_unpinned(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
     addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     m = x.numel() // x.shape[-1]

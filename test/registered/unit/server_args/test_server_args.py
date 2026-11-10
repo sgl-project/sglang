@@ -24,8 +24,8 @@ from sglang.srt.arg_groups.attention_hook import (
     _check_gdn_replayssm_ucache_cache,
     _pin_gdn_ucache_state_dtype_env,
     handle_attention_backend_compatibility,
-    handle_gdn_replayssm_ucache_spec_shape,
     handle_deterministic_inference,
+    handle_gdn_replayssm_ucache_spec_shape,
 )
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
@@ -1191,13 +1191,12 @@ class TestGdnReplaySsmUcacheRadixGuard(unittest.TestCase):
                 self._pin(**kwargs)
                 self.assertEqual(os.environ["GDN_UCACHE_STATE_DTYPE"], "bf16")
 
-    def test_host_cache_offload_is_rejected(self):
+    def test_host_cache_offload_is_accepted(self):
         for kwargs in (
             dict(enable_hierarchical_cache=True),
             dict(enable_lmcache=True),
         ):
-            with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
-                self._check(mamba_radix_cache_strategy="extra_buffer_lazy", **kwargs)
+            self._check(mamba_radix_cache_strategy="extra_buffer_lazy", **kwargs)
 
     def _check_adaptive_shape(self, candidate_steps):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:

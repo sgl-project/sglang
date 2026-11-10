@@ -32,9 +32,15 @@ exactly what trtllm sees in the zero-filled packed rows.
 
 from __future__ import annotations
 
+import logging
+import os
+
+import numpy as np
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 LOG2E = 1.4426950408889634
 
@@ -52,6 +58,110 @@ def _qsa_write_new_kv(K, V, NK, NV, LOC, NK_STRIDE, NV_STRIDE, H: tl.constexpr, 
     v = tl.load(NV + row.to(tl.int64) * NV_STRIDE + head * D + d).to(V.dtype.element_ty)
     tl.store(K + slot * H * D + head * D + d, k, mask=slot != 0)
     tl.store(V + slot * H * D + head * D + d, v, mask=slot != 0)
+
+
+# SGLANG_QSA_FUSED_FP8_KV_WRITE (default off, read once): a target verify's BF16 k/v_new reach
+# the FP8 (E4M3) pool through one kernel per layer (_qsa_write_new_kv_e4m3) instead of two torch
+# casts and the _qsa_write_new_kv copy. The backend defers the cast (qwen_sparse_attn_backend
+# _fused_kv_prefix) only after write_new_kv_e4m3_ok() found the kernel's cast equal to torch's
+# .to(torch.float8_e4m3fn) on every BF16 bit pattern on this device.
+FUSED_FP8_KV_WRITE_ENV = "SGLANG_QSA_FUSED_FP8_KV_WRITE"
+FUSED_FP8_KV_WRITE = os.environ.get(FUSED_FP8_KV_WRITE_ENV, "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+
+@triton.jit
+def _qsa_write_new_kv_e4m3(K, V, NK, NV, LOC, NK_STRIDE, NV_STRIDE, H: tl.constexpr, D: tl.constexpr, USE_PDL: tl.constexpr):
+    # _qsa_write_new_kv with BF16 k/v_new, cast in the write: BF16 -> FP32 is exact, then one
+    # round-to-nearest-even, satfinite conversion to E4M3 (the pool's dtype).
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    d = tl.arange(0, D)
+    slot = tl.load(LOC + row).to(tl.int64)
+    k = tl.load(NK + row.to(tl.int64) * NK_STRIDE + head * D + d).to(tl.float32).to(K.dtype.element_ty)
+    v = tl.load(NV + row.to(tl.int64) * NV_STRIDE + head * D + d).to(tl.float32).to(V.dtype.element_ty)
+    tl.store(K + slot * H * D + head * D + d, k, mask=slot != 0)
+    tl.store(V + slot * H * D + head * D + d, v, mask=slot != 0)
+
+
+_E4M3_CHECKED = {}
+_e4m3_noted = set()
+
+
+def _note_e4m3(key, level, fmt, *args):
+    if key not in _e4m3_noted:
+        _e4m3_noted.add(key)
+        logger.log(level, fmt, *args)
+
+
+def write_new_kv_e4m3_ok(k_cache, v_cache) -> bool:
+    """Whether the cast write may serve this FP8 pool: once per (device, heads, dim), outside
+    stream capture, every BF16 bit pattern goes through _qsa_write_new_kv_e4m3 at the pool's
+    head layout and is compared byte for byte with torch's .to(torch.float8_e4m3fn). Not yet
+    checked under capture: False (the caller keeps the stock casts) and no cache entry."""
+    if not (
+        k_cache.is_cuda
+        and k_cache.dtype == v_cache.dtype == torch.float8_e4m3fn
+        and k_cache.dim() == 3
+        and k_cache.shape[1:] == v_cache.shape[1:]
+    ):
+        return False
+    heads, dim = int(k_cache.shape[1]), int(k_cache.shape[2])
+    key = (k_cache.device.index, heads, dim)
+    if key in _E4M3_CHECKED:
+        return _E4M3_CHECKED[key]
+    if torch.cuda.is_current_stream_capturing():
+        _note_e4m3(("pending",) + key, logging.WARNING,
+                   "%s: cast check pending under stream capture (heads=%d dim=%d); stock casts kept for this call",
+                   FUSED_FP8_KV_WRITE_ENV, heads, dim)
+        return False
+    if dim & (dim - 1) or dim > 4096:
+        _E4M3_CHECKED[key] = False
+        return False
+    dev = k_cache.device
+    width = heads * dim
+    rows = triton.cdiv(1 << 16, width)
+    bits = np.zeros(rows * width, dtype=np.uint16)
+    bits[: 1 << 16] = np.arange(1 << 16, dtype=np.uint32).astype(np.uint16)
+    nk = torch.from_numpy(bits.view(np.int16)).to(dev).view(torch.bfloat16).view(rows, width)
+    nv = nk.flip(0).contiguous()
+    loc = torch.arange(1, rows + 1, dtype=torch.int64, device=dev)
+    kc = torch.zeros(rows + 1, heads, dim, dtype=torch.float8_e4m3fn, device=dev)
+    vc = torch.zeros_like(kc)
+    _qsa_write_new_kv_e4m3[(rows, heads)](
+        kc, vc, nk, nv, loc, nk.stride(0), nv.stride(0), heads, dim, False, num_warps=1
+    )
+    ok = bool(
+        torch.equal(kc[1:].reshape(rows, width).view(torch.uint8), nk.to(torch.float8_e4m3fn).view(torch.uint8))
+        and torch.equal(vc[1:].reshape(rows, width).view(torch.uint8), nv.to(torch.float8_e4m3fn).view(torch.uint8))
+        and not kc[0].view(torch.uint8).any().item()
+    )
+    _E4M3_CHECKED[key] = ok
+    if ok:
+        logger.info("%s: on: the pool write casts BF16 k/v_new to float8_e4m3fn (heads=%d dim=%d; "
+                    "all 65536 BF16 patterns equal torch's cast on %s)", FUSED_FP8_KV_WRITE_ENV, heads, dim, dev)
+    else:
+        logger.warning("%s: off: the kernel's E4M3 cast differs from torch's on %s (heads=%d dim=%d); "
+                       "stock casts kept", FUSED_FP8_KV_WRITE_ENV, dev, heads, dim)
+    return ok
+
+
+def write_new_kv_e4m3(k_cache, v_cache, nk, nv, loc, rows, kv_heads, dim, pdl, pdl_kw):
+    """The cast write for [rows, kv_heads * dim] BF16 nk/nv (unit last stride) into the FP8 pool."""
+    assert nk.dtype == nv.dtype == torch.bfloat16 and nk.stride(-1) == 1 and nv.stride(-1) == 1
+    assert k_cache.dtype == v_cache.dtype == torch.float8_e4m3fn
+    _note_e4m3(("rows", rows), logging.INFO, "%s engaged rows=%d heads=%d dim=%d",
+               FUSED_FP8_KV_WRITE_ENV, rows, kv_heads, dim)
+    _qsa_write_new_kv_e4m3[(rows, kv_heads)](
+        k_cache, v_cache, nk, nv, loc, nk.stride(0), nv.stride(0), kv_heads, dim, pdl, num_warps=1, **pdl_kw
+    )
 
 
 @triton.jit
@@ -246,6 +356,10 @@ def _qsa_pool_merge(
     SPLITS: tl.constexpr,
     SB: tl.constexpr,
     USE_PDL: tl.constexpr,
+    GATE=None,
+    GATE_STRIDE_ROW=0,
+    GATE_STRIDE_HEAD=0,
+    HAS_GATE: tl.constexpr = False,
 ):
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -283,7 +397,16 @@ def _qsa_pool_merge(
         acc += tl.sum(a * w[:, None], 0)
     Ls = tl.sum(L, 0)
     out = tl.where(Ls > 0, acc / Ls, 0.0)
-    tl.store(O + row.to(tl.int64) * O_STRIDE + qh * D + d, out.to(O.dtype.element_ty))
+    if HAS_GATE:
+        # fused_sigmoid_mul's arithmetic on the stored value: bf16 output, fp32 sigmoid gate.
+        attn = out.to(O.dtype.element_ty).to(tl.float32)
+        g = tl.load(
+            GATE + row.to(tl.int64) * GATE_STRIDE_ROW + qh * GATE_STRIDE_HEAD + d
+        ).to(tl.float32)
+        result = attn * tl.sigmoid(g)
+        tl.store(O + row.to(tl.int64) * O_STRIDE + qh * D + d, result.to(O.dtype.element_ty))
+    else:
+        tl.store(O + row.to(tl.int64) * O_STRIDE + qh * D + d, out.to(O.dtype.element_ty))
 
 
 _SMS = {}
@@ -352,6 +475,7 @@ def qsa_pool_sparse_decode(
     workspace=None,
     pdl=True,
     write_new_kv=True,
+    gate=None,
 ):
     """q [rows, QH, 256] bf16 (or [rows, QH*256]); k/v_cache [slots, H, 256];
     k/v_new [rows, H, 256] (row stride arbitrary, inner contiguous); loc [rows] int32;
@@ -437,7 +561,17 @@ def qsa_pool_sparse_decode(
     )
     if not fused_merge:
         sb = min(16, triton.next_power_of_2(splits))
+        gate_kw = {}
+        if gate is not None:
+            # [rows, q_heads, dim] view (any row/head stride), as fused_sigmoid_mul reads it.
+            gate_kw = dict(
+                GATE=gate,
+                GATE_STRIDE_ROW=gate.stride(0),
+                GATE_STRIDE_HEAD=gate.stride(1),
+                HAS_GATE=True,
+            )
         _qsa_pool_merge[(rows * qh,)](
-            m_buf, l_buf, acc_buf, out, out.stride(0), kv_heads, dim, gq, gp, splits, sb, pdl, num_warps=2, **pdl_kw
+            m_buf, l_buf, acc_buf, out, out.stride(0), kv_heads, dim, gq, gp, splits, sb, pdl,
+            num_warps=2, **gate_kw, **pdl_kw
         )
     return out

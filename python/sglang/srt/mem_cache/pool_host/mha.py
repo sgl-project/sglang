@@ -9,6 +9,7 @@ import torch
 from sglang.kernels.ops.kvcache.hicache import (
     can_use_hicache_jit_kernel,
     can_use_write_back_jit_kernel,
+    hicache_block_quota_from_env,
 )
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
@@ -34,6 +35,10 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_page_unified_lf as jit_transfer_hicache_one_layer_page_unified_lf,
 )
+from sglang.kernels.ops.kvcache.hicache import (
+    use_hicache_tma_kernel,
+)
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.device_pool_info import (
     KVScaleLayout,
     MHABufferInfo,
@@ -139,6 +144,9 @@ def prepare_mha_write_back_staging(
 
 
 class MHATokenToKVPoolHost(HostKVCache):
+    # CTA quota of the per-layer JIT load (None: the stock quota); set with the transfer views.
+    load_block_quota: int | None = None
+
     def __init__(
         self,
         buffer_info: MHABufferInfo,
@@ -259,6 +267,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             page_size=self.page_size,
             element_size=self.element_dim * self.dtype.itemsize,
         )
+        self.load_block_quota = self._resolve_load_block_quota()
 
         if self.layout == "page_unified":
             # No per-component per-layer view exists: a layer's K and V are
@@ -296,6 +305,33 @@ class MHATokenToKVPoolHost(HostKVCache):
         )
         self.host_kv_data_refs = self.k_data_refs + self.v_data_refs
         self._init_write_back_staging_buffers(buffer_info, write_back_staging)
+
+    def _resolve_load_block_quota(self) -> int | None:
+        quota = hicache_block_quota_from_env(envs.SGLANG_HICACHE_LOAD_BLOCK_QUOTA)
+        if quota is None or not _is_cuda or not self.can_use_jit:
+            return None
+        if self.layout not in ("layer_first", "page_first"):
+            return None
+        element_size = self.element_dim * self.dtype.itemsize
+        # Builds the quota's load module here rather than at the first host hit.
+        if not can_use_hicache_jit_kernel(
+            page_size=self.page_size, element_size=element_size, block_quota=quota
+        ):
+            logger.warning(
+                "HiCache KV load: no JIT kernel at quota %d; keeping the stock quota",
+                quota,
+            )
+            return None
+        tma = use_hicache_tma_kernel(
+            element_size=element_size, block_quota=quota, page_size=self.page_size
+        )
+        logger.info(
+            "HiCache KV load: %s kernel quota=%d row_bytes=%d (backups keep the stock quota)",
+            "TMA" if tma else "register",
+            quota,
+            element_size,
+        )
+        return quota
 
     def get_size_per_token(self):
         return (
@@ -466,6 +502,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.element_dim,
+                        block_quota=self.load_block_quota,
                     )
                 else:
                     self._require_packed_device_rows("transfer_kv_per_layer")
@@ -492,6 +529,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.element_dim,
+                        block_quota=self.load_block_quota,
                     )
                 else:
                     self._require_packed_device_rows("transfer_kv_per_layer_pf_lf")

@@ -40,6 +40,14 @@ from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (  # noqa: E
     commit_gdn_ucache_cursors,
     reset_gdn_ucache_cursors,
 )
+from sglang.srt.runtime_context import get_context  # noqa: E402
+from sglang.srt.server_args import ServerArgs  # noqa: E402
+
+
+def setUpModule():
+    # GdnUcacheVerifier reads the exec config when it starts; publish a minimal one.
+    get_context().set_server_args(ServerArgs(model_path="dummy"))
+
 
 H, HV, K, V = 4, 12, 128, 128
 NUM_DRAFT_TOKENS = 4

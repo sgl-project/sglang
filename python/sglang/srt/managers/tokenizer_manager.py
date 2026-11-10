@@ -1607,6 +1607,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_id=obj.session_id,
+                parent_session_id=obj.parent_session_id,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,

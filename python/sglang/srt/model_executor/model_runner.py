@@ -2000,7 +2000,15 @@ class ModelRunner:
                     state_ids.ids(forward_batch.mamba_cow_dst_indices),
                 )
         gdn_ucache = self.token_to_kv_pool_allocator.state.pool.gdn_ucache
-        if gdn_ucache is not None:
+        if gdn_ucache is not None and gdn_ucache.by_request_row:
+            from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+                reset_gdn_ucache_request_rows,
+            )
+
+            reset_gdn_ucache_request_rows(
+                buffers=gdn_ucache, request_rows=forward_batch.req_pool_indices
+            )
+        elif gdn_ucache is not None:
             from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
                 reset_gdn_ucache_cursors,
             )

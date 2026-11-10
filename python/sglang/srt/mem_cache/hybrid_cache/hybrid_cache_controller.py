@@ -36,9 +36,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
     count_pool_hits,
 )
+from sglang.srt.mem_cache import write_back_order as _write_back_order
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host import slot_state_copy as _slot_state_copy
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
@@ -205,6 +208,8 @@ class PrefetchSubmission:
 
 class HybridCacheController(BaseHiCacheController):
     is_kv_sharded: bool = False
+    # Set only inside _move_write_operation (SGLANG_HICACHE_WRITE_BACK_DEVICE_ORDERED).
+    _pin_write_indices: bool = False
 
     def __init__(
         self,
@@ -273,6 +278,25 @@ class HybridCacheController(BaseHiCacheController):
                 storage_backend_extra_config=storage_backend_extra_config,
                 host_pools=getattr(mem_pool_host, "entries", None),
             )
+        if _slot_state_copy.LOAD_ENABLED:
+            self._bind_slot_state_load_on_stream()
+
+    def _bind_slot_state_load_on_stream(self) -> None:
+        """SGLANG_HICACHE_LOAD_BACK_DEVICE_ORDERED: the Mamba side-state rows ride on the pool's first
+        layer call, so they may load on stream only when that is transfer layer 0, queued before
+        every completion event a reader of a restored slot waits on."""
+        entry = self.mem_pool_host.entry_map.get(PoolName.MAMBA)
+        if entry is None or not isinstance(entry.host_pool, MambaPoolHost):
+            return
+        if not entry.host_pool.slot_state_device_tensors:
+            return
+        if entry.layer_mapper(0) != 0:
+            logger.warning(
+                "Mamba slot-state load-back: kept the blocking copy "
+                "(SGLANG_HICACHE_LOAD_BACK_DEVICE_ORDERED: the first Mamba layer is not transfer layer 0)"
+            )
+            return
+        entry.host_pool.slot_state_load_on_stream = True
 
     def _start_storage_threads(self):
         super()._start_storage_threads()
@@ -850,6 +874,17 @@ class HybridCacheController(BaseHiCacheController):
     def _move_write_operation(
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
+        # SGLANG_HICACHE_WRITE_BACK_DEVICE_ORDERED: no host wait follows the copy, so a pageable
+        # index copy here, which waits for this stream fenced on the forward, would be the stall.
+        self._pin_write_indices = _write_back_order.ENABLED
+        try:
+            return self._move_write_indices(op)
+        finally:
+            self._pin_write_indices = False
+
+    def _move_write_indices(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
         host_group = self.mem_pool_host
         if self.is_kv_sharded:
             return self.move_hybrid_indices(op, write_back_jit=True)
@@ -904,6 +939,7 @@ class HybridCacheController(BaseHiCacheController):
                     device_indices=pool_transfer.device_indices,
                     layer_mapper=entry.layer_mapper,
                     device_translate=entry.device_translate,
+                    restores_state=pool_transfer.name == PoolName.MAMBA,
                 )
             )
         return transfers
@@ -951,6 +987,7 @@ class HybridCacheController(BaseHiCacheController):
                         device_indices=target_transfer.device_indices,
                         layer_mapper=draft_layer_mapper,
                         is_draft=True,
+                        restores_state=target_transfer.restores_state,
                     )
                 )
         return transfers
@@ -1529,6 +1566,8 @@ class HybridCacheController(BaseHiCacheController):
             if host_indices.is_cuda:
                 host_indices = host_indices.cpu()
             return host_indices, device_indices
+        if self._pin_write_indices:
+            host_indices = _write_back_order.pin_indices(host_indices)
         return self.move_indices(host_indices, device_indices)
 
     def move_hybrid_indices(

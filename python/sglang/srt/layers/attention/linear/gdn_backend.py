@@ -7,6 +7,9 @@ from typing import Optional, Tuple, Union
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.linear.fused_gdn_gating import (
+    ALPHA_FUSED as _GDN_ALPHA_FUSED,
+)
 from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     CAUSAL_CONV1D_FWD_BLOCK_M,
@@ -18,6 +21,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     GDN_SPLIT_CONV_LAUNCH,
     causal_conv1d_fn_split_qkv,
+    warmup_prefill_conv_strip,
 )
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
@@ -25,6 +29,10 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 from sglang.kernels.ops.mamba.gdn_prefill_track import (
     gdn_track_conv_window,
     gdn_track_ssm_state,
+)
+from sglang.kernels.ops.mamba.gdn_prefill_state_glue import (
+    gdn_track_conv_snapshot,
+    gdn_track_state_rows,
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
@@ -46,6 +54,7 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    gdn_ucache_track_snapshots,
     pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
@@ -76,6 +85,16 @@ _GDN_FUSED_VERIFY_GLUE = (
     is_cuda()
     and not is_hip()
     and get_bool_env_var("SGLANG_GDN_FUSED_VERIFY_GLUE", "false")
+)
+# Largest verify batch (requests) the glue serves; the default envelope is 2-4.
+# The kernel's grid is one program per (request, value head), so B only sets the grid.
+_GDN_FUSED_VERIFY_GLUE_DEFAULT_MAX_BS = 4
+_GDN_FUSED_VERIFY_GLUE_MAX_BS = envs.SGLANG_GDN_FUSED_VERIFY_GLUE_MAX_BS.get()
+_GDN_FUSED_VERIFY_GLUE_ABOVE_MAX_BS = (
+    "inactive (unsupported layer/batch shape)"
+    if _GDN_FUSED_VERIFY_GLUE_MAX_BS == _GDN_FUSED_VERIFY_GLUE_DEFAULT_MAX_BS
+    else f"inactive above verify batch {_GDN_FUSED_VERIFY_GLUE_MAX_BS} "
+    "(SGLANG_GDN_FUSED_VERIFY_GLUE_MAX_BS)"
 )
 _fused_verify_glue_logged: set = set()
 
@@ -108,7 +127,32 @@ MAX_FUSED_QKV_SPLIT_DIM = 8192
 # switch: SGLANG_X_GDN_FRONT_DISABLE=1 or SGLANG_X_GDN_FRONT_CONV_DISABLE=1.
 _GDN_FRONT_SPLIT_CONV = _Q38C_EXTEND_PATH
 logger = logging.getLogger(__name__)
+_GDN_ALPHA_FUSED_LOGGED = [False]
 _q38_front_engaged: set[int] = set()
+# Paths ("graph", "eager") whose split q / k / v conv has logged its first use.
+_split_conv_logged: set[str] = set()
+
+
+def _log_split_conv_once(path: str, num_tokens: int) -> None:
+    if path in _split_conv_logged:
+        return
+    _split_conv_logged.add(path)
+    logger.info("GDN extend front engaged (%s): split q/k/v conv, tokens=%d", path, num_tokens)
+
+
+# Verify front variants ("conv", "conv+norm") of SGLANG_Q38C_MK_GDN that have logged their
+# first use (at graph capture); log only.
+_mk_gdn_logged: set[str] = set()
+
+
+def _log_mk_gdn_once(rows: int, fused_norm: bool) -> None:
+    variant = "conv+norm" if fused_norm else "conv"
+    if variant in _mk_gdn_logged:
+        return
+    _mk_gdn_logged.add(variant)
+    logger.info("GDN verify path engaged: SGLANG_Q38C_MK_GDN in-proj front (%s), rows=%d", variant, rows)
+
+
 _fused_decode_proj_conv_logged = False
 _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
@@ -589,6 +633,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # Set while a breakable prefill CUDA graph captures or replays a bucket:
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
+    # SGLANG_ENABLE_GDN_PREFILL_CP_SPLIT: (forward metadata it was planned for,
+    # GDNPrefillCPSplit); class defaults keep stub-built backends on the stock call.
+    _cp_split_enabled: bool = False
+    _cp_split_args: Optional[tuple] = None
+    _cp_split_passes: int = 0
+    # SGLANG_ENABLE_GDN_PREFILL_SPARSE_CHECKPOINTS: (forward metadata,
+    # GDNPrefillSparseCheckpoints), as the CP split's.
+    _sparse_ckpt_enabled: bool = False
+    _sparse_ckpt_args: Optional[tuple] = None
+    _sparse_ckpt_passes: int = 0
 
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
@@ -596,6 +650,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
         self.conv_states_shape = self.state_pool.mamba_cache.conv[0].shape
+        if _GDN_FRONT_SPLIT_CONV and is_cuda():
+            # Compile the SGLANG_GDN_PREFILL_CONV_RETILE kernel now, not on the first long prefill.
+            warmup_prefill_conv_strip()
         if not is_cpu() and not is_npu():
             assert self.conv_states_shape[-1] < FLA_CHUNK_SIZE, (
                 f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
@@ -610,6 +667,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = GDNKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
         )
+        self._cp_split_enabled = self._prefill_cp_split_supported()
+        self._sparse_ckpt_enabled = self._prefill_sparse_checkpoints_supported()
+        if self._cp_split_enabled or self._sparse_ckpt_enabled:
+            # The non-CP kernel runs one CTA per (sequence, value head).
+            self._cp_split_heads = self.state_pool.mamba_cache.temporal.shape[-3]
+            self._cp_split_sms = torch.cuda.get_device_properties(
+                model_runner.device
+            ).multi_processor_count
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -641,10 +706,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 "--enable-gdn-replayssm-ucache: the GDN state pool carries no "
                 "u-cache rings, so verify would fall back to the snapshot path."
             )
+        if self._gdn_ucache is not None and self._gdn_ucache.by_request_row:
+            # Ring rows are request-table rows: the table must not outgrow them.
+            num_ring_rows = self._gdn_ucache.hist_len.shape[0]
+            num_table_rows = self.req_to_token_pool.req_to_token.shape[0]
+            if num_ring_rows < num_table_rows:
+                raise RuntimeError(
+                    f"GDN u-cache rings by request row: {num_ring_rows} ring rows for "
+                    f"{num_table_rows} request rows."
+                )
         self._gdn_ucache_verifier = (
             GdnUcacheVerifier(
                 device=torch.device(model_runner.device),
                 first_layer_id=min(self.state_layer_indices),
+                by_request_row=self._gdn_ucache.by_request_row,
+                num_ring_rows=self._gdn_ucache.hist_len.shape[0],
+                num_state_slots=self.state_pool.size + 1,
             )
             if self._gdn_ucache is not None
             else None
@@ -656,9 +733,207 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             if self._gdn_ucache is not None
             and not self.is_draft_worker
-            and get_exec().mamba.enable_mamba_extra_buffer
-            and not get_memory().radix_cache_skip_decode_insert
+            and gdn_ucache_track_snapshots()
             else None
+        )
+        self._state_copy_enabled = self._prefill_state_copy_supported()
+        # (forward metadata it was derived from, int64 clamped slots, int64 cu_seqlens)
+        self._prefill_state_copy_args: Optional[tuple] = None
+        self._fused_track_enabled = envs.SGLANG_ENABLE_GDN_PREFILL_FUSED_TRACK.get()
+        self._ucache_fused_conv_enabled = self._ucache_fused_conv_supported()
+        self._ucache_fused_conv_logged: set = set()
+        self._ucache_fused_norm_enabled = (
+            envs.SGLANG_ENABLE_GDN_UCACHE_FUSED_NORM.get()
+            and not self.is_draft_worker
+            and self._gdn_ucache_verifier is not None
+            and self._gdn_ucache_verifier.fused_conv_capable
+        )
+        if (
+            envs.SGLANG_ENABLE_GDN_UCACHE_FUSED_NORM.get()
+            and not self._ucache_fused_norm_enabled
+            and not self.is_draft_worker
+        ):
+            logger.warning(
+                "SGLANG_ENABLE_GDN_UCACHE_FUSED_NORM not taken: needs --enable-gdn-replayssm-ucache "
+                "and the SM107 flush with SGLANG_ENABLE_GDN_UCACHE_STRIDED_QKV=1 and _PDL=1"
+            )
+        self._ucache_fused_norm_max_batch = (
+            envs.SGLANG_GDN_UCACHE_FUSED_NORM_MAX_BATCH.get()
+            if self._ucache_fused_norm_enabled
+            else 0
+        )
+        self._ucache_fused_norm_logged = False
+
+    def _prefill_state_copy_supported(self) -> bool:
+        if not envs.SGLANG_ENABLE_GDN_PREFILL_FUSED_STATE_COPY.get():
+            return False
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            FlashInferGDNKernel,
+        )
+
+        if not isinstance(self.kernel_dispatcher.extend_kernel, FlashInferGDNKernel):
+            logger.warning(
+                "SGLANG_ENABLE_GDN_PREFILL_FUSED_STATE_COPY not taken (stock gather/scatter): "
+                "extend kernel %s",
+                type(self.kernel_dispatcher.extend_kernel).__name__,
+            )
+            return False
+        return True
+
+    def _ucache_fused_conv_supported(self) -> bool:
+        if not envs.SGLANG_ENABLE_GDN_UCACHE_FUSED_CONV.get() or self.is_draft_worker:
+            return False
+        reason = None
+        if self._gdn_ucache_verifier is None:
+            reason = "needs --enable-gdn-replayssm-ucache"
+        elif os.environ.get("Q38_GDN_FRONT") != "1":
+            reason = "needs Q38_GDN_FRONT=1 (the verify conv it replaces)"
+        elif not self._gdn_ucache_verifier.fused_conv_capable:
+            reason = (
+                "needs the SM107 flush with SGLANG_ENABLE_GDN_UCACHE_STRIDED_QKV=1 and "
+                "SGLANG_ENABLE_GDN_UCACHE_PDL=1"
+            )
+        if reason is not None:
+            logger.warning("SGLANG_ENABLE_GDN_UCACHE_FUSED_CONV not taken: %s", reason)
+            return False
+        return True
+
+    def _ucache_fused_conv(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        window: torch.Tensor,
+        window_indices: torch.Tensor,
+        batch_size: int,
+        draft_token_num: int,
+    ):
+        """The GdnFusedConv for this verify's flush launches, or None (the separate conv runs):
+        launches whose heads per CTA split a key head (small batches) keep it."""
+        if not self._ucache_fused_conv_enabled:
+            return None
+        from sglang.kernels.ops.attention.linear.gdn_ucache_rubin.gdn_replay_mtp_umma_rubin import (
+            GdnFusedConv,
+            fused_conv_unsupported_reason,
+        )
+
+        fused = GdnFusedConv(
+            x=mixed_qkv.view(batch_size, draft_token_num, -1),
+            weight=layer.conv_weights,
+            conv_state=conv_states,
+            window=window,
+            window_indices=window_indices,
+        )
+        reason = (
+            f"conv bias / activation {layer.bias is not None} / {layer.activation}"
+            if layer.bias is not None or layer.activation not in ("silu", "swish")
+            else fused_conv_unsupported_reason(
+                fused, num_k_heads=layer.num_k_heads, num_v_heads=layer.num_v_heads
+            )
+        )
+        key = "kept" if reason is not None else "engaged"
+        if key not in self._ucache_fused_conv_logged:
+            self._ucache_fused_conv_logged.add(key)
+            if reason is None:
+                logger.info(
+                    "SGLANG_ENABLE_GDN_UCACHE_FUSED_CONV engaged: the u-cache flush runs the "
+                    "verify conv (%d channels, %d tokens; first batch %d)",
+                    mixed_qkv.shape[1],
+                    draft_token_num,
+                    batch_size,
+                )
+            else:
+                logger.info(
+                    "SGLANG_ENABLE_GDN_UCACHE_FUSED_CONV: separate verify conv kept (%s)", reason
+                )
+        return fused if reason is None else None
+
+    def _ucache_fused_norm(
+        self,
+        *,
+        norm: Optional[tuple],
+        num_tokens: int,
+        num_draft_tokens: int,
+        num_v_heads: int,
+    ):
+        """The GdnFusedNorm for this verify's flush, or None (the model runs its gated norm): the
+        model passes ``norm`` = (z, weight, eps); T <= 4 and verifies whose separate norm reduces a
+        row as 16 threads x 8 elements (B >= 3), up to SGLANG_GDN_UCACHE_FUSED_NORM_MAX_BATCH."""
+        if (
+            norm is None
+            or not self._ucache_fused_norm_enabled
+            or num_draft_tokens > 4
+            or num_tokens > num_draft_tokens * self._ucache_fused_norm_max_batch
+        ):
+            return None
+        from sglang.kernels.ops.attention.linear.gdn_ucache_rubin.gdn_replay_mtp_umma_rubin import (
+            GdnFusedNorm,
+            fused_norm_unsupported_reason,
+        )
+        from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+            gdn_ucache_fused_norm_applies,
+        )
+
+        z, weight, eps = norm
+        if not gdn_ucache_fused_norm_applies(num_tokens * num_v_heads, z.device):
+            return None
+        fused = GdnFusedNorm(z=z, weight=weight, eps=float(eps))
+        reason = fused_norm_unsupported_reason(
+            fused, batch=num_tokens // num_draft_tokens, T=num_draft_tokens, HV=num_v_heads
+        )
+        if not self._ucache_fused_norm_logged:
+            self._ucache_fused_norm_logged = True
+            logger.info(
+                "SGLANG_ENABLE_GDN_UCACHE_FUSED_NORM %s (first verify %d tokens)",
+                "engaged: the u-cache flush stores the gated RMSNorm of its output"
+                if reason is None
+                else f"not taken: {reason}",
+                num_tokens,
+            )
+        return fused if reason is None else None
+
+    @property
+    def _prefill_state_copy(self) -> Optional[tuple]:
+        args = self._prefill_state_copy_args
+        if args is None or args[0] is not self.forward_metadata:
+            return None
+        return args[1:]
+
+    def _fused_track_conv(self, mixed_qkv: torch.Tensor, conv_states: torch.Tensor) -> bool:
+        if not self._fused_track_enabled:
+            return False
+        meta = self.forward_metadata
+        return gdn_track_conv_snapshot(
+            conv_pool=conv_states,
+            x=mixed_qkv,
+            token_rows=meta.track_conv_indices,
+            dst_slots=meta.conv_states_mask_indices,
+        )
+
+    def _fused_track_states(
+        self, h: Optional[torch.Tensor], ssm_states: torch.Tensor
+    ) -> bool:
+        meta = self.forward_metadata
+        if (
+            not self._fused_track_enabled
+            or meta.track_ssm_h_src is None
+            or meta.track_ssm_h_dst is None
+            or meta.track_ssm_final_src is None
+            or meta.track_ssm_final_dst is None
+            or (
+                meta.track_ssm_recompute_dst is not None
+                and meta.track_ssm_recompute_dst.numel() > 0
+            )
+        ):
+            return False
+        return gdn_track_state_rows(
+            pool=ssm_states,
+            h=h.squeeze(0) if h is not None else None,
+            h_src=meta.track_ssm_h_src,
+            h_dst=meta.track_ssm_h_dst,
+            f_src=meta.track_ssm_final_src,
+            f_dst=meta.track_ssm_final_dst,
         )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -674,6 +949,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 g_ring=gdn_ucache.g_ring[0],
                 flush_min=gdn_ucache.flush_min,
                 max_eager_batch_size=self.req_to_token_pool.size,
+                fused_conv=self._ucache_fused_conv_enabled,
+                fused_norm_max_batch=self._ucache_fused_norm_max_batch,
             )
         if self.gdn_ucache_track is not None:
             # Eager verifies (bs > max_bs) run up to one row per request slot.
@@ -921,11 +1198,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
         super().init_forward_metadata(forward_batch)
         self._init_target_verify_qkv_routing(forward_batch)
+        self._prefill_state_copy_args = None
+        if (
+            self._state_copy_enabled
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            # The stock extend derives both per layer; padding (-1) maps to dummy slot 0 there too.
+            meta = self.forward_metadata
+            self._prefill_state_copy_args = (
+                meta,
+                meta.mamba_cache_indices.clamp(min=0).to(torch.int64),
+                meta.query_start_loc.to(torch.int64),
+            )
         self.mis_metadata = None
         if forward_batch.multi_item_delimiter_indices is not None:
             if not self.enable_mis:
                 raise ValueError("GDN MIS metadata requires --enable-mis")
             self.mis_metadata = build_gdn_mis_metadata(forward_batch)
+        stock_src_host = None
         if self.forward_metadata.has_mamba_track_mask:
             if getattr(self.forward_metadata, "mamba_track_mask_indices", None) is None:
                 self.forward_metadata.mamba_track_mask_indices = (
@@ -941,10 +1232,230 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     maybe_build_flashinfer_checkpoint_plan,
                 )
 
-                maybe_build_flashinfer_checkpoint_plan(
+                stock_src_host = maybe_build_flashinfer_checkpoint_plan(
                     forward_batch, self.forward_metadata, self.device
                 )
         self._init_prefill_conv_block_table(forward_batch)
+        self._cp_split_args = None
+        self._sparse_ckpt_args = None
+        targets = (
+            self._sparse_checkpoint_targets(forward_batch, stock_src_host)
+            if self._sparse_ckpt_enabled
+            else None
+        )
+        if self._cp_split_enabled:
+            self._plan_prefill_cp_split(forward_batch, sparse_targets=targets)
+        if targets is not None:
+            self._plan_sparse_checkpoints(forward_batch, targets)
+
+    def _prefill_cp_split_supported(self) -> bool:
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            GDN_PREFILL_CP_SPLIT,
+            GDN_PREFILL_CP_SPLIT_MIN_LEN,
+            GDN_PREFILL_CP_SPLIT_MODEL,
+            FlashInferGDNKernel,
+        )
+
+        if not GDN_PREFILL_CP_SPLIT or self.is_draft_worker:
+            return False
+        extend_kernel = self.kernel_dispatcher.extend_kernel
+        if not isinstance(extend_kernel, FlashInferGDNKernel):
+            logger.warning(
+                "SGLANG_ENABLE_GDN_PREFILL_CP_SPLIT not taken: extend kernel %s",
+                type(extend_kernel).__name__,
+            )
+            return False
+        logger.info(
+            "SGLANG_ENABLE_GDN_PREFILL_CP_SPLIT on: eager prefills of several sequences "
+            "run sequences of >= %d tokens as one-sequence FlashInfer CP calls (%s), "
+            "the others as one non-CP call per contiguous run",
+            GDN_PREFILL_CP_SPLIT_MIN_LEN,
+            "the longest, when the cost model gains"
+            if GDN_PREFILL_CP_SPLIT_MODEL
+            else "all of them, unmodeled",
+        )
+        return True
+
+    def _plannable_prefill_lens(self, forward_batch: ForwardBatch) -> Optional[list]:
+        """Host extend lengths of an eager plain prefill whose calls may be planned."""
+        meta = self.forward_metadata
+        lens = forward_batch.extend_seq_lens_cpu
+        if (
+            forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            or self.mis_metadata is not None
+            or forward_batch.tbo_parent_token_range is not None
+            or lens is None
+            or len(lens) != forward_batch.batch_size
+            or meta.query_start_loc is None
+            or meta.query_start_loc.numel() != len(lens) + 1
+        ):
+            return None
+        return lens
+
+    def _plan_prefill_cp_split(
+        self, forward_batch: ForwardBatch, *, sparse_targets: Optional[tuple] = None
+    ) -> None:
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            build_gdn_prefill_cp_split,
+        )
+
+        meta = self.forward_metadata
+        lens = self._plannable_prefill_lens(forward_batch)
+        if lens is None:
+            return
+        plan = build_gdn_prefill_cp_split(
+            lens,
+            # Sparse checkpoints leave non-CP walks at no-checkpoint cost; a CP call
+            # still pays for checkpoints when its sequence is tracked.
+            checkpoints=meta.num_state_checkpoints > 0 and sparse_targets is None,
+            cp_checkpoints=(
+                tuple(bool(t) for t in sparse_targets)
+                if sparse_targets is not None
+                else None
+            ),
+            heads=self._cp_split_heads,
+            sms=self._cp_split_sms,
+            device=self.device,
+        )
+        if plan is None:
+            return
+        self._cp_split_args = (meta, plan)
+        self._cp_split_passes += 1
+        n = self._cp_split_passes
+        if n & (n - 1) == 0 or n % 1000 == 0:
+            cp_calls = [c for c in plan.calls if c[0]]
+            logger.info(
+                "SGLANG_ENABLE_GDN_PREFILL_CP_SPLIT pass %d: lens %s -> %d CP calls "
+                "(%d tokens) + %d non-CP call(s); modeled %.0f -> %.0f us per layer",
+                n,
+                list(plan.lens),
+                len(cp_calls),
+                sum(c[4] - c[3] for c in cp_calls),
+                len(plan.calls) - len(cp_calls),
+                plan.modeled_stock_us,
+                plan.modeled_split_us,
+            )
+
+    @property
+    def _prefill_cp_split(self):
+        args = self._cp_split_args
+        if args is None or args[0] is not self.forward_metadata:
+            return None
+        return args[1]
+
+    def _prefill_sparse_checkpoints_supported(self) -> bool:
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            GDN_PREFILL_SPARSE_CHECKPOINTS,
+            FlashInferGDNKernel,
+        )
+
+        if not GDN_PREFILL_SPARSE_CHECKPOINTS or self.is_draft_worker:
+            return False
+        extend_kernel = self.kernel_dispatcher.extend_kernel
+        reason = None
+        if not isinstance(extend_kernel, FlashInferGDNKernel):
+            reason = f"extend kernel {type(extend_kernel).__name__}"
+        elif not extend_kernel.use_state_pool or extend_kernel._prefill_needs_fp32_state:
+            reason = "needs the SM100 state-pool prefill"
+        else:
+            try:
+                import sglang.kernels.ops.mamba.gdn_prefill_ckpt_targets  # noqa: F401
+            except ImportError as e:
+                reason = f"checkpoint-targets kernel unavailable ({e})"
+        if reason is not None:
+            logger.warning(
+                "SGLANG_ENABLE_GDN_PREFILL_SPARSE_CHECKPOINTS not taken: %s", reason
+            )
+            return False
+        logger.info(
+            "SGLANG_ENABLE_GDN_PREFILL_SPARSE_CHECKPOINTS on: GDN prefills store only the "
+            "state checkpoints prefix-cache tracking reads"
+        )
+        return True
+
+    def _sparse_checkpoint_targets(
+        self, forward_batch: ForwardBatch, stock_src_host: Optional[torch.Tensor] = None
+    ) -> Optional[tuple]:
+        """Per sequence, the token whose checkpoint tracking reads (0: none), from the
+        host track metadata; None when this forward keeps the stock checkpoints.
+        stock_src_host: the stock rows, when the checkpoint plan was built from the
+        same host lists; each target must name exactly its stock row."""
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            gdn_prefill_checkpoint_targets,
+        )
+
+        meta = self.forward_metadata
+        if (
+            meta.num_state_checkpoints <= 0
+            or meta.track_ssm_h_src is None
+            or not self._has_cpu_prefill_track_metadata(forward_batch)
+        ):
+            return None
+        lens = self._plannable_prefill_lens(forward_batch)
+        if lens is None:
+            return None
+        targets = gdn_prefill_checkpoint_targets(
+            track_mask=forward_batch.mamba_prefill_track_mask_cpu,
+            track_seqlens=forward_batch.mamba_track_seqlens_cpu,
+            prefix_lens=forward_batch.extend_prefix_lens_cpu,
+            every=meta.state_checkpoint_every_n_tokens,
+        )
+        if sum(1 for t in targets if t) != meta.track_ssm_h_src.numel() or any(
+            t > n for t, n in zip(targets, lens)
+        ):
+            return None
+        if stock_src_host is not None:
+            every = meta.state_checkpoint_every_n_tokens
+            rows, start = [], 0
+            for n, t in zip(lens, targets):
+                if t:
+                    rows.append(start + t // every - 1)
+                start += n // every
+            if rows != stock_src_host.tolist():
+                return None
+        # FlashInfer runs CP for a batch this small; the targets kernel is its non-CP.
+        if 2 <= len(lens) and len(lens) * 4 * self._cp_split_heads < self._cp_split_sms:
+            return None
+        return targets
+
+    def _plan_sparse_checkpoints(self, forward_batch: ForwardBatch, targets) -> None:
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            build_gdn_prefill_sparse_checkpoints,
+        )
+
+        meta = self.forward_metadata
+        plan = build_gdn_prefill_sparse_checkpoints(
+            forward_batch.extend_seq_lens_cpu,
+            targets,
+            cp_split=self._prefill_cp_split,
+            stock_src=meta.track_ssm_h_src,
+            stock_every=meta.state_checkpoint_every_n_tokens,
+            stock_num=meta.num_state_checkpoints,
+            device=self.device,
+        )
+        self._sparse_ckpt_args = (meta, plan)
+        n = self._sparse_ckpt_passes = self._sparse_ckpt_passes + 1
+        if n & (n - 1) == 0 or n % 1000 == 0:
+            logger.info(
+                "SGLANG_ENABLE_GDN_PREFILL_SPARSE_CHECKPOINTS pass %d: %d of %d checkpoint "
+                "rows stored per GDN layer (%d sequences, %d tracked, calls %s)",
+                n,
+                plan.num_rows,
+                plan.stock_num,
+                len(plan.lens),
+                plan.src.numel(),
+                [c[6] for c in plan.calls],
+            )
+        # Tracking reads plan.src of the plan's rows; the extend allocates num_rows.
+        meta.track_ssm_h_src = plan.src
+        meta.num_state_checkpoints = plan.num_rows
+
+    @property
+    def _prefill_sparse_ckpt(self):
+        args = self._sparse_ckpt_args
+        if args is None or args[0] is not self.forward_metadata:
+            return None
+        return args[1]
 
     def _init_prefill_conv_block_table(self, forward_batch: ForwardBatch) -> None:
         metadata = self.forward_metadata
@@ -1328,6 +1839,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices: torch.Tensor,
     ):
         """_convolve_prefill + q / k / v split in one conv launch."""
+        _log_split_conv_once("eager", mixed_qkv.shape[0])
         block_table = self.forward_metadata.conv_block_table
         conv_kwargs = {"block_table": block_table} if block_table is not None else {}
         q, k, v = causal_conv1d_fn_split_qkv(
@@ -1374,6 +1886,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
         layer: RadixLinearAttention, a: torch.Tensor, b: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+
+    def _prefill_alpha_fused(self) -> bool:
+        """SGLANG_GDN_PREFILL_ALPHA_FUSED: the eager extend's gating kernel writes exp(g),
+        which only the FlashInfer prefill reads."""
+        if not _GDN_ALPHA_FUSED:
+            return False
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            FlashInferGDNKernel,
+        )
+
+        if not isinstance(self.kernel_dispatcher.extend_kernel, FlashInferGDNKernel):
+            return False
+        if not _GDN_ALPHA_FUSED_LOGGED[0]:
+            _GDN_ALPHA_FUSED_LOGGED[0] = True
+            logger.info(
+                "SGLANG_GDN_PREFILL_ALPHA_FUSED: GDN prefill exp(g) from the gating kernel "
+                "(one torch.exp launch fewer per GDN layer)"
+            )
+        return True
 
     @staticmethod
     def _split_prefill_qkv(
@@ -1428,6 +1959,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     num_tokens=meta.num_logical_tokens,
                 )
             if self._split_conv_ok(layer, mixed_qkv):
+                _log_split_conv_once("graph", mixed_qkv.shape[0])
                 query, key, value = self._split_conv_views(
                     layer,
                     *causal_conv1d_fn_split_qkv(
@@ -1636,6 +2168,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def forward_inproj_conv(self, layer, forward_batch, x, weight, *, norm_weight=None, norm_eps=1e-6):
         if os.environ.get("SGLANG_Q38C_MK_GDN", "0") == "1":
             from sglang.srt.q38.q38_mkgdn_front import run
+
+            _log_mk_gdn_once(x.shape[0], norm_weight is not None)
         else:
             from sglang.srt.q38.gdn_inproj_conv import run
         from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
@@ -1772,6 +2306,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_cache_indices = cache_indices
 
             split_qkv = None
+            ucache_fused_conv = None
             if is_target_verify and not q38_conv_applied:
                 batch_size = seq_len // forward_batch.spec_info.draft_token_num
                 draft_token_num = forward_batch.spec_info.draft_token_num
@@ -1788,24 +2323,45 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     if layer.layer_id not in _q38_front_engaged:
                         _q38_front_engaged.add(layer.layer_id)
                         logger.info("Q38_GDN_FRONT layer=%d heads=%d/%d draft=%d views=1 conv_tile=128 verify_tile=64/w1 source=Q35_plugin pdl=%s", layer.layer_id, layer.num_k_heads, layer.num_v_heads, draft_token_num, os.environ.get("Q38_GDN_PDL", "0"))
-                mixed_qkv_processed = conv_update(
-                    mixed_qkv_reshaped,
-                    conv_states,
-                    layer.conv_weights,
-                    layer.bias,
-                    layer.activation,
-                    conv_state_indices=cache_indices[:batch_size],
-                    intermediate_conv_window=intermediate_conv_window_cache,
-                    intermediate_state_indices=intermediate_state_indices[:batch_size],
-                    **(front_kwargs if front_kwargs else dict(
-                        retrieve_next_token=retrieve_next_token,
-                        retrieve_next_sibling=retrieve_next_sibling,
-                        retrieve_parent_token=retrieve_parent_token,
-                    )),
-                )
+                if front_kwargs:
+                    ucache_fused_conv = self._ucache_fused_conv(
+                        layer=layer,
+                        mixed_qkv=mixed_qkv,
+                        conv_states=conv_states,
+                        window=intermediate_conv_window_cache,
+                        window_indices=intermediate_state_indices[:batch_size],
+                        batch_size=batch_size,
+                        draft_token_num=draft_token_num,
+                    )
+                if ucache_fused_conv is not None:
+                    # the u-cache flush computes the conv into these rows (GdnFusedConv)
+                    mixed_qkv_processed = torch.empty(
+                        (batch_size, draft_token_num, mixed_qkv.shape[1]),
+                        dtype=mixed_qkv.dtype,
+                        device=mixed_qkv.device,
+                    ).transpose(1, 2)
+                else:
+                    mixed_qkv_processed = conv_update(
+                        mixed_qkv_reshaped,
+                        conv_states,
+                        layer.conv_weights,
+                        layer.bias,
+                        layer.activation,
+                        conv_state_indices=cache_indices[:batch_size],
+                        intermediate_conv_window=intermediate_conv_window_cache,
+                        intermediate_state_indices=intermediate_state_indices[:batch_size],
+                        **(front_kwargs if front_kwargs else dict(
+                            retrieve_next_token=retrieve_next_token,
+                            retrieve_next_sibling=retrieve_next_sibling,
+                            retrieve_parent_token=retrieve_parent_token,
+                        )),
+                    )
                 mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
             elif not is_target_verify:
-                if forward_metadata.has_mamba_track_mask:
+                if (
+                    forward_metadata.has_mamba_track_mask
+                    and not self._fused_track_conv(mixed_qkv, conv_states)
+                ):
                     mixed_qkv_to_track = mixed_qkv[
                         forward_metadata.track_conv_indices
                     ].transpose(1, 2)
@@ -1864,6 +2420,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # verify, fold on commit), circular ring, or the snapshotting
                 # fallback when neither ring is allocated.
                 if self._gdn_ucache is not None:
+                    ucache_fused_norm = self._ucache_fused_norm(
+                        norm=kwargs.get("gdn_ucache_norm"),
+                        num_tokens=seq_len,
+                        num_draft_tokens=forward_batch.spec_info.draft_token_num,
+                        num_v_heads=layer.num_v_heads,
+                    )
                     core_attn_out = self._gdn_ucache_target_verify(
                         layer=layer,
                         query=query,
@@ -1875,7 +2437,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         cache_indices=cache_indices,
                         num_draft_tokens=forward_batch.spec_info.draft_token_num,
                         retrieve_parent_token=retrieve_parent_token,
+                        request_rows=forward_batch.req_pool_indices,
+                        fused_conv=ucache_fused_conv,
+                        fused_norm=ucache_fused_norm,
                     )
+                    if ucache_fused_norm is not None:
+                        # the model skips its gated norm on this (output, True)
+                        core_attn_out = (core_attn_out, True)
                 elif use_replayssm_fold:
                     core_attn_out = self._replayssm_fold_target_verify(
                         layer=layer,
@@ -1939,7 +2507,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         stable_rows=pp_spec_stable_rows_enabled(),
                     )
             else:
-                g, beta = self._prefill_gates(layer, a, b)
+                alpha_fused = self._prefill_alpha_fused()
+                if alpha_fused:
+                    g, beta = fused_gdn_gating(
+                        layer.A_log, a, b, layer.dt_bias, exp_g=True
+                    )
+                else:
+                    g, beta = self._prefill_gates(layer, a, b)
                 h_track_buf = None
                 if (
                     forward_metadata.has_mamba_track_mask
@@ -1954,12 +2528,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         dtype=torch.float32,
                         device=ssm_states.device,
                     )
+                cp_split = self._prefill_cp_split
+                sparse_ckpt = self._prefill_sparse_ckpt
                 core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                     q=query,
                     k=key,
                     v=value,
                     g=g,
                     beta=beta,
+                    **({"g_is_alpha": True} if alpha_fused else {}),
                     ssm_states=ssm_states_contig,
                     cache_indices=state_cache_indices,
                     query_start_loc=query_start_loc,
@@ -1979,6 +2556,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         if h_track_buf is not None
                         else None
                     ),
+                    **(
+                        {"state_copy": self._prefill_state_copy}
+                        if self._prefill_state_copy is not None
+                        and not needs_state_gather
+                        else {}
+                    ),
+                    **({"cp_split": cp_split} if cp_split is not None else {}),
+                    **({"sparse_ckpt": sparse_ckpt} if sparse_ckpt is not None else {}),
                 )
 
                 if is_npu() and last_recurrent_state is not None:
@@ -1993,7 +2578,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     conv_states[cache_indices] = conv_states_contig
                     ssm_states[cache_indices] = ssm_states_contig
 
-                if forward_metadata.has_mamba_track_mask:
+                if forward_metadata.has_mamba_track_mask and not (
+                    h_track_buf is None and self._fused_track_states(h, ssm_states)
+                ):
                     self._track_mamba_state_extend(
                         forward_batch,
                         h,
@@ -2105,6 +2692,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states_contig = ssm_states
                 state_cache_indices = cache_indices
 
+            ucache_fused_conv = None
             if is_target_verify and not q38_conv_applied:
                 batch_size = seq_len // forward_batch.spec_info.draft_token_num
                 draft_token_num = forward_batch.spec_info.draft_token_num
@@ -2121,24 +2709,45 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     if layer.layer_id not in _q38_front_engaged:
                         _q38_front_engaged.add(layer.layer_id)
                         logger.info("Q38_GDN_FRONT layer=%d heads=%d/%d draft=%d views=1 conv_tile=128 verify_tile=64/w1 source=Q35_plugin pdl=%s", layer.layer_id, layer.num_k_heads, layer.num_v_heads, draft_token_num, os.environ.get("Q38_GDN_PDL", "0"))
-                mixed_qkv_processed = conv_update(
-                    mixed_qkv_reshaped,
-                    conv_states,
-                    layer.conv_weights,
-                    layer.bias,
-                    layer.activation,
-                    conv_state_indices=cache_indices[:batch_size],
-                    intermediate_conv_window=intermediate_conv_window_cache,
-                    intermediate_state_indices=intermediate_state_indices[:batch_size],
-                    **(front_kwargs if front_kwargs else dict(
-                        retrieve_next_token=retrieve_next_token,
-                        retrieve_next_sibling=retrieve_next_sibling,
-                        retrieve_parent_token=retrieve_parent_token,
-                    )),
-                )
+                if front_kwargs:
+                    ucache_fused_conv = self._ucache_fused_conv(
+                        layer=layer,
+                        mixed_qkv=mixed_qkv,
+                        conv_states=conv_states,
+                        window=intermediate_conv_window_cache,
+                        window_indices=intermediate_state_indices[:batch_size],
+                        batch_size=batch_size,
+                        draft_token_num=draft_token_num,
+                    )
+                if ucache_fused_conv is not None:
+                    # the u-cache flush computes the conv into these rows (GdnFusedConv)
+                    mixed_qkv_processed = torch.empty(
+                        (batch_size, draft_token_num, mixed_qkv.shape[1]),
+                        dtype=mixed_qkv.dtype,
+                        device=mixed_qkv.device,
+                    ).transpose(1, 2)
+                else:
+                    mixed_qkv_processed = conv_update(
+                        mixed_qkv_reshaped,
+                        conv_states,
+                        layer.conv_weights,
+                        layer.bias,
+                        layer.activation,
+                        conv_state_indices=cache_indices[:batch_size],
+                        intermediate_conv_window=intermediate_conv_window_cache,
+                        intermediate_state_indices=intermediate_state_indices[:batch_size],
+                        **(front_kwargs if front_kwargs else dict(
+                            retrieve_next_token=retrieve_next_token,
+                            retrieve_next_sibling=retrieve_next_sibling,
+                            retrieve_parent_token=retrieve_parent_token,
+                        )),
+                    )
                 mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
             elif not is_target_verify:
-                if forward_metadata.has_mamba_track_mask:
+                if (
+                    forward_metadata.has_mamba_track_mask
+                    and not self._fused_track_conv(mixed_qkv, conv_states)
+                ):
                     mixed_qkv_to_track = mixed_qkv[
                         forward_metadata.track_conv_indices
                     ].transpose(1, 2)
@@ -2186,6 +2795,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # verify, fold on commit), circular ring, or the snapshotting
                 # fallback when neither ring is allocated.
                 if self._gdn_ucache is not None:
+                    ucache_fused_norm = self._ucache_fused_norm(
+                        norm=kwargs.get("gdn_ucache_norm"),
+                        num_tokens=seq_len,
+                        num_draft_tokens=forward_batch.spec_info.draft_token_num,
+                        num_v_heads=layer.num_v_heads,
+                    )
                     core_attn_out = self._gdn_ucache_target_verify(
                         layer=layer,
                         query=query,
@@ -2197,7 +2812,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         cache_indices=cache_indices,
                         num_draft_tokens=forward_batch.spec_info.draft_token_num,
                         retrieve_parent_token=retrieve_parent_token,
+                        request_rows=forward_batch.req_pool_indices,
+                        fused_conv=ucache_fused_conv,
+                        fused_norm=ucache_fused_norm,
                     )
+                    if ucache_fused_norm is not None:
+                        # the model skips its gated norm on this (output, True)
+                        core_attn_out = (core_attn_out, True)
                 elif use_replayssm_fold:
                     core_attn_out = self._replayssm_fold_target_verify(
                         layer=layer,
@@ -2276,6 +2897,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         dtype=torch.float32,
                         device=ssm_states.device,
                     )
+                cp_split = self._prefill_cp_split
+                sparse_ckpt = self._prefill_sparse_ckpt
                 core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                     q=query,
                     k=key,
@@ -2301,6 +2924,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         if h_track_buf is not None
                         else None
                     ),
+                    **(
+                        {"state_copy": self._prefill_state_copy}
+                        if self._prefill_state_copy is not None
+                        and not needs_state_gather
+                        else {}
+                    ),
+                    **({"cp_split": cp_split} if cp_split is not None else {}),
+                    **({"sparse_ckpt": sparse_ckpt} if sparse_ckpt is not None else {}),
                 )
 
                 if is_npu() and last_recurrent_state is not None:
@@ -2315,7 +2946,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     conv_states[cache_indices] = conv_states_contig
                     ssm_states[cache_indices] = ssm_states_contig
 
-                if forward_metadata.has_mamba_track_mask:
+                if forward_metadata.has_mamba_track_mask and not (
+                    h_track_buf is None and self._fused_track_states(h, ssm_states)
+                ):
                     self._track_mamba_state_extend(
                         forward_batch,
                         h,
@@ -2550,6 +3183,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices: torch.Tensor,
         num_draft_tokens: int,
         retrieve_parent_token: Optional[torch.Tensor],
+        request_rows: torch.Tensor,
+        fused_conv=None,
+        fused_norm=None,
     ) -> torch.Tensor:
         assert retrieve_parent_token is None, (
             "GDN u-cache verify supports linear draft chains only (topk == 1)."
@@ -2573,6 +3209,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             buffers=gdn_ucache,
             cache_indices=cache_indices,
             num_draft_tokens=num_draft_tokens,
+            request_rows=request_rows if gdn_ucache.by_request_row else None,
+            fused_conv=fused_conv,
+            fused_norm=fused_norm,
         )
 
     def _replayssm_target_verify(
@@ -2752,7 +3391,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             or HV % H != 0
             or draft_token_num != 4
             or tokens < 2 * draft_token_num
-            or tokens > 4 * draft_token_num
             or tokens % draft_token_num != 0
             or input_dtype != torch.bfloat16
             or conv_state.dtype != input_dtype
@@ -2770,6 +3408,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             or norm_weight.shape != (V,)
         ):
             _log_fused_verify_glue_once("inactive (unsupported layer/batch shape)")
+            return False
+        if tokens > _GDN_FUSED_VERIFY_GLUE_MAX_BS * draft_token_num:
+            _log_fused_verify_glue_once(_GDN_FUSED_VERIFY_GLUE_ABOVE_MAX_BS)
             return False
 
         return True
@@ -2831,6 +3472,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Stock evaluates the `>= 0` mask every layer and discards it here.
             intermediate_state_indices = self.verify_intermediate_state_indices
         _log_fused_verify_glue_once("active")
+        if (
+            batch_size > _GDN_FUSED_VERIFY_GLUE_DEFAULT_MAX_BS
+            and "active_wide" not in _fused_verify_glue_logged
+        ):
+            _fused_verify_glue_logged.add("active_wide")
+            rank0_log(
+                f"GDN fused verify glue: active above verify batch "
+                f"{_GDN_FUSED_VERIFY_GLUE_DEFAULT_MAX_BS}, max bs "
+                f"{_GDN_FUSED_VERIFY_GLUE_MAX_BS} (first batch {batch_size}; "
+                f"SGLANG_GDN_FUSED_VERIFY_GLUE_MAX_BS)"
+            )
         return gdn_fused_verify_glue(
             mixed_qkvz=mixed_qkvz,
             mixed_ba=mixed_ba,

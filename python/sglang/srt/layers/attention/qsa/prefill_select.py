@@ -38,6 +38,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.layers.attention.qsa import prefill_scorer_tc as _scorer_tc
 from sglang.srt.layers.attention.qsa.mqa import (
     _QSA_INV_SQRT128_PRELUDE,
     HAS_TILELANG,
@@ -60,15 +61,33 @@ _DEFAULT_CONFIG = "128,512,2,Square,1"
 _LOGITS_BUDGET_BYTES = (
     _env_int("SGLANG_QSA_PREFILL_FAST_SELECT_LOGITS_MB", 128) * 1024 * 1024
 )
+# Calls at least _WIDE_MIN_KEYS wide take this budget instead (0: off). On VR200 256 MiB
+# gained 0.3-0.7 ms per 16K pass at 28K-63K keys and lost at 9K-15K (mb-h532-a3);
+# the 24,576-key cut between them is arbitrary. Row chunking is per row, so exact.
+_WIDE_LOGITS_BUDGET_BYTES = (
+    _env_int("SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_LOGITS_MB", 0) * 1024 * 1024
+)
+_WIDE_MIN_KEYS = _env_int("SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_MIN_KEYS", 24576)
 # Both top-k kernels run one 1024-thread CTA per row, two per SM; 0 turns the row
 # alignment off (stock's chunk sizes).
 _TOPK_SLOTS = _env_int("SGLANG_QSA_PREFILL_FAST_SELECT_TOPK_SLOTS", -1)
 # "stock": fast_topk's JIT kernel; "sampled": qsa_prefill_topk.cuh, the same
 # output from one pass over each long row (fast_topk's own select for the rest).
+# "half": the sampled select on 512-thread blocks (qsa_prefill_topk_half.cuh), the same output.
+# "onepass": qsa_topk_onepass.cuh, the same output from one vectorized pass with exact bin counts.
+_TOPK_IMPLS = ("stock", "sampled", "half", "onepass")
 _TOPK_IMPL = os.environ.get("SGLANG_QSA_PREFILL_FAST_SELECT_TOPK", "sampled").strip()
-if _TOPK_IMPL not in ("stock", "sampled"):
-    raise ValueError(f"SGLANG_QSA_PREFILL_FAST_SELECT_TOPK must be stock or sampled, got {_TOPK_IMPL!r}")
+if _TOPK_IMPL not in _TOPK_IMPLS:
+    raise ValueError(
+        f"SGLANG_QSA_PREFILL_FAST_SELECT_TOPK must be one of {_TOPK_IMPLS}, got {_TOPK_IMPL!r}"
+    )
 _SAMPLED_MIN_KEYS = 4096  # qsa_prefill_topk.cuh's shortest sampled row is 4097 keys
+# Debug: the first N "half" calls also run the 1024-thread kernel and log equality.
+_TOPK_CHECK_CALLS = _env_int("SGLANG_QSA_PREFILL_FAST_SELECT_TOPK_CHECK_CALLS", 0)
+_topk_checked = [0]
+# Widest call "half" takes: on VR200 it gained at 52,947 keys and lost at 60,096 (h449);
+# the cut between them is arbitrary.
+_HALF_MAX_KEYS = _env_int("SGLANG_QSA_PREFILL_FAST_SELECT_HALF_MAX_KEYS", 57344)
 # CTAs of the scorer resident per SM (for the key-split sizing).
 _SCORER_CTAS_PER_SM = _env_int("SGLANG_QSA_PREFILL_FAST_SELECT_SCORER_CTAS_PER_SM", 1)
 
@@ -202,6 +221,29 @@ def _topk_slots(device_index: int) -> int:
     return 2 * _num_sms(device_index)
 
 
+def _budget_for(width: int) -> int:
+    if _WIDE_LOGITS_BUDGET_BYTES and width >= _WIDE_MIN_KEYS:
+        _log_wide_once(width)
+        return _WIDE_LOGITS_BUDGET_BYTES
+    return _LOGITS_BUDGET_BYTES
+
+
+_wide_logged = [False]
+
+
+def _log_wide_once(width: int) -> None:
+    if _wide_logged[0]:
+        return
+    _wide_logged[0] = True
+    logger.info(
+        "QSA prefill fast select: wide logits budget %d MiB from %d keys, first call width=%d "
+        "(SGLANG_QSA_PREFILL_FAST_SELECT_WIDE_LOGITS_MB)",
+        _WIDE_LOGITS_BUDGET_BYTES >> 20,
+        _WIDE_MIN_KEYS,
+        width,
+    )
+
+
 def plan_chunk_rows(rows: int, width: int, topk_slots: int, budget_bytes: int) -> int:
     """Rows per logits chunk: stock's budget rule (``_qsa_prefill_row_chunk_size``),
     then rounded down to whole top-k waves when the budget holds at least one."""
@@ -332,7 +374,7 @@ def select_prefill_fast(
         rows,
         width,
         _topk_slots(device_index) if topk_slots is None else topk_slots,
-        _LOGITS_BUDGET_BYTES if budget_bytes is None else budget_bytes,
+        _budget_for(width) if budget_bytes is None else budget_bytes,
     )
     starts = row_starts.to(dtype=torch.int32).contiguous()
     ends = row_ends.to(dtype=torch.int32).contiguous()
@@ -387,7 +429,24 @@ class _ChunkWork:
             q_c = torch.cat([q_c, q_c.new_zeros(pad, *q_c.shape[1:])])
             s_c = torch.cat([s_c, s_c[-1:].expand(pad)])
             e_c = torch.cat([e_c, e_c[-1:].expand(pad)])
-        score_chunk(q_c, self.keys_2d, logits[: n + pad], s_c, e_c, self.width, self.config)
+        out = logits[: n + pad]
+
+        def run_stock():
+            score_chunk(q_c, self.keys_2d, out, s_c, e_c, self.width, self.config)
+
+        if not _scorer_tc.applies(q_c, self.keys_2d):
+            run_stock()
+            return
+
+        def run_tc():
+            _scorer_tc.score(
+                q_c, self.keys_2d, out, s_c, e_c, self.width, _num_sms(q_c.device.index or 0)
+            )
+
+        if _scorer_tc.wants_check():
+            _scorer_tc.check(run_tc, run_stock, out, e_c - s_c, n, self.width)
+        else:
+            run_tc()
 
     def select(self, logits, r0, r1):
         n = r1 - r0
@@ -397,7 +456,10 @@ class _ChunkWork:
 def _topk_impl_for(width: int, impl: str) -> str:
     # No row is longer than the width; rows of 4096 or fewer keys take fast_topk's own
     # select inside qsa_prefill_topk anyway, under its 32-register cap (about 5% slower).
-    return "stock" if impl == "sampled" and width <= _SAMPLED_MIN_KEYS else impl
+    if impl in ("sampled", "half", "onepass") and width <= _SAMPLED_MIN_KEYS:
+        return "stock"
+    # Rows this wide stream faster on 1024 threads than they gain from four blocks per SM.
+    return "sampled" if impl == "half" and width > _HALF_MAX_KEYS else impl
 
 
 @functools.lru_cache(maxsize=None)
@@ -410,12 +472,83 @@ def _topk_launcher(impl: str):
     from sglang.kernels.jit.utils import is_arch_support_pdl, load_jit, make_cpp_args
 
     args = make_cpp_args(is_arch_support_pdl())
+    if impl == "onepass":
+        return _onepass_runner(
+            load_jit(
+                "qsa_topk_onepass",
+                *args,
+                cuda_files=["elementwise/qsa_topk_onepass.cuh"],
+                cuda_wrappers=[("topk", f"QsaTopKOnePassKernel<{args}>::run")],
+            )
+        )
+    if impl == "half":
+        module = load_jit(
+            "qsa_prefill_topk_half",
+            *args,
+            cuda_files=["elementwise/qsa_prefill_topk_half.cuh"],
+            cuda_wrappers=[("topk", f"QsaPrefillTopKHalfKernel<{args}>::run")],
+        )
+
+        def run_half(score, row_starts, indices, lengths):
+            # Per-row flags: 1 where the 1024-thread pass serves the row.
+            fallback = torch.empty(score.shape[0], dtype=torch.int32, device=score.device)
+            module.topk(score, row_starts, indices, lengths, fallback)
+            if _topk_checked[0] < _TOPK_CHECK_CALLS and not torch.cuda.is_current_stream_capturing():
+                _topk_checked[0] += 1
+                ref = torch.empty_like(indices)
+                _topk_launcher("sampled")(score, row_starts, ref, lengths)
+                logger.info(
+                    "QSA prefill top-k half check %d/%d: rows=%d equal=%s fallback_rows=%d",
+                    _topk_checked[0],
+                    _TOPK_CHECK_CALLS,
+                    indices.shape[0],
+                    bool(torch.equal(indices, ref)),
+                    int(fallback.sum()),
+                )
+
+        return run_half
     return load_jit(
         "qsa_prefill_topk",
         *args,
         cuda_files=["elementwise/qsa_prefill_topk.cuh"],
         cuda_wrappers=[("topk", f"QsaPrefillTopKKernel<{args}>::run")],
     ).topk
+
+
+def _onepass_runner(module):
+    def run_onepass(score, row_starts, indices, lengths):
+        # Per-row flags: 1 where the 1024-thread pass serves the row.
+        fallback = torch.empty(score.shape[0], dtype=torch.int32, device=score.device)
+        module.topk(score, row_starts, indices, lengths, fallback)
+        _log_onepass_once(score.shape[0], score.shape[1])
+        if _topk_checked[0] < _TOPK_CHECK_CALLS and not torch.cuda.is_current_stream_capturing():
+            _topk_checked[0] += 1
+            ref = torch.empty_like(indices)
+            _topk_launcher("stock")(score, row_starts, ref, lengths)
+            logger.info(
+                "QSA top-k onepass check %d/%d: rows=%d equal_fast_topk=%s fallback_rows=%d",
+                _topk_checked[0],
+                _TOPK_CHECK_CALLS,
+                indices.shape[0],
+                bool(torch.equal(indices, ref)),
+                int(fallback.sum()),
+            )
+
+    return run_onepass
+
+
+_onepass_logged = [False]
+
+
+def _log_onepass_once(rows: int, width: int) -> None:
+    if _onepass_logged[0]:
+        return
+    _onepass_logged[0] = True
+    logger.info(
+        "QSA top-k onepass: on (qsa_topk_onepass.cuh, fast_topk's output), first call rows=%d width=%d",
+        rows,
+        width,
+    )
 
 
 def _expand_into(qsa_kernel, block_indices, query_positions, sequence_lengths, output,

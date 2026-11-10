@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 # Vendored from flashinfer-ai/flashinfer PR #4266 at 629147317d4149a12e53bcef27808bac380c283f.
+# With FlashInfer #7443 (854a896b3f, first released in v0.7.3) applied: the TMEM release waits for the barrier's
+# phase 0, the owner reads the peers' partials at .acquire.cluster, and tcgen05 fences order the TMEM hand-offs.
 """Blackwell low-M BF16/FP16 GEMM with an in-kernel cluster split-K reduction.
 
 Each cluster rank accumulates an exact K slice in FP32. Peers publish partials
@@ -41,7 +43,7 @@ _SUPPORTED_MMA_N = (8, 16, 32)
 #: Physical cluster-K sizes; split 1 compiles out the DSMEM path.
 _SUPPORTED_SPLIT_K = (1, 2, 3, 4, 8, 16)
 
-#: Largest public M this low-M policy serves.
+#: Largest public M this low-M policy serves; a caller may raise it (``max_m``), the grid tiles public M.
 _MAX_M = 32
 
 #: Bytes per FP32 partial exchanged through DSMEM.
@@ -134,6 +136,7 @@ def validate_tactic(
     k: int,
     *,
     smem_capacity: int = _SMEM_CAPACITY_BYTES,
+    max_m: int = _MAX_M,
 ) -> None:
     """Reject a tactic that cannot serve ``(m, n, k)``."""
     if tactic.mma_m not in _SUPPORTED_MMA_M:
@@ -147,8 +150,10 @@ def validate_tactic(
             f"ab_stages must be in [{_MIN_AB_STAGES}, {_MAX_AB_STAGES}], "
             f"got {tactic.ab_stages}"
         )
-    if not 1 <= m <= _MAX_M:
-        raise ValueError(f"this low-M policy requires 1 <= M <= {_MAX_M}, got {m}")
+    if not 1 <= m <= max(max_m, _MAX_M):
+        raise ValueError(
+            f"this low-M policy requires 1 <= M <= {max(max_m, _MAX_M)}, got {m}"
+        )
     if n <= 0:
         raise ValueError(f"N must be positive, got {n}")
     if k <= 0 or k % _CTA_K or (k // _CTA_K) % tactic.split_k:
@@ -274,6 +279,55 @@ def _store_shared_remote_v4(
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _mbarrier_wait_acquire_cluster(
+    mbar_ptr: "cute.Pointer",
+    phase: "Int32",
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """``cute.arch.mbarrier_wait`` with ``.acquire.cluster`` semantics.
+
+    The peers' ``st.async`` complete-tx operations release at cluster scope; the
+    default ``.acquire.cta`` wait does not synchronize with other CTAs' threads.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            mbar_ptr.toint(loc=loc, ip=ip).ir_value(),
+            phase.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
+        "P1, [$0], $1, 10000000;\n\t"
+        "@P1 bra DONE;\n\tbra LAB_WAIT;\n\tDONE:\n\t}",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _tcgen05_fence(*, before: bool, loc=None, ip=None) -> None:
+    """``tcgen05.fence::{before,after}_thread_sync`` around an mbarrier hand-off of
+    tcgen05 work (PTX ISA canonical tcgen05 synchronization patterns)."""
+    llvm.inline_asm(
+        None,
+        [],
+        f"tcgen05.fence::{'before' if before else 'after'}_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -672,6 +726,7 @@ class SplitKDenseGemmKernel:
     ):
         num_tmem_cols = 256
         cute.arch.alloc_tmem(num_tmem_cols, tmem_base_ptr, is_two_cta=False)
+        _tcgen05_fence(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
 
@@ -682,6 +737,7 @@ class SplitKDenseGemmKernel:
         for k_tile in cutlass.range(k_tile_count, unroll=1):
             stage = k_tile % self.num_ab_stage
             cute.arch.mbarrier_wait(bar_full + stage, full_phase)
+            _tcgen05_fence(before=False)
             for k_block in range(mma_inst_tile_k):
                 if k_block == 0:
                     mma_atom.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
@@ -700,8 +756,13 @@ class SplitKDenseGemmKernel:
 
         with cute.arch.elect_one():
             tcgen05.commit(bar_mma_epilog, None, self.cta_group)
+        # The release arrival must land in phase 1. Made while phase 0 is still
+        # open, it counts toward phase 0, and the parity-1 wait can then pass
+        # before the epilogue has read TMEM.
+        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
+        _tcgen05_fence(before=False)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=False)
 
     @cute.experimental.jit
@@ -729,6 +790,7 @@ class SplitKDenseGemmKernel:
         # Wait until MMA publishes the TMEM base pointer.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
+        _tcgen05_fence(before=False)
 
         acc_view = cute.make_tensor(
             cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr),
@@ -792,9 +854,11 @@ class SplitKDenseGemmKernel:
                 rBiasAcc.store(rBias.load().to(self.acc_dtype))
 
         cute.arch.mbarrier_wait(bar_mma_epilog, 0)
+        _tcgen05_fence(before=False)
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
         # Make tcgen05.ld visible before TMEM release and RMEM use.
         cute.arch.fence_view_async_tmem_load()
+        _tcgen05_fence(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
 
         # Peers publish FP32 partials; only rank 0 reduces and stores.
@@ -825,7 +889,7 @@ class SplitKDenseGemmKernel:
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bar_reduce, self.expected_transaction_bytes
                     )
-                cute.arch.mbarrier_wait(bar_reduce, 0)
+                _mbarrier_wait_acquire_cluster(bar_reduce, Int32(0))
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
                         rAcc[value_idx] = (
@@ -1183,9 +1247,11 @@ def run_splitk_dense_silu(
     pdl: bool,
     tactic: SplitKTactic,
     scale: float,
+    *,
+    max_m: int = _MAX_M,
 ):
     """Run ``bf16(silu(scale * (A[M,K] @ B[K,N])))``."""
-    validate_tactic(tactic, *_validate_runtime_tensors(a, b, None, out))
+    validate_tactic(tactic, *_validate_runtime_tensors(a, b, None, out), max_m=max_m)
     cute_tensors = _to_cute_swap(a, b, out, None)
     compiled = _get_compiled_splitk_kernel(
         dtype=a.dtype,

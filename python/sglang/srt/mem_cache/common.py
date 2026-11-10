@@ -357,6 +357,13 @@ def backup_kv_cache(
         device = token_to_kv_pool_allocator.get_kvcache().device
         torch.get_device_module(device).synchronize(device)
         return True
+    from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+        gdn_ucache_blocks_state_backup,
+    )
+
+    state = token_to_kv_pool_allocator.state
+    if state is not None and gdn_ucache_blocks_state_backup(state.pool):
+        return False
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True

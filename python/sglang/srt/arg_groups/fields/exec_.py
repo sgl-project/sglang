@@ -607,16 +607,17 @@ class ExecMamba(msgspec.Struct):
         "the per-step fold (16-bit ring records, one rounding per fold). Requires "
         "a GDN hybrid model, a linear draft chain with at most 8 draft tokens "
         "(in every --speculative-adaptive tier), "
-        "--mamba-ssm-dtype float16. With the radix cache, decode-time states "
-        "are cached through --mamba-radix-cache-strategy extra_buffer or "
-        "extra_buffer_lazy (each crossing writes FlashInfer's "
-        "gdn_prefix_materialize fold of the window into the track slot), or "
+        "--mamba-ssm-dtype float16. With the radix cache (aggregated serving "
+        "only), decode-time states are cached through --mamba-radix-cache-strategy "
+        "extra_buffer or extra_buffer_lazy (each crossing writes FlashInfer's "
+        "gdn_prefix_materialize fold of the window into the track slot; not with "
+        "SGLANG_ENABLE_GDN_UCACHE_REQUEST_RINGS or _FP16_KEY_RING), or "
         "--radix-cache-skip-decode-insert caches prompt prefixes only; no_buffer "
         "decode inserts are refused. With decode inserts on, sets "
         "GDN_UCACHE_STATE_DTYPE=fp16 for FlashInfer and refuses another value. "
         "Refuses mixed chunk, streaming sessions, unified memory, int8 "
-        "mamba checkpoints, HiCache, LMCache and PD disaggregation; needs "
-        "FlashInfer >= 0.7.3.",
+        "mamba checkpoints and PD disaggregation (except a "
+        "decode role under SGLANG_ENABLE_GDN_UCACHE_PD); needs FlashInfer >= 0.7.3.",
     ] = False
 
 

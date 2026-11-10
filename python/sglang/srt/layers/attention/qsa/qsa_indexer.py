@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_pending_ring_slots,
     build_rope_position_matrix,
 )
+from sglang.srt.layers.attention.qsa import verify_topk
 from sglang.srt.layers.attention.qsa.mqa import (
     HAS_TILELANG,
     _positive_env_int,
@@ -45,6 +46,52 @@ from sglang.srt.utils import is_sm100_supported
 
 logger = logging.getLogger(__name__)
 
+# SGLANG_QSA_PREFILL_TOPK_BRIDGE_DIRECT (default off): the breakable prefill graph's top-k bridge
+# (models/qwen4_exp.py _breakable_qsa_indexer) lends its rows to the next prefill selection, which
+# writes them in place of a new tensor, so the bridge's full fill and its [rows, 2051] int32 D2D copy
+# are skipped. One shot: the bridge is taken by the first select_prefill_tokens call inside
+# prefill_topk_output() or by none. Same kernels, same values: bitwise.
+QSA_PREFILL_TOPK_BRIDGE_DIRECT = os.environ.get(
+    "SGLANG_QSA_PREFILL_TOPK_BRIDGE_DIRECT", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+_PREFILL_TOPK_OUT: list = [None]
+
+
+class prefill_topk_output:
+    """Offer ``buffer`` (int32 [>= rows, token_topk + compress_ratio - 1], unit last stride) to the
+    next select_prefill_tokens call; withdrawn on exit whether taken or not."""
+
+    __slots__ = ("_buffer",)
+
+    def __init__(self, buffer: torch.Tensor):
+        self._buffer = buffer
+
+    def __enter__(self):
+        _PREFILL_TOPK_OUT[0] = self._buffer
+        return self
+
+    def __exit__(self, *exc):
+        _PREFILL_TOPK_OUT[0] = None
+        return False
+
+
+def _take_prefill_topk_output(rows: int, width: int, device) -> Optional[torch.Tensor]:
+    buffer = _PREFILL_TOPK_OUT[0]
+    if buffer is None:
+        return None
+    _PREFILL_TOPK_OUT[0] = None
+    if (
+        buffer.dtype != torch.int32
+        or buffer.dim() != 2
+        or buffer.shape[0] < rows
+        or buffer.shape[1] != width
+        or buffer.stride(1) != 1
+        or buffer.device != device
+    ):
+        return None
+    view = buffer[:rows]
+    return view if view.is_contiguous() else None
+
 # Decode/verify indexer fast paths (both exact; set to 0 to run the stock kernels):
 # SGLANG_QSA_GROUPED_SCORE scores a request's target-verify rows from one load of
 # each compressed key tile (bit-identical logits) for batches of 1-16 requests;
@@ -57,6 +104,7 @@ _QSA_GROUPED_SCORE_MAX_REQUESTS = _positive_env_int(
     envs.SGLANG_QSA_GROUPED_SCORE_MAX_REQUESTS
 )
 _QSA_GROUPED4_DRAFT_EXTEND = envs.SGLANG_ENABLE_QSA_GROUPED4_DRAFT_EXTEND.get()
+_QSA_DRAFT_EXTEND_UNION = envs.SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION.get()
 _QSA_SPLIT_TOPK_MAX_ROWS = 64
 
 
@@ -78,6 +126,20 @@ def _log_grouped_cap_once(requests: int) -> None:
         requests,
         _QSA_GROUPED_SCORE_MAX_REQUESTS,
     )
+
+
+# Decode/verify selection paths ("mk_score", "split_topk") that have logged their first use
+# (at graph capture); log only, so a run can confirm its small-batch path stayed on.
+_DECODE_PATH_LOGGED: set = set()
+
+
+def _log_decode_path_once(path: str, rows: int) -> None:
+    if path in _DECODE_PATH_LOGGED:
+        return
+    _DECODE_PATH_LOGGED.add(path)
+    name = {"mk_score": "SGLANG_Q38C_MK_QSA (score megakernel)",
+            "split_topk": "SGLANG_QSA_SPLIT_TOPK (split top-k)"}[path]
+    logger.info("QSA decode path engaged: %s, rows=%d", name, rows)
 
 
 _QSA_SHADOW_STATS = {"calls": 0, "rows": 0, "grouped_calls": 0, "logit_rows_diff": 0,
@@ -732,11 +794,19 @@ class QSAIndexer(MultiPlatformOp):
         top-k reads only each row's own section and returns indices relative to
         the row's start either way."""
         rows = q.shape[0]
-        output = torch.empty(
-            (rows, self.token_topk + self.compress_ratio - 1),
-            dtype=torch.int32,
-            device=q.device,
+        output = (
+            _take_prefill_topk_output(
+                rows, self.token_topk + self.compress_ratio - 1, q.device
+            )
+            if _PREFILL_TOPK_OUT[0] is not None
+            else None
         )
+        if output is None:
+            output = torch.empty(
+                (rows, self.token_topk + self.compress_ratio - 1),
+                dtype=torch.int32,
+                device=q.device,
+            )
         if rows == 0:
             return output
         if _QSA_PREFILL_FAST_SELECT:
@@ -831,6 +901,7 @@ class QSAIndexer(MultiPlatformOp):
         rows_per_group: int = 1,
         return_logits: bool = False,
         grouped4_only: bool = False,
+        sampled_verify_topk: bool = False,
     ) -> torch.Tensor:
         # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
         # their scores, and never reads past a row's length.
@@ -856,6 +927,8 @@ class QSAIndexer(MultiPlatformOp):
         if score_q4_requests is not None and not is_batch_invariant_mode_enabled():
             if use_mk:
                 from sglang.kernels.ops.attention.q38_mk_score import score_mk as score_q4
+
+                _log_decode_path_once("mk_score", q.shape[0])
             else:
                 from sglang.kernels.ops.attention.q38_score_q4 import score_q4
 
@@ -890,11 +963,14 @@ class QSAIndexer(MultiPlatformOp):
                 and _qsa_env_flag("SGLANG_QSA_SPLIT_TOPK")
                 and split_topk_supported(logits, self.block_topk)
             ):
+                _log_decode_path_once("split_topk", logits.shape[0])
                 block_indices = split_fast_topk(
                     logits,
                     compressed_lengths.to(torch.int32),
                     topk=self.block_topk,
                 )
+            elif sampled_verify_topk and not use_mk:
+                block_indices = verify_topk.select(logits, compressed_lengths.to(torch.int32))
             else:
                 if use_mk:
                     from sglang.kernels.ops.attention.q38_mk_topk import topk_mk as fast_topk
@@ -1189,6 +1265,12 @@ class QSAIndexer(MultiPlatformOp):
                 score_q4_requests=score_q4_requests,
                 rows_per_group=rows_per_group,
                 grouped4_only=grouped4_only,
+                # SGLANG_QSA_VERIFY_TOPK=sampled: fast_topk's exact output, faster at verify rows;
+                # SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION takes it for the grouped4 draft extend too.
+                sampled_verify_topk=(
+                    (is_target_verify and rows_per_group > 1 and verify_topk.MODE == "sampled")
+                    or (_QSA_DRAFT_EXTEND_UNION and grouped4_only)
+                ),
             )
 
             q_ref = self._qpf_shadow_q_ref

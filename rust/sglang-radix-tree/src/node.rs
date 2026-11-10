@@ -189,6 +189,12 @@ pub struct Node<K: ChildKeyType> {
     pub rotation_base: Option<i64>,
     /// The in-flight write-through backup's ack id.
     pub write_through_pending_id: Option<usize>,
+    /// Queued for its demote by the running write-back eviction walk.
+    pub write_back_queued: bool,
+    /// The access tick at which the controller marked the node host
+    /// evict-first; the mark holds while `last_access_counter` still equals it,
+    /// so any later access (match, insert, split) clears it.
+    pub host_evict_first_at: Option<i64>,
     /// Load-back anchor currently reading this node's Full host slots.
     /// Auxiliary transfers are protected by their component locks.
     pub load_back_pending_id: Option<NodeId>,
@@ -426,6 +432,8 @@ impl<K: ChildKeyType> Node<K> {
             external_cache_stored: false,
             rotation_base: None,
             write_through_pending_id: None,
+            write_back_queued: false,
+            host_evict_first_at: None,
             load_back_pending_id: None,
             last_access_counter: 0,
             creation_counter: 0,
@@ -453,6 +461,8 @@ impl<K: ChildKeyType> Node<K> {
             external_cache_stored: false,
             rotation_base: None,
             write_through_pending_id: None,
+            write_back_queued: false,
+            host_evict_first_at: None,
             load_back_pending_id: None,
             last_access_counter: 0,
             creation_counter: 0,
@@ -1185,6 +1195,11 @@ impl<K: ChildKeyType> NodeArena<K> {
             node.values[ct.idx()].lock_ref = 1;
         }
         idx
+    }
+
+    /// Whether the slot holds a live node.
+    pub fn is_allocated(&self, id: NodeIdx_) -> bool {
+        self.nodes.get(id.0).is_some_and(Option::is_some)
     }
 
     /// Every live node id, in slot order.

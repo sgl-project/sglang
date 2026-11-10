@@ -326,6 +326,36 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     unified_total_bytes: Optional[int] = None
 
 
+def host_only_mamba_checkpoint() -> bool:
+    """Radix mamba checkpoints stay in the hicache host pool.
+
+    Set ``SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT``. Off keeps the donated GPU slot.
+    (Backport of sglang#44718; the KDA ReplaySSM request ring is not carried.)
+    """
+    enabled = envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get()
+    if not enabled:
+        return False
+    if not get_memory().enable_hierarchical_cache:
+        raise ValueError(
+            "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT requires "
+            "--enable-hierarchical-cache: the checkpoint is stored in the "
+            "host mamba pool."
+        )
+    if get_exec().mamba.enable_int8_mamba_checkpoint:
+        raise ValueError(
+            "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT is not supported together "
+            "with --enable-int8-mamba-checkpoint."
+        )
+    if get_memory().enable_unified_memory:
+        # The checkpoint copy runs outside the write-ack queue that pins
+        # unified-memory state slots against relocation.
+        raise ValueError(
+            "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT is not supported together "
+            "with --enable-unified-memory."
+        )
+    return True
+
+
 @dataclass(slots=True, kw_only=True)
 class KVCacheConfigurator:
     device: str
@@ -1482,6 +1512,7 @@ class KVCacheConfigurator:
                     or self.hybrid_kda_config is not None
                 )
             ),
+            enable_gdn_replayssm_ucache=self._gdn_replayssm_ucache_active(),
         )
         return req_to_token_pool
 
@@ -2882,6 +2913,21 @@ class KVCacheConfigurator:
         if get_memory().disable_radix_cache:
             return 1
 
+        # Host-only checkpoints keep the live slot plus the ping-pong slots
+        # the extra-buffer kernel writes. They do not keep a donate slot.
+        if host_only_mamba_checkpoint():
+            minimum_ratio = 2 if get_memory().radix_cache_skip_decode_insert else 1
+            if not get_exec().mamba.enable_mamba_extra_buffer:
+                return minimum_ratio
+            return max(
+                minimum_ratio,
+                1 + get_mamba_tracking_slots(
+                    extra_buffer=True,
+                    overlap=not get_schedule().disable_overlap_schedule,
+                    lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+                ),
+            )
+
         if get_memory().radix_cache_skip_decode_insert:
             # Running requests retain the live state and one protected prefix.
             return 2
@@ -3058,7 +3104,31 @@ class KVCacheConfigurator:
             )
         return config
 
+    def _gdn_ucache_request_rings(self) -> bool:
+        # MambaPool._allocate_gdn_ucache reads the same switch (gdn_ucache_request_rings).
+        return (
+            self._gdn_replayssm_ucache_active()
+            and envs.SGLANG_ENABLE_GDN_UCACHE_REQUEST_RINGS.get()
+        )
+
     def _gdn_ucache_ring_bytes_per_slot(self, config, pp_layer_scale: float) -> int:
+        """The u-cache rings' bytes per Mamba slot (0 when they are sized by request row)."""
+        if self._gdn_ucache_request_rings():
+            return 0
+        return self._gdn_ucache_ring_bytes_per_row(config, pp_layer_scale)
+
+    def _gdn_ucache_ring_fixed_bytes(self, config, pp_layer_scale: float) -> int:
+        """The u-cache rings' bytes when they are request scratch: one row per request-table
+        row (max running requests + 1, plus a PD decode's pre-allocation rows)."""
+        if not self._gdn_ucache_request_rings():
+            return 0
+        rows = max(1, get_schedule().max_running_requests // self.attn_dp_size) + 1
+        disagg = get_disagg()
+        if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
+            rows += disagg.disaggregation_decode_extra_slots or 0
+        return self._gdn_ucache_ring_bytes_per_row(config, pp_layer_scale) * rows
+
+    def _gdn_ucache_ring_bytes_per_row(self, config, pp_layer_scale: float) -> int:
         if not self._gdn_replayssm_ucache_active():
             return 0
         from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
@@ -3138,6 +3208,9 @@ class KVCacheConfigurator:
         else:
             replayssm_fixed_bytes = 0
             replayssm_ring_per_slot = replayssm_ring_per_req
+        replayssm_fixed_bytes += self._gdn_ucache_ring_fixed_bytes(
+            config, pp_layer_scale
+        )
         ucache_active = self._gdn_replayssm_ucache_active()
         extra_per_slot = (
             replayssm_ring_per_slot

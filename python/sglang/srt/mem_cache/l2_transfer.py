@@ -44,6 +44,8 @@ class L2Transfer(NamedTuple):
     # Controller ids -> the rows the device pool indexes (a unified sub-pool's
     # id space); None when they index it as they are.
     device_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    # A request's recurrent state (the Mamba pool); a state-first load issues it first.
+    restores_state: bool = False
 
 
 class TransferCompletion(NamedTuple):
@@ -179,7 +181,11 @@ class L2TransferEngine:
         transfer_layer_id_max: int,
         start_event=None,
         on_layer_done=None,
+        on_state_done=None,
     ) -> TransferCompletion:
+        """With `on_state_done`, every state transfer's layers are issued first and
+        `on_state_done` runs after them (at once when there is none); `on_layer_done(i)`
+        still follows layer i of every transfer, since the stream runs in issue order."""
         stream = (
             device_module.current_stream()
             if self._h2d_on_current_stream
@@ -191,32 +197,46 @@ class L2TransferEngine:
         ):
             primary = transfers[0] if transfers else None
             delay_cycles = envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.get()
+            # Without a state transfer the state part needs no wait: done at once.
+            state_first = on_state_done is not None
+            if state_first:
+                for layer_id in range(transfer_layer_id_max):
+                    for transfer in transfers:
+                        if transfer.restores_state:
+                            self._load_layer(transfer, layer_id, primary=primary)
+                on_state_done()
             for layer_id in range(transfer_layer_id_max):
                 if delay_cycles:
                     torch.cuda._sleep(delay_cycles)
                 for transfer in transfers:
-                    local_layer_id = (
-                        transfer.layer_mapper(layer_id)
-                        if transfer.layer_mapper is not None
-                        else layer_id
-                    )
-                    if local_layer_id is None or (
-                        transfer is not primary
-                        and transfer.layer_mapper is None
-                        and layer_id >= transfer.host_pool.layer_num
-                    ):
-                        continue
-                    transfer.host_pool.load_to_device_per_layer_physical(
-                        transfer.device_pool,
-                        transfer.host_indices,
-                        transfer.device_indices,
-                        local_layer_id,
-                        self.io_backend,
-                        is_draft=transfer.is_draft,
-                    )
+                    if not (state_first and transfer.restores_state):
+                        self._load_layer(transfer, layer_id, primary=primary)
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
         return completion
+
+    def _load_layer(
+        self, transfer: L2Transfer, layer_id: int, *, primary: Optional[L2Transfer]
+    ) -> None:
+        local_layer_id = (
+            transfer.layer_mapper(layer_id)
+            if transfer.layer_mapper is not None
+            else layer_id
+        )
+        if local_layer_id is None or (
+            transfer is not primary
+            and transfer.layer_mapper is None
+            and layer_id >= transfer.host_pool.layer_num
+        ):
+            return
+        transfer.host_pool.load_to_device_per_layer_physical(
+            transfer.device_pool,
+            transfer.host_indices,
+            transfer.device_indices,
+            local_layer_id,
+            self.io_backend,
+            is_draft=transfer.is_draft,
+        )
 
     @staticmethod
     def _start_event(start_event):

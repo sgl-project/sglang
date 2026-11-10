@@ -28,6 +28,7 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import logging
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -91,6 +92,22 @@ _skip_attn_backend_init_warned = False
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_hip = is_hip()
+
+logger = logging.getLogger(__name__)
+_mrope_text_device_logged = False
+
+
+def _log_mrope_text_device_once(num_requests: int, num_tokens: int) -> None:
+    """Engagement line for SGLANG_ENABLE_MROPE_TEXT_DEVICE_POSITIONS (once per process)."""
+    global _mrope_text_device_logged
+    if not _mrope_text_device_logged:
+        _mrope_text_device_logged = True
+        logger.info(
+            "SGLANG_ENABLE_MROPE_TEXT_DEVICE_POSITIONS: text-only extend mrope rows "
+            "built on the device (first: %d requests, %d tokens)",
+            num_requests,
+            num_tokens,
+        )
 
 
 def _build_forward_token_modalities(
@@ -1754,6 +1771,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or positions.numel() != sum(extend_lens)
         ):
             return None
+        _log_mrope_text_device_once(len(extend_lens), positions.numel())
         return positions.to(torch.int64).unsqueeze(0).repeat(3, 1)
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):

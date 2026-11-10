@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
 import threading
 import time
 from array import array
@@ -30,6 +31,7 @@ from sglang.srt.managers.scheduler_components.shm_tag_exchange import (
     get_shm_exchange,
     set_recv_piggyback,
 )
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import (
     page_interleave_shard_size,
 )
@@ -56,6 +58,10 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     PoolBeliefPolicy,
     StorageExistenceCache,
     default_belief_policy,
+)
+from sglang.srt.mem_cache.cache_residency import (
+    CacheResidency,
+    SubagentEvictFirstTracker,
 )
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
@@ -104,6 +110,7 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     create_tree_core,
     select_tree_core_backend,
 )
+from sglang.srt.mem_cache import write_back_order as _write_back_order
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
@@ -173,6 +180,14 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
 _HC_PIGGYBACK = envs.SGLANG_PERFLL_HOST_HC_PIGGYBACK.get()
+# SGLANG_HICACHE_GROUPED_DEVICE_FREES (default off): a tree step's, or a write-back batch's,
+# page-exact token-KV frees go to the paged allocator as one segment (their concatenation,
+# last first) instead of one floor-divide + cat pair per segment. Every page is still released once and the free list
+# ends in the same order as the per-segment frees leave it.
+_GROUPED_DEVICE_FREES = os.environ.get(
+    "SGLANG_HICACHE_GROUPED_DEVICE_FREES", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+_GROUPED_DEVICE_FREES_LOGGED = [False]
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -209,6 +224,14 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    # Opt-in residency switches (cache_residency.py); init_hicache sets them.
+    _residency: Optional[CacheResidency] = None
+    _keep_backed_mamba_states = False
+    _batched_write_back_eviction = False
+    _subagents: Optional[SubagentEvictFirstTracker] = None
+    # Durations of write-back copies acknowledged on submit, observed once they land.
+    _wb_pending_timings: Optional[_write_back_order.PendingTimings] = None
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -455,7 +478,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
-        self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
+        self.ongoing_load_back: dict[
+            int, _OngoingLoadBack | list[_OngoingLoadBack]
+        ] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
         self.prefetch_loaded_storage_start_by_reqid: dict[CacheRequestHandle, int] = {}
@@ -602,6 +627,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+        self._init_cache_residency()
+        if self._mamba_host_only_checkpoint():
+            self.components[ComponentType.MAMBA].log_host_only_engagement(
+                device_kv_tokens=self.token_to_kv_pool_allocator.size_full,
+                is_write_back=self.is_write_back,
+            )
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
@@ -621,6 +652,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 enable_storage_metrics=self._enable_metrics_flag,
                 extra_metric_labels=self.extra_metric_labels,
             )
+
+    def _init_cache_residency(self) -> None:
+        """Read the opt-in residency switches; see cache_residency.py."""
+        self._residency = CacheResidency(
+            tree_core=self.tree_core, is_write_back=self.is_write_back
+        )
+        self._keep_backed_mamba_states = self._residency.keep_backed_mamba_states
+        self._batched_write_back_eviction = self._residency.batched_write_back_eviction
+        self._subagents = self._residency.subagents
 
     def register_sidecar_pool(
         self, spec: SidecarPoolSpec, entry: Optional[PoolEntry] = None
@@ -642,6 +682,8 @@ class UnifiedRadixCache(BasePrefixCache):
         same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        if self._subagents is not None and params.req is not None:
+            self._subagents.on_admit(params.req)
         result = self.session.try_match_prefix(params)
         if result is not None:
             return result
@@ -744,6 +786,10 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         if self.disable:
             return EvictResult()
+        if params.mamba_num > 0 and self._mamba_host_only_checkpoint():
+            # Host-only keeps no device Mamba state in the tree, so the slots a finished
+            # request parked (its checkpoint still copying to host) are the only reclaim.
+            self.components[ComponentType.MAMBA].reap_parked_slots(force=True)
         if allocation_reclaim_satisfied is not None:
             return self._evict(
                 params, allocation_reclaim_satisfied=allocation_reclaim_satisfied
@@ -867,6 +913,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Report full-layer tokens only
         self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
+        if self._residency is not None:
+            self._residency.maybe_log()
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(self.slot_id(TREE_WINDOW), 0),
@@ -1057,23 +1105,198 @@ class UnifiedRadixCache(BasePrefixCache):
                 walk_quota = max(
                     request_cnt, tracker[ct] + self.tree_core.full_evictable_size()
                 )
-            self.tree_core.evict_device_start(ct, walk_quota)
-            try:
-                while True:
-                    node_id, made_progress = self._evict_device_next_node(ct, tracker)
-                    if node_id is None:
-                        if not made_progress:
-                            break
+            if not self._batched_write_back_eviction:
+                self._evict_device_walk_per_victim(
+                    ct, walk_quota, tracker, target_reached
+                )
+                continue
+            self._evict_device_walk(
+                ct,
+                walk_quota,
+                request_cnt,
+                tracker,
+                target_reached,
+                available_size_targets,
+                allocation_reclaim_satisfied,
+            )
+
+    def _evict_device_walk_per_victim(
+        self,
+        ct: ComponentType,
+        walk_quota: int,
+        tracker: dict[ComponentType, int],
+        target_reached: Callable[[ComponentType], bool],
+    ) -> None:
+        """One device-eviction walk that waits for each write-back victim's
+        copy before its demote (the walk SGLANG_HICACHE_WRITE_BACK_BATCHED_EVICTION
+        replaces)."""
+        self.tree_core.evict_device_start(ct, walk_quota)
+        try:
+            while True:
+                node_id, made_progress = self._evict_device_next_node(ct, tracker)
+                if node_id is None:
+                    if not made_progress:
+                        break
+                else:
+                    if self._copy_state_before_demote(node_id):
+                        self.writing_check(write_back=True)
+                    backup_kv = self._evict_device_leaf(node_id, tracker)
+                if node_id is not None and backup_kv is not None:
+                    # Deferred demote: run the D->H backup, demote only on success.
+                    written = self._execute_and_commit_kv_backup(
+                        backup_kv, write_back=True
+                    )
+                    if written > 0:
+                        self.writing_check(write_back=True)
+                        self._demote(node_id, tracker)
+                    elif self._drop_subtree_no_host(node_id, tracker):
+                        logger.warning(
+                            "write_back: KV subtree dropped without backup "
+                            "due to host memory pressure, root node %d",
+                            node_id,
+                        )
                     else:
-                        backup_kv = self._evict_device_leaf(node_id, tracker)
-                    if node_id is not None and backup_kv is not None:
-                        # Deferred demote: run the D->H backup, demote only on success.
+                        logger.warning(
+                            "write_back: backup failed under host memory "
+                            "pressure but subtree drop declined (node "
+                            "locked); root node %d stays device-resident "
+                            "until host space frees",
+                            node_id,
+                        )
+                if target_reached(ct):
+                    break
+        finally:
+            self.tree_core.evict_device_end(ct)
+
+    def _copy_state_before_demote(self, node_id: NodeId) -> bool:
+        """SGLANG_HICACHE_KEEP_BACKED_MAMBA_STATES: queue the host copy of a
+        backed-up leaf's device-only Mamba state, which its demote would drop.
+        Returns whether a copy was queued; the caller lands it before the demote."""
+        if not self._keep_backed_mamba_states:
+            return False
+        if not self.tree_core.needs_state_backup_before_demote(node_id):
+            return False
+        state_slot = self.slot_id(TREE_STATE)
+        mamba_host_pool = self.host_pool_group.get_pool(PoolName.MAMBA)
+        if mamba_host_pool is not None and mamba_host_pool.available_size() < 1:
+            self.evict_host(1, state_slot)
+        if self.ongoing_write_through.get(node_id) is not None:
+            # An earlier copy of this node is still in flight; land it first.
+            self.writing_check(write_back=True)
+        # No Full tokens to copy (already on host): the spec carries the state only.
+        self._execute_and_commit_kv_backup(
+            BackupKV(node_ids=[node_id]), write_back=True
+        )
+        queued = node_id in self.ongoing_write_through
+        self._residency.counts[
+            "state_copies_before_demote" if queued else "state_copy_failures"
+        ] += 1
+        self._residency.note_once(
+            "state_before_demote",
+            "SGLANG_HICACHE_KEEP_BACKED_MAMBA_STATES: first Mamba state copied to "
+            "host before the demote of a backed-up node (node %d, queued %s)",
+            node_id,
+            queued,
+        )
+        return queued
+
+    def _write_back_batch_tokens(
+        self,
+        ct: ComponentType,
+        request_cnt: int,
+        tracker: dict[ComponentType, int],
+        available_size_targets: Optional[
+            dict[ComponentType, tuple[ComponentType, int]]
+        ],
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]],
+    ) -> int:
+        """Full tokens the walk may leave queued before demoting; 0 (demote
+        per victim) when its target is only observable after each demote."""
+        if ct != BASE_COMPONENT_TYPE or allocation_reclaim_satisfied is not None:
+            return 0
+        need = request_cnt - tracker[ct]
+        target = (available_size_targets or {}).get(ct)
+        if target is not None:
+            target_component, target_size = target
+            if target_component != ct:
+                return 0
+            need = min(need, target_size - self._component_available_size(ct))
+        return max(need, 0)
+
+    def _evict_device_walk(
+        self,
+        ct: ComponentType,
+        walk_quota: int,
+        request_cnt: int,
+        tracker: dict[ComponentType, int],
+        target_reached: Callable[[ComponentType], bool],
+        available_size_targets: Optional[
+            dict[ComponentType, tuple[ComponentType, int]]
+        ],
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]],
+    ) -> None:
+        """One device-eviction walk: write-back victims queue their copies and
+        demotes, then one wait lands the batch. Queued victims count as
+        evicted, so the walk takes the per-victim walk's victims in its order.
+        One decision can differ: a queued victim's fresh host copy is not
+        host-evictable until its demote, so a later victim's host eviction
+        takes another entry."""
+        pending: list[NodeId] = []
+        pending_tokens = 0
+
+        def batch_need() -> int:
+            return self._write_back_batch_tokens(
+                ct,
+                request_cnt,
+                tracker,
+                available_size_targets,
+                allocation_reclaim_satisfied,
+            )
+
+        def demote_queued() -> None:
+            nonlocal pending_tokens
+            self._demote_backed_up(pending, tracker)
+            pending_tokens = 0
+
+        self.tree_core.evict_device_start(ct, walk_quota)
+        try:
+            while True:
+                # Queued victims count as evicted toward the walk's quota.
+                tracker[ct] += pending_tokens
+                node_id, made_progress = self._evict_device_next_node(ct, tracker)
+                tracker[ct] -= pending_tokens
+                if node_id is None:
+                    if not made_progress:
+                        break
+                elif self._copy_state_before_demote(node_id):
+                    # The state's copy rides this batch's wait, like a fresh victim's.
+                    pending.append(node_id)
+                    pending_tokens += self.tree_core.mark_write_back_queued(
+                        node_id,
+                        self.ongoing_write_through[node_id].publish_node_ids,
+                    )
+                elif pending and self.tree_core.is_backuped(node_id):
+                    pending.append(node_id)
+                    pending_tokens += self.tree_core.mark_write_back_queued(node_id)
+                else:
+                    backup_kv = self._evict_device_leaf(node_id, tracker)
+                    if backup_kv is not None:
                         written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
                         )
+                        if written == 0 and pending:
+                            # Make the queued victims host-evictable, as the
+                            # per-victim walk would have by now, and retry once.
+                            demote_queued()
+                            written = self._execute_and_commit_kv_backup(
+                                backup_kv, write_back=True
+                            )
                         if written > 0:
-                            self.writing_check(write_back=True)
-                            self._demote(node_id, tracker)
+                            pending.append(node_id)
+                            pending_tokens += self.tree_core.mark_write_back_queued(
+                                node_id,
+                                self.ongoing_write_through[node_id].publish_node_ids,
+                            )
                         elif self._drop_subtree_no_host(node_id, tracker):
                             logger.warning(
                                 "write_back: KV subtree dropped without backup "
@@ -1088,10 +1311,66 @@ class UnifiedRadixCache(BasePrefixCache):
                                 "until host space frees",
                                 node_id,
                             )
-                    if target_reached(ct):
-                        break
+                if pending and pending_tokens >= batch_need():
+                    demote_queued()
+                if not pending and target_reached(ct):
+                    break
+        finally:
+            try:
+                self._demote_backed_up(pending, tracker)
             finally:
                 self.tree_core.evict_device_end(ct)
+
+    def _demote_backed_up(
+        self, node_ids: list[NodeId], tracker: dict[ComponentType, int]
+    ) -> None:
+        """Wait once for the queued copies, then demote the nodes in order."""
+        if not node_ids:
+            return
+        self.writing_check(write_back=True)
+        full_ct = self.slot_id(TREE_TOKEN)
+        if (
+            _GROUPED_DEVICE_FREES
+            and len(node_ids) > 1
+            and self._grouped_frees_allocator_ok(full_ct)
+        ):
+            self._demote_batch_grouped_frees(node_ids, tracker, full_ct=full_ct)
+            return
+        for node_id in node_ids:
+            self._demote(node_id, tracker)
+        node_ids.clear()
+
+    def _demote_batch_grouped_frees(
+        self,
+        node_ids: list[NodeId],
+        tracker: dict[ComponentType, int],
+        *,
+        full_ct: ComponentType,
+    ) -> None:
+        """_demote_backed_up's loop with the token-KV frees of the batch drained once.
+
+        Each demote is its own tree step carrying one FULL segment, so the per-step
+        grouping never sees two. Only the stock paged allocator holds those pages and
+        nothing between the demotes touches it, so freeing the held segments once
+        leaves the free list the per-demote frees would. A step with cache actions
+        takes what is held ahead of its own FULL frees, keeping their order against the
+        actions; its own drain then owns them, so a raise there cannot free them twice."""
+        held: list[torch.Tensor] = []
+        try:
+            for node_id in node_ids:
+                result = self.tree_core.demote(node_id)
+                if result.cache_actions:
+                    if held:
+                        result.device_frees[full_ct][:0] = held
+                        held = []
+                else:
+                    held.extend(result.device_frees.pop(full_ct, ()))
+                self._apply_eviction_result(result)
+                self._accumulate_tracker(tracker, result.tracker)
+            node_ids.clear()
+        finally:
+            if held:
+                self._drain_device_frees({full_ct: held})
 
     def _tracks_write_through_unbacked_evictions(self) -> bool:
         return (
@@ -1193,6 +1472,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if self._subagents is not None:
+            self._subagents.on_release(req)
         if checkpointed:
             return
         for comp in self._components_tuple:
@@ -1278,7 +1559,20 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_params.key = radix_key
         insert_params.value = values
-        result = self.insert(insert_params)
+        reuse_existing_mamba = False
+        if self._mamba_host_only_checkpoint():
+            mamba = self.components.get(ComponentType.MAMBA)
+            if mamba is not None:
+                reuse_existing_mamba = mamba.materialize_host_only_checkpoint(
+                    insert_params, radix_key
+                )
+        if reuse_existing_mamba:
+            insert_params.allow_missing_mamba = True
+        try:
+            result = self.insert(insert_params)
+        finally:
+            if reuse_existing_mamba:
+                insert_params.allow_missing_mamba = False
 
         if result.rotation_tail_declined:
             # Rotation-base discontinuity with the matched chain (pipelined
@@ -1465,9 +1759,61 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         # Free per component device slots, consuming each entry as it frees.
         for ct in list(device_frees):
+            values = device_frees.pop(ct)
+            if _GROUPED_DEVICE_FREES:
+                values = self._group_page_exact_frees(ct, values)
             self._apply_cache_action(
-                FreeComponentDeviceSlot(device_frees.pop(ct), component_type=ct)
+                FreeComponentDeviceSlot(values, component_type=ct)
             )
+
+    def _group_page_exact_frees(
+        self, ct: ComponentType, values: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        """SGLANG_HICACHE_GROUPED_DEVICE_FREES: the token-KV segments as one
+        page-exact segment for the stock paged allocator, else ``values``.
+
+        Each free_segment(s) prepends s[::ps] // ps to the free list, so k of them
+        leave [p_k, ..., p_1, free]; one free_segment of cat(s_k, ..., s_1) leaves
+        the same list when every s is whole pages (cat(...)[::ps] is then the
+        concatenation of each s[::ps])."""
+        if len(values) < 2 or not self._grouped_frees_allocator_ok(ct):
+            return values
+        ps = self.token_to_kv_pool_allocator.page_size
+        first = values[0]
+        for value in values:
+            if (
+                value.dim() != 1
+                or value.numel() % ps != 0
+                or value.dtype != first.dtype
+                or value.device != first.device
+            ):
+                return values
+        if not _GROUPED_DEVICE_FREES_LOGGED[0]:
+            _GROUPED_DEVICE_FREES_LOGGED[0] = True
+            logger.info(
+                "HiCache device frees grouped: %d page-exact token-KV segments in one "
+                "free_segment (SGLANG_HICACHE_GROUPED_DEVICE_FREES)",
+                len(values),
+            )
+        return [torch.cat(values[::-1])]
+
+    def _grouped_frees_allocator_ok(self, ct: Optional[ComponentType]) -> bool:
+        """``ct`` is the FullComponent whose pages the stock PagedTokenToKVPoolAllocator
+        alone hands out, with no free group open."""
+        if ct is None or type(self.components.get(ct)) is not FullComponent:
+            return False
+        allocator = self.token_to_kv_pool_allocator
+        paged = PagedTokenToKVPoolAllocator
+        if (
+            type(allocator).free_segment is not paged.free_segment
+            or type(allocator).free_page_ids is not paged.free_page_ids
+            or type(allocator)._release_page_ids is not paged._release_page_ids
+            or allocator.has_window_pool
+            or allocator.free_group is not None
+        ):
+            return False
+        storage, sub_pool = self.components[ct].storage_and_sub_pool()
+        return storage._band(sub_pool) is allocator
 
     def _drain_host_frees(
         self, host_frees: dict[ComponentType, list[torch.Tensor]]
@@ -1747,7 +2093,19 @@ class UnifiedRadixCache(BasePrefixCache):
             BackupKV(node_ids=[node_id]), write_back=True
         )
         if written == 0:
-            return False
+            # A backed-up node's state-only copy moves no Full tokens, but its
+            # device source must not be freed before the copy lands.
+            if not (
+                self._keep_backed_mamba_states and node_id in self.ongoing_write_through
+            ):
+                return False
+            self._residency.counts["internal_state_copies"] += 1
+            self._residency.note_once(
+                "internal_state_copy",
+                "SGLANG_HICACHE_KEEP_BACKED_MAMBA_STATES: first Mamba state on a "
+                "backed-up internal node copied to host (node %d)",
+                node_id,
+            )
         self.writing_check(write_back=True)
         return True
 
@@ -2017,11 +2375,21 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         )
 
-        self.ongoing_load_back[node_id] = _OngoingLoadBack(
+        receipt = _OngoingLoadBack(
             node_id,
             self.inc_lock_ref(node_id).to_dec_params(),
             host_anchor_params,
         )
+        # A host-only checkpoint stays off the device, so a second request can
+        # load the same anchor before the first ack. Keep every receipt.
+        if self._mamba_host_only_checkpoint():
+            pending = self.ongoing_load_back.get(node_id)
+            if pending is None:
+                self.ongoing_load_back[node_id] = [receipt]
+            else:
+                pending.append(receipt)
+        else:
+            self.ongoing_load_back[node_id] = receipt
 
         return True
 
@@ -3620,12 +3988,17 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         if cc is None:
             return
+        if self._wb_pending_timings is not None:
+            self._wb_pending_timings.drain(self.metrics_collector.observe_backup_duration)
 
         if write_back:
             # Blocking: submit what is still queued, then wait for every ack.
             if _HC_PIGGYBACK:
                 self._hc_ack_epoch += 1
             cc.start_writing()
+            if self._write_back_device_ordered(cc):
+                self._ack_write_back_on_submit(cc)
+                return
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()
@@ -3658,7 +4031,41 @@ class UnifiedRadixCache(BasePrefixCache):
             self._log_write_ack_metrics(ack)
             finish_count -= 1
 
-    def _log_write_ack_metrics(self, ack: HiCacheAck) -> None:
+    def _write_back_device_ordered(self, cc) -> bool:
+        """SGLANG_HICACHE_WRITE_BACK_DEVICE_ORDERED, where only stream-ordered kernels and the
+        guarded Mamba side-state leg read host copies, on static pools: a Band pool's move pin
+        and lazy frees assume a freed row has no reader once its ack is gone."""
+        return (
+            _write_back_order.ENABLED
+            and cc.write_policy == "write_back"
+            and cc.io_backend == "kernel"
+            and self.token_to_kv_pool_allocator.storage is None
+            and not self.enable_storage
+            and self.buffer_pipeline is None
+            and self.linker is None
+            and torch.cuda.is_available()
+        )
+
+    def _ack_write_back_on_submit(self, cc) -> None:
+        """Order the consumer streams after each submitted copy, then finish its acks so the
+        caller demotes at once (write_back_order.py has the ordering argument)."""
+        acks = list(cc.ack_write_queue)
+        cc.ack_write_queue.clear()
+        num_nodes = num_bytes = 0
+        for ack in acks:
+            _write_back_order.order_after(cc, ack.finish_event)
+            _write_back_order.note_pending(cc, ack.finish_event)
+            for ack_id in ack.node_ids:
+                if ack_id in self.ongoing_write_through:
+                    self._finish_write_through_ack(ack_id)
+                    num_nodes += 1
+            self._log_write_ack_metrics(ack, landed=False)
+            num_bytes += ack.num_bytes
+        assert len(self.ongoing_write_through) == 0
+        if acks:
+            _write_back_order.note_op(len(acks), num_nodes, num_bytes)
+
+    def _log_write_ack_metrics(self, ack: HiCacheAck, landed: bool = True) -> None:
         """Record D->H backup volume and duration for a completed write ack."""
         if self.metrics_collector is None:
             return
@@ -3669,7 +4076,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         if ack.num_bytes > 0:
             self.metrics_collector.increment_backup_num_bytes(ack.num_bytes)
-        if ack.timing_enabled:
+        if ack.timing_enabled and not landed:
+            # elapsed_time needs both events done; observed when the copy lands.
+            if self._wb_pending_timings is None:
+                self._wb_pending_timings = _write_back_order.PendingTimings()
+            self._wb_pending_timings.add(ack)
+        elif ack.timing_enabled:
             duration_ms = ack.start_event.elapsed_time(ack.finish_event)
             self.metrics_collector.observe_backup_duration(duration_ms / 1000.0)
 
@@ -3696,16 +4108,28 @@ class UnifiedRadixCache(BasePrefixCache):
                 "write_back duplicate-reclaim victims diverged across TP ranks"
             )
 
+        if self._mamba_host_only_checkpoint():
+            self.components[ComponentType.MAMBA].reap_parked_slots()
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
+            if self._mamba_host_only_checkpoint():
+                self.components[ComponentType.MAMBA].observe_load_ack(ack)
             for ack_id in ack.node_ids:
                 if (
                     self.buffer_pipeline is not None
                     and self.buffer_pipeline.try_finish_load_back(ack_id)
                 ):
                     continue
-                node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
+                if self._mamba_host_only_checkpoint():
+                    entry = self.ongoing_load_back[ack_id]
+                    node, lock_params, host_lock_params = entry.pop(0)
+                    if not entry:
+                        del self.ongoing_load_back[ack_id]
+                else:
+                    node, lock_params, host_lock_params = self.ongoing_load_back.pop(
+                        ack_id
+                    )
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
                 # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
@@ -3726,6 +4150,12 @@ class UnifiedRadixCache(BasePrefixCache):
                     )
             finish_count -= 1
 
+    def _mamba_host_only_checkpoint(self) -> bool:
+        comp = self.components.get(ComponentType.MAMBA)
+        if comp is None:
+            return False
+        return comp._mamba_host_only_checkpoint()
+
     # ---- HiCache: Scheduler Entry Points ----
 
     @rank_consensus(same_params=["params.host_hit_length"])
@@ -3733,8 +4163,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         params: InitLoadBackParams,
     ) -> Optional[tuple[int, NodeId]]:
-        """Only buffer mode returns None: its admission retries without
-        committing a load."""
+        """None means admission retries without committing a load: buffer
+        mode, or a host-only anchor whose previous load-back is still in flight."""
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node
@@ -3753,6 +4183,19 @@ class UnifiedRadixCache(BasePrefixCache):
                 and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
             )
         ):
+            # ongoing_load_back is keyed by anchor. A host-only mamba
+            # checkpoint stays off the device after its load, so another
+            # request can reach this anchor before the first H->D is acked.
+            if (
+                self._mamba_host_only_checkpoint()
+                and best_match_node_id in self.ongoing_load_back
+                and not self.components[ComponentType.MAMBA].fetch_beside_inflight_load(
+                    state_only=params.host_hit_length == 0
+                    and req.swa_host_hit_length == 0
+                    and not self.tree_core.is_full_device_evicted(best_match_node_id)
+                )
+            ):
+                return None
             if self.load_back(best_match_node_id, mem_quota, req=req):
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
@@ -3766,6 +4209,12 @@ class UnifiedRadixCache(BasePrefixCache):
                     best_match_node_id,
                 )
                 return len(new_indices), best_match_node_id
+            if self._mamba_host_only_checkpoint() and req.mamba_host_hit_length > 0:
+                # The device prefix runs past the last device Mamba state on the
+                # promise of this fetch; without it the request would extend from a
+                # cleared slot. Retry the admission, as for an in-flight anchor.
+                self.components[ComponentType.MAMBA].declined_load_back()
+                return None
 
         return 0, last_best_match_device_node_id
 
@@ -3863,6 +4312,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.linker is not None:
             return self.linker.start_layer_wise_loading()
         if self.cache_controller is not None:
+            if self._mamba_host_only_checkpoint():
+                return self.components[ComponentType.MAMBA].timed_start_loading(
+                    self.cache_controller
+                )
             return self.cache_controller.start_loading()
         return 0
 
@@ -3991,7 +4444,12 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.swa_protected_size()
 
     def mamba_protected_size(self) -> int:
-        return self.tree_core.mamba_protected_size()
+        size = self.tree_core.mamba_protected_size()
+        if self._mamba_host_only_checkpoint():
+            # Parked slots (a finished request's checkpoint still copying to host)
+            # are neither free, evictable nor held by a request.
+            size += self.components[ComponentType.MAMBA].parked_slot_count()
+        return size
 
     def total_size(self) -> tuple[int, int]:
         return self.tree_core.total_size()
@@ -4054,9 +4512,10 @@ class UnifiedRadixCache(BasePrefixCache):
             ongoing_write_through = [
                 (nid, wt.node_id) for nid, wt in self.ongoing_write_through.items()
             ]
-        ongoing_load_back = [
-            (nid, lb.node_id) for nid, lb in self.ongoing_load_back.items()
-        ]
+        ongoing_load_back = []
+        for nid, lb in self.ongoing_load_back.items():
+            receipts = lb if isinstance(lb, list) else (lb,)
+            ongoing_load_back.extend((nid, receipt.node_id) for receipt in receipts)
         self.tree_core.sanity_check(ongoing_write_through, ongoing_load_back)
 
     def pretty_print(self) -> None:

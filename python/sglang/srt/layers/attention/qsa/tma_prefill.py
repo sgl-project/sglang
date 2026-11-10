@@ -30,7 +30,7 @@ def _env_flag(name: str) -> bool:
 
 
 ENABLED = _env_flag("SGLANG_ENABLE_QSA_TMA_PREFILL")
-# Pipeline depth; 3 keeps two gathers in flight per program (microbenchmark).
+# Pipeline depth; 3 keeps two gathers in flight per program (VR200 microbench).
 # The stock kernel's tile (16 tokens, 1 warp) is kept, so the output stays bitwise.
 _STAGES = int(os.environ.get("SGLANG_QSA_TMA_PREFILL_STAGES", "3"))
 # Debug: the first N eligible calls also run the stock path and log the comparison.

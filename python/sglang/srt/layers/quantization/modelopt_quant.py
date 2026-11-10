@@ -2451,11 +2451,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def _align_fp4_moe_weights_for_flashinfer_trtllm(self, layer) -> None:
         """Align TRT-LLM weights, allowing model-specific storage layouts."""
+        from sglang.srt.layers.moe.moe_runner import nvfp4_cute_prefill
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             align_fp4_moe_weights_for_flashinfer_trtllm,
             trtllm_nvfp4_hidden_alignment,
         )
 
+        if nvfp4_cute_prefill.ENABLED and nvfp4_cute_prefill.prepare_weights(
+            layer,
+            use_per_token_activation=self.quant_config.use_per_token_activation,
+        ):
+            return
         align_fp4_moe_weights_for_flashinfer_trtllm(
             layer,
             hidden_alignment=trtllm_nvfp4_hidden_alignment(
@@ -3271,6 +3277,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 gemm1_alpha=gemm1_alpha.data if gemm1_alpha is not None else None,
                 gemm1_beta=gemm1_beta.data if gemm1_beta is not None else None,
                 gemm1_clamp_limit=gemm1_clamp.data if gemm1_clamp is not None else None,
+                cute_prefill=getattr(layer, "_nvfp4_cute_prefill", None),
             )
 
             return self.runner.run(dispatch_output, quant_info)

@@ -1069,6 +1069,7 @@ class MambaPool:
                     cache_params=cache_params,
                     num_mamba_layers=num_mamba_layers,
                     num_slots=size + 1,
+                    num_request_rows=spec_state_size + 1,
                     speculative_num_draft_tokens=speculative_num_draft_tokens,
                 )
                 if enable_gdn_replayssm_ucache
@@ -1108,33 +1109,47 @@ class MambaPool:
         cache_params: BaseLinearStateParams,
         num_mamba_layers: int,
         num_slots: int,
+        num_request_rows: int,
         speculative_num_draft_tokens: Optional[int],
     ):
         from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
             allocate_gdn_ucache,
+            gdn_ucache_request_rings,
         )
+        from sglang.srt.layers.attention.linear.utils import gdn_ucache_track_snapshots
 
         if cache_params.is_kda or speculative_num_draft_tokens is None:
             raise ValueError(
                 "--enable-gdn-replayssm-ucache needs a GDN model with spec verify."
             )
         num_v_heads, head_v_dim, head_k_dim = cache_params.shape.temporal
+        # Request-lifetime scratch: one ring row per request-table row (spec_state_size + 1),
+        # as the ReplaySSM spec rings, instead of one per Mamba slot.
+        by_request_row = gdn_ucache_request_rings()
         gdn_ucache = allocate_gdn_ucache(
             num_layers=num_mamba_layers,
-            num_slots=num_slots,
+            num_slots=num_request_rows if by_request_row else num_slots,
             num_k_heads=cache_params.shape.num_k_heads_per_tp,
             num_v_heads=num_v_heads,
             head_k_dim=head_k_dim,
             head_v_dim=head_v_dim,
             max_num_draft_tokens=speculative_num_draft_tokens,
             device=self.device,
+            by_request_row=by_request_row,
+            track_snapshots=gdn_ucache_track_snapshots(),
         )
         logger.info(
             "GDN u-cache rings allocated: "
             f"k={get_tensor_size_bytes(gdn_ucache.k_ring) / GB:.3f}GB, "
             f"u={get_tensor_size_bytes(gdn_ucache.u_ring) / GB:.3f}GB, "
             f"g={get_tensor_size_bytes(gdn_ucache.g_ring) / GB:.3f}GB, "
-            f"flush_min={gdn_ucache.flush_min}"
+            f"flush_min={gdn_ucache.flush_min}, u_ring={gdn_ucache.u_ring.dtype}, "
+            f"k_ring={gdn_ucache.k_ring.dtype}"
+            + (
+                f", rows={num_request_rows} by request row (not {num_slots} Mamba slots)"
+                if by_request_row
+                else ""
+            )
         )
         return gdn_ucache
 
