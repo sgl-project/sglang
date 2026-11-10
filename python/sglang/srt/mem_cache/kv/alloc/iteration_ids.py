@@ -260,6 +260,50 @@ class IterationIds:
         plan._write_ids = self._write_ids
         return plan
 
+    def take_rows(self, rows: torch.Tensor) -> IterationIds:
+        """Return a read/write plan for selected request rows.
+
+        Cached write translations are selected with the virtual window so a
+        sub-plan never translates an already translated physical id again.
+        Read tables are intentionally rebuilt for the selected request rows.
+        """
+        batch_size = int(self.req_pool_indices.numel())
+        assert batch_size > 0
+
+        def select(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            index = rows.to(device=tensor.device)
+            return tensor.index_select(0, index)
+
+        def select_window(
+            tensor: Optional[torch.Tensor],
+        ) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            assert tensor.numel() % batch_size == 0
+            index = rows.to(device=tensor.device)
+            return (
+                tensor.reshape(batch_size, -1)
+                .index_select(0, index)
+                .reshape(-1)
+            )
+
+        plan = IterationIds(
+            source=self._source,
+            req_pool_indices=select(self.req_pool_indices),
+            seq_lens=select(self.seq_lens),
+            seq_lens_cpu=select(self.seq_lens_cpu),
+            write_virtual=None,
+            read_extent=self.read_extent,
+        )
+        plan.write_virtual = select_window(self.write_virtual)
+        plan._write_ids = {
+            key: select_window(ids) for key, ids in self._write_ids.items()
+        }
+        plan.write_physical = plan._write_ids.get(self._full_key)
+        return plan
+
     # -- reads -----------------------------------------------------------------
 
     def has_read_table(

@@ -83,6 +83,7 @@ def _allocate_decode_buffers(
     enable_mamba_track: bool,
     ne_token_table: Optional[torch.Tensor] = None,
     hc_hidden_size: Optional[int] = None,
+    hc_pre_from_prev_sublayer: bool = False,
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
     allocate_logits_buffer: bool = True,
@@ -136,6 +137,10 @@ def _allocate_decode_buffers(
             pp_proxy_tensors = {
                 "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
+            if is_mhc and hc_pre_from_prev_sublayer:
+                pp_proxy_tensors["hc_pre"] = torch.zeros(
+                    (max_num_token, hidden_size), dtype=torch.float32
+                )
             if pp_proxy_residual_num_blocks is not None:
                 # Only Kimi K3 supplies num_blocks: its attention-residual bank
                 # is token-major [T, blocks, H] and takes the residual's place.
@@ -473,6 +478,11 @@ class BaseRunner(ABC):
                 else None
             ),
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
+            hc_pre_from_prev_sublayer=getattr(
+                mr.model_config.hf_config,
+                "hc_pre_from_prev_sublayer",
+                False,
+            ),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
             allocate_logits_buffer=allocate_logits_buffer,

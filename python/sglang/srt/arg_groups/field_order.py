@@ -563,5 +563,7 @@ POSITIONAL_FIELD_ORDER = (
     "paged_experts_enable_disk",
     "disable_normalize_embedding",
     "log_schedule_decisions",
+    "speculative_dspark_pp_replicated_draft",
+    "speculative_draft_scheduling_policy",
 )
 # fmt: on

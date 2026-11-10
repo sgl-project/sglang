@@ -214,6 +214,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_platform,
+    get_spec,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -3691,6 +3692,29 @@ def _finalize_dspark_aux(
     return _scatter_tail_rows(tail=tail, rows=packed, num_tokens=num_tokens, zero=True)
 
 
+def _pack_hc_pp_state(
+    hidden_states: torch.Tensor, last_pre: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    return {
+        "hidden_states": hidden_states.flatten(1),
+        "hc_pre": last_pre,
+    }
+
+
+def _restore_hc_pp_state(
+    pp_proxy_tensors: PPProxyTensors,
+    *,
+    hc_mult: int,
+    hidden_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    hidden_states = pp_proxy_tensors["hidden_states"]
+    if hidden_states.ndim == 2:
+        hidden_states = hidden_states.view(
+            hidden_states.shape[0], hc_mult, hidden_size
+        )
+    return hidden_states, pp_proxy_tensors["hc_pre"]
+
+
 class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
     """CUDA execution with declared residual reads and writes."""
 
@@ -4005,6 +4029,7 @@ class DeepseekV4Model(nn.Module):
             )
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
+        self.dspark_hidden_capture_enabled = False
 
         # Decoder SWA bounded replay: layers from late_layer_start on run over each
         # request's last SWA_WINDOW extend tokens only.
@@ -4022,7 +4047,10 @@ class DeepseekV4Model(nn.Module):
                 last_source if self.tail_writes_source_kv else last_source + 1
             )
             if self.tail_writes_source_kv:
-                assert self.layers[last_source].engram is None, (
+                assert (
+                    not (self.start_layer <= last_source < self.end_layer)
+                    or self.layers[last_source].engram is None
+                ), (
                     "the last kv_source layer must not carry an Engram"
                 )
                 # The tail layers read the top-k and candidates the source layer
@@ -4098,7 +4126,7 @@ class DeepseekV4Model(nn.Module):
         extend_lens = forward_batch.extend_seq_lens_cpu
         if (
             forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
-            and self.dspark_layers_to_capture is None
+            and not self.dspark_hidden_capture_enabled
             and list(tail.extend_seq_lens_cpu) != list(extend_lens)
         ):
             raise ValueError(
@@ -4120,13 +4148,13 @@ class DeepseekV4Model(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        initial_pre: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
         input_ids: torch.Tensor,
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: Optional[AuxHiddenStatePacker],
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
-        assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
@@ -4196,7 +4224,7 @@ class DeepseekV4Model(nn.Module):
         # its producer update explicitly before these readers below.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
-        state = mhc.HcState(hidden_states)
+        state = mhc.HcState(hidden_states, initial_pre)
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
@@ -4570,6 +4598,7 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        initial_pre = None
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4580,12 +4609,19 @@ class DeepseekV4Model(nn.Module):
             hidden_states = hc_broadcast(hidden_states, self.hc_mult)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            # Unflatten 2D PP IPC tensor back to 3D mHC shape.
-            if hidden_states.ndim == 2:
-                hidden_states = hidden_states.view(
-                    hidden_states.shape[0], self.hc_mult, self.hidden_size
+            if self.hc_pre_from_prev_sublayer:
+                hidden_states, initial_pre = _restore_hc_pp_state(
+                    pp_proxy_tensors,
+                    hc_mult=self.hc_mult,
+                    hidden_size=self.hidden_size,
                 )
+            else:
+                hidden_states = pp_proxy_tensors["hidden_states"]
+                # Unflatten 2D PP IPC tensor back to 3D mHC shape.
+                if hidden_states.ndim == 2:
+                    hidden_states = hidden_states.view(
+                        hidden_states.shape[0], self.hc_mult, self.hidden_size
+                    )
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -4651,6 +4687,7 @@ class DeepseekV4Model(nn.Module):
             hidden_states, last_pre, tail = self._forward_layers_hc_pre_from_prev(
                 positions,
                 layer_input.pop(),
+                initial_pre,
                 forward_batch,
                 input_ids,
                 input_ids_global,
@@ -4725,8 +4762,22 @@ class DeepseekV4Model(nn.Module):
                 )
 
         if not self.pp_group.is_last_rank:
-            # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            if self.hc_pre_from_prev_sublayer:
+                assert last_pre is not None
+                proxy_tensors = _pack_hc_pp_state(hidden_states, last_pre)
+            else:
+                # Flatten 3D mHC tensor for PP IPC.
+                proxy_tensors = {"hidden_states": hidden_states.flatten(1)}
+            if capture_dspark:
+                if dspark_aux_hidden_states:
+                    proxy_tensors["dspark_aux_hidden_states"] = torch.cat(
+                        dspark_aux_hidden_states, dim=-1
+                    )
+                else:
+                    proxy_tensors["dspark_aux_hidden_states"] = hidden_states.new_empty(
+                        hidden_states.shape[0], 0
+                    )
+            return PPProxyTensors(proxy_tensors)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -5008,14 +5059,25 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self.model.get_input_embeddings()
 
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
-        if not self.pp_group.is_last_rank:
+        replicated_pp_draft = get_spec().speculative_dspark_pp_replicated_draft
+        if not replicated_pp_draft and not self.pp_group.is_last_rank:
             return
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
             )
-        self.capture_aux_hidden_states = True
-        self.model.dspark_layers_to_capture = list(layer_ids)
+        self.model.dspark_hidden_capture_enabled = True
+        if not replicated_pp_draft:
+            self.capture_aux_hidden_states = True
+            self.model.dspark_layers_to_capture = list(layer_ids)
+            return
+        local_layer_ids = [
+            int(layer_id)
+            for layer_id in layer_ids
+            if self.model.start_layer <= int(layer_id) < self.model.end_layer
+        ]
+        self.capture_aux_hidden_states = bool(local_layer_ids)
+        self.model.dspark_layers_to_capture = local_layer_ids or None
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):

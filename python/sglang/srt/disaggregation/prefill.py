@@ -109,6 +109,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.utils import is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_d2h
@@ -371,7 +372,9 @@ class PrefillBootstrapQueue:
         layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
         layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
         transfer_draft_cache = (
-            not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1
+            get_spec().speculative_dspark_pp_replicated_draft
+            or not layer_shard_enabled
+            or layer_shard_rank == layer_shard_size - 1
         )
         kv_args.prefill_start_layer = (
             getattr(

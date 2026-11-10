@@ -5319,6 +5319,10 @@ class Scheduler(
                         batch.spec_info.dsa_topk_indices is not None
                     )
                     batch.spec_info.future_indices = future_indices
+            elif self._pp_is_replicated_dspark_batch(batch):
+                batch_result = self._pp_run_replicated_dspark_batch(
+                    batch, pp_proxy_tensors
+                )
             elif not batch.spec_algorithm.is_none():
                 is_verify_round = get_parallel().pp_size > 1 and not (
                     batch.forward_mode.is_extend() or batch.is_extend_in_batch
