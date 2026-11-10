@@ -12,7 +12,11 @@ use crate::discovery::{DiscoveryEvent, WorkerId, WorkerMode, WorkerSpec};
 use anyhow::{Context, Result};
 use futures::{Stream, StreamExt};
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointSlice};
-use kube::{api::Api, runtime::watcher, Client};
+use kube::{
+    api::Api,
+    runtime::{watcher, WatchStreamExt},
+    Client,
+};
 use std::collections::{BTreeMap, HashMap};
 use tokio::sync::mpsc;
 
@@ -278,7 +282,10 @@ async fn emit_diff(
 ///
 /// On any watcher error the kube-runtime watcher auto-restarts and emits a
 /// new `Init` cycle, so the resync logic above is what reconciles state
-/// after transient errors — no separate state reset is required.
+/// after transient errors — no separate state reset is required. The stream
+/// handed in by [`spawn`] carries kube-runtime's default backoff, so a
+/// persistent error is retried with increasing delays rather than on every
+/// poll; this loop only logs and waits for the next event.
 ///
 /// The loop returns when the input stream ends (logged at WARN) or when the
 /// consumer drops the receiving end of `tx` (logged at INFO).
@@ -452,7 +459,12 @@ pub async fn spawn(
     }
 
     let handle = tokio::spawn(async move {
-        let stream = watcher(api, watcher_cfg);
+        // The watcher retries on the very next poll after an error, so without
+        // a backoff a persistent failure — a 403 from missing RBAC, a 400 from
+        // a malformed selector, an unreachable API server — becomes a tight
+        // LIST loop: ~500 attempts and WARN lines per second until the cause
+        // goes away. `default_backoff` is what the peer watcher already uses.
+        let stream = watcher(api, watcher_cfg).default_backoff();
         tokio::pin!(stream);
         process_events(stream, tx, mode, version_group_label).await;
     });
