@@ -390,7 +390,7 @@ class DraftBlockProposer:
                 )
             )
         )
-        # SGLANG_DSPARK_DEFER_CONTEXT_KV's staged draft KV store, set by the worker.
+        # SGLANG_DSPARK_DEFER_CONTEXT_KV's draft KV store, set by its attach_draft.
         self.deferred_draft_kv = None
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
@@ -670,7 +670,7 @@ class DraftBlockProposer:
             )
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
-        # The deferred store took runs_graph for whether the graph writes its staging.
+        # before_draft_forward took runs_graph as whether the graph writes the staging.
         assert deferred_draft_kv is None or draft_out.can_run_graph == runs_graph
         logits_output = draft_out.logits_output
         raw_hidden = logits_output.hidden_states

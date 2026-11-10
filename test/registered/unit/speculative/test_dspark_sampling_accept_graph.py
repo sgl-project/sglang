@@ -235,7 +235,7 @@ def test_replay_acceptance_distribution_matches_eager(monkeypatch):
 
 
 def test_region_stages_the_deferred_draft_kv_from_the_joined_projection():
-    """The verify graph replayed this step already joined the deferred commit's
+    """The verify graph replayed this step already joined the deferred store's
     projection (its host flag is spent), so the region must stage from it instead of
     joining again, which would find nothing and fall back to an unprojected inject."""
     calls = []
