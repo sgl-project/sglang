@@ -25,9 +25,6 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
-from sglang.srt.layers.quantization.modelslim.modelslim import (
-    ModelSlimKVCacheMethod,
-)
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
@@ -44,19 +41,14 @@ def init_modelslim_mla_kv(m: "DeepseekV2AttentionMLA", prefix: str):
     quant_config = m.quant_config
     if quant_config is None or quant_config.get_name() != "modelslim" or m.use_dsa:
         return
-    scheme = quant_config.get_modelslim_kv_scheme(prefix)
-    if scheme is None:
-        return
-    attn = m.attn_mqa
-    attn.scheme = scheme
-    attn.quant_method = ModelSlimKVCacheMethod()
-    attn.quant_method.create_weights(
-        attn,
+    scheme = quant_config.init_kv_cache(
+        m.attn_mqa,
+        prefix,
         kv_lora_rank=m.kv_lora_rank,
         qk_rope_head_dim=m.qk_rope_head_dim,
-        params_dtype=torch.get_default_dtype(),
     )
-    m.attn_mha.scheme = scheme
+    if scheme is not None:
+        m.attn_mha.scheme = scheme
 
 
 # region MHA
