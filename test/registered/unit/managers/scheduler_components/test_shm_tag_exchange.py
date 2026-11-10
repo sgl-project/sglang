@@ -17,6 +17,7 @@ import torch.multiprocessing
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components import shm_tag_exchange
 from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
     _broadcast_via_exchange,
 )
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import ShmTagExchange
@@ -49,6 +50,9 @@ def _hicache_tp_rank(rank: int, extra_pools: int) -> UnifiedRadixCache:
     )
     cache.pp_rank, cache.pp_size, cache.pp_group = 0, 1, None
     cache.host_memory_mode = "cache"
+    # The tick reads the stop policy and the live prefetch set (deadline vote).
+    cache.prefetch_stop_policy = "wait_complete"
+    cache.ongoing_prefetch = {}
     cache.attn_cp_group = cache.attn_tp_group = None
     cache.tp_group, cache.tp_world_size = torch.distributed.group.WORLD, 2
     cache.cache_controller = SimpleNamespace(
@@ -143,6 +147,27 @@ def _exchange_rounds(rank: int, init_file: str) -> None:
 
 
 class TestShmTagExchange(CustomTestCase):
+    def test_request_receiver_opts_into_multihost_exchange_with_runtime_switch(self):
+        cpu_group = object()
+        tp_group = SimpleNamespace(cpu_group=cpu_group, rank=0, ranks=list(range(8)))
+        parallel = SimpleNamespace(attn_dp_enabled=False, tp_size=8, tp_group=tp_group)
+        exchange, requests = object(), [{"rid": "a"}]
+        module = "sglang.srt.managers.scheduler_components.request_receiver."
+        for enabled in (False, True):
+            with (
+                patch(module + "get_parallel", return_value=parallel),
+                patch(
+                    module + "get_shm_exchange", return_value=exchange
+                ) as get_exchange,
+                patch(module + "_broadcast_via_exchange", return_value=requests),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(enabled),
+            ):
+                got = SchedulerRequestReceiver._broadcast_reqs_across_ranks(
+                    None, requests
+                )
+            self.assertEqual(got, requests)
+            self.assertEqual(get_exchange.call_args.kwargs["multihost"], enabled)
+
     def test_rounds_and_request_broadcast_match_on_every_rank(self):
         """Every rank reads every rank's values of each call, through repeated reuse
         of both table halves with one rank late, and the request broadcast hands

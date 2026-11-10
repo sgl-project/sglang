@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import msgspec
 
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.decl import WindowLifetime
 from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
 from sglang.srt.mem_cache.kv.layout.mla import DraftMLAView
@@ -231,23 +232,29 @@ def routed_draft_pool(
             },
             page_size=page_size,
         )
-        # Backends name the runner's window role "swa". Its view still names
-        # the actual storage band, which RunnerIds resolves to that band's ids.
-        route_name = (
-            "swa" if isinstance(plan.sub_pool(host).lifetime, WindowLifetime) else host
-        )
         layer_maps.append(
-            (
-                route_name,
-                view,
-                {layer_id: idx for idx, layer_id in enumerate(layer_ids)},
-            )
+            (host, view, {layer_id: idx for idx, layer_id in enumerate(layer_ids)})
+        )
+    # A backend's one window rail reads the window host playing the
+    # sliding-window role: the longest, when the layers span several.
+    windows = {
+        host: plan.sub_pool(host).lifetime.window
+        for host in lanes_by_host
+        if isinstance(plan.sub_pool(host).lifetime, WindowLifetime)
+    }
+    roles = {}
+    if windows:
+        roles[IdSpaceKind.SLIDING_WINDOW] = max(
+            windows,
+            key=lambda host: WindowLifetime(window=windows[host]).retention(),
         )
     layer_ids = [layer_id for _, _, indices in layer_maps for layer_id in indices]
     lead = layer_maps[0][1]
     return RoutedKVCache(
         arena=arena,
         owner=owner,
+        roles=roles,
+        windows=windows,
         layer_maps=layer_maps,
         page_size=page_size,
         start_layer=min(layer_ids),

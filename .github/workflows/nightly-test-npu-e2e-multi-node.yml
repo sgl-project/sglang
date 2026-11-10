@@ -64,6 +64,11 @@ on:
         type: string
         default: '{}'
         description: 'JSON run metadata {branch_label, workflow_name, create_time}, recorded once at workflow start'
+      accuracy_dataset:
+        required: false
+        type: string
+        default: ''
+        description: 'Accuracy dataset injected into pods as NPU_ACCURACY_DATASET (gsm8k on weekdays, gpqa_diamond on weekends)'
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
@@ -99,7 +104,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Prepare code for testing
+        timeout-minutes: 15
         run: |
+          # Sweep orphaned sglang-{run_id} dirs left by jobs killed before Post process.
+          # Backgrounded and capped: the shared PVC is slow, and a pre-existing backlog
+          # must not block the critical path. fds are redirected so the runner does not
+          # wait on the background job's stdout.
+          ( find /root/.cache/tests -regextype posix-extended -maxdepth 1 -type d \
+              -regex '.*/sglang-[0-9]+$' -mtime +7 -print 2>/dev/null \
+            | head -n 5 | xargs -r rm -rf ) >/dev/null 2>&1 </dev/null &
+
           # copy source code to shared-disk
           # Append run_id to isolate concurrent runs sharing the same PVC.
           current_path=$(pwd)
@@ -193,6 +207,15 @@ jobs:
             --kube-job-type ${kube_job_type} \
             --kube-job-name-prefix ${KUBE_JOB_NAME} \
             --run-id ${{ github.run_id }}"
+
+          accuracy_dataset="${{ inputs.accuracy_dataset }}"
+          case "${accuracy_dataset}" in
+            ""|gsm8k|gpqa_diamond) ;;
+            *) echo "Unsupported accuracy dataset: ${accuracy_dataset}"; exit 1 ;;
+          esac
+          if [ -n "${accuracy_dataset}" ]; then
+            CMD="${CMD} --accuracy-dataset ${accuracy_dataset}"
+          fi
 
           if [ "$prefill_decode_deployment" = "separation" ];then
             CMD="${CMD} \
