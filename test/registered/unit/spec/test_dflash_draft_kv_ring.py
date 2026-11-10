@@ -117,9 +117,13 @@ class TestResolveDraftKVRing(CustomTestCase):
                 with self.assertRaises(ValueError):
                     self._resolve(_args(disaggregation_mode=mode), draft_cfg=None)
 
-    def test_explicit_off_is_kept(self):
-        with _switch(False):
+    def test_explicit_off_is_kept_and_logged(self):
+        with (
+            _switch(False),
+            self.assertLogs(HOOK_MODULE, level="INFO") as logs,
+        ):
             self.assertFalse(self._resolve(_args(), draft_cfg=None))
+        self.assertIn("ring: off", "\n".join(logs.output))
 
 
 WINDOW_LEFT = 1023

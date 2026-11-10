@@ -1127,6 +1127,7 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
 
     switch = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
     if not switch.get():
+        logger.info("DFLASH draft KV ring: off, SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0.")
         return
     cfg = resolving_view(server_args)
     reason = draft_kv_ring_unsupported_reason(
