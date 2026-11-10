@@ -16,6 +16,7 @@ from sglang.srt.managers.io_struct import InitWeightsUpdateGroupReqInput
 from sglang.srt.utils import init_custom_process_group
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ascend.test_npu_rl_utils import (
+    NPU_RL_ENV,
     begin_weight_update,
     checkpoint_manifest,
     checkpoint_tensor_index,
@@ -64,14 +65,14 @@ NORM_WEIGHT = "model.norm.weight"
 class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        with npu_server(MODEL, extra_args=BASE_ARGS) as base_url:
+        with npu_server(MODEL, extra_args=BASE_ARGS, env=NPU_RL_ENV) as base_url:
             cls.reference = generation_signature(base_url, PROMPTS)
         cls.manifest = checkpoint_manifest(MODEL)
         cls.tensor_index = checkpoint_tensor_index(MODEL)
         # Keep one lane server for the class: the trainer creates NPU tensors
         # in this process, and launching another server afterwards resets the
         # device on some CANN/driver combinations.
-        cls._lane_ctx = npu_server(MODEL, extra_args=LANE_ARGS)
+        cls._lane_ctx = npu_server(MODEL, extra_args=LANE_ARGS, env=NPU_RL_ENV)
         cls.lane_url = cls._lane_ctx.__enter__()
 
     @classmethod

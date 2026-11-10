@@ -12,6 +12,7 @@ import requests
 
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ascend.test_npu_rl_utils import (
+    NPU_RL_ENV,
     checkpoint_weight_bytes,
     generate,
     generation_signature,
@@ -59,7 +60,7 @@ class TestNpuMemoryOccupation(CustomTestCase):
         cls.weight_bytes = checkpoint_weight_bytes(MODEL)
         # One memory-saver server for all release/resume cases. Restarting a
         # mempool-backed server repeatedly is what stresses the NPU driver.
-        cls._server = npu_server(MODEL, extra_args=MEMORY_ARGS)
+        cls._server = npu_server(MODEL, extra_args=MEMORY_ARGS, env=NPU_RL_ENV)
         cls.base_url = cls._server.__enter__()
 
     @classmethod
@@ -131,7 +132,7 @@ class TestNpuMemoryOccupationFreshServer(CustomTestCase):
     def test_release_resume_on_fresh_server(self):
         # Keep one case on a freshly-started engine: the shared-server cases
         # cover repeated cycles, but not the first release on a clean allocator.
-        with npu_server(MODEL, extra_args=MEMORY_ARGS) as base_url:
+        with npu_server(MODEL, extra_args=MEMORY_ARGS, env=NPU_RL_ENV) as base_url:
             golden = generation_signature(base_url, PROMPTS)
 
             # Nothing has been released yet: resume must be a 200 no-op.
@@ -161,7 +162,7 @@ class TestNpuMemoryOccupationWithoutFlag(CustomTestCase):
     def setUpClass(cls):
         # No --enable-memory-saver: this server is the negative control and
         # cannot share the mempool-backed server above.
-        cls._server = npu_server(MODEL, extra_args=NO_MEMORY_ARGS)
+        cls._server = npu_server(MODEL, extra_args=NO_MEMORY_ARGS, env=NPU_RL_ENV)
         cls.base_url = cls._server.__enter__()
 
     @classmethod

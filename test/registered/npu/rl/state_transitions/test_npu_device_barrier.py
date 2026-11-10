@@ -21,6 +21,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 )
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ascend.test_npu_rl_utils import (
+    NPU_RL_ENV,
     begin_weight_update,
     checkpoint_tensor_index,
     continue_generation,
@@ -193,7 +194,7 @@ class TestNpuDeviceBarrier(CustomTestCase):
     )
     @unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
     def test_02_dp_pause_returns_after_all_ranks_drain(self):
-        with npu_server(MODEL, extra_args=DP_ARGS) as base_url:
+        with npu_server(MODEL, extra_args=DP_ARGS, env=NPU_RL_ENV) as base_url:
             requests_ = [
                 start_stream(base_url, PROMPT, max_new_tokens=384) for _ in range(2)
             ]
@@ -251,7 +252,7 @@ class TestNpuDeviceBarrier(CustomTestCase):
         tensor_index = checkpoint_tensor_index(MODEL)
         original = load_checkpoint_tensor(tensor_index, NORM_WEIGHT)
 
-        with npu_server(MODEL, extra_args=SERVER_ARGS) as base_url:
+        with npu_server(MODEL, extra_args=SERVER_ARGS, env=NPU_RL_ENV) as base_url:
             for round_idx in range(3):
                 version = f"round-{round_idx}"
                 updated = original.new_full(original.shape, 0.5)
