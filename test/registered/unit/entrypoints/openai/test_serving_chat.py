@@ -3241,6 +3241,34 @@ class ServingChatTestCase(CustomTestCase):
             "Should not include finish_reason in completion chunk",
         )
 
+    def test_unstreamed_tool_args_skip_a_call_that_never_closed(self):
+        mock_parser = Mock()
+        mock_parser.detector = Mock(
+            incomplete_tool_call_indices={0},
+            prev_tool_call_arr=[
+                {
+                    "name": "get_weather",
+                    "arguments": {"location": "San Francisco", "unit": "celsius"},
+                }
+            ],
+            streamed_args_for_tool=['{"location": "San Francisco"'],
+        )
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "What's the weather?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        )
+
+        result = self.chat._check_for_unstreamed_tool_args(
+            parser=mock_parser,
+            content={"meta_info": {"id": "chatcmpl-test123"}},
+            request=request,
+            index=0,
+            created=123,
+        )
+
+        self.assertIsNone(result)
+
     def test_unstreamed_tool_args_no_completion_needed(self):
         """Test that no completion chunk is sent when all arguments were already streamed."""
 
