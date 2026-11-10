@@ -414,13 +414,13 @@ class BaseRunner(ABC):
         runner exists; a freshly-allocated dummy set in the eager path).
         """
         mr = self.model_runner
-        canary_run_ctx = (
-            c.with_active_single_forward_manager(0)
-            if (c := mr.canary_manager) is not None
-            else empty_context()
-        )
 
         def forward_fn():
+            canary_run_ctx = (
+                c.with_active_single_forward_manager(0)
+                if (c := mr.canary_manager) is not None
+                else empty_context()
+            )
             self._dummy_run(
                 batch_size=batch_size,
                 buffers=buffers,
