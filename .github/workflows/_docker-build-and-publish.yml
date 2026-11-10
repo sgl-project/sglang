@@ -21,6 +21,11 @@ on:
         required: false
         type: string
         default: ""
+      mega_use_release_pin:
+        description: "Read docker/mega-release-ref.txt from checkout_ref instead of Mega main"
+        required: false
+        type: boolean
+        default: false
       tag_config:
         description: 'JSON array of {"cuda":"cu130","tags":["tag1","tag2"]}. Tags support {version} substitution.'
         required: true
@@ -59,14 +64,30 @@ jobs:
           echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
           echo "SGLang: $COMMIT" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Resolve Mega main for both architectures
+      - name: Resolve Mega revision for both architectures
         id: resolve
+        env:
+          USE_RELEASE_PIN: ${{ inputs.mega_use_release_pin }}
         run: |
           set -euo pipefail
-          MEGA_COMMIT="$(git ls-remote --exit-code https://github.com/sgl-project/sgl-nvidia-mega.git refs/heads/main | cut -f1)"
-          [[ "$MEGA_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          if [ "$USE_RELEASE_PIN" = "true" ]; then
+            PIN_FILE=docker/mega-release-ref.txt
+            if [ ! -f "$PIN_FILE" ]; then
+              echo "::error::Missing $PIN_FILE in the selected release tag; refusing to use Mega main."
+              exit 1
+            fi
+            MEGA_COMMIT="$(cat "$PIN_FILE")"
+            SOURCE="release pin"
+          else
+            MEGA_COMMIT="$(git ls-remote --exit-code https://github.com/sgl-project/sgl-nvidia-mega.git refs/heads/main | cut -f1)"
+            SOURCE="main"
+          fi
+          if [[ ! "$MEGA_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Mega $SOURCE must resolve to a full 40-character commit SHA."
+            exit 1
+          fi
           echo "commit=$MEGA_COMMIT" >> "$GITHUB_OUTPUT"
-          echo "Mega main: $MEGA_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+          echo "Mega $SOURCE: $MEGA_COMMIT" >> "$GITHUB_STEP_SUMMARY"
 
   build-x86:
     needs: resolve-sources
