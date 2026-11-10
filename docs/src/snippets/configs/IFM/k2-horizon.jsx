@@ -1,9 +1,10 @@
 // Single `export const config` literal — Mintlify re-evaluates this module at
 // hydration time, so keep the cookbook data self-contained.
 //
-// The serving settings in the six base recipes below were benchmarked with the
+// The serving settings in the six H200 recipes below were benchmarked with the
 // K2 Horizon runtime support in sgl-project/sglang#37654. The commands pin the
 // current model revisions; benchmark provenance is documented on the page.
+// Xeon recipes are quick-generation checks, not benchmark measurements.
 // Playground overrides remain separate from the verified commands.
 
 export const config = {
@@ -234,6 +235,28 @@ sgl-eval run gsm8k \\
         "--tp 6",
         "--dtype bfloat16",
         "--max-total-tokens 4096",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "xeon", variant: "3.7b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      warn: "Quick generation verified on Intel Xeon 6972P at TP6. The 8,192-token cache does not cover the full context. Playground overrides, dataset accuracy, and performance are unverified.",
+      env: [
+        "SGLANG_USE_CPU_ENGINE=1",
+        "RAYON_NUM_THREADS=1",
+        "TOKENIZERS_PARALLELISM=false",
+        "OPENBLAS_NUM_THREADS=1",
+      ],
+      flags: [
+        "--model {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--revision 4525090a8f0fce1026d861701b9bde2fb726b7a0",
+        "--tp 6",
+        "--dtype bfloat16",
+        "--max-total-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
