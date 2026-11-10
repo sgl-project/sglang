@@ -1456,7 +1456,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
         }
         accepted = {
-            "cutedsl_with_a2a": (args("flashinfer_cutedsl", "flashinfer"), *dense),
+            "cutedsl_with_a2a": (
+                args("flashinfer_cutedsl", "flashinfer_nvlink_one_sided"),
+                *dense,
+            ),
             "puzzle_equal_expert_counts": (
                 args("flashinfer_trtllm_routed"),
                 "NemotronHPuzzleForCausalLM",
@@ -1705,7 +1708,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ("flashinfer_trtllm", "none", True, None, "moe-runner-backend=marlin"),
             ("flashinfer_cutlass", "none", True, None, "moe-runner-backend=marlin"),
             ("flashinfer_cutedsl", "deepep", True, None, "moe-a2a-backend=none"),
-            ("flashinfer_cutedsl", "flashinfer", True, None, "moe-a2a-backend=none"),
+            (
+                "flashinfer_cutedsl",
+                "flashinfer_nvlink_one_sided",
+                True,
+                None,
+                "moe-a2a-backend=none",
+            ),
         ]
         for runner, a2a, w4a16_enabled, expected, error in cases:
             with (
@@ -4269,9 +4278,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ("marlin", "none", False, {}),
             ("marlin", "none", True, {}),
             ("flashinfer_cutedsl", "none", True, {}),
-            ("flashinfer_cutedsl", "flashinfer", True, {}),
+            ("flashinfer_cutedsl", "flashinfer_nvlink_one_sided", True, {}),
             ("flashinfer_cutedsl", "none", False, None),
-            ("flashinfer_cutedsl", "flashinfer", False, None),
+            ("flashinfer_cutedsl", "flashinfer_nvlink_one_sided", False, None),
             ("flashinfer_cutedsl", "deepep", True, None),
             ("flashinfer_cutlass", "none", True, None),
             ("flashinfer_trtllm", "none", True, None),

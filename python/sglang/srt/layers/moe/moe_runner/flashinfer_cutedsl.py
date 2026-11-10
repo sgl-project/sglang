@@ -522,7 +522,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     return StandardCombineInput(hidden_states=output)
 
 
-@register_fused_func("flashinfer", "flashinfer_cutedsl")
+@register_fused_func("flashinfer_nvlink_one_sided", "flashinfer_cutedsl")
 def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: CuteDslFp4MoeQuantInfo,

@@ -1,25 +1,15 @@
-"""The draft context-KV commit of a static verify, split around the accept
-(SGLANG_DSPARK_DEFER_CONTEXT_KV).
+"""Defers the draft KV store of a static verify's committed tokens to the next
+draft graph (SGLANG_DSPARK_DEFER_CONTEXT_KV).
 
-The commit projects the committed rows' target hidden into each draft stage's KV
-(GEMMs, independent of the accept) and stores the committed rows (needs the accept's
-commit lengths). In a static verify graph the projection is forked onto a side stream
-at the target's logits processor (a forward pre-hook, which SGLang's forward and a
-megakernel's head both call), so it overlaps the LM head and the accept; the static
-epilogue joins it and stages the store's arguments (write locations, positions, gated
-commit lengths, ring slots). The next captured draft graph runs the stores on a side
-stream forked at its head (a capture head hook); the draft's first KV store joins
-them (``join``, from the draft attention backend's ``get_swa_out_cache_loc``, which
-SGLang's draft attention and a megakernel's both reach on the store's stream). Any
-other forward runs the stores eagerly first.
+The projection of the committed rows' target hidden forks onto a side stream at the
+target's logits processor, overlapping the LM head and the accept; the static
+epilogue joins it and stages the store. The next draft graph runs the store on a
+side stream forked at its head and joined at its first KV store; an eager draft, or
+a graph that would not cover every staged row, writes it eagerly first.
 
-Contract:
-
-- Every write disarms the staging (commit lengths 0), so a staging is written once.
-- A forward that may write or read draft KV (prefill, draft extend, an eager draft)
-  runs after the pending write; a draft graph whose rows miss staged ones is preceded
-  by an eager write of every staged row.
-- Nothing reads draft KV between the verify and the next draft forward.
+A draft forward writes only the staged rows of the requests it carries and that were
+not retracted since; a prefill in between leaves the staging pending. Every write
+disarms the staging (commit lengths 0), so a staging is written once.
 """
 
 from __future__ import annotations
@@ -31,6 +21,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +29,7 @@ logger = logging.getLogger(__name__)
 _LOG_EVERY = 4096
 
 
-class DeferredContextCommit:
+class DeferredDraftKVStore:
     def __init__(
         self,
         *,
@@ -71,8 +62,8 @@ class DeferredContextCommit:
         self._proj_done: Optional[torch.cuda.Event] = None
         self._store_stream: Optional[torch.cuda.Stream] = None
         self._store_done: Optional[torch.cuda.Event] = None
-        # Host: requests a static verify staged since the last write (0: nothing pending).
-        self.staged_bs = 0
+        # Host: (req, retraction_count) per staged row; empty: nothing pending.
+        self._staged_reqs: tuple = ()
         # Host: a forked projection the static epilogue has not joined yet.
         self._proj_unjoined = False
         # Host, capture only: forked stores the draft's first KV store has not joined yet.
@@ -86,7 +77,7 @@ class DeferredContextCommit:
 
     @property
     def pending(self) -> bool:
-        return self.staged_bs > 0
+        return bool(self._staged_reqs)
 
     def _pool(self):
         return self._kv_injector.draft_model_runner.token_to_kv_pool
@@ -165,9 +156,17 @@ class DeferredContextCommit:
         if state_slot is not None:
             self.state_slot[:n].copy_(state_slot[:n])
 
-    def note_static_verify(self, live_bs: int) -> None:
-        """Host, after a static verify graph ran ``live_bs`` requests."""
-        self.staged_bs = live_bs
+    def note_staged(self, reqs) -> None:
+        """Host, after a static verify graph staged the rows of ``reqs``."""
+        self._staged_reqs = tuple((req, req.retraction_count) for req in reqs)
+
+    def _disarm_stale_rows(self, reqs) -> None:
+        """Host, before a draft forward of ``reqs`` writes the staging: disarm the
+        rows of the requests it does not carry or that were retracted since."""
+        carried = set(reqs)
+        for row, (req, retraction_count) in enumerate(self._staged_reqs):
+            if req not in carried or req.retraction_count != retraction_count:
+                self.commit_lens[row : row + 1].zero_()
 
     # Draft side: the gated stores.
 
@@ -198,39 +197,60 @@ class DeferredContextCommit:
             )
         self.commit_lens.zero_()
 
-    def flush(self, reason: str = "prefill") -> None:
+    def _flush(self, reason: str) -> None:
         """Host: write a pending staging now (an eager forward follows)."""
         # A graph captured here would replay the write on every later replay.
         if self.pending and not _capturing():
             self.write()
-            self.staged_bs = 0
+            self._staged_reqs = ()
             self.num_written_eagerly += 1
             self._eager_reasons[reason] = self._eager_reasons.get(reason, 0) + 1
 
-    def before_draft_forward(self, graph_bs: Optional[int]) -> None:
-        """Host, before a draft forward: a graph of ``graph_bs`` requests (None: eager)
-        writes only its own rows, so anything it would miss is written first."""
+    def before_draft_forward(self, graph_bs: Optional[int], reqs) -> None:
+        """Host, before a draft forward of ``reqs``: a graph of ``graph_bs`` requests
+        (None: eager) writes only its own rows, so anything it would miss is
+        written first; what stays pending is the graph's to write."""
         self._draft_forwards += 1
         if self._draft_forwards % _LOG_EVERY == 0:
             logger.debug(
-                "DSpark deferred context-KV commit: %d written in draft graphs, "
+                "DSpark deferred draft KV store: %d written in draft graphs, "
                 "%d eagerly %s",
                 self.num_written_in_graph,
                 self.num_written_eagerly,
                 self._eager_reasons,
             )
+        self._disarm_stale_rows(reqs)
         if graph_bs is None:
-            self.flush("eager draft")
+            self._flush("eager draft")
         elif graph_bs not in self._forked_bs:
-            self.flush("draft graph without the fork")
-        elif self.staged_bs > graph_bs:
-            self.flush("draft graph rows")
-
-    def after_draft_forward(self, graph_ran: bool) -> None:
-        # A pending staging past before_draft_forward is one the graph writes.
-        if graph_ran and self.pending:
-            self.staged_bs = 0
+            self._flush("draft graph without the fork")
+        elif len(self._staged_reqs) > graph_bs:
+            self._flush("draft graph rows")
+        elif self.pending:
+            self._staged_reqs = ()
             self.num_written_in_graph += 1
+
+    def attach_draft(self, draft_model_runner, proposer) -> None:
+        """Draft side: the draft graph forks the staged write at its head and its
+        first KV store joins it."""
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DeepseekV4MultiStepBackend,
+        )
+
+        proposer.deferred_draft_kv = self
+        draft_model_runner.capture_head_hooks.append(self.capture_head_hook)
+        backend = draft_model_runner.attn_backend
+        backends = [backend]
+        if isinstance(backend, DeepseekV4MultiStepBackend):
+            backends.extend(backend.attn_backends)
+        for b in backends:
+            if isinstance(b, DeepseekV4AttnBackend):
+                b.pre_kv_store_hook = self.join
+        logger.info(
+            "SGLANG_DSPARK_DEFER_CONTEXT_KV: the draft KV store runs at the "
+            "head of the next draft graph, joined at its first KV store."
+        )
 
     def capture_head_hook(self, graph_runner, forward_batch) -> None:
         """First inside each draft decode graph capture (and its warmups)."""
@@ -252,7 +272,7 @@ class DeferredContextCommit:
         self._fork_unjoined = True
         self._forked_bs.add(bs)
         logger.info(
-            "DSpark draft graph bs=%d: deferred context-KV commit forked at its head",
+            "DSpark draft graph bs=%d: deferred draft KV store forked at its head",
             bs,
         )
 
@@ -262,19 +282,66 @@ class DeferredContextCommit:
             torch.cuda.current_stream().wait_event(self._store_done)
             self._fork_unjoined = False
             logger.info(
-                "DSpark draft graph: deferred context-KV commit joined at the first KV store"
+                "DSpark draft graph: deferred draft KV store joined at the first KV store"
             )
 
     def disarm(self) -> None:
         """Drop whatever warmups or captures staged on placeholder inputs."""
         self.commit_lens.zero_()
-        self.staged_bs = 0
+        self._staged_reqs = ()
         self._fork_unjoined = False
         self._proj_unjoined = False
 
 
 def _capturing() -> bool:
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def maybe_build_deferred_draft_kv(
+    *,
+    static_verify: bool,
+    draft_is_moe: bool,
+    max_bs: int,
+    stride: int,
+    device,
+    kv_injector,
+    target_model,
+) -> Optional[DeferredDraftKVStore]:
+    """SGLANG_DSPARK_DEFER_CONTEXT_KV: only where nothing moves or reads draft KV
+    between a verify and the next draft forward but this worker's forwards."""
+    if not envs.SGLANG_DSPARK_DEFER_CONTEXT_KV.get():
+        return None
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+        is_unified_kv_triton,
+    )
+
+    memory = get_memory()
+    refusal = defer_context_kv_refusal(
+        static_verify=static_verify,
+        draft_is_moe=draft_is_moe,
+        unified_kv=is_unified_kv_triton(),
+        unified_memory=memory.enable_unified_memory,
+        hicache=memory.enable_hierarchical_cache
+        or memory.hicache_storage_backend is not None,
+        disaggregated=get_disagg().disaggregation_mode != "null",
+        attn_dp=get_parallel().attn_dp_enabled,
+    )
+    if refusal:
+        logger.warning(
+            "SGLANG_DSPARK_DEFER_CONTEXT_KV refused, the draft KV store stays "
+            "in the verify graph: %s",
+            refusal,
+        )
+        return None
+    store = DeferredDraftKVStore(
+        max_bs=max_bs, stride=stride, device=device, kv_injector=kv_injector
+    )
+    # The target's logits processor: SGLang's forward and a megakernel's head
+    # both call it, with the DSpark hidden, once the hidden is final.
+    target_model.logits_processor.register_forward_pre_hook(
+        store.logits_pre_hook, with_kwargs=True
+    )
+    return store
 
 
 def defer_context_kv_refusal(
@@ -287,7 +354,7 @@ def defer_context_kv_refusal(
     disaggregated: bool,
     attn_dp: bool,
 ) -> str:
-    """Why the deferred commit cannot run here, or ""."""
+    """Why the deferred draft KV store cannot run here, or ""."""
     reasons = (
         (not static_verify, "the verify is not static (SGLANG_RAGGED_VERIFY_MODE)"),
         (not draft_is_moe, "the draft has no MoE layers"),
