@@ -248,6 +248,10 @@ class TestMambaCapacity(unittest.TestCase):
         queue.pp_size = 1
         queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
         queue.pending_reqs = []
+        queue._num_published_destinations = 0
+        queue.transfer_queue = SimpleNamespace(
+            queue=decode_queue(ListKind.PD_RECEIVING)
+        )
         queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
         queue.retracted_queue.join([req])
         queue.req_to_token_pool = pool
@@ -277,7 +281,9 @@ class TestMambaCapacity(unittest.TestCase):
                 disaggregation_decode_host_receive_threshold=1
             ),
         ):
-            self.assertEqual(queue.pop_preallocated(), ([], []))
+            self.assertEqual(
+                queue.move_preallocated(queue.transfer_queue.queue), ([], [])
+            )
         self.assertEqual(list(queue.queue.items()), [decode_req])
         queue._match_prefix_and_lock.assert_not_called()
         queue._pre_alloc.assert_not_called()
@@ -292,7 +298,7 @@ class TestMambaCapacity(unittest.TestCase):
                 disaggregation_decode_retraction_backup="cpu_tensor"
             ),
         ):
-            self.assertEqual(queue.resume_retracted_reqs(), [])
+            self.assertEqual(queue.move_resumed(IndexedReqList(ListKind.WAITING)), [])
         self.assertEqual(list(queue.retracted_queue), [req])
         self.assertTrue(req.is_retracted)
         queue._pre_alloc.assert_not_called()
