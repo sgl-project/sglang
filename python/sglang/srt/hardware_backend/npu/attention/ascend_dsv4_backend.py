@@ -3538,11 +3538,7 @@ class DeepseekV4AscendAttnBackend(
         spec_info = forward_batch.spec_info
 
         max_len = seq_lens_cpu[:bs].max().item()
-        is_dflash_verify = (
-            spec_info is not None
-            and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
-        )
-        if forward_mode.is_target_verify() and not is_dflash_verify:
+        if forward_mode.is_target_verify():
             max_len += self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             max_len += self.speculative_step_id + 1
