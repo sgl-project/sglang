@@ -604,8 +604,14 @@ class GroupCoordinator:
                             CustomAllreduce as AiterCustomAllreduce,
                         )
 
+                        # Same graph-capture choice dispatch_custom_allreduce
+                        # makes. The table opens this class on its own, so
+                        # SGLANG_USE_AITER_AR does not have to be set.
+                        tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
                         self.ca_aiter_comm = AiterCustomAllreduce(
-                            group=self.cpu_group, device=self.device
+                            group=self.cpu_group,
+                            device=self.device,
+                            enable_register_for_capturing=not tms_cudagraph,
                         )
                         if getattr(self.ca_aiter_comm, "disabled", True):
                             self.ca_aiter_comm = None
@@ -1102,29 +1108,21 @@ class GroupCoordinator:
                 and comm.should_custom_ar(input_)
             ):
                 return "ca"
+        # The tuner already dropped kernels that cannot run this size.
+        # These rows name a class. SGLANG_USE_AITER_AR and
+        # SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 choose only the default
+        # communicator, used when the table has no row.
         if method == "sglang_ca":
             comm = self.ca_sglang_comm
-            if (
-                comm is not None
-                and not comm.disabled
-                and comm.should_custom_ar(input_)
-            ):
+            if comm is not None and not comm.disabled:
                 return "sglang_ca"
         if method == "aiter_ca":
             comm = self.ca_aiter_comm
-            if (
-                comm is not None
-                and not comm.disabled
-                and comm.should_custom_ar(input_)
-            ):
+            if comm is not None and not comm.disabled:
                 return "aiter_ca"
         if method == "car_v2":
             comm = self.ca_v2_comm
-            if (
-                comm is not None
-                and not comm.disabled
-                and comm.should_custom_ar(input_)
-            ):
+            if comm is not None and not comm.disabled:
                 return "car_v2"
         elif method == "torch_symm_mem":
             comm = self.torch_symm_mem_comm
@@ -1228,6 +1226,20 @@ class GroupCoordinator:
             input_, use_attn_tp_group=(self._fi_workspace_hint == "attn_tp")
         )
 
+    def _tuned_custom_all_reduce(self, comm, method: str, input_: torch.Tensor):
+        """Run the custom all-reduce class the tune table named.
+
+        ``custom_all_reduce`` returns None when its own size cap says no, and
+        that would drop a row the tuner measured with the cap lifted. Call the
+        implementation instead. v2 has no such side door: its ``custom_all_reduce``
+        is the kernel, and it rejects a size with no plan.
+        """
+        if method == "aiter_ca" and hasattr(comm, "all_reduce"):
+            return comm.all_reduce(input_)
+        if method == "sglang_ca" and hasattr(comm, "_all_reduce_impl"):
+            return comm._all_reduce_impl(input_, registered=False)
+        return comm.custom_all_reduce(input_)
+
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:
@@ -1275,13 +1287,13 @@ class GroupCoordinator:
             out = ca_comm.custom_all_reduce(input_)
         elif outplace_all_reduce_method == "sglang_ca":
             assert self.ca_sglang_comm is not None and not self.ca_sglang_comm.disabled
-            out = self.ca_sglang_comm.custom_all_reduce(input_)
+            out = self._tuned_custom_all_reduce(self.ca_sglang_comm, "sglang_ca", input_)
         elif outplace_all_reduce_method == "aiter_ca":
             assert self.ca_aiter_comm is not None and not self.ca_aiter_comm.disabled
-            out = self.ca_aiter_comm.custom_all_reduce(input_)
+            out = self._tuned_custom_all_reduce(self.ca_aiter_comm, "aiter_ca", input_)
         elif outplace_all_reduce_method == "car_v2":
             assert self.ca_v2_comm is not None and not self.ca_v2_comm.disabled
-            out = self.ca_v2_comm.custom_all_reduce(input_)
+            out = self._tuned_custom_all_reduce(self.ca_v2_comm, "car_v2", input_)
         elif outplace_all_reduce_method == "qr" or (
             isinstance(outplace_all_reduce_method, str)
             and outplace_all_reduce_method.startswith("qr:")
