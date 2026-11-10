@@ -25,6 +25,24 @@ def create_parser():
         choices=["FP", "INT8", "INT6", "INT4"],
         help="QuickReduce codecs to time with --allreduce. Default is INT4.",
     )
+    parser.add_argument(
+        "--use-aiter-allreduce",
+        action="store_true",
+        help=(
+            "With --allreduce, time AITER's custom all-reduce. That is the "
+            "class the ROCm server runs for a custom_allreduce row."
+        ),
+    )
+    parser.add_argument(
+        "--qr-cast-bf16-to-fp16",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help=(
+            "ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16 for the QuickReduce timing. "
+            "1 casts bf16 to fp16 inside the timed kernel."
+        ),
+    )
     return parser
 
 
@@ -75,6 +93,8 @@ def auto_tune(args: argparse.Namespace, extra_argv: Optional[list] = None):
             output_dir=args.output_dir,
             verbose=True,
             qr_quants=args.qr_quant,
+            use_aiter_allreduce=args.use_aiter_allreduce,
+            qr_cast_bf16_to_fp16=bool(args.qr_cast_bf16_to_fp16),
         )
         allreduce_end = time.perf_counter()
         print(f"\nAllreduce tuning took {allreduce_end - allreduce_start:.2f}s")

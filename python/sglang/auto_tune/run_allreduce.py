@@ -6,7 +6,8 @@ unless --qr-quant selects other codecs.
 
     torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce \
         --model-path amd/Qwen3.8-2.4T-A95B-Quark-MXFP4 \
-        --tp 8 --qr-quant INT4 --output-dir /tmp/ar-tune
+        --tp 8 --qr-quant INT4 --use-aiter-allreduce \
+        --qr-cast-bf16-to-fp16 1 --output-dir /tmp/ar-tune
 
 --model-path is a Hugging Face id or a local directory that contains
 config.json. The run reads that config and allocates random tensors. It does
@@ -46,6 +47,27 @@ def create_parser() -> argparse.ArgumentParser:
         default=["INT4"],
         choices=list(QR_QUANT_REGIMES),
         help="QuickReduce codecs to time. Default is INT4.",
+    )
+    parser.add_argument(
+        "--use-aiter-allreduce",
+        action="store_true",
+        help=(
+            "Time AITER's custom all-reduce as the custom_allreduce backend. "
+            "This is the class the ROCm server dispatches. Without this flag "
+            "the tuner times sglang's own CustomAllreduce, which is a "
+            "different kernel."
+        ),
+    )
+    parser.add_argument(
+        "--qr-cast-bf16-to-fp16",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help=(
+            "Value of ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16, set before "
+            "QuickReduce is built. 1, the server default, casts bf16 to fp16 "
+            "inside the timed QuickReduce kernel. 0 times the bf16 kernels."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -178,6 +200,8 @@ def main(argv: list[str] | None = None) -> None:
             sizes=args.sizes,
             qr_ignore_min_size=args.qr_ignore_min_size or args.ignore_size_bounds,
             qr_ignore_max_size=args.ignore_size_bounds,
+            use_aiter_allreduce=args.use_aiter_allreduce,
+            qr_cast_bf16_to_fp16=bool(args.qr_cast_bf16_to_fp16),
         )
         if rank == 0:
             print_allreduce_summary(results)

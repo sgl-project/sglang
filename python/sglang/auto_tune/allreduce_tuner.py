@@ -4,10 +4,10 @@ Benchmarks and selects the optimal allreduce backend for a given
 model and TP configuration.
 
 Supported backends:
-- custom_allreduce: sglang's NVLink-based allreduce
+- custom_allreduce: sglang's own all-reduce, or AITER's when --use-aiter-allreduce is set. The ROCm server dispatches AITER.
 - nccl: standard NCCL allreduce
 - torch_symm_mem: torch symmetric memory all-gather + reduce
-- quick_allreduce_<codec>: AMD QuickReduce. Default codec is INT4.
+- quick_allreduce_<codec>: AMD QuickReduce. Default codec is INT4. With the default cast, the timed call converts bf16 to fp16 inside that kernel.
 
 Part of #13363 item 4.
 """
@@ -150,38 +150,81 @@ def _custom_topology_ok(car) -> bool:
     return bool(car.full_nvlink)
 
 
-def _open_custom_allreduce(cpu_group, device, ignore_max_size=False):
-    """Build custom all-reduce once. The server also builds it once."""
+def _class_qualname(cls) -> str:
+    func = getattr(cls, "func", cls)
+    return (
+        f"{getattr(func, '__module__', '')}.{getattr(func, '__name__', type(func).__name__)}"
+    )
+
+
+def _open_custom_allreduce(
+    cpu_group, device, ignore_max_size=False, use_aiter=False
+):
+    """Build one custom all-reduce and time it under the name ``custom_allreduce``.
+
+    ``use_aiter`` asks for the class ``dispatch_custom_allreduce`` returns.
+    On ROCm that is AITER's communicator, which is the one the server runs
+    for a ``custom_allreduce`` row. The sglang class is a different kernel.
+    """
     car = None
     ok = False
     try:
-        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-            CustomAllreduce,
-        )
+        if use_aiter:
+            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                dispatch_custom_allreduce,
+            )
 
-        car = CustomAllreduce(cpu_group, device)
-        ok = not car.disabled
+            CAClass = dispatch_custom_allreduce(group=cpu_group, device=device)
+            opened = _class_qualname(CAClass)
+            if "aiter" not in opened:
+                logger.warning(
+                    "AITER custom all-reduce was requested, but this host "
+                    "resolved %s. The sglang class is not timed in its place.",
+                    opened,
+                )
+            else:
+                car = CAClass(group=cpu_group, device=device)
+                ok = not getattr(car, "disabled", True)
+        else:
+            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                CustomAllreduce,
+            )
+
+            opened = _class_qualname(CustomAllreduce)
+            car = CustomAllreduce(cpu_group, device)
+            ok = not car.disabled
     except Exception as e:
-        logger.warning("custom_allreduce failed: %s", e)
+        opened = ""
+        logger.warning(
+            "custom_allreduce (%s) failed: %s",
+            "aiter" if use_aiter else "sglang",
+            e,
+        )
     if not _agree(ok, cpu_group):
-        if car is not None:
+        if car is not None and hasattr(car, "close"):
             car.close()
         return None
 
+    supported = getattr(car, "_SUPPORTED_DTYPES", None) or torch_float_dtypes()
+
     def run(tensor, num_iters, num_warmup=20):
-        reason = _shape_reason(tensor, car._SUPPORTED_DTYPES)
+        reason = _shape_reason(tensor, supported)
         if reason:
             raise _Rejected(reason)
-        if not _custom_topology_ok(car):
+        # The sglang class has a topology gate the server also applies to it.
+        # AITER decides for itself inside should_custom_ar.
+        if not use_aiter and not _custom_topology_ok(car):
             raise _Rejected("not supported on this link topology")
-        if ignore_max_size:
+        if ignore_max_size and hasattr(car, "_all_reduce_impl"):
             # Past the published cap, the kernel rejects a tensor that does
             # not fit the workspace. That rejection is the skip reason.
             invoke = lambda: car._all_reduce_impl(tensor, registered=False)
         else:
-            if not car.should_custom_ar(tensor):
+            if hasattr(car, "should_custom_ar") and not car.should_custom_ar(tensor):
                 nbytes = tensor.numel() * tensor.element_size()
-                raise _Rejected(f"{nbytes}B exceeds the {car.max_size}B workspace")
+                limit = getattr(car, "max_size", None)
+                extra = f" (workspace {limit}B)" if limit is not None else ""
+                raise _Rejected(f"{nbytes}B was declined by should_custom_ar{extra}")
             invoke = lambda: car.custom_all_reduce(tensor)
 
         def timed():
@@ -192,7 +235,15 @@ def _open_custom_allreduce(cpu_group, device, ignore_max_size=False):
 
         return _time_gpu_calls(timed, num_iters, num_warmup)
 
-    return run, car.close
+    run.impl = opened
+    close = car.close if hasattr(car, "close") else (lambda: None)
+    return run, close
+
+
+def torch_float_dtypes():
+    import torch
+
+    return (torch.float32, torch.float16, torch.bfloat16)
 
 
 def _open_nccl_allreduce(group, cpu_group, device):
@@ -259,9 +310,22 @@ def _restore_qr_quant(previous: Dict[str, Optional[str]]) -> None:
 
 
 def _open_quick_allreduce(
-    quant, cpu_group, device, ignore_min_size=False, ignore_max_size=False
+    quant,
+    cpu_group,
+    device,
+    ignore_min_size=False,
+    ignore_max_size=False,
+    cast_bf16_to_fp16=True,
 ):
-    """Build QuickReduce once at one codec. The codec is read at construction."""
+    """Build QuickReduce once at one codec. The codec is read at construction.
+
+    ``cast_bf16_to_fp16`` is ``ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16``. The
+    communicator reads it once and passes it into every ``qr_all_reduce``.
+    The cast is on the kernel's load and store, so the timed call includes it.
+    """
+    os.environ["ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16"] = (
+        "1" if cast_bf16_to_fp16 else "0"
+    )
     previous = _set_qr_quant(quant)
     qr = None
     ok = False
@@ -272,6 +336,14 @@ def _open_quick_allreduce(
 
         qr = QuickAllReduce(cpu_group, device)
         ok = not qr.disabled
+        if ok and bool(qr.use_fp16_kernels) != bool(cast_bf16_to_fp16):
+            logger.warning(
+                "quick_allreduce %s cast flag is %s, requested %s",
+                quant,
+                qr.use_fp16_kernels,
+                int(cast_bf16_to_fp16),
+            )
+            ok = False
     except Exception as e:
         logger.warning("quick_allreduce %s failed: %s", quant, e)
     finally:
@@ -299,6 +371,10 @@ def _open_quick_allreduce(
                 raise _Rejected(f"{nbytes}B is outside the published size window")
 
         def timed():
+            # use_fp16_kernels was fixed at init from
+            # ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16. quick_all_reduce passes it
+            # into the kernel, which casts bf16 to fp16 on load and back on
+            # store. That conversion is inside this timed call.
             out = qr.quick_all_reduce(tensor)
             if out is None:
                 raise _Rejected("QuickReduce declined the tensor")
@@ -329,6 +405,8 @@ def _open_backends(
     verbose: bool,
     qr_ignore_min_size: bool = False,
     qr_ignore_max_size: bool = False,
+    use_aiter_allreduce: bool = False,
+    qr_cast_bf16_to_fp16: bool = True,
 ) -> Dict[str, Any]:
     """Open every backend once, in the same order on every rank.
 
@@ -338,7 +416,10 @@ def _open_backends(
         (
             "custom_allreduce",
             lambda: _open_custom_allreduce(
-                cpu_group, device, ignore_max_size=qr_ignore_max_size
+                cpu_group,
+                device,
+                ignore_max_size=qr_ignore_max_size,
+                use_aiter=use_aiter_allreduce,
             ),
         ),
         ("nccl", lambda: _open_nccl_allreduce(group, cpu_group, device)),
@@ -354,6 +435,7 @@ def _open_backends(
                     device,
                     ignore_min_size=qr_ignore_min_size,
                     ignore_max_size=qr_ignore_max_size,
+                    cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
                 ),
             )
         )
@@ -369,7 +451,9 @@ def _open_backends(
             continue
         backends[name] = opened
         if verbose:
-            print(f"  {name}: ready", flush=True)
+            impl = getattr(opened[0], "impl", "")
+            suffix = f" ({impl})" if impl else ""
+            print(f"  {name}: ready{suffix}", flush=True)
     return backends
 
 
@@ -383,6 +467,8 @@ def tune_allreduce(
     sizes: Optional[List[int]] = None,
     qr_ignore_min_size: bool = False,
     qr_ignore_max_size: bool = False,
+    use_aiter_allreduce: bool = False,
+    qr_cast_bf16_to_fp16: bool = True,
 ) -> List[AllreduceConfig]:
     """Tune allreduce algorithm for the given model and TP size.
 
@@ -427,6 +513,8 @@ def tune_allreduce(
         verbose,
         qr_ignore_min_size,
         qr_ignore_max_size=qr_ignore_max_size,
+        use_aiter_allreduce=use_aiter_allreduce,
+        qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
     )
     if verbose:
         print(f"  Backends: {', '.join(backends)}", flush=True)
@@ -436,6 +524,17 @@ def tune_allreduce(
                 "A skip is the kernel rejecting the tensor.",
                 flush=True,
             )
+        cast = int(qr_cast_bf16_to_fp16)
+        print(
+            f"  ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16={cast}. "
+            "The bf16 to fp16 cast runs inside the timed QuickReduce kernel.",
+            flush=True,
+        )
+        print(
+            "  custom_allreduce implementation: "
+            + ("aiter" if use_aiter_allreduce else "sglang"),
+            flush=True,
+        )
     dtype = model_config.get("dtype", torch.bfloat16)
     if verbose:
         print(f"  Sizes: {sizes}", flush=True)
@@ -535,6 +634,8 @@ def run_allreduce_tuning(
     sizes: Optional[List[int]] = None,
     qr_ignore_min_size: bool = False,
     qr_ignore_max_size: bool = False,
+    use_aiter_allreduce: bool = False,
+    qr_cast_bf16_to_fp16: bool = True,
 ) -> Dict[str, Any]:
     """Entry point for allreduce auto-tuning.
 
@@ -558,6 +659,8 @@ def run_allreduce_tuning(
         sizes=sizes,
         qr_ignore_min_size=qr_ignore_min_size,
         qr_ignore_max_size=qr_ignore_max_size,
+        use_aiter_allreduce=use_aiter_allreduce,
+        qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
     )
 
     if not results:
@@ -569,6 +672,8 @@ def run_allreduce_tuning(
         "tp_size": tp_size,
         "ep_size": ep_size,
         "qr_quants": qr_quants,
+        "qr_cast_bf16_to_fp16": int(qr_cast_bf16_to_fp16),
+        "custom_allreduce_impl": "aiter" if use_aiter_allreduce else "sglang",
         "configs": [r.to_dict() for r in results],
     }
 
