@@ -20,6 +20,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import sys
 import time
@@ -27,6 +28,7 @@ import traceback
 import uuid
 import warnings
 from argparse import ArgumentParser
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -46,6 +48,9 @@ from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.goodput import (
     GOODPUT_SLO_METRICS,
     calculate_goodput,
+)
+from sglang.benchmark.goodput import parse_goodput_slo as _goodput_slo
+from sglang.benchmark.goodput import (
     print_goodput,
 )
 from sglang.benchmark.utils import (
@@ -99,6 +104,8 @@ class RequestFuncInput:
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
+    scheduled_offset_ms: Optional[float] = None
+    benchmark_start_time: Optional[float] = None
 
 
 @dataclass
@@ -122,11 +129,20 @@ class RequestFuncOutput:
     spec_cap_lens_histogram: List[int] = field(default_factory=list)
     status_code: Optional[int] = None
     finish_reason: Optional[str] = None
+    usage_present: bool = False
+    stream_complete: bool = False
+    scheduled_offset_ms: Optional[float] = None
+    dispatch_offset_ms: Optional[float] = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
+        output.scheduled_offset_ms = request_func_input.scheduled_offset_ms
+        if request_func_input.benchmark_start_time is not None:
+            output.dispatch_offset_ms = (
+                time.perf_counter() - request_func_input.benchmark_start_time
+            ) * 1000
         return output
 
 
@@ -234,6 +250,7 @@ async def async_request_trt_llm(
 
                     output.latency = most_recent_timestamp - st
                     output.success = True
+                    output.stream_complete = True
                     output.output_len = request_func_input.output_len
 
                 else:
@@ -324,6 +341,10 @@ async def async_request_openai_completions(
 
         # Merge in extra parameters - these will override defaults if present
         payload.update(request_func_input.extra_request_body)
+        if payload["stream"] and getattr(args, "dataset_name", None) == "dynamic":
+            options = dict(payload.get("stream_options") or {})
+            options.setdefault("include_usage", True)
+            payload["stream_options"] = options
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
@@ -359,10 +380,13 @@ async def async_request_openai_completions(
                         chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
                         latency = time.perf_counter() - st
                         if chunk == "[DONE]":
-                            pass
+                            output.stream_complete = True
                         else:
                             data = json.loads(chunk)
                             _record_server_prompt_len(data, output)
+                            usage = data.get("usage") or {}
+                            output.usage_present = output.usage_present or bool(usage)
+                            output_len = usage.get("completion_tokens", output_len)
 
                             if getattr(args, "cache_report", False):
                                 _extract_cache_from_sglext(data, output)
@@ -386,19 +410,19 @@ async def async_request_openai_completions(
 
                                 # Decoding phase
                                 else:
-                                    output.text_chunks.append(
-                                        data["choices"][0]["text"]
-                                    )
+                                    output.text_chunks.append(choice["text"])
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
+                                generated_text += choice["text"]
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
 
                     output.generated_text = generated_text
                     output.success = True
+                    if args.disable_stream:
+                        output.stream_complete = True
                     output.latency = latency
                     output.output_len = output_len
                 else:
@@ -491,6 +515,10 @@ async def async_request_openai_chat_completions(
         # Merge in extra parameters (tools, temperature, top_p, etc.)
         # These will override defaults if present
         payload.update(request_func_input.extra_request_body)
+        if payload["stream"] and getattr(args, "dataset_name", None) == "dynamic":
+            options = dict(payload.get("stream_options") or {})
+            options.setdefault("include_usage", True)
+            payload["stream_options"] = options
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
@@ -532,6 +560,8 @@ async def async_request_openai_chat_completions(
                             "completion_tokens", output_len
                         )
                         _record_server_prompt_len(response_json, output)
+                        output.usage_present = bool(response_json.get("usage"))
+                        output.stream_complete = True
                         _meta_info = response_json["choices"][0].get("meta_info") or {}
                         output.spec_accept_length = (
                             _meta_info.get("spec_accept_length", 0.0) or 0.0
@@ -557,7 +587,7 @@ async def async_request_openai_chat_completions(
                             chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
                             latency = time.perf_counter() - st
                             if chunk == "[DONE]":
-                                pass
+                                output.stream_complete = True
                             else:
                                 data = json.loads(chunk)
                                 # Check for usage info in final chunks. OpenAI-compatible
@@ -566,6 +596,9 @@ async def async_request_openai_chat_completions(
                                     "completion_tokens", output_len
                                 )
                                 _record_server_prompt_len(data, output)
+                                output.usage_present = output.usage_present or bool(
+                                    data.get("usage")
+                                )
 
                                 if getattr(args, "cache_report", False):
                                     _extract_cache_from_sglext(data, output)
@@ -669,7 +702,7 @@ async def async_request_truss(
                         chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
                         latency = time.perf_counter() - st
                         if chunk == "[DONE]":
-                            pass
+                            output.stream_complete = True
                         else:
                             data = json.loads(chunk)
 
@@ -783,7 +816,7 @@ async def async_request_sglang_generate(
                         )
                         latency = time.perf_counter() - st
                         if sse_data == b"[DONE]":
-                            pass
+                            output.stream_complete = True
                         else:
                             data = orjson.loads(sse_data)
 
@@ -885,6 +918,7 @@ async def async_request_openai_embeddings(
                     await response.json()
                     output.latency = time.perf_counter() - st
                     output.success = True
+                    output.stream_complete = True
                     output.output_len = 0
                 else:
                     output.error = (
@@ -1121,13 +1155,30 @@ class BenchmarkMetrics:
     max_concurrent_requests: int = 0
 
 
+def _validate_trace_timestamps(input_requests: List[DatasetRow]) -> None:
+    for index, request in enumerate(input_requests):
+        timestamp = request.timestamp
+        if (
+            not isinstance(timestamp, (int, float))
+            or isinstance(timestamp, bool)
+            or not math.isfinite(timestamp)
+            or timestamp < 0
+        ):
+            raise ValueError(
+                "--use-trace-timestamps requires a finite, non-negative timestamp "
+                f"on every row; row {index} has {timestamp!r}"
+            )
+
+
 async def get_request(
     input_requests: List[DatasetRow],
     request_rate: float,
     use_trace_timestamps: bool = False,
     slowdown_factor: float = 1.0,
+    trace_origin_ms: Optional[float] = None,
 ) -> AsyncGenerator[DatasetRow, None]:
     if use_trace_timestamps:
+        _validate_trace_timestamps(input_requests)
         print(
             f"Using trace timestamps for request generation with slowdown factor {slowdown_factor}."
         )
@@ -1135,7 +1186,13 @@ async def get_request(
         input_requests.sort(key=lambda r: r.timestamp)
 
         start_time = time.perf_counter()
-        trace_start_time_ms = input_requests[0].timestamp if input_requests else 0
+        trace_start_time_ms = (
+            trace_origin_ms
+            if trace_origin_ms is not None
+            else input_requests[0].timestamp
+            if input_requests
+            else 0
+        )
 
         for request in input_requests:
             trace_time_s = (request.timestamp - trace_start_time_ms) / 1000.0
@@ -1159,6 +1216,13 @@ async def get_request(
             interval = np.random.exponential(1.0 / request_rate)
             # The next request will be sent after the interval.
             await asyncio.sleep(interval)
+
+
+async def _async_enumerate(generator):
+    index = 0
+    async for item in generator:
+        yield index, item
+        index += 1
 
 
 def calculate_metrics(
@@ -1342,6 +1406,251 @@ def calculate_metrics(
     return metrics, output_lens
 
 
+def classify_failure(output: RequestFuncOutput) -> str:
+    if output.success:
+        return "success"
+    if output.status_code == 429:
+        return "http_429"
+    if output.status_code is not None and 400 <= output.status_code < 500:
+        return "http_4xx"
+    if output.status_code is not None and output.status_code >= 500:
+        return "http_5xx"
+    error = output.error.lower()
+    if "timeout" in error or "timed out" in error:
+        return "timeout"
+    if any(
+        value in error
+        for value in ("connection reset", "connection refused", "disconnect")
+    ):
+        return "connection"
+    if error:
+        return "client_or_protocol"
+    return "unknown"
+
+
+def _redact_error(error: str) -> str:
+    error = re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1<redacted>", error)
+    return re.sub(
+        r'(?i)(api[_-]?key|authorization|cookie|token)(["\s:=]+)[^\s,;}]+',
+        r"\1\2<redacted>",
+        error,
+    )
+
+
+def calculate_phase_metrics(
+    input_requests: List[DatasetRow],
+    outputs: List[RequestFuncOutput],
+    goodput_slos: Optional[Dict[str, float]] = None,
+) -> List[Dict[str, Any]]:
+    """Summarize timestamped workload phases without changing request transport."""
+    phases: Dict[str, Dict[str, Any]] = {}
+    for request, output in zip(input_requests, outputs):
+        if request.phase is None:
+            continue
+        phase = phases.setdefault(
+            request.phase,
+            {
+                "name": request.phase,
+                "duration": request.phase_duration,
+                "request_rate": request.phase_request_rate,
+                "max_concurrency": request.phase_max_concurrency,
+                "input_len": request.prompt_len,
+                "output_len": request.output_len,
+                "planned": 0,
+                "completed": 0,
+                "outputs": [],
+                "ttfts": [],
+                "e2e_latencies": [],
+                "dispatch_offsets": [],
+                "schedule_lags": [],
+                "errors": [],
+                "failure_categories": Counter(),
+                "status_codes": Counter(),
+                "finish_reasons": Counter(),
+                "missing_usage": 0,
+                "incomplete_streams": 0,
+                "total_prompt_tokens": 0,
+                "cached_tokens": 0,
+                "device_cached_tokens": 0,
+                "host_cached_tokens": 0,
+                "storage_cached_tokens": 0,
+            },
+        )
+        phase["planned"] += 1
+        phase["outputs"].append(output)
+        if output.status_code is not None:
+            phase["status_codes"][str(output.status_code)] += 1
+        if output.finish_reason:
+            phase["finish_reasons"][output.finish_reason] += 1
+        if not output.usage_present:
+            phase["missing_usage"] += 1
+        if output.success and not output.stream_complete:
+            phase["incomplete_streams"] += 1
+            phase["failure_categories"]["sse_incomplete"] += 1
+        if output.dispatch_offset_ms is not None:
+            phase["dispatch_offsets"].append(output.dispatch_offset_ms)
+        if (
+            output.dispatch_offset_ms is not None
+            and output.scheduled_offset_ms is not None
+        ):
+            phase["schedule_lags"].append(
+                max(0.0, output.dispatch_offset_ms - output.scheduled_offset_ms)
+            )
+        if output.success:
+            phase["completed"] += 1
+            phase["ttfts"].append(output.ttft * 1000)
+            phase["e2e_latencies"].append(output.latency * 1000)
+            phase["total_prompt_tokens"] += output.prompt_len
+            phase["cached_tokens"] += output.cached_tokens
+            details = output.cached_tokens_details or {}
+            phase["device_cached_tokens"] += details.get("device") or 0
+            phase["host_cached_tokens"] += details.get("host") or 0
+            phase["storage_cached_tokens"] += details.get("storage") or 0
+        elif len(phase["errors"]) < 3:
+            phase["failure_categories"][classify_failure(output)] += 1
+            phase["errors"].append(_redact_error(output.error)[:500])
+        elif not output.success:
+            phase["failure_categories"][classify_failure(output)] += 1
+
+    summaries = []
+    for phase in phases.values():
+        phase_outputs = phase.pop("outputs")
+        if goodput_slos:
+            phase.update(
+                msgspec.structs.asdict(
+                    calculate_goodput(phase_outputs, goodput_slos, phase["duration"])
+                )
+            )
+        ttfts = phase.pop("ttfts")
+        e2e_latencies = phase.pop("e2e_latencies")
+        dispatch_offsets = phase.pop("dispatch_offsets")
+        schedule_lags = phase.pop("schedule_lags")
+        phase["failure_categories"] = dict(phase["failure_categories"])
+        phase["status_codes"] = dict(phase["status_codes"])
+        phase["finish_reasons"] = dict(phase["finish_reasons"])
+        phase["mean_ttft_ms"] = float(np.mean(ttfts)) if ttfts else None
+        phase["p99_ttft_ms"] = float(np.percentile(ttfts, 99)) if ttfts else None
+        phase["mean_e2e_latency_ms"] = (
+            float(np.mean(e2e_latencies)) if e2e_latencies else None
+        )
+        phase["p99_e2e_latency_ms"] = (
+            float(np.percentile(e2e_latencies, 99)) if e2e_latencies else None
+        )
+        phase["actual_dispatch_qps"] = (
+            (len(dispatch_offsets) - 1)
+            / ((max(dispatch_offsets) - min(dispatch_offsets)) / 1000)
+            if len(dispatch_offsets) > 1
+            and max(dispatch_offsets) > min(dispatch_offsets)
+            else None
+        )
+        phase["mean_schedule_lag_ms"] = (
+            float(np.mean(schedule_lags)) if schedule_lags else None
+        )
+        phase["p99_schedule_lag_ms"] = (
+            float(np.percentile(schedule_lags, 99)) if schedule_lags else None
+        )
+        phase["cache_hit_rate_pct"] = (
+            phase["cached_tokens"] / phase["total_prompt_tokens"] * 100
+            if phase["total_prompt_tokens"]
+            else 0.0
+        )
+        summaries.append(phase)
+    return summaries
+
+
+def _prometheus_snapshot(
+    base_url: Optional[str], metric_names: List[str]
+) -> Optional[Dict[str, float]]:
+    if not base_url or not metric_names:
+        return None
+    response = requests.get(
+        base_url.rstrip("/") + "/metrics", headers=get_auth_headers(), timeout=5
+    )
+    response.raise_for_status()
+    samples: Dict[str, float] = {}
+    for line in response.text.splitlines():
+        match = re.match(r"([^\s{]+)(?:\{[^}]*\})?\s+([^\s]+)", line)
+        if not match or match.group(1) not in metric_names:
+            continue
+        try:
+            samples[match.group(1)] = samples.get(match.group(1), 0.0) + float(
+                match.group(2)
+            )
+        except ValueError:
+            continue
+    return samples
+
+
+class PhaseResultWriter:
+    """Write a phase as soon as all of its requests have completed."""
+
+    def __init__(
+        self,
+        requests: List[DatasetRow],
+        output_file: Optional[str],
+        base_url: Optional[str] = None,
+        prometheus_metrics: Optional[List[str]] = None,
+        goodput_slos: Optional[Dict[str, float]] = None,
+    ):
+        self.goodput_slos = goodput_slos
+        self.metrics_tasks: set[asyncio.Task] = set()
+        self.metrics_error: Optional[str] = None
+        self.metrics_lock = asyncio.Lock()
+        self.output_file = output_file
+        self.base_url = base_url
+        self.prometheus_metrics = prometheus_metrics or []
+        self.remaining = Counter(row.phase for row in requests if row.phase is not None)
+        self.requests: Dict[str, List[DatasetRow]] = {}
+        self.outputs: Dict[str, List[RequestFuncOutput]] = {}
+
+    def record(self, request: DatasetRow, output: RequestFuncOutput) -> None:
+        if request.phase is None or not self.output_file:
+            return
+        self.requests.setdefault(request.phase, []).append(request)
+        self.outputs.setdefault(request.phase, []).append(output)
+        self.remaining[request.phase] -= 1
+        if self.remaining[request.phase] == 0:
+            summary = calculate_phase_metrics(
+                self.requests.pop(request.phase),
+                self.outputs.pop(request.phase),
+                self.goodput_slos,
+            )[0]
+            with open(self.output_file, "a") as file:
+                file.write(json.dumps(summary) + "\n")
+                file.flush()
+            if self.prometheus_metrics:
+                task = asyncio.create_task(self._write_metrics(request.phase))
+                self.metrics_tasks.add(task)
+
+    async def _write_metrics(self, phase: str) -> None:
+        # Serialize optional snapshots, never delaying request completion or phase
+        # evidence. A separate file also makes a slow/failed metrics endpoint visible.
+        async with self.metrics_lock:
+            result = {"name": phase}
+            if self.metrics_error is None:
+                try:
+                    result["prometheus_snapshot"] = await asyncio.to_thread(
+                        _prometheus_snapshot, self.base_url, self.prometheus_metrics
+                    )
+                except requests.RequestException as exc:
+                    self.metrics_error = _redact_error(str(exc))[:500]
+                    warnings.warn(
+                        f"Prometheus snapshots disabled after /metrics failed: "
+                        f"{self.metrics_error}",
+                        stacklevel=2,
+                    )
+            if self.metrics_error is not None:
+                result["prometheus_error"] = self.metrics_error
+            with open(
+                Path(self.output_file).with_suffix(".metrics.jsonl"), "a"
+            ) as file:
+                file.write(json.dumps(result) + "\n")
+
+    async def finish(self) -> None:
+        if self.metrics_tasks:
+            await asyncio.gather(*self.metrics_tasks)
+
+
 MULTI_TURN_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
 
 
@@ -1436,6 +1745,9 @@ async def benchmark(
     mooncake_num_rounds=1,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
+    max_pending_requests: Optional[int] = None,
+    phase_output_file: Optional[str] = None,
+    prometheus_metrics: Optional[List[str]] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1443,6 +1755,9 @@ async def benchmark(
         raise ValueError(f"Unknown backend: {backend}")
 
     is_mooncake = args.dataset_name == "mooncake"
+    if use_trace_timestamps and not is_mooncake:
+        _validate_trace_timestamps(input_requests)
+        input_requests.sort(key=lambda request: request.timestamp)
     # Multi-turn iff prompt[0] is a valid per-round payload. Single-shot
     # OpenAI messages (List[Dict]) is excluded since its first element is a dict.
     if is_mooncake:
@@ -1462,12 +1777,24 @@ async def benchmark(
     # Limit concurrency
     # From https://github.com/vllm-project/vllm/pull/9390
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
+    phase_semaphores: Dict[str, asyncio.Semaphore] = {}
 
-    async def limited_request_func(request_func_input, pbar):
-        if semaphore is None:
-            return await request_func(request_func_input=request_func_input, pbar=pbar)
-        async with semaphore:
-            return await request_func(request_func_input=request_func_input, pbar=pbar)
+    async def limited_request_func(request_func_input, pbar, phase_semaphore=None):
+        async def run_request():
+            if semaphore is None:
+                return await request_func(
+                    request_func_input=request_func_input, pbar=pbar
+                )
+            async with semaphore:
+                return await request_func(
+                    request_func_input=request_func_input, pbar=pbar
+                )
+
+        # A request waiting for its phase must not occupy a global slot.
+        if phase_semaphore is None:
+            return await run_request()
+        async with phase_semaphore:
+            return await run_request()
 
     # Warmup
     print(f"Starting warmup with {warmup_requests} sequences...")
@@ -1581,7 +1908,15 @@ async def benchmark(
 
     # Run all requests
     benchmark_start_time = time.perf_counter()
-    tasks: List[asyncio.Task] = []
+    pending: set[asyncio.Task] = set()
+    outputs: List[Optional[RequestFuncOutput]] = [None] * len(input_requests)
+    phase_writer = PhaseResultWriter(
+        [] if is_mooncake else input_requests,
+        phase_output_file,
+        base_url,
+        prometheus_metrics,
+        dict(args.goodput) if args.goodput else None,
+    )
     pbar_total = len(input_requests)
     if (
         backend == "sglang" and is_mooncake
@@ -1595,7 +1930,12 @@ async def benchmark(
         )
         pbar_total *= args.mooncake_num_rounds
     else:
-        request_generator = get_request(input_requests, request_rate)
+        request_generator = get_request(
+            input_requests,
+            request_rate,
+            use_trace_timestamps=use_trace_timestamps,
+            trace_origin_ms=0.0 if args.dataset_name == "dynamic" else None,
+        )
 
     # Prepare LoRA request distribution parameters
     if lora_request_distribution == "distinct":
@@ -1609,8 +1949,34 @@ async def benchmark(
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
     benchmark_requests: List[DatasetRow] = []
-    async for request in request_generator:
+
+    async def run_indexed(index, request, request_func_input, phase_semaphore):
+        output = await limited_request_func(
+            request_func_input=request_func_input,
+            pbar=pbar,
+            phase_semaphore=phase_semaphore,
+        )
+        outputs[index] = output
+        if not is_multi_turn:
+            phase_writer.record(request, output)
+
+    async def collect(done):
+        for task in done:
+            await task
+
+    trace_origin_ms = (
+        0.0
+        if args.dataset_name == "dynamic"
+        else input_requests[0].timestamp
+        if use_trace_timestamps
+        and input_requests
+        and input_requests[0].timestamp is not None
+        else 0.0
+    )
+    async for request_index, request in _async_enumerate(request_generator):
         benchmark_requests.append(request)
+        if request_index == len(outputs):
+            outputs.append(None)
         if lora_names is not None and len(lora_names) != 0:
             if lora_request_distribution == "uniform":
                 lora_name = random.choice(lora_names)
@@ -1641,14 +2007,35 @@ async def benchmark(
             extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
             routing_key=request.routing_key,
+            scheduled_offset_ms=(
+                request.timestamp - trace_origin_ms
+                if use_trace_timestamps and request.timestamp is not None
+                else None
+            ),
+            benchmark_start_time=benchmark_start_time,
         )
 
-        tasks.append(
+        phase_semaphore = None
+        if request.phase is not None and request.phase_max_concurrency is not None:
+            phase_semaphore = phase_semaphores.setdefault(
+                request.phase, asyncio.Semaphore(request.phase_max_concurrency)
+            )
+        pending.add(
             asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+                run_indexed(request_index, request, request_func_input, phase_semaphore)
             )
         )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+        if max_pending_requests and len(pending) >= max_pending_requests:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            await collect(done)
+    if pending:
+        done, _ = await asyncio.wait(pending)
+        await collect(done)
+    benchmark_duration = time.perf_counter() - benchmark_start_time
+    await phase_writer.finish()
+    outputs = [output for output in outputs if output is not None]
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
@@ -1693,8 +2080,7 @@ async def benchmark(
     else:
         accept_length = None
 
-    # Compute metrics and print results
-    benchmark_duration = time.perf_counter() - benchmark_start_time
+    # Compute metrics and print results (optional snapshots are outside timing).
     metrics, output_lens = calculate_metrics(
         input_requests=None if is_multi_turn else benchmark_requests,
         outputs=outputs,
@@ -1952,6 +2338,11 @@ async def benchmark(
                 "storage_cached_tokens": (total_storage if total_storage > 0 else None),
                 "storage_backend": storage_backend_name,
             }
+        phase_metrics = calculate_phase_metrics(
+            benchmark_requests, outputs, dict(args.goodput) if args.goodput else None
+        )
+        if phase_metrics:
+            result["phase_metrics"] = phase_metrics
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
         print("-" * 30)
@@ -2015,6 +2406,50 @@ def set_global_args(args_: argparse.Namespace):
     """Set the global args."""
     global args
     args = args_
+
+
+def _redacted_args(args_: argparse.Namespace) -> argparse.Namespace:
+    def redact(value):
+        if isinstance(value, dict):
+            return {
+                key: (
+                    "<redacted>"
+                    if any(
+                        name in key.lower()
+                        for name in (
+                            "authorization",
+                            "api_key",
+                            "api-key",
+                            "cookie",
+                            "token",
+                        )
+                    )
+                    else redact(item)
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        return value
+
+    values = vars(args_).copy()
+    if values.get("base_url"):
+        scheme, separator, remainder = values["base_url"].partition("://")
+        if separator and "@" in remainder:
+            values["base_url"] = (
+                f"{scheme}{separator}<redacted>@{remainder.split('@', 1)[1]}"
+            )
+    if values.get("header"):
+        values["header"] = [
+            f"{value.partition('=')[0]}=<redacted>" for value in values["header"]
+        ]
+    if values.get("extra_request_body"):
+        try:
+            body = redact(json.loads(values["extra_request_body"]))
+            values["extra_request_body"] = json.dumps(body, separators=(",", ":"))
+        except (TypeError, json.JSONDecodeError):
+            values["extra_request_body"] = "<redacted>"
+    return argparse.Namespace(**values)
 
 
 def run_benchmark(args_: argparse.Namespace):
@@ -2082,7 +2517,7 @@ def run_benchmark(args_: argparse.Namespace):
     if getattr(args, "print_requests", False):
         assert args.backend == "sglang-oai-chat"  # only support this now
 
-    print(f"benchmark_args={args}")
+    print(f"benchmark_args={_redacted_args(args)}")
 
     # Set global environments
     set_ulimit()
@@ -2198,7 +2633,7 @@ def run_benchmark(args_: argparse.Namespace):
         f"Got invalid value for --lora-zipf-alpha of {args.lora_zipf_alpha}. It must be greater than 1."
     )
 
-    print(f"{args}\n")
+    print(f"{_redacted_args(args)}\n")
 
     # Read dataset
     backend = args.backend
@@ -2262,6 +2697,9 @@ def run_benchmark(args_: argparse.Namespace):
             mooncake_num_rounds=args.mooncake_num_rounds,
             profile_prefill_url=getattr(args, "profile_prefill_url", None),
             profile_decode_url=getattr(args, "profile_decode_url", None),
+            max_pending_requests=getattr(args, "max_pending_requests", None),
+            phase_output_file=getattr(args, "phase_output_file", None),
+            prometheus_metrics=getattr(args, "prometheus_metric", None),
         )
     )
 
@@ -2277,17 +2715,6 @@ def _finite_positive_float(value) -> float:
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a finite float > 0, got {value!r}")
     return parsed
-
-
-def _goodput_slo(pair: str) -> Tuple[str, float]:
-    """argparse type for one --goodput KEY:VALUE entry; VALUE is in milliseconds."""
-    name, _, value = pair.partition(":")
-    if name not in GOODPUT_SLO_METRICS:
-        raise argparse.ArgumentTypeError(
-            f"expected KEY:VALUE with KEY in {', '.join(GOODPUT_SLO_METRICS)}, "
-            f"got {pair!r}"
-        )
-    return name, _finite_positive_float(value)
 
 
 def _validate_parsed_gsp_args(
@@ -2366,6 +2793,7 @@ def cli_main():
             "agentic-trace",
             "sharegpt",
             "custom",
+            "dynamic",
             "openai",
             "random",
             "random-ids",
@@ -2380,6 +2808,12 @@ def cli_main():
     )
     parser.add_argument(
         "--dataset-path", type=str, default="", help="Path to the dataset."
+    )
+    parser.add_argument(
+        "--dynamic-workload-path",
+        type=str,
+        default="",
+        help="JSON workload plan used by the dynamic dataset.",
     )
     parser.add_argument(
         "--dataset-offset",
@@ -2506,7 +2940,7 @@ def cli_main():
     parser.add_argument(
         "--use-trace-timestamps",
         action="store_true",
-        help="Use timestamps from the trace file for request scheduling. Only valid for 'mooncake' dataset.",
+        help="Schedule requests by DatasetRow timestamps instead of a fixed request rate.",
     )
     parser.add_argument(
         "--max-concurrency",
@@ -2522,6 +2956,22 @@ def cli_main():
         "if the server is not processing requests fast enough to keep up.",
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
+    parser.add_argument(
+        "--phase-output-file",
+        type=str,
+        help="Append each completed dynamic phase as one JSONL record.",
+    )
+    parser.add_argument(
+        "--max-pending-requests",
+        type=int,
+        help="Bound pending request tasks for long-running benchmarks.",
+    )
+    parser.add_argument(
+        "--prometheus-metric",
+        action="append",
+        default=[],
+        help="Prometheus metric to snapshot when a dynamic phase completes.",
+    )
     parser.add_argument(
         "--output-details",
         action="store_true",
@@ -2922,6 +3372,12 @@ def cli_main():
         except UnsupportedByRustClient as error:
             parser.error(str(error))
     _validate_parsed_gsp_args(parser, args)
+    if args.use_trace_timestamps and args.dataset_name not in ("mooncake", "dynamic"):
+        parser.error("--use-trace-timestamps requires the mooncake or dynamic dataset")
+    if args.dataset_name == "dynamic" and not args.dynamic_workload_path:
+        parser.error("--dataset-name dynamic requires --dynamic-workload-path")
+    if args.max_pending_requests is not None and args.max_pending_requests <= 0:
+        parser.error("--max-pending-requests must be positive")
     run_benchmark(args)
 
 
