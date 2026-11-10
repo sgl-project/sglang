@@ -94,6 +94,7 @@ from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     PerTensorScaleParameter,
 )
+from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
@@ -1802,7 +1803,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.hidden_size = config.hidden_size
         self.pp_group = get_parallel().pp_group
 
-        if _is_cpu and quant_config is not None:
+        if _is_cpu and isinstance(quant_config, AutoRoundConfig):
             quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
 
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None

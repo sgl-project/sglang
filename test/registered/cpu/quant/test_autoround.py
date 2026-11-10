@@ -5,13 +5,14 @@ import os
 import unittest
 from fractions import Fraction
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.layers.linear import MergedColumnParallelLinear
 from sglang.srt.layers.parameter import PackedvLLMParameter
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.utils import cpu_has_amx_support, kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -25,6 +26,37 @@ from sglang.test.test_utils import (
 )
 
 register_cpu_ci(est_time=183, suite="stage-a-tp-test-cpu-intel")
+
+
+def _build_qwen35_on_cpu(quant_config):
+    parallel = SimpleNamespace(
+        pp_group=SimpleNamespace(is_last_rank=True, world_size=1)
+    )
+    config = SimpleNamespace(
+        hidden_size=8,
+        num_hidden_layers=1,
+        layers_block_type=["attention"],
+        rms_norm_eps=1e-6,
+    )
+    with (
+        patch("sglang.srt.models.qwen3_5._is_cpu", True),
+        patch("sglang.srt.models.qwen3_5.get_parallel", return_value=parallel),
+        patch.object(
+            Qwen3_5ForCausalLM,
+            "_build_embed_tokens",
+            return_value=torch.nn.Identity(),
+        ),
+        patch("sglang.srt.models.qwen3_5.make_pp_layers", return_value=([], 0, 1)),
+        patch(
+            "sglang.srt.models.qwen3_5._use_mnnvl_cutedsl_fusion",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.models.qwen3_5.GemmaRMSNorm",
+            return_value=torch.nn.Identity(),
+        ),
+    ):
+        Qwen3_5ForCausalLM(config=config, quant_config=quant_config)
 
 
 class TestAutoRoundCPUConfig(CustomTestCase):
@@ -104,37 +136,7 @@ class TestAutoRoundCPUConfig(CustomTestCase):
             }
         )
         layer = torch.nn.Linear(8, 8)
-        parallel = SimpleNamespace(
-            pp_group=SimpleNamespace(is_last_rank=True, world_size=1)
-        )
-        config = SimpleNamespace(
-            hidden_size=8,
-            num_hidden_layers=1,
-            layers_block_type=["attention"],
-            rms_norm_eps=1e-6,
-        )
-        with (
-            patch("sglang.srt.models.qwen3_5._is_cpu", True),
-            patch(
-                "sglang.srt.models.qwen3_5.get_parallel",
-                return_value=parallel,
-            ),
-            patch.object(
-                Qwen3_5ForCausalLM,
-                "_build_embed_tokens",
-                return_value=torch.nn.Identity(),
-            ),
-            patch("sglang.srt.models.qwen3_5.make_pp_layers", return_value=([], 0, 1)),
-            patch(
-                "sglang.srt.models.qwen3_5._use_mnnvl_cutedsl_fusion",
-                return_value=False,
-            ),
-            patch(
-                "sglang.srt.models.qwen3_5.GemmaRMSNorm",
-                return_value=torch.nn.Identity(),
-            ),
-        ):
-            Qwen3_5ForCausalLM(config=config, quant_config=quant_config)
+        _build_qwen35_on_cpu(quant_config)
 
         shared_gate_up = quant_config.get_layer_config(
             layer, "model.language_model.layers.0.mlp.shared_expert.gate_up_proj"
@@ -145,6 +147,11 @@ class TestAutoRoundCPUConfig(CustomTestCase):
 
         self.assertEqual(shared_gate_up[0], 16)
         self.assertEqual(routed_gate_up[0], 4)
+
+    def test_qwen35_packed_mapping_skips_non_autoround_configs(self):
+        quant_config = MagicMock(spec=QuantizationConfig)
+        _build_qwen35_on_cpu(quant_config)
+        quant_config.update_packed_modules_mapping.assert_not_called()
 
     def test_gptq_defaults_are_explicit(self):
         quant_config = AutoRoundConfig.from_config(
