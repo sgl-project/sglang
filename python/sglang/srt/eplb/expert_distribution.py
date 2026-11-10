@@ -396,7 +396,7 @@ class _SinglePassGatherer(ABC):
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> _SinglePassGatherer:
-        if _placement_is_coupled():
+        if _keeps_per_source_rank_statistics():
             # The policy solves per source rank: count this rank's own TopK
             # selections rather than what its local experts received.
             return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
@@ -1010,18 +1010,16 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         )
 
 
-def _placement_is_coupled() -> bool:
-    """Whether the EvenMoE routing expression names the L1 policy owning placement.
+def _keeps_per_source_rank_statistics() -> bool:
+    """Whether the EvenMoE placement policy solves from each source EP rank's own
+    counts, so the recorder keeps the rank dimension instead of summing it."""
+    from sglang.srt.runtime_context import get_resources
 
-    Such a policy plans from live traffic one layer at a time and consumes the
-    statistics per source EP rank, so the recorder keeps the rank dimension.
-    """
-    from sglang.srt.eplb.moe_load_balancer_glue import (
-        get_configured_moe_load_balancer_pipeline,
-        uses_coupled_placement,
+    moe_load_balancer = get_resources().moe_load_balancer
+    return (
+        moe_load_balancer is not None
+        and moe_load_balancer.requires_per_source_rank_statistics()
     )
-
-    return uses_coupled_placement(get_configured_moe_load_balancer_pipeline())
 
 
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):
@@ -1068,7 +1066,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             self._first_dump = False
             torch.get_device_module().empty_cache()
 
-        coupled = _placement_is_coupled()
+        coupled = _keeps_per_source_rank_statistics()
         if coupled:
             from sglang.srt.runtime_context import get_parallel
 

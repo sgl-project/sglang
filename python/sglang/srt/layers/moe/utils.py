@@ -710,14 +710,12 @@ def resolve_shared_experts_config(
     pipeline = get_configured_moe_load_balancer_pipeline()
     routes_shared = pipeline is not None and pipeline.capabilities.routes_shared_expert
     if pipeline is not None:
-        from evenmoe import ExpertDeploymentConfig
+        from evenmoe.adapters.sglang import to_deployment_config
+
+        from sglang.srt.runtime_context import get_context
 
         reason = pipeline.is_applicable(
-            ExpertDeploymentConfig(
-                num_redundant_experts=get_exec().moe.ep_num_redundant_experts,
-                routes_shared_expert=num_fused == 1,
-                carries_placement_metadata=True,
-            )
+            to_deployment_config(get_context(), routes_shared_expert=num_fused == 1)
         )
         if reason is not None:
             raise ValueError(reason)

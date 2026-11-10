@@ -76,20 +76,28 @@ def handle_moe_load_balancer(server_args: Any):
                 "--enable-eplb requires --disable-cuda-graph."
             )
         if uses_coupled_placement(pipeline):
-            _check_coupled_placement(cfg)
+            _check_coupled_placement(cfg, pipeline)
         declare_resolution(server_args, "_handle_moe_load_balancer", **resolutions)
 
 
-def _check_coupled_placement(cfg: Any) -> None:
+def _check_coupled_placement(cfg: Any, pipeline: Any) -> None:
     """A coupled placement policy re-plans layers online from live traffic."""
-    if (
-        cfg.ep_size <= 1
-        or cfg.ep_num_redundant_experts <= 0
-        or cfg.ep_num_redundant_experts % cfg.ep_size
-    ):
-        raise ValueError(
-            "Coupled EvenMoE placement requires redundant slots on every EP rank."
+    from evenmoe import ExpertDeploymentConfig
+
+    # The policy's own layout rules (EP size, redundant slots per rank), checked
+    # here on the server arguments so they fail before any process launches.
+    # Shared-expert dispatch is not known until the model is resolved;
+    # resolve_shared_experts_config checks the full deployment then.
+    reason = pipeline.is_applicable(
+        ExpertDeploymentConfig(
+            num_redundant_experts=cfg.ep_num_redundant_experts,
+            routes_shared_expert=True,
+            carries_placement_metadata=True,
+            ep_size=cfg.ep_size,
         )
+    )
+    if reason is not None:
+        raise ValueError(reason)
     if cfg.elastic_ep_backend is not None or cfg.pp_size != 1:
         raise ValueError(
             "Coupled EvenMoE placement requires a fixed EP group and PP=1."

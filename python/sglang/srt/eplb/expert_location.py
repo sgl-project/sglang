@@ -855,8 +855,14 @@ def compute_initial_expert_location_metadata(
     data = get_exec().moe.init_expert_location
     coupled = uses_coupled_placement(moe_load_balancer)
     if data == "trivial":
-        if coupled:
-            return _init_coupled_bootstrap(model_config, moe_ep_rank)
+        if moe_load_balancer is not None:
+            # A placement policy with a layout of its own (UltraEP: each rank's
+            # masters, then its redundant slots) supplies it; otherwise trivial.
+            policy_layout = _init_policy_layout(
+                model_config, moe_ep_rank, moe_load_balancer
+            )
+            if policy_layout is not None:
+                return policy_layout
         return ExpertLocationMetadata.init_trivial(model_config, moe_ep_rank)
 
     # TODO unify with the utils function
@@ -882,9 +888,13 @@ def compute_initial_expert_location_metadata(
             moe_ep_rank=moe_ep_rank,
         )
     elif "logical_count" in data_dict:
-        if coupled and data_dict.get("logical_count_layout") != "rank_layer_expert":
+        if (
+            moe_load_balancer is not None
+            and moe_load_balancer.requires_per_source_rank_statistics()
+            and data_dict.get("logical_count_layout") != "rank_layer_expert"
+        ):
             raise ValueError(
-                "Coupled EvenMoE placement needs statistics recorded per source EP rank "
+                "This EvenMoE placement policy needs statistics recorded per source EP rank "
                 "(logical_count_layout='rank_layer_expert'); record them with the "
                 "same --moe-load-balancer-algorithm."
             )
@@ -902,30 +912,27 @@ def compute_initial_expert_location_metadata(
         )
 
 
-def _init_coupled_bootstrap(model_config: ModelConfig, moe_ep_rank: int):
-    """Bootstrap layout for a coupled placement policy: every rank holds its
-    fixed master experts followed by its own redundant slots, which the policy
-    then re-plans online from live traffic."""
+def _init_policy_layout(model_config: ModelConfig, moe_ep_rank: int, moe_load_balancer):
+    """The configured EvenMoE placement policy's layout before any traffic, or
+    None when the policy has none of its own."""
     common = ExpertLocationMetadata._init_common(model_config)
     if common is None:
         return None
-    model_info = common["model_config_for_expert_location"]
-    ep_size = common["ep_size"]
-    num_logical_experts = model_info.num_logical_experts
-    num_redundant_per_rank = get_exec().moe.ep_num_redundant_experts // ep_size
-    if ep_size <= 1 or num_logical_experts % ep_size != 0:
-        raise ValueError(
-            "Coupled EvenMoE placement requires ep_size > 1 dividing the expert count."
-        )
-    if num_redundant_per_rank <= 0:
-        raise ValueError(
-            "Coupled EvenMoE placement requires a redundant slot on every rank."
-        )
-    masters = torch.arange(num_logical_experts, dtype=torch.int32).reshape(ep_size, -1)
-    redundant = masters[:, torch.arange(num_redundant_per_rank) % masters.shape[1]]
-    layout = torch.cat((masters, redundant), dim=1).reshape(1, -1)
+    from evenmoe.adapters.sglang import plan_initial_placement
+
+    from sglang.srt.runtime_context import get_context
+
+    maps = plan_initial_placement(
+        moe_load_balancer,
+        get_context(),
+        num_layers=common["model_config_for_expert_location"].num_layers,
+    )
+    if maps is None:
+        return None
     return ExpertLocationMetadata.init_by_mapping(
-        model_config, layout.repeat(model_info.num_layers, 1), moe_ep_rank=moe_ep_rank
+        model_config,
+        physical_to_logical_map=maps.physical_to_logical_map,
+        moe_ep_rank=moe_ep_rank,
     )
 
 

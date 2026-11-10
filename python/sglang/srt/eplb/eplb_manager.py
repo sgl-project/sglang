@@ -101,39 +101,19 @@ class EPLBManager:
         if not self._should_refresh_layer(layer_id):
             return
 
-        from evenmoe.adapters.sglang import (
-            commit_placement,
-            to_placement_request,
-            to_sglang_maps,
-        )
-        from evenmoe.kernels.ops.counting import count_logical_experts
+        from evenmoe.adapters.sglang import commit_placement, plan_layer_from_topk
 
-        # Count this rank's tokens per logical expert, then gather every rank's counts.
-        live = get_global_expert_location_metadata()
-        local_count = count_logical_experts(
-            logical_topk_ids, live.num_logical_experts, dtype=torch.int32
+        # EvenMoE counts this rank's TopK, combines the counts over the EP group
+        # and plans this single layer. The maps hold one layer; their routing
+        # metadata is already keyed by layer_id.
+        maps = plan_layer_from_topk(
+            self._moe_load_balancer, get_context(), layer_id, logical_topk_ids
         )
-        per_rank_count = local_count.new_empty((live.ep_size, live.num_logical_experts))
-        dist.all_gather_into_tensor(
-            per_rank_count,
-            local_count.contiguous(),
-            group=get_parallel().moe_ep_group.device_group,
-        )
-        # EvenMoE plans the new placement for this single layer.
-        plan = self._moe_load_balancer.plan_placement(
-            to_placement_request(per_rank_count[:, None, :], context=get_context())
-        )
-        maps = to_sglang_maps(plan)
-        # The request holds one layer, so the plan's routing metadata (if the
-        # policy keeps any) sits under key 0; republish it under the real layer.
-        routing_metadata = maps.routing_metadata.get(0)
         layer_metadata = ExpertLocationMetadata._init_raw(
-            ep_size=live.ep_size,
+            ep_size=get_global_expert_location_metadata().ep_size,
             physical_to_logical_map=maps.physical_to_logical_map,
             logical_to_all_physical_map=maps.logical_to_all_physical_map,
-            mlb_routing_metadata=(
-                {} if routing_metadata is None else {layer_id: routing_metadata}
-            ),
+            mlb_routing_metadata=maps.routing_metadata,
         )
         # Move this layer's expert weights against the still-live placement.
         self._get_expert_location_updater().update_layer(

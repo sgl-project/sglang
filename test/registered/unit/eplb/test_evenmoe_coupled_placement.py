@@ -142,8 +142,15 @@ def test_current_batch_refresh_includes_idle_rank_and_commits_before_routing(emp
     live = metadata([torch.ones(2, 2), torch.ones(2, 2)])
     plan = metadata([torch.full((2, 2), 4)], layers=(1,))
     events = []
+    from evenmoe import MoELoadBalancer
+    from evenmoe.adapters.sglang.routing import _SGLangCollectives
+
     mlb = Mock()
     mlb.routing_capabilities.requires_placement_state = True
+    # EvenMoE combines the counts over SGLang's MoE EP group, the real way.
+    mlb.aggregate_logical_count.side_effect = MoELoadBalancer(
+        routing_pipeline="ultraep", collectives=_SGLangCollectives(context)
+    ).aggregate_logical_count
     mlb.plan_placement.return_value = SimpleNamespace(
         physical_to_logical_map=plan.physical_to_logical_map,
         logical_to_all_physical_map=plan.logical_to_all_physical_map,
@@ -187,8 +194,14 @@ def test_current_batch_refresh_includes_idle_rank_and_commits_before_routing(emp
         original_global_num_tokens_cpu=[0 if empty else 2, 1024],
     )
 
-    def gather(output, local, group):
-        output.copy_(torch.stack((local, local.new_tensor([4, 2]))))
+    payloads = []
+
+    def all_reduce(payload):
+        # Rank 1 contributes [4, 2] to its own row of the flattened rank rows.
+        payloads.append(payload.clone())
+        peer = torch.zeros_like(payload)
+        peer.view(2, -1)[1] = payload.new_tensor([4, 2])
+        return payload + peer
 
     def init_raw(**kwargs):
         plan.mlb_routing_metadata = kwargs["mlb_routing_metadata"]
@@ -209,12 +222,11 @@ def test_current_batch_refresh_includes_idle_rank_and_commits_before_routing(emp
         context.parallel.override(
             moe_ep_rank=0,
             tp_rank=0,
-            moe_ep_group=SimpleNamespace(device_group=object()),
+            moe_ep_group=SimpleNamespace(
+                rank_in_group=0, world_size=2, all_reduce=all_reduce
+            ),
         ),
         patch("torch.cuda.is_current_stream_capturing", return_value=False),
-        patch(
-            "torch.distributed.all_gather_into_tensor", side_effect=gather
-        ) as collective,
         patch.object(ExpertLocationMetadata, "_init_raw", side_effect=init_raw),
     ):
         ids = torch.tensor([[0, 1], [0, -1]])
@@ -222,10 +234,13 @@ def test_current_batch_refresh_includes_idle_rank_and_commits_before_routing(emp
             ids = ids[:0]
         manager.refresh_layer(1, ids)  # batch 1 of 2: not due yet
         manager.refresh_layer(1, ids)  # due
-        assert collective.call_count == 1
+        assert len(payloads) == 1
+        # One flat [ranks * experts] row per rank: a 2-D int tensor could reach
+        # SGLang's FlashInfer all-reduce, which assumes [tokens, hidden].
+        assert payloads[0].tolist() == ([0, 0] if empty else [2, 1]) + [0, 0]
         manager.refresh_layer(1, ids)
         manager.refresh_layer(1, ids)
-        assert collective.call_count == 2
+        assert len(payloads) == 2
         # A decode-only pass (idle DP ranks included) neither refreshes nor counts.
         manager._forward_batch.global_forward_mode = SimpleNamespace(
             is_decode=lambda: True
@@ -239,7 +254,7 @@ def test_current_batch_refresh_includes_idle_rank_and_commits_before_routing(emp
         )
         manager.refresh_layer(1, ids)
         assert manager._refresh_gate._batches_since_refresh == before
-        assert collective.call_count == 2
+        assert len(payloads) == 2
     assert events == ["solve", "move", "publish"] * 2
 
 
@@ -309,7 +324,7 @@ def test_rank_counts_retain_source_rank_and_sum_recorded_steps():
     with (
         get_context().parallel.override(moe_ep_group=Group()),
         patch(
-            "sglang.srt.eplb.expert_distribution._placement_is_coupled",
+            "sglang.srt.eplb.expert_distribution._keeps_per_source_rank_statistics",
             return_value=True,
         ),
         patch(
@@ -325,20 +340,47 @@ def test_rank_counts_retain_source_rank_and_sum_recorded_steps():
 
 
 def test_source_counts_are_gathered_before_dispatch_even_on_deepep_auto():
+    from evenmoe import MoELoadBalancer
+
     from sglang.srt.eplb.expert_distribution import _SinglePassGatherer
 
+    mlb = MoELoadBalancer.from_algorithm(
+        "ultraep", ep_size=2, source_rank=0, experts_per_rank=2
+    )
     with (
         get_context().override_server_args(
             moe_load_balancer_algorithm="ultraep",
             moe_a2a_backend="deepep",
             deepep_mode="auto",
         ),
+        get_context().resources.override(moe_load_balancer=mlb),
         patch(
             "sglang.srt.eplb.expert_distribution._SelectExpertsSinglePassGatherer"
         ) as select,
     ):
         result = _SinglePassGatherer.init_new(object(), rank=0)
     assert result is select.return_value
+
+
+@pytest.mark.parametrize(
+    "algorithm, per_rank", [("ultraep", True), ("lplb", False), (None, False)]
+)
+def test_recorder_keeps_source_ranks_when_the_placement_policy_asks(
+    algorithm, per_rank
+):
+    from evenmoe import MoELoadBalancer
+
+    from sglang.srt.eplb.expert_distribution import _keeps_per_source_rank_statistics
+
+    mlb = (
+        None
+        if algorithm is None
+        else MoELoadBalancer.from_algorithm(
+            algorithm, ep_size=2, source_rank=0, experts_per_rank=2
+        )
+    )
+    with get_context().resources.override(moe_load_balancer=mlb):
+        assert _keeps_per_source_rank_statistics() is per_rank
 
 
 @pytest.mark.parametrize(
@@ -363,36 +405,53 @@ def test_offline_placement_rejects_missing_rank_statistics(data, message):
             )
 
 
-def test_coupled_bootstrap_places_masters_before_rank_local_redundant_slots():
+@pytest.mark.parametrize("algorithm", ["ultraep", "lplb"])
+def test_initial_layout_comes_from_the_placement_policy(algorithm):
+    """UltraEP supplies its layout (each rank's masters, then its redundant slots
+    filled round-robin with them); a policy without one keeps SGLang's trivial."""
     from evenmoe import MoELoadBalancer
 
     from sglang.srt.eplb.expert_location import compute_initial_expert_location_metadata
 
     mlb = MoELoadBalancer.from_algorithm(
-        "ultraep", ep_size=2, source_rank=0, experts_per_rank=3
+        algorithm, ep_size=2, source_rank=0, experts_per_rank=3
     )
     common = dict(
         ep_size=2,
         model_config_for_expert_location=SimpleNamespace(
-            num_layers=1, num_logical_experts=4
+            num_layers=2, num_logical_experts=4
         ),
     )
     with (
         get_context().override_server_args(
-            init_expert_location="trivial", ep_num_redundant_experts=2
+            init_expert_location="trivial",
+            tp_size=2,
+            ep_size=2,
+            ep_num_redundant_experts=2,
+        ),
+        get_context().resources.override(
+            mlb_model_info={"num_logical_experts": 4, "num_groups": 1}
         ),
         patch.object(ExpertLocationMetadata, "_init_common", return_value=common),
         patch.object(ExpertLocationMetadata, "init_by_mapping") as initialize,
+        patch.object(ExpertLocationMetadata, "init_trivial") as trivial,
     ):
         compute_initial_expert_location_metadata(object(), 0, mlb)
-    assert initialize.call_args.args[1].tolist() == [[0, 1, 0, 2, 3, 2]]
+    if algorithm == "ultraep":
+        trivial.assert_not_called()
+        layout = initialize.call_args.kwargs["physical_to_logical_map"]
+        assert layout.tolist() == [[0, 1, 0, 2, 3, 2]] * 2
+    else:
+        initialize.assert_not_called()
+        trivial.assert_called_once()
 
 
 @pytest.mark.parametrize(
     "overrides, message",
     [
         ({"ep_num_redundant_experts": 0}, "redundant"),
-        ({"ep_num_redundant_experts": 3}, "every EP rank"),
+        ({"ep_num_redundant_experts": 3}, "split evenly across EP ranks"),
+        ({"ep_size": 1}, "more than one rank"),
         ({"pp_size": 2}, "PP=1"),
         ({"enable_eplb": False}, "recorded placement"),
         ({"disable_cuda_graph": False}, "disable-cuda-graph"),
