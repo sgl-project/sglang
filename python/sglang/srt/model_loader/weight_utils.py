@@ -2102,10 +2102,18 @@ def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
     raw_output_size = loaded_weight.size(output_dim)
     if total_output_size > raw_output_size:
         loaded_weight_pad = []
-        weight_split_size = [
-            int(output_size / total_output_size * raw_output_size)
-            for output_size in output_sizes
-        ]
+
+        # Use integer arithmetic for split computation to avoid float-rounding drift
+        # (e.g. 64/10304*1288 -> 7.999999... then truncates to 7).
+        cumulative = 0
+        previous_boundary = 0
+        weight_split_size = []
+        for output_size in output_sizes:
+            cumulative += output_size
+            boundary = (cumulative * raw_output_size) // total_output_size
+            weight_split_size.append(boundary - previous_boundary)
+            previous_boundary = boundary
+
         assert sum(weight_split_size) == raw_output_size, (
             f"Padding the loaded weight failed due to sizes are not divisible cleanly from {output_sizes} to {raw_output_size}"
         )

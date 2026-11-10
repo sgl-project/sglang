@@ -222,7 +222,7 @@ class NemotronHConfig(PretrainedConfig):
                 # Last-resort fallback to preserve compatibility when neither
                 # canonical nor legacy pattern fields are provided.
                 layers_block_type = DEFAULT_LAYERS_BLOCK_TYPE
-        return layers_block_type
+        return NemotronHConfig._normalize_layer_type_names(layers_block_type)
 
     @staticmethod
     def _resolve_mtp_layers_block_type(mtp_layers_block_type, kwargs) -> list[str]:
@@ -234,7 +234,9 @@ class NemotronHConfig(PretrainedConfig):
                 "moe",
             ]:
                 mtp_layers_block_type = NemotronHConfig._pattern_to_list(pattern)
-        return mtp_layers_block_type
+        if mtp_layers_block_type is None:
+            mtp_layers_block_type = DEFAULT_MTP_LAYERS_BLOCK_TYPE
+        return NemotronHConfig._normalize_layer_type_names(mtp_layers_block_type)
 
     @staticmethod
     def _resolve_mamba_chunk_size(mamba_chunk_size, kwargs) -> int:

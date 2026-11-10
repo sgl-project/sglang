@@ -449,7 +449,7 @@ class LlamaModel(nn.Module):
                 start_layer=pp_start_layer,
                 prefix=prefix,
             ),
-            prefix="model.layers",
+            prefix=add_prefix("layers", prefix),
             stage_facts=lambda idx: LlamaDecoderLayer.stage_facts(config, idx),
         )
 
@@ -673,6 +673,20 @@ class LlamaForCausalLM(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        quant_tensor_suffixes = (".qweight", ".qzeros", ".scales", ".g_idx")
+
+        def _missing_quantized_module(name: str) -> bool:
+            if not (
+                name.startswith("model.layers.")
+                and name.endswith(quant_tensor_suffixes)
+            ):
+                return False
+            module_prefix = name.rsplit(".", 1)[0]
+            return not any(
+                param_name.startswith(f"{module_prefix}.")
+                and param_name.endswith(quant_tensor_suffixes)
+                for param_name in params_dict
+            )
 
         for name, loaded_weight in weights:
             if name.endswith(".activation_scale"):
@@ -733,6 +747,14 @@ class LlamaForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
                 else:
+                    if _missing_quantized_module(name):
+                        raise ValueError(
+                            "Checkpoint contains quantized tensors (qweight/qzeros/scales/g_idx) "
+                            f"for '{name}', but the target module was built without quantized "
+                            "parameters. This usually means block_name_to_quantize does not "
+                            "match the runtime module prefix. Check AutoRound "
+                            "quantization_config.block_name_to_quantize and model prefix mapping."
+                        )
                     logger.warning(f"Parameter {name} not found in params_dict")
 
     def _load_weights_v2(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:

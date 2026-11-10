@@ -955,6 +955,10 @@ class NemotronHForCausalLM(nn.Module):
             )
         self.config = config
         self.quant_config = quant_config
+        if quant_config is not None:
+            # AutoRound needs the model's fused QKV mapping before submodules
+            # are constructed so fp16 q/k/v exceptions apply to qkv_proj.
+            quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
         self.model = self._init_model(
             config=config, quant_config=quant_config, prefix=prefix
         )
@@ -1304,17 +1308,28 @@ class NemotronHForCausalLM(nn.Module):
                 continue
 
             for param_name, weight_name, shard_id in self.stacked_params_mapping:
-                if weight_name not in name:
+                marker = f".{weight_name}."
+                if marker not in name:
                     continue
-                name = name.replace(weight_name, param_name)
+
+                # Keep `name` immutable while probing mappings so one failed
+                # replacement cannot cascade into synthetic names like
+                # `qkqkv_proj`.
+                name_mapped = name.replace(
+                    marker,
+                    f".{param_name}.",
+                    1,
+                )
+
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name_mapped.endswith(".bias") and name_mapped not in params_dict:
                     continue
-                if name not in params_dict:
+                if name_mapped not in params_dict:
                     continue
-                param = params_dict[name]
+                param = params_dict[name_mapped]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                name = name_mapped
                 break
             else:
                 is_expert_weight = False
