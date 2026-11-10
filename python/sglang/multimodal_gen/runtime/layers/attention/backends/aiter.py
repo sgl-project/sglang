@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
     AttentionMetadataBuilder,
+    trailing_padding_used_len,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.aiter import (
@@ -289,6 +290,9 @@ class AITerImpl(AttentionImpl):
         self.causal = causal
         self.dropout_p = dropout_p
         self.softmax_scale = softmax_scale
+        self.packed_trailing_padding = extra_impl_args.get(
+            "packed_trailing_padding", False
+        )
 
     @torch.compiler.disable
     def _forward_fp8(
@@ -420,7 +424,36 @@ class AITerImpl(AttentionImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        del cu_seqlens_host
+        used = None
+        if cu_seqlens_host is not None:
+            if tuple(cu_seqlens_host) == (0, query.shape[0]):
+                used = query.shape[0]
+            elif self.packed_trailing_padding:
+                used = trailing_padding_used_len(
+                    total_tokens=query.shape[0],
+                    max_seqlen=max_seqlen,
+                    bounds=cu_seqlens_host,
+                )
+        if used is not None:
+            # One live sequence (plus trailing padding): the batch kernel gives
+            # its rows the varlen kernel's bytes, reads strided q/k/v, and is
+            # 9-14% faster at MiniMax-H3's MI350X shapes. Padding rows are
+            # zeroed, as the FA path leaves them; no live row attends to them.
+            live = aiter.flash_attn_func(
+                query[None, :used],
+                key[None, :used],
+                value[None, :used],
+                dropout_p=self.dropout_p,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+                how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
+            )[0]
+            if used == query.shape[0]:
+                return live
+            output = query.new_empty(query.shape[0], query.shape[1], value.shape[2])
+            output[:used] = live
+            output[used:].zero_()
+            return output
         attention_func = aiter.flash_attn_varlen_func
 
         cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()

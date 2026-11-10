@@ -86,3 +86,31 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a ROCm GPU")
+@pytest.mark.parametrize("pad", [0, 24])
+def test_one_live_sequence_matches_the_varlen_kernel(pad):
+    """A packed single sequence (plus trailing padding) runs the batch kernel:
+    its live rows get the varlen kernel's bytes and the padding rows are zero."""
+    impl = _impl_cls()(
+        num_heads=4,
+        head_size=HEAD_SIZE,
+        softmax_scale=HEAD_SIZE**-0.5,
+        packed_trailing_padding=True,
+    )
+    torch.manual_seed(0)
+    total = 4096
+    used = total - pad
+    packed = torch.randn(total, 4, 3 * HEAD_SIZE, device="cuda", dtype=torch.bfloat16)
+    # strided views, as MiniMax-H3's Ulysses exchange hands them over
+    q, k, v = packed.split(HEAD_SIZE, dim=-1)
+    bounds = (0, used, total) if pad else (0, total)
+    cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device="cuda")
+    out = impl.forward_varlen(
+        q, k, v, cu_seqlens=cu_seqlens, max_seqlen=used, cu_seqlens_host=bounds
+    )
+    # without host bounds the call keeps the varlen kernel
+    ref = impl.forward_varlen(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=used)
+    assert torch.equal(out[:used], ref[:used])
+    assert not out[used:].any()
