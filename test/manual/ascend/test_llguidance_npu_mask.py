@@ -1,10 +1,10 @@
 """NPU device-branch tests for llguidance backend's bitmask application path.
 
-Manual NPU suite (not registered to CPU CI). Verifies that
+Manual Ascend suite (not registered to CPU CI). Verifies that
 ``GuidanceGrammar.apply_vocab_mask`` dispatches to the NPU kernel when logits
 are on an NPU device, and falls back to the generic ``llguidance``
-implementation otherwise. The NPU path is exercised via a mocked public
-``sgl_kernel_npu.operators.sampler.apply_token_bitmask`` entry.
+implementation otherwise. The NPU path is exercised via a mocked
+``sgl_kernel_npu.operators.sampler.apply_token_bitmask``.
 
 Requires: torch, llguidance.  When either is unavailable, a placeholder test
 documents the skip so the module still collects and passes on this machine.
@@ -12,9 +12,8 @@ documents the skip so the module still collects and passes on this machine.
 
 import math
 import sys
-import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 try:
     import torch
@@ -55,7 +54,7 @@ def _apply_ref_cpu(logits, vocab_mask):
 
 
 class _FakeNpuOps:
-    """Capture calls to the public sampler entry and apply the CPU reference."""
+    """Stand-in for the NPU bitmask operator that captures the last call."""
 
     def __init__(self):
         self.last_call = None
@@ -66,7 +65,16 @@ class _FakeNpuOps:
         # apply the reference mask on CPU tensors to avoid device mismatch.
         out = _apply_ref_cpu(logits.detach().clone(), vocab_mask)
         logits.copy_(out)
-        return logits
+
+
+def _install_npu_mock(test_case):
+    """Replace the sampler module for this test case."""
+    fake_ops = _FakeNpuOps()
+    sampler = MagicMock(apply_token_bitmask=fake_ops.apply_token_bitmask)
+    patcher = patch.dict(sys.modules, {"sgl_kernel_npu.operators.sampler": sampler})
+    patcher.start()
+    test_case.addCleanup(patcher.stop)
+    return fake_ops
 
 
 # ---------------------------------------------------------------------------
@@ -76,27 +84,18 @@ if _HAS_TORCH and _HAS_LLGUIDANCE:
     from sglang.srt.constrained.llguidance_backend import GuidanceGrammar
 
     class _NpuDeviceTensor(torch.Tensor):
-        """CPU-backed tensor that reports an NPU device to the dispatcher."""
+        """Tensor subclass whose ``device`` property reports npu:0."""
 
         @property
         def device(self):
-            return types.SimpleNamespace(type="npu")
+            return torch.device("npu:0")
 
     class TestGuidanceGrammarApplyVocabMaskNpu(unittest.TestCase):
         """Verify the NPU branch in ``GuidanceGrammar.apply_vocab_mask``."""
 
-        def _install_npu_mock(self):
-            fake_ops = _FakeNpuOps()
-            sampler = types.ModuleType("sgl_kernel_npu.operators.sampler")
-            sampler.apply_token_bitmask = fake_ops.apply_token_bitmask
-            patcher = patch.dict(sys.modules, {sampler.__name__: sampler})
-            patcher.start()
-            self.addCleanup(patcher.stop)
-            return fake_ops
-
         def test_npu_branch_dispatches_to_npu_kernel(self):
             """When logits are on npu, the NPU kernel is invoked (mocked)."""
-            fake_ops = self._install_npu_mock()
+            fake_ops = _install_npu_mock(self)
 
             vocab_size = 64
             logits = torch.zeros((1, vocab_size), dtype=torch.float32)
@@ -132,7 +131,7 @@ if _HAS_TORCH and _HAS_LLGUIDANCE:
 
         def test_npu_branch_matches_reference(self):
             """The mocked NPU kernel matches the CPU reference result."""
-            self._install_npu_mock()
+            _install_npu_mock(self)
 
             vocab_size = 128
             torch.manual_seed(42)
