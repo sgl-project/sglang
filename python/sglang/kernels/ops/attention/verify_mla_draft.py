@@ -9,41 +9,34 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention import verify_mla
+from sglang.kernels.ops.attention.verify_mla import (
+    DEFAULT_BLOCK_H,
+    DEFAULT_BLOCK_N,
+    DEFAULT_NUM_WARPS,
+    MAX_N_SPLITS,
+    TARGET_PROGRAMS,
+    _active_splits,
+    _get_vmla,
+)
 from sglang.kernels.ops.attention.verify_splitkv import _AMD_LAUNCH_KWARGS
 
-MAX_N_SPLITS = 32  # Grid split dim upper bound
-TARGET_PROGRAMS = 512  # Target total stage-1 programs
-# Narrow V heads (the K3 dspark GQA draft, Dv 64) keep cheap partials, so they split
-# further: at bs1 / 131K the 2 head blocks x 32 splits leave most MI350X CUs idle.
-NARROW_V_HEAD_DIM = 128
-NARROW_MAX_N_SPLITS = 128
-NARROW_TARGET_PROGRAMS = 1024
-# Splits the combine reads per step; the per-split online loop pays one dependent
-# round trip per split.
-NARROW_SPLIT_BLOCK = 16
-# Absorbed MLA (Dv 512, the DFlash2 MLA draft) splits further too: at bs1 / 64K the
+# Absorbed MLA (Dv 512, the DFlash2 MLA draft) splits further: at bs1 / 64K the
 # 3 head blocks x 32 splits walk 2K keys each and leave most MI350X CUs idle.
 MLA_MAX_N_SPLITS = 128
+# splits the combine reads per step; the per-split online loop pays one dependent
+# round trip per split
 MLA_SPLIT_BLOCK = 16
-# draft rows per combine program on the MLA path; the other paths take all L_EXT
+# draft rows per combine program on the MLA path; the other path takes all L_EXT
 MLA_COMBINE_ROWS = 2
-# The shared launch's waves_per_eu 4 caps stage 1 at 128 VGPRs, where both draft tiles
-# (MLA and narrow) spill on gfx950; 2 compiles them spill-free.
+# The shared launch's waves_per_eu 4 caps stage 1 at 128 VGPRs, where the MLA draft
+# tile spills on gfx950; 2 compiles it spill-free.
 DRAFT_STAGE1_WAVES_PER_EU = 2
 
-DEFAULT_BLOCK_H = (
-    4  # BLOCK_H must be a power of 2 (tl.arange); heads beyond H_Q are masked.
-)
-DEFAULT_BLOCK_N = 64
-DEFAULT_NUM_WARPS = 8
 _BLOCK_CONFIG = {
     # head_dim: (BLOCK_H, BLOCK_N, num_warps)
-    256: (4, 64, 8),  # Qwen3.5 TP2 / TP4 / TP8
-    # 4 warps beat 8 on MI350X; 2 warps, 128-key or 32-key tiles miscompute (32 keys
-    # fails test_verify_shared_kv). Two heads a tile: twice the head blocks, so a
-    # 1K-key window (the MLA5 draft) fills more of the CUs.
+    # 2 warps or 32/128-key tiles miscompute; 2 heads a tile fill more CUs on a 1K window
     576: (2, 64, 4),  # K3 MLA (kv_lora_rank 512 + qk_rope 64)
-    64: (4, 256, 4),  # K3 GQA (dspark draft attention)
 }
 
 
@@ -52,12 +45,6 @@ def block_config(head_dim):
     return _BLOCK_CONFIG.get(
         head_dim, (DEFAULT_BLOCK_H, DEFAULT_BLOCK_N, DEFAULT_NUM_WARPS)
     )
-
-
-@triton.jit
-def _active_splits(seqlen, num_splits, BLOCK_N: tl.constexpr):
-    """Floor partitioning keeps every active split non-empty."""
-    return tl.maximum(1, tl.minimum(num_splits, seqlen // BLOCK_N))
 
 
 @triton.jit
@@ -125,8 +112,6 @@ def _verify_mla_prefix_stage1(
         offs_h = head_start + tl.arange(0, BLOCK_H)
         # The caller guarantees KV_GROUP_NUM % BLOCK_H == 0, so every query head
         # in this block maps to the same KV head and the K/V tiles stay 2D loads.
-        # MLA has a single latent head; keeping the offset out of that path
-        # entirely preserves the original address arithmetic in the inner loop.
         if HAS_KV_HEADS:
             kv_head_off_k = (head_start // KV_GROUP_NUM) * stride_buf_kh
             kv_head_off_v = (head_start // KV_GROUP_NUM) * stride_buf_vh
@@ -150,7 +135,7 @@ def _verify_mla_prefix_stage1(
         )
 
         # For absorbed MLA, NOPE_DIM is the latent width and PE_DIM is the
-        # appended RoPE width. For ordinary shared-KV attention (Qwen3.5),
+        # appended RoPE width. For ordinary shared-KV attention,
         # NOPE_DIM is the complete already-rotated Q/K head and PE_DIM is zero.
         q_row = tl.reshape(
             (cur_q_start + offs_l)[None, :] * stride_qbs + offs_h[:, None] * stride_qh,
@@ -458,6 +443,8 @@ def _verify_mla_combine_stage2(
 
 
 class VerifyMLA:
+    block_config = staticmethod(block_config)
+
     def __init__(
         self,
         max_bs,
@@ -476,8 +463,7 @@ class VerifyMLA:
         # smaller group. block_h must divide it so a head block maps to one KV
         # head -- can_handle enforces that before this is constructed.
         self.kv_group_num = h_q if kv_group_num is None else kv_group_num
-        # h_kv == 1 (MLA / MQA) needs no KV-head offset at all; making that a
-        # constexpr keeps the inner-loop addressing identical to the original.
+        # h_kv == 1 (MLA / MQA) needs no KV-head offset
         self.has_kv_heads = self.kv_group_num < h_q
         self.head_dim = head_dim
         self.v_head_dim = v_head_dim
@@ -492,19 +478,16 @@ class VerifyMLA:
         self.block_n = block_n
         self.num_warps = num_warps
         self.n_head_blocks = triton.cdiv(h_q, block_h)
-        narrow = v_head_dim <= NARROW_V_HEAD_DIM
-        mla = not narrow and head_dim > v_head_dim
-        if narrow:
-            self.max_splits, self.split_block = NARROW_MAX_N_SPLITS, NARROW_SPLIT_BLOCK
-        elif mla:
+        mla = head_dim > v_head_dim
+        if mla:
             self.max_splits, self.split_block = MLA_MAX_N_SPLITS, MLA_SPLIT_BLOCK
         else:
             self.max_splits, self.split_block = MAX_N_SPLITS, 1
-        self.target_programs = NARROW_TARGET_PROGRAMS if narrow else TARGET_PROGRAMS
+        self.target_programs = TARGET_PROGRAMS
         self.row_block = min(MLA_COMBINE_ROWS, self.l_pad) if mla else 0
         self.stage1_launch = (
             dict(_AMD_LAUNCH_KWARGS, waves_per_eu=DRAFT_STAGE1_WAVES_PER_EU)
-            if (mla or narrow) and _AMD_LAUNCH_KWARGS
+            if mla and _AMD_LAUNCH_KWARGS
             else _AMD_LAUNCH_KWARGS
         )
         self._alloc(max_bs)
@@ -730,41 +713,6 @@ class VerifyMLA:
         return o_out
 
 
-_VMLA_CACHE = {}
-
-
-def _get_vmla(max_bs, h_q, head_dim, v_head_dim, l_ext, device, kv_group_num=None):
-    key = (h_q, head_dim, v_head_dim, l_ext, str(device), kv_group_num)
-    vk = _VMLA_CACHE.get(key)
-    if vk is None:
-        block_h, block_n, num_warps = block_config(head_dim)
-        if (
-            kv_group_num is not None
-            and kv_group_num < h_q  # i.e. h_kv > 1, so the offset is live
-            and kv_group_num % block_h != 0
-        ):
-            # Shrink the head block so it stays inside one KV head. can_handle
-            # only admits power-of-two groups in that case, so this stays valid
-            # for tl.arange(0, BLOCK_H).
-            block_h = kv_group_num
-        vk = VerifyMLA(
-            max_bs,
-            h_q,
-            head_dim,
-            v_head_dim,
-            l_ext,
-            device=device,
-            block_h=block_h,
-            block_n=block_n,
-            num_warps=num_warps,
-            kv_group_num=kv_group_num,
-        )
-        _VMLA_CACHE[key] = vk
-    else:
-        vk.grow_buffers(max_bs)
-    return vk
-
-
 def can_handle(
     q_extend,
     k_extend,
@@ -783,72 +731,32 @@ def can_handle(
     logit_cap=0.0,
     xai_temperature_len=-1,
 ):
-    """Check static eligibility; unsupported inputs fall back to extend_attention_fwd.
-
-    The caller must enforce topk == 1: only then does a causal mask match the
-    draft tree. Reading custom_mask values would synchronize during graph capture.
+    """``verify_mla.can_handle``, plus a sliding window: stage 1 masks it on the
+    prefix, and inside the draft block it never binds as long as it spans the block.
     """
-    if sinks is not None:
-        return False
-    # A sliding window is masked on the prefix (WINDOW in stage 1); inside the
-    # draft block it never binds as long as it spans the block.
     if sliding_window_size is not None and sliding_window_size > 0:
         try:
             if int(sliding_window_size) < int(max_len_extend):
                 return False
         except (TypeError, ValueError):
             return False
-    if logit_cap and logit_cap > 0:
-        return False
-    if xai_temperature_len is not None and xai_temperature_len > 0:
-        return False
-    if not is_causal and custom_mask is not None:
-        return False
-    # q layout must be [tokens, H_Q, D]; head dims handled by power-of-2 pad.
-    if q_extend.dim() != 3 or k_extend.dim() != 3 or v_extend.dim() != 3:
-        return False
-    # GQA group must divide evenly.
-    h_q = q_extend.shape[1]
-    h_kv = k_extend.shape[1]
-    if h_kv == 0 or h_q % h_kv != 0:
-        return False
-    kv_group_num = h_q // h_kv
-    if h_kv > 1 and (kv_group_num & (kv_group_num - 1)) != 0:
-        return False
-    # head dims must match buffers.
-    if k_buffer.shape[1] != h_kv or v_buffer.shape[1] != h_kv:
-        return False
-    if q_extend.shape[2] != k_extend.shape[2]:
-        return False
-    if q_extend.shape[2] != k_buffer.shape[2]:
-        return False
-    if v_extend.shape[2] != v_buffer.shape[2]:
-        return False
-    # NOTE: must NOT read any tensor *values* here (no .item()/.cpu()): the
-    # target-verify step runs inside a captured CUDA/HIP graph, where a
-    # device->host sync raises hipErrorStreamCaptureUnsupported. We therefore
-    # gate purely on static shapes/dtypes/python scalars.
-    bs = qo_indptr.shape[0] - 1
-    if bs < 1:
-        return False
-    # max_len_extend must be a known positive python int (it is the static
-    # server_args.speculative_num_draft_tokens for the verify path). For
-    # topk=1 the per-seq extend len is constant == num_draft_tokens ==
-    # max_len_extend by construction of qo_indptr (arange with that step), so
-    # the L_EXT row-tile mask is exactly right and the tree custom_mask equals
-    # causal -- no value inspection required.
-    try:
-        mle = int(max_len_extend)
-    except (TypeError, ValueError):
-        return False
-    if mle < 1:
-        return False
-    # The packed extend tensor must hold exactly bs * max_len_extend rows
-    # (constant extend len). This is a pure shape check (no sync) and rejects
-    # any ragged/variable-extend batch -> falls back to the baseline.
-    if q_extend.shape[0] != bs * mle:
-        return False
-    return True
+    return verify_mla.can_handle(
+        q_extend,
+        k_extend,
+        v_extend,
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        custom_mask,
+        is_causal,
+        mask_indptr,
+        max_len_extend,
+        sinks=sinks,
+        logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
+    )
 
 
 def verify_shared_kv_fwd(
@@ -928,7 +836,14 @@ def verify_shared_kv_fwd(
     if max_bs is None or max_bs < bs:
         max_bs = bs
     vk = _get_vmla(
-        max_bs, h_q, head_dim, v_head_dim, l_ext, q_extend.device, kv_group_num
+        max_bs,
+        h_q,
+        head_dim,
+        v_head_dim,
+        l_ext,
+        q_extend.device,
+        kv_group_num,
+        VerifyMLA,
     )
     vk(
         q_extend,
