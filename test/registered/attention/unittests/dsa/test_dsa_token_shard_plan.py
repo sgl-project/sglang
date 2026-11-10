@@ -11,6 +11,14 @@ test does not check the clamps. It rebuilds the answer the slow way -- walk ever
 token, assign it to a rank, read the counts off -- and requires the two to agree
 on every small batch.
 
+The collective pair ``dsa_token_shard_redistribute_heads`` /
+``dsa_token_shard_restore_tokens`` cannot run a real process group on CPU CI,
+so the exchange is scripted: the test precomputes every rank's send buffer,
+the fake group asserts the call under test built exactly that send, and the
+recv is the deterministic all-to-all of the expected sends. That still guards
+the reshape/permute math, the head order, the pad handling and the NaN
+zeroing -- the places a silent-wrong-rows bug would live.
+
 Usage:
     python -m pytest test_dsa_token_shard_plan.py -v
     python test_dsa_token_shard_plan.py
@@ -25,10 +33,17 @@ import torch
 
 from sglang.srt.layers.attention.dsa.dsa_token_shard import (
     _build_dsa_token_shard_plan,
+    dsa_token_shard_cumulative_query_lens,
     dsa_token_shard_key_lens,
+    dsa_token_shard_redistribute_heads,
+    dsa_token_shard_restore_tokens,
+    dsa_token_shard_slice,
 )
-from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import plan_dsa_token_shard
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
+    cumulative,
+    plan_dsa_token_shard,
+)
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -227,6 +242,189 @@ class TestTokenShardRefusesDpMaxLenPadding(CustomTestCase):
 
     def test_max_len_padding_is_refused(self):
         self.assertIsNone(self._plan(num_rows=2000))
+
+
+class _ScriptedAllToAllGroup:
+    """Stands in for the attention-TP process group on CPU CI.
+
+    all_to_all_single is deterministic: the recv chunk from rank s is rank s's
+    send chunk for this rank. The test precomputes every rank's send, so the
+    fake can assert the call under test built exactly that send and return the
+    matching recv -- no second process needed.
+    """
+
+    def __init__(self, expected_sends, state):
+        self._expected_sends = expected_sends
+        self._state = state
+
+    def all_to_all_single(self, recv, send):
+        me = self._state["rank"]
+        torch.testing.assert_close(
+            send, self._expected_sends[me], rtol=0, atol=0, equal_nan=True
+        )
+        expected_recv = torch.stack(
+            [
+                self._expected_sends[sender][me]
+                for sender in range(len(self._expected_sends))
+            ]
+        )
+        assert recv.shape == expected_recv.shape, (recv.shape, expected_recv.shape)
+        recv.copy_(expected_recv)
+
+
+def _expected_redistribute_send(x, plan, tp, head, dim):
+    """The send buffer redistribute builds: zero-pad to the planned width,
+    then one chunk per rank."""
+    missing = plan.num_tokens_pad - x.shape[0]
+    if missing > 0:
+        x = torch.cat([x, x.new_zeros((missing, *x.shape[1:]))], dim=0)
+    return x.reshape(tp, plan.rows, head, dim).contiguous()
+
+
+class TestTokenShardAllToAll(CustomTestCase):
+    """Round-trip of the collective pair, with the exchange scripted.
+
+    A reshape or permute slip in either function yields tensors of the right
+    shapes with the wrong rows, so the tests pin the cross-rank head order
+    and the exact inverse, not just "it runs".
+    """
+
+    def _run(
+        self, extend_lens, seq_lens, tp, head=3, dim=8, nan_tail=False, narrow=False
+    ):
+        plans = [plan_dsa_token_shard(extend_lens, seq_lens, tp, r) for r in range(tp)]
+        rows, pad = plans[0].rows, plans[0].num_tokens_pad
+        num_tokens = plans[0].num_tokens
+        full = [
+            (torch.arange(pad * head * dim, dtype=torch.float32) + r * 100000)
+            .reshape(pad, head, dim)
+            .contiguous()
+            for r in range(tp)
+        ]
+        if nan_tail:
+            for r in range(tp):
+                full[r][num_tokens:] = float("nan")
+        # narrow: the batch arrives unpadded and redistribute pads it.
+        inputs = [x[:num_tokens].clone() for x in full] if narrow else full
+        state = {"rank": 0}
+        parallel = types.SimpleNamespace(
+            attn_tp_size=tp, attn_tp_rank=0, attn_tp_group=None
+        )
+        patch = mock.patch(
+            "sglang.srt.layers.attention.dsa.dsa_token_shard.get_parallel",
+            return_value=parallel,
+        )
+        with patch:
+            expected_sends = [
+                _expected_redistribute_send(inputs[r], plans[r], tp, head, dim)
+                for r in range(tp)
+            ]
+            parallel.attn_tp_group = _ScriptedAllToAllGroup(expected_sends, state)
+            ys = []
+            for r in range(tp):
+                state["rank"] = r
+                parallel.attn_tp_rank = r
+                ys.append(dsa_token_shard_redistribute_heads(inputs[r], plans[r]))
+            for r in range(tp):
+                for s in range(tp):
+                    # Padded rows are zero in the send only when redistribute
+                    # padded them (narrow); full-width inputs keep their values.
+                    real = max(0, min(rows, num_tokens - r * rows))
+                    got = ys[r][:real, s * head : (s + 1) * head]
+                    want = full[s][r * rows : r * rows + real]
+                    self.assertTrue(torch.equal(got, want))
+
+            expected_sends = [
+                ys[r].reshape(rows, tp, head, dim).permute(1, 0, 2, 3).contiguous()
+                for r in range(tp)
+            ]
+            parallel.attn_tp_group = _ScriptedAllToAllGroup(expected_sends, state)
+            for r in range(tp):
+                state["rank"] = r
+                parallel.attn_tp_rank = r
+                num_rows = inputs[r].shape[0]
+                out = dsa_token_shard_restore_tokens(ys[r], plans[r], num_rows)
+                want = full[r][:num_rows].clone()
+                if num_rows > num_tokens:
+                    want[num_tokens:] = 0
+                self.assertTrue(torch.equal(out, want))
+
+    def test_round_trip_multi_request_tp2(self):
+        self._run([5, 9], [105, 214], tp=2)
+
+    def test_round_trip_uneven_last_slice_tp4(self):
+        # 17 tokens on 4 ranks: the last slice holds 2 real tokens, the rest
+        # padding -- the case the equal-slices intuition gets wrong.
+        self._run([17], [117], tp=4)
+
+    def test_round_trip_unpadded_input(self):
+        # The batch can arrive at the real token count; redistribute pads it.
+        # tp=4 so 14 tokens really do pad (16), unlike the tp=2 cases above.
+        self._run([5, 9], [105, 214], tp=4, narrow=True)
+
+    def test_round_trip_keeps_padded_width(self):
+        # num_rows leaves padded: what the next layer's KV write indexes
+        # against. Tail must come back zeroed even if the operator left NaN.
+        self._run([5, 9], [105, 214], tp=2, nan_tail=True)
+
+    def test_redistribute_rejects_overwide_input(self):
+        plan = plan_dsa_token_shard([5, 9], [105, 214], 2, 0)
+        x = torch.zeros(plan.num_tokens_pad + 1, 3, 8)
+        state = {"rank": 0}
+        parallel = types.SimpleNamespace(
+            attn_tp_size=2, attn_tp_rank=0, attn_tp_group=None
+        )
+        with mock.patch(
+            "sglang.srt.layers.attention.dsa.dsa_token_shard.get_parallel",
+            return_value=parallel,
+        ):
+            with self.assertRaises(AssertionError):
+                dsa_token_shard_redistribute_heads(x, plan)
+
+    def test_restore_rejects_rows_outside_the_plan(self):
+        plan = plan_dsa_token_shard([5, 9], [105, 214], 2, 0)
+        y = torch.zeros(plan.rows, 2 * 3, 8)
+        state = {"rank": 0}
+        parallel = types.SimpleNamespace(
+            attn_tp_size=2, attn_tp_rank=0, attn_tp_group=None
+        )
+        with mock.patch(
+            "sglang.srt.layers.attention.dsa.dsa_token_shard.get_parallel",
+            return_value=parallel,
+        ):
+            with self.assertRaises(AssertionError):
+                dsa_token_shard_restore_tokens(y, plan, plan.num_tokens - 1)
+            with self.assertRaises(AssertionError):
+                dsa_token_shard_restore_tokens(y, plan, plan.num_tokens_pad + 1)
+
+
+class TestTokenShardPlumbing(CustomTestCase):
+    """The non-collective helpers: top-k slicing and the cached query lens."""
+
+    def test_slice_takes_this_ranks_rows(self):
+        plan = plan_dsa_token_shard([17], [117], 4, 2)
+        x = torch.arange(20 * 3).reshape(20, 3)
+        out = dsa_token_shard_slice(x, plan)
+        self.assertEqual(out.shape[0], 5)
+        torch.testing.assert_close(out, x[10:15])
+
+    def test_slice_zero_pads_a_short_tail(self):
+        # Rank 3's slice is [15, 20) but only 17 tokens are real.
+        plan = plan_dsa_token_shard([17], [117], 4, 3)
+        x = torch.arange(20 * 3).reshape(20, 3)
+        out = dsa_token_shard_slice(x, plan)
+        self.assertEqual(out.shape[0], 5)
+        torch.testing.assert_close(out[:2], x[15:17])
+        torch.testing.assert_close(out[2:], x.new_zeros((3, 3)))
+
+    def test_cumulative_query_lens_cached_on_the_batch(self):
+        plan = plan_dsa_token_shard([5, 9], [105, 214], 2, 0)
+        batch = types.SimpleNamespace()
+        out = dsa_token_shard_cumulative_query_lens(batch, plan, torch.device("cpu"))
+        self.assertEqual(out.tolist(), cumulative(plan.query_lens))
+        self.assertIs(batch.npu_dsa_token_shard_cu_query_lens, out)
+        again = dsa_token_shard_cumulative_query_lens(batch, plan, torch.device("cpu"))
+        self.assertIs(again, out)
 
 
 if __name__ == "__main__":
