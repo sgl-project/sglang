@@ -1246,6 +1246,7 @@ class Scheduler(
                 )
             )
             self.kv_cache_allocation_time += time.perf_counter() - tic
+        kv_cache_builder.agree_on_stage_request_capacity(tp_worker=self.tp_worker)
 
         if get_model().is_startup_weight_load_overlap:
             self.tp_worker.finalize_startup_weight_load()
