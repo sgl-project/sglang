@@ -469,6 +469,9 @@ class StorageAttachment:
 
         for handle in list(cache._storage_prefetch_hit_remaining_by_reqid):
             cache.discard_storage_prefetch_accounting(handle)
+        reads = cache._native_storage_reads()
+        if reads is not None:
+            reads.clear_admission_holds()
         cache.prefetch_loaded_tokens_by_reqid.clear()
         cache.prefetch_loaded_storage_start_by_reqid.clear()
         cache.storage_prefetch_retries.clear()

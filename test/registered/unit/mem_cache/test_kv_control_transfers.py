@@ -1157,6 +1157,52 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             assert_retired(cache, service)
             cache.sanity_check()
 
+    def test_ordinary_restore_survives_eviction_until_admission_or_abort(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        for finish in ("admission", "abort", "over_budget"):
+            with (
+                self.subTest(finish=finish),
+                hicache(
+                    self, namespace_keys=True, write_policy="write_through"
+                ) as owner,
+            ):
+                _, cache, service, _ = owner
+                target = cache_fixtures.target()
+                self._cold_scopes(owner, [target])
+                demand = CacheRequestHandle("handoff-demand", 0)
+                cc = cache.cache_controller
+                with (
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                    patch.object(
+                        cc,
+                        "prefetch_capacity_limit",
+                        6 if finish == "over_budget" else 8,
+                    ),
+                ):
+                    self._ordinary_prefetch(cache, service, target, demand)
+
+                    def published():
+                        cache.drain_storage_control_queues()
+                        return demand not in cache.ongoing_prefetch
+
+                    wait_for(service, published)
+                    if finish == "over_budget":
+                        self.assertEqual(cache.evict_host(4), 4)
+                        cache.release_aborted_request(demand)
+                        continue
+                    self.assertEqual(cache.evict_host(4), 0)
+                    self.assertEqual(cache.pop_prefetch_loaded_span(demand), (4, 0))
+                    self.assertEqual(cache.evict_host(4), 0)
+                    if finish == "abort":
+                        cache.release_aborted_request(demand)
+                    else:
+                        cache.finish_storage_prefetch_admission(demand, 4, None)
+                    self.assertEqual(cache.evict_host(4), 4)
+                assert_retired(cache, service)
+                cache.sanity_check()
+
     def test_ordinary_read_does_not_wait_for_a_speculative_slot(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 

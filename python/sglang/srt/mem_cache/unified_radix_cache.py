@@ -485,6 +485,8 @@ class UnifiedRadixCache(BasePrefixCache):
         reads = self._native_storage_reads()
         if reads is not None and reads.demands:
             raise RuntimeError("Release native prefetch demand before cache reset")
+        if reads is not None:
+            reads.clear_admission_holds()
         if service is not None:
             service.invalidate_protection(reason="cache_reset")
         # In-flight restores still read their host slots; finish them first.
@@ -674,6 +676,8 @@ class UnifiedRadixCache(BasePrefixCache):
         reads = self._native_storage_reads()
         if reads is not None and reads.demands:
             raise RuntimeError("Release native prefetch demand before host teardown")
+        if reads is not None:
+            reads.clear_admission_holds()
         service = getattr(self, "kv_control_service", None)
         if service is not None:
             service.invalidate_protection(reason="host_cache_detached")
@@ -2689,6 +2693,21 @@ class UnifiedRadixCache(BasePrefixCache):
                 host_indices[: insert_result.prefix_len]
             )
             loaded_from_storage = completed_tokens - insert_result.prefix_len
+            if (
+                loaded_from_storage > 0
+                and on_publish is None
+                and hasattr(operation, "control_prefix")
+                and self.prefetch_stop_policy == "wait_complete"
+                and not self.is_write_back
+                and self.tree_core.component_types == (BASE_COMPONENT_TYPE,)
+                and insert_result.inserted_host_node is not None
+                and (reads := self._native_storage_reads()) is not None
+            ):
+                reads.hold_for_admission(
+                    request,
+                    insert_result.inserted_host_node,
+                    operation.storage_start + completed_tokens,
+                )
             # Cache mode has only completed L3 -> L2 here. Keep the usable
             # storage span unresolved until admission proves that L2 -> L1
             # load-back actually materialized it for this request.
@@ -2915,6 +2934,9 @@ class UnifiedRadixCache(BasePrefixCache):
         host allocation is transport staging rather than a resident L2 hit.
         """
         self._storage_prefetch_wait.pop(request, None)
+        reads = self._native_storage_reads()
+        if reads is not None:
+            reads.release_admission(request)
         if self.host_memory_mode == "cache":
             self._finish_storage_prefetch(request, fulfilled_tokens, reason)
 
@@ -2954,6 +2976,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
         reads = self._native_storage_reads()
         if reads is not None:
+            reads.release_admission(request)
             reads.release_demand(request, aborted=True)
         rid = request.rid
         self._storage_prefetch_wait.pop(request, None)
