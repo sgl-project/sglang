@@ -5,6 +5,7 @@ from utils import make_serving  # noqa: F401 — bootstrap import
 
 from sglang.srt.entrypoints.openai.protocol import (
     PromptTokensDetails,
+    ResponsesLifecycleEvent,
     ResponsesRequest,
     ResponsesResponse,
     UsageInfo,
@@ -361,20 +362,12 @@ class ResponsesResponseFromRequestTestCase(CustomTestCase):
         self.assertNotIn("prompt_tokens", usage)
         self.assertNotIn("completion_tokens", usage)
 
-    def test_effort_echoed_verbatim_and_masked_only_for_typed_stream_events(self):
-        import openai.types.responses as ort
-
-        from sglang.srt.entrypoints.openai.serving_responses import (
-            _sanitize_response_dict,
-        )
-
+    def test_effort_echoed_verbatim_and_accepted_by_lifecycle_stream_events(self):
         # OpenAI's Reasoning.effort literal is narrower than our tier list:
         # "none" is a request-side extension and xhigh/max postdate it. The
-        # response body echoes the requested tier verbatim; masking to None
-        # happens only where a typed SDK stream event would validate it.
-        # Echoing one of the unechoable tiers into such an event raises a
-        # ValidationError, which the stream generator builds before its try
-        # block -- the connection then dies without a single SSE byte.
+        # streaming wire uses ResponsesLifecycleEvent, which wraps our own
+        # ResponsesResponse schema rather than the SDK's narrow one, so every
+        # tier echoes verbatim without breaking event validation.
         for effort in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
             resp = _in_progress_response(
                 ResponsesRequest(
@@ -382,15 +375,7 @@ class ResponsesResponseFromRequestTestCase(CustomTestCase):
                 )
             )
             self.assertEqual(resp.reasoning["effort"], effort, effort)
-
-            payload = _sanitize_response_dict(resp.model_dump())
-            if effort in ("minimal", "low", "medium", "high"):
-                self.assertEqual(payload["reasoning"]["effort"], effort, effort)
-            else:
-                self.assertIsNone(payload["reasoning"]["effort"], effort)
-            ort.ResponseCreatedEvent(
-                type="response.created", sequence_number=0, response=payload
-            )
+            ResponsesLifecycleEvent(type="response.created", response=resp)
 
 
 class InputItemStringIdTestCase(CustomTestCase):
