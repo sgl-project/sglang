@@ -6,9 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.mm_utils import ShmPointerMMData
 from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
     AsyncShmMaterializer,
-    ShmPointerMMData,
     create_async_shm_materializer,
     estimate_shm_bytes,
 )
@@ -256,7 +256,7 @@ class AsyncShmMaterializerTest(CustomTestCase):
             server_args=None,
             model_config=None,
             max_recv_per_poll=-1,
-            stream_output=Mock(),
+            request_retirer=Mock(),
             get_last_batch=lambda: None,
             rust_server_mode=False,
             async_shm_materializer=coordinator,

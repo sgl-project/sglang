@@ -21,3 +21,5 @@ class MLAKVView(KVLayoutView):
     """One latent buffer per layer. ``set_mla_kv_buffer`` and
     ``get_mla_kv_buffer`` take ``layer_id_override``, so a caller need not
     rewrite ``RadixAttention.layer_id`` to address the view's layer."""
+
+    storage_rank_replicated = True

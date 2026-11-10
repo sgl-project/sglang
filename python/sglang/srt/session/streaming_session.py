@@ -11,7 +11,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     TreeLock,
 )
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
-from sglang.srt.utils.common import ceil_align, is_npu
+from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.device import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -138,7 +139,8 @@ class StreamingSession:
                 return None
 
         # Lend the record; the slot keeps the tree lock. A rejected chunked
-        # request matches again next cycle and borrows the same record.
+        # request matches again next cycle and borrows the same record. The
+        # row stays parked until `take`: a match is not admission.
         req.kv = slot.kv
 
         # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
@@ -147,7 +149,7 @@ class StreamingSession:
         prefix_len = min(req.kv.kv_committed_len, len(params.key))
 
         # Streaming sessions are append-only (session_controller rollback
-        # ensures req_nodes always points to the last successful req).
+        # ensures turns always points to the last successful req).
         assert prefix_len >= slot.kv.cache_protected_len, (
             f"streaming session prefix shrank: {prefix_len=} < "
             f"{slot.kv.cache_protected_len=}"
@@ -187,7 +189,7 @@ class StreamingSession:
         if not _is_streaming(req):
             return False
 
-        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+        from sglang.srt.managers.req_types import FINISH_ABORT
 
         slot = self.borrowed_slot(req)
         assert slot is not None, f"streaming {req.rid=} does not run on its slot"
@@ -220,8 +222,10 @@ class StreamingSession:
         # Use the finished length, not the req clock (it lags an in-flight verify
         # by ~1 under overlap); clamp so committed <= allocated.
         slot.kv.commit_finished(target)
+        # The slot keeps its row until the next turn, with nothing running.
+        self._storage().park_row(slot)
 
-        # Update req_nodes to this successfully finished request.
+        # Update turns to this successfully finished request.
         req.session.finish_req(req)
 
         return True
@@ -241,10 +245,13 @@ class StreamingSession:
     # -- Record ownership --
 
     def take(self, req: Req) -> None:
-        """A streaming turn's first row allocation: the session takes the
-        request's record and the tree lock it took at admission, and the
-        request borrows them from here on."""
-        if not _is_streaming(req) or self.borrowed_slot(req) is not None:
+        """A streaming turn's row allocation: the first turn's record and tree
+        lock move to a new slot it borrows; a later turn unparks its slot's row."""
+        if not _is_streaming(req):
+            return
+        slot = self.borrowed_slot(req)
+        if slot is not None:
+            self._storage().unpark_row(slot)
             return
         session_id = req.session.session_id
         assert session_id not in self.slots, f"{session_id=} already has a slot"
@@ -283,9 +290,7 @@ class StreamingSession:
         if slot.kv.holds_kv:
             self.cache.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])
             kv_storage_of(
-                self.cache.req_to_token_pool,
-                self.cache.token_to_kv_pool_allocator,
-                tree_cache=self.cache,
+                self.cache.req_to_token_pool, self.cache.token_to_kv_pool_allocator
             ).release_row(slot)
 
         self._free_slot_mamba(slot)
@@ -323,6 +328,11 @@ class StreamingSession:
         )
         req.session.abort_req()
         req.session = None
+
+    def _storage(self):
+        return kv_storage_of(
+            self.cache.req_to_token_pool, self.cache.token_to_kv_pool_allocator
+        )
 
     def _lock_to_slot(self, req: Req, slot: SessionSlot) -> None:
         slot.lock, req.lock = req.lock, None
