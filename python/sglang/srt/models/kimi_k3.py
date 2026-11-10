@@ -2826,7 +2826,13 @@ def _stage_facts(
         # reads full context and its output sums over TP.
         attn_ops["tp_group"] = SumGroup.TP
     return (
-        declare_attn(**attn_ops),
+        declare_attn(
+            **attn_ops,
+            # Interleave KDA restores sequence order inside the attention;
+            # zigzag delegates that transport to the stage boundary.
+            in_token_order=config.is_kda_layer(layer_idx)
+            and get_parallel().cp_strategy == "zigzag",
+        ),
         declare_ffn(
             **ffn_ops,
             sparse=is_moe,
