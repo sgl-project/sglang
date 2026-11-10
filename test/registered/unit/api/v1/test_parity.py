@@ -240,6 +240,7 @@ class TestResponseParity(CustomTestCase):
                 "spec_accept_rate": 0.5,
                 "cached_tokens_details": {"device": 1, "host": 0},
                 "e2e_latency": 0.25,
+                "dp_rank": None,
             },
         }
         frame = GenerateResponse.from_json_value(python_frame)
@@ -256,6 +257,7 @@ class TestResponseParity(CustomTestCase):
                 "reasoning_tokens",
                 "weight_version",
                 "cached_tokens_details",
+                "dp_rank",
             ],
         )
         self.assertEqual(
@@ -298,6 +300,7 @@ class TestResponseParity(CustomTestCase):
                 "audio_tokens",
                 "video_tokens",
                 "cached_tokens_details",
+                "dp_rank",
             ],
         )
 

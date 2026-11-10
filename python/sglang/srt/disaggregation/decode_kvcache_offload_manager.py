@@ -30,7 +30,6 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.srt.runtime_context import (
     get_memory,
@@ -40,6 +39,9 @@ from sglang.srt.runtime_context import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +55,14 @@ class DecodeKVCacheOffloadManager:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_group: torch.distributed.ProcessGroup,
         tree_cache: BasePrefixCache,
+        request_retirer: RequestRetirer,
     ) -> None:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = get_schedule().page_size
         self.request_counter = 0
         self.tree_cache = tree_cache
+        self.request_retirer = request_retirer
         env_stride = envs.SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE.get()
         if env_stride is None or env_stride <= 0:
             self.offload_stride = self.page_size
@@ -153,10 +157,6 @@ class DecodeKVCacheOffloadManager:
         # Page-aligned prompt length; the prefill instance offloaded this part.
         return len(req.origin_input_ids) // self.page_size * self.page_size
 
-    def has_inflight_device_transfer(self) -> bool:
-        """Whether a device-to-host copy may still read unified KV pages."""
-        return bool(self.ongoing_offload)
-
     def _resolve_offload_transfers(
         self, virtual_indices: torch.Tensor
     ) -> tuple[torch.Tensor, list[PoolTransfer]]:
@@ -164,17 +164,19 @@ class DecodeKVCacheOffloadManager:
         if not self._unified_window:
             return full_indices, []
 
-        swa_indices = self.token_to_kv_pool_allocator.id_spaces()[
-            IdSpaceKind.SLIDING_WINDOW
-        ].ids(virtual_indices)
+        window = self.kv_cache.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW).name
+        swa_indices = self.token_to_kv_pool_allocator.id_spaces()[window].ids(
+            virtual_indices
+        )
         # Page-aligned chunks have whole-page bindings; zero denotes the sink page.
-        live_swa_indices = swa_indices[swa_indices > 0].to(torch.int64)
-        if live_swa_indices.numel() == 0:
+        # Window rows go by the owner's ids; the copy translates them.
+        live_indices = virtual_indices[swa_indices > 0].to(torch.int64)
+        if live_indices.numel() == 0:
             return full_indices, []
         return full_indices, [
             PoolTransfer(
                 name=PoolName.SWA,
-                device_indices=live_swa_indices,
+                device_indices=live_indices,
                 hit_policy=PoolHitPolicy.TRAILING_PAGES,
             )
         ]
@@ -336,20 +338,9 @@ class DecodeKVCacheOffloadManager:
         if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
             return
 
-        # Released only at request finish; a mid-decode free races with
-        # concurrent admission over live slots. The prefix the prealloc match
-        # took from the tree stays with the tree: not freed, only unlocked.
-        self.tree_cache.free_kv_row(
-            req.kv, [(req.kv.cache_protected_len, req.kv.kv_allocated_len)]
-        )
-        self.tree_cache.unlock(req.lock)
-        req.lock = None
-        kv_storage_of(
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            tree_cache=self.tree_cache,
-        ).release_row(req)
-        req.kv.mark_kv_released()
+        # Only at finish: a mid-decode free races with admission over live slots.
+        # No checkpoint: the offloaded host copy keeps this KV, not the tree.
+        self.request_retirer.release(req, checkpoint=False)
         self.offloaded_state.pop(req, None)
 
     def _check_backup_progress(self, finish_count):

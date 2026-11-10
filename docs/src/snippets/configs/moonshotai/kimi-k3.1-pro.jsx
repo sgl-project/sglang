@@ -59,10 +59,11 @@ export const config = {
     return config.sizeOf(config.cellFor(s), "--pp-size") > 1;
   },
   // Throughput shapes verify K = 5 (block 6): at large batch the verify rows (requests ×
-  // block) dominate a step. The High-Throughput decode and every MI35x cell (whose PD prefill must
-  // match its decode) use block 6; everything else runs K = 7 (block 8).
+  // block) dominate a step. The High-Throughput decode uses block 6, everything else block 8.
+  // MI35x uses block 8 at 1-4 agents and block 5 on every High-Throughput cell, PD included.
   dflashBlock(s) {
-    return (s.pdMode === "decode" && s.strategy === "high-throughput") || config.isAmd(s) ? 6 : 8;
+    if (config.isAmd(s)) return s.strategy === "low-latency" ? 8 : 5;
+    return s.pdMode === "decode" && s.strategy === "high-throughput" ? 6 : 8;
   },
 
   matchDims: [
@@ -133,10 +134,13 @@ export const config = {
             // KV pool collapses (5.13M -> 0.77M tokens measured on decode). The PD prefill role
             // never runs verify and rejects the flag at startup.
             ...(s.pdMode !== "prefill" ? ["--enable-linear-replayssm-spec"] : []),
+            // The MI35x acceptance was measured with block verification of sampled drafts; greedy
+            // requests skip it.
+            ...(config.isAmd(s) ? ["--speculative-use-block-verification"] : []),
           ],
           hints: (s) =>
             s.pdMode === "decode" && s.strategy === "high-throughput"
-              ? ["High-throughput decode verifies K = 5 (block 6); launch the prefill role with the same block size."]
+              ? [`High-throughput decode verifies K = ${config.dflashBlock(s) - 1} (block ${config.dflashBlock(s)}); launch the prefill role with the same block size.`]
               : [],
         },
       ],
@@ -205,11 +209,11 @@ export const config = {
           flags: (s) => [
             "--enable-hierarchical-cache",
             "--hicache-write-policy write_back",
-            "--hicache-ratio 2.5",
+            `--hicache-ratio ${s.pdMode === "prefill" ? "4.0" : "2.5"}`,
           ],
           // Keeps every rank on the Rust TreeCore; write-back asserts on a mix with the Python one.
-          env: (s) => [`SGLANG_HICACHE_MAMBA_HOST_RATIO=${s.pdMode === "prefill" ? 8 : 12}`, "RUSTUP_TOOLCHAIN=stable"],
-          hints: ["The host pools pin about 190 GB of host memory per GPU; check the node's GTT limit before raising either ratio."],
+          env: (s) => [`SGLANG_HICACHE_MAMBA_HOST_RATIO=${s.pdMode === "prefill" ? 5 : 10}`, "RUSTUP_TOOLCHAIN=stable"],
+          hints: ["The host pools pin 170-190 GB of host memory per GPU, and the 8 ranks share the node's GTT (1511 GiB on MI355X); ratio 12 overflowed it at 32 agents. Check the node's GTT limit before raising either ratio."],
         },
         { id: "amd-off", label: "Off", showWhen: (s) => config.isAmd(s) },
         {
@@ -217,7 +221,7 @@ export const config = {
           label: "+ L3 (Mooncake)",
           showWhen: (s) => config.isAmd(s),
           disabled: () => true,
-          disableReason: "HiCache L3 has not run on MI350X / MI355X.",
+          disableReason: "HiCache L3 is not part of the MI350X / MI355X recipes.",
         },
       ],
     },
@@ -280,6 +284,14 @@ export const config = {
   },
   // MI35x PD roles take the host network and RDMA flags for the bootstrap ports and Mooncake.
   dockerHostNetworkWhen: (s) => config.isAmd(s) && ["prefill", "decode"].includes(s.pdMode),
+  // The MI35x image has no Ionic (AMD Pollara) verbs provider; without the host's, Mooncake uses TCP.
+  dockerMounts: (s) =>
+    config.isAmd(s) && ["prefill", "decode"].includes(s.pdMode)
+      ? [
+          "/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so:ro",
+          "/etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro",
+        ]
+      : [],
   github: {
     cookbookModel: "moonshotai/kimi-k3.1-pro",
   },
@@ -1055,6 +1067,9 @@ sgl-router \\
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=6",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "HSA_USERPTR_FOR_PAGED_MEM=0",
+        "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
+        "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
+        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1066,7 +1081,8 @@ sgl-router \\
         "--cuda-graph-max-bs-decode 4",
         "--schedule-policy lpm",
         "--prefill-decode-interval 16",
-        "--max-mamba-cache-size 60",
+        // 150 state slots keep agent sessions' prefixes cached.
+        "--max-mamba-cache-size 150",
         "--mamba-radix-cache-strategy extra_buffer_lazy",
         "--cuda-graph-backend-prefill breakable",
         "--cuda-graph-bs-prefill 256 512 768 1024 1536 2048 3072 4096",
@@ -1094,6 +1110,9 @@ sgl-router \\
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "HSA_USERPTR_FOR_PAGED_MEM=0",
+        "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
+        "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
+        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1102,11 +1121,11 @@ sgl-router \\
         "--dcp-size 8",
         "--dcp-comm-backend a2a",
         "--mem-fraction-static 0.85",
-        "--chunked-prefill-size 16384",
+        "--chunked-prefill-size 32768",
         "--max-running-requests 48",
         "--cuda-graph-max-bs-decode 48",
         "--schedule-policy lpm",
-        "--prefill-decode-interval 16",
+        "--prefill-decode-interval 32",
         "--mamba-full-memory-ratio 0.65",
         "--mamba-radix-cache-strategy extra_buffer_lazy",
         "--cuda-graph-backend-prefill breakable",
@@ -1135,6 +1154,11 @@ sgl-router \\
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION=0.1",
+        "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
+        "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
+        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
+        "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
+        "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600",
         "SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600",
         "MC_GID_INDEX=1",
@@ -1150,12 +1174,15 @@ sgl-router \\
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 16384",
         "--max-prefill-tokens 16384",
-        "--max-running-requests 128",
-        "--cuda-graph-max-bs-decode 16",
         "--schedule-policy shortest-prefill-first",
         "--disaggregation-decode-allocation-policy early",
-        "--mamba-full-memory-ratio 0.8",
+        "--enable-dsa-fp4-indexer",
+        "--mamba-full-memory-ratio 0.65",
+        "--mamba-max-states-per-path 1",
+        "--mamba-track-interval 64",
         "--mamba-radix-cache-strategy extra_buffer",
+        "--cuda-graph-backend-prefill breakable",
+        "--cuda-graph-bs-prefill 256 512 768 1024 1536 2048 3072 4096",
         "--watchdog-timeout 3600",
         "--weight-loader-prefetch-checkpoints",
         "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
@@ -1179,9 +1206,13 @@ sgl-router \\
         "SGLANG_AITER_K3_OPT=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
-        "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.95",
+        "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.99",
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
+        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
+        "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
+        "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
+        "RUSTUP_TOOLCHAIN=stable",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600",
         "SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600",
         "MC_GID_INDEX=1",
@@ -1194,10 +1225,10 @@ sgl-router \\
         "--tp-size 8",
         "--dcp-size 8",
         "--dcp-comm-backend a2a",
-        "--mem-fraction-static 0.91",
-        "--max-running-requests 96",
-        "--cuda-graph-max-bs-decode 96",
-        "--max-mamba-cache-size 160",
+        "--mem-fraction-static 0.92",
+        "--enable-dsa-fp4-indexer",
+        "--max-running-requests 160",
+        "--cuda-graph-max-bs-decode 160",
         "--mamba-radix-cache-strategy extra_buffer",
         "--disaggregation-decode-extra-slots 16",
         "--disaggregation-decode-enable-radix-cache",
@@ -1228,6 +1259,9 @@ sgl-router \\
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=6",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "HSA_USERPTR_FOR_PAGED_MEM=0",
+        "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
+        "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
+        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1239,7 +1273,8 @@ sgl-router \\
         "--cuda-graph-max-bs-decode 4",
         "--schedule-policy lpm",
         "--prefill-decode-interval 16",
-        "--max-mamba-cache-size 60",
+        // 150 state slots keep agent sessions' prefixes cached.
+        "--max-mamba-cache-size 150",
         "--mamba-radix-cache-strategy extra_buffer_lazy",
         "--cuda-graph-backend-prefill breakable",
         "--cuda-graph-bs-prefill 256 512 768 1024 1536 2048 3072 4096",
@@ -1267,6 +1302,9 @@ sgl-router \\
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "HSA_USERPTR_FOR_PAGED_MEM=0",
+        "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
+        "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
+        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1275,11 +1313,11 @@ sgl-router \\
         "--dcp-size 8",
         "--dcp-comm-backend a2a",
         "--mem-fraction-static 0.85",
-        "--chunked-prefill-size 16384",
+        "--chunked-prefill-size 32768",
         "--max-running-requests 48",
         "--cuda-graph-max-bs-decode 48",
         "--schedule-policy lpm",
-        "--prefill-decode-interval 16",
+        "--prefill-decode-interval 32",
         "--mamba-full-memory-ratio 0.65",
         "--mamba-radix-cache-strategy extra_buffer_lazy",
         "--cuda-graph-backend-prefill breakable",
@@ -1293,7 +1331,7 @@ sgl-router \\
       ],
     },
     {
-      // MI355X 1P1D prefill, measured with the decode below at AgentX concurrency 92.
+      // MI355X 1P1D prefill, measured with the decode below at AgentX concurrency 144.
       match: { hw: "mi355x", pdMode: "prefill", strategy: "high-throughput" },
       nnodes: 1,
       verified: true,
@@ -1308,6 +1346,11 @@ sgl-router \\
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION=0.1",
+        "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
+        "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
+        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
+        "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
+        "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600",
         "SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600",
         "MC_GID_INDEX=1",
@@ -1323,12 +1366,15 @@ sgl-router \\
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 16384",
         "--max-prefill-tokens 16384",
-        "--max-running-requests 128",
-        "--cuda-graph-max-bs-decode 16",
         "--schedule-policy shortest-prefill-first",
         "--disaggregation-decode-allocation-policy early",
-        "--mamba-full-memory-ratio 0.8",
+        "--enable-dsa-fp4-indexer",
+        "--mamba-full-memory-ratio 0.65",
+        "--mamba-max-states-per-path 1",
+        "--mamba-track-interval 64",
         "--mamba-radix-cache-strategy extra_buffer",
+        "--cuda-graph-backend-prefill breakable",
+        "--cuda-graph-bs-prefill 256 512 768 1024 1536 2048 3072 4096",
         "--watchdog-timeout 3600",
         "--weight-loader-prefetch-checkpoints",
         "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
@@ -1342,7 +1388,7 @@ sgl-router \\
       ],
     },
     {
-      // MI355X 1P1D decode: 160 KDA state slots leave the rest of the pool to the MLA KV (18.7M tokens).
+      // MI355X 1P1D decode at AgentX concurrency 144.
       match: { hw: "mi355x", pdMode: "decode", strategy: "high-throughput" },
       nnodes: 1,
       verified: true,
@@ -1352,9 +1398,13 @@ sgl-router \\
         "SGLANG_AITER_K3_OPT=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
-        "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.95",
+        "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.99",
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
+        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
+        "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
+        "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
+        "RUSTUP_TOOLCHAIN=stable",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600",
         "SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600",
         "MC_GID_INDEX=1",
@@ -1367,10 +1417,10 @@ sgl-router \\
         "--tp-size 8",
         "--dcp-size 8",
         "--dcp-comm-backend a2a",
-        "--mem-fraction-static 0.91",
-        "--max-running-requests 96",
-        "--cuda-graph-max-bs-decode 96",
-        "--max-mamba-cache-size 160",
+        "--mem-fraction-static 0.92",
+        "--enable-dsa-fp4-indexer",
+        "--max-running-requests 160",
+        "--cuda-graph-max-bs-decode 160",
         "--mamba-radix-cache-strategy extra_buffer",
         "--disaggregation-decode-extra-slots 16",
         "--disaggregation-decode-enable-radix-cache",
