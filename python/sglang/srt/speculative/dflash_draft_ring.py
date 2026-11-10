@@ -223,8 +223,8 @@ class DFlashDraftKVRing:
 
     def reset_floor(self, req_pool_idx: int, seq_len: int) -> None:
         """PD decode, at preallocation: no draft context until prefill's floor
-        row lands, so a prefill that ships no ring leaves an empty window
-        rather than a stale one."""
+        row lands, so a prefill that ships no ring, or a request resumed from a
+        retraction, gets an empty window rather than a stale one."""
         self.min_pos[req_pool_idx].fill_(seq_len)
 
     def ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:

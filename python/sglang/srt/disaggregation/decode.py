@@ -2233,7 +2233,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ring = self.draft_kv_ring
             if ring is None:
                 return None
-            ring.reset_floor(int(decode_req.req.kv.req_pool_idx), seq_len)
             return ring.transfer_rows(int(decode_req.req.kv.req_pool_idx), seq_len)
 
         def _request_row_payload():
@@ -2986,6 +2985,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         fill_len = pre_alloc_fill_len(req)
         req.kv.commit_prealloc(fill_len)
+        if self.draft_kv_ring is not None:
+            # The slot's ring rows hold an earlier request's draft KV: no draft
+            # context until a transfer's floor row lands. A resumed retraction
+            # gets none back, since its ring rows were not backed up.
+            self.draft_kv_ring.reset_floor(int(req.kv.req_pool_idx), fill_len)
 
         if prefix_len > 0:
             self.req_to_token_pool.write(
