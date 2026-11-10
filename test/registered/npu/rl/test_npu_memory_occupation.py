@@ -59,14 +59,26 @@ class TestNpuMemoryOccupation(CustomTestCase):
     def setUpClass(cls):
         warmup_npu()
         cls.weight_bytes = checkpoint_weight_bytes(MODEL)
+        # One memory-saver server for all release/resume cases. Restarting a
+        # mempool-backed server repeatedly is what stresses the NPU driver.
+        cls._server = npu_server(MODEL, extra_args=MEMORY_ARGS)
+        cls.base_url = cls._server.__enter__()
 
-    def test_release_weights_frees_memory(self):
-        with npu_server(MODEL, extra_args=MEMORY_ARGS) as base_url:
-            generate(base_url, PROMPTS[0])
-            before = npu_free_bytes()
+    @classmethod
+    def tearDownClass(cls):
+        cls._server.__exit__(None, None, None)
 
-            release_memory(base_url, ["weights"])
+    def setUp(self):
+        # A failed case may leave a tag offloaded. resume is idempotent, so
+        # each case starts from the fully-resident state.
+        resume_memory(self.base_url, ["weights", "kv_cache"])
 
+    def test_01_release_weights_frees_memory(self):
+        generate(self.base_url, PROMPTS[0])
+        before = npu_free_bytes()
+
+        try:
+            release_memory(self.base_url, ["weights"])
             freed = npu_free_bytes() - before
             self.assertGreater(
                 freed,
@@ -75,57 +87,85 @@ class TestNpuMemoryOccupation(CustomTestCase):
             )
             # /health generates a token, which is invalid while weights are
             # offloaded; /model_info only reads server metadata.
-            get(base_url, "/model_info")
+            get(self.base_url, "/model_info")
+        finally:
+            resume_memory(self.base_url, ["weights"])
 
     def test_release_all_then_resume_restores_output(self):
-        with npu_server(MODEL, extra_args=MEMORY_ARGS) as base_url:
-            golden = generation_signature(base_url, PROMPTS)
+        golden = generation_signature(self.base_url, PROMPTS)
 
-            release_memory(base_url, ["weights", "kv_cache"])
+        release_memory(self.base_url, ["weights", "kv_cache"])
+        resume_memory(self.base_url, ["weights", "kv_cache"])
 
-            resume_memory(base_url, ["weights", "kv_cache"])
-            actual = generation_signature(base_url, PROMPTS)
-            self.assertEqual(actual, golden, "output changed after release/resume")
+        actual = generation_signature(self.base_url, PROMPTS)
+        self.assertEqual(actual, golden, "output changed after release/resume")
 
     def test_staged_resume_restores_output(self):
-        with npu_server(MODEL, extra_args=MEMORY_ARGS) as base_url:
-            golden = generation_signature(base_url, PROMPTS)
+        golden = generation_signature(self.base_url, PROMPTS)
 
-            release_memory(base_url, ["weights", "kv_cache"])
-            resume_memory(base_url, ["weights"])
-            resume_memory(base_url, ["kv_cache"])
+        release_memory(self.base_url, ["weights", "kv_cache"])
+        resume_memory(self.base_url, ["weights"])
+        resume_memory(self.base_url, ["kv_cache"])
 
-            actual = generation_signature(base_url, PROMPTS)
-            self.assertEqual(actual, golden, "staged resume changed the output")
+        actual = generation_signature(self.base_url, PROMPTS)
+        self.assertEqual(actual, golden, "staged resume changed the output")
 
     def test_resume_twice_keeps_server_healthy(self):
+        golden = generation_signature(self.base_url, PROMPTS)
+
+        release_memory(self.base_url, ["weights", "kv_cache"])
+        resume_memory(self.base_url, ["weights", "kv_cache"])
+        second = requests.post(
+            self.base_url + "/resume_memory_occupation",
+            json={"tags": ["weights", "kv_cache"]},
+            timeout=120,
+        )
+
+        self.assertNotEqual(second.status_code, 500, "second resume crashed the server")
+        self.assertTrue(health(self.base_url))
+        actual = generation_signature(self.base_url, PROMPTS)
+        self.assertEqual(actual, golden, "double resume changed the output")
+
+
+@unittest.skipUnless(npu_available(), "requires an Ascend NPU")
+@unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
+class TestNpuMemoryOccupationFreshServer(CustomTestCase):
+    def test_release_resume_on_fresh_server(self):
+        # Keep one case on a freshly-started engine: the shared-server cases
+        # cover repeated cycles, but not the first release on a clean allocator.
         with npu_server(MODEL, extra_args=MEMORY_ARGS) as base_url:
             golden = generation_signature(base_url, PROMPTS)
 
             release_memory(base_url, ["weights", "kv_cache"])
             resume_memory(base_url, ["weights", "kv_cache"])
-            second = requests.post(
-                base_url + "/resume_memory_occupation",
-                json={"tags": ["weights", "kv_cache"]},
-                timeout=120,
-            )
 
-            self.assertNotEqual(
-                second.status_code, 500, "second resume crashed the server"
-            )
-            self.assertTrue(health(base_url))
             actual = generation_signature(base_url, PROMPTS)
-            self.assertEqual(actual, golden, "double resume changed the output")
+            self.assertEqual(actual, golden, "fresh-server resume changed the output")
+
+
+@unittest.skipUnless(npu_available(), "requires an Ascend NPU")
+@unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
+class TestNpuMemoryOccupationWithoutFlag(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        warmup_npu()
+        # No --enable-memory-saver: this server is the negative control and
+        # cannot share the mempool-backed server above.
+        cls._server = npu_server(MODEL, extra_args=NO_MEMORY_ARGS)
+        cls.base_url = cls._server.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._server.__exit__(None, None, None)
 
     def test_release_without_flag_is_noop(self):
-        with npu_server(MODEL, extra_args=NO_MEMORY_ARGS) as base_url:
-            release_memory(base_url, ["weights"])
+        release_memory(self.base_url, ["weights"])
 
-            # Without --enable-memory-saver the call must not offload weights:
-            # a real offload would make the next forward fail.
-            self.assertTrue(health(base_url))
-            response = generate(base_url, PROMPTS[0], max_new_tokens=4)
-            self.assertTrue(response.get("output_ids"))
+        # Without --enable-memory-saver the call must not offload weights:
+        # a real offload would make the next forward fail.
+        self.assertTrue(health(self.base_url))
+        response = generate(self.base_url, PROMPTS[0], max_new_tokens=4)
+        self.assertTrue(response.get("output_ids"))
 
 
 if __name__ == "__main__":
