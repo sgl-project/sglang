@@ -546,6 +546,8 @@ pub struct CacheInitParams {
     /// Host-only mamba checkpoints never occupy a GPU slot. A host value then
     /// still counts as a device-prefix match so Full KV indices stay reachable.
     pub mamba_host_only_checkpoint: bool,
+    /// Per-root-path cap on cached SWA windows; None means unlimited.
+    pub swa_max_states_per_path: Option<usize>,
 }
 
 impl Default for CacheInitParams {
@@ -568,6 +570,7 @@ impl Default for CacheInitParams {
             mamba_cache_chunk_size: None,
             mamba_max_states_per_path: None,
             mamba_host_only_checkpoint: false,
+            swa_max_states_per_path: None,
         }
     }
 }
@@ -1289,15 +1292,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(())
     }
 
-    /// Evict shallow Mamba device checkpoints beyond the per-path cap on the
-    /// tail's root path; the mamba component drives the walk.
+    /// Evict `component_type`'s shallow device values beyond its per-path cap on
+    /// the tail's root path; the component drives the walk.
     pub fn evict_excess_path_states(
         &mut self,
         tail_node_id: NodeId,
+        component_type: ComponentType,
     ) -> Result<EvictionStepResult, NodeAccessError> {
         let tail_node_id = self.arena.resolve(tail_node_id)?;
         let mut result = EvictionStepResult::default();
-        let component = self.component_by_type_(self.family_slot_(Family::State));
+        let component = self.component_by_type_(component_type);
         component.evict_excess_path_states(
             self,
             tail_node_id,
@@ -3327,6 +3331,89 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         let parent = self.arena.node(node_id).parent();
         self.update_evictable_leaf_sets_(parent);
+    }
+
+    /// Evict shallow values of `component_type` beyond `cap` on the tail's root
+    /// path; with `count_host_only` a host-only value counts as a holder and is
+    /// evicted from host. Full KV, host backups, the tail, nodes ending within
+    /// `protected_tail_tokens` of the tail's end, forks, locked nodes and device
+    /// leaves are preserved, so the cap is a best-effort soft limit.
+    pub(crate) fn evict_path_states_beyond_cap_(
+        &mut self,
+        component_type: ComponentType,
+        tail_node_id: NodeIdx_,
+        cap: usize,
+        protected_tail_tokens: usize,
+        count_host_only: bool,
+        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
+    ) {
+        // Value holders on the root path with the tokens below them, tail-first.
+        let mut holders: Vec<(NodeIdx_, usize)> = Vec::new();
+        let mut tokens_below = 0;
+        let mut cursor = Some(tail_node_id);
+        while let Some(node_id) = cursor {
+            let node = self.arena.node(node_id);
+            if node.is_root() {
+                break;
+            }
+            let host_only_holder = count_host_only
+                && !node.has_device_value(component_type)
+                && node.has_host_value(component_type);
+            if node.has_device_value(component_type) || host_only_holder {
+                holders.push((node_id, tokens_below));
+            }
+            tokens_below += node.key.atom_len();
+            cursor = node.parent;
+        }
+        let mut excess = holders.len().saturating_sub(cap);
+        if excess == 0 {
+            return;
+        }
+        // Cache-level apply: the counts are not reported, only the frees.
+        let mut tracker: HashMap<ComponentType, usize> = HashMap::new();
+        for &(node_id, tokens_below) in holders.iter().rev() {
+            if excess == 0 || node_id == tail_node_id || tokens_below < protected_tail_tokens {
+                break;
+            }
+            let node = self.arena.node(node_id);
+            let host_only_holder =
+                !node.has_device_value(component_type) && node.has_host_value(component_type);
+            if node.device_lock_ref(component_type) > 0 || node.children.len() != 1 {
+                continue;
+            }
+            if host_only_holder && node.host_lock_ref(component_type) > 0 {
+                continue;
+            }
+            if self.evictable_device_leaves.contains(node_id) {
+                continue;
+            }
+            let layer = if host_only_holder {
+                EvictLayer::Host
+            } else {
+                EvictLayer::Device
+            };
+            self.evict_component_and_detach_lru_(
+                node_id,
+                component_type,
+                device_frees,
+                host_frees,
+                cache_actions,
+                layer,
+                Some(&mut tracker),
+            );
+            self.cascade_evict_(
+                node_id,
+                component_type,
+                &mut tracker,
+                device_frees,
+                host_frees,
+                cache_actions,
+                layer,
+            );
+            excess -= 1;
+        }
     }
 
     /// Cascade eviction from trigger to lower-or-equal priority components.

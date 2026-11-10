@@ -83,12 +83,13 @@ pub struct UpdatePendingBackupOnNodeSplit {
     pub new_child_node_id: NodeId,
 }
 
-/// Per-path Mamba state-cap eviction from the tail's root path; applied at
-/// the insert's commit barrier, after the walk-time backups whose
-/// write-through locks shield the backed-up chain.
+/// Per-path state-cap eviction (Mamba states, SWA windows) from the tail's
+/// root path; applied at the insert's commit barrier, after the walk-time
+/// backups whose write-through locks shield the backed-up chain.
 #[derive(Debug)]
-pub struct MambaEvictExcessPathStates {
+pub struct EvictExcessPathStates {
     pub tail_node_id: NodeId,
+    pub component_type: ComponentType,
 }
 
 /// Free only the given component's device KV slots.
@@ -149,7 +150,7 @@ self::impl_cache_action!(
     "update_pending_backup_on_node_split",
     insert_barrier = false
 );
-self::impl_cache_action!(MambaEvictExcessPathStates, "mamba_evict_excess_path_states");
+self::impl_cache_action!(EvictExcessPathStates, "evict_excess_path_states");
 self::impl_cache_action!(FreeComponentDeviceSlot, "free_component_device_slot");
 self::impl_cache_action!(FreeComponentHostSlot, "free_component_host_slot");
 self::impl_cache_action!(RebuildFullToSwaMapping, "rebuild_full_to_swa_mapping");

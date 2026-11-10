@@ -408,6 +408,7 @@ pub struct TreeCoreInitParamsBinding {
     pub mamba_cache_chunk_size: Option<usize>,
     pub mamba_max_states_per_path: Option<usize>,
     pub mamba_host_only_checkpoint: bool,
+    pub swa_max_states_per_path: Option<usize>,
 }
 
 impl TreeCoreInitParamsBinding {
@@ -432,6 +433,7 @@ impl TreeCoreInitParamsBinding {
             mamba_cache_chunk_size: self.mamba_cache_chunk_size,
             mamba_max_states_per_path: self.mamba_max_states_per_path,
             mamba_host_only_checkpoint: self.mamba_host_only_checkpoint,
+            swa_max_states_per_path: self.swa_max_states_per_path,
         })
     }
 }
@@ -439,7 +441,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false, swa_max_states_per_path = None))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -457,6 +459,7 @@ impl TreeCoreInitParamsBinding {
         tlru_float_config: Option<TlruFloatConfigBinding>,
         dynamo_kv_event_format: bool,
         mamba_host_only_checkpoint: bool,
+        swa_max_states_per_path: Option<usize>,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
@@ -475,6 +478,7 @@ impl TreeCoreInitParamsBinding {
             mamba_cache_chunk_size,
             mamba_max_states_per_path,
             mamba_host_only_checkpoint,
+            swa_max_states_per_path,
         }
     }
 }
@@ -2031,15 +2035,20 @@ macro_rules! tree_core_methods {
                 })
             }
 
-            /// Evict shallow Mamba device checkpoints beyond the per-path cap on the
+            /// Evict a component's shallow device values beyond its per-path cap on the
             /// tail's root path; returns the step's freed tensors.
             fn evict_excess_path_states(
                 &self,
                 py: Python<'_>,
                 tail_node_id: NodeId,
+                component_type: u8,
             ) -> PyResult<HostEvictionResultBinding> {
+                let component_type = parse_component_type(component_type)?;
                 let result = py
-                    .detach(move || self.core().evict_excess_path_states(tail_node_id))
+                    .detach(move || {
+                        self.core()
+                            .evict_excess_path_states(tail_node_id, component_type)
+                    })
                     .map_err(node_access_error)?;
                 Ok(HostEvictionResultBinding {
                     tracker: tracker_to_py(result.tracker),
@@ -3398,14 +3407,18 @@ macro_rules! tree_core_binding {
                 })
             }
 
-            /// Evict shallow Mamba device checkpoints beyond the per-path cap
+            /// Evict a component's shallow device values beyond its per-path cap
             /// on the tail's root path.
             fn evict_excess_path_states(
                 &self,
                 py: Python<'_>,
                 tail_node_id: NodeId,
+                component_type: u8,
             ) -> PyResult<HostEvictionResultBinding> {
-                catch_native_panic(|| self.inner.evict_excess_path_states(py, tail_node_id))
+                catch_native_panic(|| {
+                    self.inner
+                        .evict_excess_path_states(py, tail_node_id, component_type)
+                })
             }
 
             /// Bump the reference count on a node's host-side component locks.

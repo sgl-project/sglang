@@ -1,5 +1,5 @@
 use super::*;
-use crate::cache_action::{BackupKV, FreeComponentHostSlot, MambaEvictExcessPathStates};
+use crate::cache_action::{BackupKV, EvictExcessPathStates, FreeComponentHostSlot};
 use crate::components::{ComponentSet, FULL, MAMBA, SWA};
 use crate::test_utils::{accumulate_step, action_kinds, expect_action};
 use crate::unified_lru_list::UnifiedLRUList;
@@ -2426,7 +2426,7 @@ fn evict_excess_path_states_counts_host_only_checkpoints() {
     tc.host_lru_list_mut(MAMBA).insert_mru(a);
     tc.host_lru_list_mut(MAMBA).insert_mru(b);
     let mut result = tc
-        .evict_excess_path_states(tc.arena.node(b).id)
+        .evict_excess_path_states(tc.arena.node(b).id, MAMBA)
         .expect("live test node");
     let freed = result
         .host_frees
@@ -2446,7 +2446,7 @@ fn evict_excess_path_states_removes_the_shallowest_states_beyond_the_cap() {
     set_mamba_device(&mut tc, b, 8);
     set_mamba_device(&mut tc, c, 9);
     let mut result = tc
-        .evict_excess_path_states(tc.arena.node(c).id)
+        .evict_excess_path_states(tc.arena.node(c).id, MAMBA)
         .expect("live test node");
     let freed = result
         .device_frees
@@ -2480,7 +2480,7 @@ fn evict_excess_path_states_preserves_forks_locked_nodes_and_the_tail() {
         .node_mut(b)
         .set_lock_ref_(ValueSlotIdx::device(MAMBA), 1);
     let result = tc
-        .evict_excess_path_states(tc.arena.node(c).id)
+        .evict_excess_path_states(tc.arena.node(c).id, MAMBA)
         .expect("live test node");
     assert!(result.device_frees.is_empty());
     assert!(result.host_frees.is_empty());
@@ -2496,7 +2496,7 @@ fn evict_excess_path_states_without_a_cap_is_a_no_op() {
     set_mamba_device(&mut tc, a, 7);
     set_mamba_device(&mut tc, b, 8);
     let result = tc
-        .evict_excess_path_states(tc.arena.node(b).id)
+        .evict_excess_path_states(tc.arena.node(b).id, MAMBA)
         .expect("live test node");
     assert!(result.device_frees.is_empty());
     assert!(result.host_frees.is_empty());
@@ -2512,13 +2512,16 @@ fn insert_commit_emits_the_path_cap_action_only_when_capped() {
         .best_match_node_id;
     let [action] = result.cache_actions.as_slice() else {
         panic!(
-            "expected one MambaEvictExcessPathStates, got {:?}",
+            "expected one Mamba EvictExcessPathStates, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
-    let MambaEvictExcessPathStates { tail_node_id } =
-        expect_action::<MambaEvictExcessPathStates>(action.as_ref());
+    let EvictExcessPathStates {
+        tail_node_id,
+        component_type,
+    } = expect_action::<EvictExcessPathStates>(action.as_ref());
     assert_eq!(*tail_node_id, leaf);
+    assert_eq!(*component_type, MAMBA);
 
     let mut uncapped = mamba_core(/* page_size = */ 1);
     let result = uncapped.insert(&insert_params_mamba(&vec![1, 2], &[10, 11], Some(7)));

@@ -34,11 +34,11 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
+    EvictExcessPathStates,
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
-    MambaEvictExcessPathStates,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
     SWARebuild,
@@ -199,8 +199,10 @@ def _cache_action_from_tagged(action: tuple, ids: _CoreIds) -> CacheAction:
         return FreeDeviceKVFullOnly(indices=list(action[1]))
     if tag == "backup_kv":
         return BackupKV(node_ids=list(action[1]))
-    if tag == "mamba_evict_excess_path_states":
-        return MambaEvictExcessPathStates(tail_node_id=action[1])
+    if tag == "evict_excess_path_states":
+        return EvictExcessPathStates(
+            tail_node_id=action[1], component_type=ids.tree(action[2])
+        )
     if tag == "update_pending_backup_on_node_split":
         return UpdatePendingBackupOnNodeSplit(
             ack_id=action[1],
@@ -565,6 +567,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         mamba_max_states_per_path = (
             get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
         )
+        swa_max_states_per_path = (
+            params.swa_max_states_per_path if TREE_WINDOW in families else -1
+        )
 
         self._binding = self._binding_class()(
             self._bindings.TreeCoreInitParamsBinding(
@@ -601,6 +606,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 ),
                 mamba_host_only_checkpoint=(
                     host_only_mamba_checkpoint() if has_mamba else False
+                ),
+                swa_max_states_per_path=(
+                    swa_max_states_per_path if swa_max_states_per_path >= 0 else None
                 ),
             ),
             # Each slot's id and family: the native core picks a slot's driver
@@ -974,11 +982,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,
+        component_type: ComponentType,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
-        binding_result = self._binding.evict_excess_path_states(tail_node_id)
+        binding_result = self._binding.evict_excess_path_states(
+            tail_node_id, self._ids.core(component_type)
+        )
         for component, tensors in binding_result.new_device_frees.items():
             device_frees[self._ids.tree(component)].extend(tensors)
         for component, tensors in binding_result.new_host_frees.items():
