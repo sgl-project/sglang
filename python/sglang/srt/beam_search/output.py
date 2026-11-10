@@ -59,6 +59,14 @@ def pack_beam_search_output(req: Req) -> Optional[BeamSearchOutput]:
                 cum_logprob=r.cum_logprob,
                 beam_score=r.beam_score,
                 finish_reason=finish_reason.to_json(),
+                catalog_result=(
+                    {
+                        "catalog_id": group.catalog_id,
+                        **group.catalog.catalog.resolve(r.tokens),
+                    }
+                    if getattr(group, "catalog", None) is not None
+                    else None
+                ),
             )
         )
     return BeamSearchOutput(sequences=sequences)
@@ -195,6 +203,8 @@ def _build_beam_search_out_dict(
             beam_meta_info = {}
         beam_meta_info["finish_reason"] = beam_seq.finish_reason
         beam_meta_info["sequence_score"] = beam_seq.beam_score
+        if getattr(beam_seq, "catalog_result", None) is not None:
+            beam_meta_info.update(beam_seq.catalog_result)
         beam_out_dict["meta_info"] = beam_meta_info
 
         beam_results.append(beam_out_dict)

@@ -268,6 +268,13 @@ def create_unlimited_ocr_v2_backend(runner):
     return UnlimitedOCRV2AttnBackend(runner)
 
 
+@register_attention_backend("gr_paged")
+def create_gr_paged_backend(runner):
+    from sglang.srt.layers.attention.gr_paged_backend import GRPagedAttentionBackend
+
+    return GRPagedAttentionBackend(runner)
+
+
 @register_attention_backend("torch_native")
 def create_torch_native_backend(runner):
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend

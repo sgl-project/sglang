@@ -195,6 +195,7 @@ def _tree_cache(window=8):
 
 def _req(rid, prompt, max_new_tokens=4):
     req = MagicMock(spec=Req)
+    req.beam_group = None
     req.kv = ReqKvInfo()
     req.rid = rid
     req.cache_request_handle = CacheRequestHandle(rid, 0)

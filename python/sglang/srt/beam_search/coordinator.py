@@ -44,6 +44,7 @@ import msgspec
 import torch
 
 from sglang.srt.beam_search.beam_group import BeamGroup, BeamGroupState
+from sglang.srt.beam_search.catalog import DeviceItemCatalog, get_catalog
 from sglang.srt.beam_search.fork import (
     MEMBER_LENGTH_MARGIN,
     StagedOrphans,
@@ -54,6 +55,7 @@ from sglang.srt.beam_search.fork import (
     remap_kv_mapping,
 )
 from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
+from sglang.srt.beam_search.paged_kv import GRPagedKVState
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.req_types import (
@@ -68,6 +70,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_serving,
 )
 
 if TYPE_CHECKING:
@@ -108,8 +111,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     tree_cache: BasePrefixCache
     future_map: FutureMap
 
+    # Set by the scheduler from the explicitly selected attention backend.
+    gr_paged_enabled: bool = False
+
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
+    _catalogs: dict = msgspec.field(default_factory=dict)
 
     def _storage(self):
         """Where member rows and their token ids are taken and given back."""
@@ -125,13 +132,24 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         None. On success the leader's row params are neutralized."""
         user_params = req.sampling_params
         beam_width = user_params.beam_width
+        enable_gr = get_serving().enable_gr
+        gr_paged = enable_gr and self.gr_paged_enabled
+        if enable_gr:
+            # Also enforce policy for requests delivered directly to the scheduler.
+            try:
+                user_params.apply_gr_policy()
+            except ValueError as exc:
+                return str(exc)
+        num_candidates = beam_width if enable_gr else 2 * beam_width
 
         if not self.spec_algorithm.is_none():
             return "Beam search is not supported with speculative decoding."
         if get_disagg().disaggregation_mode != "null":
             return "Beam search is not supported with PD disaggregation."
-        if get_schedule().page_size > 1:
-            return "Beam search currently requires --page-size 1."
+        if get_schedule().page_size > 1 and not gr_paged:
+            return (
+                "Beam search currently requires --page-size 1 unless GR uses gr_paged."
+            )
         if self.dllm_enabled:
             return "Beam search is not supported with diffusion LLM."
         if get_memory().enable_hisparse:
@@ -175,7 +193,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             return "Beam search does not support min_new_tokens yet."
         if user_params.n > beam_width:
             return f"n ({user_params.n}) cannot exceed beam_width ({beam_width})."
-        if 2 * beam_width > self.model_config.vocab_size:
+        if num_candidates > self.model_config.vocab_size:
             return f"beam_width ({beam_width}) is too large for the vocabulary."
         if beam_width > self.req_to_token_pool.size:
             return (
@@ -201,17 +219,67 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 f"context budget (prompt_len={prompt_len}, max_req_len={self.max_req_len})."
             )
 
+        catalog = None
+        if user_params.gr_catalog is not None:
+            if not enable_gr:
+                return "gr_catalog requires --enable-gr."
+            try:
+                user_params.verify(self.model_config.vocab_size)
+                catalog = get_catalog(
+                    get_serving().gr_catalog_manifest,
+                    user_params.gr_catalog,
+                    self.model_config.vocab_size,
+                )
+                catalog.validate_budget(user_params.max_new_tokens)
+            except ValueError as exc:
+                return str(exc)
+            # SID's continuous executor reduces initial width to root fanout;
+            # without a width policy, subsequent steps retain that active width.
+            beam_width = min(beam_width, catalog.root_width)
+            num_candidates = beam_width
+
+        paged_state = None
+        if gr_paged:
+            page_size = get_schedule().page_size
+            paged_state = GRPagedKVState(
+                prompt_len, beam_width, max_new_tokens, page_size
+            )
+            context_slots = (prompt_len + page_size - 1) // page_size * page_size
+            capacity = self.token_to_kv_pool_allocator.size // page_size * page_size
+            required = context_slots + paged_state.arena_slots
+            if required > capacity:
+                return (
+                    f"GR paged beam request needs {required} KV slots "
+                    f"(context {context_slots}, beam arena {paged_state.arena_slots}) "
+                    f"but the pool holds {capacity}."
+                )
+            if prompt_len > get_schedule().max_prefill_tokens:
+                return "GR paged attention requires the full prompt to fit --max-prefill-tokens."
+
         group = BeamGroup(
             beam_width=beam_width,
+            # Fixed-length GR returns the cumulative SID log-probability.
+            length_penalty=0.0 if enable_gr else 1.0,
             stop_token_ids=self._collect_stop_token_ids(req, user_params),
             max_new_tokens=max_new_tokens,
             num_return=user_params.n,
-            # Frontier state lives on device: selection consumes device top-2k
-            # tensors in place; only k-sized results ever reach the host.
+            num_candidates=num_candidates,
+            # GR has no stopped candidates to replace, so top-k suffices.
+            # Frontier state stays on device until the deferred commit.
             device=self.req_to_token_pool.device,
         )
         group.leader = req
         group.prompt_len = prompt_len
+        group.gr_paged_kv = paged_state
+        if catalog is not None:
+            name = user_params.gr_catalog
+            if name not in self._catalogs:
+                self._catalogs[name] = DeviceItemCatalog(
+                    catalog, self.req_to_token_pool.device
+                )
+            group.catalog = self._catalogs[name]
+            group.catalog_id = name
+            group.catalog_nodes = group.catalog.initial_nodes()
 
         # Neutralize the leader's row params (raw log_softmax scoring, no
         # self-finish path); the user's semantics now live on the group.
@@ -220,9 +288,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         neutral.no_stop_trim = user_params.no_stop_trim
         req.sampling_params = neutral
         req.beam_group = group
-        # The leader's decode suffix is a beam path, never a tree entry; this
-        # also skips the prefill-time unfinished insert.
-        req.skip_radix_cache_insert = True
+        # Ordinary beams publish no tree entry. The paged path keeps Req.kv
+        # context-only, so its prompt can use normal checkpoint/prefix reuse.
+        req.skip_radix_cache_insert = not gr_paged
         self._num_live_groups += 1
         return None
 
@@ -304,11 +372,23 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         """Launch half of the leader's prefill tick: first selection, member-row
         spawn, and the relay overwrite (the sampled token is void)."""
         group: BeamGroup = req.beam_group
-        top_logprobs, top_tokens = _rows_topk_logprobs(
-            [logits_output.beam.leader_logits[pos : pos + 1]], group.num_candidates
-        )
+        logits = logits_output.beam.leader_logits[pos : pos + 1]
+        if group.catalog is None:
+            top_logprobs, top_tokens = _rows_topk_logprobs(
+                [logits], group.num_candidates
+            )
+        else:
+            top_logprobs, top_tokens = group.catalog.topk(
+                logits, group.catalog_nodes, group.num_candidates, prefill=True
+            )
         final = group.next_step_is_final()
-        next_tokens, _ = self._select_group(group, top_logprobs, top_tokens, tick)
+        next_tokens, _ = self._select_group(
+            group,
+            top_logprobs,
+            top_tokens,
+            tick,
+            preserve_prefill_order=get_serving().enable_gr,
+        )
         if final:
             # Prefill-terminated (max_new_tokens == 1): no spawn, but the relay
             # slot still needs a token so an overshoot step has a valid input.
@@ -364,13 +444,21 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             group = entry.group
             if group.retired or group.state != BeamGroupState.DECODING:
                 continue
-            top_logprobs, top_tokens = _rows_topk_logprobs(
-                [
-                    capture.leader_logits[gi : gi + 1],
-                    capture.tail_logits[entry.start : entry.end],
-                ],
-                group.num_candidates,
-            )
+            pieces = [
+                capture.leader_logits[gi : gi + 1],
+                capture.tail_logits[entry.start : entry.end],
+            ]
+            if group.catalog is None:
+                top_logprobs, top_tokens = _rows_topk_logprobs(
+                    pieces, group.num_candidates
+                )
+            else:
+                top_logprobs, top_tokens = group.catalog.topk(
+                    torch.cat(pieces),
+                    group.catalog_nodes,
+                    group.num_candidates,
+                    prefill=False,
+                )
             next_tokens, parent_idx = self._select_group(
                 group, top_logprobs, top_tokens, batch.forward_iter
             )
@@ -401,13 +489,24 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         top_logprobs: torch.Tensor,
         top_tokens: torch.Tensor,
         tick: int,
+        *,
+        preserve_prefill_order: bool = False,
     ):
         k = group.beam_width
+        preserve_prefill_order = (
+            preserve_prefill_order
+            and group.num_candidates == k
+            and group.stop_token_ids.numel() == 0
+        )
         if group.next_step_is_final():
             # parent_idx is None on a final step: every selection finishes, so
             # no row moves onto another's slots.
             fsel = select_final_topk(
-                group.frontier_cum_logprobs, top_logprobs, top_tokens, k
+                group.frontier_cum_logprobs,
+                top_logprobs,
+                top_tokens,
+                k,
+                preserve_prefill_order=preserve_prefill_order,
             )
             group.advance_final_frontier(fsel, tick)
             return fsel.tokens, None
@@ -417,7 +516,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             top_tokens,
             group.stop_token_ids,
             k,
+            preserve_prefill_order=preserve_prefill_order,
         )
+        if group.catalog is not None:
+            group.catalog_nodes = group.catalog.advance(
+                group.catalog_nodes, sel.parent_idx[:k], sel.next_tokens[:k]
+            )
         group.advance_frontier(sel, tick)
         return sel.next_tokens[:k], sel.parent_idx[:k]
 
@@ -432,16 +536,18 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if parent_idx is not None:
             # Final steps skip this: their KV is never read again. Orphans are
             # staged, not freed here -- the set difference must not block launch.
-            old_map, new_map = remap_kv_mapping(
-                self.req_to_token_pool.req_to_token,
-                rows=rows,
-                parent_idx=parent_idx,
-                prefix_len=group.prompt_len,
-                # All rows are synchronized; the leader's committed length
-                # covers the KV computed through this step.
-                seq_len=group.leader.kv.kv_committed_len,
-            )
-            group.pending_orphans.append(StagedOrphans(tick, old_map, new_map))
+            if group.gr_paged_kv is not None:
+                group.gr_paged_kv.advance(parent_idx)
+            else:
+                old_map, new_map = remap_kv_mapping(
+                    self.req_to_token_pool.req_to_token,
+                    rows=rows,
+                    parent_idx=parent_idx,
+                    prefix_len=group.prompt_len,
+                    # Ordinary beams keep their history in the request map.
+                    seq_len=group.leader.kv.kv_committed_len,
+                )
+                group.pending_orphans.append(StagedOrphans(tick, old_map, new_map))
             # Length placeholder only; the DAG owns history and member rows
             # have no host state.
             group.leader.output_ids.append(0)
@@ -474,6 +580,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 storage.free_tokens(orphans)
 
     def _finish_group(self, group: BeamGroup) -> None:
+        if getattr(group.leader, "to_finish", None) is not None:
+            self._abort_group(group)
+            return
         # The leader carries the best sequence's finish reason.
         group.final_results = group.finalize()
         top = group.final_results[0]
@@ -518,6 +627,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             # Staged orphans are referenced by no row, so the retract-abort
             # path's direct fork.free_member_rows cannot see them.
             self._reclaim_orphans(group)
+            paged_state = getattr(group, "gr_paged_kv", None)
+            if paged_state is not None:
+                paged_state.release(self._storage().free_tokens)
             group.retired = True
             # Drops overshoot selections staged after the terminal commit.
             group._pending_steps.clear()
