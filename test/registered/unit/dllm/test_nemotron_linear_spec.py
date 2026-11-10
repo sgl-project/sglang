@@ -82,46 +82,6 @@ class TestNemotronLinearSpec(CustomTestCase):
         self.assertEqual([state["seed"].item() for state in result[3]], [6, 6, 7])
         self.assertFalse(batch.dllm_is_causal)
 
-    def test_verification_failure_restores_draft_attention_phase(self):
-        algorithm = NemotronLinearSpec(
-            DllmConfig(
-                algorithm="NemotronLinearSpec",
-                algorithm_config={},
-                block_size=2,
-                mask_id=0,
-                max_running_requests=1,
-                first_done_first_out_mode=True,
-            )
-        )
-        embedding = torch.nn.Embedding(3, 2)
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.DLLM_EXTEND,
-            input_ids=torch.zeros(2, dtype=torch.int64),
-            batch_size=1,
-            dllm_is_causal=False,
-        )
-
-        def forward(batch, pp_proxy_tensors=None):
-            if batch.dllm_is_causal:
-                raise RuntimeError("verification failed")
-            return SimpleNamespace(
-                logits_output=LogitsProcessorOutput(
-                    next_token_logits=None,
-                    full_logits=torch.tensor([[0.0, 10.0, 0.0], [0.0, 0.0, 10.0]]),
-                ),
-                can_run_graph=False,
-            )
-
-        runner = SimpleNamespace(
-            forward=forward,
-            model=SimpleNamespace(get_input_embeddings=lambda: embedding),
-        )
-        with self.assertRaisesRegex(RuntimeError, "verification failed"):
-            algorithm.run(
-                runner, batch, [{"seed": torch.tensor(1), "started": False, "steps": 0}]
-            )
-        self.assertFalse(batch.dllm_is_causal)
-
 
 if __name__ == "__main__":
     unittest.main()

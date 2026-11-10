@@ -325,9 +325,8 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
         torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
         "Blackwell ragged prefill backend selection",
     )
-    def test_cutlass_selection_is_unchanged_outside_nemotron_full_graphs(self):
+    def test_cutlass_selection_is_unchanged_outside_dllm_full_graphs(self):
         for architecture, is_dllm, decode_graphs in (
-            ("SDARForCausalLM", True, True),
             ("NemotronLabsDiffusionModel", False, True),
             ("NemotronLabsDiffusionModel", True, False),
         ):
@@ -338,16 +337,21 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
                     architecture, is_dllm=is_dllm, decode_graphs=decode_graphs
                 )
                 self.assertEqual(
-                    fixture.backend.prefill_wrapper_ragged._backend, "cutlass"
+                    fixture.backend.prefill_wrappers_ragged[0]._backend, "cutlass"
                 )
 
     @unittest.skipUnless(
         torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
         "Blackwell ragged prefill backend selection",
     )
-    def test_nemotron_ragged_graphs_survive_replanning_batch_sizes(self):
-        fixture = self._flashinfer_fixture("NemotronLabsDiffusionModel")
-        wrapper = fixture.backend.prefill_wrapper_ragged
+    def test_dllm_ragged_graphs_survive_replanning_batch_sizes(self):
+        for architecture in ("SDARForCausalLM", "NemotronLabsDiffusionModel"):
+            with self.subTest(architecture=architecture):
+                self._check_ragged_graphs_survive_replanning(architecture)
+
+    def _check_ragged_graphs_survive_replanning(self, architecture):
+        fixture = self._flashinfer_fixture(architecture)
+        wrapper = fixture.backend.prefill_wrappers_ragged[0]
         torch.manual_seed(2026)
         pointers = torch.arange(5, device="cuda", dtype=torch.int32) * 32
         q = torch.randn(128, 4, 128, device="cuda", dtype=torch.bfloat16)
