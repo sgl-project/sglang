@@ -7,6 +7,15 @@ from sglang.auto_tune.utils import get_model_config
 from sglang.auto_tune.allreduce_tuner import run_allreduce_tuning, print_allreduce_summary
 
 
+def _optional_bool(value: str) -> bool:
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y"}:
+        return True
+    if text in {"0", "false", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
 def create_parser():
     parser = argparse.ArgumentParser(
         description="SGLang Auto Tuner - Tune kernel configurations for a model."
@@ -46,6 +55,25 @@ def create_parser():
         help=(
             "With --allreduce and --use-aiter-allreduce, ignore "
             "AITER_CUSTOM_AR_MAX_SIZE."
+        ),
+    )
+    parser.add_argument(
+        "-n",
+        "--num-iters",
+        dest="num_iters",
+        type=int,
+        default=100,
+        help="Timed calls per kernel and size when --allreduce is set.",
+    )
+    parser.add_argument(
+        "--median",
+        nargs="?",
+        const=True,
+        default=False,
+        type=_optional_bool,
+        help=(
+            "With --allreduce, pick the winner from the median of the "
+            "timed calls. --median and --median true turn it on."
         ),
     )
     parser.add_argument(
@@ -112,6 +140,8 @@ def auto_tune(args: argparse.Namespace, extra_argv: Optional[list] = None):
             qr_cast_bf16_to_fp16=bool(args.qr_cast_bf16_to_fp16),
             use_car_v2=args.use_car_v2,
             ignore_acr_max_size=args.ignore_acr_max_size,
+            num_iters=args.num_iters,
+            use_median=bool(args.median),
         )
         allreduce_end = time.perf_counter()
         print(f"\nAllreduce tuning took {allreduce_end - allreduce_start:.2f}s")

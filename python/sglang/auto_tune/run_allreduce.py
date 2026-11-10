@@ -30,6 +30,15 @@ from sglang.auto_tune.allreduce_tuner import (
 from sglang.auto_tune.utils import get_model_config
 
 
+def _optional_bool(value: str) -> bool:
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y"}:
+        return True
+    if text in {"0", "false", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Tune all-reduce backends, including QuickReduce INT4."
@@ -90,7 +99,29 @@ def create_parser() -> argparse.ArgumentParser:
         default="allreduce_tune_out",
         help="Rank 0 writes allreduce_configs.json here.",
     )
-    parser.add_argument("--num-iters", type=int, default=100)
+    parser.add_argument(
+        "-n",
+        "--num-iters",
+        dest="num_iters",
+        type=int,
+        default=100,
+        help=(
+            "Timed calls per kernel and size. Warmup calls are extra and "
+            "are not counted. Default is 100."
+        ),
+    )
+    parser.add_argument(
+        "--median",
+        nargs="?",
+        const=True,
+        default=False,
+        type=_optional_bool,
+        help=(
+            "Pick the winner from the median of the timed calls. "
+            "--median and --median true turn it on. Without it, the "
+            "winner is the mean of one timed loop."
+        ),
+    )
     parser.add_argument(
         "--sizes",
         nargs="+",
@@ -189,6 +220,8 @@ def _init_distributed() -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = create_parser().parse_args(argv)
+    if args.num_iters < 1:
+        sys.exit("-n must be at least 1")
     _init_distributed()
 
     import torch.distributed as dist
@@ -221,6 +254,7 @@ def main(argv: list[str] | None = None) -> None:
             qr_cast_bf16_to_fp16=bool(args.qr_cast_bf16_to_fp16),
             use_car_v2=args.use_car_v2,
             ignore_acr_max_size=args.ignore_acr_max_size,
+            use_median=bool(args.median),
         )
         if rank == 0:
             print_allreduce_summary(results)

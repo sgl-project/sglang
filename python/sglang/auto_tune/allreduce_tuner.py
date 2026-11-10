@@ -19,6 +19,7 @@ import dataclasses
 import json
 import logging
 import os
+import statistics
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -84,23 +85,43 @@ def _get_tensor_sizes(model_config: Dict[str, Any]) -> List[int]:
     return sorted(set(sizes))
 
 
-def _time_gpu_calls(invoke, num_iters: int, num_warmup: int) -> Optional[float]:
-    """Time ``invoke`` on the GPU. ``None`` means this size is not eligible."""
+def _time_gpu_calls(
+    invoke, num_iters: int, num_warmup: int, use_median: bool = False
+) -> Optional[float]:
+    """Time ``invoke`` on the GPU, in microseconds. ``None`` means not eligible.
+
+    The default is the mean of one timed loop. With ``use_median``, each call
+    gets its own events and the result is the median of those calls.
+    """
     import torch
 
     for _ in range(num_warmup):
         if invoke() is None:
             return None
     torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(num_iters):
+    if not use_median:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(num_iters):
+            if invoke() is None:
+                return None
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) * 1000 / num_iters
+
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    for i in range(num_iters):
+        starts[i].record()
         if invoke() is None:
             return None
-    end.record()
+        ends[i].record()
     torch.cuda.synchronize()
-    return start.elapsed_time(end) * 1000 / num_iters
+    samples_us = [
+        starts[i].elapsed_time(ends[i]) * 1000 for i in range(num_iters)
+    ]
+    return statistics.median(samples_us)
 
 
 def _agree(ok: bool, cpu_group: "torch.distributed.ProcessGroup") -> bool:
@@ -242,7 +263,7 @@ def _open_custom_allreduce(
 
     supported = getattr(car, "_SUPPORTED_DTYPES", None) or torch_float_dtypes()
 
-    def run(tensor, num_iters, num_warmup=20):
+    def run(tensor, num_iters, num_warmup=20, use_median=False):
         reason = _shape_reason(tensor, supported)
         if reason:
             raise _Rejected(reason)
@@ -268,7 +289,7 @@ def _open_custom_allreduce(
                 raise _Rejected("custom all-reduce declined the tensor")
             return out
 
-        return _time_gpu_calls(timed, num_iters, num_warmup)
+        return _time_gpu_calls(timed, num_iters, num_warmup, use_median=use_median)
 
     run.impl = opened
     run.note = cap_note
@@ -302,7 +323,7 @@ def _open_car_v2(cpu_group, device):
             car.close()
         return None
 
-    def run(tensor, num_iters, num_warmup=20):
+    def run(tensor, num_iters, num_warmup=20, use_median=False):
         if not car.should_custom_ar(tensor):
             nbytes = tensor.numel() * tensor.element_size()
             limit = getattr(car, "max_size", None)
@@ -315,7 +336,7 @@ def _open_car_v2(cpu_group, device):
                 raise _Rejected("custom all-reduce v2 declined the tensor")
             return out
 
-        return _time_gpu_calls(timed, num_iters, num_warmup)
+        return _time_gpu_calls(timed, num_iters, num_warmup, use_median=use_median)
 
     run.impl = opened
     return run, car.close if hasattr(car, "close") else (lambda: None)
@@ -330,14 +351,14 @@ def torch_float_dtypes():
 def _open_nccl_allreduce(group, cpu_group, device):
     import torch.distributed as dist
 
-    def run(tensor, num_iters, num_warmup=20):
+    def run(tensor, num_iters, num_warmup=20, use_median=False):
         # dist.all_reduce returns None, which _time_gpu_calls would read as
         # "not eligible", so report success explicitly.
         def invoke():
             dist.all_reduce(tensor, group=group)
             return True
 
-        return _time_gpu_calls(invoke, num_iters, num_warmup)
+        return _time_gpu_calls(invoke, num_iters, num_warmup, use_median=use_median)
 
     return run, None
 
@@ -357,10 +378,15 @@ def _open_torch_symm_mem(group, cpu_group, device):
     if not _agree(ok, cpu_group):
         return None
 
-    def run(tensor, num_iters, num_warmup=20):
+    def run(tensor, num_iters, num_warmup=20, use_median=False):
         if not comm.should_torch_symm_mem_allreduce(tensor):
             raise _Rejected(_shape_reason(tensor, (comm.dtype,)) or "tensor was declined")
-        return _time_gpu_calls(lambda: comm.all_reduce(tensor), num_iters, num_warmup)
+        return _time_gpu_calls(
+            lambda: comm.all_reduce(tensor),
+            num_iters,
+            num_warmup,
+            use_median=use_median,
+        )
 
     return run, None
 
@@ -434,7 +460,7 @@ def _open_quick_allreduce(
             qr.close()
         return None
 
-    def run(tensor, num_iters, num_warmup=20):
+    def run(tensor, num_iters, num_warmup=20, use_median=False):
         reason = _shape_reason(tensor, qr._SUPPORTED_DTYPES)
         if reason:
             raise _Rejected(reason)
@@ -461,7 +487,7 @@ def _open_quick_allreduce(
                 raise _Rejected("QuickReduce declined the tensor")
             return out
 
-        return _time_gpu_calls(timed, num_iters, num_warmup)
+        return _time_gpu_calls(timed, num_iters, num_warmup, use_median=use_median)
 
     return run, qr.close
 
@@ -571,6 +597,7 @@ def tune_allreduce(
     qr_cast_bf16_to_fp16: bool = True,
     use_car_v2: bool = False,
     ignore_acr_max_size: bool = False,
+    use_median: bool = False,
 ) -> Tuple[List[AllreduceConfig], List[Dict[str, Any]]]:
     """Tune allreduce algorithm for the given model and TP size.
 
@@ -640,6 +667,8 @@ def tune_allreduce(
             "cutoff. --ignore-acr-max-size lifts only AITER's.",
             flush=True,
         )
+        stat = "median of each call" if use_median else "mean of one timed loop"
+        print(f"  Timing: {stat}, {num_iters} calls after 20 warmup.", flush=True)
     dtype = model_config.get("dtype", torch.bfloat16)
     if verbose:
         print(f"  Sizes: {sizes}", flush=True)
@@ -679,7 +708,7 @@ def tune_allreduce(
                 dist.barrier(group=cpu_group)
                 reason = None
                 try:
-                    t = run(tensor, num_iters)
+                    t = run(tensor, num_iters, use_median=use_median)
                 except Exception as e:
                     t = None
                     reason = str(e).splitlines()[0]
@@ -749,6 +778,7 @@ def run_allreduce_tuning(
     qr_cast_bf16_to_fp16: bool = True,
     use_car_v2: bool = False,
     ignore_acr_max_size: bool = False,
+    use_median: bool = False,
 ) -> Dict[str, Any]:
     """Entry point for allreduce auto-tuning.
 
@@ -776,6 +806,7 @@ def run_allreduce_tuning(
         qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
         use_car_v2=use_car_v2,
         ignore_acr_max_size=ignore_acr_max_size,
+        use_median=use_median,
     )
 
     if not results:
@@ -791,6 +822,8 @@ def run_allreduce_tuning(
         "custom_allreduce_impl": "sglang+aiter+v2",
         "use_car_v2": True,
         "ignore_acr_max_size": bool(ignore_acr_max_size),
+        "num_iters": int(num_iters),
+        "timing": "median" if use_median else "mean",
         "configs": [r.to_dict() for r in results],
         "measurements": measurements,
     }
@@ -806,7 +839,9 @@ def run_allreduce_tuning(
     return output
 
 
-def _print_comparison(measurements: List[Dict[str, Any]]) -> None:
+def _print_comparison(
+    measurements: List[Dict[str, Any]], timing: str = "mean"
+) -> None:
     """One row per message size, one column per kernel that was opened."""
     if not measurements:
         return
@@ -819,7 +854,7 @@ def _print_comparison(measurements: List[Dict[str, Any]]) -> None:
         return
     width = max(12, *(len(name) for name in names))
     print(
-        "\nAllreduce comparison, microseconds. "
+        f"\nAllreduce comparison, microseconds ({timing}). "
         "A star marks the fastest kernel at that size. "
         "skip means the kernel declined the tensor."
     )
@@ -850,10 +885,13 @@ def print_allreduce_summary(results: Dict[str, Any]) -> None:
         print("  No allreduce configs to summarize.")
         return
 
+    timing = results.get("timing", "mean")
+    n = results.get("num_iters")
+    count = f", {n} calls" if n else ""
     print(f"\n{'=' * 60}")
-    print("Allreduce Tuning Summary")
+    print(f"Allreduce Tuning Summary ({timing}{count})")
     print(f"{'=' * 60}")
     for c in configs:
         print(f"  {c['size_bytes']:>10}B  {c['backend']:20s}  {c['time_us']:8.2f} us")
     print(f"{'=' * 60}")
-    _print_comparison(results.get("measurements") or [])
+    _print_comparison(results.get("measurements") or [], timing=timing)
