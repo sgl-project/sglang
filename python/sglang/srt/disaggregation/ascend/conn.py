@@ -214,11 +214,6 @@ class AscendKVManager(MooncakeKVManager):
 
             return super().get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs, state_type)
 
-        # DSA state has one entry per full-attention layer, unlike the grouped
-        # main KV buffers. Use the same positional mapping for pointers and lens.
-        if state_type == StateType.DSA:
-            return super().get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs, state_type)
-
         # src_kv_ptrs: k_data, v_data, index_k_data(optional)
         # dst_kv_ptrs: k_data, v_data, index_k_data(optional)
         kv_buf_groups = getattr(self.kv_args, "kv_buf_groups", 1)

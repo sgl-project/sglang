@@ -809,13 +809,15 @@ def _static_state_entries(
             # full-attention sub-pool rather than in the Mamba state above.
             if getattr(token_to_kv_pool, "use_dsa", False):
                 dsa_pool = token_to_kv_pool.full_kv_pool
-                dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
-                add(
-                    StateType.DSA,
-                    dsa_ptrs,
-                    dsa_lens,
-                    dsa_item_lens,
-                )
+                # NPU already includes index buffers in its main KV entries.
+                if not isinstance(dsa_pool, NPUMLATokenToKVPool):
+                    dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
+                    add(
+                        StateType.DSA,
+                        dsa_ptrs,
+                        dsa_lens,
+                        dsa_item_lens,
+                    )
                 append_dsa_tail(dsa_pool)
             if isinstance(token_to_kv_pool, QSATokenToKVPool):
                 qsa_ptrs, qsa_lens, qsa_item_lens = (

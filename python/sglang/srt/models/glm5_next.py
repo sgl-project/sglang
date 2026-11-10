@@ -127,7 +127,6 @@ from sglang.srt.utils.common import (
     BumpAllocator,
     LazyValue,
     add_prefix,
-    is_npu,
     log_info_on_rank0,
     make_pp_layers,
     set_weight_attrs,
@@ -150,7 +149,7 @@ _MHC_POST_MULT_VALUE = 2.0
 _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
 
 
-@torch.compile(disable=is_npu())
+@torch.compile
 def swiglu_clamped(y: torch.Tensor, limit: float):
     gate, up = torch.chunk(y, 2, dim=-1)
     gate = torch.clamp(gate, max=limit)
@@ -293,9 +292,7 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
             max_position=8192,
             base=10000.0,
             is_neox_style=True,
-            # Match NPU with GPU's RoPE implementation: rotate Q/K in FP32, then cast back.
-            # NPU otherwise rounds this cache to the model's default BF16 dtype.
-            dtype=torch.float32 if is_npu() else None,
+            dtype=torch.float32,
         )
 
         self.blocks = nn.ModuleList(
