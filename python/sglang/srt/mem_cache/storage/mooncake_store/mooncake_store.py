@@ -7,7 +7,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, lru_cache
 from typing import Any, List, Optional, Tuple
 
 import requests
@@ -35,6 +35,21 @@ SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _log_register_extent_policy() -> None:
+    if envs.SGLANG_HICACHE_REGISTER_ALLOC_EXTENT.get():
+        logger.info(
+            "HiCache Mooncake: registering host-pool buffers at their whole "
+            "allocation extent (SGLANG_HICACHE_REGISTER_ALLOC_EXTENT=1)."
+        )
+    else:
+        logger.info(
+            "HiCache Mooncake: registering host-pool buffers at their tensor "
+            "view (SGLANG_HICACHE_REGISTER_ALLOC_EXTENT=0); a pool backed by a "
+            "shared mmap or HugeTLB mapping will not register."
+        )
 
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
@@ -348,35 +363,45 @@ class MooncakeBaseStore:
     def register_buffer(self, tensor: torch.Tensor, allocator: Any = None):
         if self.store is None:
             raise RuntimeError("Mooncake store is not initialized.")
-        # Register the whole backing allocation, not the tensor's own view. Host
-        # pools hand out views of a single allocation (the MHA pool exposes
-        # kv_buffer[0] / kv_buffer[1], two halves of one mapping), and the
-        # allocator rounds the mapping up to its page size. A registration sized
-        # to the view ends the MR inside a HugeTLB page, and the transfer engine
-        # madvise()s the registered range for ibv_reg_mr, which the kernel
-        # rejects at a non-hugepage-aligned boundary with EINVAL.
-        storage = tensor.untyped_storage()
-        ptr = int(storage.data_ptr())
-        size = int(storage.nbytes())
-        if size == 0:
-            # conv-only models have a 0-element ssm state; nothing to register
-            return
-        mapped_size_fn = getattr(allocator, "mapped_size_for", None)
-        if mapped_size_fn is not None:
-            size = max(size, int(mapped_size_fn(ptr) or 0))
-        # Views of the same allocation collapse onto one extent: register once.
-        registered = getattr(self, "_registered_buffer_extents", None)
-        if registered is None:
-            registered = self._registered_buffer_extents = set()
-        if (ptr, size) in registered:
-            return
+        _log_register_extent_policy()
+        registered = None
+        if envs.SGLANG_HICACHE_REGISTER_ALLOC_EXTENT.get():
+            # Register the whole backing allocation, not the tensor's own view.
+            # Host pools hand out views of a single allocation (the MHA pool
+            # exposes kv_buffer[0] / kv_buffer[1], two halves of one mapping),
+            # and the allocator rounds the mapping up to its page size. A
+            # registration sized to the view ends the MR inside a HugeTLB page,
+            # and the transfer engine madvise()s the registered range for
+            # ibv_reg_mr, which the kernel rejects at a non-hugepage-aligned
+            # boundary with EINVAL.
+            storage = tensor.untyped_storage()
+            ptr = int(storage.data_ptr())
+            size = int(storage.nbytes())
+            if size == 0:
+                return
+            mapped_size_fn = getattr(allocator, "mapped_size_for", None)
+            if mapped_size_fn is not None:
+                size = max(size, int(mapped_size_fn(ptr) or 0))
+            # Views of one allocation collapse onto one extent: register once.
+            registered = getattr(self, "_registered_buffer_extents", None)
+            if registered is None:
+                registered = self._registered_buffer_extents = set()
+            if (ptr, size) in registered:
+                return
+        else:
+            ptr = tensor.data_ptr()
+            size = tensor.numel() * tensor.element_size()
+            if size == 0:
+                # conv-only models have a 0-element ssm state; nothing to register
+                return
         ret_code = self.store.register_buffer(ptr, size)
         if ret_code != 0:
             logger.error(f"Failed to register buffer, error code: {ret_code}")
             raise RuntimeError(
                 f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
             )
-        registered.add((ptr, size))
+        if registered is not None:
+            registered.add((ptr, size))
 
     @cached_property
     def _has_request_context_support(self) -> bool:

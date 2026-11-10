@@ -103,7 +103,13 @@ class HostTensorAllocator:
         backing allocator already places the mapping on registration-sized
         boundaries (e.g. MooncakeHostTensorAllocator, whose C++ side widens a
         registration to the whole shared-memory segment) return 0.
+
+        Reports 0 while SGLANG_HICACHE_REGISTER_ALLOC_EXTENT is off, so every
+        caller keeps the tensor-sized registration it used before the
+        whole-extent rule existed.
         """
+        if not envs.SGLANG_HICACHE_REGISTER_ALLOC_EXTENT.get():
+            return 0
         return int(getattr(self, "_mapped_sizes", {}).get(int(ptr), 0))
 
 

@@ -872,6 +872,14 @@ class Envs:
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    # Register each HiCache host-pool buffer with the storage backend at its
+    # whole backing allocation instead of at the buffer's own view. Needed when
+    # the pool is a slice of a shared mapping (the MHA pool exposes K/V as
+    # kv_buffer[0]/kv_buffer[1] of one allocation) or the mapping is rounded up
+    # to a HugeTLB page: a registration that starts or ends inside a huge page
+    # is refused by ibv_reg_mr() with EINVAL ("error code: -600"). Off keeps the
+    # view-sized registration used before the whole-extent rule existed.
+    SGLANG_HICACHE_REGISTER_ALLOC_EXTENT = EnvBool(False)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
