@@ -819,7 +819,10 @@ class TestSynthID(CustomTestCase):
                 return_value=False,
             ),
         ):
-            output = SimpleNamespace(next_token_logits=torch.tensor([[0.8, 0.2]]).log())
+            output = SimpleNamespace(
+                next_token_logits=torch.tensor([[0.8, 0.2]]).log(),
+                next_token_logits_vocab_shard=None,
+            )
             with get_context().override_server_args(
                 speculative_use_rejection_sampling=False
             ):
@@ -860,6 +863,7 @@ class TestSynthID(CustomTestCase):
                     worker = SimpleNamespace(
                         speculative_num_steps=0,
                         activate_step_by_batch=Mock(),
+                        _wait_for_fused_hicache_load=Mock(),
                         target_worker=SimpleNamespace(
                             model_runner=SimpleNamespace(
                                 sampler=SimpleNamespace(
@@ -912,6 +916,7 @@ class TestSynthID(CustomTestCase):
         relay = FutureMap.__new__(FutureMap)
         relay.spec_algo = SpeculativeAlgorithm.EAGLE
         relay.request_proposal_relay = None
+        relay._deferred_relay = relay._relay = None
         relay.device, relay.req_pool_size, relay._forward_buf_initialized = (
             "cpu",
             2,

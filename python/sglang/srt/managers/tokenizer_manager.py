@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import gc
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 from array import array
 from collections import deque
 from contextlib import nullcontext
@@ -69,6 +71,12 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+    resolve_image_processor_backend,
+)
 from sglang.srt.kv_canary.canary_info.tokenizer_manager_hook import (
     CanaryInfoTokenizerManagerHook,
     ReqStateCanaryInfo,
@@ -126,7 +134,6 @@ from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
 from sglang.srt.managers.req_types import (
-    MultimodalDataItem,
     get_request_return_hidden_states_mode,
 )
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -142,6 +149,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
+from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -157,6 +165,12 @@ from sglang.srt.observability.req_time_stats import (
     real_time,
     set_time_batch,
 )
+from sglang.srt.observability.request_dump import (
+    build_request_dump,
+    save_request_dump,
+    write_crash_dump,
+)
+from sglang.srt.observability.request_logger import RequestLogger
 from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
@@ -183,13 +197,11 @@ from sglang.srt.sampling.custom_logit_processor import (
     supports_sampling_mask,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.watermarking.core import (
-    redact_watermark_secrets,
-)
 from sglang.srt.sampling.watermarking.server import validate_watermark_request
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
+    redact_server_args_secrets,
 )
 from sglang.srt.speculative.spec_decoding_metrics import (
     populate_spec_info,
@@ -200,29 +212,21 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_or_create_event_loop,
     kill_process_tree,
+    print_warning_once,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
-from sglang.srt.utils.crash_dump import write_crash_dump
-from sglang.srt.utils.cuda_vmm_transport_utils import CudaVmmFeatureTransport
+from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     collect_scheduler_processes,
     pyspy_dump_schedulers,
     trigger_cuda_user_coredump,
 )
-from sglang.srt.utils.hf_transformers import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-    resolve_image_processor_backend,
-)
 from sglang.srt.utils.network import get_zmq_socket
-from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.srt.utils.weight_versions import (
     add_weight_versions_to_meta_info,
     weight_version_spans_to_json,
 )
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -785,7 +789,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "hidden_states",
         ]
         self.dump_request_list: List[Tuple] = []
-        self.crash_dump_request_list: deque[Tuple] = deque()
+        # (finish time, pickled (obj, out_dict, created time, finish time))
+        self.crash_dump_request_list: deque[Tuple[float, bytes]] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
 
         # Initialize performance metrics loggers with proper skip names
@@ -1300,37 +1305,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_type_ids = mm_inputs.token_type_ids
                 if not isinstance(token_type_ids, list):
                     token_type_ids = token_type_ids.flatten().tolist()
-            # Caller-supplied per-image hashes (external KV routers, e.g.
-            # routing-aware orchestrators that compute a content-addressed
-            # hash before dispatch). Setting MultimodalDataItem.hash here
-            # short-circuits the internal hash_feature() recompute inside
-            # set_pad_value(), making the derived pad_value deterministic
-            # from the caller's hash. That alignment lets the router's
-            # routing decision agree with sglang's prefix-cache key for
-            # the same image. On any per-item parse error or list-length
-            # mismatch we fall back to the internal recompute so a
-            # malformed mm_hashes never blocks a request.
-            caller_mm_hashes = getattr(obj, "mm_hashes", None)
-            if caller_mm_hashes and mm_inputs and mm_inputs.mm_items:
-                if len(caller_mm_hashes) != len(mm_inputs.mm_items):
-                    logger.warning(
-                        "mm_hashes length (%d) != mm_items length (%d); "
-                        "ignoring caller hashes for this request.",
-                        len(caller_mm_hashes),
-                        len(mm_inputs.mm_items),
-                    )
-                else:
-                    for item, hex_hash in zip(mm_inputs.mm_items, caller_mm_hashes):
-                        if not isinstance(item, MultimodalDataItem):
-                            continue
-                        try:
-                            item.set_hash(int(hex_hash, 16))
-                        except (TypeError, ValueError):
-                            logger.warning(
-                                "Ignoring malformed mm_hashes entry %r; "
-                                "this item will fall back to hash_feature().",
-                                hex_hash,
-                            )
+            # Routing hints are not proof of feature identity. Actual contents
+            # remain authoritative even if a caller reuses a stale hash.
+            if isinstance(obj, GenerateReqInput) and obj.mm_hashes:
+                logger.warning(
+                    "mm_hashes no longer override multimodal cache identities; "
+                    "the server hashes actual encoder inputs."
+                )
+            if mm_inputs and mm_inputs.mm_items:
+                self.mm_processor.finalize_cache_identities(mm_inputs)
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
@@ -1349,7 +1332,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _normalize_mm_content_hashes(obj: GenerateReqInput) -> None:
         """Merge Native/OpenAI content identities and validate their alignment."""
         from sglang.srt.multimodal.cache import parse_content_hash
-        from sglang.srt.utils import ImageData
+        from sglang.srt.multimodal.media_io import ImageData
 
         images = obj.image_data or []
         explicit = obj.mm_content_hashes
@@ -2207,6 +2190,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 yield out
                 break
 
+            if (
+                request is not None
+                and not obj.background
+                and await request.is_disconnected()
+            ):
+                # Abort the request for disconnected requests (running)
+                self.abort_request(obj.rid)
+                # Use exception to kill the whole call stack and asyncio task
+                raise ValueError(
+                    f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
+                )
+
             if is_stream:
                 # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
@@ -2215,18 +2210,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.time_stats.get_response_sent_to_client_realtime()
                     )
                 yield out
-            else:
-                if (
-                    request is not None
-                    and not obj.background
-                    and await request.is_disconnected()
-                ):
-                    # Abort the request for disconnected requests (non-streaming, running)
-                    self.abort_request(obj.rid)
-                    # Use exception to kill the whole call stack and asyncio task
-                    raise ValueError(
-                        f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
-                    )
 
     async def _handle_batch_request(
         self,
@@ -2549,7 +2532,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         part that cannot be reconstructed afterwards.
         """
         try:
-            return redact_watermark_secrets(
+            return redact_server_args_secrets(
                 self.resolved_config_dict(self.server_args.resolved_dict())
             )
         except Exception as e:
@@ -2558,9 +2541,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _server_args_for_dump(self) -> Optional[Dict[str, Any]]:
         # Redact even with watermarking off: the Python API accepts a server
-        # key without --enable-watermark.
+        # key without --enable-watermark. The request dump pickles this as is;
+        # `write_crash_dump` redacts again on its own.
         try:
-            return redact_watermark_secrets(self.server_args.resolved_dict())
+            return redact_server_args_secrets(self.server_args.resolved_dict())
         except Exception as e:
             logger.error(f"Failed to snapshot server_args for the dump: {e!r}")
             return None
@@ -3516,28 +3500,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def record_request_for_crash_dump(self, state: ReqState, out_dict: dict):
         current_time = real_time()
-        request = state.obj
-        input_ids = request.input_ids
-        if isinstance(input_ids, list):
-            # Keep replay data intact without making full GC traverse every token.
-            request = copy.copy(request)
-            request.input_ids = (
-                tuple(tuple(row) for row in input_ids)
-                if input_ids and isinstance(input_ids[0], list)
-                else tuple(input_ids)
-            )
-        self.crash_dump_request_list.append(
-            (
-                request,
-                out_dict,
-                convert_time_to_realtime(state.time_stats.created_time),
-                current_time,
-            )
+        record = (
+            state.obj,
+            out_dict,
+            convert_time_to_realtime(state.time_stats.created_time),
+            current_time,
         )
+        # Keep the record pickled: bytes are not tracked by the cyclic GC. As live
+        # objects, five minutes of finished requests under load are a large number
+        # of tracked objects, and every gen2 collection walks them all, stalling
+        # this event loop for the whole walk.
+        try:
+            blob = pickle.dumps(record, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as e:
+            # The crash dump pickles the same tuple, so it could not hold this one.
+            print_warning_once(
+                "Leaving a finished request out of the crash dump history: "
+                f"it does not pickle ({type(e).__name__})."
+            )
+            return
+        self.crash_dump_request_list.append((current_time, blob))
         # Remove requests older than 5 minutes based on finish time
         while (
             self.crash_dump_request_list
-            and current_time - self.crash_dump_request_list[0][3] >= 300
+            and current_time - self.crash_dump_request_list[0][0] >= 300
         ):
             self.crash_dump_request_list.popleft()
 
@@ -3545,34 +3531,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, data_list: List[Tuple], filename: str, log_message: str
     ):
         logger.info(log_message)
-        to_dump_with_server_args = {
-            "server_args": self._server_args_for_dump(),
-            "config_updates": redact_watermark_secrets(get_context().overrides_log()),
-            "resolved_config": self._dump_config_snapshot(),
-            "requests": redact_watermark_secrets(data_list.copy()),
-        }
-
-        def background_task():
-            os.makedirs(os.path.dirname(filename), exist_ok=True)
-            with open(filename, "wb") as f:
-                try:
-                    pickle.dump(to_dump_with_server_args, f)
-                except Exception as e:
-                    # When the server is launched with --trust-remote-code,
-                    # server_args sometimes fails to pickle. Retry without
-                    # server_args so the request data still gets persisted.
-                    logger.error(
-                        f"Failed to pickle dump with server_args: {e!r}; "
-                        "retrying without server_args"
-                    )
-                    f.seek(0)
-                    f.truncate()
-                    to_dump_with_server_args["server_args"] = None
-                    # The snapshot copies the same object field by field.
-                    to_dump_with_server_args["resolved_config"] = None
-                    pickle.dump(to_dump_with_server_args, f)
-
-        asyncio.create_task(asyncio.to_thread(background_task))
+        data = build_request_dump(
+            data_list.copy(),
+            self._server_args_for_dump(),
+            self._dump_config_snapshot(),
+        )
+        asyncio.create_task(asyncio.to_thread(save_request_dump, filename, data))
 
     def dump_requests_before_crash(
         self, hostname: str = os.getenv("HOSTNAME", socket.gethostname())
@@ -3595,10 +3559,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.crash_dump_folder:
             logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
 
-            # Add finished requests from crash_dump_request_list
-            data_to_dump = []
-            if self.crash_dump_request_list:
-                data_to_dump.extend(self.crash_dump_request_list)
+            # Add finished requests from crash_dump_request_list (kept pickled). GC is
+            # paused while they are rebuilt: each record becomes several tracked
+            # objects, and every full collection would walk all of them built so far.
+            gc_enabled = gc.isenabled()
+            gc.disable()
+            try:
+                data_to_dump = [
+                    pickle.loads(blob) for _, blob in self.crash_dump_request_list
+                ]
+            finally:
+                if gc_enabled:
+                    gc.enable()
 
             # Add unfinished requests from rid_to_state
             unfinished_requests = []
@@ -3679,7 +3651,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.force_exit_handler()
                 break
 
-            elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
+            elif envs.SGLANG_FORCE_SHUTDOWN.get():
                 # if force shutdown flag set, exit immediately
                 logger.error(
                     "Signal SIGTERM received while force shutdown flag set. Force exiting."
@@ -4200,8 +4172,7 @@ async def print_exception_wrapper(func):
     try:
         await func()
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"TokenizerManager hit an exception: {traceback}")
+        logger.error(f"TokenizerManager hit an exception: {traceback.format_exc()}")
         if hasattr(func, "__self__") and isinstance(func.__self__, TokenizerManager):
             func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)

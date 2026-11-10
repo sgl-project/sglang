@@ -15,8 +15,8 @@ use crate::proxy::Proxy;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    classify_stream_end, outcome_from_status, MetricsRegistry, RequestLogContext, RequestOutcome,
-    StaleRequestOutcome, WorkerModeLabel,
+    classify_stream_end, outcome_from_status, MediaCounts, MetricsRegistry, RequestLogContext,
+    RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
 use crate::workers::{DecodeSlot, DpRankGuard, LoadGuard, Worker};
@@ -25,7 +25,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures::StreamExt;
-use sglang_api_types::runtime::v1::DisaggregatedParams;
+use sglang_runtime_v1_types::DisaggregatedParams;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -949,6 +949,7 @@ struct DispatchMetrics {
     worker_url: String,
     mode: WorkerModeLabel,
     streaming: bool,
+    media: MediaCounts,
     request_started_at: Instant,
     duration: Arc<RequestDurationGuard>,
 }
@@ -971,6 +972,7 @@ impl DispatchMetrics {
                 WorkerMode::Plain => WorkerModeLabel::Plain,
             },
             streaming: request.streaming,
+            media: request.media,
             request_started_at,
             duration: Arc::clone(duration),
         }
@@ -1049,6 +1051,7 @@ impl DispatchMetrics {
             streaming: self.streaming,
             outcome,
             engine_rid,
+            media: self.media,
         }
     }
 }

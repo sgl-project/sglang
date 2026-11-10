@@ -19,7 +19,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.watermarking.synthid_request import is_enabled
-from sglang.srt.utils.common import async_d2h, is_pin_memory_available
+from sglang.srt.utils.device import async_d2h, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput

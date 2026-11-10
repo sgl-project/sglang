@@ -150,7 +150,7 @@ class TestSynthIDCacheFlush(CustomTestCase):
                 scheduler.spec_algorithm = SimpleNamespace(is_ngram=lambda: False)
                 scheduler.future_map = MagicMock()
                 scheduler.beam_coordinator = MagicMock()
-                scheduler.chunked_req = None
+                scheduler.chunked_reqs = []
                 slots = torch.tensor([1, 2, 3]) if beam else torch.tensor([1, 2])
                 batch = SimpleNamespace(
                     beam_tail=SimpleNamespace(num_base_rows=2) if beam else None,
@@ -165,12 +165,13 @@ class TestSynthIDCacheFlush(CustomTestCase):
                 )
                 result = SimpleNamespace(
                     next_draft_input=None,
+                    accept_lens=None,
                     has_sampled_token_ids=True,
                     next_token_ids=torch.tensor([7, 8]),
                 )
                 indices = torch.tensor([0, 1, 2]) if beam else torch.tensor([0, 1])
                 scheduler._relay_forward_payload(batch, indices, result)
-                actual_indices, payload = scheduler.future_map.stash.call_args.args
+                actual_indices, payload = scheduler.future_map.relay.call_args.args
                 self.assertEqual(actual_indices.tolist(), [0, 1])
                 if enabled:
                     self.assertEqual(payload.synthid_enabled_host, [True, False])
@@ -206,7 +207,8 @@ class TestSynthIDCacheFlush(CustomTestCase):
             ):
                 scheduler = Scheduler.__new__(Scheduler)
                 scheduler.is_fully_idle = MagicMock(return_value=True)
-                scheduler._engine_paused = False
+                scheduler.pause_state = SimpleNamespace(paused=False)
+                scheduler.invariant_checker = MagicMock()
                 scheduler.tree_cache = MagicMock()
                 scheduler.req_to_token_pool = MagicMock()
                 scheduler.token_to_kv_pool_allocator = MagicMock()
