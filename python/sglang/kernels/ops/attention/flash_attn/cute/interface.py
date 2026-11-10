@@ -229,7 +229,7 @@ def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
 
 
 def _check_fp8_kv_dequant_args(
-    *, k, v, qv, page_table, rel_bias, block_sparse_tensors
+    *, k, v, qv, page_table, rel_bias, block_sparse_tensors, mma_pv_is_rs
 ) -> None:
     unsupported = {
         "K/V other than fp8 e4m3": v.dtype != torch.float8_e4m3fn or k.dtype != v.dtype,
@@ -240,6 +240,8 @@ def _check_fp8_kv_dequant_args(
         "qv": qv is not None,
         "rel_bias": rel_bias is not None,
         "block sparsity": block_sparse_tensors is not None,
+        # The fp8 staging tile only fits in smem when P stays in registers.
+        "mma_pv_is_rs=False": mma_pv_is_rs is False,
     }
     for feature, present in unsupported.items():
         if present:
@@ -589,7 +591,8 @@ def _flash_attn_fwd(
         ], "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
 
     # SM90 has no FP8 MMA path here: fp16/bf16 Q with an fp8 KV cache is cast to
-    # fp16 in-kernel instead.
+    # fp16 in-kernel instead. bf16 Q is narrowed to fp16 too, so |q| above 65504
+    # overflows to inf (Gemma-4's QK-norm keeps Q far below that).
     fp8_kv_dequant = (
         arch // 10 == 9
         and q is not None
@@ -605,6 +608,7 @@ def _flash_attn_fwd(
             page_table=page_table,
             rel_bias=rel_bias,
             block_sparse_tensors=block_sparse_tensors,
+            mma_pv_is_rs=mma_pv_is_rs,
         )
 
     # qk_blockscaled: Q/K are fp8 (same dtype); V may be bf16 (no v_blockscaled) or
@@ -847,8 +851,7 @@ def _flash_attn_fwd(
         )
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
     if fp8_kv_dequant:
-        # The fp8 staging tile only fits in smem when P stays in registers.
-        mma_pv_is_rs = True
+        mma_pv_is_rs = True  # an explicit False was rejected above
     if mma_pv_is_rs is None:
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:

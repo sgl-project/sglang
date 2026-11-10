@@ -2483,7 +2483,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mask_fn: Callable = None,
         score_mod_fn: Optional[Callable] = None,
         is_first_block: bool = False,
-        apply_bias: bool = False,  # FP8-KV excludes sheared bias
+        apply_bias: bool = False,  # passed by the shared main loop; FP8-KV has no bias
     ):
         self._cast_k_fp8(dequant, phase=Int32(0))
         acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
@@ -2531,7 +2531,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
-        apply_bias: bool = False,  # FP8-KV excludes sheared bias
+        apply_bias: bool = False,  # passed by the shared main loop; FP8-KV has no bias
     ):
         # QK[n] overlaps the cast of V[n + 1] and the PV that consumes it.
         smem_pipe_read_v = smem_pipe_read.clone()
@@ -2579,7 +2579,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
-        apply_bias: bool = False,  # FP8-KV excludes sheared bias
+        apply_bias: bool = False,  # passed by the shared main loop; FP8-KV has no bias
     ):
         # Each warpgroup finishes QK[n] before releasing V[n]'s slot, so K[n - 1]
         # cannot land in sK while the other warpgroup still reads it.

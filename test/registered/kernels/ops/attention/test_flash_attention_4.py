@@ -1597,14 +1597,21 @@ def _gemma4_fp8_kv_inputs(lengths, q_len, page_size, seed, dim=512):
     )
 
 
-def _fp8_kv_reference(inputs, q_len, window=None):
+def _fp8_kv_reference(inputs, q_lens, window=None, q=None, images=()):
     """fp32 causal (optionally sliding-window) attention over the dequantized
-    cache, chunked over queries."""
-    q, k, v, table = (inputs[name] for name in ("q", "k", "v", "page_table"))
+    cache, chunked over queries. q_lens is one length for every request or one
+    per request; images lists (begin, end) key ranges of request 0 whose
+    tokens see each other bidirectionally, before the window applies."""
+    q = inputs["q"] if q is None else q
+    k, v, table = (inputs[name] for name in ("k", "v", "page_table"))
     kv_heads, dim = k.shape[-2:]
     group = q.shape[1] // kv_heads
+    lengths = inputs["cache_seqlens"].tolist()
+    if isinstance(q_lens, int):
+        q_lens = [q_lens] * len(lengths)
     outs = []
-    for b, length in enumerate(inputs["cache_seqlens"].tolist()):
+    q_start = 0
+    for b, (length, q_len) in enumerate(zip(lengths, q_lens)):
         # Gather as bytes: advanced indexing has no fp8 kernel.
         kb, vb = [
             x.view(torch.uint8)[table[b].long()]
@@ -1616,14 +1623,18 @@ def _fp8_kv_reference(inputs, q_len, window=None):
         ]
         kb = kb.repeat_interleave(group, dim=1)
         vb = vb.repeat_interleave(group, dim=1)
-        qb = q[b * q_len : (b + 1) * q_len].float()
+        qb = q[q_start : q_start + q_len].float()
+        q_start += q_len
         pos = torch.arange(q_len, device="cuda") + length - q_len
         keys = torch.arange(length, device="cuda")
         for start in range(0, q_len, 512):
+            rows = pos[start : start + 512]
             scores = torch.einsum("qhd,khd->hqk", qb[start : start + 512], kb)
-            mask = keys[None, :] <= pos[start : start + 512, None]
+            mask = keys[None, :] <= rows[:, None]
+            for begin, end in images if b == 0 else ():
+                mask[(rows >= begin) & (rows <= end), begin : end + 1] = True
             if window is not None:
-                mask &= keys[None, :] >= pos[start : start + 512, None] - window
+                mask &= keys[None, :] >= rows[:, None] - window
             scores.masked_fill_(~mask[None], -torch.inf)
             outs.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), vb))
     return torch.cat(outs)
@@ -1689,6 +1700,22 @@ class TestFlashAttention4SM90(CustomTestCase):
                     rtol=0.01,
                 )
 
+    def test_fp8_kv_cache_rejects_smem_pv(self):
+        """The fp8 staging tile needs P in registers; an explicit SS PV is refused."""
+        inputs = _gemma4_fp8_kv_inputs((65,), q_len=1, page_size=64, seed=0)
+        with self.assertRaisesRegex(NotImplementedError, "mma_pv_is_rs=False"):
+            _flash_attn_fwd(
+                inputs["q"],
+                inputs["k"],
+                inputs["v"],
+                cu_seqlens_q=inputs["cu_seqlens_q"],
+                seqused_k=inputs["cache_seqlens"],
+                max_seqlen_q=1,
+                page_table=inputs["page_table"],
+                causal=True,
+                mma_pv_is_rs=False,
+            )
+
     def test_fp8_kv_cache_image_mask(self):
         """An image-bearing prefill reads the fp8 cache on every Gemma-4 layer.
 
@@ -1728,42 +1755,14 @@ class TestFlashAttention4SM90(CustomTestCase):
                         aux_tensors=[ranges, cu_q],
                         ver=4,
                     )
-                    k, v, table = inputs["k"], inputs["v"], inputs["page_table"]
-                    kv_heads = k.shape[-2]
-                    refs = []
-                    offset = 0
-                    for batch, (length, qlen) in enumerate(zip(lengths, qlens)):
-                        kb, vb = [
-                            x.view(torch.uint8)[table[batch].long()]
-                            .view(x.dtype)
-                            .reshape(-1, kv_heads, dim)[:length]
-                            .float()
-                            * inputs[name][batch][None, :, None]
-                            for x, name in ((k, "k_descale"), (v, "v_descale"))
-                        ]
-                        kb = kb.repeat_interleave(32 // kv_heads, dim=1)
-                        vb = vb.repeat_interleave(32 // kv_heads, dim=1)
-                        scores = torch.einsum(
-                            "qhd,khd->hqk", q[offset : offset + qlen].float(), kb
-                        )
-                        pos = torch.arange(qlen, device="cuda") + length - qlen
-                        keys = torch.arange(length, device="cuda")
-                        mask = keys[None, :] <= pos[:, None]
-                        if batch == 0:
-                            for begin, end in images:
-                                mask[(pos >= begin) & (pos <= end), begin : end + 1] = (
-                                    True
-                                )
-                        if window >= 0:
-                            mask &= keys[None, :] >= pos[:, None] - window
-                        scores.masked_fill_(~mask[None], -torch.inf)
-                        refs.append(
-                            torch.einsum("hqk,khd->qhd", scores.softmax(-1), vb)
-                        )
-                        offset += qlen
-                    torch.testing.assert_close(
-                        out.float(), torch.cat(refs), atol=0.01, rtol=0.01
+                    ref = _fp8_kv_reference(
+                        inputs,
+                        qlens,
+                        window=window if window >= 0 else None,
+                        q=q,
+                        images=images,
                     )
+                    torch.testing.assert_close(out.float(), ref, atol=0.01, rtol=0.01)
 
     def test_fp8_kv_cache_decode_replays_in_cuda_graph(self):
         """A captured FP8-KV decode reads the cache and descales afresh on replay."""
