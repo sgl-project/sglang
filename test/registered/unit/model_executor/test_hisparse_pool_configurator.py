@@ -9,7 +9,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestHiSparsePoolConfigurator(CustomTestCase):
@@ -41,6 +41,7 @@ class TestHiSparsePoolConfigurator(CustomTestCase):
 
         kvc = MagicMock(
             use_mla_backend=True,
+            modelslim_cache_layout=None,
             kv_cache_dtype=kv_cache_dtype,
             is_draft_worker=False,
             model_config=SimpleNamespace(

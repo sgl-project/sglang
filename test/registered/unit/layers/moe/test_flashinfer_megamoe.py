@@ -8,7 +8,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 def _load_megamoe_module(monkeypatch):
@@ -46,6 +46,9 @@ def _load_megamoe_module(monkeypatch):
     fake_modules["sglang.srt.environ"].envs = types.SimpleNamespace(
         SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=types.SimpleNamespace(get=lambda: False),
         SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
+            get=lambda: 0
+        ),
+        SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
             get=lambda: 0
         ),
         SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE=types.SimpleNamespace(
@@ -99,6 +102,7 @@ def _load_autotune_module(monkeypatch):
 
 
 def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
+    import enum
     from dataclasses import dataclass
 
     module = _load_autotune_module(monkeypatch)
@@ -126,11 +130,16 @@ def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
         def num_tokens(self):
             return self.hidden_states.shape[0]
 
+    class FinalizeMode(enum.Enum):
+        AUTO = "auto"
+
     @dataclass
     class Config:
         knobs: str | None = None
         kernel_name: str = "test_backend"
         input_norm_const: float = 1.0
+        # flashinfer's MegaMoE config carries enum fields such as finalize_mode.
+        finalize_mode: FinalizeMode = FinalizeMode.AUTO
 
     @dataclass
     class Fleet:
@@ -228,7 +237,7 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
     from unittest.mock import Mock
 
     module, first, tensors, _, _ = _profile_fixture(monkeypatch, num_tokens=1)
-    payload = {"version": 1, "entries": [{"knobs": {"native_tactic": 7}}]}
+    payload = {"version": 2, "entries": [{"knobs": {"native_tactic": 7}}]}
     events = []
     staged = []
     native_paths = []
@@ -380,7 +389,7 @@ def test_adapter_keeps_router_ids_int32(monkeypatch):
     class Mega:
         supports_output_view = False
 
-        def forward(self, tensors):
+        def forward(self, tensors, *, workspace=None):
             self.tensors = tensors
             return output
 
@@ -427,7 +436,7 @@ def test_adapter_requests_workspace_output_view(monkeypatch, supports_output_vie
     output = torch.randn_like(hidden_states)
 
     class Mega:
-        def forward(self, tensors, *, return_workspace_view=False):
+        def forward(self, tensors, *, workspace=None, return_workspace_view=False):
             self.tensors = tensors
             self.return_workspace_view = return_workspace_view
             return output
