@@ -216,7 +216,8 @@ class GrammarManager:
 
     def get_ready_grammar_requests(self) -> List[Req]:
         """
-        Move requests whose grammar objects are ready from grammar_queue to waiting_queue.
+        Return the requests whose grammar is ready, then those that timed out.
+        They stay in grammar_queue for the caller to move into their queue.
 
         For PP0, DP/TP group rank i returns two sets ready_reqs_i,
         failed_reqs_i. ready_reqs_all = all_gather(ready_reqs_i) within
@@ -336,6 +337,4 @@ class GrammarManager:
             error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
             req.set_finish_with_abort(error_msg)
 
-        # Remove finished requests from grammar_queue
-        self.grammar_queue.leave(return_reqs)
         return return_reqs

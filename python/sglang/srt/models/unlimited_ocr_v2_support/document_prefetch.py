@@ -208,8 +208,9 @@ class DocPrefetch:
             ListKind.UOCR_RELEASED, abort=lambda r: self._abort(self._released, r)
         )
 
-    def park(self, req: Req) -> bool:
-        """Hold a follow-up until its predecessor finishes; True if it was parked."""
+    def park(self, req: Req, *, src: Optional[ReqList] = None) -> bool:
+        """Hold a follow-up until its predecessor finishes, moving it out of `src`
+        if given; True if it was parked."""
         after = _after(req)
         if after is None or req.finished():
             return False
@@ -222,7 +223,7 @@ class DocPrefetch:
             return False
         if not envs.SGLANG_ENABLE_UOCR_DOC_PREFETCH.get():
             return False
-        self._parked.join([req])
+        move([req], src, self._parked)
         mm = req.multimodal_inputs
         if self._encode_ahead and mm is not None and mm.mm_items:
             self._early.encode_ahead(
@@ -238,7 +239,7 @@ class DocPrefetch:
         """Mark every follow-up of a finished ``req`` released, budget capped.
 
         Called from the KV-release path after the window's KV was retained; the
-        scheduler queues released windows with ``take_released``. A retracted
+        scheduler moves ``released`` windows into its queue. A retracted
         window comes through the same hook unfinished and releases nothing.
         """
         if _after(req) is None and not _is_predecessor(req):
@@ -257,9 +258,10 @@ class DocPrefetch:
             _apply_budget(follow, used)
         move(follows, self._parked, self._released)
 
-    def take_released(self) -> List[Req]:
-        """Follow-ups released since the last call, in release order."""
-        return self._released.take()
+    @property
+    def released(self) -> IndexedReqList:
+        """Follow-ups released and not yet queued, in release order."""
+        return self._released
 
     def request_lists(self) -> Dict[ListKind, ReqList]:
         return {

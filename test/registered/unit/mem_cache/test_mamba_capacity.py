@@ -298,9 +298,7 @@ class TestMambaCapacity(unittest.TestCase):
                 disaggregation_decode_retraction_backup="cpu_tensor"
             ),
         ):
-            self.assertEqual(
-                queue.resume_retracted_reqs(IndexedReqList(ListKind.WAITING)), []
-            )
+            self.assertEqual(queue.move_resumed(IndexedReqList(ListKind.WAITING)), [])
         self.assertEqual(list(queue.retracted_queue), [req])
         self.assertTrue(req.is_retracted)
         queue._pre_alloc.assert_not_called()

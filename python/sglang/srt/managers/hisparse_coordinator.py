@@ -51,6 +51,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
     ReqList,
+    move,
 )
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -850,7 +851,9 @@ class HiSparseCoordinator:
             ),
         )
 
-    def admit_request_into_staging(self, req: Req) -> None:
+    def admit_request_into_staging(self, req: Req, *, src: ReqList) -> None:
+        """Start the host copy of a prefilled request and move it from `src` into
+        staging."""
         req.hisparse_staging = True
 
         full_kv_indices = self.req_to_token_pool.req_to_token[
@@ -888,7 +891,7 @@ class HiSparseCoordinator:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_staging_stream)
 
-        self.ack_staging_queue.join([HiSparseAct(start_event, finish_event, req)])
+        move([HiSparseAct(start_event, finish_event, req)], src, self.ack_staging_queue)
 
     def admit_request_direct(self, req: Req) -> None:
         """Direct-to-host path: KV data already resides in host pool via RDMA.
@@ -1075,7 +1078,9 @@ class HiSparseCoordinator:
     def request_lists(self) -> Dict[ListKind, ReqList]:
         return {ListKind.HISPARSE_STAGING: self.ack_staging_queue}
 
-    def collect_ready_reqs(self) -> List[Req]:
+    def move_ready_reqs(self, dst: ReqList) -> List[Req]:
+        """Move the staged requests whose host copy has landed into `dst`, and
+        return them."""
         ready_reqs: List[Req] = []
         if len(self.ack_staging_queue) == 0:
             return ready_reqs
@@ -1095,8 +1100,8 @@ class HiSparseCoordinator:
                 group=self.tp_group,
             )
         finish_count = int(queue_size.item())
+        move([req for _, _, req in staged[:finish_count]], self.ack_staging_queue, dst)
         for _, _, req in staged[:finish_count]:
-            self.ack_staging_queue.leave([req])
             # prepare device buffer and update req
             self.alloc_device_buffer(req)
             self._skip_first_backup[req.kv.req_pool_idx] = True

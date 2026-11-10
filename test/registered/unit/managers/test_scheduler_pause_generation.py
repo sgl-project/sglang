@@ -44,6 +44,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
@@ -200,8 +201,11 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def _spy_requeue(self, scheduler: Scheduler) -> List[dict]:
         requeue_log: List[dict] = []
 
-        def record(req):
+        def record(req, *, src=None):
             requeue_log.append({"req": req, "is_retracted": req.is_retracted})
+            # The queue door takes every request out of its source.
+            if src is not None:
+                src.leave([req])
 
         scheduler._add_request_to_queue = MagicMock(side_effect=record)
         return requeue_log
@@ -340,7 +344,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.last_batch = MagicMock()
         scheduler.cur_batch_for_debug = MagicMock()
-        scheduler.chunked_req = MagicMock()
+        scheduler.chunked_reqs.join([MagicMock()])
 
         original_last_batch = scheduler.last_batch
         original_cur_batch = scheduler.cur_batch_for_debug
@@ -442,7 +446,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             forward_mode=ForwardMode.EXTEND,
             with_tensors=True,
         )
-        scheduler.chunked_req = MagicMock()
+        scheduler.chunked_reqs.join([MagicMock()])
         scheduler.running_reqs.join([run_req_a, run_req_b, last_req])
         requeue_log = self._spy_requeue(scheduler)
 
@@ -461,6 +465,45 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertFalse(scheduler.running_batch.batch_is_full)
         self.assertIsNone(scheduler.chunked_req)
         self.assertIsNone(scheduler.last_batch)
+
+    def test_retract_moves_each_request_out_of_its_list(self):
+        scheduler = self._new_scheduler()
+        running, launched, chunked = map(
+            self._make_req, ("running", "launched", "chunked")
+        )
+        scheduler.running_batch = self._make_batch(
+            scheduler, reqs=[running], with_tensors=True
+        )
+        scheduler.last_batch = self._make_batch(
+            scheduler,
+            reqs=[launched, chunked],
+            forward_mode=ForwardMode.EXTEND,
+            with_tensors=True,
+        )
+        scheduler.running_reqs.join([running])
+        scheduler.prefill_launched_reqs.join([launched])
+        scheduler.chunked_reqs.join([chunked])
+        sources = []
+
+        def requeue(req, *, src=None):
+            sources.append(src.kind)
+            move([req], src, scheduler.waiting_queue)
+
+        scheduler._add_request_to_queue = MagicMock(side_effect=requeue)
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(
+            sources,
+            [ListKind.DECODING, ListKind.PREFILL_LAUNCHED, ListKind.CHUNKED],
+        )
+        self.assertEqual(list(scheduler.waiting_queue), [running, launched, chunked])
+        for held in (
+            scheduler.running_reqs,
+            scheduler.prefill_launched_reqs,
+            scheduler.chunked_reqs,
+        ):
+            self.assertEqual(len(held), 0)
 
     def test_retract_after_dp_conversion_releases_each_req_once(self):
         """retract after DP attention converted the running batch to extend
@@ -620,7 +663,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         """retract with nothing to retract still clears chunked_req and batch_is_full."""
         scheduler = self._new_scheduler()
         scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
-        scheduler.chunked_req = MagicMock()
+        scheduler.chunked_reqs.join([MagicMock()])
         requeue_log = self._spy_requeue(scheduler)
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
@@ -650,7 +693,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         scheduler.process_batch_result = MagicMock(side_effect=process_result)
         scheduler._add_request_to_queue = MagicMock(
-            side_effect=lambda req: event_log.append(
+            side_effect=lambda req, **_: event_log.append(
                 "requeue-released" if req.is_retracted else "requeue-unreleased"
             )
         )
@@ -669,7 +712,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         chunked_req = MagicMock()
         chunked_req.finished.return_value = False
-        scheduler.chunked_req = chunked_req
+        scheduler.chunked_reqs.join([chunked_req])
 
         with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
@@ -708,6 +751,10 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.disagg_decode_prealloc_queue = MagicMock()
+        held = IndexedReqList(ListKind.PD_HELD)
+        scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.side_effect = (
+            lambda req, *, src=None: move([req], src, held)
+        )
 
         def _req(rid, req_pool_idx):
             return _FakeReq(
@@ -732,11 +779,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         # device->host KV offload rather than offload-then-delete it.
         self.assertEqual(mock_retract_all.call_args.kwargs["offload_kv"], False)
         self.assertEqual(list(scheduler.waiting_queue), [unstaged])
-        held = [
-            c.args[0]
-            for c in scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.call_args_list
-        ]
-        self.assertEqual(held, [running, staged])
+        self.assertEqual(list(held), [running, staged])
 
     def test_retract_aborts_requests_the_recompute_cannot_rebuild(self):
         for decode in (False, True):
@@ -936,7 +979,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.continue_generation(
             ContinueGenerationReqInput(torch_empty_cache=False)
         )
-        prealloc_queue.add.assert_called_once_with(kept, is_rebootstrap=True)
+        prealloc_queue.add.assert_called_once_with(
+            kept, is_rebootstrap=True, src=prealloc_queue.held_rebootstrap_reqs
+        )
 
     def test_pd_decode_abort_finishes_a_retracted_request(self):
         """A retracted request aborted while queued must leave finished, with its
@@ -1069,7 +1114,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         chunked = self._make_req("chunked")
         chunked.kv.req_pool_idx = 0
         # The chunked request's last chunk ran in the second micro-batch.
-        scheduler.chunked_req = chunked
+        scheduler.chunked_reqs.join([chunked])
         scheduler.pp_loop_size = 2
         scheduler.running_mbs = [
             self._make_batch(

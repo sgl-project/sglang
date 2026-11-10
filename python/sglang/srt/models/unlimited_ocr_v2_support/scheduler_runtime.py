@@ -10,6 +10,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
     ReqList,
+    move,
 )
 from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
     create_async_shm_materializer,
@@ -105,9 +106,10 @@ class UocrSchedulerRuntime:
 
     # -- Waiting queue and admission --
 
-    def take_released(self) -> List[Req]:
+    @property
+    def released(self) -> IndexedReqList:
         """Parked windows whose predecessor finished, to queue in this order."""
-        return self._prefetch.take_released()
+        return self._prefetch.released
 
     def request_lists(self) -> Dict[ListKind, ReqList]:
         return self._prefetch.request_lists()
@@ -228,14 +230,25 @@ class UocrSchedulerRuntime:
         return len(self._reuse.held_slots())
 
     def enqueue(
-        self, waiting_queue: IndexedReqList, req: Req, *, is_retracted: bool
+        self,
+        waiting_queue: IndexedReqList,
+        req: Req,
+        *,
+        is_retracted: bool,
+        src: Optional[ReqList] = None,
     ) -> bool:
-        """queue a follow-up in reuse order, or keep it parked until its source finishes"""
+        """queue a follow-up in reuse order, or keep it parked until its source
+        finishes; one `src` holds moves out of it"""
         if is_retracted:
             self._reuse.on_retracted(req)
-        if not is_retracted and self._prefetch.park(req):
+        if not is_retracted and self._prefetch.park(req, src=src):
             return False
-        waiting_queue.join([req], at=self._reuse.queue_position(waiting_queue, req))
+        move(
+            [req],
+            src,
+            waiting_queue,
+            at=self._reuse.queue_position(waiting_queue, req),
+        )
         return True
 
     def close(self) -> None:

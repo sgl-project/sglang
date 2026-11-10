@@ -1230,6 +1230,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             ),
             abort_request=lambda req: None,
             still_in_batch=lambda req: True,
+            prefill_launched_reqs=None,
         )
         # Stub out the methods _handle_finish_state_updated_req calls that
         # are not relevant to this test.  SchedulerBatchResultProcessor is

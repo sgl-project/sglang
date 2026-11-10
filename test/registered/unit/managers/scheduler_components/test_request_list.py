@@ -150,6 +150,34 @@ class TestMove(CustomTestCase):
 
         with self.assertRaisesRegex(RuntimeError, r"\['x'\] are not in PD_BOOTSTRAP"):
             move([a, outsider], src, dst)
+        # A lone request is looked up in place.
+        with self.assertRaisesRegex(RuntimeError, r"\['x'\] are not in PD_BOOTSTRAP"):
+            move([outsider], src, dst)
+
+        self.assertEqual(list(src), [a])
+        self.assertEqual(list(dst), [])
+
+    def test_move_without_a_source_joins_a_new_request(self):
+        a, new, owned = _reqs(["a", "new", "owned"])
+        src = KeyedReqList(ListKind.DECODING)
+        src.join([owned])
+        dst = IndexedReqList(ListKind.WAITING)
+        dst.join([a])
+
+        move([new], None, dst, at=0)
+        move([owned], src, dst, at=1)
+
+        self.assertEqual(list(dst), [new, owned, a])
+        self.assertEqual(list(src), [])
+
+    def test_a_list_without_positions_rejects_at_and_moves_nothing(self):
+        (a,) = _reqs("a")
+        src = IndexedReqList(ListKind.WAITING)
+        src.join([a])
+        dst = KeyedReqList(ListKind.DECODING)
+
+        with self.assertRaisesRegex(TypeError, "DECODING has no positions"):
+            move([a], src, dst, at=0)
 
         self.assertEqual(list(src), [a])
         self.assertEqual(list(dst), [])

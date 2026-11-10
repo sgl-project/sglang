@@ -18,6 +18,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.hisparse_coordinator import HiSparseAct, HiSparseCoordinator
 from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
@@ -26,6 +27,10 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -169,7 +174,7 @@ class TestRequestListsCheck(CustomTestCase):
         self._start_running([decoding])
         self.s.running_batch.reqs += [retracted, chunk]
         self.s.waiting_queue.join([retracted])
-        self.s.chunked_req = chunk
+        self.s.chunked_reqs.join([chunk])
 
         with self.assertRaisesRegex(
             RuntimeError, r"running batch but not in running: \['w'\]"
@@ -212,6 +217,7 @@ class TestRequestListsCheck(CustomTestCase):
         new, decoding = _req("n"), _req("d")
         mixed = _batch([new, decoding], ForwardMode.MIXED)
         self.s.running_reqs.join([decoding])
+        self.s.prefill_launched_reqs.join([new])
         _launch(self.s, mixed)
         self.s.invariant_checker.get_pp_mbs = lambda: [mixed, None]
         self.s.invariant_checker.get_running_batches = lambda: (
@@ -228,15 +234,18 @@ class TestRunningReqsHooks(CustomTestCase):
         super().setUp()
         enter_scope(self, published_topology())
 
-    def test_launch_holds_prefills_until_the_merge(self):
+    def test_prefills_wait_in_prefill_launched_until_the_merge(self):
         s = _scheduler()
         a, chunk, new, decoding = (_req(rid) for rid in ("a", "c", "n", "d"))
         s.running_batch = ScheduleBatch(reqs=[decoding])
         s.running_reqs.join([decoding])
-        s.chunked_req = chunk
+        s.chunked_reqs.join([chunk])
         # A parked chunk: scheduling has no KV of it to stash.
         chunk.extend_end = chunk.prefix_len
+        # As admission leaves them.
+        s.prefill_launched_reqs.join([a, new])
 
+        # A launch moves no request between lists.
         _launch(s, _batch([a, chunk], ForwardMode.EXTEND, chunked_req=chunk))
         mixed = _batch([new, decoding], ForwardMode.MIXED)
         _launch(s, mixed)
@@ -244,7 +253,9 @@ class TestRunningReqsHooks(CustomTestCase):
 
         self.assertEqual(list(s.prefill_launched_reqs), [a, new])
         self.assertEqual(list(s.running_reqs), [decoding])
+        self.assertEqual(list(s.chunked_reqs), [chunk])
 
+        # The merge moves the mixed step's prefill; its decode row stays put.
         _schedule_without_admission(s)
         with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
             Scheduler.get_next_batch_to_run(
@@ -259,6 +270,36 @@ class TestRunningReqsHooks(CustomTestCase):
         s.dllm_manager.waiting_queue.append(_req("p"))
         _launch(s, _batch(s.dllm_manager.waiting_queue, ForwardMode.EXTEND))
         self.assertEqual(list(s.prefill_launched_reqs), [])
+
+    def test_a_staged_hisparse_request_moves_straight_into_running(self):
+        s = _scheduler()
+        _schedule_without_admission(s)
+        staged = _req("h")
+        staged.kv.req_pool_idx = 0
+        staged.hisparse_staging = True
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.ack_staging_queue = IndexedReqList(
+            ListKind.HISPARSE_STAGING, req_of=lambda act: act.req
+        )
+        landed = SimpleNamespace(query=lambda: True)
+        coordinator.ack_staging_queue.join([HiSparseAct(None, landed, staged)])
+        coordinator.tp_world_size = 1
+        coordinator._skip_first_backup = {}
+        s.enable_hisparse = True
+        s.hisparse_coordinator = coordinator
+
+        def lists_of(req):
+            return [kind for kind, reqs in s.request_lists().items() if req in reqs]
+
+        coordinator.alloc_device_buffer = lambda req: None
+        s._build_hisparse_decode_batch = lambda reqs: _batch(reqs, ForwardMode.DECODE)
+
+        plan = Scheduler.get_next_batch_to_run(
+            s, ScheduleBatch(reqs=[], batch_is_full=False), None
+        )
+
+        self.assertEqual(plan.running_batch.reqs, [staged])
+        self.assertEqual(lists_of(staged), [ListKind.DECODING])
 
     def test_ngram_grammar_step_launches_no_finished_row(self):
         # A grammar row under NGRAM processes the previous result early; once it
@@ -405,13 +446,31 @@ class TestRunningReqsHooks(CustomTestCase):
         s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
         s.truncation_align_size = None
-        s._add_request_to_queue = Mock()
+        s.uocr_runtime = None
+        s._set_or_validate_priority = lambda req: True
+        s._abort_on_queued_limit = Mock(return_value=False)
+        s._prefetch_kvcache = Mock()
 
         new_batch, _ = s._get_new_batch_prefill_raw(None, running_batch)
 
         self.assertIsNone(new_batch)
-        s._add_request_to_queue.assert_called_once_with(victim)
+        self.assertEqual(list(s.waiting_queue), [waiting, victim])
         self.assertEqual(list(s.running_reqs), [other])
+
+    def test_a_requeued_request_moves_and_a_refused_one_still_leaves(self):
+        s = _scheduler()
+        s.uocr_runtime = None
+        s._set_or_validate_priority = lambda req: req.rid != "refused"
+        s._abort_on_queued_limit = Mock(return_value=False)
+        s._prefetch_kvcache = Mock()
+        queued, refused = _req("queued"), _req("refused")
+        s.running_reqs.join([queued, refused])
+
+        for req in (queued, refused):
+            s._add_request_to_queue(req, src=s.running_reqs)
+
+        self.assertEqual(list(s.waiting_queue), [queued])
+        self.assertEqual(list(s.running_reqs), [])
 
     def test_launch_counts_in_flight_steps_and_processing_drops_them(self):
         s = _scheduler()

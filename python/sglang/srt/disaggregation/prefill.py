@@ -549,21 +549,25 @@ class PrefillBootstrapQueue:
             self.scheduler.token_to_kv_pool_allocator.page_size,
         )
 
-    def add(self, req: Req, num_kv_heads: int) -> None:
+    def add(
+        self, req: Req, num_kv_heads: int, *, src: Optional[ReqList] = None
+    ) -> None:
+        """Queue a request for bootstrap, moving it out of `src` if given; one
+        refused at the door is finished and leaves `src` for no list."""
         # Rejected at intake: `set_finish_with_abort` left the verdict in
         # `to_finish`, which `finished()` does not read, and swapped the prompt
         # for a one-token stub. Bootstrapping it costs a handshake, a metadata
         # buffer and a forward pass before anything unwinds it.
         if is_unadmitted_reject(req):
             self.scheduler.request_retirer.retire_unadmitted(req)
+            if src is not None:
+                src.leave([req])
             return
         if not self.create_sender(req, num_kv_heads):
+            if src is not None:
+                src.leave([req])
             return
-        self.queue.join([req])
-
-    def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
-        for req in reqs:
-            self.add(req, num_kv_heads)
+        move([req], src, self.queue)
 
     def _abort(self, recv_req: AbortReq) -> None:
         for req in self.queue:
@@ -1612,7 +1616,7 @@ class SchedulerDisaggregationPrefillMixin:
             if not self.check_bootstrap(req):
                 if is_aborted(req):
                     # bootstrap failed
-                    self.chunked_req = None
+                    self.chunked_reqs.clear()
                 elif (
                     get_disagg().disaggregation_decode_allocation_policy
                     != "prefill_complete"

@@ -86,7 +86,9 @@ def _run(cls, *, hisparse=False):
     hisparse_coordinator = (
         SimpleNamespace(
             release_request=lambda req: log.append(("hisparse_finished", req.rid)),
-            admit_request_into_staging=lambda req: log.append(("admit", req.rid)),
+            admit_request_into_staging=lambda req, *, src: log.append(
+                ("admit", req.rid)
+            ),
         )
         if hisparse
         else None

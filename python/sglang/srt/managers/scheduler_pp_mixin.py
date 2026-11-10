@@ -1905,7 +1905,7 @@ class SchedulerPPMixin:
     def process_retract_queue(self: Scheduler, retract_rids: Optional[List[str]]):
         if retract_rids is not None:
             # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
-            resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs(
+            resumed_reqs = self.disagg_decode_prealloc_queue.move_resumed(
                 self.waiting_queue, retract_rids
             )
             return [req.rid for req in resumed_reqs]

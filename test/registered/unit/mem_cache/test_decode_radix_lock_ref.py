@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
+    KeyedReqList,
     ListKind,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -591,6 +592,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         scheduler = SimpleNamespace(
             grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
             waiting_queue=waiting_queue,
+            running_reqs=KeyedReqList(ListKind.DECODING),
             enable_priority_scheduling=False,
             req_to_token_pool=SimpleNamespace(size=4),
             max_running_requests=4,

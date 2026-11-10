@@ -60,7 +60,7 @@ class _Sched:
 
     def ingest(self):
         """The scheduler queues released windows at the top of its next step."""
-        for req in self.prefetch.take_released():
+        for req in self.prefetch.released.take():
             self.add(req)
 
 
@@ -91,7 +91,7 @@ class TestNextWindowPrefetch(CustomTestCase):
         sched.ingest()
         self.assertEqual(sched.queue, [w1])
         self.assertEqual(w1.sampling_params.max_new_tokens, 700)
-        self.assertEqual(prefetch.take_released(), [])
+        self.assertEqual(list(prefetch.released), [])
 
     def test_a_follow_up_arriving_late_is_not_parked(self):
         """If the window already finished, the follow-up must go straight in,
@@ -169,7 +169,7 @@ class TestNextWindowPrefetch(CustomTestCase):
         prefetch.on_window_finished(w0)
         self.assertCountEqual(prefetch.reset(), [parked, released])
         self.assertEqual(prefetch.held_count(), 0)
-        self.assertEqual(prefetch.take_released(), [])
+        self.assertEqual(list(prefetch.released), [])
 
 
 class TestEarlyEmbeddings(CustomTestCase):

@@ -87,7 +87,8 @@ class KeyedReqList(ReqList):
 
     def join(self, reqs: Iterable[Req], *, at: Optional[int] = None) -> None:
         """Add the given requests; ones already in keep their place."""
-        assert at is None, f"{self.kind.name} has no positions to insert at"
+        if at is not None:
+            raise TypeError(f"{self.kind.name} has no positions to insert at")
         for req in reqs:
             self._reqs.setdefault(req, None)
 
@@ -174,21 +175,29 @@ class IndexedReqList(ReqList):
 
 
 def move(
-    items: Iterable, src: ReqList, dst: ReqList, *, at: Optional[int] = None
+    items: Iterable,
+    src: Optional[ReqList],
+    dst: ReqList,
+    *,
+    at: Optional[int] = None,
 ) -> None:
     """Move requests from `src` into `dst` in one step; each must be in `src`.
-    `items` are what `dst` holds: its wrappers for a list that wraps requests,
-    else the requests. `at` inserts them before that position of an
-    `IndexedReqList` instead of at the back."""
-    if at is not None and not isinstance(dst, IndexedReqList):
-        raise TypeError(f"{dst.kind.name} has no positions to insert at")
+    `src=None` means the requests enter their first list. `items` are what
+    `dst` holds: its wrappers for a list that wraps requests, else the
+    requests. `at` inserts them before that position of an `IndexedReqList`
+    instead of at the back. `src` and `dst` must differ."""
+    assert src is not dst, f"{dst.kind.name} cannot move into itself"
     items = list(items)
     if not items:
         return
     reqs = [dst.req_of(item) for item in items]
-    listed = src if isinstance(src, KeyedReqList) else set(src)
-    missing = [req.rid for req in reqs if req not in listed]
-    if missing:
-        raise RuntimeError(f"Requests {missing} are not in {src.kind.name}")
-    src.leave(reqs)
+    if src is not None:
+        # A lone request is looked up in place, without a copy of `src`.
+        listed = src if isinstance(src, KeyedReqList) or len(reqs) == 1 else set(src)
+        missing = [req.rid for req in reqs if req not in listed]
+        if missing:
+            raise RuntimeError(f"Requests {missing} are not in {src.kind.name}")
+    # Joined first: a `dst` that rejects `at` raises before `src` changes.
     dst.join(items, at=at)
+    if src is not None:
+        src.leave(reqs)

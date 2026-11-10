@@ -200,7 +200,7 @@ class TestHeldDestinationPublication(CustomTestCase):
         queue.resolve_deferred_releases = MagicMock()
         prealloc = SimpleNamespace(
             publish_pending_destinations=MagicMock(),
-            resume_retracted_reqs=lambda dst: [],
+            move_resumed=lambda dst: [],
             retracted_queue=[object()],
         )
         scheduler = SimpleNamespace(

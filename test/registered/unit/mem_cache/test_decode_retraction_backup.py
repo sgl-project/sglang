@@ -863,7 +863,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 torch.cuda.stream(queue.scheduler.schedule_stream),
             ):
                 self.assertEqual(
-                    queue.resume_retracted_reqs(IndexedReqList(ListKind.WAITING)), [req]
+                    queue.move_resumed(IndexedReqList(ListKind.WAITING)), [req]
                 )
             torch.cuda.synchronize()
             restored = [buffer[reused].clone() for buffer in buffers]

@@ -24,10 +24,15 @@ from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.lora.lora_manager import LoRAManager  # noqa: E402
 from sglang.srt.managers.io_struct import AbortReq  # noqa: E402
 from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo  # noqa: E402
+from sglang.srt.managers.schedule_batch import (  # noqa: E402
+    Req,
+    ReqKvInfo,
+    ScheduleBatch,
+)
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
+    KeyedReqList,
     ListKind,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
@@ -108,7 +113,9 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler._add_request_to_queue(req)
 
         self.assertEqual(req.priority, -sys.maxsize - 1)
-        scheduler.disagg_prefill_bootstrap_queue.add.assert_called_once_with(req, 8)
+        scheduler.disagg_prefill_bootstrap_queue.add.assert_called_once_with(
+            req, 8, src=None
+        )
         req.time_stats.set_prefill_bootstrap_queue_entry_time.assert_called_once()
 
     def test_decode_mode_assigns_default_priority_before_prealloc_queue(self):
@@ -119,7 +126,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
 
         self.assertEqual(req.priority, -sys.maxsize - 1)
         scheduler.disagg_decode_prealloc_queue.add.assert_called_once_with(
-            req, is_retracted=False
+            req, is_retracted=False, src=None
         )
         req.time_stats.set_decode_prealloc_queue_entry_time.assert_called_once()
 
@@ -1035,6 +1042,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.forward_stream = MagicMock()
         scheduler.ngram_embedding_manager = MagicMock()
         scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
+        scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
         return scheduler
 
     def test_waiting_queue_is_sorted_before_prebuilt_selection(self):
@@ -1072,6 +1080,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         selected_reqs = init_new.call_args.args[0]
         self.assertEqual([req.rid for req in selected_reqs], ["high"])
         self.assertEqual([req.rid for req in scheduler.waiting_queue], ["low"])
+        self.assertEqual([req.rid for req in scheduler.running_reqs], ["high"])
 
     def test_overlap_waits_for_forward_before_processing_prebuilt(self):
         scheduler = self._new_scheduler(enable_overlap=True)
@@ -1106,6 +1115,78 @@ class TestDecodePrebuilt(unittest.TestCase):
             scheduler.forward_stream
         )
         self.assertEqual(call_order, ["prepare", "wait", "process"])
+
+    def test_prebuilt_requests_run_from_their_admission(self):
+        """Admission moves the requests from waiting into running; one that the
+        prebuilt result finishes leaves again."""
+        scheduler = self._new_scheduler(enable_overlap=False)
+        scheduler.req_to_token_pool = MagicMock(size=2)
+        scheduler.max_running_requests = 2
+        scheduler.kv_checksum_computer = None
+        scheduler.enable_hisparse = False
+        scheduler.scheduler_stage_metrics = None
+        scheduler.update_running_batch = lambda batch: batch
+        scheduler.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=lambda batch: batch
+        )
+        kept, done = (
+            FakeReq(
+                rid=rid,
+                kv=SimpleNamespace(restore_done_event=None, kv_committed_len=None),
+                init_next_round_input=lambda tree_cache: None,
+                finished_reason=None,
+            )
+            for rid in ("kept", "done")
+        )
+        for req in (kept, done):
+            req.finished = partial(lambda req: req.finished_reason is not None, req)
+        scheduler.waiting_queue.join([kept, done])
+
+        def lists_of(req):
+            return [
+                reqs.kind
+                for reqs in (scheduler.waiting_queue, scheduler.running_reqs)
+                if req in reqs
+            ]
+
+        def process_prebuilt(batch):
+            done.finished_reason = FINISH_ABORT("finished at prebuilt")
+
+        scheduler.batch_result_processor = SimpleNamespace(
+            process_batch_result_prebuilt=process_prebuilt
+        )
+
+        class _Batch(SimpleNamespace):
+            def is_empty(self):
+                return not self.reqs
+
+            def filter_batch(self):
+                self.reqs = [req for req in self.reqs if not req.finished()]
+
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                side_effect=lambda reqs, *args: _Batch(
+                    reqs=list(reqs),
+                    prepare_for_prebuilt=lambda: None,
+                    process_prebuilt=lambda future_map: None,
+                ),
+            ),
+            patch("sglang.srt.disaggregation.decode.set_time_batch"),
+            patch("sglang.srt.disaggregation.decode.set_schedule_time_batch"),
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=False
+            ),
+        ):
+            plan = (
+                SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run(
+                    scheduler, ScheduleBatch(reqs=[])
+                )
+            )
+
+        self.assertEqual(plan.running_batch.reqs, [kept])
+        self.assertEqual(lists_of(kept), [ListKind.DECODING])
+        self.assertEqual(lists_of(done), [])
 
 
 if __name__ == "__main__":
