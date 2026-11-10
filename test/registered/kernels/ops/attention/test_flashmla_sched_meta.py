@@ -367,6 +367,69 @@ class TestFlashMLAGraphMetadata(CustomTestCase):
                     self.assertEqual(pointers, saved.setdefault(bs, pointers))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestFlashMLAGraphScheduleShape(CustomTestCase):
+    def test_graphs_keep_schedules_of_different_shapes(self):
+        """Graphs whose schedules differ in partition count capture and replay."""
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+        from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+        from sglang.test.kits.dsa_metadata_kit import inputs, make_backend
+
+        def parts(rows):
+            # Native-head FlashMLA at 128 heads: 74 partitions up to 73 rows.
+            return 74 if rows <= 73 else 148
+
+        def get_mla_metadata(*, cache_seqlens, **kwargs):
+            rows = cache_seqlens.shape[0]
+            meta = cache_seqlens.new_full((parts(rows), 8), rows)
+            meta[:, 0] = cache_seqlens.sum()
+            return meta, torch.cumsum(
+                torch.nn.functional.pad(cache_seqlens, (1, 0)), 0, dtype=torch.int32
+            )
+
+        for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+            with self.subTest(mode=mode):
+                seq, req = inputs([64] * 4, list(range(4)))
+                backend = make_backend(mode, seq, req)
+                backend.dsa_decode_impl = "flashmla_kv"
+                backend.flashmla_kv_num_q_heads = 128
+                backend._call_get_mla_metadata = get_mla_metadata
+                backend.speculative_num_draft_tokens = 8
+                backend.hisparse_coordinator = None
+                backend.use_fused_topk = True
+                backend._memory_saver_adapter = TorchMemorySaverAdapter.create(
+                    enable=False
+                )
+                backend.req_to_token = torch.arange(
+                    256 * 512, device="cuda", dtype=torch.int32
+                ).view(256, 512)
+                backend._arange_buf = torch.arange(
+                    2049, device="cuda", dtype=torch.int32
+                )
+                backend.init_cuda_graph_state(max_bs=256, max_num_tokens=2048)
+                rows_per_req = 8 if mode.is_target_verify() else 1
+                saved = {}
+                for bs in (256, 8, 64, 1, 128, 8, 256, 1):
+                    seq = torch.full((bs,), 128 + bs, device="cuda", dtype=torch.int64)
+                    req = torch.arange(bs, device="cuda", dtype=torch.int64)
+                    backend._apply_cuda_graph_metadata(
+                        bs, req, seq, seq.cpu(), mode, spec_info=None
+                    )
+                    actual = backend.forward_metadata.flashmla_metadata
+                    rows = bs * rows_per_req
+                    self.assertEqual(actual.flashmla_metadata.shape[0], parts(rows))
+                    self.assertEqual(actual.num_splits.shape[0], rows + 1)
+                    self.assertEqual(
+                        actual.flashmla_metadata[0, 0].item(),
+                        backend.forward_metadata.dsa_cache_seqlens_int32.sum().item(),
+                    )
+                    pointers = (
+                        actual.flashmla_metadata.data_ptr(),
+                        actual.num_splits.data_ptr(),
+                    )
+                    self.assertEqual(pointers, saved.setdefault(bs, pointers))
+
+
 def _replay_schedule(meta, splits, num_blocks):
     """Replay how the sparse decode kernel and the combine consume a schedule
     and check it covers every request exactly once; return the costliest
