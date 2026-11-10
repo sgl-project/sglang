@@ -19,7 +19,7 @@ from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
 from sglang.srt.runtime_context import get_parallel
@@ -741,6 +741,12 @@ class DSparkDraftMixin:
             hasattr(pool, "get_key_buffer") and hasattr(pool, "get_value_buffer")
         ):
             return None
+        # The fused kernel shares one location vector across every layer.
+        if any(
+            not pool.layer_router.layer(layer.self_attn.attn.layer_id).owner
+            for layer in layers
+        ):
+            return None
         k_norm_weights = self._fused_k_norm_weights()
         attn0 = layers[0].self_attn
         head_dim = attn0.head_dim
@@ -851,6 +857,7 @@ class DSparkDraftMixin:
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         ctx_hidden = (
             target_hidden
@@ -903,6 +910,7 @@ class DSparkDraftMixin:
                     positions=positions,
                     hidden_states=ctx_hidden,
                     cache_loc=cache_loc,
+                    swa_cache_loc=swa_loc,
                     cache_loc_2d=cache_loc_2d,
                     commit_lens=commit_lens,
                 )
@@ -917,9 +925,17 @@ class DSparkDraftMixin:
                 k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                 v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             if cache_loc_2d is not None and commit_lens is not None:
-                pool.set_kv_buffer_prefix_valid(
+                pool.layer_router.layer(attn.attn.layer_id).store_prefix(
                     attn.attn,
-                    cache_loc_2d,
+                    KVWriteLoc(
+                        cache_loc_2d,
+                        window_locs=layer_window_locs(
+                            pool,
+                            attn.attn.layer_id,
+                            None if swa_loc is None else swa_loc.view_as(cache_loc_2d),
+                        ),
+                        physical=True,
+                    ),
                     commit_lens,
                     k,
                     v,
@@ -931,7 +947,13 @@ class DSparkDraftMixin:
                 # already in the ids the draft pool indexes.
                 pool.layer_router.layer(attn.attn.layer_id).store(
                     attn.attn,
-                    KVWriteLoc(cache_loc, physical=True),
+                    KVWriteLoc(
+                        cache_loc,
+                        window_locs=layer_window_locs(
+                            pool, attn.attn.layer_id, swa_loc
+                        ),
+                        physical=True,
+                    ),
                     k,
                     v,
                     attn.attn.k_scale,

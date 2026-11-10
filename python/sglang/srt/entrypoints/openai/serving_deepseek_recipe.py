@@ -19,6 +19,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.parser.deepseek_recipe_output import (
     DeepSeekRecipeOutputParser,
     RecipeToolCall,
@@ -31,7 +32,6 @@ from sglang.srt.parser.deepseek_recipe_renderer import (
     parse_effort_budget,
 )
 from sglang.srt.runtime_context import get_serving
-from sglang.srt.utils import ImageData
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.chat_encoding_adapters import ChatOutputHooks

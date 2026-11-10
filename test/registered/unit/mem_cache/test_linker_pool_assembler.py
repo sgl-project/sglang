@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -73,6 +74,32 @@ class TestDevicePoolEntry(CustomTestCase):
         )
         self.assertEqual(sizes, [[10], [22], [10], [22]])
         self.assertEqual(offsets, [[6], [14], [6], [14]])
+
+    def test_layer_ranges_preserve_layout_and_row_order(self):
+        buffers = [torch.zeros((6, width), dtype=torch.uint8) for width in (3, 5)]
+        for packed in (True, False):
+            pool = DevicePoolEntry(
+                name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=[buffers],
+                layer_mapping={0: (0, 1)},
+                page_size=1,
+                rows_are_pages=True,
+                packed=packed,
+            )
+            for rows in ([4, 0, 4], []):
+                ptrs = [[buffer[row].data_ptr() for buffer in buffers] for row in rows]
+                expected = (ptrs, [[3, 5]] * len(rows), [[0, 3]] * len(rows))
+                if not packed:
+                    expected = tuple(
+                        [[value] for row in part for value in row] for part in expected
+                    )
+                for locations in (rows, np.asarray(rows, dtype=np.int64)):
+                    with self.subTest(packed=packed, rows=rows, kind=type(locations)):
+                        self.assertEqual(
+                            pool.get_prepared_layer_range_meta(locations, 0), expected
+                        )
 
     def test_rejects_invalid_pages_and_empty_buffers(self):
         with self.assertRaisesRegex(ValueError, "has no storage buffers"):
@@ -915,6 +942,74 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         params.mtp_draft_device_pools = ()
         kvcache.full_kv_pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
         with self.assertRaisesRegex(ValueError, "plain MLA"):
+            resolve()
+
+    def test_minimax_m31_nvfp4_maps_page_rows_and_draft(self):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import (
+            MiniMaxM3Nvfp4IndexKPool,
+            MiniMaxM3Nvfp4KVPool,
+            MiniMaxM3Nvfp4MainKVPool,
+        )
+
+        def page_rows(pool_cls, row_bytes):
+            pool = pool_cls.__new__(pool_cls)
+            pool.page_size, pool.layer_num = 2, 2
+            pool.rows = [torch.zeros((4, row_bytes), dtype=torch.uint8)] * 2
+            return pool
+
+        kvcache = MiniMaxM3Nvfp4KVPool.__new__(MiniMaxM3Nvfp4KVPool)
+        kvcache.start_layer, kvcache.layer_num = 4, 2
+        kvcache.main_pool = page_rows(MiniMaxM3Nvfp4MainKVPool, 5)
+        kvcache.index_k_pool = page_rows(MiniMaxM3Nvfp4IndexKPool, 3)
+        kvcache.index_k_layer_id_mapping = {4: 0, 5: 1}
+        draft = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        draft.page_size, draft.layer_num = 2, 1
+        draft.k_scale_buffer = draft.native_k_scale_buffer = None
+        draft.k_buffer = [torch.zeros((8, 7), dtype=torch.uint8)]
+        draft.v_buffer = [torch.zeros((8, 7), dtype=torch.uint8)]
+        params = SimpleNamespace(
+            mtp_draft_device_pools=(), sidecar_draft_device_pools=(draft,)
+        )
+
+        def resolve():
+            return resolve_hybrid_device_pool_group(
+                kvcache=kvcache,
+                page_size=2,
+                params=params,
+                components={ComponentType.FULL},
+            )
+
+        group = resolve()
+        self.assertEqual(group.num_layers, 2)
+        self.assertFalse(group.rank_replicated)
+        self.assertEqual(
+            group.sources,
+            {
+                PoolName.KV: PoolName.KV,
+                PoolName.INDEXER: PoolName.KV,
+                PoolName.DRAFT: PoolName.KV,
+            },
+        )
+        indices = torch.tensor([2, 3, 6, 7])
+        for name, row_bytes in ((PoolName.KV, 5), (PoolName.INDEXER, 3)):
+            entry = group.entry_map[name]
+            self.assertEqual(entry.layer_mapping, {0: 0, 1: 1})
+            locations = entry.prepare_locations(indices)
+            self.assertEqual(locations, [1, 3])
+            _, sizes, offsets = entry.get_prepared_layer_range_meta(locations, 1)
+            self.assertEqual(sizes, [[row_bytes]] * 2)
+            self.assertEqual(offsets, [[row_bytes]] * 2)
+        draft_entry = group.entry_map[PoolName.DRAFT]
+        self.assertEqual(draft_entry.layer_mapping, {0: (0, 1)})
+        self.assertEqual(draft_entry.prepare_locations(indices), [2, 6])
+
+        params.mtp_draft_device_pools = (object(),)
+        with self.assertRaisesRegex(ValueError, "M3.1 NVFP4"):
+            resolve()
+        params.mtp_draft_device_pools = ()
+        kvcache.main_pool = page_rows(MHATokenToKVPool, 5)
+        with self.assertRaisesRegex(ValueError, "M3.1 NVFP4"):
             resolve()
 
     def test_unsupported_strategy_fails_with_context(self):

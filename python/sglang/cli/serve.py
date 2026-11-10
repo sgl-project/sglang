@@ -20,7 +20,7 @@ from sglang.cli.utils import (
     try_get_model_path,
 )
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.common import suppress_noisy_warnings
+from sglang.srt.utils.log_utils import suppress_noisy_warnings
 
 suppress_noisy_warnings()
 

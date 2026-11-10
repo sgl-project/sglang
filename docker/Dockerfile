@@ -18,8 +18,8 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.7.2
-ARG MOONCAKE_VERSION=0.3.13.post1
+ARG FLASHINFER_VERSION=0.7.3
+ARG MOONCAKE_VERSION=0.3.14
 ARG MSCCLPP_VERSION=sglang-v0.10.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -165,6 +165,7 @@ ENV LANG=en_US.UTF-8 \
 #     |
 #     +-- torch_deps ------> flashinfer_cache (needs flashinfer)
 #     |                  \-> hpc_ops_builder (cmake-only build)
+#     |                  \-> halops_wheel (prebuilt wheel download)
 #     |
 #     +-- devtools_builder (independent)
 #     +-- gateway_builder  (independent, only needs gateway source)
@@ -208,7 +209,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
 COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
-COPY rust/sglang-api-types /tmp/sglang_deps/rust/sglang-api-types
+COPY rust/sglang-runtime-v1-types /tmp/sglang_deps/rust/sglang-runtime-v1-types
 
 # Install sglang dependencies (torch, transformers, etc.).
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
@@ -270,6 +271,26 @@ RUN mkdir -p /wheels && \
         git checkout ${HPC_OPS_COMMIT} && \
         python3 setup.py bdist_wheel -d /wheels; \
     fi
+
+########################################################
+# PARALLEL STAGE 2b: HALOps Wheel (needs torch_deps)
+########################################################
+FROM torch_deps AS halops_wheel
+
+# HALOps (https://github.com/PaddlePaddle/HALOps): MXFP8 w8a8 dense GEMM kernels
+# for the opt-in --fp8-gemm-backend=halops. Only prebuilt wheels are published,
+# so fetch the one matching this image's Python and platform. A missing or
+# mismatched wheel leaves /wheels empty and the install step skips it.
+ARG HALOPS_VERSION=0.1.0
+ARG HALOPS_INDEX_URL=https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
+
+WORKDIR /build
+
+RUN mkdir -p /wheels && \
+    (python3 -m pip download "halops==${HALOPS_VERSION}" \
+        --no-deps --only-binary=:all: --no-index \
+        -f "${HALOPS_INDEX_URL}" -d /wheels \
+    || echo "WARNING: no halops ${HALOPS_VERSION} wheel for this platform; skipping")
 
 ########################################################
 # PARALLEL STAGE 3: FlashInfer Cache (needs torch_deps)
@@ -408,6 +429,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     if ls /tmp/wheels/hpc-ops/*.whl >/dev/null 2>&1; then \
         uv pip install --no-deps /tmp/wheels/hpc-ops/*.whl; \
     fi && rm -rf /tmp/wheels/hpc-ops
+
+# Copy HALOps wheel and install if it was staged; a platform-mismatched or
+# otherwise unusable wheel must not fail the image build.
+COPY --from=halops_wheel /wheels /tmp/wheels/halops
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if ls /tmp/wheels/halops/*.whl >/dev/null 2>&1; then \
+        uv pip install --no-deps /tmp/wheels/halops/*.whl \
+        || (uv pip uninstall halops >/dev/null 2>&1 || true; \
+            echo "WARNING: halops wheel install failed; building without it"); \
+    fi; \
+    rm -rf /tmp/wheels/halops
 
 # Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /opt/sglang/lib/python3.12/site-packages/
@@ -589,31 +621,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 RUN --mount=type=cache,target=/root/.cache/uv \
     cd /sgl-workspace/sglang \
     && uv pip install --no-deps -e "python[${BUILD_TYPE}]" \
-    && kernels lock python \
-    && ( success=0; \
-         # aarch64: kernels-community/sgl-flash-attn3 ships no arm variants; JIT-compile at runtime.
-         # Remove this branch once arm cubins are published upstream.
-         if [ "$(uname -m)" = "aarch64" ]; then \
-             echo "Skipping kernels-community/sgl-flash-attn3 cubin download on aarch64 (no variants published upstream); kernels will be JIT-compiled at runtime"; \
-             success=1; \
-         else \
-             for i in 1 2 3; do \
-                 echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
-                 kernels download python && \
-                 success=1 && break; \
-                 echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
-             done; \
-             # x86: if no prebuilt sgl-flash-attn3 variant matches this torch+CUDA \
-             # combo, fall back to runtime JIT instead of failing the build, \
-             # mirroring the aarch64 branch. \
-             if [ "$success" != "1" ]; then \
-                 echo "WARNING: no matching sgl-flash-attn3 cubin variant for this torch+CUDA; kernels will be JIT-compiled at runtime"; \
-                 success=1; \
-             fi; \
-         fi; \
-         [ "$success" = "1" ] ) \
     && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
-    && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
     && ( find /opt/sglang/lib/python3.12/site-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
 
 ENV SGLANG_RUST_BUILD_MODE=never
@@ -631,7 +639,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # SM103, compiled at runtime); disable with --build-arg ENABLE_SGL_NVIDIA_MEGA=0.
 ARG ENABLE_SGL_NVIDIA_MEGA=1
 ARG SGL_NVIDIA_MEGA_REPO="https://github.com/sgl-project/sgl-nvidia-mega.git"
-ARG SGL_NVIDIA_MEGA_COMMIT="54b428921749fef89fcbd043000f839ac9cc4638"
+ARG SGL_NVIDIA_MEGA_COMMIT="77360f1fd74dc46010056ebdac0ed5e0b87d3978"
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ "${ENABLE_SGL_NVIDIA_MEGA}" != "1" ]; then \
         echo "[sgl-nvidia-mega] skip (ENABLE_SGL_NVIDIA_MEGA=${ENABLE_SGL_NVIDIA_MEGA})"; \
@@ -663,169 +671,3 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
-
-########################################################
-########## Runtime Image ##############################
-########################################################
-#
-# PURPOSE: Production runtime environment with JIT support
-#
-# This stage creates a production-ready image containing:
-# - Pre-installed SGLang and CUDA dependencies
-# - Full CUDA toolchain for JIT compilation (DeepGEMM, Triton, FlashInfer)
-# - Optimized for inference workloads and deployment
-# - Smaller than framework (no dev tools like vim, tmux, nsight, etc.)
-#
-# Use this stage when you need:
-# - Production deployment of SGLang
-# - JIT compilation support for FP8/microscaling kernels
-# - Ready-to-run inference server environment
-#
-# Note: Uses devel base for complete NVCC toolchain required by DeepGEMM JIT
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
-
-ARG CUDA_VERSION
-ARG TARGETARCH
-ARG GDRCOPY_VERSION=2.5.1
-ARG PYTHON_VERSION
-
-ENV DEBIAN_FRONTEND=noninteractive \
-    CUDA_HOME=/usr/local/cuda \
-    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    SGLANG_RUST_BUILD_MODE=never
-
-# Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT
-ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
-    LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
-
-# Install runtime dependencies (devel base provides gcc/g++/build tools)
-RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
-    apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
-    wget \
-    # Core system utilities
-    ca-certificates \
-    netcat-openbsd \
-    curl \
-    ffmpeg \
-    git \
-    # Runtime libraries
-    libopenmpi3 \
-    libnuma1 \
-    numactl \
-    libibverbs1 \
-    libibumad3 \
-    librdmacm1 \
-    libnl-3-200 \
-    libnl-route-3-200 \
-    ibverbs-providers \
-    libgoogle-glog0v6t64 \
-    libunwind8 \
-    libboost-system1.83.0 \
-    libboost-thread1.83.0 \
-    libboost-filesystem1.83.0 \
-    libgrpc++1.51t64 \
-    libprotobuf32t64 \
-    libhiredis1.1.0 \
-    libcurl4 \
-    libczmq4 \
-    libfabric1 \
-    libssl-dev \
-    # RDMA runtime
-    rdma-core \
-    infiniband-diags \
-    perftest \
-    # Build tools for JIT compilation
-    ninja-build \
-    # NCCL packages needed for pynccl_allocator JIT compilation (-lnccl)
-    libnccl2 \
-    libnccl-dev \
-    # GPG key verification
-    gnupg2 \
-    linux-libc-dev \
-    && for py in python python3; do \
-        rm -f /usr/bin/$py \
-        && printf '#!/bin/sh\nexec /opt/sglang/bin/python "$@"\n' > /usr/bin/$py \
-        && chmod +x /usr/bin/$py; \
-    done \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
-
-# create virtual env for sglang to avoid conflict with system python packages
-COPY --from=uv /uv /uvx /usr/local/bin/
-COPY --from=base /opt/python /opt/python
-ENV UV_PYTHON_INSTALL_DIR=/opt/python \
-    UV_PYTHON_PREFERENCE=only-managed \
-    UV_LINK_MODE=copy \
-    VIRTUAL_ENV=/opt/sglang
-RUN UV_PYTHON_DOWNLOADS=never uv venv --python ${PYTHON_VERSION} /opt/sglang \
-    && /opt/sglang/bin/python -VV
-ENV PATH="/opt/sglang/bin:${PATH}"
-
-# Set up locale
-RUN apt-get update && apt-get install -y --no-install-recommends locales \
-    && locale-gen en_US.UTF-8 \
-    && rm -rf /var/lib/apt/lists/*
-
-ENV LANG=en_US.UTF-8 \
-    LANGUAGE=en_US:en \
-    LC_ALL=en_US.UTF-8
-
-# Fix Trivy-reported CVEs (see framework stage for full CVE list)
-RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
-    apt-get update && apt-get install -y --only-upgrade \
-    binutils binutils-common binutils-x86-64-linux-gnu libbinutils \
-    libctf0 libctf-nobfd0 libgprofng0 libsframe1 \
-    libgnutls30t64 \
-    libpam-modules libpam-modules-bin libpam-runtime libpam0g \
-    libsqlite3-0 libtasn1-6 \
-    dpkg dpkg-dev libdpkg-perl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
-COPY --from=framework_final /opt/sglang/lib/python3.12/site-packages /opt/sglang/lib/python3.12/site-packages
-COPY --from=framework_final /opt/sglang/bin/pip* /opt/sglang/bin/
-
-# Copy SGLang workspace
-COPY --from=framework_final /sgl-workspace /sgl-workspace
-
-# Copy sgl-model-gateway binary
-COPY --from=framework_final /opt/sglang/bin/sgl-model-gateway /opt/sglang/bin/sgl-model-gateway
-
-# Copy sglang binary
-COPY --from=framework_final /opt/sglang/bin/sglang /opt/sglang/bin/sglang
-
-# Copy py-spy binary
-COPY --from=framework_final /opt/sglang/bin/py-spy /opt/sglang/bin/py-spy
-
-# Copy cache for kernels from kernels community
-COPY --from=framework_final /root/.cache/huggingface /root/.cache/huggingface
-COPY --from=framework_final /root/.cache/sglang /root/.cache/sglang
-
-# Copy GDRCopy runtime libraries (but not the build artifacts)
-COPY --from=framework_final /usr/lib/*-linux-gnu/libgdrapi.so* /usr/lib/
-COPY --from=framework_final /usr/bin/gdrcopy_* /usr/bin/
-COPY --from=framework_final /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
-
-# Fix DeepEP IBGDA symlink in runtime
-RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so \
-    && ldconfig
-
-WORKDIR /sgl-workspace/sglang
-
-# Keep build provenance at the end so metadata changes do not invalidate build layers.
-ARG SGLANG_BUILD_COMMIT=unknown
-ARG SGLANG_BUILD_URL=
-ARG SGLANG_IMAGE_TAG=local/sglang:dev
-ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
-    SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
-    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
-LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
-      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
-      org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
-      org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
-      ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
-      ai.sglang.build.url="${SGLANG_BUILD_URL}" \
-      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
-
-# Default command
-CMD ["/bin/bash"]

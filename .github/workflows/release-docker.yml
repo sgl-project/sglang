@@ -43,7 +43,6 @@ jobs:
     needs: resolve-version
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
-      docker_target: framework_final
       sgl_version: ${{ needs.resolve-version.outputs.version }}
       use_environment: prod
       image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}

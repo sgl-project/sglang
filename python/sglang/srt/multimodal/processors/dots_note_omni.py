@@ -14,18 +14,18 @@ import torch
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.dots3 import Dots3NoteForCausalLM
+from sglang.srt.models.dots3_common.dots_omni_audio import OmniAudioConfig
 from sglang.srt.models.dots3_common.dots_omni_towers import (
     DotsNoteOmniImagePreprocessor,
-    OmniAudioConfig,
     get_audio_token_string,
     load_omni_component_config,
 )
+from sglang.srt.multimodal.media_io import VideoData, get_video_bytes
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils import VideoData, get_video_bytes
 
 logger = logging.getLogger(__name__)
 

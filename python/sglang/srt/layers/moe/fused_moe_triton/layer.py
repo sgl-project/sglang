@@ -411,6 +411,7 @@ class FusedMoE(torch.nn.Module):
         enable_qwen35_fp8_deferred_finalize: bool = False,
         quant_method: Optional[FusedMoEMethodBase] = None,
         uses_expert_location: bool = True,
+        allow_fp8_blockwise_tail: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -430,6 +431,7 @@ class FusedMoE(torch.nn.Module):
         self.num_experts = num_experts
         self.with_bias = with_bias
         self.num_fused_shared_experts = num_fused_shared_experts
+        self.allow_fp8_blockwise_tail = allow_fp8_blockwise_tail
 
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
@@ -1258,6 +1260,17 @@ class FusedMoE(torch.nn.Module):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
+        for local_expert_id in self._weight_loader_expert_ids(param, expert_id):
+            self._weight_loader_impl(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=local_expert_id,
+            )
+
+    def _weight_loader_expert_ids(self, param: torch.nn.Parameter, expert_id: int):
+        """Resolve destinations before online loaders allocate a source tensor."""
         global_expert_location_metadata = (
             get_global_expert_location_metadata() if self.uses_expert_location else None
         )
@@ -1266,14 +1279,7 @@ class FusedMoE(torch.nn.Module):
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
                 if expert_id == -1:
                     return
-
-            self._weight_loader_impl(
-                param=param,
-                loaded_weight=loaded_weight,
-                weight_name=weight_name,
-                shard_id=shard_id,
-                expert_id=expert_id,
-            )
+            yield expert_id
             return
 
         require_global_experts = getattr(param, "_sglang_require_global_experts", False)
@@ -1305,44 +1311,18 @@ class FusedMoE(torch.nn.Module):
                 # routed slot can lie past _num_global_routed and map to the shared slot.
                 physical_expert_ids = self._local_routed_expert_ids(physical_expert_ids)
 
-        for physical_expert_id in physical_expert_ids:
-            self._weight_loader_physical(
-                param=param,
-                loaded_weight=loaded_weight,
-                weight_name=weight_name,
-                shard_id=shard_id,
-                expert_id=physical_expert_id,
-            )
-
-    def _weight_loader_physical(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-    ) -> None:
-        # WARN: This makes the `expert_id` mean "local" and "global" in different cases
-        if not getattr(param, "_sglang_require_global_experts", False):
-            expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
-            if expert_id < 0 or expert_id >= self.num_local_experts:
-                return
-
-        if isinstance(
-            self.quant_method,
-            KTEPWrapperMethod,
-        ):
-            if self.quant_method.num_gpu_experts != -1:
-                if expert_id >= self.quant_method.num_gpu_experts:
-                    return
-
-        self._weight_loader_impl(
-            param=param,
-            loaded_weight=loaded_weight,
-            weight_name=weight_name,
-            shard_id=shard_id,
-            expert_id=expert_id,
-        )
+        for expert_id in physical_expert_ids:
+            # Expert IDs are local unless this parameter explicitly requires
+            # global expert storage. Preserve EPLB replicas and shared slots.
+            if not getattr(param, "_sglang_require_global_experts", False):
+                expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+                if expert_id < 0 or expert_id >= self.num_local_experts:
+                    continue
+            if isinstance(self.quant_method, KTEPWrapperMethod):
+                if self.quant_method.num_gpu_experts != -1:
+                    if expert_id >= self.quant_method.num_gpu_experts:
+                        continue
+            yield expert_id
 
     def _load_gguf_weight(
         self,

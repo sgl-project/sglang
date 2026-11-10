@@ -77,6 +77,7 @@ ATTENTION_BACKEND_CHOICES = [
     "unlimited_ocr_v2",
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
+    "ernie55",
     # NVIDIA specific
     "fa3",
     "fa4",
@@ -178,6 +179,8 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "triton",
     "aiter",
+    "halops",
+    "xpu_scaled_mm",
 ]
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [

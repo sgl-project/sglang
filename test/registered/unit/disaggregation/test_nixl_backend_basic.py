@@ -16,6 +16,7 @@ import requests
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
+from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
@@ -23,7 +24,6 @@ from sglang.srt.disaggregation.nixl.conn import (
     NixlKVReceiver,
     NixlKVSender,
     TransferInfo,
-    TransferKVChunk,
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -543,6 +543,7 @@ class TestNixlTransferWorker(CustomTestCase):
                 dst_dcp_rank=dcp_rank,
                 dcp_dst_region_indices=[0],
                 dcp_token_item_lens=[4],
+                dst_draft_rows_dcp_collapsed=False,
             )
             for i, (agent, dcp_rank) in enumerate(zip(agents, dcp_ranks))
         }
