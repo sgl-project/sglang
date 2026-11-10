@@ -96,7 +96,7 @@ if _is_cuda or _is_xpu or _is_musa:
             )
             from flashinfer.norm import rmsnorm_quant as _flashinfer_rmsnorm_quant
 
-            _flashinfer_rmsnorm_quant_available = True
+            _flashinfer_rmsnorm_quant_available = not envs.SGLANG_DISABLE_FUSIONS.get()
         except (ImportError, AttributeError):
             _flashinfer_rmsnorm_quant_available = False
     else:
@@ -459,6 +459,44 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
     return False
 
 
+def _forward_with_per_tensor_quant_fusion(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    residual: Optional[torch.Tensor] = None,
+    post_residual_addition: Optional[torch.Tensor] = None,
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+):
+    """Run FlashInfer's fused RMSNorm and static per-tensor FP8 quantization."""
+    orig_dtype = x.dtype
+    needs_reshape = x.dim() != 2
+    if needs_reshape:
+        original_shape = x.shape
+        x = x.contiguous().reshape(-1, original_shape[-1])
+    elif not x.is_contiguous():
+        x = x.contiguous()
+
+    out = torch.empty_like(x, dtype=fp8_dtype)
+    if residual is not None:
+        if post_residual_addition is not None:
+            residual = residual + post_residual_addition
+        if residual.dim() != 2:
+            residual = residual.contiguous().reshape(-1, residual.shape[-1])
+        elif not residual.is_contiguous():
+            residual = residual.contiguous()
+        _flashinfer_fused_add_rmsnorm_quant(out, x, residual, weight, scale, eps)
+        if needs_reshape:
+            out = out.reshape(original_shape)
+            residual = residual.reshape(original_shape)
+        return (out, scale, orig_dtype), residual
+
+    _flashinfer_rmsnorm_quant(out, x, weight, scale, eps)
+    if needs_reshape:
+        out = out.reshape(original_shape)
+    return out, scale, orig_dtype
+
+
 class RMSNorm(BaseFusedOp):
     # Explicit opt-in: implementations must honor use_attn_tp_group=False.
     supports_non_attn_tp_allreduce = True
@@ -599,6 +637,7 @@ class RMSNorm(BaseFusedOp):
         if (
             quant_linear is not None
             and not self.cast_x_before_out_mul
+            and not envs.SGLANG_DISABLE_FUSIONS.get()
             and (_flashinfer_rmsnorm_quant_available or self.use_jit_rmsnorm)
         ):
             scale = _fp8_static_input_scale(quant_linear)
@@ -1272,6 +1311,9 @@ class LayerNorm(BaseFusedOp):
 class GemmaRMSNorm(BaseFusedOp):
     supports_non_attn_tp_allreduce = True
 
+    # The projection that consumes this norm's output; see fuse_input_quant().
+    _quant_linear: Optional[nn.Module] = None
+
     def __init__(
         self,
         hidden_size: int,
@@ -1298,11 +1340,16 @@ class GemmaRMSNorm(BaseFusedOp):
         # CPU offload may move the parameter to host while the buffer stays on device.
         self.gemma_weight.copy_(self.weight.data).add_(1.0)
 
+    def fuse_input_quant(self, linear: nn.Module) -> None:
+        """Record the projection whose static FP8 input quantization can fuse."""
+        self.__dict__["_quant_linear"] = linear
+
     def _forward_impl(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         needs_reshape = x.dim() != 2 and residual is None
         if needs_reshape:
@@ -1325,6 +1372,7 @@ class GemmaRMSNorm(BaseFusedOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         orig_dtype = x.dtype
         if residual is not None:
@@ -1345,7 +1393,21 @@ class GemmaRMSNorm(BaseFusedOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if quant_linear is None:
+            quant_linear = self._quant_linear
+        if quant_linear is not None and _flashinfer_rmsnorm_quant_available:
+            scale = _fp8_static_input_scale(quant_linear)
+            if scale is not None:
+                return _forward_with_per_tensor_quant_fusion(
+                    x,
+                    scale,
+                    self.gemma_weight,
+                    self.variance_epsilon,
+                    residual,
+                    post_residual_addition,
+                )
         return self._forward_impl(x, residual, post_residual_addition)
 
     def forward_hip(
@@ -1353,6 +1415,7 @@ class GemmaRMSNorm(BaseFusedOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if _use_aiter and _has_rocm_triton_gemma_rms_norm:
             if residual is not None:
@@ -1409,6 +1472,7 @@ class GemmaRMSNorm(BaseFusedOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if _is_cpu_amx_available:
             if residual is not None:
@@ -1428,6 +1492,7 @@ class GemmaRMSNorm(BaseFusedOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
             return self.forward_native(x, residual)
@@ -1447,6 +1512,7 @@ class GemmaRMSNorm(BaseFusedOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self._forward_impl(x, residual, post_residual_addition)
 
@@ -1455,6 +1521,7 @@ class GemmaRMSNorm(BaseFusedOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # sgl_kernel's gemma norm ops are built for MUSA (see the import gate
         # above); opt into the CUDA-path implementation explicitly.
@@ -1498,16 +1565,37 @@ class GemmaRMSNorm(BaseFusedOp):
 
 
 class Gemma3RMSNorm(BaseFusedOp):
+    # The projection that consumes this norm's output; see fuse_input_quant().
+    _quant_linear: Optional[nn.Module] = None
+
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
+        self.register_buffer(
+            "gemma_weight", torch.ones_like(self.weight), persistent=False
+        )
+        self.weight.weight_loader = self._weight_loader
         # Re-dispatch
+
+    def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        assert param.size() == loaded_weight.size()
+        param.data.copy_(loaded_weight)
+        torch.add(param.data, 1.0, out=self.gemma_weight)
+
+    def fuse_input_quant(self, linear: nn.Module) -> None:
+        """Record the projection whose static FP8 input quantization can fuse."""
+        self.__dict__["_quant_linear"] = linear
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward_native(self, x, residual: Optional[torch.Tensor] = None):
+    def forward_native(
+        self,
+        x,
+        residual: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
+    ):
         if residual is not None:
             residual = x + residual
             x = residual
@@ -1518,14 +1606,32 @@ class Gemma3RMSNorm(BaseFusedOp):
         output = output.type_as(x)
         return output if residual is None else (output, residual)
 
-    def forward_cpu(self, x, residual: Optional[torch.Tensor] = None):
+    def forward_cpu(
+        self,
+        x,
+        residual: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
+    ):
         if residual is not None:
             return self.forward_native(x, residual)
         if _is_cpu_amx_available and x.stride(-1) == 1:
             return torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x, self.weight, self.eps)
         return self.forward_native(x)
 
-    def forward_cuda(self, x, residual: Optional[torch.Tensor] = None):
+    def forward_cuda(
+        self,
+        x,
+        residual: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
+    ):
+        if quant_linear is None:
+            quant_linear = self._quant_linear
+        if quant_linear is not None and _flashinfer_rmsnorm_quant_available:
+            scale = _fp8_static_input_scale(quant_linear)
+            if scale is not None:
+                return _forward_with_per_tensor_quant_fusion(
+                    x, scale, self.gemma_weight, self.eps, residual
+                )
         if residual is not None:
             # The decoder residual is token-major and contiguous. The fused
             # kernel updates both tensors in place: x becomes the normalized
@@ -1541,7 +1647,12 @@ class Gemma3RMSNorm(BaseFusedOp):
         flat = x.contiguous().view(-1, x.shape[-1])
         return gemma_rmsnorm(flat, self.weight.data, self.eps).view(x.shape)
 
-    def forward_xpu(self, x, residual: Optional[torch.Tensor] = None):
+    def forward_xpu(
+        self,
+        x,
+        residual: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
+    ):
         if residual is not None and x.dim() == 2:
             # The decoder residual is token-major and contiguous. The fused
             # kernel updates both tensors in place: x becomes the normalized
@@ -1558,16 +1669,31 @@ class Gemma3RMSNorm(BaseFusedOp):
             return gemma_rmsnorm(x, self.weight.data, self.eps)
         return self.forward_native(x, residual)
 
-    def forward_musa(self, x, residual: Optional[torch.Tensor] = None):
+    def forward_musa(
+        self,
+        x,
+        residual: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
+    ):
         # sgl_kernel's gemma norm ops are built for MUSA; follow the CUDA path.
         return self.forward_cuda(x, residual)
 
-    def forward_hip(self, x, residual: Optional[torch.Tensor] = None):
+    def forward_hip(
+        self,
+        x,
+        residual: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
+    ):
         # sgl_kernel's gemma_rmsnorm/gemma_fused_add_rmsnorm are not available on
         # ROCm; delegate to the pure-PyTorch implementation.
         return self.forward_native(x, residual)
 
-    def forward_npu(self, x, residual: Optional[torch.Tensor] = None):
+    def forward_npu(
+        self,
+        x,
+        residual: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
+    ):
         if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
             return self.forward_native(x, residual)
         if residual is not None:
