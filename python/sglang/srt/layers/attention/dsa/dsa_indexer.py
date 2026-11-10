@@ -1833,7 +1833,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             local_lens,
             block_tables.shape[1] * page_size,
         )
-        return dcp_global_topk(
+        # attention reads local KV slots and their counts
+        return dcp_local_topk(
             logits,
             local_lens,
             seqlens_32.view(-1)[:q_offset],
@@ -1841,6 +1842,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.index_topk,
             page_size,
             metadata.attn_metadata.topk_v2_plan,
+            metadata.attn_metadata.dcp_topk_length,
         )
 
     def _hip_mqa_logits(self, q, index_k, weights, ks, ke, plans=None) -> torch.Tensor:
