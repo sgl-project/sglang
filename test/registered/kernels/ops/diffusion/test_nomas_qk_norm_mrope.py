@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import sys
+
 import pytest
 import torch
 
@@ -84,3 +86,7 @@ def test_qk_norm_mrope_rejects_invalid_mean_shape():
     args[1] = args[1][..., 0]
     with pytest.raises(ValueError, match="mean squares"):
         fused_nomas_qk_norm_mrope(*args)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
