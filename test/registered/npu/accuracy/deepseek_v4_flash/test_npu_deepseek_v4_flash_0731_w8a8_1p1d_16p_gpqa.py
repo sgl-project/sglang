@@ -14,6 +14,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+    NIC_NAME,
     build_meta_service_config,
     resolve_prefill_instance_master_ip,
 )
@@ -89,8 +90,14 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "STREAMS_PER_DEVICE": "32",
     "INF_NAN_MODE_FORCE_DISABLE": "1",
     "SGLANG_SET_CPU_AFFINITY": "1",
-    "HCCL_SOCKET_IFNAME": "lo",
-    "GLOO_SOCKET_IFNAME": "lo",
+    # The prefill instance spans 2 pods (--nnodes 2), so both the HCCL and the
+    # gloo CPU process group must bind the real NIC instead of loopback: with
+    # GLOO_SOCKET_IFNAME=lo every rank advertises 127.0.0.1 to its peers and
+    # cross-node connectFullMesh fails with "Connection refused".
+    "HCCL_SOCKET_IFNAME": NIC_NAME,
+    "GLOO_SOCKET_IFNAME": NIC_NAME,
+    # Two pods may share a host (hostNetwork); let HCCL pick free host ports.
+    "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
