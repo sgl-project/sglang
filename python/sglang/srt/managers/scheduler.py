@@ -113,7 +113,6 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     decode_offloads_kvcache,
-    disagg_transfers_in_flight,
     get_dsa_seed_metadata_dim,
     prepare_abort,
 )
@@ -346,6 +345,7 @@ from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.kv.alloc.demand import window_retirement
 from sglang.srt.mem_cache.kv.alloc.forward_steps import (
     ForwardLaunch,
     forward_steps_of,
@@ -505,6 +505,8 @@ class Scheduler(
     # Set by maybe_init_rust_server; a watchdog timeout reads it to dump. A
     # class-level default, so it reads as None before __init__ gets that far.
     rust_server: Optional[RustServer] = None
+    # The alignment a truncated prefill chunk is cut to; None leaves it free.
+    truncation_align_size: Optional[int] = None
 
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
@@ -527,6 +529,8 @@ class Scheduler(
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
+        # Beats while the scheduler waits inside a step (`feed_watchdog`).
+        self.watchdog_heartbeats: int = 0
         # Prefill tokens processed so far; used as the aging axis for the HRRN scheduling policy. Reqs snapshot this at waiting_queue entry.
         self.processed_tokens_counter: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
@@ -728,7 +732,6 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
-        self.maybe_init_disaggregation_pin_source()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1338,6 +1341,7 @@ class Scheduler(
 
         self.metrics_collector.emit_constants(
             max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens_window=self.window_token_capacities(),
             max_total_num_tokens_swa=self.swa_tokens_per_layer,
             weight_memory_usage_gb=self.tp_worker.model_runner.weight_load_mem_usage,
             kv_cache_memory_usage_gb=(
@@ -1544,6 +1548,11 @@ class Scheduler(
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
 
+    def feed_watchdog(self) -> None:
+        """Tell the watchdogs the scheduler is alive while it waits on the host
+        inside a step (a page move waiting for network transfers)."""
+        self.watchdog_heartbeats += 1
+
     def init_soft_watchdog(self):
         if (x := get_device().soft_watchdog_timeout) is not None:
             self.soft_watchdog = create_scheduler_watchdog(
@@ -1707,9 +1716,6 @@ class Scheduler(
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
             )
-            # Requests with a sent chunk that are not yet on the transfer queue.
-            self.disagg_prefill_pending_chunk_rids: Set[str] = set()
-
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         # Init mm receiver for EPD disaggregation mode
@@ -1722,16 +1728,6 @@ class Scheduler(
                 dtype=self.model_config.dtype,
                 hf_config=self.model_config.hf_config,
                 scheduler=self,
-            )
-
-    def maybe_init_disaggregation_pin_source(self):
-        # A role switch rebuilds PD queues, but the allocator keeps its pins.
-        if self.disaggregation_mode != DisaggregationMode.NULL:
-            storage = kv_storage_of(
-                self.req_to_token_pool, self.token_to_kv_pool_allocator
-            )
-            storage.add_pin_source(
-                storage.sub_pool_names(), disagg_transfers_in_flight(self)
             )
 
     def init_overlap(self):
@@ -1861,9 +1857,11 @@ class Scheduler(
         prefix sits on the kernel chunk grid, so a chunk that stops anywhere
         else costs the request every donation it would have made after that.
         Without DCP the prefix-relative rule already donates, so leave the
-        existing alignment alone. Use the LCM to preserve any alignment that
-        is already set."""
-        chunk_size = mamba_prefill_chunk_grid()
+        existing alignment alone, except where unified memory retires window
+        rows behind the checkpoints (`mamba_prefill_chunk_grid`): there every
+        cut lands on the checkpoint grid. Use the LCM to preserve any alignment
+        that is already set."""
+        chunk_size = mamba_prefill_chunk_grid(getattr(self, "tree_cache", None))
         if chunk_size <= 1:
             return
 
@@ -1894,9 +1892,12 @@ class Scheduler(
             f"Chunked prefill is aligned to {align} tokens, but each rank's "
             f"chunked prefill size is {chunk}{dp_note}; a prompt longer than "
             f"{chunk} tokens could never be scheduled. Raise --chunked-prefill-size "
-            f"to at least {align * attn_dp_size}, or, with the flashinfer backend "
-            f"under deterministic inference, lower "
-            f"SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE."
+            f"to at least {align * attn_dp_size}. The alignment includes the Mamba "
+            f"state checkpoint grid under DCP, and under --enable-unified-memory "
+            f"when sliding-window layers retire their rows behind the cached "
+            f"checkpoints; with the flashinfer backend under deterministic "
+            f"inference, lowering SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE also "
+            f"helps."
         )
 
     def init_request_dispatcher(self):
@@ -2689,11 +2690,13 @@ class Scheduler(
             return dict(get_drain_state=lambda: DRAIN_STATE_NO_LISTENER)
         return {}
 
-    def init_pool_stats_observer(self) -> None:
+    def _observed_storage(self):
+        """The sub-pools the pool observers report: a unified pool's own
+        storage, else the static pools described by their sizing."""
         global_tokens = self.max_total_num_tokens * self.kv_shard_widening
         if is_cp_sharded_padded():
             global_tokens = from_cp_sharded(global_tokens)
-        storage = kv_storage_of(
+        return kv_storage_of(
             self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
             shape=StaticPoolShape(
@@ -2703,11 +2706,23 @@ class Scheduler(
                 token_capacity=global_tokens,
                 full_tokens_per_layer=self.full_tokens_per_layer,
                 swa_tokens_per_layer=self.swa_tokens_per_layer,
+                window=self.sliding_window_size,
             ),
         )
+
+    def window_token_capacities(self) -> Dict[str, int]:
+        """Each window pool's token capacity by window name, as its usage gauges
+        divide by; a draft's own window included."""
+        return {
+            usage.label: usage.capacity
+            for usage in self._observed_storage().usage()
+            if usage.metrics == "window"
+        }
+
+    def init_pool_stats_observer(self) -> None:
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
-            storage=storage,
+            storage=self._observed_storage(),
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             session_controller=self.session_controller,
             hisparse_coordinator=self.hisparse_coordinator,
@@ -2971,12 +2986,21 @@ class Scheduler(
             extra_padding = group_padding - page_padding
             extra_headroom = group_size - self.page_size
             token_capacity -= extra_padding + extra_headroom
+        retirement = window_retirement(
+            shares_prefixes=self.tree_cache.supports_prefix_sharing()
+        )
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,
             token_capacity=token_capacity,
             sliding_window_size=self.sliding_window_size,
             chunk_size=self.chunked_prefill_size,
+            prefill_retire_lag=retirement.prefill_retire_lag,
+            decode_retire_lag=retirement.decode_retire_lag,
+            eviction_interval=retirement.eviction_interval,
+            checkpoint_interval=self.tree_cache.window_checkpoint_interval(),
+            # Admission cuts a chunk on this alignment, so no smaller chunk runs.
+            chunk_align=self.truncation_align_size,
         )
         if max_new_tokens is None:
             req.set_finish_with_abort(
@@ -4500,6 +4524,8 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        # Requests no memory will ever come back for; aborted after the loop.
+        unschedulable: List[Req] = []
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             # A spent pass budget admits no one, even before the first
@@ -4601,7 +4627,27 @@ class Scheduler(
                         kv_storage_of(
                             self.req_to_token_pool, self.token_to_kv_pool_allocator
                         ).release_state_slot(req)
+                if res == AddReqResult.UNSCHEDULABLE and not added:
+                    # Nothing holding memory will give it back: waiting would
+                    # keep the request queued forever.
+                    unschedulable.append(req)
+                    continue
                 break
+
+        if unschedulable:
+            self.waiting_queue.leave(unschedulable)
+            for req in unschedulable:
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    # As a queued abort: the sender goes before the KV it reads.
+                    self.release_prefill_sender(req, abort_sender=True)
+                self._abort_unavailable(
+                    req,
+                    message=(
+                        "The request cannot be scheduled: it fits the KV memory "
+                        "pool only once memory held elsewhere is freed, and "
+                        "nothing that holds memory will free it."
+                    ),
+                )
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
@@ -4866,7 +4912,7 @@ class Scheduler(
         # The pages freed while the forward ran join the free lists. Every
         # result processor has already synchronized an event recorded behind
         # the step's `forward_done`: its `copy_done`, or on a pipeline stage its
-        # `d2h_event` (see `_pp_make_skip_output_result` for skipped outputs).
+        # `d2h_event` (see `_pp_result_done_event`).
         forward_steps = forward_steps_of(
             getattr(self, "token_to_kv_pool_allocator", None)
         )
@@ -6057,7 +6103,6 @@ class Scheduler(
                 "Hierarchical cache is disabled", page_size=self.page_size
             )
 
-        from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
             MooncakeStore,
         )
@@ -6078,16 +6123,18 @@ class Scheduler(
             )
 
         sidecar_pool_specs = ()
-        window = None
+        window_trailing_pages = {}
         if isinstance(tree_cache, UnifiedRadixCache):
             sidecar_pool_specs = tree_cache.sidecar_pool_specs
-            # By family: a unified window's slot is named by its sub-pool.
-            window = tree_cache.component_of(TREE_WINDOW)
+            window_trailing_pages = {
+                str(window.pool_name): window.full_window_pages
+                for window in (
+                    tree_cache.components[ct] for ct in tree_cache.window_slots()
+                )
+            }
         return storage_backend.describe_l3_object_layout(
             sidecar_pool_specs=sidecar_pool_specs,
-            swa_trailing_pages=(
-                window.full_window_pages if window is not None else None
-            ),
+            window_trailing_pages=window_trailing_pages,
             page_size=self.page_size,
         )
 
@@ -6255,45 +6302,60 @@ class Scheduler(
             self._drain_mlx_pending_jobs()
         # The pause starts once the in-flight result has drained.
         self.pause_state.start_window()
-        self._retract_batch(self.running_batch, self.last_batch)
+        self._retract_batches([(self.running_batch, self.last_batch)])
         self.last_batch = None
         self.cur_batch_for_debug = None
         self._publish_paused_state()
 
-    def _retract_batch(
-        self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+    def _retract_batches(
+        self, batches: List[Tuple[ScheduleBatch, Optional[ScheduleBatch]]]
     ) -> None:
-        """Retract the requests of `running_batch`, of `last_batch` when it is a
-        prefill not merged into it yet, and the chunked request, none of them in
-        flight. PD decode also retracts the waiting requests that hold KV; PD
-        prefill keeps the chunked request and a prefill already handed to transfer."""
-        retract_reqs = [r for r in running_batch.reqs if not r.finished()]
-        if (
-            last_batch is not None
-            and last_batch.forward_mode.is_extend()
-            # A running batch that DP attention converted to extend is
-            # last_batch itself; its requests are already listed above.
-            and last_batch is not running_batch
-            # Skip merge for disagg prefill: completed prefill requests are
-            # already in disagg_prefill_transfer_queue. Merging them into
-            # running_batch leaks them, since the prefill event loop never
-            # calls update_running_batch to clean them up.
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
-            retract_reqs += [r for r in last_batch.reqs if not r.finished()]
+        """Retract every request that holds KV, once for the whole pause; `batches`
+        holds one `(running_batch, last_batch)` pair per PP micro-batch, none in
+        flight. PD prefill keeps the chunked request and a prefill already handed
+        to transfer."""
+        retract_reqs = []
+        for running_batch, last_batch in batches:
+            retract_reqs += [r for r in running_batch.reqs if not r.finished()]
+            if (
+                last_batch is not None
+                and last_batch.forward_mode.is_extend()
+                # A running batch that DP attention converted to extend is
+                # last_batch itself; its requests are already listed above.
+                and last_batch is not running_batch
+                # Skip merge for disagg prefill: completed prefill requests are
+                # already in disagg_prefill_transfer_queue. Merging them into
+                # running_batch leaks them, since the prefill event loop never
+                # calls update_running_batch to clean them up.
+                and self.disaggregation_mode != DisaggregationMode.PREFILL
+            ):
+                retract_reqs += [r for r in last_batch.reqs if not r.finished()]
 
         if (
             self.chunked_req is not None
             and not self.chunked_req.finished()
-            and self.chunked_req not in retract_reqs
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             retract_reqs.append(self.chunked_req)
+
+        if self.hisparse_coordinator is not None:
+            # Only a running loop moves a staged request on; the whole queue, so
+            # TP ranks agree.
+            retract_reqs += self.hisparse_coordinator.ack_staging_queue.take()
+
+        if self.dllm_config is not None:
+            # A dLLM request keeps its row between rounds; a finished one leaves
+            # the lists only at the next schedule, which a paused loop never reaches.
+            self.dllm_manager.filter_finished_reqs()
+            retract_reqs += self.dllm_manager.take(lambda r: r.kv.holds_kv)
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Transferred requests wait for a slot holding their row and KV;
             # retract them too, so their KV is rebuilt under the new weights.
             retract_reqs += self.waiting_queue.take(lambda r: r.kv.holds_kv)
+
+        # The chunked, a staged or a dLLM request may also sit in a batch.
+        retract_reqs = list(dict.fromkeys(retract_reqs))
 
         if self.decode_offload_manager is not None:
             # Pending offload copies may still read the device KV that retraction frees,
@@ -6309,9 +6371,10 @@ class Scheduler(
                 request_retirer=self.request_retirer,
                 offload_kv=False,
             )
-        # Empties the batch through filter_batch so a beam tail goes with the reqs.
-        running_batch.filter_batch(keep_indices=[])
-        # Under PP the other micro-batches keep running.
+        for running_batch, _ in batches:
+            # Empties the batch through filter_batch so a beam tail goes with the reqs.
+            running_batch.filter_batch(keep_indices=[])
+            running_batch.batch_is_full = False
         self.running_reqs.leave(retract_reqs)
         self.prefill_launched_reqs.leave(retract_reqs)
         for req in retract_reqs:
@@ -6323,7 +6386,6 @@ class Scheduler(
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:
                 self._add_request_to_queue(req)
-        running_batch.batch_is_full = False
         # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
         # freeing its KV under a live disagg KV-sender crashes pop_bootstrapped or
         # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.
@@ -6491,6 +6553,10 @@ class Scheduler(
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
+        if self.enable_overlap or get_parallel().pp_size > 1:
+            # The unload zeroes the adapter's pool slot on this stream; a step
+            # launched before this request may still run that adapter.
+            self.schedule_stream.wait_stream(self.forward_stream)
         result = self.tp_worker.unload_lora_adapter(recv_req)
         return result
 
