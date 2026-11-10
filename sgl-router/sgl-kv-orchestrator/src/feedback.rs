@@ -105,12 +105,13 @@ impl Effect {
             storage: true,
         }
     }
-    fn merge(&mut self, other: Self) {
+    pub(super) fn merge(&mut self, other: Self) {
         self.ready |= other.ready;
         self.claims |= other.claims;
         self.storage |= other.storage;
     }
 }
+#[derive(Clone)]
 struct Owner {
     binding: Option<Binding>,
     cursor: Option<Cursor>,
@@ -148,6 +149,25 @@ impl FeedbackCache {
             fact_bytes: 0,
             dropped_facts: 0,
         }
+    }
+    /// Each worker has one in-flight poll. It carries only that worker's
+    /// cursor and fences, with fresh diagnostics merged at completion.
+    pub fn for_worker(&self, url: &str) -> Self {
+        let mut scoped = Self::new(1, self.max_facts, self.max_bytes);
+        if let Some(owner) = self.owners.get(url) {
+            scoped.owners.insert(url.into(), owner.clone());
+        }
+        scoped
+    }
+    pub fn merge_worker(&mut self, other: Self) {
+        self.owners.extend(other.owners);
+        self.dropped_facts = self.dropped_facts.saturating_add(other.dropped_facts);
+        for (fact, _) in other.facts {
+            self.push_fact(fact);
+        }
+    }
+    pub fn forget_worker(&mut self, url: &str) {
+        self.owners.remove(url);
     }
     pub fn bind(&mut self, url: &str, caps: &Capabilities) -> Effect {
         if !self.owners.contains_key(url) && self.owners.len() >= self.max_owners {

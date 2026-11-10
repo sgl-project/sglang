@@ -14,6 +14,7 @@ use crate::{
     target_resolver::{FrozenTarget, Selector},
 };
 use bytes::Bytes;
+use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -61,6 +62,7 @@ enum Message {
         tokens: Option<Vec<u32>>,
         salt: Option<String>,
         worker: String,
+        observed_at: Instant,
     },
 }
 /// Bounded admission handle. Queue pressure drops optional route observations;
@@ -162,6 +164,7 @@ impl Runtime {
             worker: worker.into(),
             tokens: tokens.filter(|t| t.len() <= 65_536).map(<[u32]>::to_vec),
             salt: salt.map(str::to_string),
+            observed_at: Instant::now(),
         });
     }
 }
@@ -271,15 +274,16 @@ fn validate_input(value: &Value) -> Result<(), String> {
     }
     Ok(())
 }
+#[derive(Clone)]
 struct Job {
     id: String,
     url: String,
     caps: Capabilities,
-    prefix: PrefixTarget,
+    prefix: Arc<PrefixTarget>,
     action: String,
-    payload: Value,
+    payload: Arc<Value>,
     context: Value,
-    result: Value,
+    result: Arc<Value>,
     operation_ref: Option<Value>,
     claim_view: Value,
     submitted: bool,
@@ -293,6 +297,7 @@ struct Job {
     cache_watermark: Value,
     ready_end: u64,
     ready_at: Option<Instant>,
+    polls: u64,
 }
 struct Intent {
     fingerprint: String,
@@ -302,6 +307,24 @@ struct Intent {
     expires: Instant,
     released: bool,
 }
+enum WaitFor {
+    Workers(Vec<String>),
+    Jobs(Vec<(String, u64)>),
+}
+
+/// One HTTP transaction at a time per worker. Only its own observation state
+/// travels with the transaction; the actor retains session and job ownership.
+struct WorkerPoll {
+    url: String,
+    client: EngineClient,
+    caller: String,
+    feedback_limit: usize,
+    feedback: FeedbackCache,
+    caps: Option<Capabilities>,
+    effect: Effect,
+    job: Option<Job>,
+}
+
 struct Actor {
     config: OrchestrationConfig,
     client: EngineClient,
@@ -311,8 +334,11 @@ struct Actor {
     book: DemandBook,
     jobs: BTreeMap<String, Job>,
     intents: BTreeMap<DemandId, Intent>,
-    caps: BTreeMap<String, Capabilities>,
-    last_route: BTreeMap<SessionIdentity, String>,
+    caps: BTreeMap<String, Option<Capabilities>>,
+    busy: BTreeMap<String, Option<String>>,
+    polls: FuturesUnordered<BoxFuture<'static, WorkerPoll>>,
+    pending: Vec<(WaitFor, Message)>,
+    last_route: BTreeMap<SessionIdentity, (String, Instant)>,
     tick_cursor: usize,
     events: BTreeMap<DemandId, (String, Value)>,
     feedback: FeedbackCache,
@@ -334,6 +360,9 @@ impl Actor {
             jobs: BTreeMap::new(),
             intents: BTreeMap::new(),
             caps: BTreeMap::new(),
+            busy: BTreeMap::new(),
+            polls: FuturesUnordered::new(),
+            pending: Vec::new(),
             last_route: BTreeMap::new(),
             tick_cursor: 0,
             events: BTreeMap::new(),
@@ -349,19 +378,15 @@ impl Actor {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                message=rx.recv()=>match message {
-                    Some(Message::Api(value,reply))=> { let result=self.api(value).await;let _=reply.send(result); }
-                    Some(Message::Routed { context, tokens, salt, worker }) => {
-                        if let Some(tokens) = tokens {
-                            if let Err(reason) = self.record(context.clone(), tokens, salt, worker.clone()).await {
-                                tracing::debug!(%reason, "KV association unavailable");
-                            }
-                        }
-                        self.changed_route(&context.task(&self.config.caller_id), &worker);
-                    }
-                    None=>break,
+                message = rx.recv() => match message {
+                    Some(message) => self.receive(message),
+                    None => break,
                 },
-                _=tick.tick()=>self.pump().await,
+                Some(poll) = self.polls.next(), if !self.polls.is_empty() => {
+                    self.complete_poll(poll);
+                    self.resume_pending();
+                }
+                _ = tick.tick() => self.pump(),
             }
         }
         // Actor shutdown never fabricates quiescence. Engine leases/deadlines
@@ -372,36 +397,241 @@ impl Actor {
         workers.truncate(self.config.max_workers);
         workers
     }
-    async fn refresh(&mut self, url: &str) -> Result<Capabilities, String> {
-        match self.client.capabilities(url).await {
-            Ok(caps) => {
-                let effect = self.feedback.bind(url, &caps);
-                self.invalidate_feedback(url, effect);
-                if self.caps.get(url).is_some_and(|old| {
-                    old.epoch != caps.epoch
-                        || old.generation != caps.generation
-                        || old.compatibility != caps.compatibility
-                }) {
-                    for job in self.jobs.values_mut().filter(|j| j.url == url) {
-                        job.ready_end = 0;
-                        job.ready_at = None;
+    fn candidates(&self, preferred: Option<&str>) -> Vec<String> {
+        match preferred {
+            Some(url) => (self.workers)()
+                .into_iter()
+                .filter(|worker| worker == url)
+                .collect(),
+            None => self.workers(),
+        }
+    }
+    fn receive(&mut self, message: Message) {
+        if let Message::Api(value, _) = &message {
+            if let Err(reason) = validate_input(value) {
+                if let Message::Api(_, reply) = message {
+                    let _ = reply.send(error("invalid_payload", reason));
+                }
+                return;
+            }
+        }
+        let wait = match &message {
+            Message::Routed {
+                tokens: Some(_),
+                worker,
+                ..
+            } => self.discover(self.candidates(Some(worker))),
+            Message::Api(value, _) => {
+                let kind = value["kind"].as_str().unwrap_or_default();
+                let event = value["event"].as_str().unwrap_or_default();
+                let demand = task(value.get("task").unwrap_or(value), &self.config.caller_id)
+                    .ok()
+                    .zip(
+                        value["message_id"]
+                            .as_str()
+                            .or_else(|| value["event_id"].as_str()),
+                    )
+                    .map(|(task, id)| DemandId {
+                        task,
+                        id: id.into(),
+                    });
+                let intent = demand.as_ref().and_then(|d| self.intents.get(d));
+                if kind == "query" {
+                    intent.map(|intent| {
+                        WaitFor::Jobs(
+                            intent
+                                .jobs
+                                .iter()
+                                .filter_map(|id| {
+                                    self.jobs.get(id).map(|job| (id.clone(), job.polls + 1))
+                                })
+                                .collect(),
+                        )
+                    })
+                } else if intent.is_none()
+                    && (kind == "submit"
+                        || kind == "session_event"
+                            && (matches!(event, "request_observed" | "prepare" | "resume")
+                                || event == "tool_wait" && value["pressure"] == true))
+                {
+                    self.discover(self.candidates(value["worker_url"].as_str()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(wait) = wait {
+            if self.pending.len() >= self.config.queue_capacity {
+                match message {
+                    Message::Api(_, reply) => {
+                        let _ = reply.send(error("capacity", "orchestration wait queue full"));
+                    }
+                    Message::Routed { .. } => {
+                        self.dropped_routes.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                if self.caps.contains_key(url) || self.caps.len() < self.config.max_workers {
-                    self.caps.insert(url.into(), caps.clone());
-                }
-                Ok(caps)
+                return;
             }
-            Err(e) => {
-                let effect = self.feedback.fail(url, "capabilities unavailable");
-                self.invalidate_feedback(url, effect);
-                self.caps.remove(url);
-                for job in self.jobs.values_mut().filter(|j| j.url == url) {
-                    job.ready_end = 0;
-                    job.ready_at = None;
-                }
-                Err(e)
+            if !self.wait_ready(&wait) {
+                self.pending.push((wait, message));
+                return;
             }
+        }
+        self.apply_message(message);
+    }
+    fn discover(&mut self, workers: Vec<String>) -> Option<WaitFor> {
+        if workers
+            .iter()
+            .any(|url| self.caps.get(url).is_some_and(Option::is_some))
+        {
+            return None;
+        }
+        for url in &workers {
+            self.launch_poll(url, None);
+        }
+        Some(WaitFor::Workers(workers))
+    }
+    fn wait_ready(&mut self, wait: &WaitFor) -> bool {
+        match wait {
+            WaitFor::Workers(workers) => {
+                workers
+                    .iter()
+                    .any(|url| self.caps.get(url).is_some_and(Option::is_some))
+                    || workers.iter().all(|url| !self.busy.contains_key(url))
+            }
+            WaitFor::Jobs(jobs) => {
+                let mut ready = true;
+                for (id, target) in jobs {
+                    if self.jobs.get(id).is_some_and(|job| job.polls < *target) {
+                        self.request_poll(id);
+                        ready &= self.jobs.get(id).is_none_or(|job| job.polls >= *target);
+                    }
+                }
+                ready
+            }
+        }
+    }
+    fn resume_pending(&mut self) {
+        for (wait, message) in std::mem::take(&mut self.pending) {
+            if matches!(&message, Message::Api(_, reply) if reply.is_closed()) {
+                continue;
+            }
+            if self.wait_ready(&wait) {
+                self.apply_message(message);
+            } else {
+                self.pending.push((wait, message));
+            }
+        }
+    }
+    fn apply_message(&mut self, message: Message) {
+        match message {
+            Message::Api(value, reply) => {
+                let _ = reply.send(self.api(value));
+            }
+            Message::Routed {
+                context,
+                tokens,
+                salt,
+                worker,
+                observed_at,
+            } => {
+                let task = context.task(&self.config.caller_id);
+                if let Some(tokens) = tokens {
+                    if let Err(reason) = self.record(context, tokens, salt, &worker) {
+                        tracing::debug!(%reason, "KV association unavailable");
+                    }
+                }
+                self.changed_route(&task, &worker, observed_at);
+            }
+        }
+    }
+    fn launch_poll(&mut self, url: &str, job: Option<Job>) {
+        if self.busy.contains_key(url) {
+            return;
+        }
+        if !self.caps.contains_key(url) && self.caps.len() == self.config.max_workers {
+            let Some(idle) = self
+                .caps
+                .keys()
+                .find(|other| {
+                    !self.busy.contains_key(*other) && !self.jobs.values().any(|j| &j.url == *other)
+                })
+                .cloned()
+            else {
+                return;
+            };
+            self.caps.remove(&idle);
+            self.feedback.forget_worker(&idle);
+        }
+        let caps = self.caps.entry(url.into()).or_default().clone();
+        let mut poll = WorkerPoll {
+            url: url.into(),
+            client: self.client.clone(),
+            caller: self.config.caller_id.clone(),
+            feedback_limit: self.config.queue_capacity.clamp(1, 256),
+            feedback: self.feedback.for_worker(url),
+            caps,
+            effect: Effect::default(),
+            job: None,
+        };
+        let cancel = job
+            .as_ref()
+            .is_some_and(|j| self.book.job(&j.id).is_some_and(|b| b.cancel_requested));
+        let shared_pin = cancel
+            && job.as_ref().is_some_and(|j| {
+                j.action == "sglang.pin" && j.quiescent && self.shares_live_claim(j)
+            });
+        self.busy
+            .insert(url.into(), job.as_ref().map(|j| j.id.clone()));
+        self.polls.push(Box::pin(async move {
+            if let Some(mut job) = job {
+                if !shared_pin {
+                    if let Err(reason) = poll.advance(&mut job, cancel).await {
+                        job.last_error = Some(reason);
+                        job.ready_end = 0;
+                        job.ready_at = None;
+                        job.claim_view = Value::Null;
+                    }
+                }
+                job.polls += 1;
+                poll.job = Some(job);
+            } else if let Ok(caps) = poll.refresh().await {
+                let url = poll.url.clone();
+                let _ = poll.poll_feedback(&url, &caps).await;
+            }
+            poll
+        }));
+    }
+    fn request_poll(&mut self, id: &str) {
+        let Some(job) = self.jobs.get_mut(id) else {
+            return;
+        };
+        if self.busy.contains_key(&job.url) {
+            return;
+        }
+        if !(self.workers)().contains(&job.url) {
+            job.polls += 1;
+            job.ready_end = 0;
+            job.ready_at = None;
+            job.claim_view = Value::Null;
+            job.last_error = Some("worker unavailable".into());
+            return;
+        }
+        let job = job.clone();
+        let url = job.url.clone();
+        self.launch_poll(&url, Some(job));
+    }
+    fn complete_poll(&mut self, poll: WorkerPoll) {
+        self.busy.remove(&poll.url);
+        self.feedback.merge_worker(poll.feedback);
+        self.invalidate_feedback(&poll.url, poll.effect);
+        self.caps.insert(poll.url, poll.caps);
+        if let Some(job) = poll.job {
+            if job.quiescent {
+                let _ = self.book.mark_quiescent(&job.id);
+            }
+            self.jobs.insert(job.id.clone(), job);
         }
     }
     fn invalidate_feedback(&mut self, url: &str, effect: Effect) {
@@ -415,51 +645,49 @@ impl Actor {
             }
         }
     }
-    async fn poll_feedback(&mut self, url: &str, caps: &Capabilities) -> Result<(), String> {
-        let limit = self.config.queue_capacity.min(256).max(1);
-        let request = self
-            .feedback
-            .command(url, caps.context(&self.config.caller_id), limit);
-        let result = match request {
-            Ok(None) => return Ok(()),
-            Ok(Some(command)) => match self.client.command(url, &command).await {
-                Ok(page) => self
-                    .feedback
-                    .apply(url, &self.config.caller_id, &page, limit),
-                Err(reason) => Err(reason),
-            },
-            Err(reason) => Err(reason),
-        };
-        match result {
-            Ok(effect) => {
-                self.invalidate_feedback(url, effect);
-                Ok(())
-            }
-            Err(reason) => {
-                let effect = self.feedback.fail(url, &reason);
-                self.invalidate_feedback(url, effect);
-                Err(reason)
-            }
-        }
+    fn shares_live_claim(&self, job: &Job) -> bool {
+        self.jobs.values().any(|other| {
+            other.id != job.id
+                && other.url == job.url
+                && other.action == "sglang.pin"
+                && other.payload["claim_id"] == job.payload["claim_id"]
+                && self
+                    .book
+                    .job(&other.id)
+                    .is_some_and(|b| !b.interests.is_empty())
+        })
     }
-    async fn record(
+    fn drained(&self, job: &Job) -> bool {
+        self.busy.get(&job.url).and_then(Option::as_ref) != Some(&job.id)
+            && job.quiescent
+            && (job.action != "sglang.pin"
+                || !job.attempted
+                || !self.book.job(&job.id).is_some_and(|b| b.cancel_requested)
+                || matches!(
+                    job.claim_view["state"].as_str(),
+                    Some("released" | "expired" | "invalidated")
+                )
+                || self.shares_live_claim(job))
+    }
+    fn record(
         &mut self,
         context: KvContext,
         tokens: Vec<u32>,
         salt: Option<String>,
-        worker: String,
+        worker: &str,
     ) -> Result<(), String> {
-        if !self.workers().iter().any(|w| *w == worker) {
-            return Err("worker unavailable".into());
-        }
-        let caps = self.refresh(&worker).await?;
+        let caps = self
+            .caps
+            .get(worker)
+            .and_then(Option::as_ref)
+            .ok_or("worker capabilities unknown")?;
         let task = context.task(&self.config.caller_id);
         if self.index.session_revision(&task).is_none() {
             self.index
                 .start_session(task.clone(), None)
                 .map_err(|e| format!("{e:?}"))?;
         }
-        let mut compatibility = caps.compatibility;
+        let mut compatibility = caps.compatibility.clone();
         compatibility.cache_salt = salt;
         let page = compatibility.page_size as usize;
         let end = tokens.len() / page * page;
@@ -501,11 +729,17 @@ impl Actor {
             .map_err(|e| format!("{e:?}"))?;
         Ok(())
     }
-    fn changed_route(&mut self, task: &SessionIdentity, worker: &str) {
-        if self.index.session_revision(task).is_none() {
+    fn changed_route(&mut self, task: &SessionIdentity, worker: &str, observed_at: Instant) {
+        if self.index.session_revision(task).is_none()
+            || self
+                .last_route
+                .get(task)
+                .is_some_and(|(_, at)| *at > observed_at)
+        {
             return;
         }
-        self.last_route.insert(task.clone(), worker.into());
+        self.last_route
+            .insert(task.clone(), (worker.into(), observed_at));
         // Only this task's useless preparation interests are withdrawn. Shared
         // jobs and other tasks remain. Ordinary cache stays under Engine lifetime.
         let ids: Vec<_> = self
@@ -591,10 +825,7 @@ impl Actor {
         };
         Ok(self.index.resolve(selector))
     }
-    async fn api(&mut self, value: Value) -> Value {
-        if let Err(reason) = validate_input(&value) {
-            return error("invalid_payload", reason);
-        }
+    fn api(&mut self, value: Value) -> Value {
         let event_key = if value["kind"] == "session_event" {
             task(value.get("task").unwrap_or(&value), &self.config.caller_id)
                 .ok()
@@ -629,7 +860,7 @@ impl Actor {
                 return error("conflict", "stale lifecycle revision");
             }
         }
-        let result = match self.apply(value.clone()).await {
+        let result = match self.apply(value.clone()) {
             Ok(data) => ok(data),
             Err(e) => error(
                 if e.to_lowercase().contains("capacity") {
@@ -655,7 +886,7 @@ impl Actor {
         }
         result
     }
-    async fn apply(&mut self, value: Value) -> Result<Value, String> {
+    fn apply(&mut self, value: Value) -> Result<Value, String> {
         let kind = value["kind"].as_str().ok_or("kind required")?;
         if kind == "feedback" {
             return Ok(self.feedback.view());
@@ -686,14 +917,8 @@ impl Actor {
         };
         match kind {
             "query" => {
-                let jobs = self
-                    .intents
-                    .get(&demand)
-                    .ok_or("unknown intent")?
-                    .jobs
-                    .clone();
-                for id in jobs {
-                    self.poll_job(&id).await;
+                if !self.intents.contains_key(&demand) {
+                    return Err("unknown intent".into());
                 }
                 Ok(self.intent_view(&demand))
             }
@@ -721,12 +946,9 @@ impl Actor {
                     return Err("cancel or release the PIN intent before acknowledging".into());
                 }
                 self.release(&demand);
-                for id in &ids {
-                    self.poll_job(id).await;
-                }
                 if ids
                     .iter()
-                    .any(|id| self.jobs.get(id).is_some_and(|j| !j.quiescent))
+                    .any(|id| self.jobs.get(id).is_some_and(|j| !self.drained(j)))
                 {
                     return Err("operation/claim not quiescent".into());
                 }
@@ -807,10 +1029,9 @@ impl Actor {
                             context,
                             tokens,
                             value["cache_salt"].as_str().map(str::to_string),
-                            worker.into(),
-                        )
-                        .await?;
-                        self.changed_route(&task, worker);
+                            worker,
+                        )?;
+                        self.changed_route(&task, worker, Instant::now());
                         Ok(json!({"state":"associated","residency":"unknown"}))
                     }
                     "request_finished" => {
@@ -846,16 +1067,16 @@ impl Actor {
                         command["action"] = json!(action);
                         command["source"] = json!({"tier":source});
                         command["destination"] = json!({"tier":destination});
-                        self.submit(command, task, demand).await
+                        self.submit(command, task, demand)
                     }
                     _ => Err("unsupported lifecycle signal".into()),
                 }
             }
-            "submit" => self.submit(value, task, demand).await,
+            "submit" => self.submit(value, task, demand),
             _ => Err("unsupported Router control kind".into()),
         }
     }
-    async fn submit(
+    fn submit(
         &mut self,
         value: Value,
         task: SessionIdentity,
@@ -911,21 +1132,19 @@ impl Actor {
         if action == "sglang.pin" && pin_tier != "host" {
             return Err("only host PIN is supported".into());
         }
-        let mut workers = self.workers();
-        if let Some(url) = value["worker_url"].as_str() {
-            workers.retain(|w| w == url);
-        }
+        let mut workers = self.candidates(value["worker_url"].as_str());
         // A read-only affinity preference. No policy.select, load guard, pending
         // stake or session-affinity commit is used for preparation placement.
-        if let Some(preferred) = self.last_route.get(&task) {
+        if let Some((preferred, _)) = self.last_route.get(&task) {
             workers.sort_by_key(|url| url != preferred);
         }
-        let mut available = Vec::new();
-        for url in workers {
-            if let Ok(caps) = self.refresh(&url).await {
-                available.push((url, caps));
-            }
-        }
+        let available: Vec<_> = workers
+            .into_iter()
+            .filter_map(|url| {
+                let caps = self.caps.get(&url).and_then(Option::as_ref)?;
+                Some((url, caps))
+            })
+            .collect();
         let mut expires = Instant::now()
             + Duration::from_millis(
                 value["ttl_ms"]
@@ -1008,12 +1227,12 @@ impl Actor {
                     Job {
                         id: id.clone(),
                         url: url.clone(),
-                        caps: caps.clone(),
-                        prefix,
+                        caps: (*caps).clone(),
+                        prefix: Arc::new(prefix),
                         action: action.into(),
-                        payload,
+                        payload: Arc::new(payload),
                         context: caps.context(&self.config.caller_id),
-                        result: Value::Null,
+                        result: Arc::new(Value::Null),
                         operation_ref: None,
                         claim_view: Value::Null,
                         submitted: false,
@@ -1027,6 +1246,7 @@ impl Actor {
                         cache_watermark: Value::Null,
                         ready_end: 0,
                         ready_at: None,
+                        polls: 0,
                     },
                 );
             }
@@ -1108,12 +1328,12 @@ impl Actor {
             "missing_scope":intent.frozen.missing_scope().iter().map(|s|format!("{s:?}")).collect::<Vec<_>>(),
             "materialization_required":intent.frozen.materialization_required().iter().map(|s|format!("{s:?}")).collect::<Vec<_>>(),
             "admission_gaps":intent.admission_gaps,
-            "released":intent.released,"quiescent":intent.jobs.iter().all(|id|self.jobs.get(id).is_none_or(|j|j.quiescent)),
+            "released":intent.released,"quiescent":intent.jobs.iter().all(|id|self.jobs.get(id).is_none_or(|j|self.drained(j))),
             "operations":intent.jobs.iter().filter_map(|id|self.jobs.get(id)).map(|j|json!({"child_id":j.id,"worker_url":j.url,"engine_id":j.caps.engine_id,"owner_epoch":j.caps.epoch,
-                "action":j.action,"result":j.result,"cache_watermark":j.cache_watermark,"observation_age_ms":j.ready_at.map(|at|at.elapsed().as_millis()),"claim":j.claim_view,"error":j.last_error,"quiescent":j.quiescent,"cancel_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested),
+                "action":j.action,"result":j.result.as_ref(),"cache_watermark":j.cache_watermark,"observation_age_ms":j.ready_at.map(|at|at.elapsed().as_millis()),"claim":j.claim_view,"error":j.last_error,"quiescent":self.drained(j),"cancel_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested),
                 "ready_scope":if !intent.released && self.feedback.current(&j.url,&j.cache_watermark) && j.ready_at.is_some_and(|at|now.duration_since(at)<Duration::from_millis(self.config.poll_ms*2)) && j.ready_end>0 {json!({"start_token":0,"end_token":j.ready_end,"tier":j.payload["destination"]["tier"],"provenance":"engine_scoped_query"})}else{Value::Null}})).collect::<Vec<_>>()})
     }
-    async fn pump(&mut self) {
+    fn pump(&mut self) {
         let now = Instant::now();
         let expired: Vec<_> = self
             .intents
@@ -1125,43 +1345,70 @@ impl Actor {
             self.release(&d);
         }
         self.tick_cursor = self.tick_cursor.wrapping_add(1);
-        let healthy: BTreeSet<_> = self.workers().into_iter().collect();
-        self.caps.retain(|url, _| healthy.contains(url));
-        for job in self.jobs.values_mut().filter(|j| !healthy.contains(&j.url)) {
-            job.ready_end = 0;
-            job.ready_at = None;
-            job.last_error = Some("worker unavailable".into());
+        self.resume_pending();
+        let ids: Vec<_> = self.jobs.keys().cloned().collect();
+        let offset = self.tick_cursor % ids.len().max(1);
+        for id in ids[offset..].iter().chain(&ids[..offset]) {
+            self.request_poll(id);
         }
         let candidates = self.workers();
         if let Some(worker) = candidates.get(self.tick_cursor % candidates.len().max(1)) {
-            if let Ok(caps) = self.refresh(worker).await {
-                let _ = self.poll_feedback(worker, &caps).await;
+            self.launch_poll(worker, None);
+        }
+    }
+}
+
+impl WorkerPoll {
+    async fn refresh(&mut self) -> Result<Capabilities, String> {
+        match self.client.capabilities(&self.url).await {
+            Ok(caps) => {
+                self.effect.merge(self.feedback.bind(&self.url, &caps));
+                if self.caps.as_ref().is_some_and(|old| {
+                    old.epoch != caps.epoch
+                        || old.generation != caps.generation
+                        || old.compatibility != caps.compatibility
+                }) {
+                    self.effect.ready = true;
+                    self.effect.claims = true;
+                }
+                self.caps = Some(caps.clone());
+                Ok(caps)
+            }
+            Err(reason) => {
+                self.effect
+                    .merge(self.feedback.fail(&self.url, "capabilities unavailable"));
+                self.caps = None;
+                Err(reason)
             }
         }
-        let ids: Vec<_> = self.jobs.keys().cloned().collect();
-        if !ids.is_empty() {
-            let id = ids[self.tick_cursor % ids.len()].clone();
-            self.poll_job(&id).await;
-        }
     }
-    async fn poll_job(&mut self, id: &str) {
-        let Some(mut job) = self.jobs.remove(id) else {
-            return;
+
+    async fn poll_feedback(&mut self, url: &str, caps: &Capabilities) -> Result<(), String> {
+        let limit = self.feedback_limit;
+        let request = self
+            .feedback
+            .command(url, caps.context(&self.caller), limit);
+        let result = match request {
+            Ok(None) => return Ok(()),
+            Ok(Some(command)) => match self.client.command(url, &command).await {
+                Ok(page) => self.feedback.apply(url, &self.caller, &page, limit),
+                Err(reason) => Err(reason),
+            },
+            Err(reason) => Err(reason),
         };
-        let result = self.advance(&mut job).await;
-        if let Err(e) = result {
-            job.last_error = Some(e);
-            job.ready_end = 0;
-            job.ready_at = None;
-            job.claim_view = Value::Null;
+        match result {
+            Ok(effect) => {
+                self.effect.merge(effect);
+                Ok(())
+            }
+            Err(reason) => {
+                let effect = self.feedback.fail(url, &reason);
+                self.effect.merge(effect);
+                Err(reason)
+            }
         }
-        if job.quiescent {
-            let _ = self.book.mark_quiescent(id);
-        }
-        self.jobs.insert(id.into(), job);
     }
-    async fn advance(&mut self, job: &mut Job) -> Result<(), String> {
-        let cancel = self.book.job(&job.id).is_some_and(|b| b.cancel_requested);
+    async fn advance(&mut self, job: &mut Job, cancel: bool) -> Result<(), String> {
         if !job.submitted && !job.attempted && cancel {
             job.quiescent = true;
             return Ok(());
@@ -1172,17 +1419,6 @@ impl Actor {
             && job.quiescent
             && !job.releasing_pin
         {
-            if self.jobs.values().any(|other| {
-                other.url == job.url
-                    && other.action == "sglang.pin"
-                    && other.payload["claim_id"] == job.payload["claim_id"]
-                    && self
-                        .book
-                        .job(&other.id)
-                        .is_some_and(|interest| !interest.interests.is_empty())
-            }) {
-                return Ok(());
-            }
             let current = self.client.command(&job.url, &json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?;
             if matches!(
                 current["state"].as_str(),
@@ -1191,23 +1427,21 @@ impl Actor {
                 job.claim_view = current;
                 return Ok(());
             }
-            job.payload["mode"] = json!("release");
-            job.payload["revision"] = json!(current["revision"]
+            let payload = Arc::make_mut(&mut job.payload);
+            payload["mode"] = json!("release");
+            payload["revision"] = json!(current["revision"]
                 .as_u64()
                 .ok_or("claim revision absent")?
                 .saturating_add(1));
-            job.payload["ttl_seconds"] = Value::Null;
+            payload["ttl_seconds"] = Value::Null;
             job.message_id = format!("{}-release", job.id);
             job.submitted = false;
             job.attempted = false;
             job.quiescent = false;
             job.releasing_pin = true;
-            job.result = Value::Null;
+            job.result = Arc::new(Value::Null);
         }
-        if !self.workers().iter().any(|w| *w == job.url) {
-            return Err("worker unavailable".into());
-        }
-        let live = self.refresh(&job.url).await?;
+        let live = self.refresh().await?;
         if live.epoch != job.caps.epoch || live.compatibility != job.caps.compatibility {
             return Err(
                 "owner epoch/compatibility changed; reconcile old operation separately".into(),
@@ -1224,7 +1458,7 @@ impl Actor {
             // envelope/context. Never make a new physical attempt implicitly.
             job.attempted = true;
             let reply=self.client.command(&job.url,&json!({"kind":"submit","context":job.context,"envelope":{"protocol_version":"0.1","message_id":job.message_id,
-                "actions":[{"action_id":"transfer","action_type":job.action,"action_version":"1.0","payload":job.payload}]}})).await?;
+                "actions":[{"action_id":"transfer","action_type":job.action,"action_version":"1.0","payload":job.payload.as_ref()}]}})).await?;
             job.submitted = true;
             self.update_result(job, reply)?;
         }
@@ -1270,13 +1504,13 @@ impl Actor {
             let ticket = self.feedback.ticket(&job.url)?;
             let snapshot = self
                 .client
-                .residency(&job.url, &live, &self.config.caller_id, &job.prefix, tier)
+                .residency(&job.url, &live, &self.caller, &job.prefix, tier)
                 .await?;
             self.poll_feedback(&job.url, &live).await?;
             let effect =
                 self.feedback
                     .accept_query(&job.url, &ticket, &snapshot["cache_watermark"])?;
-            self.invalidate_feedback(&job.url, effect);
+            self.effect.merge(effect);
             job.cache_watermark = snapshot
                 .get("cache_watermark")
                 .cloned()
@@ -1305,7 +1539,7 @@ impl Actor {
         }
         job.operation_ref = Some(result["ref"].clone());
         job.quiescent = result["update"]["quiescent"].as_bool().unwrap_or(false);
-        job.result = result.clone();
+        job.result = Arc::new(result.clone());
         Ok(())
     }
 }

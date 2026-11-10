@@ -56,6 +56,7 @@ struct EngineState {
     feedback_events: Vec<Value>,
     residency_override: Option<Value>,
     delayed_query: Option<Arc<DelayedQuery>>,
+    delayed_capabilities: Option<Arc<DelayedQuery>>,
 }
 #[derive(Default)]
 struct DelayedQuery {
@@ -81,6 +82,11 @@ impl Drop for Engine {
     }
 }
 async fn capabilities(State(state): State<Arc<Mutex<EngineState>>>) -> Json<Value> {
+    let delayed = state.lock().unwrap().delayed_capabilities.take();
+    if let Some(delayed) = delayed {
+        delayed.started.notify_one();
+        delayed.release.notified().await;
+    }
     let s = state.lock().unwrap();
     let mut reply = json!({"success":true,"data":{"engine_id":"mock-engine","engine_epoch":s.epoch,"namespace":"weights-v1",
         "cache_salt_encoding":"owner_assertion","executor":{"cache_generation":1},"public_protocol":{"actions":{"sglang.prefetch":["1.0"],"sglang.demote":["1.0"],"sglang.pin":["1.0"]},
@@ -439,6 +445,117 @@ async fn lifecycle_prefetch_reports_readiness_without_overriding_worker_selectio
         assert!(commands
             .iter()
             .any(|c| c["kind"] == "residency" && c["target"]["kind"] == "tokens"));
+    }
+}
+
+#[tokio::test]
+async fn slow_worker_control_does_not_delay_another_worker_or_inference() {
+    for reorg in [false, true] {
+        let slow = Engine::start().await;
+        let fast = Engine::start().await;
+        let discovery = Arc::new(DelayedQuery::default());
+        slow.state.lock().unwrap().delayed_capabilities = Some(discovery.clone());
+        let router = router_with(
+            &[&slow, &fast],
+            reorg,
+            Some(OrchestrationConfig {
+                queue_capacity: 2,
+                rpc_timeout_ms: 8_000,
+                ..orchestration()
+            }),
+        )
+        .await;
+        start(&router, "slow").await;
+        start(&router, "fast").await;
+        let endpoint = format!("{}/v1/kv/control", router.url);
+        let slow_url = slow.url.clone();
+        let request = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(endpoint)
+                .bearer_auth("test-control")
+                .json(
+                    &json!({"kind":"submit","task":task("slow"),"message_id":"prepare",
+                    "action":"sglang.prefetch","target":prefix(vec![1,2,3,4]),"worker_url":slow_url,
+                    "source":{"tier":"storage"},"destination":{"tier":"host"}}),
+                )
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(2), discovery.started.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            submit(&router, "fast", "prepare", prefix(vec![1, 2, 3, 4]), &fast).await;
+            assert_eq!(
+                ready(&router, "fast", "prepare").await["operations"][0]["ready_scope"]
+                    ["end_token"],
+                4
+            );
+            let hashes = compute_block_hashes(&[1, 2, 3, 4], 1);
+            router
+                .tree
+                .insert(&KvWorkerId::new(fast.url.clone(), 0), None, &hashes);
+            let response = reqwest::Client::new()
+                .post(format!("{}/generate", router.url))
+                .json(&json!({"input_ids":[1,2,3,4]}))
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            assert_eq!(response.headers()["x-sgl-worker-url"], fast.url);
+            event(&router, "fast", "task_finished", 1, "finish").await;
+        })
+        .await
+        .expect("fast worker and inference must finish while slow discovery waits");
+        assert!(!request.is_finished());
+        discovery.release.notify_one();
+        assert_eq!(
+            request.await.unwrap()["data"]["operations"][0]["worker_url"],
+            slow.url
+        );
+
+        let query_gate = Arc::new(DelayedQuery::default());
+        slow.state.lock().unwrap().delayed_query = Some(query_gate.clone());
+        let query = query(&router, "slow", "prepare");
+        let other = async {
+            tokio::time::timeout(Duration::from_secs(2), query_gate.started.notified())
+                .await
+                .unwrap();
+            let view = tokio::time::timeout(Duration::from_secs(2), async {
+                start(&router, "another").await;
+                submit(
+                    &router,
+                    "another",
+                    "other-prepare",
+                    prefix(vec![4, 5, 6, 7]),
+                    &fast,
+                )
+                .await;
+                ready(&router, "another", "other-prepare").await
+            })
+            .await
+            .expect("fast control must complete during a slow residency query");
+            assert_eq!(view["operations"][0]["worker_url"], fast.url);
+            let mut competing = tokio::task::JoinSet::new();
+            let client = reqwest::Client::new();
+            for _ in 0..4 {
+                let request = client
+                    .post(format!("{}/v1/kv/control", router.url))
+                    .bearer_auth("test-control")
+                    .json(&json!({"kind":"query","task":task("slow"),"message_id":"prepare"}));
+                competing.spawn(async move { request.send().await.unwrap().status() });
+            }
+            let rejected = tokio::time::timeout(Duration::from_secs(2), competing.join_next())
+                .await
+                .expect("full queue must reject without waiting for the slow RPC");
+            assert_eq!(rejected.unwrap().unwrap(), 429);
+            query_gate.release.notify_one();
+        };
+        tokio::join!(query, other);
     }
 }
 
