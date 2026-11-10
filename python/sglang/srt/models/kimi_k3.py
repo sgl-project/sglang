@@ -4033,6 +4033,16 @@ class KimiK3ForConditionalGeneration(nn.Module):
             use_gpu_preprocessing=use_gpu_preprocessing,
         )
 
+    def get_image_dp_group(self):
+        parallel = get_parallel()
+        if (
+            self.use_data_parallel
+            and parallel.attn_cp_size > 1
+            and parallel.attn_dp_size == 1
+        ):
+            return parallel.tp_group
+        return None
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
@@ -4183,14 +4193,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if self.use_data_parallel:
             from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 
-            parallel = get_parallel()
-            # Before token sharding, CP peers own the same images. Share ViT
-            # work across them without changing the language-model TP groups.
-            vision_dp_group = (
-                parallel.tp_group
-                if parallel.attn_cp_size > 1 and parallel.attn_dp_size == 1
-                else None
-            )
+            vision_dp_group = self.get_image_dp_group()
             image_embeds = run_dp_sharded_mrope_vision_model(
                 self.vision_tower,
                 None,

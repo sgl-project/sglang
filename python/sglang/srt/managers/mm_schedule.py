@@ -2,6 +2,7 @@
 
 import logging
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -10,6 +11,10 @@ import torch
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
+from sglang.srt.multimodal.image_dp_consensus import (
+    image_dp_coordinator,
+    image_dp_group,
+)
 from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
 from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
@@ -337,19 +342,28 @@ def _get_chunked_embedding_full(
             )
             embedding_per_req = None
 
+    coordinator = image_dp_coordinator(data_embedding_func)
+    if coordinator is not None:
+        descriptor = ("full", tuple(item_hashes), tuple(items_offset))
+        if coordinator.reconcile((descriptor,), [embedding_per_req is None])[0]:
+            if embedding_per_req is not None:
+                embedding_cache.free(embedding_items_hash, None)
+            embedding_per_req = None
+
     if embedding_per_req is None:
-        _move_items_to_device(embedding_items_per_req, device, data_embedding_func)
-        embedding = data_embedding_func(embedding_items_per_req)
-        if isinstance(embedding, list):
-            # This path caches the combined per-request embedding, so the
-            # per-item form is flattened here.
-            embedding = _flatten_embedding_result(embedding)
-        embedding_per_req = (
-            EmbeddingResult(embedding=embedding)
-            if isinstance(embedding, torch.Tensor)
-            else embedding
-        )
-        embedding_cache.set(embedding_items_hash, embedding_per_req)
+        with coordinator.encoding() if coordinator is not None else nullcontext():
+            _move_items_to_device(embedding_items_per_req, device, data_embedding_func)
+            embedding = data_embedding_func(embedding_items_per_req)
+            if isinstance(embedding, list):
+                # This path caches the combined per-request embedding, so the
+                # per-item form is flattened here.
+                embedding = _flatten_embedding_result(embedding)
+            embedding_per_req = (
+                EmbeddingResult(embedding=embedding)
+                if isinstance(embedding, torch.Tensor)
+                else embedding
+            )
+            embedding_cache.set(embedding_items_hash, embedding_per_req)
 
     # cache hits keep raw-input leases until request cleanup for eviction/re-prefill
 
@@ -405,6 +419,9 @@ def _batch_encode_per_image_misses(
     hash_to_embedding: Dict[Tuple[bytes, int], torch.Tensor] = {}
 
     prefetched = _prefetched_source(data_embedding_func)
+    coordinator = image_dp_coordinator(data_embedding_func)
+    all_items = {}
+
     # Phase 1a: find overlapping items per request and collect cache misses
     for req_info in per_image_requests:
         chunk_start = req_info.extend_prefix_len
@@ -419,6 +436,8 @@ def _batch_encode_per_image_misses(
 
         for _idx, item, expected_token_count in overlapping:
             cache_key = (item.cache_key, expected_token_count)
+            if coordinator is not None:
+                all_items.setdefault(cache_key, (item, expected_token_count))
             if cache_key in hash_to_embedding:
                 continue
             if prefetched is not None:
@@ -446,39 +465,50 @@ def _batch_encode_per_image_misses(
                     item.model_specific_data[BORROW_CUDA_IPC_FEATURE_KEY] = True
                 unique_misses[cache_key] = (item, expected_token_count)
 
+    if coordinator is not None:
+        keys = tuple(all_items)
+        missing = coordinator.reconcile(keys, [key in unique_misses for key in keys])
+        unique_misses = {
+            key: all_items[key] for key, miss in zip(keys, missing) if miss
+        }
+        for key in unique_misses:
+            if hash_to_embedding.pop(key, None) is not None:
+                embedding_cache.free(key[0], None)
+
     # Phase 1b: single ViT call for all unique cache misses
     if unique_misses:
-        ordered_cache_keys = list(unique_misses.keys())
-        miss_items = [unique_misses[key][0] for key in ordered_cache_keys]
-        token_counts = [unique_misses[key][1] for key in ordered_cache_keys]
+        with coordinator.encoding() if coordinator is not None else nullcontext():
+            ordered_cache_keys = list(unique_misses.keys())
+            miss_items = [unique_misses[key][0] for key in ordered_cache_keys]
+            token_counts = [unique_misses[key][1] for key in ordered_cache_keys]
 
-        _move_items_to_device(miss_items, device, data_embedding_func)
-        all_miss_embedding = data_embedding_func(miss_items)
+            _move_items_to_device(miss_items, device, data_embedding_func)
+            all_miss_embedding = data_embedding_func(miss_items)
 
-        if isinstance(all_miss_embedding, list):
-            # Per-item embeddings: no split needed, and each cache entry owns
-            # its storage (a torch.split view would pin the whole concatenated
-            # buffer for as long as any single item stays cached). Mirrors
-            # _get_chunked_embedding_by_item.
-            assert len(all_miss_embedding) == len(miss_items), (
-                f"per-item embedding count {len(all_miss_embedding)} != "
-                f"cache-miss item count {len(miss_items)}"
-            )
-            split_embeddings = [
-                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
-            ]
-        else:
-            all_miss_embedding = all_miss_embedding.reshape(
-                -1, all_miss_embedding.shape[-1]
-            )
-            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
-        for cache_key, emb in zip(ordered_cache_keys, split_embeddings):
-            if embedding_cache.set(cache_key[0], EmbeddingResult(embedding=emb)):
-                cached = embedding_cache.get_single(cache_key[0])
-                if _embedding_token_count(cached.embedding) == cache_key[1]:
-                    emb = cached.embedding
-            # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
-            hash_to_embedding[cache_key] = emb
+            if isinstance(all_miss_embedding, list):
+                # Per-item embeddings: no split needed, and each cache entry owns
+                # its storage (a torch.split view would pin the whole concatenated
+                # buffer for as long as any single item stays cached). Mirrors
+                # _get_chunked_embedding_by_item.
+                assert len(all_miss_embedding) == len(miss_items), (
+                    f"per-item embedding count {len(all_miss_embedding)} != "
+                    f"cache-miss item count {len(miss_items)}"
+                )
+                split_embeddings = [
+                    emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
+                ]
+            else:
+                all_miss_embedding = all_miss_embedding.reshape(
+                    -1, all_miss_embedding.shape[-1]
+                )
+                split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+            for cache_key, emb in zip(ordered_cache_keys, split_embeddings):
+                if embedding_cache.set(cache_key[0], EmbeddingResult(embedding=emb)):
+                    cached = embedding_cache.get_single(cache_key[0])
+                    if _embedding_token_count(cached.embedding) == cache_key[1]:
+                        emb = cached.embedding
+                # Keep a local ref (no extra GPU memory) so assembly never fails due to LRU eviction.
+                hash_to_embedding[cache_key] = emb
 
     return hash_to_embedding
 
@@ -532,36 +562,52 @@ def _get_chunked_embedding_by_item(
         else:
             miss_items.append((idx, item, expected_token_count))
 
+    coordinator = image_dp_coordinator(data_embedding_func)
+    if coordinator is not None:
+        keys = tuple(
+            (item.cache_key, count, index) for index, item, count in overlapping
+        )
+        missing = coordinator.reconcile(
+            keys, [index not in cached_embeddings for index, _, _ in overlapping]
+        )
+        miss_items = [entry for entry, miss in zip(overlapping, missing) if miss]
+        for index, item, _ in miss_items:
+            if cached_embeddings.pop(index, None) is not None:
+                embedding_cache.free(item.cache_key, None)
+
     if miss_items:
-        miss_item_list = [item for _, item, _ in miss_items]
-        _move_items_to_device(miss_item_list, device, data_embedding_func)
-        all_miss_embedding = data_embedding_func(miss_item_list)
+        with coordinator.encoding() if coordinator is not None else nullcontext():
+            miss_item_list = [item for _, item, _ in miss_items]
+            _move_items_to_device(miss_item_list, device, data_embedding_func)
+            all_miss_embedding = data_embedding_func(miss_item_list)
 
-        if isinstance(all_miss_embedding, list):
-            # Per-item embeddings: no split needed, and each cache entry owns
-            # its storage (a torch.split view would pin the whole concatenated
-            # buffer for as long as any single item stays cached).
-            assert len(all_miss_embedding) == len(miss_items), (
-                f"per-item embedding count {len(all_miss_embedding)} != "
-                f"cache-miss item count {len(miss_items)}"
-            )
-            split_embeddings = [
-                emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
-            ]
-        else:
-            all_miss_embedding = all_miss_embedding.reshape(
-                -1, all_miss_embedding.shape[-1]
-            )
-            # Split output by per-item token count
-            token_counts = [n for _, _, n in miss_items]
-            split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
+            if isinstance(all_miss_embedding, list):
+                # Per-item embeddings: no split needed, and each cache entry owns
+                # its storage (a torch.split view would pin the whole concatenated
+                # buffer for as long as any single item stays cached).
+                assert len(all_miss_embedding) == len(miss_items), (
+                    f"per-item embedding count {len(all_miss_embedding)} != "
+                    f"cache-miss item count {len(miss_items)}"
+                )
+                split_embeddings = [
+                    emb.reshape(-1, emb.shape[-1]) for emb in all_miss_embedding
+                ]
+            else:
+                all_miss_embedding = all_miss_embedding.reshape(
+                    -1, all_miss_embedding.shape[-1]
+                )
+                # Split output by per-item token count
+                token_counts = [n for _, _, n in miss_items]
+                split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
 
-        for (idx, item, expected_token_count), emb in zip(miss_items, split_embeddings):
-            if embedding_cache.set(item.cache_key, EmbeddingResult(embedding=emb)):
-                cached = embedding_cache.get_single(item.cache_key)
-                if _embedding_token_count(cached.embedding) == expected_token_count:
-                    emb = cached.embedding
-            cached_embeddings[idx] = emb
+            for (idx, item, expected_token_count), emb in zip(
+                miss_items, split_embeddings
+            ):
+                if embedding_cache.set(item.cache_key, EmbeddingResult(embedding=emb)):
+                    cached = embedding_cache.get_single(item.cache_key)
+                    if _embedding_token_count(cached.embedding) == expected_token_count:
+                        emb = cached.embedding
+                cached_embeddings[idx] = emb
 
     return [
         _slice_item_chunk(cached_embeddings[idx], item, chunk_start, extend_seq_len)
@@ -665,7 +711,7 @@ def _get_chunked_prefill_embedding(
 
     # Phase 1: batch encode all per-image cache misses in ONE ViT call
     hash_to_embedding: Dict[Tuple[bytes, int], torch.Tensor] = {}
-    if per_image_requests:
+    if per_image_requests or image_dp_group(data_embedding_func) is not None:
         hash_to_embedding = _batch_encode_per_image_misses(
             data_embedding_func, per_image_requests, device
         )
