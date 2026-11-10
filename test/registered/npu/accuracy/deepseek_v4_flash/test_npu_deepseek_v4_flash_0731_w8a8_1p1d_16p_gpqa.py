@@ -15,6 +15,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     build_meta_service_config,
+    resolve_prefill_instance_master_ip,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,8 +50,10 @@ def _get_first_visible_device():
 #     "metrics_url": f"http://127.0.0.1:{META_METRICS_PORT}",
 # }
 
-# Endpoints use the prefill pod's real IP (POD_IP) so a multi-pod prefill
-# instance can reach the MetaService across nodes.
+# Endpoints default to the local pod's real IP (POD_IP) so a multi-pod
+# prefill instance can reach the MetaService across nodes. When the prefill
+# instance spans multiple pods, setUpClass replaces this with the instance
+# master's IP resolved from the ConfigMap.
 METASERVICE_CONFIG = build_meta_service_config()
 
 
@@ -66,16 +69,20 @@ METASERVICE_CONFIG = build_meta_service_config()
 # per-rank DRAM contribution. All 16 ranks live on the prefill node, so the
 # node must donate world_size * dram_size of host DRAM (16 x 4GB = 64GB here);
 # 10GB per rank exhausted the node during MemCache init.
-HICACHE_STORAGE_EXTRA_CONFIG = json.dumps(
-    {
-        "meta_service_url": METASERVICE_CONFIG["meta_service_url"],
-        "config_store_url": METASERVICE_CONFIG["config_store_url"],
-        "log_level": "info",
-        "world_size": 16,
-        "protocol": "device_sdma",
-        "dram_size": "4GB",
-    }
-)
+def _build_hicache_storage_extra_config(meta_cfg):
+    return json.dumps(
+        {
+            "meta_service_url": meta_cfg["meta_service_url"],
+            "config_store_url": meta_cfg["config_store_url"],
+            "log_level": "info",
+            "world_size": 16,
+            "protocol": "device_sdma",
+            "dram_size": "4GB",
+        }
+    )
+
+
+HICACHE_STORAGE_EXTRA_CONFIG = _build_hicache_storage_extra_config(METASERVICE_CONFIG)
 
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -212,6 +219,14 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     HICACHE_STORAGE_EXTRA_CONFIG,
 ]
 
+
+def _override_meta_service_config(meta_cfg):
+    """Point the prefill launch args at the resolved MetaService endpoints."""
+    prefill_args = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS
+    args_index = prefill_args.index("--hicache-storage-backend-extra-config")
+    prefill_args[args_index + 1] = _build_hicache_storage_extra_config(meta_cfg)
+
+
 # Decode node launch arguments.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     "--page-size",
@@ -335,12 +350,27 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
                         description,
                         result.returncode,
                     )
+
+            # Resolve the prefill instance master from the ConfigMap so every
+            # prefill pod targets the same MetaService. Must happen before
+            # super().setUpClass(), which starts the MetaService and the model
+            # server. Falls back to the local POD_IP outside k8s and for
+            # single-pod prefill (the master is this pod).
+            last_part = os.environ.get("HOSTNAME", "").rsplit("-", 1)[-1]
+            if last_part.isdigit():
+                master_ip = resolve_prefill_instance_master_ip(
+                    int(last_part), cls.model_config["prefill_args"]
+                )
+                if master_ip:
+                    meta_cfg = build_meta_service_config(master_ip)
+                    cls.meta_service_config = meta_cfg
+                    _override_meta_service_config(meta_cfg)
         super().setUpClass()
 
     model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
-    # Start the npu_memcache MetaService on the prefill node before the model
-    # server, as required by the L3 cache backend. Its ports are derived from
-    # the pod's visible devices (see METASERVICE_CONFIG above).
+    # Start the npu_memcache MetaService on the prefill instance master before
+    # the model server, as required by the L3 cache backend. The endpoint is
+    # resolved from the ConfigMap in setUpClass (see METASERVICE_CONFIG above).
     meta_service_config = METASERVICE_CONFIG
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
     accuracy = 0.874
