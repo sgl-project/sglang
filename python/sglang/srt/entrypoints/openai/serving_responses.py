@@ -1563,10 +1563,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         return {"type": "function", "function": {"name": tool_choice["name"]}}
 
     def _native_request(self, request: ResponsesRequest) -> Optional[NativeRequest]:
-        """A DeepSeek request that searches for tools or defers some converts
-        through deepseek-recipe's Responses adapter, which places the definitions a
-        search returns and groups its results; the request then answers with the
-        tools the model can call after its history. Cached on the tool state."""
+        """Keep native discovery history separate from the Chat bridge's messages."""
         state = request._tool_state
         if state.native is not None:
             return state.native
@@ -2816,20 +2813,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 completed_item = _tool_search_call(
                     state["item_id"], state["call_id"], arguments, truncated=truncated
                 )
-                events.append(
-                    _send_event(
-                        ResponseToolSearchCallEvent(
-                            type="response.output_item.done",
-                            sequence_number=-1,
-                            output_index=state["output_index"],
-                            item=completed_item,
-                        )
-                    )
-                )
-                emitted_items.append(completed_item)
-                state["done"] = True
-                return events
-            if state["custom"]:
+            elif state["custom"]:
                 payload = decode_custom_tool_input(arguments)
                 # Deltas cannot be retracted, so a payload that no longer
                 # extends what was already streamed defers to the streamed text.
@@ -2896,9 +2880,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                         )
                     )
                 )
+            event_class = (
+                ResponseToolSearchCallEvent
+                if state["search"]
+                else openai_responses_types.ResponseOutputItemDoneEvent
+            )
             events.append(
                 _send_event(
-                    openai_responses_types.ResponseOutputItemDoneEvent(
+                    event_class(
                         type="response.output_item.done",
                         sequence_number=-1,
                         output_index=state["output_index"],
@@ -3108,16 +3097,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 and name == TOOL_SEARCH
                             )
                             namespace, name = namespace_names.get(name, (None, name))
+                            prefix = (
+                                "ctc" if is_custom else "tsc" if is_search else "fc"
+                            )
                             state = {
-                                "item_id": (
-                                    f"ctc_{random_uuid()[:8]}"
-                                    if is_custom
-                                    else (
-                                        f"tsc_{random_uuid()[:8]}"
-                                        if is_search
-                                        else f"fc_{random_uuid()[:8]}"
-                                    )
-                                ),
+                                "item_id": f"{prefix}_{random_uuid()[:8]}",
                                 "call_id": f"call_{random_uuid()[:24]}",
                                 "output_index": current_output_index,
                                 "name": name,
@@ -3130,25 +3114,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 "done": False,
                             }
                             tool_call_states[tool_index] = state
-                        if not state["added"] and state["search"]:
-                            # Its arguments are reported whole, when it completes.
-                            state["added"] = True
-                            yield _send_event(
-                                ResponseToolSearchCallEvent(
-                                    type="response.output_item.added",
-                                    sequence_number=-1,
-                                    output_index=state["output_index"],
-                                    item=ResponseToolSearchCall(
-                                        id=state["item_id"],
-                                        call_id=state["call_id"],
-                                        arguments={},
-                                        status="in_progress",
-                                    ),
-                                )
-                            )
                         if not state["added"]:
                             state["added"] = True
-                            if state["custom"]:
+                            if state["search"]:
+                                # Search arguments are reported whole on completion.
+                                added_item = ResponseToolSearchCall(
+                                    id=state["item_id"],
+                                    call_id=state["call_id"],
+                                    arguments={},
+                                    status="in_progress",
+                                )
+                            elif state["custom"]:
                                 added_item = ResponseCustomToolCall(
                                     type="custom_tool_call",
                                     id=state["item_id"],
@@ -3170,8 +3146,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     status="in_progress",
                                     **_namespace_field(state),
                                 )
+                            event_class = (
+                                ResponseToolSearchCallEvent
+                                if state["search"]
+                                else openai_responses_types.ResponseOutputItemAddedEvent
+                            )
                             yield _send_event(
-                                openai_responses_types.ResponseOutputItemAddedEvent(
+                                event_class(
                                     type="response.output_item.added",
                                     sequence_number=-1,
                                     output_index=state["output_index"],

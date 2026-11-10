@@ -188,29 +188,6 @@ print("reasoning:", getattr(choice.message, "reasoning_content", None))
 
 A successful call returns `finish_reason: "tool_calls"` with a single `get_weather` entry whose arguments carry the requested location. If you see the raw DSML markup in `content` instead, the parser flag is missing.
 
-#### Tools that load mid-conversation
-
-DeepSeek-V4.1 can learn about a tool partway through a conversation. SGLang renders the new schema at that point, through [deepseek-recipe](https://github.com/deepseek-ai/deepseek-recipe) 0.2.0, as an `### Updated Tool Schemas` block. Each API exposes this its own way:
-
-- **Chat Completions** (SGLang extension): give a `system` or `developer` message a `tools` list of function tools. Its `content` may be empty.
-  - Once tool use is active, the prompt before the declaration does not change. Tool use is active when the request has `tools` or an earlier message declared some.
-  - If a message declaration is a conversation's first tool, the prompt gains deepseek-recipe's tool instructions at its start.
-  - `tool_choice` covers request tools and declared tools. `none` drops the declarations.
-  - Message tools follow the same rules as request tools. Mixing `strict` and non-strict tools in one request is rejected.
-  - Request-level `defer_loading` is rejected, since nothing in Chat Completions can load such a tool. Declare the tool in a message instead.
-- **Responses**: declare `{"type": "tool_search", "execution": "client"}`. SGLang does not run searches; your client does.
-  - The model's searches return as `tool_search_call` items with object `arguments`. A call cut off by `max_output_tokens` is `incomplete` with empty arguments.
-  - Your client answers with a `tool_search_output` item whose `tools` hold function or namespace definitions. They render where that item appears, and `tool_choice` can then force them by name. `previous_response_id` replays the search calls.
-  - Request tools with `defer_loading: true` stay out of the prompt until a `tool_search_output` returns their definitions.
-  - A `tool_search` tool without `execution: "client"` is rejected.
-- **Messages**: a tool with `defer_loading: true` stays out of the prompt until it is loaded. A `tool_result` can load it with `{"type": "tool_reference", "tool_name": ...}`. A `system` message can load it with deepseek-recipe's `{"type": "tool_addition", "tool": {"type": "tool_reference", "name": ...}}` block.
-  - A reference to an undeclared tool, or a `tool_choice` naming a tool that has not loaded, is rejected.
-  - `any` forces only loaded tools.
-
-`strict` tools keep their argument grammar. In Responses and Messages requests that load tools, `strict` tools may sit beside non-strict ones, such as the search tool. Their schemas render as declared, and SGLang's grammar enforces the arguments.
-
-DeepSeek-V4 cannot render tools mid-conversation. It rejects message-level tools, `tool_search`, `tool_reference`, and `tool_addition`. It loads deferred `/v1/messages` tools up front.
-
 ### 3.3 Speculative Decoding (DSpark)
 
 DSpark is DeepSeek-V4.1 Flash's own bundled draft — there is no EAGLE or MTP path for this model, and no `--speculative-num-steps` knob (the draft-token count is resolved from the checkpoint). Turn it on with `--speculative-algorithm DSPARK --speculative-dspark-block-size 5`, which is what the Low-Latency cells do.

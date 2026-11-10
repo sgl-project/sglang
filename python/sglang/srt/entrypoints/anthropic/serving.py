@@ -196,8 +196,7 @@ def _block_types(messages: list[Any]) -> set[str]:
 
 
 def _native_block(block: dict[str, Any]) -> dict[str, Any]:
-    """`block` in deepseek-recipe's Messages schema: the reference and legacy field
-    names SGLang accepts, and search results as the text SGLang renders."""
+    """Normalize SGLang's legacy field aliases and search results for recipe."""
     kind = block["type"]
     if kind == "tool_result":
         content = block.get("content")
@@ -776,9 +775,7 @@ class AnthropicServing:
         anthropic_request: AnthropicMessagesRequest,
         chat_request: ChatCompletionRequest,
     ) -> None:
-        """DeepSeek-V4.1 converts deferred tools and the tools that results and
-        system messages load through deepseek-recipe's Messages adapter, which
-        renders each loaded schema where it loads; its tools become the active set."""
+        """Recipe needs the original Messages blocks to place deferred-tool schemas."""
         types = _block_types(anthropic_request.messages)
         loads = bool(types & {"tool_reference", "tool_addition"})
         tools = [

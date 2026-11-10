@@ -41,9 +41,7 @@ DYNAMIC_TOOLS_SPEC = "dsv41"
 
 
 class NativeRequest(msgspec.Struct, frozen=True):
-    """A Responses or Messages payload that recipe's own adapter converts, so tools
-    it discovers or references mid-history render where recipe places them.
-    `tool_name` is a named tool choice: only that tool stays visible."""
+    """A native protocol payload with SGLang's named tool selection."""
 
     protocol: str
     body: dict[str, Any]
@@ -124,23 +122,25 @@ def _convert(recipe: ModuleType, request: Any, options: Any) -> Any:
 
 
 def _splice_declarations(
-    messages: list[Any], declarations: list[tuple[str, str, list[str]]]
-) -> list[tuple[Any, Optional[list[str]]]]:
-    """Pair each converted message with the names it declares. A declaring message
-    is what conversion left between its markers: itself, or nothing when empty."""
-    spliced = [(message, None) for message in messages]
+    messages: list[Any],
+    declarations: list[tuple[str, str, list[str]]],
+    tools: dict[str, Any],
+) -> list[Any]:
+    """Restore declarations around the messages the converter kept or dropped."""
+    spliced = list(messages)
     for opening, closing, names in declarations:
         start, end = (_marker_index(spliced, marker) for marker in (opening, closing))
-        declared = [message for message, _ in spliced[start + 1 : end]]
-        spliced[start : end + 1] = [(declared[0] if declared else None, names)]
+        message = spliced[start + 1] if end > start + 1 else None
+        spliced[start : end + 1] = [
+            _system_message(message, tools=[tools[name] for name in names])
+        ]
     return spliced
 
 
-def _marker_index(spliced: list[tuple[Any, Any]], marker: str) -> int:
-    for index, (message, _) in enumerate(spliced):
-        if message is not None and message.role == "system":
-            if message.content == marker:
-                return index
+def _marker_index(messages: list[Any], marker: str) -> int:
+    for index, message in enumerate(messages):
+        if message.role == "system" and message.content == marker:
+            return index
     raise ValueError("deepseek-recipe dropped a message that declares tools")
 
 
@@ -189,31 +189,6 @@ def _keep_tool(
                 message = _system_message(message, tools=selected)
         kept.append(message)
     return kept, [tool for tool in tools if tool.name == name]
-
-
-def _rebuild(
-    recipe: ModuleType,
-    messages: list[Any],
-    tools: list[Any],
-    *,
-    choice: str,
-    settings: Any,
-) -> Any:
-    """A conversation of `messages` and `tools` with the thinking mode, effort and
-    response format of the converted `settings`."""
-    response_format = settings.response_format
-    formats = {
-        "json_schema": {"response_schema": settings.response_schema},
-        "regex": {"response_regex": settings.response_regex},
-    }
-    return recipe.Conversation(
-        messages,
-        thinking_mode=settings.thinking_mode,
-        tools=tools,
-        tool_choice=choice,
-        reasoning_effort=settings.reasoning_effort,
-        **formats.get(response_format, {"response_format": response_format}),
-    )
 
 
 class DeepSeekRecipe:
@@ -312,29 +287,27 @@ class DeepSeekRecipe:
                 _deferred(tool) if tool.name in deferred else tool
                 for tool in settings.tools
             ]
-            by_name = {tool.name: tool for tool in tools}
-            messages = [
-                (
-                    message
-                    if names is None
-                    else _system_message(
-                        message, tools=[by_name[name] for name in names]
-                    )
-                )
-                for message, names in _splice_declarations(
-                    list(settings.messages), declarations=declarations
-                )
-            ]
+            messages = _splice_declarations(
+                settings.messages,
+                declarations=declarations,
+                tools={tool.name: tool for tool in tools},
+            )
         else:
             return settings
         if tool_name is not None:
             messages, tools = _keep_tool(messages, tools=tools, name=tool_name)
-        return _rebuild(
-            recipe,
-            messages=messages,
+        response_format = settings.response_format
+        formats = {
+            "json_schema": {"response_schema": settings.response_schema},
+            "regex": {"response_regex": settings.response_regex},
+        }
+        return recipe.Conversation(
+            messages,
+            thinking_mode=settings.thinking_mode,
             tools=tools,
-            choice=conversation.tool_choice,
-            settings=settings,
+            tool_choice=conversation.tool_choice,
+            reasoning_effort=settings.reasoning_effort,
+            **formats.get(response_format, {"response_format": response_format}),
         )
 
     def native_tools(self, native: NativeRequest) -> list[Any]:
