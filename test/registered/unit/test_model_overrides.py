@@ -1983,10 +1983,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_deterministic_rocm_fp8_gemm_backend(self):
         """Deterministic ROCm runs block-FP8 linears through Triton unless the user chose
         a backend; CUDA and normal mode keep auto."""
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deterministic_rocm_fp8_gemm_backend,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_rocm_fp8_gemm_backend
 
         # (is_hip, deterministic, fp8_gemm_runner_backend, expected)
         for is_hip, det, backend, expected in [
