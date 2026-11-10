@@ -1084,10 +1084,6 @@ class Envs:
     # the shared experts stay TP-sharded on the all-gathered normed input.
     # SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT takes precedence.
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT = EnvBool(False)
-    # With the row-sharded attention read, exchange o_proj's input to row shards (all-to-all,
-    # 1/4.7 of the output's bytes) and run o_proj there with its full weight, gathered at load
-    # (+176 MB a layer), instead of reduce-scattering the TP-partial output. Eager batches only.
-    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ = EnvBool(False)
     # With the row-sharded MoE tail, leave the stream on each rank's rows: the next layer's
     # attention read aggregates the bank there and gathers its normed input.
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)

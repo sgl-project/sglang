@@ -135,12 +135,7 @@ from sglang.srt.models.kimi_k3_amd.moe import (
     link_column_tails_hip,
     link_row_sharded_stream_hip,
 )
-from sglang.srt.models.kimi_k3_amd.row_shard_o_proj import (
-    gather_full_o_proj,
-    pad_o_proj_rows,
-    row_shard_o_proj,
-    take_o_proj_row_shard,
-)
+from sglang.srt.models.kimi_k3_amd.row_shard_o_proj import pad_o_proj_rows
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -490,18 +485,12 @@ _EP_FRONT_LOGGED = False
 
 
 def _row_sharded_switch_on() -> bool:
-    """Any of the opt-in gfx950 row-sharded front / o_proj / stream switches."""
+    """Any of the opt-in gfx950 row-sharded front / stream switches."""
     return (
         envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT.get()
         or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT.get()
-        or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ.get()
         or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get()
     )
-
-
-def _is_row_shard_o_proj(o_proj: RowParallelLinear) -> bool:
-    """Whether row_shard_o_proj wrapped o_proj (its forward then keeps the input)."""
-    return "row_shard_input" in o_proj.__dict__
 
 
 def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
@@ -2165,8 +2154,6 @@ class KimiK3DeltaAttention(nn.Module):
             # buffer, which needs the GEMM to write into caller-owned storage
             self.all_reduce_fusion = False
             self.o_proj.use_dp_attention_reduce = True
-        if _is_hip and envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ.get():
-            row_shard_o_proj(self.o_proj)
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -2728,9 +2715,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # Allocate o_proj's output in the attention-TP group's symmetric
             # memory, where the stage boundary sums it.
             self.o_proj.use_dp_attention_reduce = True
-        if _is_hip and envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ.get():
-            # inside the output gate, which multiplies x before o_proj takes it
-            row_shard_o_proj(self.o_proj)
         if self.use_output_gate:
             projection_size = config.num_attention_heads * config.v_head_dim
             # Shard by attn-TP to match the attention output (DSV2 MLA shards
@@ -3131,14 +3115,9 @@ class KimiK3DecoderLayer(nn.Module):
 
         self._ffn_writes_stream = _latent_moe_writes_stream(config, layer_idx)
         self._declare_stages(config, layer_idx, attn_bank)
-        # o_proj keeps its input for the row-sharded FFN read (row_shard_o_proj),
-        # else writes into rows padded for its reduce-scatter
-        self._o_proj_row_sharded = False
+        # o_proj writes into rows padded for the row-sharded read's reduce-scatter
         o_proj = self.self_attn.o_proj
-        if self._row_shards is not None and _is_row_shard_o_proj(o_proj):
-            o_proj.row_shards = self._row_shards
-            self._o_proj_row_sharded = True
-        elif (
+        if (
             self._row_shards is not None
             and _row_sharded_switch_on()
             and _o_proj_takes_output(o_proj)
@@ -3146,11 +3125,6 @@ class KimiK3DecoderLayer(nn.Module):
             pad_o_proj_rows(
                 o_proj, tp_size=get_parallel().attn_tp_size, row_shards=self._row_shards
             )
-
-    def _o_proj_row_shard(self, num_tokens: int) -> Optional[torch.Tensor]:
-        if not self._o_proj_row_sharded:
-            return None
-        return take_o_proj_row_shard(self.self_attn.o_proj, num_tokens)
 
     def _declare_stages(self, config, layer_idx, attn_bank):
         """Declare this layer's attention and FFN stages as _stage_facts gives
@@ -3179,9 +3153,6 @@ class KimiK3DecoderLayer(nn.Module):
                     if self._row_shards is not None and isinstance(self.mlp, KimiK3MoE)
                     else None
                 ),
-                ffn_attn_rows=self._o_proj_row_shard
-                if self._row_shards is not None
-                else None,
             ).residual_ops()
         attn, ffn = _stage_facts(
             config, layer_idx, sp_collective=sp_collective, bank=bank
@@ -4061,8 +4032,6 @@ class KimiK3LinearForCausalLM(nn.Module):
                 bias = layer.mlp.gate.e_score_correction_bias
                 if bias.dtype != torch.float32:
                     bias.data = bias.data.to(torch.float32)
-            if layer._o_proj_row_sharded:
-                gather_full_o_proj(layer.self_attn.o_proj)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
