@@ -8,17 +8,25 @@ and an explicit SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1 there is an error.
 
 import contextlib
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import _resolve_dflash_draft_kv_ring
+from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.utils import (
+    _append_draft_kv_ring_state,
+    append_state_component,
+)
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
     draft_kv_ring_rows_per_req,
+    draft_ring_row_pairs,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -147,7 +155,7 @@ WINDOW_LEFT = 1023
 BLOCK = 8
 
 
-def _ring(dcp, req_pool_rows=4):
+def _ring(dcp, req_pool_rows=4, dcp_rank=0, pool=None):
     return DFlashDraftKVRing(
         rows_per_req=draft_kv_ring_rows_per_req(
             window_left=WINDOW_LEFT, block_size=BLOCK, dcp_size=dcp
@@ -155,6 +163,9 @@ def _ring(dcp, req_pool_rows=4):
         dcp_size=dcp,
         req_pool_rows=req_pool_rows,
         device="cpu",
+        window_left=WINDOW_LEFT,
+        dcp_rank=dcp_rank,
+        pool=pool,
     )
 
 
@@ -189,6 +200,134 @@ class TestDraftKVRingLayout(CustomTestCase):
         self.assertTrue(bool(kept[-ring.span :].all()))
         self.assertEqual(first[kept].unique().numel(), ring.span)
         self.assertTrue(bool((second != 0).all()))
+
+
+class TestDraftKVRingPDTransfer(CustomTestCase):
+    """Prefill and decode build position-matched ``transfer_rows`` for their own
+    req pool slot; Mooncake copies the pairs both ranks own."""
+
+    def _received(self, prefill_dcp, decode_dcp, seq_len):
+        """{decode rank: [(position, prefill row, decode row)]} one prefill rank
+        per decode rank: the same rank under equal DCP, else prefill rank 0."""
+        received = {}
+        for rank in range(decode_dcp):
+            src_rank = rank if prefill_dcp == decode_dcp else 0
+            prefill = _ring(prefill_dcp, req_pool_rows=8, dcp_rank=src_rank)
+            decode = _ring(decode_dcp, req_pool_rows=8, dcp_rank=rank)
+            src, dst = draft_ring_row_pairs(
+                prefill.transfer_rows(3, seq_len).tolist(),
+                decode.transfer_rows(5, seq_len).tolist(),
+            )
+            first = max(0, seq_len - WINDOW_LEFT - 1)
+            positions = [p for p in range(first, seq_len) if p % decode_dcp == rank]
+            received[rank] = (positions, src, dst, prefill, decode)
+        return received
+
+    def test_each_decode_rank_gets_the_window_positions_it_owns(self):
+        for prefill_dcp, decode_dcp in ((1, 1), (1, 8), (8, 8)):
+            for seq_len in (5, WINDOW_LEFT + 1, 5000):
+                with self.subTest(prefill=prefill_dcp, decode=decode_dcp, L=seq_len):
+                    covered = []
+                    received = self._received(prefill_dcp, decode_dcp, seq_len)
+                    for positions, src, dst, prefill, decode in received.values():
+                        pos = torch.tensor(positions, dtype=torch.int64)
+                        # The rows each side's own locs give those positions.
+                        self.assertEqual(
+                            src,
+                            (
+                                prefill.locs(torch.full_like(pos, 3), pos)
+                                // prefill_dcp
+                            ).tolist(),
+                        )
+                        self.assertEqual(
+                            dst,
+                            (
+                                decode.locs(torch.full_like(pos, 5), pos) // decode_dcp
+                            ).tolist(),
+                        )
+                        covered += positions
+                    window = range(max(0, seq_len - WINDOW_LEFT - 1), seq_len)
+                    self.assertEqual(sorted(covered), list(window))
+
+    def test_reset_floor_empties_the_window(self):
+        ring = _ring(8)
+        ring.min_pos[2] = 7
+        ring.reset_floor(2, 4096)
+        self.assertEqual(ring.min_pos.tolist(), [0, 0, 4096, 0])
+
+    def test_buffer_infos_address_one_ring_row_per_item(self):
+        page_size = 64
+        pool = SimpleNamespace(
+            page_size=page_size,
+            get_contiguous_buf_infos=lambda: (
+                [1000, 2000],
+                [page_size * 576 * 10, page_size * 576 * 10],
+                [page_size * 576, page_size * 576],
+            ),
+        )
+        ring = _ring(8, pool=pool)
+        self.assertEqual(
+            ring.ring_buf_infos(),
+            ([1000, 2000], [page_size * 5760] * 2, [576, 576]),
+        )
+        ptrs, lens, item_lens = ring.floor_buf_infos()
+        self.assertEqual(ptrs, [ring.min_pos.data_ptr()])
+        self.assertEqual((lens, item_lens), ([4 * 4], [4]))
+
+
+class TestDraftKVRingRegistration(CustomTestCase):
+    """The ring's two state entries go last, so prefill and decode pair them by
+    position; a side with the ring resolved on but no ring keeps empty slots."""
+
+    def _register(self, ring, *, ring_on):
+        kv_args = KVArgs()
+        for name in (
+            "state_types",
+            "state_sub_pools",
+            "state_wire_keys",
+            "state_data_ptrs",
+            "state_data_lens",
+            "state_item_lens",
+            "state_dim_per_tensor",
+            "state_conv_shard_groups",
+            "state_slice_outer_counts",
+            "state_layer_ids",
+        ):
+            setattr(kv_args, name, [])
+        append_state_component(kv_args, StateType.MAMBA, [1], [2], [3])
+        with (
+            get_context().override_server_args(),
+            get_spec().override(speculative_dflash_draft_kv_ring=ring_on),
+        ):
+            _append_draft_kv_ring_state(kv_args, ring)
+        return kv_args
+
+    def test_a_ring_registers_its_rows_and_floor_last(self):
+        pool = SimpleNamespace(
+            page_size=1,
+            get_contiguous_buf_infos=lambda: ([1000], [5760], [576]),
+        )
+        ring = _ring(8, pool=pool)
+        kv_args = self._register(ring, ring_on=True)
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.MAMBA, StateType.DRAFT_RING, StateType.REQUEST_ROW],
+        )
+        self.assertEqual(
+            kv_args.state_data_ptrs[1:], [[1000], [ring.min_pos.data_ptr()]]
+        )
+        self.assertEqual(kv_args.state_item_lens[1:], [[576], [4]])
+
+    def test_a_stage_without_the_ring_keeps_empty_slots(self):
+        kv_args = self._register(None, ring_on=True)
+        self.assertEqual(
+            kv_args.state_types[1:], [StateType.DRAFT_RING, StateType.REQUEST_ROW]
+        )
+        self.assertEqual(kv_args.state_data_ptrs[1:], [[], []])
+
+    def test_nothing_is_registered_with_the_ring_off(self):
+        kv_args = self._register(None, ring_on=False)
+        self.assertEqual(kv_args.state_types, [StateType.MAMBA])
 
 
 if __name__ == "__main__":
