@@ -157,9 +157,9 @@ jobs:
           # --force-reinstall: a base image may already carry this exact version,
           # in which case pip skips the wheel and the job tests a stale _C.so.
           python3 -m pip install dist/*.whl --force-reinstall --no-deps
-          # This DeepEP wheel requires NCCL 2.30.7, which Torch 2.14 also pins;
-          # reinstall it after every dependency-resolving pip command.
-          python3 -m pip install "nvidia-nccl-cu13==2.30.7" --force-reinstall --no-deps
+          # Match the image's NCCL (SGL_NCCL_VERSION in docker/Dockerfile); reinstall
+          # it after every dependency-resolving pip command.
+          python3 -m pip install "nvidia-nccl-cu13==2.31.2" --force-reinstall --no-deps
           nccl_lib=$(python3 -c "from importlib.metadata import distribution; print(distribution('nvidia-nccl-cu13').locate_file('nvidia/nccl/lib'))")
           export LD_LIBRARY_PATH="${nccl_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
           echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" >> "${GITHUB_ENV}"
@@ -176,7 +176,7 @@ jobs:
           # torch.cuda.nccl.version() reports Torch's compiled version, not the loaded library.
           nccl_version = ctypes.c_int()
           assert ctypes.CDLL("libnccl.so.2").ncclGetVersion(ctypes.byref(nccl_version)) == 0
-          assert nccl_version.value == 23007, nccl_version.value
+          assert nccl_version.value == 23102, nccl_version.value
           assert hasattr(deep_ep, "ElasticBuffer"), "DeepEP ElasticBuffer is required"
           print("DeepGEMM test dependencies ready; NCCL:", nccl_version.value)
           PY
