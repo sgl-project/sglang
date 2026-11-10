@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """SGLang's binding to the monokernel plugins: the AMD ones behind
---enable-amd-monokernel and the MSA one, which --enable-nvidia-megakernel routes
-here. Startup validation and graph-size alignment, then weight observation and
-the full-forward dispatch installed on the model."""
+--enable-amd-monokernel, the Intel XPU ones behind --enable-xpu-monokernel and
+the MSA one, which --enable-nvidia-megakernel routes here. Startup validation and
+graph-size alignment, then weight observation and the full-forward dispatch
+installed on the model."""
 
 from __future__ import annotations
 
@@ -29,6 +30,8 @@ from sglang.kernels.plugin_kernels.amd.spec import (
     spec_registered,
 )
 from sglang.kernels.plugin_kernels.nvidia.spec import FLAG as NVIDIA_FLAG
+from sglang.kernels.plugin_kernels.xpu.spec import BACKEND as XPU_BACKEND
+from sglang.kernels.plugin_kernels.xpu.spec import FLAG as XPU_FLAG
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     model_config_of,
@@ -73,10 +76,18 @@ def selected_monokernel(cfg: Any) -> Optional[tuple[str, str]]:
     """The (backend, flag) a monokernel may serve under this configuration."""
     if cfg.enable_amd_monokernel:
         return BACKEND, FLAG
+    if getattr(cfg, "enable_xpu_monokernel", False):
+        return XPU_BACKEND, XPU_FLAG
     if cfg.enable_nvidia_megakernel:
         return MSA_BACKEND, NVIDIA_FLAG
     return None
 
+
+# What a backend's plugin does when an in-kernel wait for a peer fails.
+_FAILED_WAIT = {
+    BACKEND: "a failed wait stops every rank with a GPU fault at address 0x0",
+    XPU_BACKEND: "a failed wait makes the step's outputs NaN and the plugin stops the server",
+}
 
 # Leave time for peers to abort before the process watchdog fires.
 MAX_DEADLINE_S, MIN_DEADLINE_S = 60.0, 5.0
@@ -89,8 +100,30 @@ def deadline_s(watchdog_timeout: Optional[float]) -> float:
     return min(MAX_DEADLINE_S, 0.5 * float(watchdog_timeout))
 
 
+def _device_module():
+    """The torch module of this server's accelerator: torch.xpu on Intel GPUs,
+    else torch.cuda (CUDA and ROCm)."""
+    if (
+        not torch.cuda.is_available()
+        and hasattr(torch, "xpu")
+        and torch.xpu.is_available()
+    ):
+        return torch.xpu
+    return torch.cuda
+
+
+def _compute_units(props: Any) -> int:
+    """SMs / CUs of a CUDA or ROCm GPU, Xe cores of an Intel GPU."""
+    count = getattr(props, "multi_processor_count", None)
+    return count if count is not None else props.gpu_subslice_count
+
+
 def device_isa() -> Optional[str]:
     """Return the GPU ISA without feature suffixes, or None without a GPU."""
+    if _device_module() is torch.xpu:
+        # SYCL architecture: IP version major in bits 30.., e.g. 20 (Xe2)
+        arch = torch.xpu.get_device_properties(torch.xpu.current_device()).architecture
+        return f"xe{(arch >> 30) // 10}"
     if not torch.cuda.is_available():
         return None
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -233,6 +266,11 @@ def handle_monokernel(server_args: ServerArgs) -> None:
     if selected is None:
         return
     backend, flag = selected
+    if cfg.enable_amd_monokernel and getattr(cfg, "enable_xpu_monokernel", False):
+        # both replace the model's forward
+        raise ValueError(
+            f"{XPU_FLAG}: --enable-amd-monokernel is also set; use one of the two"
+        )
     model_config = model_config_of(server_args)
     if backend == MSA_BACKEND and not msa_serves(model_config.hf_config.architectures):
         return  # sgl-nvidia-mega serves this model
@@ -331,13 +369,23 @@ def monokernel_weights_iterator(
     return watched()
 
 
+# Backends whose drafter plugins also run the draft extend step (a verify-shaped
+# step of the draft model: its rows are the target's verified positions).
+_DRAFT_EXTEND_BACKENDS = frozenset({"xpu"})
+
+
 def shape_key(forward_batch: ForwardBatch) -> Optional[ShapeKey]:
-    """The graph key of a DECODE or TARGET_VERIFY step, else None."""
+    """The graph key of a DECODE, TARGET_VERIFY or DRAFT_EXTEND_V2 step, else None.
+
+    Only a backend in ``_DRAFT_EXTEND_BACKENDS`` serves the draft extend keys.
+    """
     mode = forward_batch.forward_mode
     if mode.is_decode():
         name = "decode"
     elif mode.is_target_verify():
         name = "target_verify"
+    elif mode.is_draft_extend_v2():
+        name = "draft_extend"
     else:
         return None
     bs, rows = int(forward_batch.batch_size), int(forward_batch.input_ids.shape[0])
@@ -410,10 +458,11 @@ def install_monokernel_forward(
             f"{spec.name} keeps weight copies at load, and this load path does not "
             "pass checkpoint tensors through monokernel_weights_iterator"
         )
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    if props.multi_processor_count < spec.devices[isa].resident_blocks:
+    device = _device_module()
+    units = _compute_units(device.get_device_properties(device.current_device()))
+    if units < spec.devices[isa].resident_blocks:
         reasons.append(
-            f"{Feature.PARTITIONED_GPU.value}: {props.multi_processor_count} compute "
+            f"{Feature.PARTITIONED_GPU.value}: {units} compute "
             f"units, the launch grid needs {spec.devices[isa].resident_blocks}"
         )
     # Collect validation failures before the plugin starts collective setup.
@@ -428,6 +477,9 @@ def install_monokernel_forward(
     mode, tokens = _server_step()
     if spec.tokens_per_request is not None:
         tokens = spec.tokens_per_request(model)
+        if tokens == 1 and _chain_draft():
+            # an EAGLE / NEXTN draft's loop runs decode steps of one token
+            mode = "decode"
     capture_keys = _capture_keys(mode=mode, tokens=tokens)
     capture_rows = {k.rows for k in capture_keys}
     # Eager execution can use every supported width.
@@ -437,6 +489,12 @@ def install_monokernel_forward(
         if w % tokens == 0 and (not capture_keys or w in capture_rows)
     )
     served = _served_keys(mode=mode, widths=widths, tokens=tokens)
+    if mode == "decode" and tokens == 1 and _chain_draft():
+        served |= _draft_extend_keys(
+            backend=backend,
+            widths=spec.widths(isa),
+            sizes={k.batch_size for k in capture_keys},
+        )
     # Different routes would leave ranks waiting in incompatible collectives.
     if any(other != served for other in _gather_tp(served)):
         raise RuntimeError(f"{_flag()}: the ranks route different graph keys")
@@ -451,7 +509,7 @@ def install_monokernel_forward(
         deadline_s=deadline_s(get_device().watchdog_timeout),
         copies=copies,
     )
-    build_start, memory_before = time.perf_counter(), torch.cuda.memory_allocated()
+    build_start, memory_before = time.perf_counter(), device.memory_allocated()
     built = spec.build(model, hf_config, build_context)
     _install_forward(model=model, built=built, served=served, spec=spec)
     # Captured kernels retain weight copies that online updates cannot refresh.
@@ -460,14 +518,14 @@ def install_monokernel_forward(
     )
     logger.info(
         "monokernel %s on %s: widths %s built in %.1f s, %.1f MiB; wait deadline "
-        "%.0f s (a failed wait stops every rank with a GPU fault at address 0x0); "
-        "weight copies: %s",
+        "at most %.0f s (%s); weight copies: %s",
         spec.name,
         isa,
         list(widths),
         time.perf_counter() - build_start,
-        (torch.cuda.memory_allocated() - memory_before) / 2**20,
+        (device.memory_allocated() - memory_before) / 2**20,
         build_context.deadline_s,
+        _FAILED_WAIT.get(backend, "a failed wait stops every rank"),
         _format_weight_copies(copies),
     )
     if capture_keys:
@@ -483,16 +541,19 @@ def install_monokernel_forward(
 
 
 class _CaptureCheck:
-    """Check the captured decode graphs, not the configured sizes, once all are in.
+    """Check the captured graphs, not the configured sizes, once all are in.
 
     Logs the steps that run the monokernels, captured and eager, and refuses a
-    runner none of whose graphs run them.
+    runner none of whose decode graphs run them. A draft extend runner's graphs
+    are checked apart: one that routes none falls back to the model's forward.
     """
 
     def __init__(self, *, spec: MonoSpec, isa: str, served: frozenset):
         self.spec, self.isa, self.served = spec, isa, served
         self.captured: dict[int, Optional[ShapeKey]] = {}
+        self.extend_captured: dict[int, Optional[ShapeKey]] = {}
         self.is_done = False
+        self.is_extend_done = False
 
     def __call__(
         self,
@@ -501,20 +562,40 @@ class _CaptureCheck:
         forward_batch: ForwardBatch,
         num_tokens: int,
     ) -> None:
-        if self.is_done or not torch.cuda.is_current_stream_capturing():
+        if not _device_module().is_current_stream_capturing():
             return  # the runner's warmup runs, and any recapture
-        self.captured[int(forward_batch.batch_size)] = shape_key(forward_batch)
-        if not set(runner.capture_bs) <= set(self.captured):
+        is_extend = forward_batch.forward_mode.is_draft_extend_v2()
+        if self.is_extend_done if is_extend else self.is_done:
+            return
+        captured = self.extend_captured if is_extend else self.captured
+        captured[int(forward_batch.batch_size)] = shape_key(forward_batch)
+        if not set(runner.capture_bs) <= set(captured):
+            return
+        routed = [k for k in captured.values() if k in self.served]
+        if is_extend:
+            self.is_extend_done = True
+            logger.info(
+                "monokernel %s on %s runs %s (%d of %d captured draft extend graphs)",
+                self.spec.name,
+                self.isa,
+                _format_steps(routed) if routed else "no draft extend step",
+                len(routed),
+                len(captured),
+            )
             return
         self.is_done = True
-        routed = [k for k in self.captured.values() if k in self.served]
         if not routed:
             raise ValueError(
                 f"{_flag()}: none of the "
-                f"{len(self.captured)} captured decode graphs (batch sizes "
-                f"{sorted(self.captured)}) runs {self.spec.name}'s monokernels"
+                f"{len(captured)} captured decode graphs (batch sizes "
+                f"{sorted(captured)}) runs {self.spec.name}'s monokernels"
             )
-        eager = _eager_keys(served=self.served, captured=self.captured.values())
+        eager = _eager_keys(
+            served=frozenset(
+                k for k in self.served if k.forward_mode != "draft_extend"
+            ),
+            captured=captured.values(),
+        )
         logger.info(
             "monokernel %s on %s runs %s (%d of %d captured decode graphs)%s; every "
             "other step runs the standard path",
@@ -522,7 +603,7 @@ class _CaptureCheck:
             self.isa,
             _format_steps(routed),
             len(routed),
-            len(self.captured),
+            len(captured),
             f", and eagerly {_format_steps(eager)}" if eager else "",
         )
 
@@ -552,6 +633,25 @@ def _served_keys(
         ShapeKey(forward_mode=mode, batch_size=w // tokens, tokens_per_request=tokens)
         for w in widths
         if w % tokens == 0
+    )
+
+
+def _draft_extend_keys(
+    *, backend: str, widths: tuple[int, ...], sizes: set[int]
+) -> frozenset[ShapeKey]:
+    """The graph keys of a chain draft's draft extend steps: every request holds the
+    verify width's tokens. ``sizes`` are the captured batch sizes (empty without graphs)."""
+    tokens = int(get_spec().speculative_num_draft_tokens or 0)
+    if backend not in _DRAFT_EXTEND_BACKENDS or tokens < 2:
+        return frozenset()
+    return frozenset(
+        ShapeKey(
+            forward_mode="draft_extend",
+            batch_size=w // tokens,
+            tokens_per_request=tokens,
+        )
+        for w in widths
+        if w % tokens == 0 and (not sizes or w // tokens in sizes)
     )
 
 
@@ -617,6 +717,13 @@ def _format_weight_copies(copies: dict[tuple, torch.Tensor]) -> str:
         f"{kind} ({count} tensor{'' if count == 1 else 's'}, {nbytes / 2**20:.1f} MiB)"
         for kind, (count, nbytes) in sorted(totals.items())
     )
+
+
+def _chain_draft() -> bool:
+    """Whether the server's drafter steps through its draft loop in decode steps
+    (EAGLE / NEXTN chains); other drafters (e.g. DSPARK) run verify steps."""
+    algorithm = (get_spec().speculative_algorithm or "").upper()
+    return algorithm in ("EAGLE", "EAGLE3", "NEXTN")
 
 
 def _server_step() -> tuple[str, int]:

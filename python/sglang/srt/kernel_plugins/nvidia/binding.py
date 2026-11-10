@@ -1158,6 +1158,8 @@ def handle_nvidia_megakernel(server_args: Any) -> None:
     if cfg.enable_amd_monokernel:
         # both replace the model's forward, which would fail only after weights load
         reasons.append("--enable-amd-monokernel is also set; use one of the two")
+    if getattr(cfg, "enable_xpu_monokernel", False):
+        reasons.append("--enable-xpu-monokernel is also set; use one of the two")
     if reasons:
         raise ValueError(
             f"{FLAG} cannot run this setup:\n  - " + "\n  - ".join(reasons)

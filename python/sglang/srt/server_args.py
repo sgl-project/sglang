@@ -422,10 +422,12 @@ class ServerArgs:
             flags={
                 "amd": ("enable_amd_monokernel", "--enable-amd-monokernel"),
                 "msa": ("enable_nvidia_megakernel", "--enable-nvidia-megakernel"),
+                "xpu": ("enable_xpu_monokernel", "--enable-xpu-monokernel"),
             },
             help="Deprecated. Use --enable-amd-monokernel instead of "
-            "--monokernel-backend amd, and --enable-nvidia-megakernel instead of "
-            "--monokernel-backend msa.",
+            "--monokernel-backend amd, --enable-nvidia-megakernel instead of "
+            "--monokernel-backend msa, and --enable-xpu-monokernel instead of "
+            "--monokernel-backend xpu.",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
