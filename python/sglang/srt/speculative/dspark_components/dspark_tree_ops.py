@@ -9,7 +9,9 @@ signatures and the same invariants; the rest of the speculative stack must not
 contain any other device-specific tree code.
 
 Projection, compression and indexing use the in-tree Triton package.
-The backend switch selects the compressed tree attention implementation:
+``SGLANG_DSPARK_TREE_ATTN_IMPL=ascendc`` selects the sgl-kernel-npu AscendC
+attention, and ``triton`` selects Triton. When unset, attention follows
+``SGLANG_DSPARK_TREE_BACKEND``:
 
 * ``sgl_kernel_npu`` (default): use the in-tree Triton package.
 * ``vendor``: load the vllm-ascend ``_C_ascend`` bindings listed in
@@ -56,6 +58,7 @@ from dataclasses import dataclass, field
 import torch
 
 _TREE_BACKEND_ENV = "SGLANG_DSPARK_TREE_BACKEND"
+_TREE_ATTN_IMPL_ENV = "SGLANG_DSPARK_TREE_ATTN_IMPL"
 _TREE_OPS_ENV = "SGLANG_DSPARK_TREE_OPS"
 _TREE_BACKENDS = ("vendor", "sgl_kernel_npu")
 _TREE_BACKEND_ALIASES = {
@@ -206,6 +209,15 @@ def _tree_backend() -> str:
     return backend
 
 
+def _tree_attn_impl() -> str:
+    impl = os.environ.get(_TREE_ATTN_IMPL_ENV, "").strip().lower()
+    if not impl:
+        return "vendor" if _tree_backend() == "vendor" else "triton"
+    if impl not in ("ascendc", "triton"):
+        raise ValueError(f"{_TREE_ATTN_IMPL_ENV} must be ascendc or triton, got {impl!r}")
+    return impl
+
+
 def _ensure_vendor_ops() -> None:
     """Load the vllm-ascend tree bindings from SGLANG_DSPARK_TREE_OPS once."""
     global _TREE_OPS_LOADED
@@ -311,8 +323,23 @@ def _load_vendor_indexer_op():
         ) from exc
 
 
+def _load_sgl_ascendc_op(name: str):
+    try:
+        import sgl_kernel_npu  # noqa: F401 - registers torch.ops.npu
+
+        return getattr(torch.ops.npu, name)
+    except (ImportError, AttributeError, OSError) as exc:
+        raise RuntimeError(
+            f"DSpark AscendC tree attention requires torch.ops.npu.{name}; "
+            "install the A3 sgl-kernel-npu wheel with native tree attention."
+        ) from exc
+
+
 def _load_attention_op():
-    if _tree_backend() != "sgl_kernel_npu":
+    impl = _tree_attn_impl()
+    if impl == "ascendc":
+        return _load_sgl_ascendc_op("sparse_attn_sharedkv_tree")
+    if impl == "vendor":
         _ensure_vendor_ops()
         namespace = _vendor_namespace()
         try:
@@ -499,57 +526,74 @@ def build_tree_attn_metadata(
 ):
     """Build the tiling metadata the tree attention op requires.
 
-    The Triton attention validates the metadata ABI (int32[1024]) but ignores its
-    contents (D2), so a zeroed tensor is returned together with the per-node
-    ``cu_seqlens_*`` the op does consume. ``window``/``cmp_sparse_indices``/
-    ``compressed`` are retained for signature parity with the vendor path.
+    Triton ignores metadata contents. Both AscendC paths use a schedule
+    computed from the actual query geometry and compressed index width.
     """
     seq = metadata.node_seqused_kv.to(torch.int32)
     cu_ori, cu_cmp = _cached_cu_seqlens(plan, seq, ratio)
-    if _tree_backend() != "sgl_kernel_npu":
+    impl = _tree_attn_impl()
+    if impl == "triton":
+        metadata_tensor = torch.zeros(1024, dtype=torch.int32, device=query.device)
+        return metadata_tensor, cu_ori, cu_cmp
+
+    ratio = int(ratio)
+    cmp_topk = (
+        int(cmp_sparse_indices.shape[-1])
+        if cmp_sparse_indices is not None and ratio == 4
+        else 0
+    )
+    has_cmp_kv = compressed is not None
+    if (
+        impl == "ascendc"
+        and has_cmp_kv
+        and ratio == 4
+        and cmp_topk not in (512, 1024)
+    ):
+        raise ValueError(
+            "sgl-kernel-npu AscendC tree attention requires a C4 index width "
+            f"of 512 or 1024 for host metadata, got {cmp_topk}."
+        )
+    cache_key = (
+        impl,
+        int(query.shape[1]),
+        int(query.shape[2]),
+        ratio,
+        int(window),
+        cmp_topk,
+        has_cmp_kv,
+        int(seq.data_ptr()),
+        int(seq.numel()),
+    )
+    cached = plan.attn_metadata_cache.get(cache_key)
+    if cached is not None:
+        return cached, cu_ori, cu_cmp
+
+    kwargs = dict(
+        num_heads_q=query.shape[1],
+        num_heads_kv=1,
+        head_dim=query.shape[2],
+        batch_size=plan.n,
+        cmp_topk=cmp_topk,
+        cmp_ratio=ratio,
+        has_ori_kv=True,
+        has_cmp_kv=has_cmp_kv,
+        ori_mask_mode=4,
+        cmp_mask_mode=3,
+        ori_win_left=int(window) - 1,
+        ori_win_right=0,
+        layout_q="TND",
+        layout_kv="PA_ND",
+    )
+    if impl == "ascendc":
+        op = _load_sgl_ascendc_op("sparse_attn_sharedkv_metadata_host")
+        # The host scheduler reads CPU int32 lengths and returns an NPU tensor.
+        metadata_tensor = op(
+            cu_seqlens_q=plan.query_cu.to(device="cpu", dtype=torch.int32).contiguous(),
+            seqused_kv=seq.to(device="cpu").contiguous(),
+            **kwargs,
+        )
+    else:
         _ensure_vendor_ops()
-        cmp_topk = (
-            int(cmp_sparse_indices.shape[-1])
-            if cmp_sparse_indices is not None and int(ratio) == 4
-            else 0
-        )
-        cache_key = (
-            int(query.shape[1]),
-            int(query.shape[2]),
-            int(ratio),
-            int(window),
-            cmp_topk,
-            compressed is not None,
-            int(seq.data_ptr()),
-            int(seq.numel()),
-        )
-        cached = plan.attn_metadata_cache.get(cache_key)
-        if cached is not None:
-            return cached, cu_ori, cu_cmp
-        kwargs = dict(
-            num_heads_q=query.shape[1],
-            num_heads_kv=1,
-            head_dim=query.shape[2],
-            seqused_q=seq.new_empty(0),
-            batch_size=plan.n,
-            max_seqlen_q=1,
-            max_seqlen_kv=_cached_max_seqlen(plan, seq, ratio),
-            cmp_topk=cmp_topk,
-            has_ori_kv=True,
-            has_cmp_kv=compressed is not None,
-            device=str(query.device),
-            cu_seqlens_q=plan.query_cu,
-            cu_seqlens_ori_kv=cu_ori,
-            cu_seqlens_cmp_kv=cu_cmp,
-            seqused_kv=seq,
-            cmp_ratio=int(ratio),
-            ori_mask_mode=4,
-            cmp_mask_mode=3,
-            ori_win_left=int(window) - 1,
-            ori_win_right=0,
-            layout_q="TND",
-            layout_kv="PA_ND",
-        )
         custom = getattr(torch.ops, "custom", None)
         op = getattr(custom, "npu_sparse_attn_sharedkv_metadata", None)
         if op is None:
@@ -562,10 +606,18 @@ def build_tree_attn_metadata(
                 "torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata or "
                 "torch.ops.custom.npu_sparse_attn_sharedkv_metadata"
             )
-        metadata_tensor = op(**kwargs)
-        plan.attn_metadata_cache[cache_key] = metadata_tensor
-        return metadata_tensor, cu_ori, cu_cmp
-    metadata_tensor = torch.zeros(1024, dtype=torch.int32, device=query.device)
+        metadata_tensor = op(
+            seqused_q=seq.new_empty(0),
+            max_seqlen_q=1,
+            max_seqlen_kv=_cached_max_seqlen(plan, seq, ratio),
+            device=str(query.device),
+            cu_seqlens_q=plan.query_cu,
+            cu_seqlens_ori_kv=cu_ori,
+            cu_seqlens_cmp_kv=cu_cmp,
+            seqused_kv=seq,
+            **kwargs,
+        )
+    plan.attn_metadata_cache[cache_key] = metadata_tensor
     return metadata_tensor, cu_ori, cu_cmp
 
 
