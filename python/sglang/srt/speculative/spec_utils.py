@@ -1187,22 +1187,14 @@ def commit_mamba_states_after_verify(
     model_runner = target_worker.model_runner
     if mambaish_config(model_runner.model_config) is None:
         return
+    if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+        return
 
-    # ReplaySSM spec-verify path (Part B of #28511): the accepted drafts already
-    # live in the per-slot circular ring (written during verify). Instead of
-    # scattering an intermediate full SSM state into `temporal`, advance the
-    # block-keyed cursors by the accepted count (the ring owns the SSM state; the
-    # verify/flush kernel folds it into `temporal` periodically). The CONV state
-    # still needs its usual accept-rollback, so we keep the conv-window scatter and
-    # skip only the SSM scatter. GDN-only + linear-chain (topk<=1) -- the runtime
-    # ring is allocated only then; KDA never allocates the cursors.
     mamba_pool = model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
     bs = accept_lens.shape[0]
     src_indices_raw = (
         batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
     )
-    if batch.forward_mode.is_idle() or accept_index.numel() == 0:
-        return
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
     if prepared_step_indices is None:
         last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
@@ -1241,10 +1233,9 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = replay_state_indices
         commit_gdn_replayssm_fold_after_verify(
             spec_state=spec_state,
-            state_batch_indices=state_batch_indices,
+            state_batch_indices=replay_state_indices,
             accept_lens=accept_lens,
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=replay_track_indices,
@@ -1254,6 +1245,7 @@ def commit_mamba_states_after_verify(
         )
         return
 
+    # Circular ReplaySSM (GDN, topk <= 1): the ring owns the SSM state.
     if (
         mamba_pool is not None
         and mamba_pool.replayssm_cache_base is not None
@@ -1268,7 +1260,6 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = replay_state_indices
         replay_indices = batch.req_pool_indices
         # Advance the per-request circular cursors by the accepted count (incl. the
         # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
@@ -1292,7 +1283,7 @@ def commit_mamba_states_after_verify(
             g_cache=spec_state.replayssm_g,
             d_residual_cache=spec_state.replayssm_rawv,
             k_residual_cache=spec_state.replayssm_rawk,
-            state_batch_indices=state_batch_indices,
+            state_batch_indices=replay_state_indices,
             replay_indices=replay_indices,
             write_pos=mamba_pool.replayssm_spec_write_pos,
             cache_base=mamba_pool.replayssm_cache_base,
@@ -1306,7 +1297,7 @@ def commit_mamba_states_after_verify(
         fused_conv_window_scatter_with_mask(
             spec_state.conv[0],
             spec_state.intermediate_conv_window[0],
-            state_batch_indices,
+            replay_state_indices,
             last_correct_step_indices,
             src_indices_raw,
         )
@@ -1336,15 +1327,12 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = replay_state_indices
         ring_indices = None
         if mamba_pool.replayssm_request_ring:
-            ring_indices = batch.req_pool_indices[: state_batch_indices.shape[0]]
-        # extra_buffer: the same fold also snapshots the interval-crossing step
-        # into the track slot, so `temporal` stays current without a flush.
+            ring_indices = batch.req_pool_indices[: replay_state_indices.shape[0]]
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,
-            state_batch_indices=state_batch_indices,
+            state_batch_indices=replay_state_indices,
             accept_lens=accept_lens,  # incl. bonus token
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=replay_track_indices,
