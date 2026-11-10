@@ -150,3 +150,38 @@ test('prior finish summaries do not block producer retries', async () => {
   const result = await check({ failedJobNames: ['pr-test-finish'] });
   assert.deepEqual(result.failures, []);
 });
+
+const failed = (name, step) => ({ name, status: 'completed', conclusion: 'failure',
+  steps: [{ name: step, conclusion: 'failure' }] });
+
+test('a Base-B wait caused only by health cascades does not become a root', async () => {
+  const result = await check({ jobs: [
+    failed('wait-for-base-b', 'Run ./.github/actions/wait-for-jobs'),
+    failed('base-b-test-1-gpu-large / test (0)', 'Run ./.github/actions/check-pr-test-health'),
+  ] });
+  assert.deepEqual(result.failures, []);
+});
+
+test('a standalone Base-B wait failure remains a root', async () => {
+  const result = await check({ jobs: [failed('wait-for-base-b', 'Run ./.github/actions/wait-for-jobs')] });
+  assert.match(result.failures[0], /wait-for-base-b/);
+});
+
+test('a real producer failure is not hidden with its Base-B wait', async () => {
+  const result = await check({ jobs: [
+    failed('wait-for-base-b', 'Run ./.github/actions/wait-for-jobs'),
+    failed('base-b-test-1-gpu-large / test (0)', 'Run test'),
+    failed('base-b-test-2-gpu-large / test (0)', 'Run ./.github/actions/check-pr-test-health'),
+  ] });
+  assert.match(result.failures[0], /wait-for-base-b/);
+  assert.match(result.failures[0], /base-b-test-1-gpu-large/);
+});
+
+test('the generic action still blocks real roots behind a coverage summary', async () => {
+  const result = await check({ jobs: [
+    failed('call-multimodal-gen-tests / diffusion-coverage-check', 'Verify coverage'),
+    diffusionJob('diffusion-1-gpu-5090 (0)'),
+  ] });
+  assert.match(result.failures[0], /diffusion-1-gpu-5090/);
+  assert.doesNotMatch(result.failures[0], /coverage-check/);
+});
