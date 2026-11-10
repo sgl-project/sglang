@@ -108,8 +108,7 @@ class SchedulerPPMixin:
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
-    # Records a skipped output's completion behind its microbatch's forward
-    # (`_pp_make_skip_output_result`); made on first use.
+    # Side stream of `_pp_result_done_event`; made on first use.
     _pp_skip_output_stream = None
 
     @DynamicGradMode()
@@ -1028,21 +1027,29 @@ class SchedulerPPMixin:
                 mb_metadata.unified_forward_done if mb_metadata else None
             ),
         )
-        d2h_event = self.device_module.Event()
-        forward_done = mb_metadata.forward_done if mb_metadata else None
-        if forward_done is None:
-            d2h_event.record(self.device_module.current_stream())
-        else:
-            # Processing this result retires the microbatch's forward, so the
-            # host must see that forward end first: record the event on a side
-            # stream that waits it, which the caller's synchronize then implies.
-            # The current stream gains no dependency on the forward.
-            stream = self._pp_skip_output_stream
-            if stream is None:
-                stream = self._pp_skip_output_stream = self.device_module.Stream()
-            stream.wait_event(forward_done)
-            d2h_event.record(stream)
+        d2h_event = self._pp_result_done_event(mb_metadata, side_stream=True)
         return None, batch_result, d2h_event
+
+    def _pp_result_done_event(
+        self: Scheduler,
+        mb_metadata: Optional[PPBatchMetadata],
+        *,
+        side_stream: bool = False,
+    ) -> torch.Event:
+        """An event recorded after this rank's forward of the micro-batch, which
+        processing the result retires. ``side_stream`` keeps the current stream
+        from waiting on it."""
+        stream = self.device_module.current_stream()
+        forward_done = mb_metadata.forward_done if mb_metadata else None
+        if forward_done is not None:
+            if side_stream:
+                if self._pp_skip_output_stream is None:
+                    self._pp_skip_output_stream = self.device_module.Stream()
+                stream = self._pp_skip_output_stream
+            stream.wait_event(forward_done)
+        event = self.device_module.Event()
+        event.record(stream)
+        return event
 
     def _pp_prep_batch_result(
         self: Scheduler,
@@ -1594,18 +1601,17 @@ class SchedulerPPMixin:
                 batch_result = self._pp_prep_batch_result(
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
-                d2h_event = self.device_module.Event()
+                d2h_event = self._pp_result_done_event(mb_metadata[next_mb_id])
                 if (
                     batch_result.logits_output is not None
                     and batch_result.logits_output.sampling_mask_output is not None
                 ):
+                    # `copy_to_cpu` records it again behind its copies.
                     batch_result.copy_done = d2h_event
                     batch_result.copy_to_cpu(
                         return_logprob=target.return_logprob,
                         return_hidden_states=False,
                     )
-                else:
-                    d2h_event.record(self.device_module.current_stream())
 
         if send_first:
             send_output_work = _do_send()
@@ -1700,8 +1706,7 @@ class SchedulerPPMixin:
                     batch_result = self._pp_prep_batch_result(
                         target_recv, mb_metadata[next_mb_id], next_pp_outputs
                     )
-                    d2h_event = self.device_module.Event()
-                    d2h_event.record(self.device_module.current_stream())
+                    d2h_event = self._pp_result_done_event(mb_metadata[next_mb_id])
 
         # ---- Execute communication ----
         if send_dict is not None and should_recv:
