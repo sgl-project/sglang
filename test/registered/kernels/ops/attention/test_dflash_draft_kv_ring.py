@@ -73,7 +73,7 @@ def test_window_reads_the_rows_the_ring_writes(dcp):
 
 @pytest.mark.parametrize("dcp", [1, 8])
 def test_fused_block_locs_match_locs(dcp):
-    """SGLANG_OPT_DFLASH_RING_LOCS_FUSED computes the same block locs."""
+    """The fused block locs equal the ring's locs."""
     device = "cuda"
     ring = _ring(dcp, 9, device)
     req_pool_indices = torch.tensor([3, 7, 1, 8], dtype=torch.int32, device=device)

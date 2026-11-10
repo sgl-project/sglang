@@ -1069,7 +1069,6 @@ sgl-router \\
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1112,7 +1111,6 @@ sgl-router \\
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1156,7 +1154,6 @@ sgl-router \\
         "SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION=0.1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600",
@@ -1209,7 +1206,6 @@ sgl-router \\
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.99",
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "RUSTUP_TOOLCHAIN=stable",
@@ -1261,7 +1257,6 @@ sgl-router \\
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1304,7 +1299,6 @@ sgl-router \\
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1348,7 +1342,6 @@ sgl-router \\
         "SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION=0.1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600",
@@ -1401,7 +1394,6 @@ sgl-router \\
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.99",
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "RUSTUP_TOOLCHAIN=stable",

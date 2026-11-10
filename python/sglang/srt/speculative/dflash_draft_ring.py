@@ -23,7 +23,6 @@ from typing import Any, Callable, Dict, Optional
 import torch
 
 from sglang.kernels.ops.speculative.dflash_ring_locs import dflash_ring_block_locs
-from sglang.srt.environ import envs
 
 
 def draft_kv_ring_unsupported_reason(
@@ -118,7 +117,6 @@ class DFlashDraftKVRing:
         self.span = rows_per_req * dcp_size
         self.min_pos = torch.zeros(req_pool_rows, dtype=torch.int32, device=device)
         self._floor_rids: Dict[int, str] = {}
-        self._fused_block_locs = envs.SGLANG_OPT_DFLASH_RING_LOCS_FUSED.get()
 
     def locs(
         self, req_pool_indices: torch.Tensor, positions: torch.Tensor
@@ -135,10 +133,8 @@ class DFlashDraftKVRing:
     def block_locs(
         self, req_pool_indices: torch.Tensor, positions: torch.Tensor, block_size: int
     ) -> torch.Tensor:
-        """Ring locs of a draft block: ``block_size`` positions per request."""
-        if not self._fused_block_locs:
-            return self.locs(req_pool_indices.repeat_interleave(block_size), positions)
-
+        """Ring locs of a draft block: ``block_size`` positions per request, in
+        one launch (bitwise equal to ``locs`` on the repeated indices)."""
         return dflash_ring_block_locs(
             req_pool_indices,
             positions,
