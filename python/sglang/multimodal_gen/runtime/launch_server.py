@@ -260,13 +260,13 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     local_num_gpus = num_gpus // nnodes
     rank_offset = node_rank * local_num_gpus
     server_args_payload = ServerArgsPayload.capture(server_args)
-    processes = _WorkerProcesses(
-        _start_scheduler_processes(
-            server_args_payload,
-            [(i, rank_offset + i) for i in range(local_num_gpus)],
-            "sglang-diffusionWorker-",
-        )
+    processes = _start_scheduler_processes(
+        server_args_payload,
+        [(i, rank_offset + i) for i in range(local_num_gpus)],
+        "sglang-diffusionWorker-",
     )
+    if server_args.causal_pipeline_mode != "off":
+        processes = _WorkerProcesses(processes)
 
     logger.debug("All workers are ready")
     logger.info("[server-load] workers_ready_monotonic_ns=%d", time.monotonic_ns())
