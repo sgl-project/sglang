@@ -88,7 +88,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         ):
             setattr(queue, budget, MagicMock(side_effect=AssertionError(budget)))
 
-        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(
+            queue.move_preallocated(decode_queue(ListKind.PD_RECEIVING)), ([], [])
+        )
         queue._resolve_pending_reqs.assert_called_once()
 
     def test_prefetches_prefill_dp_rank_query(self):
@@ -265,7 +267,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
                 self.assertEqual(gated.poll(), expected)
 
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
-    def test_pop_transferred_branches_on_reduced_poll_only(self, mock_prepare_abort):
+    def test_move_transferred_branches_on_reduced_poll_only(self, mock_prepare_abort):
         def make_queue(decode_req, peer_poll):
             queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
             queue.queue = decode_queue(ListKind.PD_RECEIVING, [decode_req])
@@ -304,7 +306,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
 
         decode_req = _gated_decode_req(KVPoll.Success, HiCacheRestoreResult.FAILED)
         queue = make_queue(decode_req, peer_poll=KVPoll.Failed)
-        self.assertEqual(queue.pop_transferred(), [])
+        self.assertEqual(queue.move_transferred(IndexedReqList(ListKind.WAITING)), [])
         self.assertEqual(list(queue.queue.items()), [])
         queue._commit_transfer_to_req.assert_not_called()
         queue._record_transfer_failure.assert_called_once_with("HiCache restore failed")
@@ -313,7 +315,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         mock_prepare_abort.reset_mock()
         decode_req = _gated_decode_req(KVPoll.Success, HiCacheRestoreResult.READY)
         queue = make_queue(decode_req, peer_poll=KVPoll.Failed)
-        self.assertEqual(queue.pop_transferred(), [])
+        self.assertEqual(queue.move_transferred(IndexedReqList(ListKind.WAITING)), [])
         queue._commit_transfer_to_req.assert_not_called()
         queue._record_transfer_failure.assert_called_once_with(
             "Failed due to an unknown reason from another rank"
@@ -323,7 +325,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         mock_prepare_abort.reset_mock()
         decode_req = _gated_decode_req(KVPoll.Transferring, HiCacheRestoreResult.FAILED)
         queue = make_queue(decode_req, peer_poll=KVPoll.Success)
-        self.assertEqual(queue.pop_transferred(), [])
+        self.assertEqual(queue.move_transferred(IndexedReqList(ListKind.WAITING)), [])
         self.assertEqual(list(queue.queue.items()), [decode_req])
         mock_prepare_abort.assert_not_called()
         queue.scheduler.request_retirer.release.assert_not_called()
@@ -498,7 +500,9 @@ class TestDeferredDestinationPublish(CustomTestCase):
         decode_req = self._decode_req(receiver)
         queue = self._deferring_queue([decode_req])
 
-        self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+        self.assertEqual(
+            queue.move_preallocated(queue.transfer_queue.queue), ([decode_req], [])
+        )
 
         receiver.send_metadata.assert_not_called()
         self.assertTrue(decode_req.awaiting_publish)
@@ -536,7 +540,9 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue = self._deferring_queue([decode_req])
         # A relief that could not keep the held rows moved pages in between.
         self.storage = _HoldingStorage(epochs=(0, 1))
-        self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+        self.assertEqual(
+            queue.move_preallocated(queue.transfer_queue.queue), ([decode_req], [])
+        )
         with patch(
             "sglang.srt.disaggregation.decode.all_reduce_flags",
             side_effect=_local_reduce,
@@ -564,7 +570,9 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue.scheduler.forward_stream = object()
         gate_closed = self._gate_at_handoff(queue)
 
-        self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+        self.assertEqual(
+            queue.move_preallocated(queue.transfer_queue.queue), ([decode_req], [])
+        )
 
         receiver.send_metadata.assert_not_called()
         self.assertEqual(recorded, [queue.scheduler.forward_stream])
@@ -632,7 +640,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
                 ),
                 patch.object(torch.Tensor, "copy_", copy),
             ):
-                queue.pop_preallocated()
+                queue.move_preallocated(queue.transfer_queue.queue)
             transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
             transfer.queue = decode_queue(ListKind.PD_RECEIVING, [entry])
             transfer.gloo_group = object()
@@ -682,7 +690,9 @@ class TestDeferredDestinationPublish(CustomTestCase):
         # A page moves between the hold and the send.
         self.storage = _HoldingStorage(epochs=(0, 1))
 
-        self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+        self.assertEqual(
+            queue.move_preallocated(queue.transfer_queue.queue), ([decode_req], [])
+        )
         self.assertIn(decode_req.req.rid, self.storage.holds)
         self.assertEqual(self.storage.recorded, [])
         receiver.send_metadata.assert_not_called()
@@ -724,7 +734,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
             side_effect=lambda _: receiver.send_metadata.assert_called_once()
         )
 
-        queue.pop_preallocated()
+        queue.move_preallocated(queue.transfer_queue.queue)
         queue._submit_prefill_recompute.assert_not_called()
         transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
         transfer.queue = decode_queue(ListKind.PD_RECEIVING, [decode_req])
@@ -750,7 +760,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue = self._deferring_queue([self._decode_req(_PollingReceiver())])
         gate_closed = self._gate_at_handoff(queue)
 
-        queue.pop_preallocated()
+        queue.move_preallocated(queue.transfer_queue.queue)
 
         self.assertEqual(gate_closed, [True])
         start, end, signal = self.storage.holds["deferred"]
@@ -825,7 +835,9 @@ class TestDeferredDestinationPublish(CustomTestCase):
         )
 
         with patch("sglang.srt.disaggregation.decode.get_disagg", return_value=disagg):
-            self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+            self.assertEqual(
+                queue.move_preallocated(queue.transfer_queue.queue), ([decode_req], [])
+            )
 
         self.assertTrue(decode_req.host_staged)
         receiver.send_metadata.assert_called_once()

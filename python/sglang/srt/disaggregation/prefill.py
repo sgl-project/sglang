@@ -602,7 +602,7 @@ class PrefillBootstrapQueue:
         )
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def pop_bootstrapped(self, dst: ReqList) -> List[Req]:
+    def move_bootstrapped(self, dst: ReqList) -> List[Req]:
         """Move the reqs which have finished bootstrapping into `dst`, and
         return them."""
 
@@ -657,7 +657,7 @@ class PrefillBootstrapQueue:
                 req.arrival_processed_tokens = self.scheduler.processed_tokens_counter
             else:
                 raise RuntimeError(
-                    f"Unexpected poll state {poll} for req {req.rid} in pop_bootstrapped"
+                    f"Unexpected poll state {poll} for req {req.rid} in move_bootstrapped"
                 )
 
         self.queue.leave(failed_reqs)
@@ -812,7 +812,7 @@ class SchedulerDisaggregationPrefillMixin:
             if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            self.disagg_prefill_bootstrap_queue.pop_bootstrapped(self.waiting_queue)
+            self.disagg_prefill_bootstrap_queue.move_bootstrapped(self.waiting_queue)
 
             # Get the next batch to run
             plan = self.get_next_disagg_prefill_batch_to_run(
@@ -951,7 +951,9 @@ class SchedulerDisaggregationPrefillMixin:
                 self._yield_gil_if_needed()
                 continue
             bootstrapped_reqs = (
-                self.disagg_prefill_bootstrap_queue.pop_bootstrapped(self.waiting_queue)
+                self.disagg_prefill_bootstrap_queue.move_bootstrapped(
+                    self.waiting_queue
+                )
                 if should_ingest_requests
                 else []
             )
@@ -1574,7 +1576,7 @@ class SchedulerDisaggregationPrefillMixin:
         elif poll == KVPoll.WaitingForInput:
             if should_force_retry(req):  # test hook
                 return False
-            # Metadata buffer was allocated in pop_bootstrapped before
+            # Metadata buffer was allocated in move_bootstrapped before
             # the request entered the waiting queue, so finalize should not fail.
             finalized = self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
             assert finalized

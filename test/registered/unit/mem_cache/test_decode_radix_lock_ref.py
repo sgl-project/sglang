@@ -5,13 +5,13 @@ Verifies that inc_lock_ref / dec_lock_ref are balanced across the four
 transfer scenarios identified in PR #19746:
 
 1. Incremental transfer & success (prefix match > 0)
-   inc_lock_ref(pop_preallocated) -> dec+inc(checkpoint) -> dec(release_kv_cache)
+   inc_lock_ref(move_preallocated) -> dec+inc(checkpoint) -> dec(release_kv_cache)
 
 2. Full transfer & success (prefix match == 0, full KV transferred)
    inc_lock_ref(get_new_prebuilt_batch) -> dec+inc(checkpoint) -> dec(release_kv_cache)
 
 3. Incremental transfer & failure (prefix match > 0, transfer fails)
-   lock(pop_preallocated) -> unlock(release_kv_cache checkpoint=False)
+   lock(move_preallocated) -> unlock(release_kv_cache checkpoint=False)
 
 4. Full transfer & failure (prefix match == 0, transfer fails)
    no inc_lock_ref -> dec(root_node) is no-op since root lock_ref starts at 1
@@ -158,7 +158,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
     def test_incremental_transfer_success(self):
         """Scenario 1: prefix match > 0, transfer succeeds.
 
-        Flow: inc_lock_ref(pop_preallocated)
+        Flow: inc_lock_ref(move_preallocated)
               -> dec_lock_ref + inc_lock_ref(checkpoint)
               -> dec_lock_ref(cache_finished_req)
         """
@@ -169,13 +169,13 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         prefix_vals = [10, 20, 30]
         self._populate_prefix(cache, prefix, prefix_vals)
 
-        # Match prefix (simulates _match_prefix_and_lock in pop_preallocated)
+        # Match prefix (simulates _match_prefix_and_lock in move_preallocated)
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
         matched_node = result.last_device_node
         prefix_len = result.device_prefix_len
         self.assertEqual(prefix_len, 3)
 
-        # Step 1: lock (pop_preallocated locks the matched node)
+        # Step 1: lock (move_preallocated locks the matched node)
         lock = cache.lock(matched_node)
         self.assertGreater(matched_node.lock_ref, 0)
 
@@ -261,7 +261,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         The final committed KV slot has no corresponding output token. Cleanup
         must preserve the matched prefix and release the full request-owned suffix.
 
-        Flow: lock(pop_preallocated)
+        Flow: lock(move_preallocated)
               -> unlock(release_kv_cache checkpoint=False)
         """
         cache, req_to_token = _make_cache_with_pools()
@@ -401,7 +401,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         self.assertEqual(cache.protected_size(), 0)
         self.assertEqual(cache.evictable_size(), 0)
 
-    def test_pop_preallocated_rechecks_budget_after_lock(self):
+    def test_move_preallocated_rechecks_budget_after_lock(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
 
@@ -424,7 +424,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         decode_req.waiting_for_input = True
         # Non-rebootstrap request: exercise the normal decode radix-cache path
         # (a truthy MagicMock would disable use_decode_radix_cache via the
-        # `not decode_req.is_rebootstrap` gate in pop_preallocated).
+        # `not decode_req.is_rebootstrap` gate in move_preallocated).
         decode_req.is_rebootstrap = False
 
         queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
@@ -461,7 +461,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         queue.req_to_token_pool.available_size.return_value = 1
         # Non-hybrid pools have no mamba allocator; MagicMock would otherwise
         # auto-create one and break the `available_size() <= 0` comparison in
-        # pop_preallocated.
+        # move_preallocated.
         queue.req_to_token_pool.mamba_allocator = None
         queue.req_to_token_pool.holds_state_slots = False
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
@@ -500,7 +500,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # when the SWA lock was already released for fresh tail allocation.
         queue._allocatable_token_budgets = MagicMock(return_value=3)
 
-        preallocated, failed = queue.pop_preallocated()
+        preallocated, failed = queue.move_preallocated(queue.transfer_queue.queue)
 
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])

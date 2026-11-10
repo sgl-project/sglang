@@ -281,7 +281,9 @@ class TestMambaCapacity(unittest.TestCase):
                 disaggregation_decode_host_receive_threshold=1
             ),
         ):
-            self.assertEqual(queue.pop_preallocated(), ([], []))
+            self.assertEqual(
+                queue.move_preallocated(queue.transfer_queue.queue), ([], [])
+            )
         self.assertEqual(list(queue.queue.items()), [decode_req])
         queue._match_prefix_and_lock.assert_not_called()
         queue._pre_alloc.assert_not_called()

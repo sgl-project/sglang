@@ -50,7 +50,7 @@ class ReqList(ABC):
     def __iter__(self) -> Iterator[Req]: ...
 
     @abstractmethod
-    def join(self, items) -> None: ...
+    def join(self, items, *, at: Optional[int] = None) -> None: ...
 
     @abstractmethod
     def leave(self, reqs: Iterable[Req]) -> None: ...
@@ -85,8 +85,9 @@ class KeyedReqList(ReqList):
         self.kind = kind
         self._reqs: Dict[Req, None] = {}
 
-    def join(self, reqs: Iterable[Req]) -> None:
+    def join(self, reqs: Iterable[Req], *, at: Optional[int] = None) -> None:
         """Add the given requests; ones already in keep their place."""
+        assert at is None, f"{self.kind.name} has no positions to insert at"
         for req in reqs:
             self._reqs.setdefault(req, None)
 
@@ -190,7 +191,4 @@ def move(
     if missing:
         raise RuntimeError(f"Requests {missing} are not in {src.kind.name}")
     src.leave(reqs)
-    if at is None:
-        dst.join(items)
-    else:
-        dst.join(items, at=at)
+    dst.join(items, at=at)

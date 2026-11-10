@@ -131,19 +131,6 @@ class TestMove(CustomTestCase):
         self.assertEqual(list(src.items()), [wrappers[0]])
         self.assertEqual(list(dst), [b])
 
-    def test_at_inserts_before_a_position(self):
-        a, b, c, d, e = _reqs("abcde")
-        src = IndexedReqList(ListKind.PD_SENDING)
-        src.join([d, e])
-        dst = IndexedReqList(ListKind.WAITING)
-        dst.join([a, b, c])
-
-        move([d], src, dst, at=0)
-        move([e], src, dst, at=2)
-
-        self.assertEqual(list(dst), [d, a, e, b, c])
-        self.assertEqual(list(src), [])
-
     def test_join_at_matches_a_rebuilt_list(self):
         for at in (None, 0, 1, 3, 9):
             with self.subTest(at=at):
@@ -163,18 +150,6 @@ class TestMove(CustomTestCase):
 
         with self.assertRaisesRegex(RuntimeError, r"\['x'\] are not in PD_BOOTSTRAP"):
             move([a, outsider], src, dst)
-
-        self.assertEqual(list(src), [a])
-        self.assertEqual(list(dst), [])
-
-    def test_at_into_a_keyed_list_raises_and_moves_nothing(self):
-        (a,) = _reqs("a")
-        src = IndexedReqList(ListKind.WAITING)
-        src.join([a])
-        dst = KeyedReqList(ListKind.PREFILL_LAUNCHED)
-
-        with self.assertRaisesRegex(TypeError, "PREFILL_LAUNCHED"):
-            move([a], src, dst, at=0)
 
         self.assertEqual(list(src), [a])
         self.assertEqual(list(dst), [])

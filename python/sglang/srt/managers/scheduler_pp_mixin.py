@@ -660,7 +660,7 @@ class SchedulerPPMixin:
         ] = defaultdict(deque)
 
     def process_bootstrapped_queue(self: Scheduler):
-        self.disagg_prefill_bootstrap_queue.pop_bootstrapped(self.waiting_queue)
+        self.disagg_prefill_bootstrap_queue.move_bootstrapped(self.waiting_queue)
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler) -> Dict[str, bool]:
         """Return {rid: failed} for the transfers every stage so far has concluded.
@@ -1921,9 +1921,12 @@ class SchedulerPPMixin:
                 good_consensus_prealloc_rids,
                 bad_consensus_prealloc_rids,
             ) = prealloc_rids
-            good_reqs, failed_reqs = self.disagg_decode_prealloc_queue.pop_preallocated(
-                pp_good_rids=good_consensus_prealloc_rids,
-                pp_bad_rids=bad_consensus_prealloc_rids,
+            good_reqs, failed_reqs = (
+                self.disagg_decode_prealloc_queue.move_preallocated(
+                    self.disagg_decode_transfer_queue.queue,
+                    pp_good_rids=good_consensus_prealloc_rids,
+                    pp_bad_rids=bad_consensus_prealloc_rids,
+                )
             )
             return [
                 [req.req.rid for req in good_reqs],
@@ -1942,13 +1945,12 @@ class SchedulerPPMixin:
         self.disagg_decode_transfer_queue.resolve_deferred_releases()
         if release_rids is not None:
             released_reqs, outcomes = (
-                self.disagg_decode_transfer_queue.pop_transferred_with_outcomes(
-                    release_rids
+                self.disagg_decode_transfer_queue.move_transferred_with_outcomes(
+                    self.waiting_queue, release_rids
                 )
             )
             if self.enable_hisparse:
                 for req in released_reqs:
                     self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.join(released_reqs)
             return outcomes
         return None

@@ -114,7 +114,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s.ingest_requests = Mock(return_value=[])
         s.waiting_queue = IndexedReqList(ListKind.WAITING)
         s.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            pop_bootstrapped=lambda dst: []
+            move_bootstrapped=lambda dst: []
         )
         s._pp_pd_get_prefill_transferred_ids = Mock(return_value=[])
         s._pp_commit_comm_work = Mock()

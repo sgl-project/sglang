@@ -303,7 +303,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             ),
         ):
             waiting = IndexedReqList(ListKind.WAITING)
-            result = queue.pop_bootstrapped(waiting)
+            result = queue.move_bootstrapped(waiting)
         self.assertEqual(list(waiting), result)
 
         return queue, req, result
@@ -537,7 +537,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         queue.pending_reqs = []
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
-        # `pop_preallocated` credits this counter; `__new__` skips the __init__
+        # `move_preallocated` credits this counter; `__new__` skips the __init__
         # that seeds it.
         queue._num_published_destinations = 0
         queue._resolve_pending_reqs = MagicMock()
@@ -555,7 +555,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         queue.req_to_token_pool.available_size.return_value = 100
         # Non-hybrid pools have no mamba allocator; MagicMock would otherwise
         # auto-create one and break the `available_size() <= 0` comparison in
-        # pop_preallocated.
+        # move_preallocated.
         queue.req_to_token_pool.mamba_allocator = None
         queue.req_to_token_pool.holds_state_slots = False
         queue.req_to_token_pool.req_to_token = torch.arange(
@@ -636,7 +636,9 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
                 queue._uses_swa_reservation = MagicMock(return_value=False)
                 queue._send_kv_metadata = MagicMock()
 
-                preallocated, failed = queue.pop_preallocated()
+                preallocated, failed = queue.move_preallocated(
+                    queue.transfer_queue.queue
+                )
 
                 self.assertEqual(failed, [])
                 self.assertEqual(preallocated, reqs[:admitted])
@@ -680,8 +682,10 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         manager.num_pinned_loras = 0
         scheduler.tp_worker.model_runner.lora_manager = manager
 
-        preallocated, failed = queue.pop_preallocated(
-            pp_good_rids=[entry.req.rid for entry in reqs], pp_bad_rids=[]
+        preallocated, failed = queue.move_preallocated(
+            queue.transfer_queue.queue,
+            pp_good_rids=[entry.req.rid for entry in reqs],
+            pp_bad_rids=[],
         )
 
         self.assertEqual(preallocated, [reqs[0], reqs[2]])
@@ -701,7 +705,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         queue = self._new_queue(reqs)
 
         with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
-            preallocated, failed = queue.pop_preallocated()
+            preallocated, failed = queue.move_preallocated(queue.transfer_queue.queue)
 
         self.assertEqual(
             [decode_req.req.rid for decode_req in preallocated],
@@ -722,7 +726,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         queue = self._new_queue(reqs, low_priority_values_first=True)
 
         with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
-            preallocated, failed = queue.pop_preallocated()
+            preallocated, failed = queue.move_preallocated(queue.transfer_queue.queue)
 
         self.assertEqual(
             [decode_req.req.rid for decode_req in preallocated],
@@ -740,7 +744,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         queue = self._new_queue([failed_low, healthy_high])
 
         with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
-            preallocated, failed = queue.pop_preallocated()
+            preallocated, failed = queue.move_preallocated(queue.transfer_queue.queue)
 
         self.assertEqual(
             [decode_req.req.rid for decode_req in preallocated], ["healthy-high"]
@@ -766,7 +770,9 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
                 queue.token_to_kv_pool_allocator.available_size.return_value = 100
                 queue._required_alloc_tokens = MagicMock(return_value=charge)
 
-                preallocated, failed = queue.pop_preallocated()
+                preallocated, failed = queue.move_preallocated(
+                    queue.transfer_queue.queue
+                )
 
                 queue._required_alloc_tokens.assert_called_once_with(
                     fill_len=3, prefix_len=0
