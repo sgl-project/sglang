@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Owner-thread L2 eviction exclusion, independent of operation lifetimes."""
+"""Owner-thread L2 protection, independent of operation lifetimes."""
 
 from __future__ import annotations
 
@@ -8,11 +8,12 @@ import threading
 import time
 from array import array
 from collections.abc import Callable
+from itertools import islice
 from typing import TYPE_CHECKING, Literal
 
 import msgspec
 
-from sglang.srt.managers.kv_control.contracts import ControlError
+from sglang.srt.managers.kv_control.contracts import ControlError, Priority, validated
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 if TYPE_CHECKING:
@@ -72,14 +73,14 @@ class ProtectionSnapshot(msgspec.Struct, frozen=True, kw_only=True):
     engine_id: str
     engine_epoch: str
     namespace: str
-    condition: Literal["eviction_exclusion"] = "eviction_exclusion"
+    priority: int | None = None
     reason: str = ""
 
 
 class _Record(msgspec.Struct, kw_only=True):
     snapshot: ProtectionSnapshot
     fingerprint: tuple
-    slots: frozenset[int] = frozenset()
+    pages: frozenset[int] = frozenset()
     holds: tuple[tuple[int, DecLockRefParams], ...] = ()
 
 
@@ -166,8 +167,12 @@ class ProtectionRegistry:
         self._clock = clock
         self._last_now = -math.inf
         self._records: dict[ProtectionKey, _Record] = {}
+        # Physical page starts survive radix splits. Remove their entries before
+        # returning any published indices to the host allocator.
         self._physical_refs: dict[int, int] = {}
-        self._pending_changes: list[ProtectionSnapshot] = []
+        self._priority_refs: dict[int, dict[ProtectionKey, int]] = {}
+        self.priorities: dict[int, int] = {}
+        self._pending_changes: dict[ProtectionKey, ProtectionSnapshot] = {}
         self._active_count = 0
         self._invalidated = ""
 
@@ -201,8 +206,8 @@ class ProtectionRegistry:
         ):
             # Reset destroyed the old tree/allocator ownership. Replaying old
             # receipts against recycled node IDs would release unrelated locks.
-            self._pending_changes.extend(
-                self._invalidate("cache_reset", release_holds=False)
+            self._pending_changes.update(
+                (s.key, s) for s in self._invalidate("cache_reset", release_holds=False)
             )
 
     def _now(self) -> float:
@@ -231,17 +236,18 @@ class ProtectionRegistry:
             )
         return float(ttl_seconds)
 
+    def _parameters(self, ttl_seconds, priority, now):
+        if ttl_seconds is None and priority is None:
+            raise ControlError("invalid", "Protection requires TTL or priority")
+        ttl = self._ttl(ttl_seconds, now) if ttl_seconds is not None else None
+        return ttl, validated(priority, Priority) if priority is not None else None
+
     def _record(self, key: ProtectionKey, now: float) -> _Record | None:
         if not isinstance(key, ProtectionKey):
             raise ControlError("invalid", "Protection requires a typed claim key")
         record = self._records.get(key)
-        if (
-            record is not None
-            and record.snapshot.state == "active"
-            and record.snapshot.expires_at <= now
-        ):
-            self._retire(record, state="expired", reason="ttl_expired")
-            self._pending_changes.append(record.snapshot)
+        if record is not None and self._expire(record, now):
+            self._pending_changes[key] = record.snapshot
         return record
 
     def _replay(
@@ -285,7 +291,7 @@ class ProtectionRegistry:
             raise ControlError(
                 "capacity", "Protection scope exceeds its traversal budget"
             )
-        nodes, slots = {}, set()
+        nodes, pages = {}, set()
         for prefix in prefixes:
             tokens = prefix.token_ids
             if not tokens or len(tokens) % self._core.page_size:
@@ -333,9 +339,9 @@ class ProtectionRegistry:
                         "Host prefix has an unsupported physical span layout",
                     )
                 nodes[node.id] = node
-                slots.update(value.tolist())
+                pages.update(value[:: self._core.page_size].tolist())
                 offset += matched
-        return tuple(nodes.values()), frozenset(slots)
+        return tuple(nodes.values()), frozenset(pages)
 
     def _hold(
         self, nodes: tuple[UnifiedTreeNode, ...]
@@ -354,59 +360,87 @@ class ProtectionRegistry:
         for node_id, receipt in reversed(holds):
             self._cache.dec_host_lock_ref(node_id, receipt)
 
+    def _hold_ttl(self, nodes, pages, ttl, *, replacing=None):
+        old_pages = replacing.pages if replacing is not None and replacing.holds else ()
+        added = len(pages.difference(self._physical_refs))
+        removed = sum(self._physical_refs[p] == 1 for p in set(old_pages) - pages)
+        if (len(self._physical_refs) + added - removed) * self._core.page_size > (
+            self.max_protected_tokens
+        ):
+            raise ControlError("capacity", "L2 protection token capacity exhausted")
+        holds = self._hold(nodes)
+        try:
+            now = self._now()
+            self._ttl(ttl, now)
+        except Exception:
+            self._release(holds)
+            raise
+        for page in pages:
+            self._physical_refs[page] = self._physical_refs.get(page, 0) + 1
+        return holds, now
+
+    def _set_priority(self, record: _Record, priority: int | None):
+        if record.snapshot.priority is None and priority is None:
+            return
+        for page in record.pages:
+            refs = self._priority_refs.setdefault(page, {})
+            if priority is None:
+                refs.pop(record.snapshot.key, None)
+            else:
+                refs[record.snapshot.key] = priority
+            if refs:
+                self.priorities[page] = max(refs.values())
+            else:
+                del self._priority_refs[page]
+                self.priorities.pop(page, None)
+
     def acquire(
         self,
         *,
         key: ProtectionKey,
         revision: int,
         prefixes: tuple[HostPrefix, ...],
-        ttl_seconds: float,
+        ttl_seconds: float | None = None,
+        priority: int | None = None,
     ) -> ProtectionSnapshot:
         self._check()
         _revision(revision)
         now = self._now()
-        ttl = self._ttl(ttl_seconds, now)
+        ttl, priority = self._parameters(ttl_seconds, priority, now)
         record = self._record(key, now)
-        fingerprint = ("acquire", prefixes, ttl)
+        fingerprint = ("acquire", prefixes, ttl, priority)
         replay = self._replay(record, revision, fingerprint)
         if replay is not None:
             return replay
         self._admit_key(record)
-        nodes, slots = self._resolve(prefixes)
-        old_slots = record.slots if record is not None else frozenset()
-        added = slots.difference(self._physical_refs)
-        removed = sum(self._physical_refs[s] == 1 for s in old_slots - slots)
-        if len(self._physical_refs) + len(added) - removed > self.max_protected_tokens:
-            raise ControlError("capacity", "L2 protection token capacity exhausted")
-        holds = self._hold(nodes)
-        try:
-            # The deadline starts only after the native holds are installed.
-            now = self._now()
-            self._ttl(ttl, now)
-        except Exception:
-            self._release(holds)
-            raise
+        nodes, pages = self._resolve(prefixes)
+        holds = ()
+        if ttl is not None:
+            holds, now = self._hold_ttl(nodes, pages, ttl, replacing=record)
         # Acquire the replacement first: an update never opens an eviction gap.
         if record is not None:
             self._drop_holds(record)
+            self._set_priority(record, None)
         snapshot = ProtectionSnapshot(
             key=key,
             revision=revision,
             state="active",
             prefixes=prefixes,
-            physical_tokens=len(slots),
+            physical_tokens=len(pages) * self._core.page_size,
             activated_at=now,
-            expires_at=now + ttl,
+            expires_at=now + ttl if ttl is not None else None,
             engine_id=self.engine_id,
             engine_epoch=self.engine_epoch,
             namespace=self.namespace,
+            priority=priority,
         )
-        self._records[key] = _Record(
-            snapshot=snapshot, fingerprint=fingerprint, slots=slots, holds=holds
+        replacement = _Record(
+            snapshot=snapshot, fingerprint=fingerprint, pages=pages, holds=holds
         )
-        for slot in slots:
-            self._physical_refs[slot] = self._physical_refs.get(slot, 0) + 1
-        self._active_count += 1
+        self._set_priority(replacement, priority)
+        self._records[key] = replacement
+        if record is None:
+            self._active_count += 1
         return snapshot
 
     def _admit_key(self, record: _Record | None) -> None:
@@ -429,14 +463,19 @@ class ProtectionRegistry:
             )
 
     def renew(
-        self, *, key: ProtectionKey, revision: int, ttl_seconds: float
+        self,
+        *,
+        key: ProtectionKey,
+        revision: int,
+        ttl_seconds: float | None = None,
+        priority: int | None = None,
     ) -> ProtectionSnapshot:
         self._check()
         _revision(revision)
         now = self._now()
-        ttl = self._ttl(ttl_seconds, now)
+        ttl, priority = self._parameters(ttl_seconds, priority, now)
         record = self._record(key, now)
-        fingerprint = ("renew", ttl)
+        fingerprint = ("renew", ttl, priority)
         replay = self._replay(record, revision, fingerprint)
         if replay is not None:
             return replay
@@ -445,8 +484,17 @@ class ProtectionRegistry:
                 "missing", "Renew requires an existing active protection claim"
             )
         self._admit_key(record)
+        if ttl is not None and not record.holds:
+            nodes, pages = self._resolve(record.snapshot.prefixes)
+            assert pages == record.pages
+            record.holds, now = self._hold_ttl(nodes, pages, ttl)
+        if priority is not None:
+            self._set_priority(record, priority)
         record.snapshot = msgspec.structs.replace(
-            record.snapshot, revision=revision, expires_at=now + ttl
+            record.snapshot,
+            revision=revision,
+            expires_at=now + ttl if ttl is not None else record.snapshot.expires_at,
+            priority=priority if priority is not None else record.snapshot.priority,
         )
         record.fingerprint = fingerprint
         return record.snapshot
@@ -488,16 +536,17 @@ class ProtectionRegistry:
         return record.snapshot
 
     def _drop_holds(self, record: _Record, *, release_holds: bool = True) -> None:
+        if not record.holds:
+            return
         if release_holds:
             self._release(record.holds)
-        for slot in record.slots:
-            count = self._physical_refs[slot] - 1
+        for page in record.pages:
+            count = self._physical_refs[page] - 1
             if count:
-                self._physical_refs[slot] = count
+                self._physical_refs[page] = count
             else:
-                del self._physical_refs[slot]
-        record.holds, record.slots = (), frozenset()
-        self._active_count -= 1
+                del self._physical_refs[page]
+        record.holds = ()
 
     def _retire(
         self,
@@ -509,9 +558,38 @@ class ProtectionRegistry:
     ) -> None:
         if record.snapshot.state == "active":
             self._drop_holds(record, release_holds=release_holds)
+            self._set_priority(record, None)
+            record.pages = frozenset()
+            self._active_count -= 1
             record.snapshot = msgspec.structs.replace(
-                record.snapshot, state=state, reason=reason
+                record.snapshot, state=state, reason=reason, priority=None
             )
+
+    def _expire(self, record: _Record, now: float) -> bool:
+        snapshot = record.snapshot
+        if (
+            snapshot.state != "active"
+            or snapshot.expires_at is None
+            or snapshot.expires_at > now
+        ):
+            return False
+        if snapshot.priority is None:
+            self._retire(record, state="expired", reason="ttl_expired")
+        else:
+            self._drop_holds(record)
+            record.snapshot = msgspec.structs.replace(snapshot, expires_at=None)
+        return True
+
+    def host_evicted(self, pages) -> tuple[ProtectionSnapshot, ...]:
+        self._check()
+        keys = {key for page in pages for key in self._priority_refs.get(page, ())}
+        changes = []
+        for key in keys:
+            record = self._records[key]
+            assert not record.holds, "Capacity eviction must respect L2 host holds"
+            self._retire(record, state="invalidated", reason="host_evicted")
+            changes.append(record.snapshot)
+        return tuple(changes)
 
     def get(self, key: ProtectionKey) -> ProtectionSnapshot | None:
         self._check()
@@ -521,9 +599,8 @@ class ProtectionRegistry:
     def expire(self, *, limit: int = 64) -> tuple[ProtectionSnapshot, ...]:
         """Retire a bounded batch and return unreported expiry/reset changes.
 
-        Lazy expiry in ``get``/``renew`` and reset detection also enqueue their
-        terminal change here. Each key contributes at most one such change,
-        keeping publication work within the revision record bound.
+        Lazy expiry and reset detection also enqueue their latest change per
+        claim, keeping publication work within the revision record bound.
         """
         self._check()
         if type(limit) is not int or not 1 <= limit <= 1 << 24:
@@ -531,13 +608,15 @@ class ProtectionRegistry:
                 "invalid", "Expiry batch must be a bounded positive integer"
             )
         now = self._now()
-        expired = self._pending_changes[:limit]
-        del self._pending_changes[:limit]
+        expired = []
+        for key in tuple(islice(self._pending_changes, limit)):
+            snapshot = self._pending_changes.pop(key)
+            if self._records[key].snapshot == snapshot:
+                expired.append(snapshot)
         if len(expired) == limit:
             return tuple(expired)
         for record in self._records.values():
-            if record.snapshot.state == "active" and record.snapshot.expires_at <= now:
-                self._retire(record, state="expired", reason="ttl_expired")
+            if self._expire(record, now):
                 expired.append(record.snapshot)
                 if len(expired) == limit:
                     break
@@ -583,7 +662,11 @@ class ProtectionRegistry:
     ) -> tuple[ProtectionSnapshot, ...]:
         self._check()
         _identifier(reason, "reason")
-        pending = tuple(self._pending_changes)
+        pending = tuple(
+            s
+            for key, s in self._pending_changes.items()
+            if self._records[key].snapshot == s
+        )
         self._pending_changes.clear()
         return pending + self._invalidate(reason, release_holds=not self._invalidated)
 
@@ -596,20 +679,19 @@ class ProtectionRegistry:
             (
                 r.snapshot.expires_at
                 for r in self._records.values()
-                if r.snapshot.state == "active"
+                if r.snapshot.state == "active" and r.snapshot.expires_at is not None
             ),
             default=None,
         )
 
     @property
     def has_background_work(self) -> bool:
-        self._check()
-        return self._active_count > 0 or bool(self._pending_changes)
+        return self.next_deadline is not None
 
     @property
     def protected_tokens(self) -> int:
         self._check()
-        return len(self._physical_refs)
+        return len(self._physical_refs) * self._core.page_size
 
     @property
     def active_claims(self) -> int:

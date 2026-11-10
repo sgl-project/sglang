@@ -60,12 +60,9 @@ pub struct Pin {
     pub claim_id: String,
     pub revision: u64,
     pub ttl_seconds: Option<f64>,
-    #[serde(default = "protection")]
-    pub required_protection: String,
+    pub priority: Option<i32>,
+    pub required_protection: Option<String>,
     pub owner_task: Option<crate::models::TaskIdentity>,
-}
-fn protection() -> String {
-    "eviction_exclusion".into()
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum ParsedAction {
@@ -131,7 +128,7 @@ pub fn parse_action(action: &Action) -> Result<ParsedAction, Error> {
     if action.action_type == "sglang.pin" {
         let pin: Pin = serde_json::from_value(action.payload.clone()).map_err(decode_error)?;
         validate_location(&pin.location)?;
-        if (pin.mode == "release") != pin.ttl_seconds.is_none() {
+        if (pin.mode == "release") != (pin.ttl_seconds.is_none() && pin.priority.is_none()) {
             return Err(Error::InvalidPayload);
         }
         return Ok(ParsedAction::Pin(pin));

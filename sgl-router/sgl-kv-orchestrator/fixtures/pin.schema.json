@@ -72,12 +72,33 @@
           ],
           "default": null
         },
-        "required_protection": {
-          "enum": [
-            "backend_soft_pin",
-            "eviction_exclusion"
+        "priority": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": -2147483648,
+              "maximum": 2147483647
+            },
+            {
+              "type": "null"
+            }
           ],
-          "default": "eviction_exclusion"
+          "default": null
+        },
+        "required_protection": {
+          "anyOf": [
+            {
+              "enum": [
+                "backend_soft_pin",
+                "eviction_exclusion",
+                "eviction_priority"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "owner_task": {
           "anyOf": [

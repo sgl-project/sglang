@@ -5,7 +5,7 @@ actions:
 
 | Action | Effect |
 | --- | --- |
-| `sglang.pin` | Acquire, renew, or release finite eviction protection for existing host KV. |
+| `sglang.pin` | Set a TTL, eviction priority, or both for existing host KV. |
 | `sglang.prefetch` | Prepare a supported destination while keeping the source. |
 | `sglang.demote` | Preserve data at a lower tier, then reclaim the eligible source range. |
 
@@ -71,6 +71,15 @@ Use a target that matches the worker's page size, layout and cache salt. A PIN
 requires an already published host copy; it does not copy missing data. An
 attached PIN targeting `"request_cached"` binds only after successful request
 completion and cache checkpointing.
+
+Acquiring or renewing a PIN requires `ttl_seconds`, `priority`, or both.
+TTL starts on the Engine after it holds the host pages. The optional signed
+32-bit priority changes eviction order without holding a reference:
+unranked pages are reclaimed first, then ranked pages from lowest to highest.
+Shared pages use the highest active priority. A TTL expiry removes the hold
+and keeps any assigned priority. Renewal updates only supplied fields;
+release supplies neither. Eviction invalidates the claim before slots can be
+reused. The claim view reports its own priority and any remaining hard TTL.
 
 Use `query` and `claim` to inspect the result. `cancel` drains worker access before
 releasing resources. Acknowledge with `ack` once the operation is quiescent. An

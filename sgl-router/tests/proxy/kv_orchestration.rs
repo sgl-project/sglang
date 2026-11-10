@@ -91,6 +91,7 @@ async fn capabilities(State(state): State<Arc<Mutex<EngineState>>>) -> Json<Valu
     let mut reply = json!({"success":true,"data":{"engine_id":"mock-engine","engine_epoch":s.epoch,"namespace":"weights-v1",
         "cache_salt_encoding":"owner_assertion","executor":{"cache_generation":1},"public_protocol":{"actions":{"sglang.prefetch":["1.0"],"sglang.demote":["1.0"],"sglang.pin":["1.0"]},
         "paths":{"sglang.prefetch":[["storage","host"],["host","gpu"]],"sglang.demote":[["host","storage"]]},
+        "pin_protections":[{"tier":"host","condition":"eviction_exclusion"},{"tier":"host","condition":"eviction_priority"}],
         "storage_backend":"mooncake","backend_namespace":"pool-a","storage_targets":true,"prefix":{"namespace":"weights-v1","layout_id":"full:p1","page_size":1,"components":["full"],"hash_scheme":"sglang.sha256.u32le.i64.v1"}}}});
     if s.feedback && !s.hide_feedback {
         reply["data"]["feedback"] = json!({"query":"events","version":"1.0","source_id":"control:mock","source_epoch":s.feedback_epoch,
@@ -201,7 +202,9 @@ fn command_now(
             let payload = &action["payload"];
             let epoch = s.epoch.clone();
             s.claims.insert(payload["claim_id"].as_str().unwrap().into(),json!({"owner_epoch":epoch,"revision":payload["revision"],
-                "state":if payload["mode"]=="release"{"released"}else{"active"},"effective_protection":"eviction_exclusion","actual_scope":[{"start_token":0,"end_token":count}]}));
+                "state":if payload["mode"]=="release"{"released"}else{"active"},"priority":payload["priority"],
+                "effective_protection":if payload["ttl_seconds"].is_null(){"eviction_priority"}else{"eviction_exclusion"},
+                "actual_scope":[{"start_token":0,"end_token":count}]}));
         }
         s.operations.entry(id).or_insert(result);
         if !s.running && action["action_type"] == "sglang.prefetch" {
@@ -750,10 +753,11 @@ async fn l2_pin_queries_claim_state_and_task_finish_releases_without_engine_task
     let router = router(&[&engine], false, true).await;
     start(&router, "task").await;
     let view=api(&router,json!({"kind":"submit","task":task("task"),"message_id":"keep","action":"sglang.pin","target":prefix(vec![1,2,3,4]),
-        "location":{"tier":"host"},"mode":"acquire","claim_id":"keep","revision":1,"ttl_seconds":10,"required_protection":"eviction_exclusion"})).await;
+        "location":{"tier":"host"},"mode":"acquire","claim_id":"keep","revision":1,"priority":0})).await;
     assert_eq!(view["operations"].as_array().unwrap().len(), 1);
     let view = query(&router, "task", "keep").await;
     assert_eq!(view["operations"][0]["claim"]["state"], "active");
+    assert_eq!(view["operations"][0]["claim"]["priority"], 0);
     assert!(view["operations"][0]["ready_scope"].is_null());
     event(&router, "task", "task_finished", 1, "finish").await;
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -769,6 +773,10 @@ async fn l2_pin_queries_claim_state_and_task_finish_releases_without_engine_task
     .unwrap();
     let state = engine.state.lock().unwrap();
     assert_eq!(state.claims.len(), 1);
+    assert!(state.commands.iter().any(|c| {
+        let pin = &c["envelope"]["actions"][0]["payload"];
+        pin["mode"] == "release" && pin["priority"].is_null() && pin["ttl_seconds"].is_null()
+    }));
     assert!(state
         .commands
         .iter()

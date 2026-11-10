@@ -72,6 +72,7 @@ class CacheControlState:
         self.config = config
         self.clock = time.monotonic
         self.generation = 0
+        self.host_priorities: dict[int, int] = {}
         self._binding: tuple[str, str] | None = None
         self._binding_generation = -1
 
@@ -92,3 +93,4 @@ class CacheControlState:
 
     def reset(self):
         self.generation += 1
+        self.host_priorities.clear()

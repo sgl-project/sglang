@@ -434,7 +434,8 @@
             {
               "enum": [
                 "backend_soft_pin",
-                "eviction_exclusion"
+                "eviction_exclusion",
+                "eviction_priority"
               ]
             },
             {
@@ -449,6 +450,19 @@
               "type": "number",
               "exclusiveMinimum": 0,
               "maximum": 31536000
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "priority": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": -2147483648,
+              "maximum": 2147483647
             },
             {
               "type": "null"

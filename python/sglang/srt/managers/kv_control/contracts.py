@@ -258,9 +258,10 @@ class Pin(Value):
     claim_id: Identifier
     revision: Position
     ttl_seconds: Seconds | None = None
-    required_protection: Literal["eviction_exclusion", "backend_soft_pin"] = (
-        "eviction_exclusion"
-    )
+    priority: Priority | None = None
+    required_protection: (
+        Literal["eviction_exclusion", "eviction_priority", "backend_soft_pin"] | None
+    ) = None
     # Explicit demand ownership, independent of the selected content/session.
     owner_task: TaskIdentity | None = None
 
@@ -277,10 +278,11 @@ class ClaimState(Value):
     # A release tombstone fences late renewals without asserting live protection.
     protection_version: Literal["1.0"] = "1.0"
     tombstone: bool = False
-    effective_protection: Literal["eviction_exclusion", "backend_soft_pin"] | None = (
-        None
-    )
+    effective_protection: (
+        Literal["eviction_exclusion", "eviction_priority", "backend_soft_pin"] | None
+    ) = None
     remaining_ttl: Seconds | None = None
+    priority: Priority | None = None
     owner_task: TaskIdentity | None = None
     actual_scope: tuple[TargetOutcome, ...] = ()
     location: PublicLocation | None = None
@@ -548,9 +550,12 @@ def validate_prefix(target: PrefixTarget) -> None:
 
 def validate_public(payload):
     if isinstance(payload, Pin):
-        if (payload.mode == "release") != (payload.ttl_seconds is None):
+        if (payload.mode == "release") != (
+            payload.ttl_seconds is None and payload.priority is None
+        ):
             raise ControlError(
-                "invalid_payload", "Acquire/renew require TTL; release must omit TTL"
+                "invalid_payload",
+                "Acquire/renew require TTL or priority; release omits both",
             )
         if payload.ttl_seconds is not None and not math.isfinite(payload.ttl_seconds):
             raise ControlError("invalid_payload", "TTL must be finite")

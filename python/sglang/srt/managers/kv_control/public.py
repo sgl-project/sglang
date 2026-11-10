@@ -87,17 +87,34 @@ def public_capabilities(caps):
 def normalize_public(payload, caps):
     capability = public_capabilities(caps)
     if isinstance(payload, Pin):
-        if (
-            not (
-                capability["pin_protections"]
-                if payload.mode == "acquire"
-                else caps.get("pin_protections", ())
+        protections = (
+            capability["pin_protections"]
+            if payload.mode == "acquire"
+            else caps.get("pin_protections", ())
+        )
+        conditions = {p["condition"] for p in protections if p["tier"] == "host"}
+        requested = {
+            condition
+            for condition, enabled in (
+                ("eviction_exclusion", payload.ttl_seconds is not None),
+                ("eviction_priority", payload.priority is not None),
             )
+            if enabled
+        }
+        required = payload.required_protection
+        if (
+            not conditions
             or payload.location.tier != "host"
-            or payload.required_protection != "eviction_exclusion"
+            or not requested <= conditions
+            or required is not None
+            and (
+                required not in conditions
+                or payload.mode == "acquire"
+                and required not in requested
+            )
         ):
             raise ControlError(
-                "unsupported", "Only local host eviction exclusion is executable"
+                "unsupported", "Requested local host protection is unavailable"
             )
         locations = (payload.location,)
     else:

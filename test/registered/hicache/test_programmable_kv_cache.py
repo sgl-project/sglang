@@ -174,6 +174,35 @@ class TestProgrammableKVCache(CustomTestCase):
                 )
             )
             self._evict_to_host(cache, len(tokens))
+            context = service.control.context("test")
+            pin = service.control.submit(
+                KvHintsEnvelope(
+                    protocol_version="0.1",
+                    message_id="keep",
+                    actions=[
+                        KvHintAction(
+                            action_id="a",
+                            action_type="sglang.pin",
+                            action_version="1.0",
+                            payload={
+                                "mode": "acquire",
+                                "claim_id": "keep",
+                                "revision": 1,
+                                "target": msgspec.json.decode(
+                                    msgspec.json.encode(target)
+                                ),
+                                "location": {"tier": "host"},
+                                "priority": 0,
+                            },
+                        )
+                    ],
+                ),
+                context,
+            ).results[0]
+            self.assertEqual(pin.status, Status.COMPLETED)
+            self.assertEqual(
+                pin.public_result.claim.effective_protection, "eviction_priority"
+            )
             host = cache.host_pool_group.anchor_entry.host_pool
             available = host.available_size()
             location = {"tier": "storage", "backend": "mooncake"}
@@ -184,6 +213,10 @@ class TestProgrammableKVCache(CustomTestCase):
                 ).ref,
             )
             self.assertTrue(saved.public_result.reclaimed_scope)
+            claim = service.control.executor.protection.get(
+                caller_id="test", claim_id="keep", owner_task=None
+            )
+            self.assertEqual(claim.state, "invalidated")
             self.assertEqual(host.available_size(), available + len(tokens))
             self.assertFalse(cache.tree_core.root_node.children)
             self._wait(

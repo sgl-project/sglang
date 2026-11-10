@@ -421,8 +421,19 @@ class KVControlService:
             self.feedback.close()
         atexit.unregister(self.close)
 
+    def progress_protection(self, *, limit=64):
+        protection = self.control.executor.protection
+        if protection is not None:
+            for claim in protection.progress(limit=limit):
+                self.feedback.append("claim", claim.caller_id, claim)
+
+    def host_protection_evicted(self, values):
+        protection = self.control.executor.protection
+        if protection is not None and protection.registry.priorities:
+            for claim in protection.host_evicted(values):
+                self.feedback.append("claim", claim.caller_id, claim)
+
     def progress(self):
-        executor = self.control.executor
         backend = self._backend_identity()
         if (
             backend[0] != self._feedback_backend[0]
@@ -444,9 +455,7 @@ class KVControlService:
 
         if self.has_pending:
             self.control.progress()
-        if executor.protection is not None:
-            for claim in executor.protection.progress():
-                self.feedback.append("claim", claim.caller_id, claim)
+        self.progress_protection()
         self.feedback.flush()
 
     def reset_after_cache_flush(self):

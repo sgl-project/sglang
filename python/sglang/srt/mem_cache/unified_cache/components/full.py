@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -257,27 +258,63 @@ class FullComponent(TreeComponent):
     ) -> None:
         """Evict host leaves to free KV host pool space."""
         self._ensure_eviction_strategy()
-        heap = [
-            (self.session_ref_eviction_strategy(n), n)
-            for n in self.tree_core.evictable_host_leaves
-        ]
-        heapq.heapify(heap)
+        tree = self.tree_core
         ct = self.component_type
+        priorities = tree.control_state.host_priorities if tree.control_state else None
+        reclaim_duplicates = (
+            tree.is_write_back
+            and not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
+        )
+        if reclaim_duplicates:
+            tree._reclaim_full_host_duplicates(
+                num_tokens,
+                tracker,
+                device_frees,
+                host_frees,
+                cache_actions,
+                host_priorities=priorities,
+            )
+        if tracker[ct] >= num_tokens:
+            return
+        leaf_key = self.session_ref_eviction_strategy
+        if priorities:
+
+            def priority_key(node):
+                slot = int(node.component_data[ct].host_value[0])
+                priority = priorities.get(slot)
+                return (priority is not None, priority or 0)
+
+            def leaf_key(node):
+                return priority_key(node), 2, self.session_ref_eviction_strategy(node)
+
+        heap = [(leaf_key(n), n) for n in tree.evictable_host_leaves]
+        if priorities and reclaim_duplicates:
+            # At the same priority retain duplicate-first ordering, including
+            # the existing preference to spare imminent GPU demotions.
+            heap.extend(
+                ((priority_key(n), n in tree.evictable_device_leaves, i), n)
+                for i, n in enumerate(tree.full_host_duplicates.values())
+                if tree._can_reclaim_full_host_duplicate(n)
+            )
+        heapq.heapify(heap)
         while tracker[ct] < num_tokens and heap:
             _, x = heapq.heappop(heap)
-            if x not in self.tree_core.evictable_host_leaves:
+            if x not in tree.evictable_host_leaves:
+                if (
+                    priorities
+                    and reclaim_duplicates
+                    and tree._can_reclaim_full_host_duplicate(x)
+                ):
+                    tree._release_full_host_duplicate(
+                        x, tracker, device_frees, host_frees, cache_actions
+                    )
+                    tree.full_host_duplicates.pop(x.id, None)
                 continue
-            self.tree_core._evict_host_leaf(
+            tree._evict_host_leaf(
                 x, tracker, device_frees, host_frees, cache_actions=cache_actions
             )
-            if (
-                x.parent is not None
-                and x.parent in self.tree_core.evictable_host_leaves
-            ):
-                heapq.heappush(
-                    heap,
-                    (self.session_ref_eviction_strategy(x.parent), x.parent),
-                )
+            if x.parent is not None and x.parent in tree.evictable_host_leaves:
+                heapq.heappush(heap, (leaf_key(x.parent), x.parent))
 
     def acquire_component_lock(
         self,

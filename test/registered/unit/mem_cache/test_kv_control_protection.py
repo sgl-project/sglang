@@ -520,6 +520,7 @@ def pin_command(
     revision=1,
     claim_id="pin",
     ttl=10,
+    priority=None,
     owner_task=None,
     selection=None,
     salt=None,
@@ -549,6 +550,8 @@ def pin_command(
     }
     if mode != "release":
         payload["ttl_seconds"] = ttl
+    if priority is not None:
+        payload["priority"] = priority
     return {
         "kind": "submit",
         "context": msgspec.to_builtins(service.control.context(caller)),
@@ -1037,6 +1040,104 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
             self.assertEqual(cache.evict_host(100), 0)
             run_pin(service, caller="B", mode="release", revision=2, message="done")
             self.assertEqual(cache.evict_host(100), 4)
+            cache.sanity_check()
+
+    def test_priority_orders_host_leaves_and_gpu_duplicates_without_holds(self):
+        with transfer_fixtures.hicache(self) as owner:
+            _, cache, service, dma = owner
+            high = host_copy(owner)
+            low = transfer_fixtures.seed(cache, (5, 6, 7, 8))
+            ordinary = transfer_fixtures.seed(cache, (9, 10, 11, 12))
+            for node in (low, ordinary):
+                transfer_fixtures.backup_prefix(cache, dma, node, evict=True)
+            self.assertIn(high.id, cache.tree_core.full_host_duplicates)
+
+            pin = run_pin(service, ttl=None, priority=0)
+            state = pin["public_result"]["claim"]
+            self.assertEqual(state["effective_protection"], "eviction_priority")
+            self.assertEqual(state["priority"], 0)
+            self.assertIsNone(state["remaining_ttl"])
+            run_pin(
+                service,
+                message="low",
+                claim_id="low",
+                ttl=None,
+                priority=-5,
+                selection=msgspec.to_builtins(cache_fixtures.target((5, 6, 7, 8))),
+            )
+            protection = service.control.executor.protection
+            self.assertEqual(protection.registry.protected_tokens, 0)
+            self.assertIsNone(protection.next_deadline)
+
+            for evicted in (ordinary, low, high):
+                self.assertEqual(cache.evict_host(4), 4)
+                self.assertIsNone(evicted.component_data[FULL].host_value)
+            self.assertIsNotNone(high.component_data[FULL].value)
+            self.assertEqual(query_claim(service)["data"]["state"], "invalidated")
+            self.assertFalse(protection.registry.priorities)
+            cache.sanity_check()
+
+    def test_shared_priority_survives_ttl_split_and_never_follows_recycled_slots(self):
+        with transfer_fixtures.hicache(self) as owner:
+            _, cache, service, dma = owner
+            leaf = transfer_fixtures.seed(cache)
+            alternate = transfer_fixtures.seed(cache, (9, 10, 11, 12))
+            for node in (leaf, alternate):
+                transfer_fixtures.backup_prefix(cache, dma, node, evict=True)
+            old_slots = set(leaf.component_data[FULL].host_value.tolist())
+            run_pin(service, ttl=2, priority=0)
+            run_pin(service, caller="B", message="b", ttl=None, priority=7)
+            run_pin(
+                service,
+                message="other",
+                claim_id="other",
+                ttl=None,
+                priority=3,
+                selection=msgspec.to_builtins(cache_fixtures.target((9, 10, 11, 12))),
+            )
+            cache_fixtures.match_len(cache, (1, 2))
+            parent = leaf.parent
+            self.assertIsNot(parent, cache.tree_core.root_node)
+            self.assertEqual(parent.component_data[FULL].host_lock_ref, 1)
+            updated = run_pin(
+                service,
+                mode="renew",
+                message="priority",
+                revision=2,
+                ttl=None,
+                priority=1,
+            )["public_result"]["claim"]
+            self.assertEqual(updated["remaining_ttl"], 2)
+            self.clock.now = 102
+            # No service tick: capacity eviction itself expires native holds.
+            self.assertEqual(cache.evict_host(4), 4)
+            self.assertIsNone(alternate.component_data[FULL].host_value)
+            self.assertIsNotNone(leaf.component_data[FULL].host_value)
+            self.assertEqual(parent.component_data[FULL].host_lock_ref, 0)
+            self.assertEqual(leaf.component_data[FULL].host_lock_ref, 0)
+            state = query_claim(service)["data"]
+            self.assertEqual((state["state"], state["priority"]), ("active", 1))
+            self.assertIsNone(state["remaining_ttl"])
+            run_pin(
+                service, caller="B", mode="release", revision=2, message="release-b"
+            )
+
+            # A TTL renewal keeps the supplied priority and reestablishes the
+            # native holds on both segments of the split.
+            renewed = run_pin(service, mode="renew", message="ttl", revision=3, ttl=2)
+            self.assertEqual(renewed["public_result"]["claim"]["priority"], 1)
+            self.assertEqual(cache.evict_host(4), 0)
+            pool = cache.host_pool_group.anchor_entry.host_pool
+            reserved = pool.alloc(pool.available_size())
+            self.clock.now = 104
+            self.assertEqual(cache.evict_host(4), 4)
+            self.assertEqual(query_claim(service)["data"]["state"], "invalidated")
+            fresh = host_copy(owner, (13, 14, 15, 16))
+            self.assertEqual(
+                set(fresh.component_data[FULL].host_value.tolist()), old_slots
+            )
+            self.assertEqual(cache.evict_host(4), 4)
+            pool.free(reserved)
             cache.sanity_check()
 
     def test_idle_expiry_publishes_after_operation_completion_without_early_scans(self):

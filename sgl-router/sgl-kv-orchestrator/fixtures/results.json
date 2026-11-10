@@ -115,6 +115,7 @@
       "tombstone": true,
       "effective_protection": null,
       "remaining_ttl": null,
+      "priority": null,
       "owner_task": null,
       "actual_scope": [],
       "location": null

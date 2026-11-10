@@ -27,7 +27,6 @@ import msgspec
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -1963,18 +1962,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = DriveHostEvictionResult()
         comp = self.components_by_type.get(component_type)
         if comp is not None:
-            if (
-                not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
-                and self.is_write_back
-                and component_type == BASE_COMPONENT_TYPE
-            ):
-                self._reclaim_full_host_duplicates(
-                    num_tokens,
-                    result.tracker,
-                    result.device_frees,
-                    result.host_frees,
-                    cache_actions=result.cache_actions,
-                )
             comp.drive_host_eviction(
                 num_tokens,
                 result.tracker,
@@ -2005,6 +1992,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
         cache_actions: list[CacheAction | ComponentAction],
+        *,
+        host_priorities: dict[int, int] | None = None,
     ) -> None:
         """Reclaim Full host duplicates until num_tokens are freed; pass 1
         spares evictable D-leaves (imminent free demotes), pass 2 takes them."""
@@ -2018,6 +2007,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 cd = node.component_data[BASE_COMPONENT_TYPE]
                 if cd.value is None or cd.host_value is None:
                     swept_ids.append(node.id)  # stale entry
+                    continue
+                if host_priorities and int(cd.host_value[0]) in host_priorities:
                     continue
                 if spare_imminent_demotes and node in self.evictable_device_leaves:
                     continue

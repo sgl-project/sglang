@@ -123,6 +123,7 @@ class HostCacheProtection:
                 if name != "max_events"
             },
         )
+        executor.control_state.host_priorities = self.registry.priorities
         self._scopes: dict[ProtectionKey, tuple[TargetOutcome, ...]] = {}
         self._owners: dict[ProtectionKey, TaskIdentity | None] = {}
         self._events: deque[ClaimEvent] = deque(maxlen=limits.max_events)
@@ -138,25 +139,14 @@ class HostCacheProtection:
     def has_background_work(self) -> bool:
         return self._deadline is not None
 
-    def owns_host_refs(self, node):
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-
-        cd = node.component_data[ComponentType.FULL]
-        if cd.host_value is None or not cd.host_value.numel():
-            return False
-        counts = {
-            self.registry._physical_refs.get(slot, 0) for slot in cd.host_value.tolist()
-        }
-        return counts == {cd.host_lock_ref}
-
     def state(self, snapshot: ProtectionSnapshot) -> ClaimState:
+        remaining = None
+        if snapshot.state == "active" and snapshot.expires_at is not None:
+            remaining = snapshot.expires_at - self.clock()
+            if remaining <= 0:
+                snapshot = self.registry.get(snapshot.key)
+                remaining = None
         active = snapshot.state == "active"
-        remaining = max(0.0, snapshot.expires_at - self.clock()) if active else None
-        # A clock advancing between registry lookup and projection cannot yield
-        # a positive protection assertion past its confirmed deadline.
-        if active and remaining <= 0:
-            snapshot = self.registry.get(snapshot.key)
-            active, remaining = False, None
         owner = self._owners.get(snapshot.key)
         return ClaimState(
             caller_id=snapshot.key.caller_id,
@@ -166,8 +156,15 @@ class HostCacheProtection:
             state=snapshot.state,
             owner_epoch=snapshot.engine_epoch,
             tombstone=not active,
-            effective_protection="eviction_exclusion" if active else None,
+            effective_protection=(
+                "eviction_exclusion"
+                if remaining is not None
+                else "eviction_priority"
+                if active and snapshot.priority is not None
+                else None
+            ),
             remaining_ttl=remaining,
+            priority=snapshot.priority,
             owner_task=owner,
             actual_scope=self._scopes.get(snapshot.key, ()),
             location=PublicLocation(tier="host", engine_id=self.executor.engine_id),
@@ -223,6 +220,11 @@ class HostCacheProtection:
         self._deadline = self.registry.next_deadline
         return changed
 
+    def host_evicted(self, values):
+        page_size = self.executor.core.page_size
+        pages = (page for value in values for page in value[::page_size].tolist())
+        return tuple(self._publish(s) for s in self.registry.host_evicted(pages))
+
     def _prefixes(self, scope):
         self.executor._check(scope)
         end = scope.requested.end_token
@@ -270,6 +272,7 @@ class HostCacheProtection:
                     revision=payload.revision,
                     prefixes=self._prefixes(scope),
                     ttl_seconds=payload.ttl_seconds,
+                    priority=payload.priority,
                 )
                 if snapshot.state == "active":
                     self._scopes[key] = self.outcomes(
@@ -277,7 +280,10 @@ class HostCacheProtection:
                     )
             elif payload.mode == "renew":
                 snapshot = self.registry.renew(
-                    key=key, revision=payload.revision, ttl_seconds=payload.ttl_seconds
+                    key=key,
+                    revision=payload.revision,
+                    ttl_seconds=payload.ttl_seconds,
+                    priority=payload.priority,
                 )
             else:
                 snapshot = self.registry.release(key=key, revision=payload.revision)

@@ -285,7 +285,8 @@
         "claim_id": "c",
         "revision": 3,
         "required_protection": "eviction_exclusion",
-        "ttl_seconds": 60
+        "ttl_seconds": 60,
+        "priority": -2147483648
       }
     },
     "valid": true

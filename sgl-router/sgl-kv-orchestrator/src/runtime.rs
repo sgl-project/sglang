@@ -238,6 +238,15 @@ fn validate_input(value: &Value) -> Result<(), String> {
             return Err("invalid ttl_seconds".into());
         }
     }
+    if let Some(priority) = value.get("priority").filter(|priority| !priority.is_null()) {
+        if priority
+            .as_i64()
+            .and_then(|n| i32::try_from(n).ok())
+            .is_none()
+        {
+            return Err("invalid priority".into());
+        }
+    }
     for tokens in [
         value.get("input_ids"),
         value.get("target").and_then(|v| v.get("token_ids")),
@@ -304,7 +313,7 @@ struct Intent {
     admission_gaps: Vec<String>,
     jobs: Vec<String>,
     frozen: FrozenTarget,
-    expires: Instant,
+    expires: Option<Instant>,
     released: bool,
 }
 enum WaitFor {
@@ -939,7 +948,12 @@ impl Actor {
                 if !self.intents[&demand].released
                     && ids.iter().any(|id| {
                         self.jobs.get(id).is_some_and(|job| {
-                            job.action == "sglang.pin" && job.payload["mode"] != "release"
+                            job.action == "sglang.pin"
+                                && job.payload["mode"] != "release"
+                                && !matches!(
+                                    job.claim_view["state"].as_str(),
+                                    Some("expired" | "released" | "invalidated")
+                                )
                         })
                     })
                 {
@@ -1145,21 +1159,13 @@ impl Actor {
                 Some((url, caps))
             })
             .collect();
-        let mut expires = Instant::now()
+        let deadline = Instant::now()
             + Duration::from_millis(
                 value["ttl_ms"]
                     .as_u64()
                     .unwrap_or(self.config.operation_ttl_ms)
                     .min(self.config.operation_ttl_ms),
             );
-        if action == "sglang.pin" {
-            if let Some(ttl) = value["ttl_seconds"]
-                .as_f64()
-                .filter(|ttl| ttl.is_finite() && *ttl > 0.0 && *ttl <= 31_536_000.0)
-            {
-                expires = Instant::now() + Duration::from_secs_f64(ttl);
-            }
-        }
         let mut planned = BTreeMap::new();
         let mut ids = BTreeSet::new();
         let mut missing = Vec::new();
@@ -1177,6 +1183,12 @@ impl Actor {
                         c.public["actions"][action]
                             .as_array()
                             .is_some_and(|a| a.iter().any(|v| v == "1.0"))
+                            && (value["priority"].is_null()
+                                || c.public["pin_protections"].as_array().is_some_and(|ps| {
+                                    ps.iter().any(|p| {
+                                        p["tier"] == "host" && p["condition"] == "eviction_priority"
+                                    })
+                                }))
                     } else {
                         c.path(action, source, destination)
                     }
@@ -1195,9 +1207,15 @@ impl Actor {
                 }
             }
             let payload = if action == "sglang.pin" {
-                json!({"target":prefix,"location":{"tier":pin_tier,"engine_id":caps.engine_id},"mode":value["mode"],
+                let mut payload = json!({"target":prefix,"location":{"tier":pin_tier,"engine_id":caps.engine_id},"mode":value["mode"],
                 "claim_id":format!("claim-{}",digest(&(self.config.caller_id.as_str(),&task,&value["claim_id"],&prefix))),"revision":value["revision"],
-                "ttl_seconds":value["ttl_seconds"],"required_protection":value.get("required_protection").cloned().unwrap_or(json!("eviction_exclusion"))})
+                "ttl_seconds":value["ttl_seconds"]});
+                for key in ["priority", "required_protection"] {
+                    if !value[key].is_null() {
+                        payload[key] = value[key].clone();
+                    }
+                }
+                payload
             } else {
                 json!({"target":prefix,"source":src,"destination":dst,"allow_partial":value["allow_partial"].as_bool().unwrap_or(false),"timeout_ms":self.config.operation_ttl_ms})
             };
@@ -1241,7 +1259,7 @@ impl Actor {
                         releasing_pin: false,
                         cancel_sent: false,
                         quiescent: false,
-                        deadline: expires,
+                        deadline,
                         last_error: None,
                         cache_watermark: Value::Null,
                         ready_end: 0,
@@ -1312,7 +1330,9 @@ impl Actor {
                 admission_gaps: missing,
                 jobs: ids.into_iter().collect(),
                 frozen,
-                expires,
+                // Only the Engine owns the TTL clock. Priority and TTL claims
+                // stay associated with the task until explicit cleanup.
+                expires: (action != "sglang.pin").then_some(deadline),
                 released: false,
             },
         );
@@ -1338,7 +1358,7 @@ impl Actor {
         let expired: Vec<_> = self
             .intents
             .iter()
-            .filter(|(_, i)| !i.released && i.expires <= now)
+            .filter(|(_, i)| !i.released && i.expires.is_some_and(|deadline| deadline <= now))
             .map(|(d, _)| d.clone())
             .collect();
         for d in expired {
@@ -1434,6 +1454,9 @@ impl WorkerPoll {
                 .ok_or("claim revision absent")?
                 .saturating_add(1));
             payload["ttl_seconds"] = Value::Null;
+            let fields = payload.as_object_mut().expect("PIN payload object");
+            fields.remove("priority");
+            fields.remove("required_protection");
             job.message_id = format!("{}-release", job.id);
             job.submitted = false;
             job.attempted = false;

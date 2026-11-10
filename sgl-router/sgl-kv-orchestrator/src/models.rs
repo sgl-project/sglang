@@ -86,6 +86,7 @@ pub struct ClaimState {
     pub protection_version: String,
     pub effective_protection: Option<String>,
     pub remaining_ttl: Option<f64>,
+    pub priority: Option<i32>,
     pub owner_task: Option<TaskIdentity>,
     #[serde(default)]
     pub actual_scope: Vec<Value>,

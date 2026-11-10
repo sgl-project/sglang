@@ -240,13 +240,14 @@ class UnifiedCacheExecutor:
         supported = not reason and not self.core.enable_external_cache_linker
         return {
             "namespace": self.config.namespace,
-            "pin_protections": (
+            "pin_protections": tuple(
                 {
                     "tier": "host",
-                    "condition": "eviction_exclusion",
+                    "condition": condition,
                     "owner": "engine",
                     "scope": "complete_full_prefix_at_existing_boundary",
-                },
+                }
+                for condition in ("eviction_exclusion", "eviction_priority")
             )
             if supported and self.protection is not None
             else (),

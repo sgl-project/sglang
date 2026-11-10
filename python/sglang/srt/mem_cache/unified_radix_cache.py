@@ -1518,6 +1518,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self, host_frees: dict[ComponentType, list[torch.Tensor]]
     ) -> None:
         # Free per component host-pool slots, consuming each entry as it frees.
+        if host_frees.get(BASE_COMPONENT_TYPE):
+            service = getattr(self, "kv_control_service", None)
+            if service is not None:
+                service.host_protection_evicted(host_frees[BASE_COMPONENT_TYPE])
         for ct in list(host_frees):
             self.components[ct].free_host_values(host_frees.pop(ct))
 
@@ -1529,6 +1533,11 @@ class UnifiedRadixCache(BasePrefixCache):
             # The tree never holds host values in buffer mode, and staging
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
+        service = getattr(self, "kv_control_service", None)
+        if service is not None:
+            service.progress_protection(
+                limit=service.config.protection_limits.max_claims
+            )
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._apply_eviction_result(result)
         return result.tracker.get(component_type, 0)
