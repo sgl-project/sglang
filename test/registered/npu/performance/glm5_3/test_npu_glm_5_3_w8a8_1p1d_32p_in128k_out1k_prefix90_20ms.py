@@ -169,10 +169,10 @@ GLM_5_3_PD_SEP_MODEL_CONFIG = {
 }
 
 
-class TestNPUGLM5_3_W8A8_2P2D_32P_In128k_Out1k_Prefix90_20ms(
+class TestNPUGLM5_3_W8A8_1P1D_32P_In128k_Out1k_Prefix90_20ms(
     TestNpuPerfMultiNodePdSepTestCaseBase
 ):
-    """Test NPU performance for GLM-5.3-w8a8 PD separation 2p2d in128k out1k prefix90"""
+    """Test NPU performance for GLM-5.3-w8a8 PD separation 1p1d in128k out1k prefix90"""
 
     model_config = GLM_5_3_PD_SEP_MODEL_CONFIG
     benchmark_tool = AISBENCHMARK
@@ -187,7 +187,7 @@ class TestNPUGLM5_3_W8A8_2P2D_32P_In128k_Out1k_Prefix90_20ms(
     tpot = 20
     output_token_throughput = 800
 
-    def test_npu_glm_5_3_w8a8_2p2d_32p_in128k_out1k_prefix90_20ms(self):
+    def test_npu_glm_5_3_w8a8_1p1d_32p_in128k_out1k_prefix90_20ms(self):
         """Run NPU performance test for GLM-5.3-w8a8 PD separation"""
         self.run_throughput()
 
