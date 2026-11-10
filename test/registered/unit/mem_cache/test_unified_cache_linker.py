@@ -1396,6 +1396,39 @@ class TestUnifiedCacheLinkerPythonBackend(
 
         return consumer, consumer_req_pool, consumer_linker
 
+    def test_mamba_state_attached_to_a_stored_node_is_offloaded(self):
+        self.cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.MAMBA),
+            kv_size=64,
+            max_context_len=64,
+        )
+        cache, allocator, req_pool = build_fixture(self.cfg)
+        linker = _InMemoryUnifiedCacheLinker(defaultdict(set))
+        cache.init_cache_linker(linker)
+        tokens = list(range(1, 7))
+        node = self._insert(cache, allocator, req_pool, tokens).last_device_node
+        for _ in linker.offload_calls:
+            linker.complete_next_offload(True)
+        cache.check_hicache_events()
+        offloads = len(linker.offload_calls)
+
+        # A recompute re-attaches the state the device dropped; the node is
+        # already stored, so the write-through chain skips it.
+        self._evict_device_component(cache, node, ComponentType.MAMBA)
+        again = self._insert(cache, allocator, req_pool, tokens)
+        self.assertEqual(again.last_device_node, node)
+        self.assertEqual(len(linker.offload_calls), offloads)
+
+        cache.linker.offload_new_state(node)
+        (state,) = linker.offload_calls[-1]
+        self.assertEqual(state.name, PoolName.MAMBA)
+        self.assertEqual(state.keys, cache.tree_core.get_hash_values(node)[-1:])
+        linker.complete_next_offload(True)
+        cache.check_hicache_events()
+        self.assertEqual(cache.linker.pending_offloads, [])
+        cache.sanity_check()
+
     def test_mamba_state_round_trips_only_at_its_checkpoint(self):
         tokens = list(range(1, 7))
         consumer, consumer_req_pool, consumer_linker = self._mamba_linker_consumer(

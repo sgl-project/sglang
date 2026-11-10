@@ -115,7 +115,7 @@ class TestEveryRankWrites(CustomTestCase):
         linker._offload_queue = Queue()
         linker._gc_frozen = True  # short-circuits _freeze_gc_once
         linker.pool_group = SimpleNamespace(
-            resolve_transfers=lambda _transfers, allow_partial: ["transfer"]
+            resolve_transfers=lambda _transfers, **_: ["transfer"]
         )
         fake_device = SimpleNamespace(
             Event=lambda: SimpleNamespace(record=lambda: None)
@@ -133,7 +133,7 @@ class TestEveryRankWrites(CustomTestCase):
         linker._offload_queue = Queue()
         linker._gc_frozen = True
         linker.pool_group = SimpleNamespace(
-            resolve_transfers=lambda _transfers, allow_partial: []
+            resolve_transfers=lambda _transfers, **_: []
         )
         self.assertFalse(linker.offload([]))
         self.assertEqual(linker._offload_results.qsize(), 0)
