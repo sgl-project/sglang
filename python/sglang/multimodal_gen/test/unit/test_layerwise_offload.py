@@ -3151,9 +3151,12 @@ def test_layerwise_breakable_graph_preserves_copies_and_event_lifetimes():
         eager_on_graph,
     )
 
-    @eager_on_graph
-    def boundary(x):
-        return x
+    @eager_on_graph(output_factory=torch.empty_like, pass_output=True)
+    def boundary(x, out=None):
+        if out is None:
+            return x
+        out.copy_(x)
+        return out
 
     class Model(torch.nn.Module):
         def __init__(self):

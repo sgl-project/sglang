@@ -182,14 +182,15 @@ def image_router(api_server, monkeypatch):
         admitted.append(req)
         path = req.output_file_path()
         Image.new("RGB", (16, 16)).save(path)
-        return [path], OutputBatch()
+        with open(path, "rb") as f:
+            return [path], OutputBatch(output_image_bytes=[f.read()])
 
     async def upload(paths):
         return [None] * len(paths)
 
     monkeypatch.setattr(image_api, "get_global_server_args", lambda: api_server)
     monkeypatch.setattr(image_api, "process_generation_batch", generate)
-    monkeypatch.setattr(image_api, "_upload_and_cleanup_images", upload)
+    monkeypatch.setattr(image_api.cloud_storage, "upload_all_and_cleanup", upload)
     app = FastAPI()
     app.include_router(image_api.router)
     with TestClient(app) as client:

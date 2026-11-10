@@ -96,15 +96,14 @@ def _tiny_image():
     reason="requires NVIDIA CUDA",
 )
 def test_layerwise_image_vae_preserves_fused_decode(tiny_image, monkeypatch):
-    monkeypatch.setenv("MINIMAX_H3_VAE_DECODER_FUSED_NORM", "1")
-    model = tiny_image.cuda()
+    model = maybe_optimize_minimax_h3_vae(tiny_image.cuda())
     model.prepare_decoder_autocast_weights(torch.bfloat16)
     with torch.no_grad():
         for block in model.decoder.transformer_blocks:
             block.scale1.normal_(0, 0.1)
             block.scale2.normal_(0, 0.1)
     latents = [torch.randn(1, 24, 1, 4, 4, device="cuda") for _ in range(2)]
-    with set_forward_context(0, None):
+    with set_forward_context(0, None), use_vae_fast_path(model, True):
         expected = [model.decode_image_raw(x) for x in latents]
         model.configure_layerwise_offload(
             normalized_args(layerwise_prefetch_size={"video_vae": 1}),
@@ -189,18 +188,18 @@ def test_decode_tile_batching_bounds_order_and_exact_restoration(
     indices = list(range(129, -1, -1))
     expected = [tiles[i] * 2 for i in indices]
     with use_vae_fast_path(tiny_image, True):
-        outputs = tiny_image._run_tile_tasks(tiles, indices, decode, False)
+        outputs = tiny_image._run_tile_tasks(tiles, indices, decode)
     for actual, reference in zip(outputs, expected, strict=True):
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
     assert calls == ([128, 128, 4] if device == "cuda" else [2] * 130)
     calls.clear()
-    tiny_image._run_tile_tasks(tiles, indices, decode, False)
+    tiny_image._run_tile_tasks(tiles, indices, decode)
     assert calls == [2] * 130
 
     # Encoder execution must never inherit decode batching.
     calls.clear()
     with use_vae_fast_path(tiny_image, True):
-        tiny_image._run_tile_tasks(tiles, indices, lambda x: decode(x), False)
+        tiny_image._run_tile_tasks(tiles, indices, lambda x: decode(x))
     assert calls == [2] * 130
 
 
@@ -240,7 +239,7 @@ def _decode_tiles_distributed(rank, rendezvous):
             ]
             indices = list(range(count))
             with use_vae_fast_path(vae, True):
-                outputs = vae._run_tile_tasks(tiles, indices, decode, False)
+                outputs = vae._run_tile_tasks(tiles, indices, decode)
             for actual, tile in zip(outputs, tiles, strict=True):
                 torch.testing.assert_close(actual, tile * 2, rtol=0, atol=0)
             local_samples = 2 * len(range(rank, count, 2)) if count > 1 else 2
@@ -250,12 +249,12 @@ def _decode_tiles_distributed(rank, rendezvous):
 
             vae.sglang_config.use_parallel_tiling = False
             with use_vae_fast_path(vae, True):
-                vae._run_tile_tasks(tiles, indices, decode, False)
+                vae._run_tile_tasks(tiles, indices, decode)
             assert sum(calls) == 2 * count
             vae.sglang_config.use_parallel_tiling = True
             calls.clear()
 
-            vae._run_tile_tasks(tiles, indices, decode, False)
+            vae._run_tile_tasks(tiles, indices, decode)
             assert calls == [2] * count
             calls.clear()
     finally:
