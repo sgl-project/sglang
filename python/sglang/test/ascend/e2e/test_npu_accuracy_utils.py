@@ -121,8 +121,9 @@ def apply_accuracy_dataset_override(test_cls):
 
     No-op when NPU_ACCURACY_DATASET is unset (PR/full-test/manual runs keep the
     dataset declared by the case itself). Cases opt in by declaring
-    `dataset_baselines`, so a missing baseline fails loudly instead of silently
-    gating against the wrong dataset.
+    `dataset_baselines`; a case without a baseline for the selected dataset
+    keeps its own dataset instead of failing, so enabling the pipeline-wide
+    override never breaks cases that have not been calibrated yet.
     """
     dataset = os.environ.get(ACCURACY_DATASET_ENV, "").strip()
     if not dataset:
@@ -130,11 +131,13 @@ def apply_accuracy_dataset_override(test_cls):
 
     baselines = getattr(test_cls, "dataset_baselines", None) or {}
     if dataset not in baselines:
-        raise ValueError(
-            f"{test_cls.__name__} has no baseline for dataset '{dataset}'; "
-            f"declare dataset_baselines['{dataset}'] to enable the "
-            f"{ACCURACY_DATASET_ENV} override."
+        logger.warning(
+            f"[accuracy-dataset] {ACCURACY_DATASET_ENV}={dataset} ignored for "
+            f"{test_cls.__name__}: no dataset_baselines['{dataset}'], keeping "
+            f"datasets={getattr(test_cls, 'datasets', None)}. Declare the "
+            f"baseline to opt this case in."
         )
+        return
 
     limits = {
         **ACCURACY_DATASET_LIMITS,

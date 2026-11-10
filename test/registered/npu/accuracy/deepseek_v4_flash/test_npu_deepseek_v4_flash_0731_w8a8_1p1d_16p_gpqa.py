@@ -227,6 +227,14 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
     accuracy = 0.874
     datasets = ["gpqa_diamond"]
+    # Weekend nightly runs gpqa_diamond, weekday (Mon-Fri) runs gsm8k with a
+    # 200-sample cap, selected through NPU_ACCURACY_DATASET. The gsm8k baseline
+    # starts ~5 points below the official 95.0 and is tightened once nightly
+    # runs report the Ascend number.
+    dataset_baselines = {
+        "gpqa_diamond": 0.874,
+        "gsm8k": 0.90,
+    }
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
