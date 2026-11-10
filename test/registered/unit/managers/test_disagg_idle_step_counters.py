@@ -211,6 +211,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                             self.run_and_check(
                                 scheduler, event_loop, mode, pattern == "idle_cycle"
                             )
+                        # Each launched micro-batch gets its write-after-read barrier.
+                        self.assertEqual(scheduler._apply_war_barrier.call_count, 4)
                         # Transfers suppress housekeeping, not the idle flag.
                         self.assertEqual(
                             scheduler.on_idle.call_count,
