@@ -305,11 +305,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self._window_index_cache = None
         self._window_counter_buffer = None
         self._window_row_indptr = None
-
-        # Without DCP the window path drops the LSE and every row owns a key.
-        self._swa_need_lse = get_parallel().dcp_enabled or not (
-            envs.SGLANG_OPT_DFLASH_SWA_SKIP_LSE.get()
-        )
         if model_runner.sliding_window_size is not None and (
             model_runner.sliding_window_size >= 0
         ):
@@ -1519,7 +1514,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             multi_ctas_kv_counter_buffer=self._window_counter_buffer,
-            need_lse=self._swa_need_lse,
         )
         out = out.view(rows, kernel_heads, -1)[:, :heads]
         if not get_parallel().dcp_enabled:
