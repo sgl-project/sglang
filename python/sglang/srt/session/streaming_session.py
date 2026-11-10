@@ -50,6 +50,11 @@ class SessionSlot:
     # these slots again under the new key.
     extra_key: Optional[str] = None
     cache_salt: Optional[str] = None
+    # Caller salt from before bind_multimodal_cache_namespace rewrites
+    # cache_salt when a turn adds media. That rewrite is not a tenant change,
+    # so the row can still be lent; abort still compares cache_salt so the
+    # row is not inserted under the new key beside the original node.
+    user_cache_salt: Optional[str] = None
 
 
 def is_virtual_node(node: Any) -> bool:
@@ -104,7 +109,9 @@ class StreamingSession:
             return False
         slot = self.slots.get(req.session.session_id)
         return (
-            slot is not None and slot.kv.holds_kv and self._namespace_matches(slot, req)
+            slot is not None
+            and slot.kv.holds_kv
+            and self._can_lend_namespace(slot, req)
         )
 
     def try_match_prefix(self, params: MatchPrefixParams) -> Optional[MatchResult]:
@@ -119,7 +126,7 @@ class StreamingSession:
             return None
 
         req = params.req
-        if not self._namespace_matches(slot, req):
+        if not self._can_lend_namespace(slot, req):
             self._reject_foreign_namespace(req)
             return None
 
@@ -260,6 +267,7 @@ class StreamingSession:
             publishes_prompt=True,
             extra_key=req.extra_key,
             cache_salt=req.cache_salt or None,
+            user_cache_salt=req._user_cache_salt or None,
         )
         self._lock_to_slot(req, slot)
         self.slots[session_id] = slot
@@ -319,6 +327,15 @@ class StreamingSession:
             req.extra_key,
             req.cache_salt or None,
         )
+
+    def _can_lend_namespace(self, slot: SessionSlot, req: Req) -> bool:
+        # A media-adding turn rewrites cache_salt from the same user salt.
+        # extra_key (and lora_id, which is folded into it) must still match.
+        if slot.extra_key != req.extra_key:
+            return False
+        if slot.cache_salt == (req.cache_salt or None):
+            return True
+        return (slot.user_cache_salt or None) == (req._user_cache_salt or None)
 
     def _reject_foreign_namespace(self, req: Req) -> None:
         # Keep the slot. Lending the row would let this turn's abort insert

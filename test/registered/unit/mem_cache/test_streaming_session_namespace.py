@@ -269,6 +269,82 @@ class TestStreamingSessionNamespace(CustomTestCase):
         self.assertEqual(_match_len(cache, extended, "tenant-a", "s"), len(extended))
         self._assert_one_owner(cache, allocator, initial)
 
+    def test_media_adding_turn_is_lent_and_abort_does_not_alias_slots(self):
+        """Adding media rewrites cache_salt through bind_multimodal_cache_namespace
+        without the caller changing extra_key or the user salt. That turn must
+        still borrow the session row, and aborting it must not insert the row
+        under the new salt."""
+        cases = (
+            # Text first turn, then a later turn attaches media.
+            (None, "sglang-mm-v1:media-turn-2"),
+            # First turn already had media; a later turn adds another item.
+            ("sglang-mm-v1:media-turn-1", "sglang-mm-v1:media-turn-2"),
+        )
+        for first_salt, later_salt in cases:
+            with self.subTest(first_salt=first_salt, later_salt=later_salt):
+                cache, allocator, pool = _make_cache()
+                initial = allocator.available_size()
+                session = _session()
+                tokens = list(range(1, 9))
+                user_salt = "user-salt"
+                first = _turn(
+                    tokens,
+                    session,
+                    extra_key="tenant-a",
+                    cache_salt=user_salt,
+                    rid="t1",
+                )
+                # bind_multimodal_cache_namespace rewrites cache_salt only.
+                if first_salt is not None:
+                    first.cache_salt = first_salt
+                pool.alloc([first])
+                _fill_row(pool, allocator, first, 0, len(tokens))
+                first.kv.kv_committed_len = len(tokens)
+                first.kv.kv_allocated_len = len(tokens)
+                first.last_node = cache.root_node_handle()
+                first.lock = cache.lock(first.last_node)
+                cache.maybe_hand_to_session(first)
+                cache.checkpoint(first, up_to=len(tokens))
+                first.finished_reason = FINISH_LENGTH(length=0)
+                first.finished_len = 0
+                self.assertTrue(cache.session.try_cache_finished_req(first))
+                slot = cache.session.slots["s"]
+                self.assertEqual(
+                    _match_len(cache, tokens, "tenant-a", first.cache_salt),
+                    len(tokens),
+                )
+
+                later = _turn(
+                    tokens + [9, 10],
+                    session,
+                    extra_key="tenant-a",
+                    cache_salt=user_salt,
+                    rid="t2",
+                )
+                later.cache_salt = later_salt
+                cache.match_prefix(
+                    MatchPrefixParams(
+                        key=_key(tokens + [9, 10], "tenant-a", later_salt),
+                        req=later,
+                    )
+                )
+                self.assertIs(later.kv, slot.kv)
+                self.assertFalse(isinstance(later.finished_reason, FINISH_ABORT))
+                _fill_row(pool, allocator, later, len(tokens), 2)
+                later.kv.kv_committed_len = len(tokens) + 2
+                later.kv.kv_allocated_len = len(tokens) + 2
+                later.finished_reason = FINISH_ABORT()
+                release_kv_cache(later, cache, checkpoint=True)
+
+                self.assertEqual(
+                    _match_len(cache, tokens + [9, 10], "tenant-a", later_salt), 0
+                )
+                self.assertEqual(
+                    _match_len(cache, tokens, "tenant-a", first.cache_salt),
+                    len(tokens),
+                )
+                self._assert_one_owner(cache, allocator, initial)
+
 
 if __name__ == "__main__":
     unittest.main()
