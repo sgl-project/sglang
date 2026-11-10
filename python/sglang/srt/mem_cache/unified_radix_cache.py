@@ -217,6 +217,7 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    hicache_mamba_l3_snapshot_interval: int = 0
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
     # Whether eviction walks every component in one joint LRU order; set from the
@@ -528,6 +529,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
+        self.hicache_mamba_l3_snapshot_interval = (
+            get_memory().hicache_mamba_l3_snapshot_interval
+        )
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             supported = {ComponentType.FULL, ComponentType.MAMBA, *self.window_slots()}
@@ -757,6 +761,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
+                    if (
+                        self.hicache_mamba_l3_snapshot_interval
+                        and params.mamba_storage_prompt_boundary
+                        and step.result.last_device_node is not None
+                        and self.tree_core.promote_mamba_storage_boundary(
+                            step.result.last_device_node
+                        )
+                    ):
+                        self.write_backup_storage(step.result.last_device_node)
                     return step.result
                 step = self.tree_core.resume_insert()
         finally:
@@ -2490,9 +2503,16 @@ class UnifiedRadixCache(BasePrefixCache):
     def write_backup_storage(self, node_id: NodeId) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
-        spec = self.tree_core.build_storage_backup_spec(
-            node_id, self.hicache_storage_pass_prefix_keys
-        )
+        if self.hicache_mamba_l3_snapshot_interval:
+            spec = self.tree_core.build_storage_backup_spec(
+                node_id,
+                self.hicache_storage_pass_prefix_keys,
+                self.hicache_mamba_l3_snapshot_interval,
+            )
+        else:
+            spec = self.tree_core.build_storage_backup_spec(
+                node_id, self.hicache_storage_pass_prefix_keys
+            )
         if spec is None:
             return
 

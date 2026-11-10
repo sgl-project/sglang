@@ -171,6 +171,12 @@ class Memory(msgspec.Struct):
             ],
         ),
     ] = None
+    hicache_mamba_l3_snapshot_interval: A[
+        int,
+        "Token interval for selecting existing Mamba/KDA checkpoints for L3. "
+        "0 keeps all available checkpoints; legal prompt/request endpoints are "
+        "always kept. L1/L2 checkpoint capture and KV writes are unchanged.",
+    ] = 0
     hicache_storage_prefetch_policy: A[
         str,
         Arg(

@@ -117,6 +117,7 @@ class StorageBackupSpec(NamedTuple):
 
 class UnifiedTreeNode:
     counter = 0
+    mamba_storage_boundary: bool = False
 
     def __init__(self, tree_components: tuple[ComponentType, ...], priority: int = 0):
         # Plain dict (not defaultdict): a missing-key read must raise, never
@@ -2868,8 +2869,41 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 comp_xfers[comp.component_type] = t
         return device_value, comp_xfers
 
+    def promote_mamba_storage_boundary(self, node_id: NodeId) -> bool:
+        node = self.node_by_id(node_id)
+        state_slot = self.slot_id(TREE_STATE)
+        if state_slot is None or node.parent is None or node.mamba_storage_boundary:
+            return False
+        state = node.component_data[state_slot]
+        if state.value is None and state.host_value is None:
+            return False
+        node.mamba_storage_boundary = True
+        return (
+            node.backuped
+            and state.host_value is not None
+            and node.write_through_pending_id is None
+        )
+
+    @staticmethod
+    def _backup_mamba_storage(node: UnifiedTreeNode, interval: int) -> bool:
+        if interval == 0 or node.mamba_storage_boundary:
+            return True
+        if node.parent is None:
+            return False
+        span = len(node.key)
+        end = span
+        parent = node.parent
+        while parent.parent is not None:
+            end += len(parent.key)
+            parent = parent.parent
+        # Select an existing legal endpoint after a grid crossing.
+        return end // interval > (end - span) // interval
+
     def build_storage_backup_spec(
-        self, node_id: NodeId, pass_prefix_keys: bool
+        self,
+        node_id: NodeId,
+        pass_prefix_keys: bool,
+        mamba_l3_snapshot_interval: int = 0,
     ) -> Optional[StorageBackupSpec]:
         """Gather a node's device->storage backup spec; None if the node is not backuped."""
         node = self.node_by_id(node_id)
@@ -2879,8 +2913,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if pass_prefix_keys:
             prefix_keys = node.get_prefix_hash_values(node.parent)
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        backup_mamba = self._backup_mamba_storage(node, mamba_l3_snapshot_interval)
         for comp in self.components:
             if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            if comp.family == TREE_STATE and not backup_mamba:
                 continue
             transfers = comp.build_hicache_transfers(
                 node, CacheTransferPhase.BACKUP_STORAGE

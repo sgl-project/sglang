@@ -668,9 +668,21 @@ class UnifiedTreeCoreInterface(ABC):
             f"{type(self).__name__} does not expose build_backup_kv_action"
         )
 
+    def promote_mamba_storage_boundary(self, node_id: NodeId) -> bool:
+        """Mark an existing checkpoint as a request/prompt endpoint. Return
+        whether its ready host copy needs an L3 write; pending backups publish
+        it after their normal acknowledgement. Repeated promotions are no-ops.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support Mamba storage endpoints"
+        )
+
     @abstractmethod
     def build_storage_backup_spec(
-        self, node_id: NodeId, pass_prefix_keys: bool
+        self,
+        node_id: NodeId,
+        pass_prefix_keys: bool,
+        mamba_l3_snapshot_interval: int = 0,
     ) -> Optional[StorageBackupSpec]:
         """Gather a node's device->storage backup spec; None if not backuped."""
         ...

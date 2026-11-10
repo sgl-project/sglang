@@ -787,6 +787,10 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        if getattr(self.cache, "hicache_mamba_l3_snapshot_interval", 0):
+            insert_params.mamba_storage_prompt_boundary = (
+                is_finished or token_ids_len >= len(req.origin_input_ids)
+            )
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.kv.mamba_last_track_seqlen
         else:

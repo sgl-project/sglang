@@ -20,6 +20,7 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    validate_hicache_mamba_l3_snapshot_interval(cfg)
     from sglang.srt.mem_cache.unified_cache.linker_config import (
         UnifiedCacheLinkerConfig,
         parse_linker_load_options,
@@ -330,6 +331,28 @@ def resolve_unified_memory_layout_io(server_args: Any):
         "pool's strided KV rows, switching to the page_first layout with the "
         "kernel io backend"
     )
+
+
+def validate_hicache_mamba_l3_snapshot_interval(cfg: Any):
+    interval = getattr(cfg, "hicache_mamba_l3_snapshot_interval", 0)
+    if type(interval) is not int or interval < 0:
+        raise ValueError("--hicache-mamba-l3-snapshot-interval must be non-negative")
+    if interval == 0:
+        return
+    if (
+        not cfg.enable_hierarchical_cache
+        or cfg.hicache_storage_backend is None
+        or cfg.hicache_host_memory_mode != "cache"
+    ):
+        raise ValueError(
+            "--hicache-mamba-l3-snapshot-interval requires HiCache storage in cache mode"
+        )
+    track = cfg.mamba_track_interval
+    if type(track) is not int or track <= 0 or interval % track:
+        raise ValueError(
+            "--hicache-mamba-l3-snapshot-interval must be a multiple of the positive "
+            "--mamba-track-interval"
+        )
 
 
 def validate_hicache_host_memory_mode(server_args: Any):

@@ -98,6 +98,8 @@ class InsertParams:
     allow_missing_mamba: bool = False
     # The ping-pong slot prepare picked; cleanup keeps that same slot.
     mamba_keep_idx: Optional[int] = None
+    # Preserve an existing legal prompt/request checkpoint when thinning L3.
+    mamba_storage_prompt_boundary: bool = False
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None

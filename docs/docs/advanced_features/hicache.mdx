@@ -6,3 +6,11 @@ metatags:
 - [Hicache Best Practices](./hicache_best_practices)
 - [Hicache Design](./hicache_design)
 - [Hicache Storage Runtime Attach Detach](./hicache_storage_runtime_attach_detach)
+
+## Mamba snapshots in L3
+
+For a hybrid Mamba/KDA model using HiCache storage with `--hicache-host-memory-mode cache`, you can set `--hicache-mamba-l3-snapshot-interval 32768` to reduce intermediate state writes to L3. The default, `0`, keeps the existing write policy. A positive value must be a multiple of the positive `--mamba-track-interval`.
+
+The policy selects existing legal node endpoints whose spans cross the interval grid, and always preserves legal prompt/request endpoints. It does not create a checkpoint exactly at each grid position. L1/L2 state capture, KV writes, state dtype and the storage format are unchanged. Both Python and Rust TreeCore support the policy.
+
+Fewer intermediate L3 snapshots can increase recomputation when a request shares a prefix ending between retained checkpoints. Tune the L3 interval separately from the state capture interval.
