@@ -13,7 +13,7 @@ from abc import abstractmethod
 from array import array
 from collections import defaultdict
 from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import msgspec
 import numpy as np
@@ -1064,6 +1064,50 @@ def _compute_patch_slices(model_specific_data: dict, num_items: int) -> tuple:
 
 # Keys whose dim-0 aligns with total patch count rather than num_items.
 _PATCH_ALIGNED_KEYS = frozenset(("patch_pixel_values", "patch_newline_mask"))
+
+
+def _select_model_data_for_items(
+    model_specific_data: dict, indices: Iterable[int], num_items: int
+) -> dict:
+    """Select metadata for arbitrary items, retaining order and repeated items.
+
+    Known patch-aligned fields use each selected item's complete patch span,
+    even when the total patch count happens to equal the item count. Other
+    dim-0 item-aligned fields are selected by item; shared values are retained.
+    Selection preserves tensor, ndarray, list and tuple representations and
+    never mutates the input metadata.
+    """
+    indices = list(indices)
+    patch_slices, total_num_patches = _compute_patch_slices(
+        model_specific_data, num_items
+    )
+    selected_data = {}
+    for key, value in model_specific_data.items():
+        length = _get_length(value)
+        if (
+            key in _PATCH_ALIGNED_KEYS
+            and patch_slices is not None
+            and length == total_num_patches
+        ):
+            pieces = [_slice_value(value, *patch_slices[index]) for index in indices]
+            if not pieces:
+                selected_data[key] = _slice_value(value, 0, 0)
+            elif len(pieces) == 1:
+                selected_data[key] = pieces[0]
+            elif isinstance(value, torch.Tensor):
+                selected_data[key] = torch.cat(pieces, dim=0)
+            elif isinstance(value, np.ndarray):
+                selected_data[key] = np.concatenate(pieces, axis=0)
+            else:
+                selected_data[key] = type(value)(x for piece in pieces for x in piece)
+        elif length == num_items:
+            if isinstance(value, (torch.Tensor, np.ndarray)):
+                selected_data[key] = value[indices]
+            else:
+                selected_data[key] = type(value)(value[index] for index in indices)
+        else:
+            selected_data[key] = value
+    return selected_data
 
 
 def _split_model_data_for_item(

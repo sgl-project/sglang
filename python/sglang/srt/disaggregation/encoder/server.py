@@ -26,7 +26,6 @@ from sglang.srt.disaggregation.encoder.preprocessor import (
     EncoderPreprocessor,
     EncoderPreprocessResult,
     _convert,
-    _mm_grid_attrs,
 )
 from sglang.srt.disaggregation.encoder.receiver import (
     EmbeddingData,
@@ -49,6 +48,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     async_sock_recv,
 )
+from sglang.srt.managers.mm_utils import _select_model_data_for_items
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
@@ -1019,24 +1019,15 @@ class MMEncoder:
             for index in range(len(preprocess_result.grid_thw))
         ]
 
-    def _encode_missing(
+    def _forward_mm_items(
         self,
-        mm_feature,
-        preprocess_result: EncoderPreprocessResult,
-        indices: List[int],
-        modality: Modality = Modality.IMAGE,
-        get_feature_fn=None,
+        mm_items: List[MultimodalDataItem],
+        modality: Modality,
+        get_feature_fn,
         *,
         observe_metrics: bool = True,
-    ) -> List[torch.Tensor]:
-        """
-        GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
-        """
-        token_counts = preprocess_result.token_counts
-        mm_items = self._build_model_mm_items(
-            mm_feature, preprocess_result, indices, modality
-        )
-
+    ) -> torch.Tensor:
+        """Normalize one model forward without copying an existing 2-D output."""
         forward_start = time.perf_counter()
         with torch.inference_mode():
             new_embeddings = get_feature_fn(mm_items)
@@ -1051,7 +1042,28 @@ class MMEncoder:
                 time.perf_counter() - forward_start, modality=modality.name.lower()
             )
 
-        return self.slice_embedding(new_embeddings, (token_counts[i] for i in indices))
+        return new_embeddings
+
+    def _encode_missing(
+        self,
+        mm_feature,
+        preprocess_result: EncoderPreprocessResult,
+        indices: List[int],
+        modality: Modality = Modality.IMAGE,
+        get_feature_fn=None,
+        *,
+        observe_metrics: bool = True,
+    ) -> List[torch.Tensor]:
+        """Run the model on missing items and return preprocessing-owned slices."""
+        mm_items = self._build_model_mm_items(
+            mm_feature, preprocess_result, indices, modality
+        )
+        new_embeddings = self._forward_mm_items(
+            mm_items, modality, get_feature_fn, observe_metrics=observe_metrics
+        )
+        return self.slice_embedding(
+            new_embeddings, (preprocess_result.token_counts[i] for i in indices)
+        )
 
     def _build_model_mm_items(
         self,
@@ -1129,19 +1141,22 @@ class MMEncoder:
                 )
             ]
 
-        for key, value in mm_inputs.items():
-            if key in _mm_feature_attrs.get(modality, []):
-                continue
-            value = _convert(value)
-            if key in _mm_grid_attrs.get(modality, []):
-                if split_kimi_k3_images:
-                    for mm_item, idx in zip(mm_items, indices):
-                        mm_item.set(key, value[idx : idx + 1])
-                else:
-                    mm_items[0].set(key, value[indices])
-            else:
-                for mm_item in mm_items:
-                    mm_item.set(key, value)
+        model_data = {
+            key: value
+            for key, value in mm_inputs.items()
+            if key not in _mm_feature_attrs.get(modality, [])
+        }
+        metadata_groups = (
+            [
+                _select_model_data_for_items(model_data, [index], len(grid_thw))
+                for index in indices
+            ]
+            if split_kimi_k3_images
+            else [_select_model_data_for_items(model_data, indices, len(grid_thw))]
+        )
+        for mm_item, metadata in zip(mm_items, metadata_groups):
+            for key, value in metadata.items():
+                mm_item.set(key, _convert(value))
         for item in mm_items:
             item.bind_processor_fingerprint(self.cache_namespace)
         return mm_items
@@ -1781,10 +1796,39 @@ class MMEncoder:
                             continue
                         cached_rows[index] = entry.embedding
                         hit_indices.append(index)
+                owner_materializer = getattr(
+                    ctx.preprocess_result.mm_inputs, "materialize_local_items", None
+                )
+                if (
+                    hit_indices
+                    and missing_indices
+                    and owner_materializer is not None
+                    and get_parallel().attn_tp_size > 1
+                ):
+                    # Owner-side CPU preprocessing already used the full batch's
+                    # vision-DP assignment. Filtering misses would rebalance it
+                    # and can send deferred pixels to the wrong collective peer.
+                    # Full hits remain reusable; mixed batches keep their owners.
+                    hit_indices.clear()
+                    missing_indices = list(range(ctx.num_items))
             else:
                 missing_indices = list(range(ctx.num_items))
+                mm_items = self._build_model_mm_items(
+                    ctx.mm_feature,
+                    ctx.preprocess_result,
+                    missing_indices,
+                    modality,
+                )
+                mm_embedding = self._forward_mm_items(
+                    mm_items,
+                    modality,
+                    ctx.get_feature_fn,
+                    observe_metrics=not ctx.is_health_check,
+                )
+                if not keep_on_gpu:
+                    mm_embedding = mm_embedding.cpu()
 
-            if missing_indices:
+            if use_mm_cache and missing_indices:
                 encoded_rows = self._encode_missing(
                     ctx.mm_feature,
                     ctx.preprocess_result,
@@ -1797,7 +1841,8 @@ class MMEncoder:
                     encoded_rows = [row.cpu() for row in encoded_rows]
                 for index, row in zip(missing_indices, encoded_rows):
                     cached_rows[index] = row
-            mm_embedding = torch.cat(cached_rows, dim=0)
+            if use_mm_cache:
+                mm_embedding = torch.cat(cached_rows, dim=0)
 
             try:
                 self._validate_embedding_token_count(ctx, mm_embedding)

@@ -109,8 +109,13 @@ combines several grids in one forward item. An all-item hit skips the vision
 forward and concatenates the cached rows in request order. A partial hit encodes
 only the missing grids and reuses the cached rows. Entries whose token count no
 longer matches the current preprocessing metadata are evicted before reuse.
-Cache-hit metrics count only entries found at lookup, excluding newly encoded
+Cache-hit metrics count only embeddings actually reused, excluding newly encoded
 rows and items that exceed the host cache capacity.
+
+When CPU preprocessing has already assigned images to vision-DP ranks (such as
+Kimi-K3 with TP greater than one), a partial hit keeps the original full-batch
+forward to preserve that assignment. An all-item hit still skips the forward.
+Recomputed entries are not counted as reused cache hits.
 
 ```bash Command
 python -m sglang.launch_server \

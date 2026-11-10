@@ -1,8 +1,8 @@
 """CPU regressions through the actual encoder item builder and embedding cache.
 
-The forward below is synthetic; preprocessing-owned grid metadata, model-facing
-item construction, hashes, slicing and cache accounting use their real owners.
-This does not load a model or qualify image/GPU/EPD transport behavior.
+Image/video forwards and the audio tower are synthetic; Qwen3-Omni audio
+packing, model-facing item construction, hashes, slicing and cache accounting
+use their real owners. This does not load weights or qualify GPU/EPD behavior.
 """
 
 import asyncio
@@ -18,6 +18,9 @@ from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessResu
 from sglang.srt.disaggregation.encoder.server import EncodeContext, MMEncoder
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
+from sglang.srt.models.qwen3_omni_moe import (
+    Qwen3OmniMoeThinkerForConditionalGeneration,
+)
 from sglang.srt.multimodal.encoder_preprocessing import EncoderPreprocessOutput
 from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -37,20 +40,53 @@ class _FeatureFn:
         return features if self.as_list else torch.cat(features, dim=0)
 
 
-def _ctx(features, feature_fn, *, itemwise=False, items_per_req=None):
+class _PackedAudioTower(torch.nn.Module):
+    """Synthetic neural boundary: sum each clip packed by the real consumer."""
+
+    def __init__(self):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+        self.calls = []
+
+    @property
+    def dtype(self):
+        return self.anchor.dtype
+
+    def forward(self, features, *, feature_lens):
+        lengths = feature_lens.tolist()
+        self.calls.append(lengths)
+        clips = features.split(lengths, dim=1)
+        return SimpleNamespace(
+            last_hidden_state=torch.stack([clip.sum(dim=1) for clip in clips])
+        )
+
+
+def _ctx(
+    features,
+    feature_fn,
+    *,
+    itemwise=False,
+    items_per_req=None,
+    modality=Modality.IMAGE,
+    metadata=None,
+):
     grid = torch.tensor([[1, 1, len(feature)] for feature in features], device="cpu")
     joined = torch.cat(features, dim=0)
-    inputs = {"pixel_values": joined, "image_grid_thw": grid}
+    feature_key, grid_key = {
+        Modality.IMAGE: ("pixel_values", "image_grid_thw"),
+        Modality.VIDEO: ("pixel_values_videos", "video_grid_thw"),
+    }[modality]
+    inputs = {feature_key: joined, grid_key: grid, **(metadata or {})}
     if itemwise:
         inputs = EncoderPreprocessOutput(
             inputs,
             mm_items=[
                 MultimodalDataItem.from_dict(
                     {
-                        "modality": Modality.IMAGE,
+                        "modality": modality,
                         "feature": feature,
                         "model_specific_data": {
-                            "image_grid_thw": grid[index : index + 1],
+                            grid_key: grid[index : index + 1],
                         },
                     }
                 )
@@ -59,7 +95,7 @@ def _ctx(features, feature_fn, *, itemwise=False, items_per_req=None):
         )
     return EncodeContext(
         req_id="encoder-prefix-cache-cpu",
-        modality=Modality.IMAGE,
+        modality=modality,
         preprocess_result=EncoderPreprocessResult(
             mm_inputs=inputs,
             grid_thw=grid,
@@ -180,6 +216,98 @@ class TestEncoderPrefixCacheBatch(CustomTestCase):
         self.assertTrue(torch.equal(partial, torch.cat([self.a, self.c])))
         self.assertEqual([len(items) for items in forward.calls], [2, 1])
         self.assertTrue(torch.equal(forward.calls[-1][0], self.c))
+
+    def test_partial_audio_hit_selects_masks_for_the_real_qwen_consumer(self):
+        """A cached clip must not leave its mask beside only the missing clip.
+
+        Qwen3-Omni packs features using the selected clips' attention masks.
+        Keeping a full-batch mask on a partial cache miss raises IndexError.
+        Only the neural tower is synthetic; packing, building and cache are real.
+        """
+        tower = _PackedAudioTower()
+        thinker = Qwen3OmniMoeThinkerForConditionalGeneration.__new__(
+            Qwen3OmniMoeThinkerForConditionalGeneration
+        )
+        torch.nn.Module.__init__(thinker)
+        thinker.audio_tower = tower
+        encoder = _encoder()
+        encoder.model_type = "qwen3_omni_moe"
+        mask = torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], device="cpu")
+        lengths = torch.tensor([2, 3], device="cpu")
+
+        def context(second_value):
+            features = torch.stack([torch.ones(2, 4), torch.full((2, 4), second_value)])
+            return EncodeContext(
+                req_id="encoder-prefix-cache-audio-cpu",
+                modality=Modality.AUDIO,
+                preprocess_result=EncoderPreprocessResult(
+                    mm_inputs={
+                        "input_features": features,
+                        "feature_attention_mask": mask,
+                        "audio_feature_lens_raw": lengths,
+                        "audio_feature_lens": lengths,
+                    },
+                    grid_thw=lengths,
+                    token_counts=[1, 1],
+                ),
+                get_feature_fn=thinker.get_audio_feature,
+                mm_feature=features,
+                num_items=2,
+                items_per_req=[1, 1],
+                aux_data={},
+                str_mm_hashes=None,
+                use_global_cache=False,
+                is_health_check=False,
+            )
+
+        cold = self._run(encoder, context(2.0))
+        partial = self._run(encoder, context(3.0))
+        self.assertTrue(torch.equal(cold, torch.tensor([[2.0, 2.0], [6.0, 6.0]])))
+        self.assertTrue(torch.equal(partial, torch.tensor([[2.0, 2.0], [9.0, 9.0]])))
+        self.assertEqual(tower.calls, [[2, 3], [3]])
+        self.assertTrue(torch.equal(mask, torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]])))
+
+    def test_video_identity_uses_only_its_own_timing_metadata(self):
+        """Another clip's timing must not invalidate an unchanged video key.
+
+        Timing remains part of identity, but an item's key must be independent
+        of its batch position and its companions' metadata.
+        """
+        for model_type, metadata_key, metadata_values in (
+            ("qwen3_vl", "video_timestamps", [[0.0, 0.5], [0.0, 0.75]]),
+            ("qwen3_omni_moe", "second_per_grid_ts", torch.tensor([0.5, 0.5])),
+        ):
+            with self.subTest(model_type=model_type):
+                encoder = _encoder()
+                encoder.model_type = model_type
+
+                def key(features, values, index=0):
+                    ctx = _ctx(
+                        features,
+                        _FeatureFn(),
+                        modality=Modality.VIDEO,
+                        metadata={metadata_key: values},
+                    )
+                    return encoder._calculate_hashes_from_features(
+                        ctx.mm_feature, ctx.preprocess_result, Modality.VIDEO
+                    )[index]
+
+                alone_key = key([self.a], metadata_values[:1])
+                batched_key = key([self.a, self.b], metadata_values)
+                reversed_values = (
+                    metadata_values.flip(0)
+                    if isinstance(metadata_values, torch.Tensor)
+                    else metadata_values[::-1]
+                )
+                reordered_key = key([self.b, self.a], reversed_values, index=1)
+                self.assertEqual(alone_key, batched_key)
+                self.assertEqual(alone_key, reordered_key)
+                changed = (
+                    torch.tensor([1.0])
+                    if isinstance(metadata_values, torch.Tensor)
+                    else [[0.0, 1.0]]
+                )
+                self.assertNotEqual(alone_key, key([self.a], changed))
 
     def test_rank_zero_stages_cached_grids_for_each_request(self):
         """Cache reordering must preserve each request's rows and grid metadata.
@@ -359,6 +487,30 @@ class TestEncoderPrefixCacheBatch(CustomTestCase):
                 self.assertTrue(torch.equal(first, torch.cat([self.a, self.b])))
                 self.assertTrue(torch.equal(again, first))
                 self.assertEqual(len(forward.calls), 1)
+
+    def test_cache_bypass_preserves_the_forward_tensor(self):
+        """Bypassing the cache must not duplicate the full model output."""
+        output = torch.cat([self.a, self.b])
+        for enabled, health_check, keep_on_gpu in (
+            (True, False, True),
+            (False, False, False),
+            (True, True, False),
+        ):
+            with self.subTest(
+                enabled=enabled,
+                health_check=health_check,
+                keep_on_gpu=keep_on_gpu,
+            ):
+                encoder = _encoder()
+                ctx = _ctx([self.a, self.b], lambda items: output)
+                ctx.is_health_check = health_check
+                with patch.object(
+                    encoder_server,
+                    "get_mm",
+                    return_value=SimpleNamespace(enable_prefix_mm_cache=enabled),
+                ):
+                    result = self._run(encoder, ctx, keep_on_gpu=keep_on_gpu)
+                self.assertIs(result, output)
 
     def test_health_checks_and_gpu_output_bypass_prefix_cache(self):
         for health_check, keep_on_gpu in ((True, False), (False, True)):
