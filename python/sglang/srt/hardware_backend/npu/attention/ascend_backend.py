@@ -50,7 +50,12 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
-from sglang.srt.layers.dcp.layout import get_dcp_chain_spec_lens, get_dcp_lens
+from sglang.srt.layers.dcp.layout import (
+    dcp_packed_kv_lens,
+    dcp_packed_read_plan,
+    get_dcp_chain_spec_lens,
+    get_dcp_lens,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -1531,7 +1536,28 @@ class AscendAttnBackend(AttentionBackend):
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
         seq_lengths_kv = dcp_metadata.dcp_kv_indptr[1:]
         sparse_mode = 3
-        if dsa_token_shard_plan is not None:
+        packed_plan = None
+        if dsa_token_shard_plan is None:
+            # The shard's shortened cumulative lengths describe the TND layout;
+            # packed rows are the collective's own order and cannot address a
+            # token-sliced query, so the packed read stands down per forward.
+            packed_plan = dcp_packed_read_plan(
+                forward_batch,
+                topk_indices.shape[-1] if topk_indices is not None else None,
+            )
+        if packed_plan is not None:
+            # C1: the buffer is the all-gather's own rank-major output, so a
+            # row's index no longer says anything about its position -- and
+            # both conventions below are about position. The top-k was remapped
+            # to rows by the model, the whole buffer is one request, and the
+            # operator's causal crop has to go: sparse_mode 3 aligns query i to
+            # key K - Q + i, which is meaningless once the keys are permuted.
+            # Causality is not lost, it moves upstream to the indexer.
+            seq_lengths_kv = dcp_packed_kv_lens(
+                forward_batch, packed_plan, q_nope.device
+            )
+            sparse_mode = 0
+        elif dsa_token_shard_plan is not None:
             if dcp_metadata.extend_crop_free:
                 # Full per-request KV lengths, no crop: no request's start moves.
                 sparse_mode = 0

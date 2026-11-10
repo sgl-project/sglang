@@ -1343,6 +1343,56 @@ class Envs:
     # DCP extend on NPU: above this many new tokens the prefix KV is gathered
     # whatever the bytes say, as the query path's fp32 merge grows with them.
     SGLANG_NPU_DCP_EXTEND_QUERY_GATHER_MAX_TOKENS = EnvInt(4096)
+    # DCP extend on NPU: log each extend forward's peak device memory, per rank.
+    SGLANG_DEBUG_NPU_DCP_EXTEND_MEMORY = EnvBool(False)
+    # DCP extend on NPU: run each layer's prefix gather a layer ahead on a side
+    # stream. Costs a second scratch; needs GATHER_PIECE_ROWS <= 0.
+    SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH = EnvBool(False)
+    # DCP extend on NPU: let the sparse operator read the gathered prefix in
+    # the rank-major order the all-gather already produced, remapping the
+    # top-k instead of permuting ~1 GiB of KV back into position order.
+    # One-request extends only; the refusal cases fall back to the permuting
+    # path, which stays available. On by default (D2): the two D2 optimisations
+    # (prefetch, prime) are only valid on this path.
+    SGLANG_NPU_ENABLE_DCP_PACKED_READ = EnvBool(True)
+    # DCP extend on NPU (packed read): gather layer l+1's prefix on a side
+    # stream while layer l computes, into the other of two slots; the first
+    # layer's gather is primed in prepare, before the QKV. Requires the packed
+    # read above. This gates the PACKED-path prefetch (the side-stream double
+    # buffer the packed read rides on); it is distinct from the base
+    # SGLANG_NPU_ENABLE_DCP_EXTEND_GATHER_PREFETCH, which gates the piece-based
+    # (permuting) path's prefetch. The D2 AISBench run peaked at 49.90 GiB
+    # allocated against a ceiling near 51.7, so a serving box that takes both
+    # paths may need --mem-fraction-static a notch below 0.70.
+    SGLANG_NPU_ENABLE_DCP_PACKED_GATHER_PREFETCH = EnvBool(True)
+    # DCP extend on NPU (D2v2): split the per-layer context all-gather into N
+    # sub-all-gathers, each writing a contiguous chunk-major slice of the same
+    # packed buffer. The monolithic gather was one 9-16 ms AIV episode (93%
+    # MTE2) that starved the compute stream's own AIV work (pool writes at a
+    # 5.4 ms median, 1:1 lockstep with the gather, against 0.005 ms solo); N
+    # short episodes leave the inter-collective windows in which that work
+    # runs. Same bytes, no extra copy; 1 disables chunking (the single
+    # collective, bit for bit).
+    SGLANG_NPU_DCP_GATHER_CHUNKS = EnvInt(8)
+    # DCP extend on NPU (D2v2): the priority the gather's side stream is created
+    # with. The vLLM-CUDA "KV I/O yields to compute" pattern; the lowest
+    # torch_npu exposes is 0 (positive clamps to the same pool, -1 is the HIGH
+    # pool, never for a stream that must yield). Honest limit: torch_npu 2.x
+    # passes CANN priority 0 for both pools, so on this stack it is a scheduler
+    # hint -- the hard protection is the high-priority critical-path HCCL groups
+    # below plus the chunked gather above.
+    SGLANG_NPU_DCP_GATHER_STREAM_PRIORITY = EnvInt(0)
+    # NPU (D2v2): create the critical-path HCCL process groups -- the
+    # attention-TP group (the current-chunk exchange that feeds every layer's
+    # indexer) and the MoE groups (dispatch/combine) -- with
+    # is_high_priority_stream=True, so their collectives are served ahead of
+    # background work such as the DCP context-gather prefetch (which keeps the
+    # default group priority). Fail-soft: a torch_npu build without the option
+    # logs once and continues.
+    SGLANG_NPU_ENABLE_PG_PRIORITY = EnvBool(True)
+    # DCP on NPU: shard the latent KV in page_size runs, as #37787 and
+    # vLLM-Ascend do, instead of one position per rank.
+    SGLANG_NPU_DCP_PAGE_INTERLEAVE = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Opt in to fused MHA KV writes. Disabled by default because ScatterPa
