@@ -21,7 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
-from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
+from sglang.srt.utils.device import is_sm80_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
     awq_marlin_quantize,

@@ -38,6 +38,7 @@ from sglang.srt.distributed import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -87,6 +88,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -115,17 +118,14 @@ from sglang.srt.runtime_context import (
     get_stream,
 )
 from sglang.srt.utils import (
-    add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
     is_npu,
-    make_pp_layers,
     use_intel_amx_backend,
 )
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -934,7 +934,6 @@ class Qwen2MoeAttention(nn.Module):
         max_position_embeddings: int = 8192,
         qkv_bias: int = True,
         quant_config: Optional[QuantizationConfig] = None,
-        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -989,7 +988,6 @@ class Qwen2MoeAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -1032,9 +1030,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         qkv_bias = getattr(config, "qkv_bias", True)
-        dual_chunk_attention_config = getattr(
-            config, "dual_chunk_attention_config", None
-        )
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -1044,7 +1039,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            dual_chunk_attention_config=dual_chunk_attention_config,
             qkv_bias=qkv_bias,
             prefix=add_prefix("self_attn", prefix),
         )

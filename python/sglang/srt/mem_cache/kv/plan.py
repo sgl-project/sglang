@@ -11,6 +11,8 @@ from typing import Dict, List, Optional, Sequence, Tuple, Type
 import msgspec
 
 from sglang.srt.mem_cache.kv.decl import (
+    KV_PART,
+    STATE_PART,
     DerivedPartDecl,
     FullLifetime,
     KVLayerDecl,
@@ -24,12 +26,13 @@ from sglang.srt.mem_cache.kv.decl import (
     StateLifetime,
     TensorPartDecl,
     WindowLifetime,
+    primary_window,
+    window_sub_pool_name,
 )
 from sglang.srt.mem_cache.kv.layout.base import SubPoolSpec, _store_dtype_for
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
-from sglang.srt.mem_cache.kv.router import KV_PART, STATE_PART
 from sglang.srt.mem_cache.layout.fused_draft import (
     LAYER_STATE,
     LAYER_WINDOW,
@@ -39,10 +42,10 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     MLADraftRegion,
 )
 
-# The draft placement and the id spaces name sub-pools by these.
+# The draft placement and the id spaces name sub-pools by these; windows are
+# named by `window_sub_pool_name`.
 _SUB_POOL_NAMES: Dict[Type, str] = {
     FullLifetime: "full",
-    WindowLifetime: "swa",
     StateLifetime: "mamba",
 }
 
@@ -51,33 +54,66 @@ class SubPoolExternal(msgspec.Struct, frozen=True, kw_only=True):
     """The names a sub-pool goes by outside this process, at the values peers,
     host stores, the radix tree and metrics already use: its HiCache host pool
     (also the suffix of its L3 keys), its radix tree component, the family its
-    usage is reported under, and the PD state type it travels as (None for the
-    sub-pool whose token KV PD registers as the transfer's KV entries)."""
+    usage is reported under and the label within it, the PD state type it
+    travels as (None for the sub-pool whose token KV PD registers as the
+    transfer's KV entries), and the key PD peers tell its entries apart by.
+    Renaming a sub-pool inside this process changes none of them unless they
+    are derived from its name."""
 
     host_pool: str
     tree_component: str
     metrics: str
+    label: str
     wire: Optional[str] = None
+    wire_key: Optional[str] = None
 
 
 _EXTERNAL: Dict[Type, SubPoolExternal] = {
     FullLifetime: SubPoolExternal(
-        host_pool="kv", tree_component="FULL", metrics="full"
-    ),
-    WindowLifetime: SubPoolExternal(
-        host_pool="swa", tree_component="SWA", metrics="swa", wire="swa"
+        host_pool="kv",
+        tree_component="FULL",
+        metrics="full",
+        label="full",
+        wire_key="full",
     ),
     StateLifetime: SubPoolExternal(
-        host_pool="mamba", tree_component="MAMBA", metrics="mamba", wire="mamba"
+        host_pool="mamba",
+        tree_component="MAMBA",
+        metrics="mamba",
+        label="mamba",
+        wire="mamba",
+        wire_key="mamba",
     ),
 }
+
+# A window's prefix tree component and host pool are named by its sub-pool.
+
+# The PD state type every window travels as: its trailing pages. A peer tells
+# one window's entry from another's by the entry's sub-pool.
+WINDOW_WIRE = "swa"
+
+
+def window_tree_component(name: str) -> str:
+    """The prefix tree component a window sub-pool goes by."""
+    return name.upper()
+
+
+def _window_external(name: str) -> SubPoolExternal:
+    return SubPoolExternal(
+        host_pool=name,
+        tree_component=window_tree_component(name),
+        metrics="window",
+        label=name,
+        wire=WINDOW_WIRE,
+        wire_key=name,
+    )
+
 
 # The order PD peers list state entries in: a window's before recurrent state.
 _WIRE_ORDER = (
     "minimax_index_k",
     "minimax_dense_kv",
-    "swa",
-    "auxiliary_swa",
+    WINDOW_WIRE,
     "block_scale",
     "block_scale_swa",
     "swa_ring",
@@ -118,14 +154,19 @@ class TreeSlot(msgspec.Struct, frozen=True, kw_only=True):
     window: Optional[int] = None
     # State family: a cached state is valid after a multiple of this many tokens.
     checkpoint_interval: Optional[int] = None
+    # The host pool keeping the slot's HiCache copies, by name; None means the
+    # family's own (the window host pool for a window).
+    host_pool: Optional[str] = None
 
 
 class WireEntry(msgspec.Struct, frozen=True, kw_only=True):
-    """One PD state entry: the sub-pool part it carries and its state type."""
+    """One PD state entry: the sub-pool part it carries, its state type, and
+    the key peers tell entries of one type apart by (the sub-pool's)."""
 
     sub_pool: str
     part: str
     state_type: str
+    key: Optional[str] = None
 
 
 class PlannedSubPool(msgspec.Struct, frozen=True, kw_only=True):
@@ -177,11 +218,35 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
         return frozenset(type(s.lifetime) for s in self.sub_pools)
 
     def of_lifetime(self, lifetime_type: Type) -> Optional[PlannedSubPool]:
+        """The plan's one sub-pool of a lifetime type; windows can be several,
+        see `windows` and `primary_window`."""
+        assert lifetime_type is not WindowLifetime, "a plan may hold several windows"
         found = [s for s in self.sub_pools if isinstance(s.lifetime, lifetime_type)]
-        if lifetime_type is WindowLifetime and len(found) > 1:
-            return next(s for s in found if s.name == "swa")
         assert len(found) <= 1, f"more than one {lifetime_type.__name__} sub-pool"
         return found[0] if found else None
+
+    def windows(self) -> Tuple[PlannedSubPool, ...]:
+        """The window sub-pools in window-slot order: the primary window, then
+        the rest in drive order."""
+        primary = self.primary_window()
+        rest = [
+            s
+            for s in self.drive_order()
+            if isinstance(s.lifetime, WindowLifetime) and s is not primary
+        ]
+        return tuple([primary] * (primary is not None) + rest)
+
+    def primary_window(self) -> Optional[PlannedSubPool]:
+        """The longest window the target's layers declare, or the longest
+        window when the target declares none: the window a single-window reader
+        sizes and retains by."""
+        drafts = set() if self.fused_draft is None else set(self.fused_draft.new_bands)
+        windows = [s for s in self.sub_pools if isinstance(s.lifetime, WindowLifetime)]
+        candidates = [s for s in windows if s.name not in drafts] or windows
+        if not candidates:
+            return None
+        length = primary_window(s.lifetime.window for s in candidates)
+        return next(s for s in candidates if s.lifetime.window == length)
 
     def owner(self) -> PlannedSubPool:
         """The sub-pool that owns the token id space."""
@@ -208,11 +273,14 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
         )
 
     def tree_slots(
-        self, *, window_reaches: Optional[Dict[str, int]] = None
+        self, *, window_lengths: Optional[Dict[str, int]] = None
     ) -> Tuple[TreeSlot, ...]:
-        """The prefix tree's slots, one per sub-pool, in drive order.
-        ``window_reaches`` names the storage sub-pools additional readers use,
-        and how far back from the committed length each reader needs them."""
+        """The prefix tree's slots, one per sub-pool, in drive order with the
+        windows in `windows` order: the tree's first window slot is the
+        target's window. A window slot keeps ``window_lengths[name]``, the
+        tail a running request keeps of it (`KVStorage.retained_window_lengths`);
+        without it, the window its layers declare (for a slot's identity
+        only)."""
         for sub_pool in self.sub_pools:
             lifetime = sub_pool.lifetime
             if isinstance(lifetime, StateLifetime) and (
@@ -228,9 +296,8 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
                 component=s.external.tree_component,
                 family=_TREE_FAMILY[type(s.lifetime)],
                 window=(
-                    max(s.lifetime.window, (window_reaches or {}).get(s.name, 0))
+                    (window_lengths or {}).get(s.name, s.lifetime.window)
                     if isinstance(s.lifetime, WindowLifetime)
-                    and s.lifetime.window is not None
                     else None
                 ),
                 checkpoint_interval=(
@@ -238,18 +305,27 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
                     if isinstance(s.lifetime, StateLifetime)
                     else None
                 ),
+                host_pool=s.external.host_pool,
             )
+            for s in self._tree_order()
+        )
+
+    def _tree_order(self) -> Tuple[PlannedSubPool, ...]:
+        windows = iter(self.windows())
+        return tuple(
+            next(windows) if isinstance(s.lifetime, WindowLifetime) else s
             for s in self.drive_order()
         )
 
     def wire_entries(self) -> Tuple[WireEntry, ...]:
-        """The PD state entries, in the order peers list them. The owner's
-        token KV is the transfer's KV entries, not a state entry."""
+        """The PD state entries in peer order: by state type, then key, so
+        entries of one type line up on both peers. Owner token KV is not one."""
         entries = [
             WireEntry(
                 sub_pool=s.name,
                 part=STATE_PART if isinstance(s.lifetime, StateLifetime) else KV_PART,
                 state_type=s.external.wire,
+                key=s.external.wire_key,
             )
             for s in self.sub_pools
             if s.external.wire is not None
@@ -264,6 +340,7 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
                         sub_pool=declared.sub_pool,
                         part=declared.wire,
                         state_type=declared.wire,
+                        key=self.sub_pool(declared.sub_pool).external.wire_key,
                     ),
                 )
         for declared in self.request_parts:
@@ -275,10 +352,19 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
                         sub_pool=self.owner().name,
                         part=declared.wire,
                         state_type=declared.wire,
+                        key=self.owner().external.wire_key,
                     ),
                 )
         entries.extend(groups.values())
-        return tuple(sorted(entries, key=lambda e: _WIRE_ORDER.index(e.state_type)))
+        unknown = [e.state_type for e in entries if e.state_type not in _WIRE_ORDER]
+        if unknown:
+            raise ValueError(f"PD transfers have no state type for {unknown}")
+        return tuple(
+            sorted(
+                entries,
+                key=lambda e: (_WIRE_ORDER.index(e.state_type), e.key),
+            )
+        )
 
 
 def _unit(lifetime: KVLifetime, page_size: int) -> int:
@@ -288,7 +374,13 @@ def _unit(lifetime: KVLifetime, page_size: int) -> int:
 def _chain_key(key: Tuple[KVLifetime, int]) -> tuple:
     lifetime, unit = key
     rank, window = lifetime.retention()
-    return (rank, -window, unit, _SUB_POOL_NAMES[type(lifetime)])
+    return (rank, -window, unit)
+
+
+def _sub_pool_name(lifetime: KVLifetime) -> str:
+    if isinstance(lifetime, WindowLifetime):
+        return window_sub_pool_name(lifetime.window)
+    return _SUB_POOL_NAMES[type(lifetime)]
 
 
 def _group_parts(
@@ -313,9 +405,7 @@ def sub_pool_names(decls: Sequence[KVLayerDecl]) -> Tuple[str, ...]:
     """The sub-pools a plan of these declarations holds, owner first: what the
     fused-draft placement needs before the plan exists."""
     keys = _group_parts(decls, page_size=1)
-    return tuple(_SUB_POOL_NAMES[type(lt)] for lt, _ in sorted(keys, key=_chain_key))[
-        ::-1
-    ]
+    return tuple(_sub_pool_name(lt) for lt, _ in sorted(keys, key=_chain_key))[::-1]
 
 
 def _spec_for(
@@ -379,9 +469,7 @@ def plan_kv_storage(
     groups = _group_parts(decls, page_size)
     if not any(isinstance(lt, FullLifetime) for lt, _ in groups):
         raise ValueError("unified storage needs a FULL virtual-id owner")
-    if len({lt for lt, _ in groups if isinstance(lt, WindowLifetime)}) > 1:
-        raise ValueError("multiple target windows require named model declarations")
-    names_by_key = {key: _SUB_POOL_NAMES[type(key[0])] for key in groups}
+    names_by_key = {key: _sub_pool_name(key[0]) for key in groups}
     if fused_draft is not None:
         for name, band in fused_draft.new_bands.items():
             region = fused_draft.region(name)
@@ -414,9 +502,12 @@ def plan_kv_storage(
             key = (lifetime, _unit(lifetime, page_size))
             if key in groups:
                 raise ValueError(f"draft band {name!r} duplicates a target lifetime")
+            if name in names_by_key.values():
+                raise ValueError(f"draft band {name!r} takes a target sub-pool's name")
             groups[key] = ([], geometry)
             names_by_key[key] = name
-    chain = sorted(groups, key=_chain_key)
+    chain = sorted(groups, key=lambda key: (*_chain_key(key), names_by_key[key]))
+
     sub_pools = []
     for i, key in enumerate(chain):
         lifetime, unit = key
@@ -438,13 +529,8 @@ def plan_kv_storage(
                     fused_draft=fused_draft,
                 ),
                 external=(
-                    SubPoolExternal(
-                        host_pool="auxiliary_swa",
-                        tree_component="AUXILIARY_SWA",
-                        metrics="swa",
-                        wire="auxiliary_swa",
-                    )
-                    if name == "draft_swa"
+                    _window_external(name)
+                    if isinstance(lifetime, WindowLifetime)
                     else _EXTERNAL[type(lifetime)]
                 ),
             )

@@ -26,6 +26,7 @@ HW_MAPPING = {
     "mlx": HWBackend.MLX,
     "mps": HWBackend.MPS,
     "ppu": HWBackend.PPU,
+    "mlu": HWBackend.MLU,
 }
 
 # Per-commit test suites (run on every PR).
@@ -96,6 +97,7 @@ PER_COMMIT_SUITES = {
         "base-b-test-diffusion-bcg-1-gpu-h100",
         "base-b-test-diffusion-component-2-gpu-h100",
         "base-b-test-diffusion-unit-1-gpu-h100",
+        "base-b-test-diffusion-unit-1-gpu-b300",
         "base-c-test-4-gpu-h100",
         "base-c-test-4-gpu-b200",
         "base-c-test-2-gpu-gb300",
@@ -142,6 +144,10 @@ PER_COMMIT_SUITES = {
     HWBackend.PPU: [
         "stage-a-test-1-gpu-ppu",
     ],
+    HWBackend.MLU: [
+        "pr-test-1-mlu",
+        "pr-test-2-mlu",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -170,6 +176,7 @@ NIGHTLY_SUITES = {
         "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",
         "nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4",
         "nightly-amd-accuracy-8-gpu-mi35x-kimi-k3",
+        "nightly-amd-accuracy-8-gpu-mi35x-kimi-k31-pro",
         "nightly-amd-8-gpu-mi35x-qwen38-mxfp4",
         "nightly-amd-8-gpu-mi35x-glm52-fp8",
         "nightly-amd-8-gpu-mi35x-glm53-flash",
@@ -253,6 +260,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.MLX,
     HWBackend.MPS,
     HWBackend.PPU,
+    HWBackend.MLU,
 }
 
 

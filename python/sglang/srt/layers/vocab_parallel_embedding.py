@@ -35,14 +35,9 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import (
-    cpu_has_amx_support,
-    get_compiler_backend,
-    is_cpu,
-    is_npu,
-    set_weight_attrs,
-)
+from sglang.srt.utils import cpu_has_amx_support, get_compiler_backend, is_cpu, is_npu
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
