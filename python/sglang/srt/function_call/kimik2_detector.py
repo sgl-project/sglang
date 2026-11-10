@@ -79,7 +79,7 @@ class KimiK2Detector(BaseFormatDetector):
             re.DOTALL,
         )
 
-        self._current_function_id: Optional[str] = None
+        self._current_function_id: str | None = None
         self._current_stream_function_name: str | None = None
         self._argument_buffer = StringIO()
 
@@ -236,46 +236,47 @@ class KimiK2Detector(BaseFormatDetector):
 
         try:
             while True:
-                name_just_resolved = False
                 if self._current_function_id is None:
                     buffer = self._buffer
+
+                    # Locate next <|tool_call_begin|>, draining any prefix as text.
                     begin_idx = self._locate_tool_call_start(buffer, normal_text_parts)
                     if begin_idx is None:
                         break
                     buffer = self._buffer
 
+                    # If another <|tool_call_begin|> appears before the header
+                    # closes with <|tool_call_argument_begin|>, the section is
+                    # malformed -- discard and restart at the orphan.
                     arg_begin_idx = buffer.find(self.tool_call_argument_begin_token)
                     next_begin = buffer.find(
-                        self.tool_call_start_token,
-                        len(self.tool_call_start_token),
+                        self.tool_call_start_token, len(self.tool_call_start_token)
                     )
                     if next_begin != -1 and (
                         arg_begin_idx == -1 or next_begin < arg_begin_idx
                     ):
                         logger.warning(
-                            "Kimi-K2 tool_call_begin without preceding "
-                            "tool_call_end; discarding incomplete section."
+                            "Kimi-K2 tool_call_begin without preceding tool_call_end; "
+                            "discarding incomplete section."
                         )
                         self._buffer = buffer[next_begin:]
                         self._reset_inflight_call_state()
                         continue
 
                     if arg_begin_idx == -1:
+                        # Header not fully arrived yet.
                         break
 
+                    # Parse the header once; only the arguments stay buffered.
                     id_start = len(self.tool_call_start_token)
                     self._current_function_id = buffer[id_start:arg_begin_idx].strip()
                     args_start = arg_begin_idx + len(
                         self.tool_call_argument_begin_token
                     )
                     self._buffer = buffer[args_start:]
-                    resolved = self._resolve_function_name(
-                        self._current_function_id, tools, ""
-                    )
-                    if resolved is not None:
-                        self._begin_streaming_call(resolved)
-                        name_just_resolved = True
 
+                # Take the arguments up to the end marker, holding back a
+                # possible partial end marker.
                 buffer = self._buffer
                 end_idx = buffer.find(self.tool_call_end_token)
                 if end_idx == -1:
@@ -283,47 +284,70 @@ class KimiK2Detector(BaseFormatDetector):
                 else:
                     argument_diff = buffer[:end_idx]
                     self._buffer = buffer[end_idx + len(self.tool_call_end_token) :]
-                self._argument_buffer.write(argument_diff)
 
-                if argument_diff or name_just_resolved:
-                    if self._current_stream_function_name is not None:
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=(
-                                    self._current_stream_function_name
-                                    if name_just_resolved
-                                    else None
-                                ),
-                                parameters=argument_diff,
-                            )
-                        )
-
-                if end_idx == -1:
-                    break
-
-                arguments = self._argument_buffer.getvalue()
+                # Resolve function name (cached across chunks within a section).
+                name_just_resolved = False
                 if self._current_stream_function_name is None:
+                    self._argument_buffer.write(argument_diff)
+                    argument_diff = self._argument_buffer.getvalue()
                     resolved = self._resolve_function_name(
-                        self._current_function_id, tools, arguments
+                        self._current_function_id, tools, argument_diff
                     )
                     if resolved is None:
+                        if end_idx == -1:
+                            # Wait for the end marker before deciding.
+                            break
                         logger.warning(
                             "Kimi-K2 unrecognized tool_call_id %r; skipping section.",
                             self._current_function_id,
                         )
                         self._reset_inflight_call_state()
                         continue
-                    self._begin_streaming_call(resolved)
+                    name = resolved
+                    self._current_stream_function_name = name
+                    name_just_resolved = True
+
+                    # ``tool_index`` is the per-response 0-based position
+                    # (OpenAI streaming spec); ignore the model's ``:N`` suffix
+                    # which is a conversation-level counter.
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+                        self.prev_tool_call_arr = []
+                        self.streamed_args_for_tool = [""]
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+                    self.prev_tool_call_arr[self.current_tool_id] = {
+                        "name": name,
+                        "arguments": {},
+                    }
+                    self.current_tool_name_sent = True
+
+                # Stream newly-arrived args, combining the first event with
+                # the freshly-resolved name.
+                if argument_diff or name_just_resolved:
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
-                            name=resolved,
-                            parameters=arguments,
+                            name=(
+                                self._current_stream_function_name
+                                if name_just_resolved
+                                else None
+                            ),
+                            parameters=argument_diff,
                         )
                     )
+                    if argument_diff:
+                        self.streamed_args_for_tool[self.current_tool_id] += (
+                            argument_diff
+                        )
 
-                self.streamed_args_for_tool[self.current_tool_id] = arguments
+                if end_idx == -1:
+                    # Args still streaming.
+                    break
+
+                # Section finalized -- prepare next call.
                 self.current_tool_id += 1
                 self._reset_inflight_call_state()
 
@@ -340,28 +364,22 @@ class KimiK2Detector(BaseFormatDetector):
                 normal_text="".join(normal_text_parts), calls=calls
             )
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release arguments held back as a possible partial end marker."""
+        if self._current_stream_function_name is None or not self._buffer:
+            return StreamingParseResult()
+        pending, self._buffer = self._buffer, ""
+        self.streamed_args_for_tool[self.current_tool_id] += pending
+        return StreamingParseResult(
+            calls=[ToolCallItem(tool_index=self.current_tool_id, parameters=pending)]
+        )
+
     def _reset_inflight_call_state(self) -> None:
         """Reset per-section streaming state after finalize/discard."""
         self._current_function_id = None
         self.current_tool_name_sent = False
         self._current_stream_function_name = None
         self._argument_buffer = StringIO()
-
-    def _begin_streaming_call(self, name: str) -> None:
-        if self.current_tool_id == -1:
-            self.current_tool_id = 0
-            self.prev_tool_call_arr = []
-            self.streamed_args_for_tool = [""]
-        while len(self.prev_tool_call_arr) <= self.current_tool_id:
-            self.prev_tool_call_arr.append({})
-        while len(self.streamed_args_for_tool) <= self.current_tool_id:
-            self.streamed_args_for_tool.append("")
-        self.prev_tool_call_arr[self.current_tool_id] = {
-            "name": name,
-            "arguments": {},
-        }
-        self._current_stream_function_name = name
-        self.current_tool_name_sent = True
 
     def _split_pending_end(self, text: str) -> tuple[str, str]:
         max_tail = min(len(text), len(self.tool_call_end_token) - 1)

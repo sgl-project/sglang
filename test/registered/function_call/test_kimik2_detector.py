@@ -325,6 +325,23 @@ class TestKimiK2DetectorStreaming(unittest.TestCase):
             [{"name": "get_weather", "parameters": arguments}],
         )
 
+    def test_streaming_unfinished_call_at_stream_end(self):
+        """serving_chat reads streamed_args_for_tool when a stream ends mid-call."""
+        detector = KimiK2FuncDetector()
+        chunks = [
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>functions.get_weather:0"
+            '<|tool_call_argument_begin|>{"city": "a',
+            " <",
+        ]
+
+        tool_calls, _ = _collect_streaming_tool_calls(detector, chunks, self.tools)
+        end = detector.finish(self.tools)
+
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "a ')
+        self.assertEqual([call.parameters for call in end.calls], ["<"])
+        self.assertEqual(detector.streamed_args_for_tool, ['{"city": "a <'])
+
 
 class TestKimiK2DetectorSpecialTokenLeakage(unittest.TestCase):
     """Verify special tokens are never leaked into normal_text output."""
@@ -1435,6 +1452,19 @@ class TestKimiK2BareCounterParsing(unittest.TestCase):
         tool_calls, _ = _collect_streaming_tool_calls(detector, chunks, single_tool)
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0]["name"], "search")
+
+    def test_streaming_bare_counter_resolves_before_end_marker(self):
+        detector = KimiK2FuncDetector()
+        chunks = [
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>0"
+            '<|tool_call_argument_begin|>{"city": ',
+            '"Tokyo"}',
+        ]
+        tool_calls, _ = _collect_streaming_tool_calls(detector, chunks, self.tools)
+        self.assertEqual(
+            tool_calls, [{"name": "get_weather", "parameters": '{"city": "Tokyo"}'}]
+        )
 
 
 if __name__ == "__main__":
