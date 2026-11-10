@@ -1,9 +1,0 @@
-{
-  "engine_commit": "630da396a576b6bb1dceadbeb0f3442fc33c9f20",
-  "router_source_equivalent_commit": "1324442271",
-  "router_build_worktree": "/tmp/sglang-rfc-build/router-worktree",
-  "router_binary_sha256": "e06d7a635754aabf190296f9551e560a416c308a447ccde3e84f3ea7b3a4ebe9",
-  "model": "Qwen3-8B",
-  "scope": "P6 Router feature acceptance; final P7 feedback adapter is separately checked",
-  "control_credentials": "not stored; raw excludes Authorization"
-}

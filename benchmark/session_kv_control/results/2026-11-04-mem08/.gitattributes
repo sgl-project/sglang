@@ -1,4 +1,0 @@
-# Keep standard generated CSV, matplotlib SVG, and captured test output bytes intact.
-analysis/*.csv whitespace=cr-at-eol
-analysis/*.svg -whitespace
-provenance/*.log -whitespace

@@ -1,7 +1,0 @@
-{
-  "first_formal_command_utc": "2026-11-04T08:07:53.176692+00:00",
-  "last_formal_command_utc": "2026-11-04T10:24:54.312914+00:00",
-  "wall_interval_seconds": 8221.136221885681,
-  "definition": "Includes source publication, laboratory resets, code-snapshot transition and pauses between matrix cells; work-only rates are separately measured.",
-  "formal_calls": 5724
-}

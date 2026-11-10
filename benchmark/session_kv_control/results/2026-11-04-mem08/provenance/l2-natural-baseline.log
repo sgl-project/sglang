@@ -1,6 +1,0 @@
-{"arm": "b0-pin", "valid": true, "wall_ms": 163340.85166081786, "completed": 61, "errors": []}
-{"arm": "b0-on_demand", "valid": true, "wall_ms": 209512.4316830188, "completed": 61, "errors": []}
-{"arm": "b1-on_demand", "valid": true, "wall_ms": 148235.36110296845, "completed": 61, "errors": []}
-{"arm": "b1-pin", "valid": true, "wall_ms": 140362.98749875277, "completed": 61, "errors": []}
-{"arm": "b2-on_demand", "valid": true, "wall_ms": 155339.0995375812, "completed": 61, "errors": []}
-{"arm": "b2-pin", "valid": true, "wall_ms": 159760.66620927304, "completed": 61, "errors": []}

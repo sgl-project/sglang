@@ -1,2 +1,0 @@
-{"arm": "b0-prefetch", "valid": true, "wall_ms": 3709.0350594371557, "completed": 2, "errors": []}
-{"arm": "b0-on_demand", "valid": true, "wall_ms": 3842.110261321068, "completed": 2, "errors": []}

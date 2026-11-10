@@ -1,6 +1,0 @@
-WAIT baseline c32 completion
-Traceback (most recent call last):
-  File "/tmp/sglang-rfc-build/mem08/run-optimized.py", line 21, in <module>
-    assert len(summary['arms'])==6 and all(a['valid'] for a in summary['arms']), 'baseline not fully valid'
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-AssertionError: baseline not fully valid

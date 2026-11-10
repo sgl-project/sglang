@@ -1,3 +1,0 @@
-Running 11 items in this shard
-...........                                                          [100%]
-11 passed, 17 warnings, 4 subtests passed in 22.19s

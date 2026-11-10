@@ -1,8 +1,0 @@
-{
-  "engine_commit": "f65f0393c4c916184c6c9017fafb9fa389ec2f4a",
-  "router_rust_source_commit": "35a18bf008",
-  "router_binary_sha256": "4bf41f770d7b3bf509a798be55dbaae2f04e797f021364ea4be274c6a2bf4e5b",
-  "protocol": "0.1 envelope, 1.0 public actions",
-  "source_note": "f65 includes P7 feedback and bounded host-capacity correction; later documentation changes do not alter runtime source",
-  "hardware_csv": "provenance/gpu-hardware.csv"
-}

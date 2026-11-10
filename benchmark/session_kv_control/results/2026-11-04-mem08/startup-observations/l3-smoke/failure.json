@@ -1,4 +1,0 @@
-{
-  "error": "source publication failed; comparison cannot begin",
-  "traceback": "Traceback (most recent call last):\n  File \"/tmp/sglang-rfc-build/mem08-harness-worktree/benchmark/session_kv_control/stress_bench.py\", line 491, in run\n    raise BenchError(\"source publication failed; comparison cannot begin\")\nsession_kv_bench.BenchError: source publication failed; comparison cannot begin\n"
-}

@@ -1,7 +1,0 @@
-{
-  "mooncake-transfer-engine-cuda13": "0.3.14",
-  "torch": "2.14.1",
-  "transformers": "5.17.0",
-  "msgspec": "0.22.0",
-  "matplotlib": "3.11.2"
-}

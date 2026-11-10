@@ -1,6 +1,0 @@
-{"arm": "b0-prefetch", "valid": true, "wall_ms": 195995.77336385846, "completed": 128, "errors": []}
-{"arm": "b0-on_demand", "valid": true, "wall_ms": 156508.1674521789, "completed": 128, "errors": []}
-{"arm": "b1-on_demand", "valid": true, "wall_ms": 148668.44903398305, "completed": 128, "errors": []}
-{"arm": "b1-prefetch", "valid": true, "wall_ms": 179251.15818995982, "completed": 128, "errors": []}
-{"arm": "b2-on_demand", "valid": true, "wall_ms": 166217.22376625985, "completed": 128, "errors": []}
-{"arm": "b2-prefetch", "valid": true, "wall_ms": 184168.845821172, "completed": 128, "errors": []}
