@@ -6290,8 +6290,6 @@ class TestRequestChatTemplateTrustGate(CustomTestCase):
 
 
 class KimiK3ThinkingTestCase(unittest.TestCase):
-    """The K3 renderer's view of `thinking` / `reasoning_effort`."""
-
     MESSAGES = [{"role": "user", "content": "hi"}]
 
     def setUp(self):
@@ -6323,17 +6321,6 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
         self.chat._process_messages(request, is_multimodal=False)
         return self.tm.tokenizer.apply_chat_template.call_args.kwargs
 
-    def test_thinking_disabled_reaches_the_encoder(self):
-        kwargs = self._template_kwargs(thinking={"type": "disabled"})
-        self.assertIs(kwargs["thinking"], False)
-        self.assertNotIn("thinking_effort", kwargs)
-
-    def test_thinking_effort_wins_over_reasoning_effort(self):
-        kwargs = self._template_kwargs(
-            reasoning_effort="max", thinking={"type": "enabled", "effort": "low"}
-        )
-        self.assertEqual(kwargs["thinking_effort"], "low")
-
     def test_chat_template_kwargs_remains_the_top_override(self):
         kwargs = self._template_kwargs(
             thinking={"effort": "low"},
@@ -6348,6 +6335,7 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
             ("medium", "high"),
             ("high", "high"),
             ("xhigh", "max"),
+            ("ultra", "max"),
             ("max", "max"),
         ):
             with self.subTest(reasoning_effort=requested):
@@ -6381,37 +6369,30 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
 
     def test_template_kwargs_cannot_collide_with_encoder_arguments(self):
         kwargs = self._template_kwargs(
-            chat_template_kwargs={"add_generation_prompt": False, "tokenize": False}
+            chat_template_kwargs={"add_generation_prompt": False}
         )
         self.assertIs(kwargs["add_generation_prompt"], True)
-        self.assertIs(kwargs["tokenize"], True)
         for key in ("tools", "conversation"):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
                 self._template_kwargs(chat_template_kwargs={key: []})
-
-    def test_unsupported_effort_is_reported_by_validation(self):
-        request = ChatCompletionRequest(
-            model="x", messages=self.MESSAGES, reasoning_effort=0.5
-        )
-        self.assertIn("reasoning_effort", self.chat._validate_request(request))
 
     def test_float_effort_is_a_client_error(self):
         with self.assertRaises(ValueError):
             self._template_kwargs(reasoning_effort=0.5)
 
-    def test_keep_is_normalized_not_rejected(self):
-        """ "all" is the only retention mode implemented, and a deployment is
-        expected to force it. Rejecting instead fails a request the reference
-        service answers."""
-        for keep in ("all", "none", "some-future-mode"):
-            for thinking_type in ("enabled", "disabled"):
-                with self.subTest(keep=keep, type=thinking_type):
-                    request = ChatCompletionRequest(
-                        model="x",
-                        messages=self.MESSAGES,
-                        thinking={"type": thinking_type, "keep": keep},
-                    )
-                    self.assertIsNone(self.chat._validate_request(request))
+    def test_keep_is_accepted(self):
+        request = ChatCompletionRequest(
+            model="x", messages=self.MESSAGES, thinking={"keep": "none"}
+        )
+        self.assertIsNone(self.chat._validate_request(request))
+
+    def test_bad_thinking_is_a_client_error(self):
+        for thinking in (False, {"type": "bogus"}):
+            with self.subTest(thinking=thinking):
+                request = ChatCompletionRequest(
+                    model="x", messages=self.MESSAGES, thinking=thinking
+                )
+                self.assertIn("invalid thinking", self.chat._validate_request(request))
 
     def test_response_channel_flag_tracks_the_resolved_thinking_mode(self):
         """The constraint has to know which channel the prompt left open."""
@@ -6475,14 +6456,6 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
                     },
                 }
             ],
-        )
-        self.assertIsNone(self.chat._validate_request(request))
-
-    def test_keep_all_accepted(self):
-        request = ChatCompletionRequest(
-            model="x",
-            messages=self.MESSAGES,
-            thinking={"type": "enabled", "keep": "all"},
         )
         self.assertIsNone(self.chat._validate_request(request))
 

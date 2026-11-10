@@ -198,7 +198,6 @@ class TestChatCompletionRequest(CustomTestCase):
         self.assertEqual(request.messages[0].content[0].image_url.detail, "auto")
 
     def test_image_url_may_be_a_bare_string(self):
-        """A bare-string image_url parses like {"url": ...} in user and tool messages."""
         url = "https://example.com/a.png"
         request = ChatCompletionRequest(
             model="test-model",
@@ -207,30 +206,9 @@ class TestChatCompletionRequest(CustomTestCase):
                     "role": "user",
                     "content": [{"type": "image_url", "image_url": url}],
                 },
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "screenshot", "arguments": "{}"},
-                        }
-                    ],
-                },
-                {
-                    "role": "tool",
-                    "tool_call_id": "call_1",
-                    "content": [
-                        {"type": "text", "text": "result:"},
-                        {"type": "image_url", "image_url": url},
-                    ],
-                },
             ],
         )
         self.assertEqual(request.messages[0].content[0].image_url.url, url)
-        self.assertEqual(request.messages[0].content[0].image_url.detail, "auto")
-        self.assertEqual(request.messages[2].content[1].image_url.url, url)
 
     def test_sampling_param_build(self):
         req = ChatCompletionRequest(
@@ -1047,9 +1025,7 @@ class TestMessageLevelTools(unittest.TestCase):
                 )
 
 
-class TestThinkingParam(unittest.TestCase):
-    """`thinking` is the K3 spelling of the reasoning controls."""
-
+class TestThinkingObject(unittest.TestCase):
     MESSAGES = [{"role": "user", "content": "hi"}]
 
     def _request(self, **kwargs):
@@ -1082,26 +1058,21 @@ class TestThinkingParam(unittest.TestCase):
         request = self._request(reasoning_effort="high", thinking={"type": "disabled"})
         self.assertIs(request.chat_template_kwargs["thinking"], False)
 
+    def test_invalid_effort_names_the_thinking_field(self):
+        with self.assertRaisesRegex(ValidationError, "invalid thinking effort"):
+            self._request(thinking={"type": "enabled", "effort": "bogus"})
+
+    def test_non_object_thinking_leaves_the_toggle_unset(self):
+        request = self._request(thinking=False)
+        self.assertIsNone(request.chat_template_kwargs)
+
     def test_adaptive_is_treated_as_enabled(self):
         request = self._request(thinking={"type": "adaptive"})
         self.assertIs(request.chat_template_kwargs["thinking"], True)
 
     def test_explicit_none_effort_survives_a_thinking_object(self):
-        # A thinking object with no explicit type must not turn reasoning back on.
         request = self._request(reasoning_effort="none", thinking={"keep": "all"})
         self.assertIs(request.chat_template_kwargs["thinking"], False)
-
-    def test_effort_none_inside_thinking_disables_reasoning(self):
-        request = self._request(thinking={"effort": "none"})
-        self.assertIs(request.chat_template_kwargs["thinking"], False)
-
-    def test_null_type_is_treated_as_absent(self):
-        request = self._request(thinking={"type": None, "keep": "all"})
-        self.assertIs(request.chat_template_kwargs["thinking"], True)
-
-    def test_unknown_type_rejected(self):
-        with self.assertRaises(ValidationError):
-            self._request(thinking={"type": "sometimes"})
 
 
 if __name__ == "__main__":

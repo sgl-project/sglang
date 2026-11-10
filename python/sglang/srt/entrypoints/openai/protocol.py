@@ -696,7 +696,6 @@ class ChatCompletionMessageContentImagePart(BaseModel):
     @field_validator("image_url", mode="before")
     @classmethod
     def _accept_bare_url(cls, value: Any) -> Any:
-        # Some clients send "image_url": "<url>" instead of {"url": "<url>"}.
         return {"url": value} if isinstance(value, str) else value
 
 
@@ -992,30 +991,19 @@ _TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 _TOOL_NAME_MAX_LEN = 256
 
 
-class ThinkingParam(BaseModel):
-    """K3-style thinking control, as Kimi K3 and compatible surfaces send it.
-
-    ``type`` gates reasoning and ``effort`` outranks ``reasoning_effort``.
-
-    ``keep`` selects how much earlier reasoning is replayed; "all" is the only
-    mode implemented here, and any other value is normalized to it rather than
-    rejected. A deployment is expected to force "all" this way -- rejecting the
-    request would fail one the reference service answers. ``adaptive`` is
-    accepted as an alias for enabled so an Anthropic-shaped value reaching this
-    surface does not 400.
-    """
-
-    model_config = ConfigDict(extra="allow")
-
-    type: Optional[Literal["enabled", "disabled", "adaptive"]] = None
-    # Accepted and normalized to "all"; see the class docstring.
-    keep: Optional[str] = None
-    effort: ReasoningEffortType = None
-
-    @property
-    def enabled(self) -> bool:
-        """Absent or "adaptive" both mean reasoning is on; only "disabled" is off."""
-        return self.type != "disabled"
+def _parse_effort(effort: Any, field: str) -> Union[str, float]:
+    if isinstance(effort, str) and effort in get_args(ReasoningEffortTier):
+        return effort
+    if isinstance(effort, (int, float)) and not isinstance(effort, bool):
+        return float(effort)
+    if isinstance(effort, str):
+        # Keep parity with the top-level reasoning_effort field, whose
+        # lax union coerces numeric strings; range checks then apply.
+        try:
+            return float(effort)
+        except ValueError as exc:
+            raise ValueError(f"invalid {field}: {effort!r}") from exc
+    raise ValueError(f"invalid {field}: {effort!r}")
 
 
 def _message_tools_indices(messages: Any) -> List[int]:
@@ -1130,12 +1118,10 @@ class ChatCompletionRequest(PDRoutingFields):
     )
     thinking: Optional[Any] = Field(
         default=None,
-        description="Thinking control. K3 form: {type: enabled|disabled|adaptive, "
-        "keep: all, effort: low|high|max}; 'effort' takes precedence over "
-        "reasoning_effort, 'type: disabled' turns reasoning off, 'keep' is "
-        "normalized to 'all'. Other models whose chat template defines a thinking "
-        "mode read it as a plain dict (e.g. {'type': 'adaptive'}). Kept as a dict; "
-        "the K3 serving path validates it against ThinkingParam.",
+        description="Thinking config such as {'type': 'adaptive'}. 'type' "
+        "(enabled, disabled, adaptive) sets the thinking toggle and 'effort' takes "
+        "precedence over reasoning_effort; templates that define a thinking mode "
+        "also read the dict itself.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]
@@ -1347,28 +1333,8 @@ class ChatCompletionRequest(PDRoutingFields):
             effort = r.get("effort")
             if effort is None:
                 effort = r.get("reasoning_effort")
-            if isinstance(effort, str) and effort in {
-                "none",
-                "minimal",
-                "low",
-                "medium",
-                "high",
-                "xhigh",
-                "ultra",
-                "max",
-            }:
-                values["reasoning_effort"] = effort
-            elif isinstance(effort, (int, float)) and not isinstance(effort, bool):
-                values["reasoning_effort"] = float(effort)
-            elif isinstance(effort, str):
-                # Keep parity with the top-level reasoning_effort field, whose
-                # lax union coerces numeric strings; range checks then apply.
-                try:
-                    values["reasoning_effort"] = float(effort)
-                except ValueError as exc:
-                    raise ValueError(f"invalid reasoning effort: {effort!r}") from exc
-            elif effort is not None:
-                raise ValueError(f"invalid reasoning effort: {effort!r}")
+            if effort is not None:
+                values["reasoning_effort"] = _parse_effort(effort, "reasoning effort")
 
             enabled = (
                 r.get("enabled")
@@ -1380,15 +1346,16 @@ class ChatCompletionRequest(PDRoutingFields):
             if enabled:
                 thinking = True
 
-        # thinking.effort outranks reasoning.effort and the top-level field.
-        # chat_template_kwargs stays above all three: the renderers only fill
-        # thinking_effort when the caller has not set it themselves.
+        # thinking.effort outranks reasoning.effort and reasoning_effort;
+        # chat_template_kwargs still wins, since renderers only fill unset keys.
         thinking_type = None
         thinking_config = values.get("thinking")
         if isinstance(thinking_config, dict):
             thinking_effort = thinking_config.get("effort")
             if thinking_effort is not None:
-                values["reasoning_effort"] = thinking_effort
+                values["reasoning_effort"] = _parse_effort(
+                    thinking_effort, "thinking effort"
+                )
             thinking_type = thinking_config.get("type")
 
         effort = values.get("reasoning_effort")
@@ -1396,9 +1363,7 @@ class ChatCompletionRequest(PDRoutingFields):
             thinking = effort != "none"
         if thinking_type is not None:
             thinking = thinking_type != "disabled"
-        elif thinking_config is not None and thinking is None:
-            # A thinking object with no explicit type still means "reasoning on",
-            # but never contradicts an effort that already resolved it.
+        elif isinstance(thinking_config, dict) and thinking is None:
             thinking = True
 
         if thinking is not None:
