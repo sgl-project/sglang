@@ -179,6 +179,9 @@ class FusedOpPool:
     def register_fused_func(
         cls, a2a_backend_name: str, runner_backend_name: str, fused_func: Callable
     ):
+        # Key by the canonical value, which is what lookups pass, so a
+        # deprecated alias such as "flashinfer" still registers correctly.
+        a2a_backend_name = MoeA2ABackend(a2a_backend_name).value
         key = (a2a_backend_name, runner_backend_name)
         if key in cls._fused_funcs:
             raise ValueError(

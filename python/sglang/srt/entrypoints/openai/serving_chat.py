@@ -1253,7 +1253,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     "or contains a cycle."
                 )
 
-        max_output_tokens = request.max_completion_tokens or request.max_tokens
+        max_output_tokens = request.effective_max_tokens
         server_context_length = get_model().context_length
         if (
             validate_max_output_tokens
@@ -3898,6 +3898,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # Get the last tool call that was being processed
         tool_index = len(detector.prev_tool_call_arr) - 1
         if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
+            return None
+        if tool_index in _incomplete_tool_call_indices(parser):
             return None
 
         # Get expected vs actual arguments
