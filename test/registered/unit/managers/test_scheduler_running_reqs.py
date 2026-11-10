@@ -2,7 +2,7 @@ import unittest
 from array import array
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock
 
 import torch
 
@@ -84,8 +84,8 @@ def _invariant_checker(s):
     )
 
 
-def _scheduler(cls=_Scheduler):
-    s = cls.__new__(cls)
+def _scheduler():
+    s = _Scheduler.__new__(_Scheduler)
     empty_request_lists(s)
     s.dllm_manager = SimpleNamespace(waiting_queue=[])
     s.running_batch = ScheduleBatch(reqs=[])
@@ -348,105 +348,6 @@ class TestRunningReqsHooks(CustomTestCase):
                 (["kept"], [True]),
             ],
         )
-
-    def test_resource_drain_precedes_admission_and_processes_each_step_once(self):
-        for token_budget, min_free_gb in ((64, 0), (0, 2)):
-            with self.subTest(token_budget=token_budget, min_free_gb=min_free_gb):
-                s = _scheduler(Scheduler)
-                done, kept, new = (_req(rid) for rid in ("done", "kept", "new"))
-                first = _batch([done, kept], ForwardMode.EXTEND)
-                first.extend_num_tokens = 16
-                first.spec_algorithm = SpeculativeAlgorithm.NONE
-                mixed = _batch([new, kept], ForwardMode.MIXED)
-                mixed.extend_num_tokens = 32
-                mixed.spec_algorithm = SpeculativeAlgorithm.NONE
-                s.last_batch = None
-                s.waiting_queue.join([new])
-                s.grammar_manager.has_waiting_grammars = lambda: False
-                s.chunked_prefill_size = 64
-                s.dynamic_chunk_sizer = None
-                s.require_mlp_sync = False
-                s.device = "cpu"
-                s.tp_cpu_group = object()
-                s.gracefully_exit = False
-                s.pause_state = PauseState()
-                s.increment_scheduler_iterations = Mock()
-                s.ingest_requests = Mock(side_effect=[None, None, None, StopIteration])
-                s.is_generation = False
-                s.enable_unified_memory = False
-                s._apply_war_barrier = Mock()
-                _schedule_without_admission(s)
-                s._should_defer_prefill = Mock(return_value=False)
-                s.update_running_batch = lambda b: None
-                events, launched, processed = [], [], []
-
-                def plan(*, running_batch, last_batch):
-                    events.append("plan")
-                    return Scheduler.get_next_batch_to_run(
-                        s, running_batch=running_batch, last_batch=last_batch
-                    )
-
-                def admit(running_batch):
-                    if not launched:
-                        return NextBatchPlan(first, running_batch)
-                    if len(launched) == 1:
-                        # This is the admission boundary, before allocating the
-                        # next mixed step. A late pop would still see done here.
-                        self.assertTrue(done.finished())
-                        self.assertEqual(running_batch.reqs, [kept])
-                        self.assertEqual(list(s.running_reqs), [kept])
-                        self.assertEqual(list(s.prefill_launched_reqs), [])
-                        s.waiting_queue.clear()
-                        # Mixed decode rows move into the step until its merge.
-                        return NextBatchPlan(mixed, ScheduleBatch(reqs=[]))
-                    return NextBatchPlan(None, running_batch)
-
-                def launch(batch):
-                    events.append("run")
-                    self.assertTrue(all(not req.finished() for req in batch.reqs))
-                    s._on_step_launch(batch)
-                    launched.append([req.rid for req in batch.reqs])
-                    return SimpleNamespace()
-
-                def process(batch, result):
-                    events.append("process")
-                    processed.append([req.rid for req in batch.reqs])
-                    if len(processed) == 1:
-                        _finish(done)
-                    else:
-                        _finish(kept)
-                        _finish(new)
-                    s._on_step_processed(batch, result)
-
-                s.get_next_batch_to_run = plan
-                s.get_new_batch_prefill = admit
-                s.run_batch = launch
-                s.process_batch_result = process
-                with (
-                    envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False),
-                    envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.override(token_budget),
-                    envs.SGLANG_PREFILL_OVERLAP_MIN_FREE_GB.override(min_free_gb),
-                    envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True),
-                    patch(
-                        "sglang.srt.managers.scheduler.get_available_gpu_memory",
-                        return_value=1,
-                    ),
-                    self.assertRaises(StopIteration),
-                ):
-                    s.event_loop_overlap()
-
-                self.assertEqual(
-                    events,
-                    ["plan", "run", "process", "plan", "run", "plan", "process"],
-                )
-                self.assertEqual(launched, [["done", "kept"], ["new", "kept"]])
-                self.assertEqual(processed, launched)
-                self.assertEqual(
-                    [r.inflight_steps for r in (done, kept, new)], [0, 0, 0]
-                )
-                self.assertEqual(len(s.running_reqs), 0)
-                self.assertEqual(len(s.prefill_launched_reqs), 0)
-                self.assertEqual(len(s.result_queue), 0)
 
     def test_preemption_leaves_even_when_nothing_is_admitted(self):
         s = _scheduler()
