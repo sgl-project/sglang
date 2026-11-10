@@ -130,6 +130,7 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     identity: Optional[bytes] = None
     pad_values: Optional[Tuple[int, ...]] = None
     processor_fingerprint: Optional[str] = None
+    feature_released: bool = False
 
     def __post_init__(self) -> None:
         if self.hash is not None and not 0 <= self.hash <= _MM_HASH_MASK:
@@ -372,6 +373,11 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
             getattr(proxy, "consumer_count", requested_count),
         )
         return min(requested_count, proxy_count)
+
+    def release_feature(self, *, consumed: bool = False) -> None:
+        """Drop the raw feature and record whether it was consumed."""
+        self.feature = None
+        self.feature_released = self.feature_released or consumed
 
 
 class MultimodalProcessorOutput(
@@ -655,7 +661,18 @@ class MultimodalInputs:
                     exc_info=True,
                 )
             finally:
-                item.feature = None
+                item.release_feature()
+
+    def has_released_items_beyond_prefix(self, prefix_len: int) -> bool:
+        """Whether re-prefill needs a feature released after consumption."""
+        for item in self.mm_items:
+            if not getattr(item, "feature_released", False):
+                continue
+            if item.precomputed_embeddings is not None or not item.offsets:
+                continue
+            if any(end >= prefix_len for _, end in item.offsets):
+                return True
+        return False
 
     @staticmethod
     def from_processor_output(

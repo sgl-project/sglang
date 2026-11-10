@@ -46,6 +46,7 @@ class _FakeReq(FakeReq):
     request_finish = Req.request_finish
     finish_outside_step = Req.finish_outside_step
     get_mm_token_counts = MagicMock()
+    release_mm_prefix_hold = Req.release_mm_prefix_hold
 
     def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
         self.rid = rid
@@ -54,6 +55,7 @@ class _FakeReq(FakeReq):
         self.beam_group = None
         self.session = None
         self.multimodal_inputs = None
+        self.mm_prefix_hold = None
         self._finished = is_finished
         self.finished_reason = None
         self.output_ids = []

@@ -326,6 +326,7 @@ class TestFlushWithDocumentState(CustomTestCase):
         scheduler = object.__new__(Scheduler)
         scheduler.uocr_runtime = hooks
         scheduler.pause_state = PauseState()
+        scheduler.waiting_queue = []
         scheduler.is_fully_idle = lambda **kw: True
         scheduler.tree_cache = Mock()
         scheduler.tree_cache.reset.side_effect = lambda: seen.append(
