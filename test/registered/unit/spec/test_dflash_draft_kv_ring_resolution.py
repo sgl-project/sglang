@@ -61,7 +61,13 @@ def _args(**overrides) -> ServerArgs:
 
 class TestResolveDraftKVRing(CustomTestCase):
     def _resolve(self, args, draft_cfg=SWA_MLA_DRAFT) -> bool:
-        with patch(f"{HOOK_MODULE}._load_draft_hf_config", return_value=draft_cfg):
+        """``draft_cfg=None``: the decision must not load the draft config."""
+        load = patch(
+            f"{HOOK_MODULE}._load_draft_hf_config",
+            return_value=draft_cfg,
+            side_effect=None if draft_cfg else AssertionError("draft config loaded"),
+        )
+        with load:
             _resolve_dflash_draft_kv_ring(args)
         return resolution_result(args, "speculative_dflash_draft_kv_ring")
 
@@ -73,29 +79,49 @@ class TestResolveDraftKVRing(CustomTestCase):
                 # The decision lives in the declaration, not in the environment.
                 self.assertFalse(SWITCH.is_set())
 
-    def test_off_by_default_where_not_served(self):
+    def test_off_by_launch_flags_without_loading_the_draft(self):
         cases = {
             "prefill": _args(disaggregation_mode="prefill"),
             "decode": _args(disaggregation_mode="decode"),
             "unified": _args(enable_unified_memory=True),
             "flashinfer": _args(speculative_draft_attention_backend="flashinfer"),
+            "compact window": _args(speculative_draft_window_size=4096),
         }
         for name, args in cases.items():
             with self.subTest(name), _switch():
-                self.assertFalse(self._resolve(args))
-        with _switch():
-            mixed = dict(SWA_MLA_DRAFT, layer_types=["full_attention"] * 5)
-            self.assertFalse(self._resolve(_args(), draft_cfg=mixed))
+                self.assertFalse(self._resolve(args, draft_cfg=None))
+
+    def test_off_for_drafts_it_does_not_fit(self):
+        cases = {
+            "full attention": dict(SWA_MLA_DRAFT, layer_types=["full_attention"] * 5),
+            "mixed": dict(
+                SWA_MLA_DRAFT,
+                layer_types=["sliding_attention"] * 4 + ["full_attention"],
+            ),
+            "not mla": dict(SWA_MLA_DRAFT, dflash_config={}),
+        }
+        for name, draft_cfg in cases.items():
+            with self.subTest(name), _switch():
+                self.assertFalse(self._resolve(_args(), draft_cfg=draft_cfg))
+
+    def test_off_under_dcp_when_the_draft_does_not_run_dcp(self):
+        # Ascend drafts run without DCP, so their rows are not DCP-collapsed.
+        with (
+            _switch(),
+            patch("sglang.srt.configs.model_config.is_npu", return_value=True),
+        ):
+            self.assertFalse(self._resolve(_args(dcp_size=8)))
+            self.assertTrue(self._resolve(_args(dcp_size=1)))
 
     def test_explicit_on_where_not_served_is_an_error(self):
         for mode in ("prefill", "decode"):
             with self.subTest(mode=mode), _switch(True):
                 with self.assertRaises(ValueError):
-                    self._resolve(_args(disaggregation_mode=mode))
+                    self._resolve(_args(disaggregation_mode=mode), draft_cfg=None)
 
     def test_explicit_off_is_kept(self):
         with _switch(False):
-            self.assertFalse(self._resolve(_args()))
+            self.assertFalse(self._resolve(_args(), draft_cfg=None))
 
 
 def _kvc(*, is_draft_worker=False, cell_size=2880, attn_dp_size=1):

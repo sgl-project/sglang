@@ -1130,11 +1130,12 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         return
     cfg = resolving_view(server_args)
     reason = draft_kv_ring_unsupported_reason(
-        _load_draft_hf_config(cfg),
+        lambda: _load_draft_hf_config(cfg),
         draft_backend=cfg.speculative_draft_attention_backend,
         draft_window_size=cfg.speculative_draft_window_size,
         disaggregation_mode=cfg.disaggregation_mode,
         enable_unified_memory=cfg.enable_unified_memory,
+        dcp_size=cfg.dcp_size,
     )
     if reason is not None:
         if switch.is_set():

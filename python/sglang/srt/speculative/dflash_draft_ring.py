@@ -18,7 +18,7 @@ prefix-cache hit) or from a previous request in the same req pool slot;
 ``min_pos`` floors the window there.
 """
 
-from typing import Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import torch
 
@@ -27,35 +27,47 @@ from sglang.srt.environ import envs
 
 
 def draft_kv_ring_unsupported_reason(
-    draft_hf_config,
+    load_draft_hf_config: Callable[[], Any],
     *,
     draft_backend: Optional[str],
-    draft_window_size,
+    draft_window_size: Optional[int],
     disaggregation_mode: str = "null",
     enable_unified_memory: bool = False,
+    dcp_size: int = 1,
 ) -> Optional[str]:
-    """Why a draft KV ring cannot serve this DFLASH draft, or None if it can."""
+    """Why a draft KV ring cannot serve this DFLASH draft, or None if it can.
+    The draft config is loaded only once the launch flags allow a ring."""
     if disaggregation_mode != "null":
         return "PD disaggregation does not transfer the ring yet"
     if enable_unified_memory:
         return "--enable-unified-memory places the draft KV in the target's pool"
-    from sglang.srt.speculative.dflash_utils import (
-        get_dflash_layer_types,
-        is_dflash_mla_draft_config,
-    )
     from sglang.srt.speculative.draft_worker_common import (
         DFLASH_MLA_ONLY_DRAFT_BACKENDS,
     )
 
+    if draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+        return f"draft backend {draft_backend!r} has no window index path"
+    if draft_window_size is not None:
+        return "--speculative-draft-window-size keeps the compact draft table"
+
+    from sglang.srt.configs.model_config import mla_attention_dcp_size
+    from sglang.srt.speculative.dflash_utils import (
+        get_dflash_layer_types,
+        is_dflash_mla_draft_config,
+    )
+
+    draft_hf_config = load_draft_hf_config()
     if not is_dflash_mla_draft_config(draft_hf_config):
         return "the draft is not MLA"
     layer_types = get_dflash_layer_types(draft_hf_config)
     if not layer_types or any(t != "sliding_attention" for t in layer_types):
         return f"not every draft layer is sliding_attention ({layer_types})"
-    if draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
-        return f"draft backend {draft_backend!r} has no window index path"
-    if draft_window_size is not None:
-        return "--speculative-draft-window-size keeps the compact draft table"
+    # Ring locs follow the DCP owner rule of DCP-collapsed draft rows.
+    if dcp_size > 1 and (
+        mla_attention_dcp_size(draft_hf_config, dcp_size=dcp_size, is_nextn=True)
+        != dcp_size
+    ):
+        return "the draft does not run DCP, so its rows are not DCP-collapsed"
     return None
 
 
