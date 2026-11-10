@@ -153,7 +153,7 @@ The [NIM 2.1.6 campaign](https://gitlab-master.nvidia.com/nim/nim-ops/-/blob/012
 uses SGLang 0.5.22 and the `trace_agentic_64k_400_90kv_structured_4perc` workload.
 The release evidence below supersedes the older tuning results for the cells it covers.
 
-Flash-0731 B200 TP4 is promoted: 755.6 → 827.6 output tok/s/GPU (+9.52%) at matched c256; mean ITL changes from 16.69 to 16.87 ms and mean TTFT improves from 130.684 to 114.858 s. At c4–c16 the candidate is 0.6–1.2% slower and adds 74–427 ms TTFT. A paired 250-question GSM8K sanity check through NIM HTTP scored 245/250 for the incumbent and 247/250 for the candidate, without request errors or output caps; it does not establish full release accuracy. H200 TP4 is not promoted (−0.19%); retain its incumbent. This campaign does not update the Pro recipes.
+Flash-0731 B200 TP4 is promoted: 755.6 → 827.6 output tok/s/GPU (+9.52%) at matched c256; mean ITL changes from 16.69 to 16.87 ms and mean TTFT improves from 130.684 to 114.858 s. At c4–c16 the candidate is 0.6–1.2% slower and adds 74–427 ms TTFT. A paired 250-question GSM8K sanity check through NIM HTTP scored 245/250 for the incumbent and 247/250 for the candidate, without request errors or output caps; it does not establish full release accuracy. H200 TP4 is not promoted (−0.19%); retain its incumbent. The separate Pro-0813 decision-only campaign is recorded below.
 
 <Note>
 These are recorded NIM release-candidate measurements, with calibrated speculative acceptance where enabled.
@@ -281,6 +281,77 @@ deepseek-ai/DeepSeek-V4-Flash-0731,7872f01b1d1fe23eabc4c98b48bffcef5a386062,0.5.
 deepseek-ai/DeepSeek-V4-Flash-0731,7872f01b1d1fe23eabc4c98b48bffcef5a386062,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261029070228@sha256:a0716651c8c94f4144aafc76c5832dc2113f970ef8552268b47f608a5c7fbc06,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,4,4,candidate,214fe389fdc99834eae57c79638da6056ef358c45aa29b3852df8515b72bb94d,64,1,01M684DCK8RPMF1XQFQ07K1P20,https://platform.athena.nvidia.com/trials/01M684DCK8RPMF1XQFQ07K1P20,completed,461.10309060637803,20.24102068680791,21151.179386052016,942,0
 deepseek-ai/DeepSeek-V4-Flash-0731,7872f01b1d1fe23eabc4c98b48bffcef5a386062,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261029070228@sha256:a0716651c8c94f4144aafc76c5832dc2113f970ef8552268b47f608a5c7fbc06,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,4,4,candidate,214fe389fdc99834eae57c79638da6056ef358c45aa29b3852df8515b72bb94d,128,1,01M686GK1ACDAESAAYYWBS7VKS,https://platform.athena.nvidia.com/trials/01M686GK1ACDAESAAYYWBS7VKS,completed,462.1702450251519,18.974276923173118,100299.75320728768,942,0
 deepseek-ai/DeepSeek-V4-Flash-0731,7872f01b1d1fe23eabc4c98b48bffcef5a386062,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261029070228@sha256:a0716651c8c94f4144aafc76c5832dc2113f970ef8552268b47f608a5c7fbc06,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,4,4,candidate,214fe389fdc99834eae57c79638da6056ef358c45aa29b3852df8515b72bb94d,256,1,01M687F5ETCA96P4M6F0JT96H5,https://platform.athena.nvidia.com/trials/01M687F5ETCA96P4M6F0JT96H5,completed,462.89448178300273,17.503938226958304,258787.40580615817,942,0
+```
+
+</Accordion>
+
+### NIM 2.1.6 Pro-0813 performance recipe
+
+[DeepSeek-V4-Pro-0813 campaign](https://gitlab-master.nvidia.com/nim/nim-ops/-/blob/01202ac33d5fc342ce2f5d53835ed9b29b85c563/perf_campaigns/2.1.6/deepseek-v4-pro-0813/README.md), SGLang 0.5.22.
+
+B200 TP8 has a **decision-only promotion, pending reviewer decision**: incumbent c16 reaches 125.89 output tok/s/GPU at 17.17 ms mean ITL; candidate c128 reaches 256.80 at 17.43 ms (+103.98%). Mean TTFT rises from 2.15 to 93.98 s. The full concurrency grid and public-recipe curves are deferred. This is not a completed full-grid or release-accuracy qualification. The campaign name records a 15% agentic workload; use the exact benchmark configuration in the source CSV rather than assuming the other models’ 4% trace.
+
+<Note>
+These are recorded NIM release-candidate results. Public-checkpoint commands adapt the delivered NIM settings;
+NGC and public weights may differ. Run on one Linux/CUDA node with the stated GPUs and pipeline parallelism 1.
+Install SGLang 0.5.22 and supply `HF_TOKEN` where required. Commands omit calibrated synthetic acceptance
+and benchmark-only context caps. Reproduce measurements with the exact runtime, checkpoint and workload in
+the source CSV (NVIDIA access required). Fresh public-runtime GPU performance and accuracy qualification
+have not been run; these results do not change the Deploy panel’s verification status.
+</Note>
+
+<Accordion title="NIM 2.1.6 DeepSeek-V4-Pro-0813: B200 TP8">
+
+[Delivered settings](https://gitlab-master.nvidia.com/nim/nim-ops/-/blob/01202ac33d5fc342ce2f5d53835ed9b29b85c563/docs/serving-configs/deepseek-v4-pro-0813-f6e709b4126a3f3c6db754c1d5090a5d1006d23b5f0e62c4cec8e423e8eb5de0.md).
+
+```bash Launch command
+sglang serve \
+  --model-path nvidia/DeepSeek-V4-Pro-0813-NVFP4 \
+  --tp-size 8 \
+  --attn-dp-size 8 \
+  --chunked-prefill-size 65536 \
+  --enable-dp-attention-local-control-broadcast \
+  --enable-dp-lm-head \
+  --load-balance-method total_tokens \
+  --load-snapshot-publish-interval 1 \
+  --log-level info \
+  --log-level-http info \
+  --max-running-requests 512 \
+  --mem-fraction-static 0.88 \
+  --moe-runner-backend flashinfer_trtllm_routed \
+  --prefill-decode-interval 24 \
+  --reasoning-parser deepseek-v4 \
+  --swa-full-tokens-ratio 0.1 \
+  --tool-call-parser deepseekv4 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 5 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+</Accordion>
+
+<Accordion title="NIM 2.1.6 DeepSeek-V4-Pro-0813 measured curves and source identities">
+
+Every source CSV row is retained in selected columns, including infeasible points. SHA256 identifies the complete source CSV. Throughput is output tokens/s per allocated GPU; latency columns are milliseconds.
+
+#### deepseek-v4-pro-0813
+
+[Campaign decisions and qualification](https://gitlab-master.nvidia.com/nim/nim-ops/-/blob/01202ac33d5fc342ce2f5d53835ed9b29b85c563/perf_campaigns/2.1.6/deepseek-v4-pro-0813/README.md).
+
+[deepseek-v4-pro-0813-b200-tp8-nvfp4-sglang0-5-22-trace-agentic-64k-400-90kv-attempt-1e66025acc7f14f4.csv](https://gitlab-master.nvidia.com/nim/nim-ops/-/blob/01202ac33d5fc342ce2f5d53835ed9b29b85c563/perf_campaigns/2.1.6/deepseek-v4-pro-0813/deepseek-v4-pro-0813-b200-tp8-nvfp4-sglang0-5-22-trace-agentic-64k-400-90kv-attempt-1e66025acc7f14f4.csv)
+
+SHA256: `965d950a30800ec68c05d04d4c9528bf512673f4f5be11ecc5ea23409242d423`
+
+```csv Measurements
+model,model_revision,engine_version,server_image,client_image,sku,precision,tp,gpu_count,arm,config_id,concurrency,replicate,trial_id,source_url,status,tok_s_per_gpu,itl_ms,ttft_ms,request_count,failed_request_count
+deepseek-ai/DeepSeek-V4-Pro-0813,hf-9491386-nvfp4-nim,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261029070228@sha256:a0716651c8c94f4144aafc76c5832dc2113f970ef8552268b47f608a5c7fbc06,nvcr.io/nvidia/ai-dynamo/aiperf-nightly:20261020-b0276e1@sha256:f5ca0a5c9d3173f29e32da3701939c58bd99a6b0ff1e2a83672cc30b9b26c49e,B200,nvfp4,8,8,baseline,e25f9a7c606ac9a77b5436b32ed27fa40cd76540d06fd58f899046b219f3b029,4,1,01M6G2V01KQFCGN325Q9KPX893,https://platform.athena.nvidia.com/trials/01M6G2V01KQFCGN325Q9KPX893,completed,83.72232648618154,5.152645243502677,1897.747664642837,3539,2
+deepseek-ai/DeepSeek-V4-Pro-0813,hf-9491386-nvfp4-nim,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261029070228@sha256:a0716651c8c94f4144aafc76c5832dc2113f970ef8552268b47f608a5c7fbc06,nvcr.io/nvidia/ai-dynamo/aiperf-nightly:20261020-b0276e1@sha256:f5ca0a5c9d3173f29e32da3701939c58bd99a6b0ff1e2a83672cc30b9b26c49e,B200,nvfp4,8,8,baseline,e25f9a7c606ac9a77b5436b32ed27fa40cd76540d06fd58f899046b219f3b029,16,1,01M6G2V26RTXE00GPD9CRYQG4Y,https://platform.athena.nvidia.com/trials/01M6G2V26RTXE00GPD9CRYQG4Y,completed,125.89467498156841,17.16652394063397,2154.169405135914,3539,2
+deepseek-ai/DeepSeek-V4-Pro-0813,hf-9491386-nvfp4-nim,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261029070228@sha256:a0716651c8c94f4144aafc76c5832dc2113f970ef8552268b47f608a5c7fbc06,nvcr.io/nvidia/ai-dynamo/aiperf-nightly:20261020-b0276e1@sha256:f5ca0a5c9d3173f29e32da3701939c58bd99a6b0ff1e2a83672cc30b9b26c49e,B200,nvfp4,8,8,optimized,4fda02a03532a079c3245924c894798f6b018dcd420017b31cc19a9f2f870127,16,1,01M6GDQPE3NC22ERSVXZK4X7CM,https://platform.athena.nvidia.com/trials/01M6GDQPE3NC22ERSVXZK4X7CM,completed,126.34783426198703,10.271355344553308,9014.309898245267,3539,2
+deepseek-ai/DeepSeek-V4-Pro-0813,hf-9491386-nvfp4-nim,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261029070228@sha256:a0716651c8c94f4144aafc76c5832dc2113f970ef8552268b47f608a5c7fbc06,nvcr.io/nvidia/ai-dynamo/aiperf-nightly:20261020-b0276e1@sha256:f5ca0a5c9d3173f29e32da3701939c58bd99a6b0ff1e2a83672cc30b9b26c49e,B200,nvfp4,8,8,optimized,4fda02a03532a079c3245924c894798f6b018dcd420017b31cc19a9f2f870127,128,1,01M6GJ5H0GXX4R18YD1P4G4HH3,https://platform.athena.nvidia.com/trials/01M6GJ5H0GXX4R18YD1P4G4HH3,completed,256.80389635480907,17.431399112189368,93979.01207080786,3539,2
+deepseek-ai/DeepSeek-V4-Pro-0813,hf-9491386-nvfp4-nim,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261029070228@sha256:a0716651c8c94f4144aafc76c5832dc2113f970ef8552268b47f608a5c7fbc06,nvcr.io/nvidia/ai-dynamo/aiperf-nightly:20261020-b0276e1@sha256:f5ca0a5c9d3173f29e32da3701939c58bd99a6b0ff1e2a83672cc30b9b26c49e,B200,nvfp4,8,8,baseline,e25f9a7c606ac9a77b5436b32ed27fa40cd76540d06fd58f899046b219f3b029,4,2,01M6GTR0V4C4CP6G3Y87HQFE6X,https://platform.athena.nvidia.com/trials/01M6GTR0V4C4CP6G3Y87HQFE6X,completed,83.4346087804181,5.878135217114743,1844.7629634294997,3539,2
+deepseek-ai/DeepSeek-V4-Pro-0813,hf-9491386-nvfp4-nim,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261029070228@sha256:a0716651c8c94f4144aafc76c5832dc2113f970ef8552268b47f608a5c7fbc06,nvcr.io/nvidia/ai-dynamo/aiperf-nightly:20261020-b0276e1@sha256:f5ca0a5c9d3173f29e32da3701939c58bd99a6b0ff1e2a83672cc30b9b26c49e,B200,nvfp4,8,8,baseline,e25f9a7c606ac9a77b5436b32ed27fa40cd76540d06fd58f899046b219f3b029,4,3,01M6H05KY20MN466HQEDJ4HA7V,https://platform.athena.nvidia.com/trials/01M6H05KY20MN466HQEDJ4HA7V,completed,83.22978900053427,5.638060449132987,1875.041959515965,3539,2
+deepseek-ai/DeepSeek-V4-Pro-0813,hf-9491386-nvfp4-nim,0.5.22,lmsysorg/sglang:v0.5.22-cu130-runtime@sha256:043de01240f95395c193d6e77c55b82d7f948441aaf9583b69e77b801cd7015a,nvcr.io/nvidia/ai-dynamo/aiperf-nightly:20261020-b0276e1@sha256:f5ca0a5c9d3173f29e32da3701939c58bd99a6b0ff1e2a83672cc30b9b26c49e,B200,nvfp4,8,8,baseline,0ee958b0739ba9914da805b72de0accdb8709e057da46a426d6571b0c5df4f7f,8,1,01M68Y00PHME730E3ATX80J8YV,https://platform.athena.nvidia.com/trials/01M68Y00PHME730E3ATX80J8YV,completed,59.10726135433568,15.793240518287824,1780.4680929711783,3539,2
 ```
 
 </Accordion>

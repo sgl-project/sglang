@@ -84,6 +84,132 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## Agentic Long-Context Deployment
 
+### NIM 2.1.6 performance recipes
+
+[DeepSeek-V4.1-Flash campaign](https://gitlab-master.nvidia.com/nim/nim-ops/-/blob/01202ac33d5fc342ce2f5d53835ed9b29b85c563/perf_campaigns/2.1.6/deepseek-v4-1-flash-sglang/README.md), SGLang 0.5.22.
+
+B200 TP4 is promoted: 475.8 → 953.8 output tok/s/GPU (+100.44%, incumbent c32 → candidate c256), at 19.94 ms mean ITL. H200 TP8 is promoted at matched c8: 63.2 → 66.7 (+5.58%), with mean ITL improving from 15.57 to 15.10 ms. Both stock-default launches failed before serving, so neither result establishes a stock-relative speedup. B200 stock exhausted its sliding-window memory budget; H200 stock rejected the per-partition MoE intermediate width. The B200 profile caps running requests at 96, so higher client concurrency includes queueing.
+
+<Note>
+These are recorded NIM release-candidate results. Public-checkpoint commands adapt the delivered NIM settings;
+NGC and public weights may differ. Run on one Linux/CUDA node with the stated GPUs and pipeline parallelism 1.
+Install SGLang 0.5.22 and supply `HF_TOKEN` where required. Commands omit calibrated synthetic acceptance
+and benchmark-only context caps. Reproduce measurements with the exact runtime, checkpoint and workload in
+the source CSV (NVIDIA access required). Fresh public-runtime GPU performance and accuracy qualification
+have not been run; these results do not change the Deploy panel’s verification status.
+</Note>
+
+<Accordion title="NIM 2.1.6 DeepSeek-V4.1-Flash: B200 TP4">
+
+[Delivered settings](https://gitlab-master.nvidia.com/nim/nim-ops/-/blob/01202ac33d5fc342ce2f5d53835ed9b29b85c563/docs/serving-configs/deepseek-v4-1-flash-sglang-54cfd5e0518499275efd78a39661e22822e6644d284a43b234a0957d7e6fbb32.md).
+
+```bash Launch command
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-V4.1-Flash \
+  --tp-size 4 \
+  --cuda-graph-max-bs-decode 96 \
+  --dsv4-attn-backend trtllm \
+  --ep-size 4 \
+  --max-running-requests 96 \
+  --mem-fraction-static 0.8 \
+  --prefill-decode-interval 8 \
+  --swa-prefix-tails 512 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 5 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+</Accordion>
+
+<Accordion title="NIM 2.1.6 DeepSeek-V4.1-Flash: H200 TP8">
+
+[Delivered settings](https://gitlab-master.nvidia.com/nim/nim-ops/-/blob/01202ac33d5fc342ce2f5d53835ed9b29b85c563/docs/serving-configs/deepseek-v4-1-flash-sglang-7b77e905105207a39a70ce222a6ea59960fb2f0f67ab31e02626d20393185e28.md).
+
+```bash Launch command
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-V4.1-Flash \
+  --tp-size 8 \
+  --cuda-graph-max-bs-decode 64 \
+  --ep-size 8 \
+  --flashinfer-mxfp4-moe-precision fp8 \
+  --mem-fraction-static 0.8 \
+  --speculative-algorithm DSPARK \
+  --speculative-dspark-block-size 5 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+</Accordion>
+
+<Accordion title="NIM 2.1.6 DeepSeek-V4.1-Flash measured curves and source identities">
+
+Every source CSV row is retained in selected columns, including infeasible points. SHA256 identifies the complete source CSV. Throughput is output tokens/s per allocated GPU; latency columns are milliseconds.
+
+#### deepseek-v4-1-flash-sglang
+
+[Campaign decisions and qualification](https://gitlab-master.nvidia.com/nim/nim-ops/-/blob/01202ac33d5fc342ce2f5d53835ed9b29b85c563/perf_campaigns/2.1.6/deepseek-v4-1-flash-sglang/README.md).
+
+[deepseek-v4-1-flash-sglang-b200-tp4-fp8-sglang0-5-22-trace-agentic-64k-400-90kv-structured-4perc.csv](https://gitlab-master.nvidia.com/nim/nim-ops/-/blob/01202ac33d5fc342ce2f5d53835ed9b29b85c563/perf_campaigns/2.1.6/deepseek-v4-1-flash-sglang/deepseek-v4-1-flash-sglang-b200-tp4-fp8-sglang0-5-22-trace-agentic-64k-400-90kv-structured-4perc.csv)
+
+SHA256: `68ed59503a75cd70f3b0bc37407547bfafe3276c19fe752cb43d469ee977f9ea`
+
+```csv Measurements
+model,model_revision,engine_version,server_image,client_image,sku,precision,tp,gpu_count,arm,config_id,concurrency,replicate,trial_id,source_url,status,tok_s_per_gpu,itl_ms,ttft_ms,request_count,failed_request_count
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,baseline,42cb587cee4151eb5ae572a4ce41758c64cad4275945fc676c54c9d1136b5f6d,4,1,01M649R1AMHFAY7FSXBRX5ME7X,https://platform.athena.nvidia.com/trials/01M649R1AMHFAY7FSXBRX5ME7X,completed,230.15786292601467,3.9250552364765445,734.2486618184713,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,baseline,42cb587cee4151eb5ae572a4ce41758c64cad4275945fc676c54c9d1136b5f6d,8,1,01M649R16YM850V6J4HCC56ABK,https://platform.athena.nvidia.com/trials/01M649R16YM850V6J4HCC56ABK,completed,318.3274309486454,6.688048057580761,802.7874865276009,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,baseline,42cb587cee4151eb5ae572a4ce41758c64cad4275945fc676c54c9d1136b5f6d,16,1,01M649R1CN56E5APJ4G93BJAA8,https://platform.athena.nvidia.com/trials/01M649R1CN56E5APJ4G93BJAA8,completed,408.77470126241445,10.646844785934443,1919.9364423524414,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,baseline,42cb587cee4151eb5ae572a4ce41758c64cad4275945fc676c54c9d1136b5f6d,32,1,01M649R1444FFVS05VEQJYVZFY,https://platform.athena.nvidia.com/trials/01M649R1444FFVS05VEQJYVZFY,completed,475.84625412120175,18.17392901838964,14914.85019207431,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,baseline,42cb587cee4151eb5ae572a4ce41758c64cad4275945fc676c54c9d1136b5f6d,64,1,01M64GFYXCVYKKN5B5K5BAH68Q,https://platform.athena.nvidia.com/trials/01M64GFYXCVYKKN5B5K5BAH68Q,completed,474.5870770835076,23.61047720361136,50648.3519793535,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,baseline,42cb587cee4151eb5ae572a4ce41758c64cad4275945fc676c54c9d1136b5f6d,80,1,01M64GFZD0TA1JTCE3YHMZDFTH,https://platform.athena.nvidia.com/trials/01M64GFZD0TA1JTCE3YHMZDFTH,completed,479.75139197000226,30.261108156272474,66618.88002349682,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,baseline,42cb587cee4151eb5ae572a4ce41758c64cad4275945fc676c54c9d1136b5f6d,128,1,01M64GFZQVH2D8BACZRWJKZAV1,https://platform.athena.nvidia.com/trials/01M64GFZQVH2D8BACZRWJKZAV1,completed,449.1492680315101,32.11021566603697,123619.70886289915,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,baseline,42cb587cee4151eb5ae572a4ce41758c64cad4275945fc676c54c9d1136b5f6d,256,1,01M64GGMNAK0Z0VR0S73K88FDN,https://platform.athena.nvidia.com/trials/01M64GGMNAK0Z0VR0S73K88FDN,completed,423.3679347682144,46.00943322903719,266406.0114540488,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,candidate,2c7efafa0d70defca37b64094d52d731b21114677184f425e62c7c35fc90fb68,4,1,01M64QGZ26WJN7AQSXQQTT9043,https://platform.athena.nvidia.com/trials/01M64QGZ26WJN7AQSXQQTT9043,completed,236.5099518104104,3.9282555631269416,595.1131370902335,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,candidate,2c7efafa0d70defca37b64094d52d731b21114677184f425e62c7c35fc90fb68,8,1,01M64QH9N7ZBYQ33EWFQF2RH96,https://platform.athena.nvidia.com/trials/01M64QH9N7ZBYQ33EWFQF2RH96,completed,331.92361118912436,5.560253652222065,777.5408499352442,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,candidate,2c7efafa0d70defca37b64094d52d731b21114677184f425e62c7c35fc90fb68,16,1,01M64VBE8G8BS9YDM9798SH6GY,https://platform.athena.nvidia.com/trials/01M64VBE8G8BS9YDM9798SH6GY,completed,466.8986910735775,7.890455913937635,1029.5668310594478,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,candidate,2c7efafa0d70defca37b64094d52d731b21114677184f425e62c7c35fc90fb68,32,1,01M64VTGZQ91W3GP2QT6J037CN,https://platform.athena.nvidia.com/trials/01M64VTGZQ91W3GP2QT6J037CN,completed,656.0793026550934,10.756440043033741,1750.2214380116773,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,candidate,2c7efafa0d70defca37b64094d52d731b21114677184f425e62c7c35fc90fb68,64,1,01M64WA00XN37G4QXJYC8GBYJX,https://platform.athena.nvidia.com/trials/01M64WA00XN37G4QXJYC8GBYJX,completed,801.9299600176416,16.866279022350604,4089.804906539278,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,candidate,2c7efafa0d70defca37b64094d52d731b21114677184f425e62c7c35fc90fb68,80,1,01M64WFDM9NFVMM4318CWHMR9S,https://platform.athena.nvidia.com/trials/01M64WFDM9NFVMM4318CWHMR9S,completed,850.0935966933108,19.729950179089887,5375.140409947982,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,candidate,2c7efafa0d70defca37b64094d52d731b21114677184f425e62c7c35fc90fb68,128,1,01M64ZF1BE0Q7TPSGNAPSEWQ7G,https://platform.athena.nvidia.com/trials/01M64ZF1BE0Q7TPSGNAPSEWQ7G,completed,935.1865565134924,20.46939861000944,25166.704961395964,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,candidate,2c7efafa0d70defca37b64094d52d731b21114677184f425e62c7c35fc90fb68,256,1,01M6513Q81N3K7FJN4D0WM4FNF,https://platform.athena.nvidia.com/trials/01M6513Q81N3K7FJN4D0WM4FNF,completed,953.7909299568918,19.944785243487395,86539.24266308067,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,baseline,42cb587cee4151eb5ae572a4ce41758c64cad4275945fc676c54c9d1136b5f6d,4,2,01M652DRS3V9JQZ71VYC6PHPN9,https://platform.athena.nvidia.com/trials/01M652DRS3V9JQZ71VYC6PHPN9,completed,229.82703983285546,3.9171677076366804,753.0100106613588,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,fp8,4,4,baseline,42cb587cee4151eb5ae572a4ce41758c64cad4275945fc676c54c9d1136b5f6d,4,3,01M65JQBPR1YZ4MS5C7YPKPY3Q,https://platform.athena.nvidia.com/trials/01M65JQBPR1YZ4MS5C7YPKPY3Q,completed,230.55071833815754,3.9396707497620964,732.3117036178344,942,0
+```
+
+[deepseek-v4-1-flash-sglang-h200-tp8-fp8-sglang0-5-22-trace-agentic-64k-400-90kv-structured-4perc.csv](https://gitlab-master.nvidia.com/nim/nim-ops/-/blob/01202ac33d5fc342ce2f5d53835ed9b29b85c563/perf_campaigns/2.1.6/deepseek-v4-1-flash-sglang/deepseek-v4-1-flash-sglang-h200-tp8-fp8-sglang0-5-22-trace-agentic-64k-400-90kv-structured-4perc.csv)
+
+SHA256: `7a4dc4e28548c38fe00f53c97ae1c086311fc77d7ecbe8b1f701e477e0780f4a`
+
+```csv Measurements
+model,model_revision,engine_version,server_image,client_image,sku,precision,tp,gpu_count,arm,config_id,concurrency,replicate,trial_id,source_url,status,tok_s_per_gpu,itl_ms,ttft_ms,request_count,failed_request_count
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,e0f9b0bd56d84725a6c5b9cc77f0246aca2334fc5ae7e120761a3198b3c7ce77,4,1,01M66Y0A72KHM58HX9VBE8G9AZ,https://platform.athena.nvidia.com/trials/01M66Y0A72KHM58HX9VBE8G9AZ,completed,55.83401432111527,6.9280728055539695,2868.2628256942676,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,e0f9b0bd56d84725a6c5b9cc77f0246aca2334fc5ae7e120761a3198b3c7ce77,8,1,01M66Y0A4K7WBYZF28V3RCR2ZH,https://platform.athena.nvidia.com/trials/01M66Y0A4K7WBYZF28V3RCR2ZH,completed,63.21259599587342,15.57084286296639,2929.1247416454353,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,e0f9b0bd56d84725a6c5b9cc77f0246aca2334fc5ae7e120761a3198b3c7ce77,16,1,01M66Y0A6SW324NJWM612ZR05Q,https://platform.athena.nvidia.com/trials/01M66Y0A6SW324NJWM612ZR05Q,completed,66.32388636846851,39.14862279093095,3597.5622988004243,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,e0f9b0bd56d84725a6c5b9cc77f0246aca2334fc5ae7e120761a3198b3c7ce77,32,1,01M66Y0A75755BBZDZE526Z507,https://platform.athena.nvidia.com/trials/01M66Y0A75755BBZDZE526Z507,completed,67.0737033666974,103.28105880859556,4387.57091907431,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,e0f9b0bd56d84725a6c5b9cc77f0246aca2334fc5ae7e120761a3198b3c7ce77,64,1,01M6745E9NCVJMYAFDYHPTFN1D,https://platform.athena.nvidia.com/trials/01M6745E9NCVJMYAFDYHPTFN1D,completed,73.084088761167,258.54875720643304,6111.989953705945,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,e0f9b0bd56d84725a6c5b9cc77f0246aca2334fc5ae7e120761a3198b3c7ce77,128,1,01M6745K7WWSS372WCH1STWKQS,https://platform.athena.nvidia.com/trials/01M6745K7WWSS372WCH1STWKQS,completed,69.10674486743866,635.6389193055229,13099.026984730359,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,e0f9b0bd56d84725a6c5b9cc77f0246aca2334fc5ae7e120761a3198b3c7ce77,256,1,01M674AVCJKAKRKEDA8311HG41,https://platform.athena.nvidia.com/trials/01M674AVCJKAKRKEDA8311HG41,completed,69.35824328609414,1941.6635448348184,84567.01025909743,934,8
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,optimized,d6a9ae48a800be5a7de852520bc03a7f6072dd8f61cecbc2395f7ce9fceb09e7,4,1,01M675549P94JBJ7QZFH3FA44Z,https://platform.athena.nvidia.com/trials/01M675549P94JBJ7QZFH3FA44Z,completed,58.55556498746689,6.934143130994221,2596.435857972399,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,optimized,d6a9ae48a800be5a7de852520bc03a7f6072dd8f61cecbc2395f7ce9fceb09e7,8,1,01M67A0X5VRWH4EWFY6ZQ6WA1P,https://platform.athena.nvidia.com/trials/01M67A0X5VRWH4EWFY6ZQ6WA1P,completed,66.73884156219928,15.096165884548888,2925.1447819065816,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,optimized,d6a9ae48a800be5a7de852520bc03a7f6072dd8f61cecbc2395f7ce9fceb09e7,16,1,01M67ACYFERHVEDSG07QT8JPAQ,https://platform.athena.nvidia.com/trials/01M67ACYFERHVEDSG07QT8JPAQ,completed,68.37269659401879,40.74435844359705,3288.476367976645,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,optimized,d6a9ae48a800be5a7de852520bc03a7f6072dd8f61cecbc2395f7ce9fceb09e7,32,1,01M67AE296GMR2ZXEXD0PX47X3,https://platform.athena.nvidia.com/trials/01M67AE296GMR2ZXEXD0PX47X3,completed,69.55771539144803,99.44666947198931,3864.1957899044583,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,optimized,d6a9ae48a800be5a7de852520bc03a7f6072dd8f61cecbc2395f7ce9fceb09e7,64,1,01M67C0K8ZMVBXFP4AY0M2HS38,https://platform.athena.nvidia.com/trials/01M67C0K8ZMVBXFP4AY0M2HS38,completed,77.91036770371893,237.88184177786133,5846.539289721868,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,optimized,d6a9ae48a800be5a7de852520bc03a7f6072dd8f61cecbc2395f7ce9fceb09e7,128,1,01M67GC7QHRGBSYVG8819TWFT3,https://platform.athena.nvidia.com/trials/01M67GC7QHRGBSYVG8819TWFT3,completed,71.40154811958283,609.3385958392349,12311.948616401272,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,optimized,d6a9ae48a800be5a7de852520bc03a7f6072dd8f61cecbc2395f7ce9fceb09e7,256,1,01M67GD91AHXY84QBMHT10ZE7D,https://platform.athena.nvidia.com/trials/01M67GD91AHXY84QBMHT10ZE7D,completed,77.85250107399862,1825.9371750175376,73560.20626804246,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,24bc359aed0ad7bff4bde43b596118ddda71bf2d5a2128c474f7ce9d9c188b4c,4,1,01M67GFWJ8FWYFE1TZADE2Z76C,https://platform.athena.nvidia.com/trials/01M67GFWJ8FWYFE1TZADE2Z76C,completed,55.54758882273262,7.030187179306012,2894.697661237792,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,24bc359aed0ad7bff4bde43b596118ddda71bf2d5a2128c474f7ce9d9c188b4c,8,1,01M67HHXQHVH10JCNR6V5BB8R7,https://platform.athena.nvidia.com/trials/01M67HHXQHVH10JCNR6V5BB8R7,completed,63.30322893530432,16.292843879006615,2852.9421524628447,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,24bc359aed0ad7bff4bde43b596118ddda71bf2d5a2128c474f7ce9d9c188b4c,16,1,01M67TP0E7BE1CW1QGH2H7JREK,https://platform.athena.nvidia.com/trials/01M67TP0E7BE1CW1QGH2H7JREK,completed,65.56857298059191,41.85820286190919,3516.70386170276,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,24bc359aed0ad7bff4bde43b596118ddda71bf2d5a2128c474f7ce9d9c188b4c,32,1,01M67V0ZZ845EPH89N0G38FYJB,https://platform.athena.nvidia.com/trials/01M67V0ZZ845EPH89N0G38FYJB,completed,67.18429039687899,103.61593110681811,3975.112192873673,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,24bc359aed0ad7bff4bde43b596118ddda71bf2d5a2128c474f7ce9d9c188b4c,64,1,01M67XR2BMTC2CRMYN6W75JKMC,https://platform.athena.nvidia.com/trials/01M67XR2BMTC2CRMYN6W75JKMC,completed,73.28405193024999,253.94406359690606,6503.390549406581,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,24bc359aed0ad7bff4bde43b596118ddda71bf2d5a2128c474f7ce9d9c188b4c,128,1,01M67XTPFDDF3XZ2ST94PQP6T5,https://platform.athena.nvidia.com/trials/01M67XTPFDDF3XZ2ST94PQP6T5,completed,69.31962646774033,628.3391515605787,14818.576957890657,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,24bc359aed0ad7bff4bde43b596118ddda71bf2d5a2128c474f7ce9d9c188b4c,256,1,01M683Y8G5YZ2HDF61ET65AJGF,https://platform.athena.nvidia.com/trials/01M683Y8G5YZ2HDF61ET65AJGF,completed,68.95725887029991,1891.328104917376,96788.92303974598,933,9
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,e0f9b0bd56d84725a6c5b9cc77f0246aca2334fc5ae7e120761a3198b3c7ce77,4,2,01M68BXG3KEPSBKYS3G3ERWG78,https://platform.athena.nvidia.com/trials/01M68BXG3KEPSBKYS3G3ERWG78,completed,55.836704747249485,7.158171799094607,2812.0645013970275,942,0
+deepseek-ai/DeepSeek-V4.1-Flash,FP8-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,H200,fp8,8,8,baseline,e0f9b0bd56d84725a6c5b9cc77f0246aca2334fc5ae7e120761a3198b3c7ce77,4,3,01M68BXG6RAZ869C0M5HPFTQB4,https://platform.athena.nvidia.com/trials/01M68BXG6RAZ869C0M5HPFTQB4,completed,55.73990552656974,7.360610355393162,2870.7836844522294,942,0
+```
+
+</Accordion>
+
+
 Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. This section gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
 
 - **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks).
