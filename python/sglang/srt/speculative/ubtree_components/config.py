@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 import msgspec
+from transformers import PretrainedConfig
 
 
 class UBTreeConfig(msgspec.Struct, frozen=True):
@@ -32,7 +33,7 @@ def _mapping(value: Any) -> Mapping[str, Any]:
         return value
     if value is None:
         return {}
-    if hasattr(value, "to_dict"):
+    if isinstance(value, PretrainedConfig):
         return value.to_dict()
     return vars(value)
 
@@ -41,15 +42,10 @@ def parse_ubtree_config(config: Any) -> UBTreeConfig:
     """Parse and validate the serving subset of a DeepSpec UBTree config."""
 
     root = _mapping(config)
-    metadata = _mapping(
-        root.get("ubtree_config", getattr(config, "ubtree_config", None))
-    )
-    dflash = _mapping(root.get("dflash_config", getattr(config, "dflash_config", None)))
+    metadata = _mapping(root.get("ubtree_config"))
+    dflash = _mapping(root.get("dflash_config"))
 
-    block_size = int(
-        root.get("block_size", getattr(config, "block_size", 0))
-        or dflash.get("block_size", 0)
-    )
+    block_size = int(root.get("block_size", 0) or dflash.get("block_size", 0))
     parsed = UBTreeConfig(
         block_size=block_size,
         candidate_k=int(metadata.get("candidate_k", 0)),
@@ -59,10 +55,7 @@ def parse_ubtree_config(config: Any) -> UBTreeConfig:
         depth_bonus=float(metadata.get("tree_depth_bonus", 0.0)),
         factorizer_hidden_width=int(metadata.get("factorizer_hidden_width", 0)),
         target_embedding_dim=int(
-            metadata.get(
-                "target_embedding_dim",
-                root.get("hidden_size", getattr(config, "hidden_size", 0)),
-            )
+            metadata.get("target_embedding_dim", root.get("hidden_size", 0))
         ),
         depth_count=int(metadata.get("depth_condition_count", 0)),
     )

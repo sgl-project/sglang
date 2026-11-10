@@ -24,6 +24,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.models.ubtree import Qwen3UBTreeModel
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -102,11 +103,11 @@ class UBTreeWorkerV2(DFlashWorkerV2):
         # width; the DFlash runner itself keeps ``block_size`` at 16.
         self.speculative_num_draft_tokens = resolved_verify_node_count
 
-        selector = getattr(self.draft_model, "ubtree_selector", None)
-        if selector is None:
+        if not isinstance(self.draft_model, Qwen3UBTreeModel):
             raise ValueError(
                 "UBTREE draft checkpoint must use a registered UBTree architecture"
             )
+        selector = self.draft_model.ubtree_selector
         target_model = self.target_worker.model_runner.model
         validate_ubtree_lm_head(target_model.lm_head)
         selector.bind_target_embedding(
@@ -225,8 +226,10 @@ class UBTreeWorkerV2(DFlashWorkerV2):
                 and hasattr(draft_pool, "set_kv_buffer_prefix_valid")
             )
             mamba_pool = target_kvcache.layer_router.part_view(STATE_PART)
-            if not can_fold_draft_kv or not getattr(
-                mamba_pool, "factorized_kda_tree", False
+            if (
+                not can_fold_draft_kv
+                or mamba_pool is None
+                or not mamba_pool.factorized_kda_tree
             ):
                 raise ValueError(
                     "UBTREE requires fused draft KV materialization and factorized KDA state"
@@ -396,13 +399,13 @@ class UBTreeWorkerV2(DFlashWorkerV2):
         sampling_info = batch.sampling_info
         if sampling_info is None:
             return False
-        if getattr(sampling_info, "acc_additive_penalties", None) is not None:
+        if sampling_info.acc_additive_penalties is not None:
             return False
-        if getattr(sampling_info, "acc_scaling_penalties", None) is not None:
+        if sampling_info.acc_scaling_penalties is not None:
             return False
-        if getattr(sampling_info, "logit_bias", None) is not None:
+        if sampling_info.logit_bias is not None:
             return False
-        if getattr(sampling_info, "has_custom_logit_processor", False):
+        if sampling_info.has_custom_logit_processor:
             return False
         if not sampling_info.is_all_greedy and (
             sampling_info.sampling_seed is not None
@@ -421,7 +424,7 @@ class UBTreeWorkerV2(DFlashWorkerV2):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ):
-        if getattr(batch, "return_logprob", False):
+        if batch.return_logprob:
             raise ValueError("UBTREE does not support return_logprob yet")
         if batch.sampling_info is not None and not self._can_fold_verify_epilogue(
             batch
@@ -430,7 +433,7 @@ class UBTreeWorkerV2(DFlashWorkerV2):
                 "UBTREE requires greedy or unseeded FlashInfer sampling without "
                 "penalties, logit bias, custom processors, or simulated acceptance"
             )
-        if getattr(batch, "has_grammar", False):
+        if batch.has_grammar:
             raise ValueError("UBTREE currently does not support constrained decoding")
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             return super().forward_batch_generation(
@@ -536,8 +539,8 @@ class UBTreeWorkerV2(DFlashWorkerV2):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=node_count,
             new_seq_lens=new_seq_lens,
-            routed_experts_output=getattr(target_output, "routed_experts_output", None),
-            indexer_topk_output=getattr(target_output, "indexer_topk_output", None),
+            routed_experts_output=target_output.routed_experts_output,
+            indexer_topk_output=target_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],
         )
 

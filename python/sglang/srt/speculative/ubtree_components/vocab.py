@@ -32,7 +32,7 @@ def vocab_parallel_topk(
     vocab_size: int,
     tp_group=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute exact global Top-K over a replicated or TP-sharded LM head."""
+    """Compute exact global Top-K over a vocabulary-parallel LM head."""
 
     if hidden_states.ndim != 2:
         raise ValueError("UBTree LM-head input must be rank 2")
@@ -45,14 +45,7 @@ def vocab_parallel_topk(
         else hidden_states.to(weight.dtype)
     )
 
-    shard = getattr(lm_head, "shard_indices", None)
-    if shard is None:
-        if int(weight.shape[0]) < int(vocab_size):
-            raise ValueError(
-                "UBTree target lm_head has fewer rows than the configured vocabulary"
-            )
-        return F.linear(hidden, weight[:vocab_size]).float().topk(k, dim=-1)
-
+    shard = lm_head.shard_indices
     local_count = int(shard.num_org_elements)
     local_start = int(shard.org_vocab_start_index)
     if local_count > 0:

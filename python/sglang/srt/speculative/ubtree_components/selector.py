@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.speculative.ubtree_components.config import parse_ubtree_config
 
 TokenFactorRole = Literal["predecessor", "successor"]
@@ -114,9 +115,7 @@ class TargetEmbeddingTokenFactorizer(nn.Module):
         without gathering the much larger H-dimensional embedding table.
         """
 
-        weight = getattr(embedding_module, "weight", None)
-        if weight is None:
-            raise TypeError("UBTree target embedding module must expose weight")
+        weight = embedding_module.weight
         signature = (
             "module",
             id(embedding_module),
@@ -153,13 +152,8 @@ class TargetEmbeddingTokenFactorizer(nn.Module):
     ) -> None:
         """Factorize local embedding shards, then gather the smaller caches."""
 
-        weight = getattr(embedding_module, "weight", None)
-        shard = getattr(embedding_module, "shard_indices", None)
-        if weight is None or shard is None:
-            raise TypeError(
-                "UBTree TP cache construction requires a vocabulary-parallel "
-                "embedding with weight and shard_indices"
-            )
+        weight = embedding_module.weight
+        shard = embedding_module.shard_indices
         if not torch.is_floating_point(weight):
             raise ValueError("UBTree does not support quantized target embeddings")
         if tp_group is None:
@@ -259,12 +253,12 @@ class UBTreeSelector(nn.Module):
 
         if not is_dense_head_weight(weight):
             raise ValueError("UBTREE requires dense FP16/BF16/FP32 target embeddings")
-        if (
-            int(getattr(embedding_module, "tp_size", 1)) == 1
-            and int(weight.shape[0]) >= self.vocab_size
-        ):
+        vocab_parallel = isinstance(embedding_module, VocabParallelEmbedding)
+        if (not vocab_parallel or embedding_module.tp_size == 1) and int(
+            weight.shape[0]
+        ) >= self.vocab_size:
             self.materialize_cache(weight[: self.vocab_size])
-        elif hasattr(embedding_module, "shard_indices"):
+        elif vocab_parallel:
             self.materialize_cache_from_vocab_parallel_embedding(embedding_module)
         else:
             self.materialize_cache_from_embedding(embedding_module, device=device)

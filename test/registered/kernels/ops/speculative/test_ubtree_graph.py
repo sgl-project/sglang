@@ -295,6 +295,9 @@ def _make_selector_graph_components(device):
     lm_head = torch.nn.Linear(
         config.hidden_size, config.vocab_size, bias=False, device=device
     )
+    lm_head.shard_indices = SimpleNamespace(
+        num_org_elements=config.vocab_size, org_vocab_start_index=0
+    )
     return config, selector, lm_head
 
 
@@ -328,6 +331,7 @@ def test_proposal_tail_replays_changing_inputs_exactly():
             num_nodes=6,
             lm_head=lm_head,
             selector=selector,
+            tp_group=SimpleNamespace(world_size=1),
         )
 
     for _ in range(2):
@@ -620,7 +624,15 @@ def test_worker_commits_once_and_keeps_scheduler_outputs_alive(
     batch = SimpleNamespace(
         forward_mode=ForwardMode.DECODE,
         is_extend_in_batch=False,
-        sampling_info=SimpleNamespace(is_all_greedy=True),
+        return_logprob=False,
+        has_grammar=False,
+        sampling_info=SimpleNamespace(
+            is_all_greedy=True,
+            acc_additive_penalties=None,
+            acc_scaling_penalties=None,
+            logit_bias=None,
+            has_custom_logit_processor=False,
+        ),
         spec_info=DFlashDraftInputV2.create_idle_input(device="cuda"),
         seq_lens=torch.tensor([3], dtype=torch.int32, device="cuda"),
     )
@@ -655,7 +667,12 @@ def test_worker_commits_once_and_keeps_scheduler_outputs_alive(
                 seq_lens=forward.seq_lens,
                 out_cache_loc=forward.out_cache_loc,
             )
-        return SimpleNamespace(logits_output=output, can_run_cuda_graph=graph_replay)
+        return SimpleNamespace(
+            logits_output=output,
+            can_run_cuda_graph=graph_replay,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+        )
 
     worker._target_worker = SimpleNamespace(forward_batch_generation=target_forward)
     worker._make_next_draft_input_decode = lambda **kwargs: SimpleNamespace(**kwargs)
@@ -686,7 +703,13 @@ def test_worker_rejects_penalties_before_prefill():
     batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
         is_extend_in_batch=False,
-        sampling_info=SimpleNamespace(is_all_greedy=True, logit_bias={1: 1}),
+        return_logprob=False,
+        sampling_info=SimpleNamespace(
+            is_all_greedy=True,
+            acc_additive_penalties=None,
+            acc_scaling_penalties=None,
+            logit_bias={1: 1},
+        ),
     )
     with pytest.raises(ValueError, match="without penalties"):
         worker.forward_batch_generation(batch)
