@@ -9,7 +9,7 @@ import weakref
 from collections import Counter
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -793,78 +793,6 @@ def test_worker_rejects_penalties_before_prefill():
         worker.forward_batch_generation(batch)
 
 
-@pytest.mark.parametrize("capture_raises", [False, True])
-def test_sampling_capture_device_guard_is_scoped_to_cache_miss(
-    monkeypatch, capture_raises
-):
-    from sglang.srt.speculative.ubtree_components.sampling_graph import (
-        UBTreeSamplingGraphRunner,
-    )
-
-    # Keep the guard contract covered even on a one-GPU CI runner. Real
-    # cross-device stream/capture/replay is checked separately below.
-    runner = UBTreeSamplingGraphRunner.__new__(UBTreeSamplingGraphRunner)
-    runner.device = torch.device("cuda:1")
-    runner._captured = {}
-    info = SimpleNamespace(
-        temperatures=torch.ones(1, 1),
-        top_ks=torch.tensor([2]),
-        top_ps=torch.ones(1),
-        min_ps=torch.zeros(1),
-        need_min_p_sampling=False,
-        is_all_greedy=False,
-        sampling_seed=None,
-    )
-    metadata = (torch.tensor([0]), torch.tensor([7]), torch.arange(3), None)
-    result = object()
-    epilogue = SimpleNamespace(
-        node_count=3,
-        graph_metadata=Mock(return_value=metadata),
-        set_armed=Mock(),
-        read_result=Mock(return_value=result),
-    )
-    captured = SimpleNamespace(graph=Mock(), sampling_info=info)
-    depth, entries = 0, []
-
-    @contextmanager
-    def device_guard(device):
-        nonlocal depth
-        assert device == runner.device
-        entries.append(device)
-        depth += 1
-        try:
-            yield
-        finally:
-            depth -= 1
-
-    def capture(**kwargs):
-        assert depth == 1, "lazy capture must enter the worker device first"
-        if capture_raises:
-            raise RuntimeError("test capture failure")
-        return captured
-
-    monkeypatch.setattr(torch.cuda, "device", device_guard)
-    monkeypatch.setattr(runner, "_capture", capture)
-    kwargs = dict(
-        logits=torch.zeros(3, 5),
-        hidden=torch.zeros(3, 8),
-        sampling_info=info,
-        epilogue=epilogue,
-        forward_batch=SimpleNamespace(batch_size=1),
-        can_run_cuda_graph=True,
-    )
-    if capture_raises:
-        with pytest.raises(RuntimeError, match="test capture failure"):
-            runner.run(**kwargs)
-        assert not runner._captured
-    else:
-        assert runner.run(**kwargs) is result
-        assert runner.run(**kwargs) is result
-        assert captured.graph.replay.call_count == 2
-    assert depth == 0
-    assert entries == [runner.device]
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")
 @pytest.mark.parametrize("width", range(2, 50))
 def test_tree_metadata_all_widths_matches_cpu_after_replay(width):
@@ -1061,20 +989,13 @@ def test_sampling_and_tree_walk_match_joint_ar_distribution(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")
-@pytest.mark.parametrize("foreign_device", [False, True])
-@pytest.mark.parametrize("precreate_stream", [False, True])
-def test_sampling_graph_refreshes_coins_parameters_and_logits(
-    monkeypatch, foreign_device, precreate_stream
-):
+def test_sampling_graph_refreshes_coins_parameters_and_logits(monkeypatch):
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.runtime_context import get_parallel, get_resources
+    from sglang.srt.runtime_context import get_parallel
     from sglang.srt.speculative.ubtree_components import sampling_graph
     from sglang.srt.speculative.ubtree_components.sampling_graph import (
         UBTreeSamplingGraphRunner,
     )
-
-    if foreign_device and torch.cuda.device_count() < 2:
-        pytest.skip("A foreign current device requires two CUDA devices")
 
     @contextmanager
     def capture_context(stream):
@@ -1084,9 +1005,6 @@ def test_sampling_graph_refreshes_coins_parameters_and_logits(
 
     # Keep real capture/replay; this one-device fixture has no TP process group.
     monkeypatch.setattr(sampling_graph, "graph_capture", capture_context)
-    # Exercise the real lazy stream factory without inheriting another test's
-    # already-created stream. Restore the resource registry on teardown.
-    monkeypatch.setattr(get_resources(), "streams", {})
 
     width, vocab_size = 33, 64
     epilogue = UBTreeVerifyEpilogue(
@@ -1129,13 +1047,6 @@ def test_sampling_graph_refreshes_coins_parameters_and_logits(
     runner = UBTreeSamplingGraphRunner("cuda")
     assert runner.device == logits.device
     runner._generator.manual_seed(314159)
-    if precreate_stream:
-        sampling_graph.get_or_create_global_graph_capture_stream()
-    caller_device = (
-        (runner.device.index + 1) % torch.cuda.device_count()
-        if foreign_device
-        else runner.device.index
-    )
 
     def run(graph=True):
         return runner.run(
@@ -1147,21 +1058,13 @@ def test_sampling_graph_refreshes_coins_parameters_and_logits(
             can_run_cuda_graph=graph,
         )
 
-    with (
-        torch.cuda.device(caller_device),
-        get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
-    ):
+    with get_parallel().override(tp_group=SimpleNamespace(world_size=1)):
         samples = []
         for _ in range(4):
             run()
             captured = next(iter(runner._captured.values()))
             samples.append(captured.target_predict.clone())
         assert all(not torch.equal(samples[0], sample) for sample in samples[1:])
-        assert torch.cuda.current_device() == caller_device
-        assert (
-            sampling_graph.get_or_create_global_graph_capture_stream().device
-            == runner.device
-        )
         # A full-vocabulary top-k cutoff retains all equal-probability ties.
         assert torch.cat(samples).max().item() >= 20
         assert len(runner._captured) == 1
@@ -1193,7 +1096,6 @@ def test_sampling_graph_refreshes_coins_parameters_and_logits(
         epilogue.begin_tree_step(tree, metadata.seq_lens)
         result = run(graph=False)
         assert result.new_seq_lens.item() == 11
-        assert torch.cuda.current_device() == caller_device
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")

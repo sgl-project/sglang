@@ -88,7 +88,6 @@ class UBTreeSamplingGraphRunner:
 
     def __init__(self, device: torch.device | str) -> None:
         self.device = torch.device(device)
-        # Lazy capture can run after a different device becomes current.
         # Keep streams and generators on the worker's concrete CUDA device.
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
@@ -234,16 +233,13 @@ class UBTreeSamplingGraphRunner:
         )
         captured = self._captured.get(key)
         if captured is None:
-            # The lazy stream factory and Graph initialization also depend on
-            # the current device, before _run_tail enters its own device guard.
-            with torch.cuda.device(self.device):
-                captured = self._capture(
-                    logits=logits,
-                    hidden=hidden,
-                    sampling_info=sampling_info,
-                    epilogue=epilogue,
-                    metadata=metadata,
-                )
+            captured = self._capture(
+                logits=logits,
+                hidden=hidden,
+                sampling_info=sampling_info,
+                epilogue=epilogue,
+                metadata=metadata,
+            )
             self._captured[key] = captured
         self._stage_inputs(captured.sampling_info, sampling_info)
         epilogue.set_armed(True)
