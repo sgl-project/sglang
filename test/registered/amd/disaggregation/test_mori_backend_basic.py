@@ -92,10 +92,10 @@ class TestMoriDCP(unittest.TestCase):
 
     def test_pp_local_descriptors_map_by_layer(self):
         manager = object.__new__(mori_conn.MoriKVManager)
-        manager.kv_mem_descs = ["src-17", "src-23"]
+        manager._local_keys = SimpleNamespace(kv=["src-17", "src-23"])
         manager.kv_args = SimpleNamespace(kv_layer_ids=[17, 23])
 
-        src, dst, count = manager._get_mla_mem_desc_slices(
+        src, dst, count = manager._get_mla_kv_key_slices(
             ["dst-11", "dst-17", "dst-23"], [11, 17, 23]
         )
 
@@ -114,7 +114,8 @@ class TestMoriDCP(unittest.TestCase):
             page_size=64, kv_item_lens=[4096], num_draft_entries=0, aux_data_ptrs=[]
         )
         manager.decode_kv_args_table = {}
-        manager.engine = Mock()
+        manager.transport = Mock()
+        manager._peers = {}
         info = mori_conn.KVArgsRegisterInfo(
             endpoint="127.0.0.1",
             dst_port=1,
@@ -154,10 +155,11 @@ class TestMoriDsaStateElision(unittest.TestCase):
         manager.attn_tp_size = 1
         manager._build_contiguous_transfer_plan = Mock(return_value="plan")
         manager._submit_batch_transfer_plan = Mock(return_value=[])
+        manager._peers = {"peer": SimpleNamespace(remote="remote")}
         indices = np.array([1, 2], dtype=np.int32)
 
         manager._send_swa_dsa_state(
-            SimpleNamespace(decode_tp_size=1),
+            SimpleNamespace(decode_tp_size=1, engine_key="peer"),
             indices,
             indices,
             [f"s{layer}" for layer in src_layers],
@@ -177,12 +179,20 @@ class TestMoriDsaStateElision(unittest.TestCase):
         # Decode elided layer 2 only. Both prefill layers must still be sent;
         # reading dst_lens[i] instead of dst_lens[j] drops layer 3.
         calls = self._send([3, 4], [2, 3, 4], [132, 132], [0, 132, 132])
-        self.assertEqual(calls, [call("s3", "d3", "plan"), call("s4", "d4", "plan")])
+        self.assertEqual(
+            calls,
+            [
+                call(remote="remote", src="s3", dst="d3", plan="plan"),
+                call(remote="remote", src="s4", dst="d4", plan="plan"),
+            ],
+        )
 
     def test_elided_dst_entry_is_never_written(self):
         # Decode elided layer 4. Writing to it would use a None descriptor.
         calls = self._send([4, 5], [3, 4, 5], [132, 132], [132, 0, 132])
-        self.assertEqual(calls, [call("s5", "d5", "plan")])
+        self.assertEqual(
+            calls, [call(remote="remote", src="s5", dst="d5", plan="plan")]
+        )
 
 
 if __name__ == "__main__":
