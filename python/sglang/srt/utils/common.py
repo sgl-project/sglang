@@ -524,16 +524,12 @@ def get_available_gpu_memory(
         # TODO: rename the variables in the current function to be not GPU specific
         parallel = get_parallel()
         mem_bind_env = os.environ.get("SGLANG_CPU_MEM_BIND", None)
-        # This file contains the NUMA nodes with compute cores
-        has_cpu_path = "/sys/devices/system/node/has_cpu"
 
         nodes = None
-        if parallel.dp_size == 1 and parallel.pp_size == 1 and parallel.nnodes == 1:
-            if mem_bind_env:
-                nodes = parse_node_list(mem_bind_env)
-            elif os.path.exists(has_cpu_path):
-                with open(has_cpu_path) as f:
-                    nodes = parse_node_list(f.read())
+        if mem_bind_env and (
+            parallel.dp_size == 1 and parallel.pp_size == 1 and parallel.nnodes == 1
+        ):
+            nodes = parse_node_list(mem_bind_env)
 
         if nodes and parallel.tp_size <= len(nodes):
             free_gpu_memory = min(
