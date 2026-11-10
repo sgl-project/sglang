@@ -3,7 +3,7 @@ import os
 import re
 import tempfile
 from typing import Dict, List, Optional, Tuple, Union
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 
 import pybase64
 import torch
@@ -400,13 +400,6 @@ class MossVLImageProcessor(SGLangBaseProcessor):
         visible_frame_counts = (~cross_attention_mask).sum(dim=-1, dtype=torch.int32)
         return visible_frame_counts.reshape(-1)
 
-    def _resolve_file_url(self, value: str) -> str:
-        parsed = urlparse(value)
-        path = unquote(parsed.path or "")
-        if parsed.netloc and not path.startswith("/"):
-            path = f"/{path}"
-        return path
-
     def _write_video_bytes_to_tempfile(
         self, video_bytes: bytes, suffix: str = ".mp4"
     ) -> str:
@@ -422,11 +415,12 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             raise
 
     def _normalize_video_string(self, value: str) -> Tuple[str, Optional[str]]:
-        if value.startswith("file://"):
-            return self._resolve_file_url(value), None
+        if value.startswith("file://") or (len(value) < 4096 and os.path.isfile(value)):
+            from sglang.srt.multimodal.media_io import (
+                _assert_local_media_path_allowed,
+            )
 
-        if os.path.isfile(value):
-            return value, None
+            return _assert_local_media_path_allowed(value), None
 
         if value.startswith(("http://", "https://")):
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))

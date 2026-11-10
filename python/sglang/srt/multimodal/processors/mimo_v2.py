@@ -24,7 +24,13 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
-from sglang.srt.multimodal.media_io import ImageData, VideoData, download_remote_media
+from sglang.srt.multimodal.media_io import (
+    ImageData,
+    VideoData,
+    _assert_local_media_path_allowed,
+    download_remote_media,
+    read_local_media,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -480,6 +486,14 @@ class MiMoProcessor:
             and ";base64," in path_or_data
         ):
             source = BytesIO(base64.b64decode(path_or_data.split(";base64,")[1]))
+        elif isinstance(path_or_data, str) and (
+            path_or_data.startswith("file://")
+            or path_or_data.startswith("/")
+            or (len(path_or_data) < 4096 and os.path.exists(path_or_data))
+        ):
+            # ffprobe must not read arbitrary local files either: apply the same
+            # local path allowlist as the shared loaders before handing it over.
+            source = _assert_local_media_path_allowed(path_or_data)
         else:
             source = path_or_data  # local path or file://
         try:
@@ -1427,8 +1441,9 @@ class MiMoProcessor:
             if image.startswith("http://") or image.startswith("https://"):
                 with BytesIO(download_remote_media(image, timeout=3)) as bio:
                     image_obj = copy.deepcopy(Image.open(bio))
-            elif image.startswith("file://"):
-                image_obj = Image.open(image[7:])
+            elif image.startswith("file://") or image.startswith("/"):
+                with BytesIO(read_local_media(image)) as bio:
+                    image_obj = copy.deepcopy(Image.open(bio))
             elif image.startswith("data:image"):
                 if "base64," in image:
                     _, base64_data = image.split("base64,", 1)
@@ -1436,7 +1451,8 @@ class MiMoProcessor:
                     with BytesIO(data) as bio:
                         image_obj = copy.deepcopy(Image.open(bio))
             else:
-                image_obj = Image.open(image)
+                with BytesIO(read_local_media(image)) as bio:
+                    image_obj = copy.deepcopy(Image.open(bio))
         else:
             image_obj = Image.open(BytesIO(image))
         if image_obj is None:
