@@ -17,7 +17,9 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=False, disabled=No
 
 @pytest.mark.parametrize("prefix_lens", [(0, 0), (2, 0), (2, 1)])
 @pytest.mark.parametrize("cache_path", ["bf16", "fp8", "dcp"])
-@pytest.mark.parametrize("weight_layout", ["block_scale", "serialized_fp8", "bf16"])
+@pytest.mark.parametrize(
+    "weight_layout", ["block_scale", "serialized_fp8", "mxfp8", "bf16"]
+)
 def test_mha_projects_full_prefix_kv(prefix_lens, cache_path, weight_layout):
     # Two requests, with distinct cached prefixes and newly appended suffixes.
     suffix_lens = (2, 3)
@@ -59,10 +61,14 @@ def test_mha_projects_full_prefix_kv(prefix_lens, cache_path, weight_layout):
     if weight_layout == "block_scale":
         kv_b_proj.weight_scale = torch.ones(1, rank // 128)
     elif weight_layout == "serialized_fp8":
-        # Standard serialized FP8 exposes weight_scale_inv. Preserve its normal
-        # input-quantization path, which does not use the fused RMSNorm tuple.
+        # Serialized block FP8 checkpoints store 128-wide block scales as
+        # weight_scale_inv, which the fused RMSNorm and quantization accepts.
         kv_b_proj.weight_scale_inv = torch.ones(1, rank // 128)
-    fused_layout = weight_layout == "block_scale"
+    elif weight_layout == "mxfp8":
+        # MXFP8 scales cover 32-wide blocks, which the group-128 fused kernel
+        # cannot consume, so the layer keeps its normal input quantization.
+        kv_b_proj.weight_scale_inv = torch.ones(1, rank // 32)
+    fused_layout = weight_layout in ("block_scale", "serialized_fp8")
     norm = mock.Mock(side_effect=lambda x: F.rms_norm(x, (rank,), norm_weight, 1e-5))
     norm.weight = norm_weight
     norm.variance_epsilon = 1e-5

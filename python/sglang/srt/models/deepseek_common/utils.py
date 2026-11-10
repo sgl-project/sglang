@@ -80,21 +80,46 @@ if _is_sail:
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.append("flashmla")
 
 
-def _is_block_scale_fp8(proj: torch.nn.Module) -> bool:
-    """Return True if proj uses block-scale fp8 quantization.
+# Group size the gfx95 fused fp8 kernels (fused_rms_fp8_group_quant,
+# fused_flatten_fp8_group_quant) are called with in the ROCm forward methods.
+GFX95_FUSED_FP8_GROUP_SIZE = 128
 
-    Per-channel fp8 has weight_scale shape [N, 1] (one scale per output row).
-    Block-scale fp8 has weight_scale shape [N, K/block_size] (multiple columns).
-    The fused gfx95 kernels (fused_rms_fp8_group_quant, fused_flatten_fp8_group_quant)
-    are only compatible with block-scale layouts — per-channel layers must fall
-    through to the plain bf16 path instead.
+# Fp8LinearMethod registers block scales as `weight_scale_inv` and per-tensor
+# scales as `weight_scale`; other quant paths use `weight_scale` for blocks too.
+_FP8_WEIGHT_SCALE_NAMES = ("weight_scale", "weight_scale_inv")
+
+
+def _has_fp8_weight_scale(proj: torch.nn.Module) -> bool:
+    """Whether a weight scale has been materialized under either known name.
+
+    Callers use this to tell "not quantized / not loaded yet" apart from
+    "loaded, but not a layout the fused kernels accept".
     """
+    return any(getattr(proj, n, None) is not None for n in _FP8_WEIGHT_SCALE_NAMES)
+
+
+def _is_block_scale_fp8(proj: torch.nn.Module) -> bool:
+    """Whether proj is block-scale fp8 with 128-wide K blocks, the only layout the
+    gfx95 fused fp8 kernels accept. The 2-D scale is `weight_scale_inv` under
+    Fp8LinearMethod and `weight_scale` elsewhere; per-channel ([N, 1]) and MXFP8
+    ([1, 32] blocks) scales are rejected."""
     if not hasattr(proj, "weight") or proj.weight.dtype != torch.float8_e4m3fn:
         return False
-    weight_scale = getattr(proj, "weight_scale", None)
-    if weight_scale is None or weight_scale.dim() != 2:
+    weight = proj.weight
+    if weight.dim() != 2:
         return False
-    return weight_scale.shape[-1] > 1
+    in_features = weight.shape[-1]
+    for name in _FP8_WEIGHT_SCALE_NAMES:
+        weight_scale = getattr(proj, name, None)
+        if weight_scale is None or weight_scale.dim() != 2:
+            continue
+        scale_cols = weight_scale.shape[-1]
+        if scale_cols <= 1:
+            continue
+        # ceil-div: scale columns cover ceil(K / block_k) groups.
+        if -(-in_features // scale_cols) == GFX95_FUSED_FP8_GROUP_SIZE:
+            return True
+    return False
 
 
 def awq_dequantize_func():
