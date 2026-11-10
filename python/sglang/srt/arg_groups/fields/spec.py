@@ -162,7 +162,7 @@ class Spec(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
-    speculative_draft_lm_head_dtype: A[
+    speculative_dspark_lm_head_dtype: A[
         Optional[str],
         Arg(
             help="DSPARK only. Quantized dtype for the draft's projection through the "

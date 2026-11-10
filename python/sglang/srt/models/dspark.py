@@ -131,7 +131,7 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
     if should_apply_lm_head_quant_method(lm_head, quant_method):
         return quant_method.apply(lm_head, hidden, None)
     weight = lm_head.weight
-    dtype = get_spec().speculative_draft_lm_head_dtype
+    dtype = get_spec().speculative_dspark_lm_head_dtype
     if dtype is not None and weight.is_floating_point() and hidden.shape[0] > 0:
         if dtype == "fp8" and weight.shape[-1] % 16 == 0:
             return _fp8_lm_head_matmul(hidden, lm_head)

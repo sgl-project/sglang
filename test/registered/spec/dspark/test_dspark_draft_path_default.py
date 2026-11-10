@@ -7,7 +7,7 @@ from unittest.mock import patch
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
-    _resolve_dspark_draft_lm_head_dtype,
+    _resolve_dspark_lm_head_dtype,
     _target_checkpoint_bundles_dspark_draft,
     _target_checkpoint_dspark_subfolder,
 )
@@ -65,16 +65,16 @@ class TestTargetCheckpointBundlesDsparkDraft(CustomTestCase):
         self.assertFalse(_target_checkpoint_bundles_dspark_draft(server_args))
 
 
-class TestDsparkDraftLmHeadDtype(CustomTestCase):
+class TestDsparkLmHeadDtype(CustomTestCase):
     def _resolve(self, dtype, *, is_gfx95=False, is_blackwell=False):
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
         )
-        server_args.speculative_draft_lm_head_dtype = dtype
+        server_args.speculative_dspark_lm_head_dtype = dtype
         facts = SimpleNamespace(is_gfx95=is_gfx95, is_blackwell=is_blackwell)
         with patch(f"{_HOOK}.get_platform", return_value=facts):
-            _resolve_dspark_draft_lm_head_dtype(server_args)
-        return resolution_result(server_args, "speculative_draft_lm_head_dtype")
+            _resolve_dspark_lm_head_dtype(server_args)
+        return resolution_result(server_args, "speculative_dspark_lm_head_dtype")
 
     def test_unsupported_platform_raises(self):
         for dtype in ("fp8", "mxfp8"):

@@ -668,11 +668,11 @@ def _target_checkpoint_dspark_subfolder(
     return os.path.join(snapshot, _DSPARK_DRAFT_SUBFOLDER)
 
 
-_DRAFT_LM_HEAD_DTYPE_PLATFORM_PROBES = {"fp8": "is_gfx95", "mxfp8": "is_blackwell"}
+_DSPARK_LM_HEAD_DTYPE_PLATFORM_PROBES = {"fp8": "is_gfx95", "mxfp8": "is_blackwell"}
 
 
-def _resolve_dspark_draft_lm_head_dtype(server_args: ServerArgs) -> None:
-    dtype = resolving_view(server_args).speculative_draft_lm_head_dtype
+def _resolve_dspark_lm_head_dtype(server_args: ServerArgs) -> None:
+    dtype = resolving_view(server_args).speculative_dspark_lm_head_dtype
     if dtype is None:
         if not envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.get():
             return
@@ -684,16 +684,16 @@ def _resolve_dspark_draft_lm_head_dtype(server_args: ServerArgs) -> None:
             return
         logger.warning(
             "SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD is deprecated; pass "
-            "'--speculative-draft-lm-head-dtype fp8' instead."
+            "'--speculative-dspark-lm-head-dtype fp8' instead."
         )
         declare_resolution(
-            server_args, "_handle_dspark", speculative_draft_lm_head_dtype="fp8"
+            server_args, "_handle_dspark", speculative_dspark_lm_head_dtype="fp8"
         )
         return
-    probe = _DRAFT_LM_HEAD_DTYPE_PLATFORM_PROBES[dtype]
+    probe = _DSPARK_LM_HEAD_DTYPE_PLATFORM_PROBES[dtype]
     if not getattr(get_platform(), probe):
         raise ValueError(
-            f"--speculative-draft-lm-head-dtype {dtype} is not supported on this "
+            f"--speculative-dspark-lm-head-dtype {dtype} is not supported on this "
             f"device (requires {probe.removeprefix('is_')})."
         )
 
@@ -705,7 +705,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         raise ValueError(
             "DSpark speculative decoding only supports CUDA, NPU or XPU device."
         )
-    _resolve_dspark_draft_lm_head_dtype(server_args)
+    _resolve_dspark_lm_head_dtype(server_args)
 
     if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:

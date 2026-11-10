@@ -1210,7 +1210,7 @@ class Envs:
     # target-verify kept running the norm+RoPE as separate kernels. Set to 0 to
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
-    # Deprecated alias of `--speculative-draft-lm-head-dtype fp8` (gfx95x only).
+    # Deprecated alias of `--speculative-dspark-lm-head-dtype fp8` (gfx95x only).
     SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD = EnvBool(False)
     # Pooled prefill-logits budget of the HIP FP4 indexer, in MiB.
     SGLANG_DSV4_FP4_LOGITS_BUDGET_MB = EnvInt(2048)
