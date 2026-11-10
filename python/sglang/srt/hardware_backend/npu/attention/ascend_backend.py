@@ -4483,10 +4483,6 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
-        if self.use_mla and topk_indices is None:
-            raise NotImplementedError(
-                "The 'enable-mixed-chunk' feature is currently unsupported when using the MLA backend (without DSA sparse attention) on Ascend NPU devices."
-            )
         # A mixed batch is a varlen extend batch (decode rows are 1-token
         # extends), so reuse the extend path
         return self.forward_extend(

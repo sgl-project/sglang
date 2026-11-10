@@ -69,7 +69,7 @@ from sglang.srt.multimodal.mm_utils import batch_single_media_input, has_valid_d
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
-from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams, validate_n
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgpack_utils import (
     dec_hook,
@@ -82,6 +82,7 @@ from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
     msgspec_struct_pydantic_core_schema,
 )
+from sglang.srt.utils.rid_utils import expand_base_rid
 from sglang.srt.utils.weight_versions import WeightVersionSpans
 
 # Handle serialization of Image for pydantic
@@ -537,12 +538,13 @@ class GenerateReqInput:
         if self.sampling_params is None:
             self.parallel_sample_num = 1
             return
+        # Validate before inputs are expanded n times; verify() runs too late.
         elif isinstance(self.sampling_params, dict):
-            self.parallel_sample_num = self.sampling_params.get("n", 1)
+            self.parallel_sample_num = validate_n(self.sampling_params.get("n", 1))
         else:  # isinstance(self.sampling_params, list):
-            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
+            self.parallel_sample_num = validate_n(self.sampling_params[0].get("n", 1))
             for sampling_params in self.sampling_params:
-                if self.parallel_sample_num != sampling_params.get("n", 1):
+                if self.parallel_sample_num != validate_n(sampling_params.get("n", 1)):
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
@@ -780,6 +782,7 @@ class GenerateReqInput:
         if self.rid is None:
             self.rid = [uuid.uuid4().hex for _ in range(num)]
         elif isinstance(self.rid, str):
+            # Unpadded on purpose: clients and the Rust server rebuild `<rid>_<i>`.
             new_rids = [f"{self.rid}_{i}" for i in range(num)]
             self.rid = new_rids
         elif isinstance(self.rid, list):
@@ -1399,6 +1402,8 @@ class EmbeddingReqInput:
         else:
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
+            elif isinstance(self.rid, str):
+                self.rid = expand_base_rid(self.rid, self.batch_size)
             else:
                 assert isinstance(self.rid, list), "The rid should be a list."
 

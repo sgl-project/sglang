@@ -585,7 +585,7 @@ class Envs:
     )
     SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS = EnvInt(1)
     SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS = EnvInt(0)
-    # Static verify graphs stage the draft context-KV commit; the next draft graph
+    # Static verify graphs stage the draft KV store; the next draft graph
     # writes it on a side stream forked at its head, joined at its first KV store.
     SGLANG_DSPARK_DEFER_CONTEXT_KV = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
@@ -613,8 +613,8 @@ class Envs:
     SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # The deferred commit's staging (hidden, write locations, positions, commit lengths)
-    # in one Triton launch instead of four copies and a fill.
+    # The deferred draft KV store's staging (write locations, positions, state slots,
+    # commit lengths) in one Triton launch instead of four copies and a fill.
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
