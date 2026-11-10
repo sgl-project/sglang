@@ -4,6 +4,7 @@ use crate::cache_action::{
     RecoverSwaWithLockedFull, SwaRebuild, UpdatePendingBackupOnNodeSplit,
 };
 use crate::components::{ComponentSet, FULL, MAMBA, SWA};
+use crate::node::KeyNamespaceRef;
 use crate::test_utils::{accumulate_step, action_kinds, expect_action, matched_device_indices};
 use crate::unified_tree_core::CacheInitParams;
 
@@ -1499,7 +1500,7 @@ fn insert_overlap_straddling_a_second_level_locked_node_defers_the_tail() {
 }
 
 #[test]
-fn insert_overlap_prev_prefix_strictly_inside_the_node_still_recovers() {
+fn insert_overlap_prev_prefix_strictly_inside_the_node_recovers_only_beyond_it() {
     let mut tc = swa_core(/* window = */ 8, /* page_size = */ 1);
     tc.insert(&insert_params_swa(
         &vec![1, 2, 3, 4],
@@ -1509,19 +1510,172 @@ fn insert_overlap_prev_prefix_strictly_inside_the_node_still_recovers() {
     ));
     let root = tc.arena.root();
     let node = child_of(&tc, root, &[1]);
+    // The request's row for its protected prefix [1,2] is the node's own
+    // canonical ids; only [3,4] carries fresh KV.
     let result = tc.insert(&insert_params_swa(
         &vec![1, 2, 3, 4],
-        &[20, 21, 22, 23],
+        &[10, 11, 22, 23],
         /* prev_prefix_len = */ 2,
         /* swa_evicted_seqlen = */ 0,
     ));
-    // prev covers only part of the node, so the tombstone recovery runs.
+    // The recovery is clamped to the protected prefix: the node splits there,
+    // the head keeps its canonical ids and only the tail adopts the fresh KV.
+    let head = child_of(&tc, root, &[1]);
+    assert_eq!(tc.arena.node(head).key, vec![1, 2]);
+    assert_eq!(tc.arena.node(node).key, vec![3, 4]);
+    assert!(
+        tc.arena
+            .device_value(head, FULL)
+            .equal(&Tensor::from_slice(&[10i64, 11]))
+    );
     assert!(
         tc.arena
             .device_value(node, FULL)
-            .equal(&Tensor::from_slice(&[20i64, 21, 22, 23]))
+            .equal(&Tensor::from_slice(&[22i64, 23]))
     );
-    assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, .. }) if *node_id == tc.arena.node(node).id)));
+    let [action0, action1] = result.cache_actions.as_slice() else {
+        panic!(
+            "expected FreeDeviceKVFullOnly then SwaRebuild, got {:?}",
+            action_kinds(&result.cache_actions)
+        );
+    };
+    let FreeDeviceKVFullOnly { indices: old_tail } =
+        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action1.as_ref());
+    assert!(old_tail[0].equal(&Tensor::from_slice(&[12i64, 13])));
+    assert_eq!(*node_id, tc.arena.node(node).id);
+    assert!(source_value.equal(&Tensor::from_slice(&[22i64, 23])));
+}
+
+// ---- Aliased-head regression: a request whose
+// protected prefix ends inside an SWA-tombstoned node re-inserts that node's
+// tokens with its own row, which holds the node's canonical ids up to the
+// protected length. The recovery must never free those ids.
+
+/// FULL-pool ids the controller frees for `actions`: dedup frees, the swap
+/// branch's old_full, and RecoverSwaWithLockedFull's incoming_full.
+fn freed_full_ids(actions: &CacheActions) -> Vec<i64> {
+    let mut freed = Vec::new();
+    for action in actions {
+        let any = action.as_any();
+        let tensors: Vec<&Tensor> = if let Some(a) = any.downcast_ref::<FreeDeviceKV>() {
+            a.indices.iter().collect()
+        } else if let Some(a) = any.downcast_ref::<FreeDeviceKVFullOnly>() {
+            a.indices.iter().collect()
+        } else if let Some(a) = any.downcast_ref::<RecoverSwaWithLockedFull>() {
+            vec![&a.incoming_full]
+        } else {
+            Vec::new()
+        };
+        for tensor in tensors {
+            freed.extend(Vec::<i64>::try_from(tensor).unwrap());
+        }
+    }
+    freed
+}
+
+/// Apply the SWA publications the controller would run (SwaRebuild and
+/// RecoverSwaWithLockedFull both end in set_component_device_value).
+fn publish_swa(tc: &mut UnifiedTreeCore<Vec<i64>>, actions: &CacheActions) {
+    for action in actions {
+        let any = action.as_any();
+        if let Some(a) = any.downcast_ref::<SwaRebuild>() {
+            tc.set_component_device_value(a.node_id, SWA, a.source_value.copy())
+                .unwrap();
+        } else if let Some(a) = any.downcast_ref::<RecoverSwaWithLockedFull>() {
+            tc.set_component_device_value(a.node_id, SWA, a.kept_full.copy())
+                .unwrap();
+        }
+    }
+}
+
+fn mapped_full_ids(tc: &UnifiedTreeCore<Vec<i64>>) -> Vec<i64> {
+    tc.arena
+        .live_ids()
+        .filter_map(|idx| tc.arena.node(idx).try_device_value(FULL))
+        .flat_map(|tensor| Vec::<i64>::try_from(tensor).unwrap())
+        .collect()
+}
+
+/// Ownership post-condition: nothing freed is still mapped by a node, and the
+/// request's protected prefix stays mapped.
+fn assert_ownership(tc: &UnifiedTreeCore<Vec<i64>>, freed: &[i64], protected: &[i64]) {
+    let mapped: std::collections::HashSet<i64> = mapped_full_ids(tc).into_iter().collect();
+    let double_owned: Vec<i64> = freed
+        .iter()
+        .copied()
+        .filter(|id| mapped.contains(id))
+        .collect();
+    assert!(
+        double_owned.is_empty(),
+        "freed FULL ids still mapped by a node: {double_owned:?}"
+    );
+    let lost: Vec<i64> = protected
+        .iter()
+        .copied()
+        .filter(|id| !mapped.contains(id))
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "protected prefix ids no longer mapped: {lost:?}"
+    );
+    tc.sanity_check(&[], &[]);
+}
+
+/// The anchor a request locks after a read-only prefix match (no split), so
+/// its protected length can end inside that node.
+fn read_only_prefix_anchor(
+    tc: &UnifiedTreeCore<Vec<i64>>,
+    key: &[i64],
+    protected: usize,
+) -> NodeId {
+    let prefix: Vec<i64> = key[..protected].to_vec();
+    let (matched, anchor, _) = tc.match_full_device_prefix(&prefix, KeyNamespaceRef::default());
+    assert_eq!(matched, protected);
+    anchor
+}
+
+#[test]
+fn insert_overlap_keeps_the_protected_head_when_swa_evicted_seqlen_is_below_it() {
+    // N[0,24) is FULL-only; the request's protected prefix (16) ends inside
+    // it and its swa_evicted_seqlen (8) is below it (no SWA freed yet).
+    for locked in [false, true] {
+        let mut tc = swa_core(8, 4);
+        let key: Vec<i64> = (1..=24).collect();
+        let canonical: Vec<i64> = (100..124).collect();
+        tc.insert(&insert_params_swa(&key, &canonical, 0, 24));
+        let anchor = read_only_prefix_anchor(&tc, &key, 16);
+        let receipt = locked.then(|| {
+            tc.inc_lock_ref(anchor, ComponentSet::EMPTY)
+                .unwrap()
+                .to_dec_params()
+        });
+        let mut value = canonical[..16].to_vec();
+        value.extend(500..508);
+        let result = tc.insert(&InsertParams {
+            track_adopted_ranges: true,
+            ..insert_params_swa(&key, &value, 16, 8)
+        });
+        let freed = freed_full_ids(&result.cache_actions);
+        publish_swa(&mut tc, &result.cache_actions);
+        assert_ownership(&tc, &freed, &canonical[..16]);
+        // Only [16,24) is recovered: the locked node hands back the fresh
+        // ids, the unlocked node swaps and frees its old tail.
+        assert_eq!(result.adopted_ranges.as_ref().unwrap()[&SWA], [(16, 24)]);
+        let expected: Vec<i64> = if locked {
+            (500..508).collect()
+        } else {
+            canonical[16..24].to_vec()
+        };
+        assert_eq!(freed, expected);
+        if let Some(receipt) = receipt {
+            tc.dec_lock_ref(anchor, &receipt, false).unwrap();
+        }
+        tc.sanity_check(&[], &[]);
+    }
 }
 
 #[test]
