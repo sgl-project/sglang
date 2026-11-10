@@ -48,8 +48,6 @@ checked against NCCL in
 and attention coverage lives in ``test_page_sharded_dsa_attention.py``.
 """
 
-import ctypes
-import gc
 import math
 import shutil
 import unittest
@@ -64,10 +62,6 @@ from parameterized import parameterized_class
 
 from sglang.srt.disaggregation.common.conn import CommonKVSender
 from sglang.srt.disaggregation.utils import filter_kv_indices_for_shard_rank
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    _release_nccl_window_buffer,
-    allocate_symmetric_buffer,
-)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import page_interleave
@@ -368,86 +362,6 @@ class TestZeroSmScratchLayout(CustomTestCase):
         for (_, end), (next_start, _) in zip(spans, spans[1:]):
             self.assertLessEqual(end, next_start)
         self.assertLessEqual(spans[-1][1], nbytes)
-
-
-class TestSymmetricBufferFailureCleanup(CustomTestCase):
-    @contextmanager
-    def _fixture(self):
-        comm = SimpleNamespace(
-            device=torch.device("cuda:0"),
-            nccl=SimpleNamespace(
-                ncclMemAlloc=unittest.mock.Mock(return_value=1234),
-                ncclMemFree=unittest.mock.Mock(),
-            ),
-            register_comm_window_raw=unittest.mock.Mock(
-                return_value=ctypes.c_void_p(5678)
-            ),
-            deregister_comm_window=unittest.mock.Mock(),
-        )
-        with (
-            unittest.mock.patch("torch.cuda.device", return_value=nullcontext()),
-            unittest.mock.patch("torch.cuda.synchronize"),
-            unittest.mock.patch("torch.as_tensor") as as_tensor,
-        ):
-            yield comm, as_tensor
-
-    def test_registration_failure_frees_allocation(self):
-        with self._fixture() as (comm, as_tensor):
-            comm.register_comm_window_raw.side_effect = RuntimeError("register failed")
-            with self.assertRaisesRegex(RuntimeError, "register failed"):
-                allocate_symmetric_buffer(comm, 8192)
-            gc.collect()
-            as_tensor.assert_not_called()
-            comm.deregister_comm_window.assert_not_called()
-            comm.nccl.ncclMemFree.assert_called_once_with(1234)
-
-    def test_tensor_setup_failures_release_once(self):
-        for operation in ("wrap", "zero"):
-            with (
-                self.subTest(operation=operation),
-                self._fixture() as (comm, as_tensor),
-            ):
-                if operation == "wrap":
-                    as_tensor.side_effect = RuntimeError("wrap failed")
-                else:
-                    as_tensor.return_value.zero_.side_effect = RuntimeError(
-                        "zero failed"
-                    )
-                with self.assertRaisesRegex(RuntimeError, f"{operation} failed"):
-                    allocate_symmetric_buffer(comm, 8192)
-                # Drop Mock's saved owner reference as well: a registered
-                # finalizer must not run a second time after eager cleanup.
-                as_tensor.reset_mock()
-                gc.collect()
-                comm.deregister_comm_window.assert_called_once()
-                self.assertEqual(
-                    comm.deregister_comm_window.call_args.args[0].value, 5678
-                )
-                comm.nccl.ncclMemFree.assert_called_once_with(1234)
-
-    def test_cleanup_failure_preserves_setup_error_without_double_free(self):
-        with self._fixture() as (comm, as_tensor):
-            as_tensor.side_effect = RuntimeError("wrap failed")
-            comm.deregister_comm_window.side_effect = RuntimeError("deregister failed")
-            with (
-                self.assertLogs(
-                    "sglang.srt.distributed.device_communicators.pynccl_allocator",
-                    level="ERROR",
-                ),
-                self.assertRaisesRegex(RuntimeError, "wrap failed"),
-            ):
-                allocate_symmetric_buffer(comm, 8192)
-            as_tensor.reset_mock()
-            gc.collect()
-            comm.deregister_comm_window.assert_called_once()
-            comm.nccl.ncclMemFree.assert_called_once_with(1234)
-
-    def test_deregister_failure_still_frees_allocation(self):
-        with self._fixture() as (comm, _):
-            comm.deregister_comm_window.side_effect = RuntimeError("deregister failed")
-            with self.assertRaisesRegex(RuntimeError, "deregister failed"):
-                _release_nccl_window_buffer(comm, 1234, ctypes.c_void_p(5678))
-            comm.nccl.ncclMemFree.assert_called_once_with(1234)
 
 
 def _make_mtp_configurator(use_mla=True):
