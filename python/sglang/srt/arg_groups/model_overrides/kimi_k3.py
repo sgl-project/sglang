@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.model_override_base import (
     is_attention_backend_not_set,
     resolving_view,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -232,6 +233,22 @@ def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
     rejected = [name for name, on in unsupported.items() if on]
     if rejected:
         raise ValueError(f"Kimi-K3.1 DCP does not support {', '.join(rejected)} yet.")
+    if (
+        cfg.dsa_topk_backend != "sgl-kernel"
+        or not envs.SGLANG_OPT_USE_TOPK_V2.get()
+        or not envs.SGLANG_DSA_FUSE_TOPK.get()
+    ):
+        raise ValueError(
+            "Kimi-K3.1 DCP needs the fused sgl-kernel v2 DSA top-k "
+            "(--dsa-topk-backend sgl-kernel, SGLANG_OPT_USE_TOPK_V2 and "
+            "SGLANG_DSA_FUSE_TOPK on)."
+        )
+    if cfg.enable_return_indexer_topk or envs.SGLANG_DSA_TOPK_BROADCAST.get():
+        # the sharded indexer returns only this rank's local KV slots
+        raise ValueError(
+            "Kimi-K3.1 DCP does not support --enable-return-indexer-topk "
+            "or SGLANG_DSA_TOPK_BROADCAST."
+        )
     overrides = _dcp_replicate_q_proj_default(cfg, "Kimi-K3.1")
     if cfg.speculative_algorithm == "DFLASH":
         overrides["speculative_draft_attention_backend"] = dflash_draft_backend

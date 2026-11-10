@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -38,7 +39,19 @@ from sglang.srt.runtime_context import (
     reset_context,
 )
 from sglang.srt.server_args import _declared_default
+from sglang.srt.utils.device import is_confidential_compute
 from sglang.test.test_utils import CustomTestCase
+
+
+@contextlib.contextmanager
+def _confidential_compute(enabled: bool):
+    # is_confidential_compute is lru_cached, so clear it on both edges.
+    is_confidential_compute.cache_clear()
+    try:
+        with envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.override(enabled):
+            yield
+    finally:
+        is_confidential_compute.cache_clear()
 
 
 @dataclasses.dataclass
@@ -335,7 +348,7 @@ class TestBoundaryReductionDefaults(CustomTestCase):
                     hf_config=SimpleNamespace(architectures=["MiMoV2ForCausalLM"])
                 )
                 with patch(
-                    "sglang.srt.utils.hf_transformers.get_config",
+                    "sglang.srt.hf_transformers.get_config",
                     return_value=SimpleNamespace(model_type="qwen3"),
                 ) as load:
                     run_post_process_pass(args, resolve_boundary_reduction)
@@ -1895,18 +1908,18 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def test_gpt_oss_mxfp4_forces_bfloat16(self):
         from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 
-        if "mxfp4" not in QUANTIZATION_METHODS:
-            # Registration is platform-gated (CUDA / CPU engine / MXFP-HIP);
-            # plain CPU CI runners cannot construct an mxfp4 ModelConfig.
-            self.skipTest("mxfp4 quantization is not registered on this platform")
-        sa = self._construct(
-            "GptOssForCausalLM",
-            "llama",
-            config_extra={"quantization_config": {"quant_method": "mxfp4"}},
-        )
-        self.assertEqual(self._resolved(sa, "dtype"), "bfloat16")
-        self.assertEqual((self._publish(sa), self._leaf("dtype"))[1], "bfloat16")
+        # Registration is platform-gated (CUDA / CPU engine / MXFP-HIP), so a
+        # plain CPU runner would otherwise reject the mxfp4 ModelConfig.
+        with patch.dict(QUANTIZATION_METHODS, {"mxfp4": Mxfp4Config}):
+            sa = self._construct(
+                "GptOssForCausalLM",
+                "llama",
+                config_extra={"quantization_config": {"quant_method": "mxfp4"}},
+            )
+            self.assertEqual(self._resolved(sa, "dtype"), "bfloat16")
+            self.assertEqual((self._publish(sa), self._leaf("dtype"))[1], "bfloat16")
 
     def test_gpt_oss_without_mxfp4_keeps_pristine_dtype(self):
         sa = self._construct("GptOssForCausalLM", "llama")
@@ -1929,7 +1942,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_sampling_backend_default_pass(self):
-        from sglang.srt.utils.common import is_flashinfer_available
+        from sglang.srt.utils.device import is_flashinfer_available
 
         sa = self._construct("LlamaForCausalLM", "llama")
         expected = "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -2938,6 +2951,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
         with (
+            _confidential_compute(False),
             override_platform(is_sm90=True),
             override_platform(is_sm100=False),
         ):
@@ -2982,6 +2996,26 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ),
                 {},
             )
+
+        # SM100 auto-enables multi-node mnnvl, which needs NVLink multicast, so
+        # Confidential Computing keeps only single-node trtllm.
+        with (
+            override_platform(is_sm90=False),
+            override_platform(is_sm100=True),
+        ):
+            with _confidential_compute(False):
+                self.assertEqual(
+                    _flashinfer_allreduce_fusion_auto_enable(_view(nnodes=2)),
+                    {"flashinfer_allreduce_fusion_backend": "auto"},
+                )
+            with _confidential_compute(True):
+                self.assertEqual(
+                    _flashinfer_allreduce_fusion_auto_enable(_view(nnodes=2)), {}
+                )
+                self.assertEqual(
+                    _flashinfer_allreduce_fusion_auto_enable(_view()),
+                    {"flashinfer_allreduce_fusion_backend": "trtllm"},
+                )
 
         # enforce-disable wins over everything
         self.assertEqual(
@@ -3594,7 +3628,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         from sglang.srt.arg_groups.overrides import _gguf_quantization
 
         with patch(
-            "sglang.srt.utils.hf_transformers.check_gguf_file",
+            "sglang.srt.hf_transformers.check_gguf_file",
             return_value=True,
         ):
             self.assertEqual(
@@ -4464,6 +4498,7 @@ class TestKimiK31DcpOverrides(CustomTestCase):
             enable_hisparse=False,
             enable_prefill_cp=False,
             attn_cp_size=None,
+            dsa_topk_backend="sgl-kernel",
         )
         for name, value in fields.items():
             setattr(cfg, name, value)

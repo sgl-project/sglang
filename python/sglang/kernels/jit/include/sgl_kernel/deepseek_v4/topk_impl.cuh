@@ -39,7 +39,8 @@
 
 #if SUPPORT_CLUSTER
 #include <sgl_kernel/math.cuh>
-#include <sgl_kernel/mbarrier.cuh>
+
+#include <sgl_kernel/ptx/barrier.cuh>
 
 #include <cooperative_groups.h>
 #endif
@@ -160,16 +161,6 @@ SGL_DEVICE float2 coarse_bin_bounds(uint32_t bin) {
   const float hi_edge = __int_as_float(hi + (hi >> 31) + (hi == 0));
   const float nan = __int_as_float(0x7F800001);
   return {bin <= kNegInfBin ? -infinity_value() : bin > kInfBin ? nan : lo_edge, bin >= kInfBin ? nan : hi_edge};
-}
-
-/// The score pointer, asserted global. Loads through a pointer that crossed an asm
-/// memory clobber (the PDL wait) or a call otherwise lose the global address space
-/// and become generic LD.E; call this on a local copy after the clobber.
-SGL_DEVICE const float* assume_global(const float* ptr) {
-#if !defined(USE_ROCM)
-  __builtin_assume(__isGlobal(ptr));
-#endif
-  return ptr;
 }
 
 SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
@@ -1196,7 +1187,7 @@ struct TopKStreaming : TopKRadixBase<12> {
 
 #if SUPPORT_CLUSTER
 
-/// Single-instruction PTX wrappers of the cluster path, on top of sgl_kernel/mbarrier.cuh.
+/// Single-instruction PTX wrappers of the cluster path, on top of sgl_kernel/ptx/barrier.cuh.
 namespace ptx {
 
 using device::ptx::mbar_init;
@@ -1234,7 +1225,7 @@ SGL_DEVICE void st_async_v2(uint32_t dst, uint32_t a, uint32_t b, uint32_t mbar)
 SGL_DEVICE void fence_mbar_init() {
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 }
-// The waits below differ from mbarrier.cuh: a "memory" clobber, and a cluster-scope acquire
+// The waits below differ from ptx/barrier.cuh: a "memory" clobber, and a cluster-scope acquire
 // that pairs with the remote st.async complete_tx. They wait on phase 0 only: after every
 // used phase the CTA completes the next one empty (mbar_skip_phase), so each problem
 // starts every mbarrier on an even phase.

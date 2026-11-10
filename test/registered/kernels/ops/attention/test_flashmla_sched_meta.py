@@ -300,11 +300,11 @@ def test_parallel_walk_replay_switches_with_lengths():
 
 
 def _native_flashmla():
-    import sgl_kernel.flash_mla as flash_mla
+    from sglang.kernels.ops.attention import flash_mla_interface
 
-    if not hasattr(torch.ops.sgl_kernel, "sparse_decode_num_sm_parts"):
+    if not flash_mla_interface.supports_native_heads():
         pytest.skip("installed FlashMLA predates native head support")
-    return flash_mla
+    return flash_mla_interface
 
 
 @pytest.mark.skipif(not get_platform().is_sm100, reason="native heads require SM100")
@@ -361,7 +361,7 @@ def test_native_heads_schedule_and_output(heads, batch, mode):
         extra_topk_length=None,
         schedule="parallel",
     )
-    expected_parts = torch.ops.sgl_kernel.sparse_decode_num_sm_parts(batch, 1, heads)
+    expected_parts = flash_mla.sparse_decode_num_sm_parts(batch, 1, heads)
     assert custom_meta.tile_scheduler_metadata.shape[0] == expected_parts
     if reference_meta.tile_scheduler_metadata is not None:
         # Word 7 is unwritten padding in the upstream scheduler.

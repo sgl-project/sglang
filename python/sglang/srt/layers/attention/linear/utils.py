@@ -7,7 +7,7 @@ import msgspec
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.log_utils import rank0_log
 
 if TYPE_CHECKING:
     pass
@@ -143,7 +143,7 @@ def build_verify_intermediate_state_indices(pool_size: int, device):
     """
     import torch
 
-    from sglang.srt.utils.common import (
+    from sglang.srt.layers.dp_attention import (
         get_cuda_graph_max_batch_size,
         get_eager_max_batch_size,
     )

@@ -20,6 +20,7 @@ from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.layers.communication.k3_ar_fusion import _SHARDED_UP_MAX_TOKENS
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
@@ -28,8 +29,14 @@ register_cuda_ci(est_time=21, stage="base-c", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=480, stage="nightly", runner_config="8-gpu-b200")
 
 _HIDDEN_SIZE = 7168
-# both sides of the GEMV / gather boundary, and the gather path's cap
-_GEMM_AG_NUM_TOKENS = (1, 12, 13, 256)
+# The GEMV table's two ends, the first batch past it (slice GEMM + gather_add3 only),
+# and the model's gather cap, where the consumer reaches its widest block and strides.
+_GEMM_AG_NUM_TOKENS = (
+    1,
+    gemm_ag.GEMV_MAX_TOKENS,
+    gemm_ag.GEMV_MAX_TOKENS + 1,
+    _SHARDED_UP_MAX_TOKENS,
+)
 _MB = 1024 * 1024
 _SP_TUNING = sp_collective.Tuning(num_blocks=1, block_size=256)
 

@@ -120,7 +120,7 @@ def pcg_dsa_indexer_prefill_split(
         )
         return
 
-    # Fused path stores K (no-Hadamard) and computes q_fp8 + head gate in the
+    # Fused path stores K and computes q_fp8 + head gate in the
     # fused kernels, sliced to the unpadded count. Single stream: the split op is
     # captured, so the dual-stream overlap is disabled.
     if indexer.use_dsa_indexer_fusion and not in_cp:
@@ -152,12 +152,18 @@ def pcg_dsa_indexer_prefill_split(
         enable_dual_stream=False,
         forward_batch=forward_batch,
     )
+    from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+
     if (
         _is_cuda
         and indexer.bf16_head_gate
         and indexer.skip_rope
         and indexer.head_dim == indexer.block_size == 128
+        # The fused kernel writes the FP8 query; an FP4 indexer quantizes its own.
+        and type(indexer)._quantize_query is Indexer._quantize_query
     ):
+        # Kimi's no-RoPE indexer: one kernel for the Q quantization and the
+        # BF16 head-gate scaling.
         from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
 
         gate = indexer._project_head_gates(x)
@@ -165,8 +171,9 @@ def pcg_dsa_indexer_prefill_split(
             query, gate, indexer.softmax_scale, indexer.scale_fmt
         )
     else:
-        q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
-        weights = (
+        q_fp8, q_scale = indexer._quantize_query(query, act_quant)
+        # Reuse the compiled head-gate util shared with the eager path.
+        weights = (  # same head-gate choice as the eager CP branch
             indexer._scale_head_gates(weights_raw, q_scale)
             if indexer.use_dsa_indexer_fusion
             else indexer._get_logits_head_gate(x, q_scale)
@@ -208,12 +215,12 @@ def pcg_dsa_indexer_prefill_split(
         topk_result[logical_tokens:].fill_(-1)
 
 
-def _dsa_indexer_prefill_capture_stub(
+def _dsa_indexer_prefill_on_capture(
     layer_id, x, q_lora, positions, topk_result, **kwargs
 ):
     topk_result.fill_(-1)
 
 
 bcg_dsa_indexer_prefill_split = eager_on_graph(
-    on_capture=_dsa_indexer_prefill_capture_stub
+    True, on_capture=_dsa_indexer_prefill_on_capture
 )(pcg_dsa_indexer_prefill_split)

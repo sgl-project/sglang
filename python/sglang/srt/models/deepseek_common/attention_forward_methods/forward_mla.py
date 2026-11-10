@@ -186,10 +186,13 @@ class DeepseekMLAForwardMixin:
     dsa_decode_absorb_under_indexer = False
     # set by forward_absorb_prepare when that overlap wrote the layer's KV
     _kv_cache_saved_early = False
+    # Apply W_UV to the DCP decode partials before the reduce (DSA layers only)
+    dcp_v_preproject = False
+    _dcp_v_weights: Optional[torch.Tensor] = None
 
     def _prepare_dcp_v_weights(self, group):
         weights = group.all_gather(self.w_vc.contiguous(), dim=0)
-        cached = getattr(self, "_dcp_v_weights", None)
+        cached = self._dcp_v_weights
         if cached is None:
             self._dcp_v_weights = weights
         else:
@@ -846,7 +849,7 @@ class DeepseekMLAForwardMixin:
                     q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
                 )
             born_q_backend.q8kv8_stash_born_q(
-                padded_extend_real_tokens(q_nope, forward_batch) or num_tokens,
+                padded_extend_real_tokens(q_nope.shape[0], forward_batch) or num_tokens,
                 self.attn_mqa.layer_id,
             )
             q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
@@ -880,7 +883,7 @@ class DeepseekMLAForwardMixin:
                         q_pe=q_pe,
                     )
             elif forward_batch.forward_mode.is_extend():
-                # for extend, gather kv (K3.1's DSA backend gathers its own cache)
+                # for extend, gather kv
                 if not self.use_dsa:
                     bcg_dcp_extend_kv_gather(
                         get_token_to_kv_pool(),
@@ -1042,7 +1045,7 @@ class DeepseekMLAForwardMixin:
                     # A head's linear V projection commutes with its LSE-weighted
                     # reduction. Exchange the narrower projected partials.
                     if (
-                        getattr(self, "dcp_v_preproject", False)
+                        self.dcp_v_preproject
                         and self.use_dsa
                         and (
                             attn_output.shape[0] >= _DCP_V_PREPROJECT_MIN_ROWS
@@ -1058,7 +1061,7 @@ class DeepseekMLAForwardMixin:
                         and not _SGLANG_EXPERIMENTAL_LORA_OPTI
                         and not is_kv_b_lora_active(self)
                     ):
-                        weights = getattr(self, "_dcp_v_weights", None)
+                        weights = self._dcp_v_weights
                         if (
                             weights is None
                             and not torch.cuda.is_current_stream_capturing()

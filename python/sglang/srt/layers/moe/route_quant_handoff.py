@@ -33,8 +33,6 @@ from typing import Any, Optional, Tuple
 import msgspec
 import torch
 
-from sglang.srt.environ import envs
-
 
 class _Handoff(msgspec.Struct):
     # staged by the model layer: the activation rows the runner will quantize
@@ -103,24 +101,23 @@ def try_route_quant_fused(
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
-    from sglang.kernels.ops.moe import kimi_k31_fused_routing, moe_route_quant_fused
+    from sglang.kernels.ops.moe import kimi_k3_fused_routing, moe_route_quant_fused
 
     layer = _handoff.request_layer
     if (
         layer is not None
         and _handoff.fused_routing_ok
-        and envs.SGLANG_K31_FUSED_ROUTING.get()
-        and kimi_k31_fused_routing.covered(gating_output, correction_bias, topk, x)
-        and kimi_k31_fused_routing.available()
+        and kimi_k3_fused_routing.covered(gating_output, correction_bias, topk, x)
+        and kimi_k3_fused_routing.available()
     ):
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             select_trtllm_routed_body,
         )
 
-        weights_dtype = kimi_k31_fused_routing.k31_expert_weights_dtype(x.shape[0])
+        weights_dtype = kimi_k3_fused_routing.expert_weights_dtype(x.shape[0])
         body = select_trtllm_routed_body(layer, x, topk, weights_dtype)
         if body is not None:
-            routed = kimi_k31_fused_routing.k31_fused_routing(
+            routed = kimi_k3_fused_routing.fused_routing(
                 gating_output,
                 correction_bias,
                 x,

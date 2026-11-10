@@ -30,7 +30,8 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.common import cdiv, get_bool_env_var, print_info_once
+from sglang.srt.utils import print_info_once
+from sglang.srt.utils.common import cdiv, get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.communication.k3_ll_comm_hip import LLComm

@@ -24,8 +24,11 @@ Both selections run the v2 top-k kernel, which orders by score descending,
 then column ascending. Local columns are in global position order, and the
 merge scatters candidates into a row indexed by global position, so ties
 resolve by global position at both steps. With 8 or 16 ranks and multicast,
-decode rows instead merge in one kernel (``DcpTopKMerge``).
+decode rows instead merge in one kernel (``DcpTopKMerge``); with 8 ranks,
+they can also select and merge in one kernel (``DcpFusedTopK``).
 """
+
+from __future__ import annotations
 
 from functools import partial
 from typing import Callable, Optional
@@ -34,14 +37,22 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.dcp_kernels import _gather_candidate_prefix_kernel
+from sglang.kernels.ops.attention.dsa.dcp_fused_topk import (
+    DCP_FUSED_TOPK_K,
+    DCP_FUSED_TOPK_MAX_CONTEXT,
+    DCP_FUSED_TOPK_PAGE_SIZE,
+    DCP_FUSED_TOPK_RANKS,
+    dcp_fused_topk,
+    dcp_fused_topk_buffer_numel,
+)
 from sglang.kernels.ops.attention.dsa.dcp_topk_merge import (
     dcp_topk_merge,
     dcp_topk_merge_buffer_numel,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_candidates_v2,
-    topk_transform_packed_v2,
     topk_transform_paged_v2,
 )
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
@@ -53,7 +64,6 @@ from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import print_info_once
 
-_ZEROS: dict[torch.device, torch.Tensor] = {}
 _SIDE_STREAMS: dict[torch.device, torch.cuda.Stream] = {}
 
 
@@ -137,10 +147,8 @@ class DcpCandidateAllGather:
         return out.view(self.group.world_size * t.shape[0], *t.shape[1:])
 
     def merge_scores(self, rows: int, width: int) -> torch.Tensor:
-        # Like the candidate buffer, this scratch is consumed before the next
-        # merge. Reserve it during eager warmup and reuse it across graph batch
-        # sizes: a context-sized allocation per capture can exhaust VRAM.
-        # Never replace storage that a captured graph may still reference.
+        # Reserved outside capture and reused by every graph; never rebound once captured.
+        # TODO(kpham-sgl): reserve at init inside the KV budget; it is max_rows x context fp32.
         if (
             self.merge_buffer is None
             and 0 < rows <= self.max_rows
@@ -165,14 +173,12 @@ def init_dcp_candidate_all_gather(max_rows: int, topk: int) -> None:
     """Collective over the DCP group; call on every rank before CUDA graph
     capture."""
     global _CANDIDATE_ALL_GATHER
-    if _CANDIDATE_ALL_GATHER is not None:  # one buffer per process
+    if _CANDIDATE_ALL_GATHER is not None:
         return
     _CANDIDATE_ALL_GATHER = DcpCandidateAllGather(
         get_parallel().dcp_group, max_rows, topk
     )
 
-
-_CANDIDATE_CLUSTER_FLOOR = 16384
 
 # Candidates per rank in the merge. Over 109824 decode rows of six real
 # workloads (32K and 100K contexts, all 24 DSA layers), a rank held at most 339
@@ -205,7 +211,7 @@ class DcpTopKMerge:
     @classmethod
     def create(
         cls, group, max_rows: int, topk: int, dcp_rank: int
-    ) -> Optional["DcpTopKMerge"]:
+    ) -> Optional[DcpTopKMerge]:
         """Collective over ``group``. None unless it has 8 ranks (16 with the
         megakernel), top-k is 2048, and its GPUs share NVLink multicast."""
         import torch.distributed._symmetric_memory as symm_mem
@@ -271,40 +277,24 @@ class DcpTopKMerge:
 
 
 _TOPK_MERGE: Optional[DcpTopKMerge] = None
-_TOPK_MERGE_INITIALIZED = False
+_TOPK_MERGE_CREATED = False
 
 
-def init_dcp_topk_merge(max_rows: int, topk: int) -> None:
+def init_dcp_topk_merge(max_rows: int, topk: int) -> bool:
     """Collective over the DCP group; call on every rank before CUDA graph
-    capture."""
-    global _TOPK_MERGE, _TOPK_MERGE_INITIALIZED
-    if _TOPK_MERGE_INITIALIZED:  # one buffer per process
-        return
-    _TOPK_MERGE_INITIALIZED = True
-    parallel = get_parallel()
-    group = parallel.dcp_group
-    # the kernel's rank must be the one the local candidates encode positions with
-    assert group.world_size == parallel.attn_dcp_size
-    _TOPK_MERGE = DcpTopKMerge.create(group, max_rows, topk, parallel.attn_dcp_rank)
-
-
-def _zeros_i32(n: int, device: torch.device) -> torch.Tensor:
-    """A read-only int32 zero vector of length n from a shared buffer (grown
-    outside CUDA graph capture only, so captured graphs never see it move)."""
-    buf = _ZEROS.get(device)
-    if buf is None or buf.numel() < n:
-        if torch.cuda.is_current_stream_capturing():
-            return torch.zeros(n, dtype=torch.int32, device=device)
-        buf = _ZEROS[device] = torch.zeros(
-            max(n, 4096), dtype=torch.int32, device=device
+    capture. Returns whether decode rows merge in one kernel."""
+    global _TOPK_MERGE, _TOPK_MERGE_CREATED
+    if not _TOPK_MERGE_CREATED:  # one buffer per process, also when create declined
+        _TOPK_MERGE_CREATED = True
+        parallel = get_parallel()
+        _TOPK_MERGE = DcpTopKMerge.create(
+            parallel.dcp_group, max_rows, topk, parallel.attn_dcp_rank
         )
-    return buf[:n]
+    return _TOPK_MERGE is not None
 
 
 @triton.jit
 def _fill_visible_kernel(dense, dense_stride, lens, BLOCK: tl.constexpr):
-    # -inf over [0, lens[row]), the only columns the top-k reads; a fixed
-    # number of programs per row strides over it
     row = tl.program_id(0)
     n = tl.load(lens + row)
     base = dense + row.to(tl.int64) * dense_stride
@@ -325,7 +315,6 @@ def _scatter_candidates_kernel(
     BLOCK: tl.constexpr,
     COMPACT_PREFIX: tl.constexpr = False,
 ):
-    # one program per (rank, row) block of candidates
     src_row = tl.program_id(0)
     row = src_row % num_rows
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -360,8 +349,6 @@ def _localize_compact_kernel(
     dcp_rank,
     TOPK: tl.constexpr,
 ):
-    # owned slots (slot % N == rank) -> local rows slot // N at the front, in
-    # order, -1 after them; lengths[row] = number of owned slots
     row = tl.program_id(0)
     offs = tl.arange(0, TOPK)
     x = tl.load(slots + row.to(tl.int64) * slots_stride + offs)
@@ -377,13 +364,17 @@ def _localize_compact_kernel(
     tl.store(lengths + row, n)
 
 
-def dcp_localize_compact(slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def dcp_localize_compact(
+    slots: torch.Tensor, lengths: Optional[torch.Tensor] = None
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Global top-k slots [rows, topk] -> (this rank's rows compacted to the
-    front, -1 after; [rows] counts) for FlashMLA's ``topk_length``."""
+    front, -1 after; [rows] counts, into ``lengths`` when given) for FlashMLA's
+    ``topk_length``."""
     parallel = get_parallel()
     rows, topk = slots.shape
     out = torch.empty_like(slots)
-    lengths = torch.empty(rows, dtype=torch.int32, device=slots.device)
+    if lengths is None:
+        lengths = torch.empty(rows, dtype=torch.int32, device=slots.device)
     if rows:
         _localize_compact_kernel[(rows,)](
             slots,
@@ -420,7 +411,6 @@ def _local_candidates(
         dcp_size=parallel.attn_dcp_size,
         dcp_rank=parallel.attn_dcp_rank,
         deterministic=True,
-        cluster_floor=_CANDIDATE_CLUSTER_FLOOR,
     )
     return out
 
@@ -520,34 +510,28 @@ def dcp_global_topk(
     return out
 
 
-def dcp_all_visible(
+def dcp_local_topk(
+    logits: torch.Tensor,
+    local_lens: torch.Tensor,
     global_lens: torch.Tensor,
     page_table: torch.Tensor,
     topk: int,
     page_size: int,
+    plan: torch.Tensor,
+    out_len: torch.Tensor,
 ) -> torch.Tensor:
-    """Decode / target verify: every visible position as widened KV slots, for
-    rows that see at most ``topk`` keys (the indexer's k-only path), -1 padded."""
-    span = page_size * get_parallel().attn_dcp_size
-    rows = global_lens.shape[0]
-    if get_platform().is_hip:
-        from sglang.srt.layers.attention.dsa import dsa_dcp_sharded_hip
-
-        return dsa_dcp_sharded_hip.dcp_all_visible(global_lens, page_table, topk, span)
-    scores = torch.zeros((rows, topk), dtype=torch.float32, device=global_lens.device)
-    out = torch.empty((rows, topk), dtype=torch.int32, device=global_lens.device)
-    if rows == 0:
-        return out
-    topk_transform_packed_v2(
-        scores,
-        global_lens.to(torch.int32),
-        page_table,
-        out,
-        span,
-        row_starts=_zeros_i32(rows, global_lens.device),
-        deterministic=True,
+    """Decode: what DCP decode attention reads, this rank's keys of the global
+    top-k as local KV slots compacted to the front (-1 after); their counts go
+    to ``out_len`` [rows]. Arguments otherwise as for ``dcp_global_topk``."""
+    rows = local_lens.shape[0]
+    assert out_len.shape[0] == rows, (out_len.shape, rows)
+    if _FUSED_TOPK is not None and 0 < rows and _FUSED_TOPK.usable(rows):
+        slots = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
+        return _FUSED_TOPK(logits, local_lens, global_lens, page_table, slots, out_len)
+    slots = dcp_global_topk(
+        logits, local_lens, global_lens, page_table, topk, page_size, plan
     )
-    return out
+    return dcp_localize_compact(slots, out_len)[0]
 
 
 def dcp_gather_request_rows(
@@ -561,3 +545,146 @@ def dcp_gather_request_rows(
     top-k indices).
     """
     return all_gather_kv_cache_for_dcp(local_rows, local_rows[:, :0], seq_lens_cpu)
+
+
+class DcpFusedTopK:
+    """Local select, exchange and merge of decode rows in one kernel; see
+    jit/csrc/dsa/dcp_fused_topk.cuh. Built by ``create``. Rows per call are
+    capped by the SM count (every CTA of every rank is resident at once).
+    Contract: context length <= 1M (the kernel cuts longer rows). The selected
+    values are exact; ties at the threshold are not ordered by position. Calls
+    go on one stream, never concurrently, with the same rows in the same order
+    on every rank."""
+
+    def __init__(self, group, max_rows: int, buffer: torch.Tensor, handle):
+        device = group.device
+        self.dcp_rank = group.rank_in_group
+        self.max_rows = max_rows
+        self.buffer = buffer
+        self.multicast_ptr = handle.multicast_ptr
+        self.counters = torch.zeros(max_rows, dtype=torch.int32, device=device)
+        # exact fallbacks per row slot (for tests)
+        self.fallbacks = torch.zeros(max_rows, dtype=torch.int32, device=device)
+        self._warm(device)
+
+    @classmethod
+    def create(
+        cls, group, max_rows: int, topk: int, page_size: int, dcp_rank: int
+    ) -> Optional[DcpFusedTopK]:
+        """Collective over ``group``. None unless it has 8 ranks, top-k is 2048,
+        the page size is 64, the GPUs are SM100 and share NVLink multicast."""
+        import torch.distributed._symmetric_memory as symm_mem
+
+        # global position p of a row is local position p // 8 on rank p % 8
+        assert group.rank_in_group == dcp_rank, (group.rank_in_group, dcp_rank)
+
+        if (
+            group.world_size != DCP_FUSED_TOPK_RANKS
+            or topk != DCP_FUSED_TOPK_K
+            or page_size != DCP_FUSED_TOPK_PAGE_SIZE
+            or not current_arch().is_sm(10)
+        ):
+            print_info_once(
+                "DSA DCP fused top-k off: it needs 8 ranks, top-k 2048, page size 64 and SM100"
+            )
+            return None
+        if not all(in_the_same_node_as(group.cpu_group)) and not is_one_nvlink_clique(
+            group.cpu_group, group.device
+        ):
+            print_info_once("DSA DCP fused top-k off: ranks span NVLink domains")
+            return None
+        max_rows = min(
+            max_rows,
+            torch.cuda.get_device_properties(group.device).multi_processor_count,
+        )
+        buffer = symm_mem.empty(
+            dcp_fused_topk_buffer_numel(max_rows),
+            dtype=torch.int32,
+            device=group.device,
+        )
+        # Zero before the rendezvous: a peer pushes into this buffer as soon as
+        # its own rendezvous returns.
+        buffer.zero_()
+        torch.cuda.synchronize(group.device)
+        handle = symm_mem.rendezvous(buffer, group.device_group.group_name)
+        if handle.multicast_ptr == 0:
+            print_info_once("DSA DCP fused top-k off: no multicast")
+            return None
+        return cls(group, max_rows, buffer, handle)
+
+    def _warm(self, device: torch.device) -> None:
+        # The first touch of the peer and multicast pages costs 65-160 us; take
+        # it here for both parities of every row slot, not in the first forward.
+        rows, n = self.max_rows, 2 * DCP_FUSED_TOPK_K // DCP_FUSED_TOPK_RANKS
+        g = torch.Generator(device=device).manual_seed(0)
+        logits = torch.randn((rows, n), generator=g, device=device)
+        local_lens = torch.full((rows,), n, dtype=torch.int32, device=device)
+        page_table = torch.zeros(
+            (rows, n // DCP_FUSED_TOPK_PAGE_SIZE), dtype=torch.int32, device=device
+        )
+        out = torch.empty((rows, DCP_FUSED_TOPK_K), dtype=torch.int32, device=device)
+        global_lens = local_lens * DCP_FUSED_TOPK_RANKS
+        for _ in range(2):
+            self(
+                logits,
+                local_lens,
+                global_lens,
+                page_table,
+                out,
+                torch.empty_like(local_lens),
+            )
+        torch.cuda.synchronize(device)
+
+    def usable(self, rows: int) -> bool:
+        return rows <= self.max_rows
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        local_lens: torch.Tensor,
+        global_lens: torch.Tensor,
+        page_table: torch.Tensor,
+        out_slots: torch.Tensor,
+        out_len: torch.Tensor,
+    ) -> torch.Tensor:
+        """Writes this rank's keys of the global top-k into ``out_slots`` as
+        widened slots and their counts per row into ``out_len``; returns them
+        as local KV slots compacted to the front, -1 after."""
+        local = torch.empty_like(out_slots)
+        dcp_fused_topk(
+            logits,
+            local_lens,
+            global_lens,
+            page_table,
+            out_local=local,
+            out_slots=out_slots,
+            out_len=out_len,
+            buffer=self.buffer,
+            multicast_ptr=self.multicast_ptr,
+            counters=self.counters,
+            fallbacks=self.fallbacks,
+            dcp_rank=self.dcp_rank,
+        )
+        return local
+
+
+_FUSED_TOPK: Optional[DcpFusedTopK] = None
+_FUSED_TOPK_CREATED = False
+
+
+def init_dcp_fused_topk(
+    max_rows: int, topk: int, page_size: int, max_context_len: int
+) -> bool:
+    """Collective over the DCP group; call on every rank before CUDA graph
+    capture. Returns whether decode rows select and merge in one kernel."""
+    global _FUSED_TOPK, _FUSED_TOPK_CREATED
+    if max_context_len > DCP_FUSED_TOPK_MAX_CONTEXT:
+        print_info_once("DSA DCP fused top-k off: it needs context length <= 1M")
+        return False
+    if not _FUSED_TOPK_CREATED:  # one buffer per process, also when create declined
+        _FUSED_TOPK_CREATED = True
+        parallel = get_parallel()
+        _FUSED_TOPK = DcpFusedTopK.create(
+            parallel.dcp_group, max_rows, topk, page_size, parallel.attn_dcp_rank
+        )
+    return _FUSED_TOPK is not None

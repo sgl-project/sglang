@@ -36,6 +36,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
+from sglang.srt.configs.quant_utils import get_quantization_config
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
@@ -45,11 +46,8 @@ from sglang.srt.runtime_context import (
     derive_attn_tp_size,
     get_platform,
 )
-from sglang.srt.utils.common import (
-    get_quantization_config,
-    is_mps,
-    parse_connector_type,
-)
+from sglang.srt.utils.common import parse_connector_type
+from sglang.srt.utils.device import is_mps
 
 logger = logging.getLogger(__name__)
 
@@ -502,11 +500,10 @@ def handle_model_specific_adjustments(server_args: Any):
             if not envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
             # The default top-k v2 path still requires unsupported resources.
-            envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+            if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
             if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
-            if not envs.SGLANG_OPT_FUSE_MHC_POST_PRE.is_set():
-                envs.SGLANG_OPT_FUSE_MHC_POST_PRE.set(True)
             if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.is_set():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
             # Out of the box the indexer runs the TileLang kernel (works on
@@ -518,16 +515,15 @@ def handle_model_specific_adjustments(server_args: Any):
             if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.is_set():
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
         elif get_platform().is_hip:
-            envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
             _configure_rocm_fp8_wo_a_gemm(model_config, cfg.download_dir)
-            envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
-            envs.SGLANG_OPT_USE_TOPK_V2.set(True)
-            envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
-            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
-            envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
-            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
-            envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
+            if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+            if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.is_set():
+                envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
+            if not envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.is_set():
+                envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
+            if not envs.SGLANG_EAGER_INPUT_NO_COPY.is_set():
+                envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
 
     elif model_arch in ["Xing4_0ForCausalLM"]:
         # Xing4_0 uses the TileLang mhc_pre/mhc_post kernels
@@ -676,6 +672,7 @@ def handle_model_specific_adjustments(server_args: Any):
             "trtllm_mha",
             "triton",
             "fa4",
+            "fa3",
             "ascend",
             "intel_xpu",
             "intel_amx",
@@ -684,7 +681,7 @@ def handle_model_specific_adjustments(server_args: Any):
         assert (
             prefill_backend in accepted_backends and decode_backend in accepted_backends
         ), (
-            "Gemma4 only supports trtllm_mha, triton, fa4, ascend, intel_xpu, intel_amx, or "
+            "Gemma4 only supports trtllm_mha, triton, fa4, fa3, ascend, intel_xpu, intel_amx, or "
             f"aiter attention backend, got prefill={prefill_backend}, decode={decode_backend}"
         )
 

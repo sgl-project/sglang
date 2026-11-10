@@ -24,6 +24,7 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -70,6 +71,8 @@ def get_cw(
     proj: ReplicatedLinear,
     norm: RMSNorm,
     dtype: torch.dtype = torch.float32,
+    *,
+    refresh: bool = False,
 ) -> torch.Tensor:
     """Cached product norm_weight ⊙ proj_weight (both [H]) in `dtype`.
 
@@ -80,9 +83,10 @@ def get_cw(
         cache = {}
         proj._attn_res_cw_cache = cache
     cw = cache.get(dtype)
-    if cw is None:
-        cw = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
-        cw = cache[dtype] = cw.to(dtype)
+    if cw is None or refresh:
+        # Refresh in place: captured graphs retain the original cache storage.
+        updated = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
+        cw = cache[dtype] = bind_or_assign(cw, updated.to(dtype))
     return cw
 
 

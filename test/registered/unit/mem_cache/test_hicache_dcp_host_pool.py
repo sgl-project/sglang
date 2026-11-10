@@ -604,6 +604,12 @@ class TestDcpIndexerStoragePages(CustomTestCase):
         )
         self.assertEqual(sizes, [2 * 6] * 2)
 
+    def test_zero_copy_pointers_are_ints_without_dcp(self):
+        anchor = _make_host_pool(0, dcp_size=1, layout="page_first")
+        pool = _make_indexer_host(anchor)
+        pointers, _ = pool.get_page_buffer_meta(torch.arange(128))
+        self.assertEqual([type(p) for p in pointers], [int, int])
+
     def test_invalid_logical_starts_are_rejected(self):
         anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
         pool = _make_indexer_host(anchor)

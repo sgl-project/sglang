@@ -23,14 +23,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_gfx1250_supported, is_hip
-
-_is_cuda = is_cuda()
-if _is_cuda:
-    CUDA_CAPABILITY = torch.cuda.get_device_capability()
+from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported, is_hip
 
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
@@ -92,7 +89,8 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
             BLOCK_M, BLOCK_N = (64, 64)
             num_warps = 4
     else:
-        if _is_cuda and CUDA_CAPABILITY[0] == 12:
+        arch = current_arch()
+        if arch.is_sm(12):
             # sm120 workstation Blackwell architecture (RTX Pro 6000) has a much smaller shared memory size (100K)
             if Lq <= 128:
                 BLOCK_M, BLOCK_N = (64, 128)
@@ -100,7 +98,7 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
                 BLOCK_M, BLOCK_N = (64, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 32)
-        elif _is_cuda and CUDA_CAPABILITY[0] == 10:
+        elif arch.is_sm(10):
             # Blackwell data-center architecture (GB200, B200, sm_100a)
             # sm_100a has different register constraints from Hopper; Hopper block sizes
             # cause PTX register exhaustion (>255 regs) for large head dims (Lq=512).
@@ -108,7 +106,7 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
                 BLOCK_M, BLOCK_N = (64, 64)
             else:
                 BLOCK_M, BLOCK_N = (16, 64)
-        elif _is_cuda and CUDA_CAPABILITY[0] >= 9:
+        elif arch.is_sm_at_least(9):
             # Hopper architecture (H100, etc.)
             if Lq <= 128:
                 BLOCK_M, BLOCK_N = (128, 64)
@@ -116,10 +114,10 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
                 BLOCK_M, BLOCK_N = (64, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
-        elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
+        elif arch.is_sm_at_least(8):
             # Ampere architecture (A100, etc.)
             # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
-            if CUDA_CAPABILITY[1] == 9 or CUDA_CAPABILITY[1] == 6:
+            if arch.is_sm(8, 9) or arch.is_sm(8, 6):
                 if Lq <= 128:
                     BLOCK_M, BLOCK_N = (64, 128)
                 elif Lq <= 256:
@@ -1066,8 +1064,8 @@ def extend_attention_fwd(
     stride_lse_bs = lse_extend.stride(0) if STORE_LSE else 0
     stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
 
-    # Compact grid: AMD/HIP-only optimization (parity with flash-attn's ragged-aware
-    # launch). Explicitly check _is_hip and allow env var override.
+    # Compact grid: HIP only (parity with flash-attn's ragged-aware launch);
+    # SGLANG_TRITON_COMPACT_EXTEND_ATTENTION=0 turns it off.
     use_compact_tile_grid = (
         _is_hip and envs.SGLANG_TRITON_COMPACT_EXTEND_ATTENTION.get()
     )

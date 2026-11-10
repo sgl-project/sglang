@@ -97,7 +97,7 @@ def try_pack_dcp_src(
 def dsa_index_k_item_lens(kv_args) -> List[int]:
     """Page bytes of the DSA index-K buffers a PD DCP relayout moves token by
     token, or [] when the pool has none it can move that way."""
-    if getattr(kv_args, "dsa_index_k_token_bytes", None) is None:
+    if kv_args.dsa_index_k_token_bytes is None:
         return []
     from sglang.srt.disaggregation.base.conn import StateType
 

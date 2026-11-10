@@ -40,7 +40,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import is_fi_a2a_supported
+from sglang.srt.utils.device import is_fi_a2a_supported
 
 logger = logging.getLogger(__name__)
 
@@ -559,7 +559,7 @@ def init_dcp_push_combine(cp_group: "GroupCoordinator", num_heads: int) -> None:
 
     if _PUSH_COMBINE_COMM is not None or cp_group.world_size == 1:
         return
-    if not envs.SGLANG_DCP_PUSH_COMBINE.get() or num_heads % cp_group.world_size:
+    if not envs.SGLANG_ENABLE_DCP_PUSH_COMBINE.get() or num_heads % cp_group.world_size:
         return
     from sglang.kernels.ops.attention import dcp_push_combine as pc
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (

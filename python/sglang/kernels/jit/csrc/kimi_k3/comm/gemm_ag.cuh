@@ -388,7 +388,7 @@ struct GEMMAGKernel {
 
     auto M = SymbolicSize{"num_tokens"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({M, kNLocal}).with_dtype<bf16_t>().with_device(device).verify(local);
     TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(b);
     if (c.has_value()) {

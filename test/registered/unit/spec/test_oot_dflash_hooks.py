@@ -131,7 +131,7 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
                 return_value=(target_backend, target_backend),
             ),
             patch(
-                "sglang.srt.utils.hf_transformers.get_config",
+                "sglang.srt.hf_transformers.get_config",
                 return_value=config,
             ),
         ):
