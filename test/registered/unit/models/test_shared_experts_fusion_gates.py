@@ -297,7 +297,7 @@ class TestGlmMoeLiteGate(_FusionGateCase):
         with self._on_cuda(glm4_moe_lite):
             self.assertIsNone(self._reason(Glm4MoeLiteForCausalLM, self._config()))
             self.assertIn(
-                "Only GLM-4.5 or GLM-4.6",
+                "exactly one shared expert",
                 self._reason(Glm4MoeLiteForCausalLM, self._config(n_shared_experts=2)),
             )
 
@@ -316,6 +316,40 @@ class TestGlmMoeLiteGate(_FusionGateCase):
         self.assertEqual(
             Glm4MoeLiteForCausalLMNextN.fused_shared_experts_architecture,
             "Glm4MoeLiteForCausalLMNextN",
+        )
+
+    def test_enforce_opts_in_off_cuda_with_expert_parallelism(self):
+        """GLM-4.7-Flash (S=1) is the NPU S=1 validation model: enforce must
+        bypass both the CUDA-only default and the EP veto."""
+        import sglang.srt.models.glm4_moe_lite as glm4_moe_lite
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteForCausalLM
+
+        self._seed(enforce_shared_experts_fusion=True)
+        with unittest.mock.patch.object(glm4_moe_lite, "_is_cuda", False):
+            self.assertIsNone(
+                self._reason(Glm4MoeLiteForCausalLM, self._config(), moe_ep_size=2)
+            )
+
+    def test_enforce_still_rejects_mixed_precision_quant(self):
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteForCausalLM
+
+        self._seed(enforce_shared_experts_fusion=True)
+        mixed = SimpleNamespace(
+            get_name=lambda: "quark", can_fuse_shared_expert=lambda: False
+        )
+        self.assertIn(
+            "higher precision",
+            self._reason(Glm4MoeLiteForCausalLM, self._config(), mixed),
+        )
+
+    def test_enforce_still_rejects_more_than_one_shared_expert(self):
+        """``load_weights`` fuses exactly one slot; S > 1 must fail here."""
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteForCausalLM
+
+        self._seed(enforce_shared_experts_fusion=True)
+        self.assertIn(
+            "exactly one shared expert",
+            self._reason(Glm4MoeLiteForCausalLM, self._config(n_shared_experts=2)),
         )
 
 

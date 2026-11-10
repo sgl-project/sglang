@@ -212,6 +212,13 @@ class DeepEPBuffer:
     ):
         state = cls._state()
         if state.buffer is not None:
+            # The buffer is process-wide; a mismatched num_experts (e.g. a
+            # draft model with different expert counts reusing this rank's
+            # buffer) would silently misroute, so fail fast instead.
+            assert state.num_experts == num_experts, (
+                f"DeepEP buffer was created with num_experts={state.num_experts} "
+                f"but is now requested with num_experts={num_experts}"
+            )
             return state.buffer
 
         state.hidden_size = hidden_size
@@ -377,6 +384,7 @@ class _DeepEPDispatcherImplBase:
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
         runner_backend=None,
+        num_fused_shared_experts: int = 0,
     ):
         if not use_deepep:
             raise ImportError(
@@ -395,6 +403,9 @@ class _DeepEPDispatcherImplBase:
         self.permute_fusion = permute_fusion
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
+        # Fused shared-expert slots live at the tail of the local expert block;
+        # the EPLB recorder only tracks routed experts, so hooks strip them.
+        self.num_routed_local_experts = num_local_experts - num_fused_shared_experts
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
@@ -681,7 +692,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             **npu_quantization_opts,
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
-            num_recv_tokens_per_expert,
+            num_recv_tokens_per_expert[: self.num_routed_local_experts],
             num_tokens_per_rank=num_tokens_per_rank,
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
             num_tokens_per_expert=num_tokens_per_expert,
@@ -803,7 +814,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-            masked_m
+            masked_m[: self.num_routed_local_experts]
         )
 
         if isinstance(hidden_states, tuple):
@@ -1000,6 +1011,7 @@ class DeepEPDispatcher(BaseDispatcher):
         async_finish: bool = False,
         return_recv_hook: bool = False,
         runner_backend=None,
+        num_fused_shared_experts: int = 0,
     ):
         super().__init__()
 
@@ -1015,6 +1027,7 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
+            num_fused_shared_experts=num_fused_shared_experts,
         )
 
         if self.deepep_mode.enable_low_latency():

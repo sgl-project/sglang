@@ -760,7 +760,13 @@ def is_deepep_class_backend() -> bool:
 
 def uses_per_rank_fused_shared_slots() -> bool:
     """Check whether fused shared experts use per-rank physical slots."""
-    return is_deepep_class_backend() or get_moe_a2a_backend().is_megamoe()
+    b = get_moe_a2a_backend()
+    return (
+        is_deepep_class_backend()
+        or b.is_megamoe()
+        or b.is_ascend_fuseep()
+        or b.is_ascend_ops()
+    )
 
 
 def has_per_rank_fused_shared_slots(num_shared: int) -> bool:
