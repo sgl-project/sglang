@@ -601,7 +601,7 @@ def decode_scores(
             rows_per_request=(
                 metadata.rows_per_request
                 if inputs.is_verify
-                and envs.SGLANG_OPT_DSV41_VERIFY_INDEXER_K_REUSE.get()
+                and envs.SGLANG_OPT_DSV41_VERIFY_INDEXER_BF16_K_REUSE.get()
                 else 1
             ),
         )
