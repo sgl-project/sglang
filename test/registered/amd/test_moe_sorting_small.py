@@ -147,6 +147,61 @@ class TestMoeSortingSmall(CustomTestCase):
                 f"E={E} m={m} scales",
             )
 
+    def test_fused_mxfp8_quant_matches_aiter_hidden_7168(self):
+        # hidden 7168 (DeepSeek-V3 / V4: 256 routed + 1 fused shared expert, top-8 + shared)
+        # passes the `hidden % 1024` gate; quantizes in 1024-column chunks (gcd(7168, 2048))
+        bs = 32
+        emitted_cases = 0
+        for E, topk, m in (
+            (257, 9, 1),
+            (257, 9, 3),
+            (257, 9, 4),
+            (257, 9, 16),
+            (257, 9, 28),
+            (385, 7, 9),
+            (385, 7, 36),
+        ):
+            dim = 7168
+            with self.subTest(E=E, topk=topk, m=m):
+                ids, w = self._routing(m, m, E, topk)
+                x = torch.randn(m, dim, dtype=torch.bfloat16, device=self.dev)
+                sid, sw, _, nv, _ = self._sort(self.orig_sort, ids, w, bs, E)
+                ref_q, ref_s = self.orig_quant(
+                    x,
+                    sorted_ids=sid,
+                    num_valid_ids=nv,
+                    token_num=m,
+                    topk=topk,
+                    block_size=bs,
+                    sorted_weights=sw,
+                    num_experts_upper_bound=E,
+                )
+                emitted = self._emitted_quant(ids, w, x, bs, E)
+                if emitted is None:
+                    continue
+                emitted_cases += 1
+                self.assertTrue(
+                    torch.equal(ref_q.view(torch.uint8), emitted[0].view(torch.uint8)),
+                    f"E={E} m={m} codes",
+                )
+                rows = torch.nonzero(sid[: int(nv[0])] != ((topk << 24) | m))
+                pad, g = (
+                    (dim // 32 + 7) // 8 * 8,
+                    torch.arange(dim // 32, device=self.dev),
+                )
+                addr = (rows // 32) * pad * 32 + rows % 16 * 4 + rows % 32 // 16
+                addr = (addr + g // 8 * 256 + g % 4 * 64 + g % 8 // 4 * 2).flatten()
+                self.assertTrue(
+                    torch.equal(
+                        ref_s.view(torch.uint8).flatten()[addr],
+                        emitted[1].view(torch.uint8).flatten()[addr],
+                    ),
+                    f"E={E} m={m} scales",
+                )
+        self.assertGreater(
+            emitted_cases, 0, "no hidden-7168 case took the in-sort quant"
+        )
+
     def test_falls_back_to_aiter_past_compact_at_513_experts(self):
         m = 6
         ids, _ = self._routing(m, m)
