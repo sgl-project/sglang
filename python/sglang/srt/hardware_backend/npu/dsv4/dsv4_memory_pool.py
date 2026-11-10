@@ -614,7 +614,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         if cache_2d.shape[0] == 0:
             return
-        torch.ops.npu.kv_compress_epilog(
+        from sgl_kernel_npu.operators.mem_cache import kv_compress_epilog
+
+        kv_compress_epilog(
             buf.view(-1, 1, buf.shape[-1]),
             cache_2d,
             slot_mapping,

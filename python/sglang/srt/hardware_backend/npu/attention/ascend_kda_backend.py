@@ -4,6 +4,7 @@ from typing import Optional
 import torch
 from sgl_kernel_npu.fla.kda_gate import fused_kda_gate_npu
 from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
+from sgl_kernel_npu.operators.attention.kda import chunk_kda_fwd
 
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.linear.kda_backend import (
@@ -60,7 +61,7 @@ class _AscendKDAExtendKernel:
         scale = k.shape[-1] ** -0.5
         query_start_loc = query_start_loc.to(dtype=torch.int64).contiguous()
 
-        outputs = torch.ops.npu.chunk_kda_fwd(
+        outputs = chunk_kda_fwd(
             q,
             k,
             v,

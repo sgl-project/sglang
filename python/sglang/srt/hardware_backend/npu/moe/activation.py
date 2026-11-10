@@ -259,7 +259,9 @@ class NPUSwigluMxfp8Quant(BaseActivation):
                 "swiglu_group_quant takes a per-expert count group list, got "
                 f"group_list_type={group_list_type}"
             )
-        out, scale, _ = torch.ops.npu.swiglu_group_quant(
+        from sgl_kernel_npu.operators.activation import swiglu_group_quant
+
+        out, scale, _ = swiglu_group_quant(
             x=hidden_states,
             group_index=group_list,
             quant_mode=2,  # MX: one e8m0 scale per 32-element block

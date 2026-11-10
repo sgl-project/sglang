@@ -385,7 +385,7 @@ def _layer_norm_fwd(
 
 
 if _is_npu:
-    from sgl_kernel_npu.fla.layernorm_gated import layer_norm_fwd_npu as _layer_norm_fwd
+    from sgl_kernel_npu.operators.norm import layer_norm_fwd as _layer_norm_fwd
 
 
 def rms_norm_gated(
