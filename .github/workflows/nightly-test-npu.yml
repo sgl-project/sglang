@@ -294,8 +294,8 @@ jobs:
       is_nightly_pipeline_job: true
       partitions: '{"size":4,"arr":[0,1,2,3]}'
       # All four shards land on agents of the same host and crashed on locked
-      # memory when started together, so run them one at a time.
-      serialize_partitions: true
+      # memory when started together, so cap the concurrency at two.
+      max_parallel_partitions: 2
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false
