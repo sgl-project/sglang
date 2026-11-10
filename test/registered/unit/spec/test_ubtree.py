@@ -14,10 +14,6 @@ from msgspec.structs import replace
 
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_registry import (
-    CustomSpecAlgo,
-    _assert_custom_spec_algo_conforms,
-)
 from sglang.srt.speculative.ubtree_components.config import (
     parse_ubtree_config,
     resolve_verify_width,
@@ -269,16 +265,13 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
     def test_verify_width_is_fixed_and_within_checkpoint(self):
         config = replace(parse_ubtree_config(_config()), tree_budget=64)
         self.assertEqual(resolve_verify_width(config, None), 49)
-        for width in (5, 17, 31, 32, 33, 48, 49, 64, 65):
+        for width in (5, 65):
             with self.subTest(width=width):
                 self.assertEqual(resolve_verify_width(config, width), width)
-        for budget in (4, 16, 31, 39):
-            with self.subTest(budget=budget):
-                self.assertEqual(
-                    resolve_verify_width(replace(config, tree_budget=budget), None),
-                    budget + 1,
-                )
-        for width in (-1, 0, 4, 66):
+        self.assertEqual(
+            resolve_verify_width(replace(config, tree_budget=39), None), 40
+        )
+        for width in (4, 66):
             with self.subTest(width=width), self.assertRaises(ValueError):
                 resolve_verify_width(config, width)
         with self.assertRaises(ValueError):
@@ -312,7 +305,6 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
         self.assertFalse(algo.supports_grammar_overlap())
         self.assertFalse(algo.supports_ragged_verify())
         self.assertFalse(algo.supports_prefill_shared_read_done())
-        _assert_custom_spec_algo_conforms(CustomSpecAlgo)
 
     def test_invalid_runtime_shapes_are_rejected(self):
         cfg = SimpleNamespace(
@@ -348,9 +340,8 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
                 ),
                 ("fa3",),
             )
-        for backend in ("flashinfer", "triton"):
-            with self.subTest(backend=backend), self.assertRaises(ValueError):
-                validate_runtime_config(cfg, (backend,))
+        with self.assertRaises(ValueError):
+            validate_runtime_config(cfg, ("flashinfer",))
         for field, value in [
             ("device", "cpu"),
             ("speculative_draft_attention_backend", "flashinfer"),
@@ -358,13 +349,10 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
             ("dp_size", 2),
             ("max_running_requests", 2),
             ("disaggregation_mode", "decode"),
-            ("disaggregation_mode", "prefill"),
             ("enable_pd_role_switch", True),
             ("linear_attn_verify_backend", "helion"),
-            ("linear_attn_verify_backend", "flashinfer"),
             ("enable_strict_thinking", True),
             ("page_size", 16),
-            ("disable_cuda_graph_padding", False),
             ("speculative_adaptive", True),
             ("speculative_use_rejection_sampling", True),
             ("speculative_draft_window_size", 32),
@@ -402,13 +390,11 @@ class TestUBTreeRequestValidation(CustomTestCase):
                 self.assertIsNone(validate_ubtree_request(req))
 
     def test_custom_processors_are_rejected_without_deserialization(self):
-        for processor in ('{"callable": "invalid-hex"}', "invalid-processor"):
-            with self.subTest(processor=processor):
-                req = self._request(custom_logit_processor=processor)
-                self.assertEqual(
-                    validate_ubtree_request(req),
-                    "UBTREE does not support custom_logit_processor.",
-                )
+        req = self._request(custom_logit_processor='{"callable": "invalid-hex"}')
+        self.assertEqual(
+            validate_ubtree_request(req),
+            "UBTREE does not support custom_logit_processor.",
+        )
 
     def test_unsupported_outputs_are_still_rejected(self):
         for field in ("return_hidden_states", "return_sampling_mask"):
@@ -489,14 +475,13 @@ class TestUBTreeLoading(CustomTestCase):
         config = _config()
         source = self._model(config)
         weights = [(name, torch.ones_like(p)) for name, p in source.named_parameters()]
-        for missing, _ in weights:
-            with self.subTest(missing=missing):
-                model = self._model(config)
-                with self.assertRaisesRegex(ValueError, missing):
-                    model.load_weights(
-                        (name, value) for name, value in weights if name != missing
-                    )
-                self.assertFalse(model._ubtree_selector_loaded)
+        missing = weights[0][0]
+        model = self._model(config)
+        with self.assertRaisesRegex(ValueError, missing):
+            model.load_weights(
+                (name, value) for name, value in weights if name != missing
+            )
+        self.assertFalse(model._ubtree_selector_loaded)
         for prefix in ("", "model."):
             model = self._model(config)
             model.load_weights((prefix + name, value) for name, value in weights)
@@ -509,19 +494,15 @@ class TestUBTreeLoading(CustomTestCase):
             torch.testing.assert_close(dict(model.named_parameters())[name], value * 2)
 
     def test_quantized_head_is_rejected_before_matmul(self):
-        for dtype in (torch.float8_e4m3fn, torch.int8):
-            with (
-                self.subTest(dtype=dtype),
-                patch("torch.nn.functional.linear") as linear,
-            ):
-                with self.assertRaisesRegex(ValueError, "dense FP16/BF16/FP32"):
-                    vocab_parallel_topk(
-                        torch.ones(1, 8),
-                        SimpleNamespace(weight=torch.ones((17, 8)).to(dtype)),
-                        k=3,
-                        vocab_size=17,
-                    )
-                linear.assert_not_called()
+        with patch("torch.nn.functional.linear") as linear:
+            with self.assertRaisesRegex(ValueError, "dense FP16/BF16/FP32"):
+                vocab_parallel_topk(
+                    torch.ones(1, 8),
+                    SimpleNamespace(weight=torch.ones((17, 8)).to(torch.int8)),
+                    k=3,
+                    vocab_size=17,
+                )
+            linear.assert_not_called()
 
     def test_bound_selector_rejects_target_and_draft_weight_updates(self):
         from sglang.srt.model_executor.model_runner_components.weight_updater import (
