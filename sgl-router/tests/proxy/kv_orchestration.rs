@@ -207,10 +207,13 @@ fn command_now(
         } else {
             "completed"
         };
-        let result = json!({"ref":{"context":body["context"],"message_id":id,"action_id":"transfer","operation_id":format!("op-{id}")},
+        let mut result = json!({"ref":{"context":body["context"],"message_id":id,"action_id":"transfer","operation_id":format!("op-{id}")},
             "sequence":1,"update":{"status":status,"quiescent":!s.running},"public_result":{"state_version":99_999}});
         if pin && !s.pin_missing {
             let payload = &action["payload"];
+            if status == "completed" && payload["mode"] == "release" {
+                result["update"]["completed_steps"] = json!(["protection_released"]);
+            }
             let epoch = s.epoch.clone();
             s.claims.insert(payload["claim_id"].as_str().unwrap().into(),json!({"owner_epoch":epoch,"revision":payload["revision"],
                 "state":if payload["mode"]=="release"{"released"}else{"active"},"priority":payload["priority"],
@@ -1046,7 +1049,9 @@ async fn changed_formal_route_releases_only_its_preparation() {
 #[tokio::test]
 async fn l2_pin_queries_claim_state_and_task_finish_releases_without_engine_task_binding() {
     let engine = Engine::start().await;
-    let router = router(&[&engine], false, true).await;
+    let mut cfg = orchestration();
+    cfg.poll_ms = cfg.operation_ttl_ms;
+    let router = router_with(&[&engine], false, Some(cfg)).await;
     start(&router, "task").await;
     let view=api(&router,json!({"kind":"submit","task":task("task"),"message_id":"keep","action":"sglang.pin","target":prefix(vec![1,2,3,4]),
         "location":{"tier":"host"},"mode":"acquire","claim_id":"keep","revision":1,"priority":0})).await;
@@ -1067,6 +1072,21 @@ async fn l2_pin_queries_claim_state_and_task_finish_releases_without_engine_task
     })
     .await
     .unwrap();
+    let delayed = Arc::new(DelayedQuery::default());
+    engine.state.lock().unwrap().delayed_capabilities = Some(delayed.clone());
+    let view =
+        tokio::time::timeout(Duration::from_millis(500), query(&router, "task", "keep")).await;
+    delayed.release.notify_one();
+    let view = view.expect("released PIN receipt does not need another worker RPC");
+    assert_eq!(view["quiescent"], true);
+    assert_eq!(
+        api(
+            &router,
+            json!({"kind":"ack","task":task("task"),"message_id":"keep"}),
+        )
+        .await["acknowledged"],
+        true
+    );
     let state = engine.state.lock().unwrap();
     assert_eq!(state.claims.len(), 1);
     assert!(state.commands.iter().any(|c| {

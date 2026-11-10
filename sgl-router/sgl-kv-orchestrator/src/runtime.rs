@@ -325,14 +325,25 @@ impl Job {
         !self.releasing_pin && !self.attempted && !self.submitted && !self.quiescent
     }
 
-    fn has_final_transfer_receipt(&self) -> bool {
-        // A terminal transfer receipt is independent of current residency.
+    fn has_final_receipt(&self) -> bool {
+        // A terminal action receipt is independent of current residency.
         // A queued operation can also be physically quiescent.
+        if !self.submitted || !self.quiescent {
+            return false;
+        }
+        let update = &self.result["update"];
+        if self.action == "sglang.pin" {
+            // Only the recorded release is immutable. A PIN acquisition or
+            // a claim observation can still need cleanup.
+            return self.payload["mode"] == "release"
+                && update["status"] == "completed"
+                && update["completed_steps"]
+                    .as_array()
+                    .is_some_and(|steps| steps.iter().any(|step| step == "protection_released"));
+        }
         matches!(self.action.as_str(), "sglang.prefetch" | "sglang.demote")
-            && self.submitted
-            && self.quiescent
             && matches!(
-                self.result["update"]["status"].as_str(),
+                update["status"].as_str(),
                 Some(
                     "completed"
                         | "partial"
@@ -500,9 +511,7 @@ impl Actor {
                                 .filter_map(|id| {
                                     self.jobs
                                         .get(id)
-                                        .filter(|job| {
-                                            !intent.released || !job.has_final_transfer_receipt()
-                                        })
+                                        .filter(|job| !intent.released || !job.has_final_receipt())
                                         .map(|job| (id.clone(), job.polls + 1))
                                 })
                                 .collect(),
@@ -803,12 +812,12 @@ impl Actor {
         })
     }
     fn needs_receipt_only(&self, job: &Job) -> bool {
-        job.has_final_transfer_receipt()
+        job.has_final_receipt()
             && (job.action == "sglang.demote"
                 || self.book.job(&job.id).is_some_and(|b| b.cancel_requested))
     }
     fn drained(&self, job: &Job) -> bool {
-        if job.has_final_transfer_receipt() {
+        if job.has_final_receipt() {
             return true;
         }
         self.busy.get(&job.url).and_then(Option::as_ref) != Some(&job.id)
@@ -1721,7 +1730,7 @@ impl WorkerPoll {
                 }
             }
         }
-        if job.action == "sglang.demote" && job.has_final_transfer_receipt() {
+        if job.action == "sglang.demote" && job.has_final_receipt() {
             job.last_error = None;
             return Ok(());
         }
