@@ -4,7 +4,8 @@
 causal (target-verify) path. These tests check:
   (a) numerical parity with ``extend_attention_fwd`` on the pure-causal path
       (the operative case at topk=1), across head dims / GQA ratios / prefix
-      lengths / extend lengths / KV scales / attention sinks / fp8 KV buffers;
+      lengths / extend lengths / KV scales / attention sinks / fp8 KV buffers /
+      splits left without keys;
   (b) ``can_handle()`` rejects cases the kernel cannot serve bit-equivalently
       (non-causal, sliding-window, logit-cap, ragged extend, mis-shaped
       sinks), so the backend falls back to ``extend_attention_fwd``.
@@ -25,6 +26,7 @@ from sglang.kernels.ops.attention.extend_attention import (
     extend_attention_fwd,
 )
 from sglang.kernels.ops.attention.verify_splitkv import (
+    VerifySplitKV,
     can_handle,
     verify_splitkv_fwd,
 )
@@ -107,6 +109,7 @@ class TestVerifySplitKV(CustomTestCase):
         dtype=torch.bfloat16,
         sinks=None,
         kv_buffer_dtype=None,
+        poisoned_n_splits=None,
     ):
         device = "cuda"
         q, k, v, kb, vb, qo, kvp, kvi, mle = _build_verify_inputs(
@@ -146,6 +149,38 @@ class TestVerifySplitKV(CustomTestCase):
         )
 
         o_split = torch.empty_like(o_ref)
+        if poisoned_n_splits is not None:
+            # verify_splitkv_fwd picks the split count and caches its scratch,
+            # so build the kernel object here to pin the count and poison it.
+            vk = VerifySplitKV(
+                len(prefix_lens),
+                h_q,
+                h_kv,
+                head_dim,
+                v_head_dim,
+                l_ext,
+                device=device,
+                n_splits=poisoned_n_splits,
+            )
+            vk.att_out.fill_(float("nan"))
+            vk.att_lse.fill_(float("nan"))
+            vk(
+                q,
+                k,
+                v,
+                kb,
+                vb,
+                qo,
+                kvp,
+                kvi,
+                sm_scale,
+                o_out=o_split,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                sinks=sinks,
+            )
+            torch.testing.assert_close(o_split, o_ref, atol=ATOL, rtol=RTOL)
+            return
         ran = verify_splitkv_fwd(
             q,
             k,
@@ -232,6 +267,12 @@ class TestVerifySplitKV(CustomTestCase):
             sinks=self._gpt_oss_sinks(32, prefix_lens),
             kv_buffer_dtype=torch.float8_e4m3fn,
         )
+
+    def test_numerics_short_prefix_poisoned_scratch(self):
+        """A prefix can leave trailing splits without keys;
+        stale NaN in their scratch must not reach the output."""
+        # At 16 splits of at least 32 keys, 15 and 5 splits get no keys here.
+        self._run_parity([4, 700], poisoned_n_splits=16)
 
     # --- fallback: can_handle() must reject what the kernel can't serve --------
     # (topk>1 is gated off in the backend, not here -- can_handle never inspects

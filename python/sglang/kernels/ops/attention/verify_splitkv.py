@@ -351,9 +351,12 @@ def _verify_combine_stage2(
         + offs_l[None, :, None] * stride_ol
         + offs_dv[None, None, :]
     )
+    # A split with no keys gets only the -inf lse sentinel from stage 1;
+    # its Att_Out is uninitialized, and NaN there would survive the zero weight.
+    split_ran = lse > float("-inf")  # [N_SPLITS, L_EXT]; implies mask_l
     ao = tl.load(
         offs_ao + Att_Out,
-        mask=mask_l[None, :, None] & (offs_dv[None, None, :] < V_HEAD_DIM),
+        mask=split_ran[:, :, None] & (offs_dv[None, None, :] < V_HEAD_DIM),
         other=0.0,
     )  # [N_SPLITS, L_EXT, Dv]
     o_prefix = tl.sum(ao * w[:, :, None], 0)  # [L_EXT, Dv]
