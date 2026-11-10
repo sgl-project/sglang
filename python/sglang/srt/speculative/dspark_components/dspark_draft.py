@@ -713,7 +713,7 @@ class DraftBlockProposer:
         if self._num_token_non_padded is not None:
             self._num_token_non_padded.fill_(num_tokens)
             forward_batch.num_token_non_padded = self._num_token_non_padded
-        forward_batch.num_token_non_padded_cpu = num_tokens
+        forward_batch.global_num_token_non_padded_cpu = num_tokens
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
         # Graph bucket selection uses the raw per-rank request counts.  Keep

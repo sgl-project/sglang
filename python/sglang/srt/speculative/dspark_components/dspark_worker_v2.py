@@ -104,6 +104,37 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _extend_span_has_image_token(worker, batch) -> bool:
+    """Image prefills stay on the target. The draft would embed image_token_id."""
+    model_config = getattr(worker.target_worker, "model_runner", None)
+    hf = getattr(getattr(model_config, "model_config", None), "hf_config", None)
+    if hf is None:
+        return False
+    token_id = getattr(hf, "image_token_id", None)
+    if token_id is None:
+        return False
+    if int(getattr(hf, "vision_n_layers", 0) or 0) <= 0:
+        return False
+    if getattr(hf, "language_model_only", False):
+        return False
+    # ScheduleBatch stores this as multimodal_inputs. input_ids is None on
+    # extend; the token ids sit on prefill_input_ids_cpu until H2D.
+    mm_inputs = getattr(batch, "multimodal_inputs", None) or []
+    for mm in mm_inputs:
+        if mm is not None and mm.contains_image_inputs():
+            return True
+    for name in ("input_ids", "prefill_input_ids_cpu"):
+        ids = getattr(batch, name, None)
+        if (
+            isinstance(ids, torch.Tensor)
+            and ids.numel()
+            and bool((ids == token_id).any().item())
+        ):
+            return True
+    return False
+
+
 _is_npu = is_npu()
 
 
@@ -237,6 +268,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+        draft_cfg = self.draft_model_runner.model_config.hf_config
+        logger.info(
+            "DSpark launch worker=%s draft_arch=%s n_routed_experts=%s "
+            "num_experts_per_tok=%s kv_dtype=%s sm=%s",
+            type(self).__module__,
+            getattr(draft_cfg, "architectures", [type(self.draft_model).__name__]),
+            getattr(draft_cfg, "n_routed_experts", None),
+            getattr(draft_cfg, "num_experts_per_tok", None),
+            getattr(self.draft_model_runner, "kv_cache_dtype_str", None),
+            (
+                torch.cuda.get_device_capability()[0]
+                if torch.cuda.is_available()
+                else None
+            ),
+        )
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -449,6 +495,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     resolve_req_to_token=lambda: (
                         self.model_runner.req_to_token_pool.req_to_token
                     ),
+                    resolve_attn_backend=lambda: self.draft_model_runner.attn_backend,
                     kv_injector=self._kv_injector,
                     resolve_engram_hasher=(
                         (
@@ -714,6 +761,23 @@ class DSparkWorkerV2(BaseSpecWorker):
                     )
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
+            if _extend_span_has_image_token(self, batch):
+                logger.info("DSV41 image extend: target only, DSpark skipped")
+                # The CSA2 image still tracks this sequence: a position-0
+                # image prompt must clear (or spill) the previous one.
+                self._csa2_prepare_extend(batch)
+                batch_output = self.target_worker.forward_batch_generation(
+                    batch, pp_proxy_tensors=pp_proxy_tensors
+                )
+                self._csa2_finish(batch, self._seq0(batch.seq_lens), from_extend=True)
+                batch_output.new_seq_lens = batch.seq_lens
+                if on_publish is not None:
+                    on_publish(batch_output.new_seq_lens)
+                batch_output.next_draft_input = make_next_draft_input(
+                    bonus_tokens=batch_output.next_token_ids,
+                    new_seq_lens=batch.seq_lens,
+                )
+                return batch_output
             return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
@@ -758,6 +822,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Placing the draft KV reads scheduler-shared tables, which prefill
         # read-done releases once the target forward's own reads end.
         placement = self._kv_injector.place_prefill(batch)
+        self._csa2_prepare_extend(batch)
         batch_output = self.target_worker.forward_batch_generation(
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
@@ -814,6 +879,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 token_indices=logits_output.hidden_states_token_indices,
                 target_hidden_is_projected=target_hidden_is_projected,
             )
+        self._csa2_finish(batch, self._seq0(batch.seq_lens), from_extend=True)
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
         logits_output.hidden_states_token_indices = None
@@ -942,6 +1008,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
         )
+        self._csa2_prepare_decode(batch)
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens
@@ -1188,6 +1255,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 accept_tokens=accept.out_tokens,
                 accept_lens=accept.commit_lens,
             )
+        # Target verify scored a scratch CSA2 window. Publish only the
+        # accepted inputs that fit the scheduler pin; a longer accept is
+        # dropped by finished_len and must not stay in the image. The commit
+        # lens come from the accept above, whichever path produced it.
+        csa2_commit = self._csa2_capped_commit(batch, prefix_lens, accept.commit_lens)
+        self._commit_sm70_csa2_verify(csa2_commit)
         engram_in_graph = (
             folded_accept and not run_compact and epilogue.folds_engram_commit
         ) or (
@@ -1255,6 +1328,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                     run_compact=run_compact,
                 )
         logits_output.hidden_states = None
+        if self._csa2_enabled():
+            self._csa2_finish(
+                batch,
+                self._csa2_snap_len(batch, prefix_lens, csa2_commit),
+                from_extend=False,
+                start=self._seq0(prefix_lens),
+            )
 
         self._observers.observe_verify_step(
             forward_ct=int(batch.forward_iter),
@@ -1401,6 +1481,126 @@ class DSparkWorkerV2(BaseSpecWorker):
         if in_graph is not None:
             return in_graph
         return accept.commit_lens + accept.cap_trim_lens
+
+    def _csa2_backends(self):
+        backends = [self.target_worker.model_runner.attn_backend]
+        draft_runner = getattr(self, "draft_model_runner", None)
+        if draft_runner is not None:
+            backends.append(draft_runner.attn_backend)
+        return backends
+
+    @staticmethod
+    def _seq0(seqs) -> int:
+        if torch.is_tensor(seqs):
+            return int(seqs.reshape(-1)[0].item())
+        return int(seqs[0])
+
+    def _csa2_enabled(self) -> bool:
+        """The CSA2 image and its boundary helpers belong to the SM70
+        attention branch; stay inert (upstream path) unless the target
+        backend carries one."""
+        backend = self.target_worker.model_runner.attn_backend
+        return getattr(backend, "_sm70_csa2", None) is not None
+
+    def _csa2_one_req(self, batch: ScheduleBatch) -> bool:
+        seqs = batch.seq_lens
+        n = int(seqs.shape[0]) if torch.is_tensor(seqs) else len(seqs)
+        return n == 1
+
+    def _csa2_prepare_extend(self, batch: ScheduleBatch) -> None:
+        if (
+            not self._csa2_enabled()
+            or not self._csa2_one_req(batch)
+            or batch.prefix_lens is None
+        ):
+            return
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_boundary import (
+            csa2_prepare_extend,
+        )
+
+        csa2_prepare_extend(self._csa2_backends(), self._seq0(batch.prefix_lens))
+
+    def _csa2_prepare_decode(self, batch: ScheduleBatch) -> None:
+        if not self._csa2_enabled() or not self._csa2_one_req(batch):
+            return
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_boundary import (
+            csa2_prepare_decode,
+        )
+
+        csa2_prepare_decode(self._csa2_backends())
+
+    def _csa2_finish(
+        self,
+        batch: ScheduleBatch,
+        seq_len: int,
+        *,
+        from_extend: bool,
+        start: Optional[int] = None,
+    ) -> None:
+        if not self._csa2_enabled() or not self._csa2_one_req(batch):
+            return
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_boundary import (
+            csa2_finish_forward,
+        )
+
+        csa2_finish_forward(
+            self._csa2_backends(), seq_len, from_extend=from_extend, start=start
+        )
+
+    def _csa2_pin_cap(self, batch: ScheduleBatch) -> Optional[int]:
+        reqs = getattr(batch, "reqs", None) or []
+        if len(reqs) != 1:
+            return None
+        req = reqs[0]
+        origin = getattr(req, "origin_input_ids", None)
+        params = getattr(req, "sampling_params", None)
+        budget = getattr(params, "max_new_tokens", None) if params is not None else None
+        if origin is None or not isinstance(budget, int) or budget < 0:
+            return None
+        return len(origin) + budget
+
+    def _csa2_capped_commit(self, batch: ScheduleBatch, prefix_lens, commit_lens):
+        if not self._csa2_enabled() or not self._csa2_one_req(batch):
+            return commit_lens
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_boundary import (
+            cap_verify_commit,
+        )
+
+        cap = self._csa2_pin_cap(batch)
+        if cap is None:
+            return commit_lens
+        prefix = self._seq0(prefix_lens)
+        commit = self._seq0(commit_lens)
+        keep = cap_verify_commit(prefix, commit, cap)
+        if keep == commit:
+            return commit_lens
+        logger.info(
+            "csa2 boundary cap commit %d->%d prefix=%d pin_cap=%d",
+            commit,
+            keep,
+            prefix,
+            cap,
+        )
+        capped = commit_lens.clone()
+        capped.reshape(-1)[0] = keep
+        return capped
+
+    def _csa2_snap_len(self, batch: ScheduleBatch, prefix_lens, commit_lens) -> int:
+        return self._seq0(prefix_lens) + self._seq0(commit_lens)
+
+    def _commit_sm70_csa2_verify(self, commit_lens: torch.Tensor) -> None:
+        backend = self.target_worker.model_runner.attn_backend
+        if getattr(backend, "_sm70_csa2", None) is None:
+            return
+        from sglang.srt.layers.attention.dsv4.sm70_csa2 import (
+            sm70_commit_target_verify,
+        )
+
+        sm70_commit_target_verify(
+            backend,
+            commit_lens,
+            num_positions=int(self.verify_num_draft_tokens),
+        )
 
     def _commit_target_mamba_states_after_verify(
         self,

@@ -1,4 +1,5 @@
 import contextlib
+import importlib
 import logging
 import time
 from typing import Callable, List, Optional
@@ -21,10 +22,6 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseMultiStepDraftBackend,
 )
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
-from sglang.srt.layers.attention.trtllm_mla_backend import (
-    TRTLLMMLABackend,
-)
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -72,7 +69,10 @@ from sglang.srt.speculative.draft_parallel import (
     model_draft_parallel_spec,
     resolve_draft_parallel_layout,
 )
-from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.draft_utils import (
+    DraftBackendFactory,
+    qsa_draft_extend_graph_backend,
+)
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -156,6 +156,60 @@ def _select_spec_graph_runner_cls(
     return oot_runner_cls()
 
 
+# Draft-extend CUDA-graph backends that are optional in a Volta build. A gate
+# on `_is_cuda` is not enough -- V100 *is* CUDA -- and each of these reaches a
+# stack that is absent here: trtllm_mla_backend pulls the flashinfer MLA
+# wrappers, which the SM70 flashinfer build does not ship, and dsa_backend /
+# deepseek_v4_backend pull `deep_gemm`, an sm90+ package.
+_MLA_GRAPH_BACKENDS = (
+    ("sglang.srt.layers.attention.trtllm_mla_backend", "TRTLLMMLABackend"),
+    ("sglang.srt.layers.attention.tokenspeed_mla_backend", "TokenspeedMLABackend"),
+)
+_SPARSE_GRAPH_BACKENDS = (
+    ("sglang.srt.layers.attention.dsa_backend", "DeepseekSparseAttnBackend"),
+    ("sglang.srt.layers.attention.deepseek_v4_backend", "DeepseekV4AttnBackend"),
+)
+_FLASHMLA_GRAPH_BACKENDS = (
+    ("sglang.srt.layers.attention.flashmla_backend", "FlashMLABackend"),
+)
+_FLA_GRAPH_BACKENDS = (
+    ("sglang.srt.layers.attention.flashattention_backend", "FlashAttentionBackend"),
+)
+# Hybrid mamba/full-attn models resolve the draft-extend backend to this
+# wrapper, which is not any listed type, so the isinstance test below reads as
+# unsupported and the draft-extend graph is silently skipped. Listing it
+# requires its graph metadata path to honor the DRAFT_EXTEND_V2 special case
+# that init_forward_metadata already applies.
+_HYBRID_GRAPH_BACKENDS = (
+    (
+        "sglang.srt.layers.attention.hybrid_linear_attn_backend",
+        "HybridLinearAttnBackend",
+    ),
+)
+
+
+def _optional_graph_backend_types(specs) -> list:
+    """Import the given backends, skipping any this build cannot provide.
+
+    A non-MLA, non-sparse EAGLE worker never builds these, and a missing one
+    only narrows the isinstance test at the call site. An installed but
+    unloadable wheel (deep_gemm for CUDA 13 on cu128) raises other than ImportError.
+    """
+    backend_types = []
+    for module_path, class_name in specs:
+        try:
+            module = importlib.import_module(module_path)
+        except Exception as e:
+            logger.debug(
+                "Draft-extend CUDA graph: %s is unavailable in this build (%s).",
+                class_name,
+                e,
+            )
+            continue
+        backend_types.append(getattr(module, class_name))
+    return backend_types
+
+
 def _qsa_index_share_requested(hf_config) -> bool:
     """--json-model-override-args writes top-level hf_config attributes, while
     checkpoint configs carry the flag on the nested text_config; read both."""
@@ -169,12 +223,25 @@ def _qsa_index_share_requested(hf_config) -> bool:
     )
 
 
+def _sm70_qsa_draft_extend_graph_enabled() -> bool:
+    """Whether to capture the QSA draft-extend graph on Volta.
+
+    The descriptor belongs to the SM70 QSA/env branch, which may not be applied
+    yet; an absent descriptor keeps the (upstream) eager draft-extend path.
+    """
+    flag = getattr(envs, "SGLANG_SM70_QSA_DRAFT_EXTEND_GRAPH", None)
+    return flag is not None and flag.get()
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     # Always-present draft dispatch. init_attention_backends resolves it before
     # graph capture; the class default keeps __new__-based test harnesses on stock.
     draft_runtime: eagle_megakernel.EagleDraftRuntime = (
         eagle_megakernel.STOCK_EAGLE_DRAFT_RUNTIME
     )
+    # Set by configure_draft_top1 in __init__; the class default keeps
+    # __new__-based harnesses and the flag-off path on the stock argmax.
+    sm70_local_top1 = False
 
     def __init__(
         self,
@@ -257,6 +324,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.init_token_map()
         self.init_lm_head()
+
+        from sglang.srt.speculative.sm70_draft_top1 import configure_draft_top1
+
+        self.sm70_local_top1 = configure_draft_top1(
+            self.draft_runner, self.topk, self.hot_token_id, self.server_args
+        )
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
@@ -375,9 +448,38 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         else:
             if self.hot_token_id is not None and head is not None:
-                head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
+                from sglang.srt.models.qwen4_exp_mtp import Qwen4ExpForCausalLMMTP
+
+                if target_lm_head is not None and isinstance(
+                    self.draft_runner.model, Qwen4ExpForCausalLMMTP
+                ):
+                    from sglang.srt.distributed.parallel_state import get_tp_group
+                    from sglang.srt.speculative.tp_hot_vocab import (
+                        build_sharded_hot_head,
+                    )
+
+                    if (
+                        self.server_args.enable_dp_attention
+                        or self.server_args.enable_lora
+                    ):
+                        raise ValueError(
+                            "Qwen Flash-Next FR-Spec currently requires ordinary TP without LoRA"
+                        )
+                    head = build_sharded_hot_head(
+                        head, self.hot_token_id, target_lm_head, get_tp_group()
+                    )
+                    width = self.hot_token_id.numel()
+                    self.draft_runner.model.logits_processor.vocab_size = width
+                    self.draft_runner.model_config.hf_config.hot_vocab_size = width
+                    logger.info(
+                        "Native MTP FR-Spec: %d global tokens, %d local head rows",
+                        width,
+                        head.shape[0],
+                    )
+                else:
+                    head = head.clone()
+                    head.data = head.data[self.hot_token_id]
 
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
@@ -417,6 +519,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
+        if (
+            _is_cuda
+            and torch.cuda.get_device_capability() == (7, 0)
+            and _sm70_qsa_draft_extend_graph_enabled()
+            and self.draft_runner.model_config.hf_config.architectures
+            == ["Qwen4ExpForCausalLMMTP"]
+        ):
+            qsa_graph_backend = qsa_draft_extend_graph_backend(
+                self.draft_extend_attn_backend, self.topk
+            )
+            if qsa_graph_backend is not None:
+                # The MTP model contains only full attention. Capture through
+                # QSA directly: the hybrid wrapper's linear backend has no
+                # DRAFT_EXTEND_V2 metadata and is not used by this forward.
+                self.draft_extend_attn_backend = qsa_graph_backend
+                self.draft_runner.attn_backend = qsa_graph_backend
         self._configure_qsa_mtp_index_share()
         self.tree_mask_mode = default_tree_mask_mode()
 
@@ -575,37 +693,26 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         graph_supported_backend_types = [
             TritonAttnBackend,
-            TRTLLMMLABackend,
-            TRTLLMHAAttnBackend,
+            # TRTLLMHAAttnBackend subclasses FlashInferAttnBackend, so it needs
+            # no entry of its own -- and no module-scope import (see
+            # _optional_graph_backend_types).
             FlashInferAttnBackend,
             QwenSparseAttnBackend,
         ]
         if _is_cuda or _is_musa:
-            # DSA is CUDA-only; import lazily so non-CUDA builds don't pull in
-            # deep_gemm and the rest of the sparse-attention stack at import time.
-            from sglang.srt.layers.attention.dsa_backend import (
-                DeepseekSparseAttnBackend,
+            graph_supported_backend_types.extend(
+                _optional_graph_backend_types(
+                    _MLA_GRAPH_BACKENDS + _SPARSE_GRAPH_BACKENDS
+                )
             )
-
-            graph_supported_backend_types.append(DeepseekSparseAttnBackend)
-            from sglang.srt.layers.attention.deepseek_v4_backend import (
-                DeepseekV4AttnBackend,
-            )
-
-            graph_supported_backend_types.append(DeepseekV4AttnBackend)
         if _is_cuda:
-            # FlashAttention is CUDA-only here; import lazily so MUSA and NPU
-            # builds don't pull sgl_kernel in at import time.
-            from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend,
+            graph_supported_backend_types.extend(
+                _optional_graph_backend_types(
+                    _FLA_GRAPH_BACKENDS
+                    + _FLASHMLA_GRAPH_BACKENDS
+                    + _HYBRID_GRAPH_BACKENDS
+                )
             )
-
-            graph_supported_backend_types.append(FlashAttentionBackend)
-            # FlashMLA is CUDA-only; import lazily so CPU builds don't pull
-            # FlashMLA at import time.
-            from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
-
-            graph_supported_backend_types.append(FlashMLABackend)
 
         graph_supported_backend = isinstance(
             self.draft_extend_attn_backend,
@@ -707,7 +814,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         with canary_outside_ctx:
             # Run draft
-            if can_run_decode_cuda_graph:
+            lookup_tokens = (
+                self.prompt_lookup.draft(batch, draft_input.bonus_tokens)
+                if getattr(self, "prompt_lookup", None) is not None
+                else None
+            )
+            if lookup_tokens is not None:
+                # Top-k one is a linear chain, so the preallocated parent and
+                # score-index vectors already describe it; every target
+                # verification and state-commit path below is unchanged.
+                parent_list = self._topk1_parents_prealloc[:1]
+                top_scores_index = self._topk1_score_indices_prealloc[:1]
+                draft_tokens = lookup_tokens
+                draft_probs = None
+            elif can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
@@ -875,7 +995,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
                 elif self.topk == 1:
-                    if _is_cuda or _is_hip:
+                    if self.sm70_local_top1:
+                        # Logits are shard-local: resolve the global winner
+                        # with one two-float all-gather, then advance.
+                        from sglang.srt.speculative.sm70_draft_top1 import (
+                            draft_top1,
+                        )
+
+                        topk_index = draft_top1(
+                            logits_output.next_token_logits, self.draft_runner
+                        )
+                        topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                        if draft_tokens_topk1 is not None:
+                            draft_tokens_topk1[:, i + 1] = topk_index[:, 0]
+                        forward_batch.positions.add_(1)
+                    elif _is_cuda or _is_hip:
                         topk_p, topk_index = draft_topk1_postprocess(
                             logits_output.next_token_logits,
                             forward_batch.positions,
@@ -898,11 +1032,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch.positions.add_(1)
                 if self.draft_runner.model_config.model_is_mrope:
                     forward_batch.mrope_positions.add_(1)
+                vocab_limit = (
+                    self.draft_runner.model_config.vocab_size
+                    if self.sm70_local_top1
+                    else logits_output.next_token_logits.shape[-1]
+                )
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    logits_output.next_token_logits.shape[-1],
-                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                    vocab_limit,
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={vocab_limit}",
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
@@ -988,6 +1127,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """
         self.draft_runtime.note_draft_extend()
         # Construct input_ids
+        if getattr(self, "prompt_lookup", None) is not None:
+            # A new request begins: drop the previous lookup history and the
+            # pending acceptance copy before the next draft round.
+            self.prompt_lookup.reset()
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
             tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
@@ -1272,8 +1415,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             elif self.topk == 1:
                 # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
                 # MTP draft selection on FP8 logits.
-                ret_topk_index = torch.argmax(
-                    draft_logits_output.next_token_logits, dim=-1, keepdim=True
+                # SM70 draft top-1: the logits may be TP-shard-local, so the
+                # global winner needs the two-float all-gather (`draft_top1`
+                # degrades to argmax when the SM70 head layout is not in use).
+                from sglang.srt.speculative.sm70_draft_top1 import draft_top1
+
+                ret_topk_index = draft_top1(
+                    draft_logits_output.next_token_logits, self.draft_runner
                 )
                 ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             else:
@@ -1367,6 +1515,29 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if self._hosts_draft
             else None
         )
+
+        if envs.SGLANG_SM70_PROMPT_LOOKUP.get() and self._hosts_draft:
+            from sglang.srt.speculative.prompt_lookup import GreedyPromptLookup
+
+            hf_config = self._draft_worker.draft_runner.model_config.hf_config
+            if not (
+                self.device == "cuda"
+                and torch.cuda.get_device_capability() == (7, 0)
+                and getattr(hf_config, "architectures", None)
+                == ["Qwen4ExpForCausalLMMTP"]
+                and self.topk == 1
+                and self.speculative_num_steps == 3
+                and self.speculative_num_draft_tokens == 4
+                and getattr(server_args, "max_running_requests", None) == 1
+                and not get_spec().speculative_adaptive
+                and not get_spec().speculative_use_rejection_sampling
+            ):
+                raise ValueError(
+                    "SM70 prompt lookup requires Qwen MTP-3/4, top-k one, "
+                    "max-running-requests=1, no adaptive speculation and no "
+                    "rejection sampling"
+                )
+            self._draft_worker.prompt_lookup = GreedyPromptLookup(3, self.device)
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
@@ -2062,4 +2233,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             post_verify_graphs=self._post_verify_graphs,
             simulated_acc_len_rng=self._simulated_acc_len_rng,
             sparse_bonus_argmax=max_top_k is not None,
+            on_accept=(
+                self._draft_worker.prompt_lookup.observe
+                if getattr(self._draft_worker, "prompt_lookup", None) is not None
+                else None
+            ),
         )

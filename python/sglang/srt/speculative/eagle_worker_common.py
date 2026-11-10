@@ -773,6 +773,7 @@ def run_eagle_verify(
     post_verify_graphs: Optional[EaglePostVerifyGraphs] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
+    on_accept=None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -1046,6 +1047,10 @@ def run_eagle_verify(
 
     if not fused_commit_outputs and not batch.forward_mode.is_idle():
         accept_tokens = predict[accept_index]
+        if on_accept is not None:
+            # Verified tokens, not the scheduler's snapshot: an optional
+            # observer (e.g. prompt lookup) may read them after the event.
+            on_accept(batch, accept_tokens, accept_lens)
         bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
         # stride = accept_tokens per-req width = accept_index.shape[1]
         # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.

@@ -277,6 +277,7 @@ class TargetHiddenKvInjector:
                 swa_loc=swa_loc,
                 positions=positions,
                 pool=pool,
+                attn_backend=self.draft_model_runner.attn_backend,
             )
 
     def committed_swa_loc(
@@ -414,6 +415,7 @@ class TargetHiddenKvInjector:
                     swa_loc=inject_layout.swa_loc,
                     positions=inject_layout.positions,
                     pool=pool,
+                    attn_backend=self.draft_model_runner.attn_backend,
                 )
             return
 

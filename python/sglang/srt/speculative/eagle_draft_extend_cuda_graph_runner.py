@@ -238,7 +238,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_for_logprob_gpu = None
 
             hot_token_id = getattr(self.eagle_worker, "hot_token_id", None)
-            if hasattr(
+            if getattr(self.model_runner, "sm70_draft_logits_width", None) is not None:
+                # TP-local draft top-1: the logits buffer is one shard wide.
+                vocab_size = self.model_runner.sm70_draft_logits_width
+            elif hasattr(
                 self.model_runner.model_config.hf_config, "draft_vocab_size"
             ):  # llama_eagle
                 vocab_size = self.model_runner.model_config.hf_config.draft_vocab_size
@@ -771,6 +774,25 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 self._kv_writes_done_event(shared_read_ends)
             )
 
+        hidden_states = out.hidden_states
+        if hidden_states.shape[0] == bs * self.captured_req_width:
+            # Multi-stream (hyper-connection) draft models hand back the whole
+            # per-token window because the LM head wants the post-mix single
+            # stream while the next draft step wants the pre-mix one. The
+            # selected row is still to be picked, so mirror the eager path's
+            # `hidden_states[select_index]` gather instead of slicing.
+            hidden_states = hidden_states[select_index]
+        elif hidden_states.shape[0] != bs:
+            raise RuntimeError(
+                "Unexpected draft-extend hidden rows "
+                f"{hidden_states.shape[0]} for bs={bs}, "
+                f"width={self.captured_req_width}."
+            )
+        else:
+            # Upstream draft models return already-selected hidden states.
+            hidden_states = hidden_states[:raw_bs]
+        # CUDA graph replay reuses its captured output storage. These states
+        # survive into the next draft step, so detach them from that buffer.
         out = LogitsProcessorOutput(
             # None when the megakernel's draft_extend kept the logits
             next_token_logits=(
@@ -778,12 +800,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 if out.next_token_logits is None
                 else out.next_token_logits[:raw_bs]
             ),
-            # The unchanged megakernel batch consumes the graph-owned rows before
-            # replay; every other path detaches the recurrent state from that buffer.
+            # `hidden_states` is already row-selected above: gathered through
+            # select_index for a wide (multi-stream) draft window, otherwise a
+            # slice of the graph-owned rows. The unchanged megakernel batch
+            # consumes those rows before replay; every other path detaches the
+            # recurrent state from that buffer.
             hidden_states=(
-                out.hidden_states[:raw_bs]
-                if self.keep_hidden_in_place
-                else out.hidden_states[:raw_bs].clone()
+                hidden_states if self.keep_hidden_in_place else hidden_states.clone()
             ),
         )
         return out

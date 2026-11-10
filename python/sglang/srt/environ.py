@@ -1785,6 +1785,15 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # SM70 (V100/Volta) native-MTP draft head: keep the full draft vocabulary
+    # sharded and exchange only each TP shard's winner (two-float all-gather)
+    # instead of all-gathering the full-vocabulary logits. Requires top-k 1,
+    # plain TP (no DP attention / LoRA / PP) and the full draft vocabulary.
+    SGLANG_SM70_MTP_LOCAL_TOP1 = EnvBool(False)
+    # SM70: draft from a verified prompt-suffix lookup instead of the Qwen4 MTP
+    # model for a single greedy request. Requires MTP-3/4, top-k 1,
+    # --max-running-requests 1 and no adaptive speculation.
+    SGLANG_SM70_PROMPT_LOOKUP = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing

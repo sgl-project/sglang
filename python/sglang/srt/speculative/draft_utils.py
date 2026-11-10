@@ -16,6 +16,32 @@ from sglang.srt.utils.device import (
 logger = logging.getLogger(__name__)
 
 
+def qsa_draft_extend_graph_backend(attn_backend, topk: int):
+    """Resolve the graph-capable full-attention side of a QSA draft model.
+
+    `variant` / `draft_extend_cuda_graph` are supplied by the SM70 QSA profile
+    branch; without it the draft-extend graph stays off (upstream eager path).
+    """
+
+    from sglang.srt.layers.attention.qsa.config import QSA_VARIANT_COMPRESSED
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        QwenSparseAttnBackend,
+    )
+
+    # The hybrid wrapper exposes the graph-capable side as
+    # full_attn_backend; a bare backend has no such attribute.
+    backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+    if (
+        topk == 1
+        and isinstance(backend, QwenSparseAttnBackend)
+        and backend.qsa_profile is not None
+        and backend.qsa_profile.variant == QSA_VARIANT_COMPRESSED
+        and backend.qsa_profile.draft_extend_cuda_graph
+    ):
+        return backend
+    return None
+
+
 def _assert_draft_needs_no_conv_sidecar(draft_model_runner) -> None:
     """Refuse a multi-step draft decode backend for a draft with conv layers."""
     from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
@@ -100,6 +126,10 @@ class DraftBackendFactory:
         backend_map = {
             "flashinfer": self._create_flashinfer_decode_backend,
             "triton": self._create_triton_decode_backend,
+            # The V100 TileLang backend delegates multi-step built-in MTP
+            # draft attention to Triton.
+            "tilelang_fa_v100": self._create_triton_decode_backend,
+            "flash_attn_v100": self._create_triton_decode_backend,
             "intel_amx": self._create_intel_amx_decode_backend,
             "intel_xpu": self._create_intel_xpu_decode_backend,
             "aiter": self._create_aiter_decode_backend,
@@ -131,6 +161,8 @@ class DraftBackendFactory:
         backend_map = {
             "flashinfer": self._create_flashinfer_prefill_backend,
             "triton": self._create_triton_prefill_backend,
+            "tilelang_fa_v100": self._create_triton_prefill_backend,
+            "flash_attn_v100": self._create_triton_prefill_backend,
             "intel_amx": self._create_intel_amx_prefill_backend,
             "intel_xpu": self._create_intel_xpu_prefill_backend,
             "aiter": self._create_aiter_prefill_backend,
