@@ -300,6 +300,11 @@ class Envs:
     SGLANG_OPT_MULTI_CTA_VERIFY_TREE_SAMPLING = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Mooncake PD prefill: spread KV transfers over the transfer queues by room
+    # instead of by destination sessions (one decode worker uses one queue).
+    SGLANG_OPT_DISAGG_TRANSFER_SHARD_BY_ROOM = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

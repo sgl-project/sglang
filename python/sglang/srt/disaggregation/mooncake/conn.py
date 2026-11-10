@@ -3440,9 +3440,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # NOTE(shangming): sharding according to the dst_infos to make sure
         # requests with the same dst_sessions will be added into the same
         # queue, which enables early abort with failed sessions.
-        dst_infos = self.transfer_infos[bootstrap_room].keys()
-        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
-        shard_idx = session_port_sum % len(self.transfer_queues)
+        if envs.SGLANG_OPT_DISAGG_TRANSFER_SHARD_BY_ROOM.get():
+            # One decode worker gives every room the same session set, so the
+            # session sharding puts all transfers on one queue and one worker
+            # thread. A room's chunks still share one queue (their order is kept);
+            # failed sessions are checked per chunk from the shared set. The low
+            # bits of a room can encode the decode DP rank, so they are skipped.
+            shard_idx = (bootstrap_room >> 16) % len(self.transfer_queues)
+        else:
+            dst_infos = self.transfer_infos[bootstrap_room].keys()
+            session_port_sum = sum(
+                int(session.rsplit(":", 1)[1]) for session in dst_infos
+            )
+            shard_idx = session_port_sum % len(self.transfer_queues)
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
