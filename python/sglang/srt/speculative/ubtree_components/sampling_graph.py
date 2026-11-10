@@ -37,9 +37,8 @@ def _sample_target_tokens(
     """Use the ordinary FlashInfer AR sampler for every verification node.
 
     Keep the full vocabulary, including probability ties at the top-k cutoff.
-    Joint top-k/top-p filtering differs from applying top-p after top-k
-    renormalization. The min-p branch follows AR's separate renormalization
-    path instead.
+    Both branches keep the joint top-k/top-p support. The min-p branch, like
+    AR, renormalizes by top-p before top-k and then applies the min-p cut.
     """
     from flashinfer.sampling import (
         min_p_sampling_from_probs,
@@ -52,8 +51,8 @@ def _sample_target_tokens(
     top_ks = torch.repeat_interleave(sampling_info.top_ks, node_count, dim=0)
     top_ps = torch.repeat_interleave(sampling_info.top_ps, node_count, dim=0)
     if sampling_info.need_min_p_sampling:
-        probs = top_k_renorm_prob(probs, top_ks)
         probs = top_p_renorm_prob(probs, top_ps)
+        probs = top_k_renorm_prob(probs, top_ks)
         min_ps = torch.repeat_interleave(sampling_info.min_ps, node_count, dim=0)
         target_predict = min_p_sampling_from_probs(
             probs, min_ps, seed=seed, offset=offset

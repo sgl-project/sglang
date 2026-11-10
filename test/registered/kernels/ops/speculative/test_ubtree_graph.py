@@ -953,6 +953,8 @@ def test_tree_metadata_all_widths_matches_cpu_after_replay(width):
     [
         (1.0, 3, 1.0, 0.0, False),
         (0.7, 2, 0.85, 0.0, False),
+        (1.0, 2, 0.65, 0.0, False),
+        (1.0, 2, 0.65, 0.01, False),
         (1.3, 3, 0.9, 0.6, False),
         (1.0, 2, 1.0, 0.0, True),
     ],
@@ -998,14 +1000,8 @@ def test_sampling_and_tree_walk_match_joint_ar_distribution(
     probabilities = []
     for logits in node_logits:
         probs = torch.softmax(logits.double() / temperature, dim=0)
-        top_k_mask = probs >= probs.topk(top_k).values[-1]
-        if min_p:
-            probs *= top_k_mask
-            probs /= probs.sum()
-            probs *= top_p_mask(probs)
-            probs *= probs >= probs.max() * min_p
-        else:
-            probs *= top_k_mask & top_p_mask(probs)
+        probs *= (probs >= probs.topk(top_k).values[-1]) & top_p_mask(probs)
+        probs *= probs >= probs.max() * min_p
         probabilities.append(probs / probs.sum())
     expected = {}
 
