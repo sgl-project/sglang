@@ -72,6 +72,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_ulysses_ctx,
 )
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
@@ -92,6 +93,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
 )
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
@@ -408,11 +410,8 @@ def _copy_grouped_qkv_tp_shard(
     return True
 
 
-def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> nn.RMSNorm:
-    # RMSNorm uses fp32 accumulation with bf16 inputs and outputs.
-    # torch.nn.RMSNorm upcasts reduced-precision inputs for the variance
-    # reduction, matching that accumulation semantic.
-    return nn.RMSNorm(size, eps=eps, dtype=dtype)
+def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> RMSNorm:
+    return RMSNorm(size, eps=eps).to(dtype=dtype)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -422,7 +421,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def _modulate_rmsnorm_scale_shift(
     x: torch.Tensor,
-    norm: nn.RMSNorm,
+    norm: RMSNorm,
     shift: torch.Tensor,
     scale: torch.Tensor,
     indices: torch.Tensor,
@@ -442,7 +441,11 @@ def _modulate_rmsnorm_scale_shift(
         and norm.weight is not None
         and can_use_rmsnorm_indexed_scale_shift(x, norm.weight, shift, scale, indices)
     ):
-        eps = norm.eps if norm.eps is not None else torch.finfo(x.dtype).eps
+        eps = (
+            norm.variance_epsilon
+            if norm.variance_epsilon is not None
+            else torch.finfo(x.dtype).eps
+        )
         return rmsnorm_indexed_scale_shift(x, norm.weight, shift, scale, indices, eps)
     return _modulate_scale_shift(norm(x), shift, scale, indices, dtype=dtype)
 
@@ -537,8 +540,8 @@ _ATEN_HEAD_RMSNORM = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm")
 def _apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: nn.RMSNorm,
-    k_norm: nn.RMSNorm,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (
@@ -547,7 +550,7 @@ def _apply_qk_norm(
         and q.dtype == k.dtype == q_norm.weight.dtype == k_norm.weight.dtype
         and q.stride(-1) == k.stride(-1) == 1
         and q.stride(-2) == k.stride(-2) == head_dim
-        and q_norm.eps == k_norm.eps
+        and q_norm.variance_epsilon == k_norm.variance_epsilon
         and not torch.compiler.is_compiling()
         and current_platform.is_cuda()
     ):
@@ -556,21 +559,21 @@ def _apply_qk_norm(
             k,
             q_norm.weight,
             k_norm.weight,
-            eps=q_norm.eps,
+            eps=q_norm.variance_epsilon,
             head_dim=head_dim,
         )
         return q, k
     if (
-        q_norm.eps is not None
-        and k_norm.eps is not None
+        q_norm.variance_epsilon is not None
+        and k_norm.variance_epsilon is not None
         and not torch.compiler.is_compiling()
         and can_use_aten_head_rmsnorm(q, q_norm.weight)
         and can_use_aten_head_rmsnorm(k, k_norm.weight)
     ):
         return _ATEN_HEAD_RMSNORM.run(
             lambda: (
-                aten_head_rmsnorm(q, q_norm.weight, q_norm.eps),
-                aten_head_rmsnorm(k, k_norm.weight, k_norm.eps),
+                aten_head_rmsnorm(q, q_norm.weight, q_norm.variance_epsilon),
+                aten_head_rmsnorm(k, k_norm.weight, k_norm.variance_epsilon),
             ),
             lambda: (q_norm(q), k_norm(k)),
             equal=tensors_equal,
@@ -669,8 +672,8 @@ _ATEN_HEAD_RMSNORM_ROPE = BitExactFusionGate("MiniMax-H3 ROCm QK RMSNorm + RoPE"
 def _apply_qk_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: nn.RMSNorm,
-    k_norm: nn.RMSNorm,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
     head_dim: int,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
@@ -680,8 +683,8 @@ def _apply_qk_norm_rope(
         return _apply_rope_qk(normed_q, normed_k, cos_sin_cache, positions)
 
     if (
-        q_norm.eps is not None
-        and k_norm.eps is not None
+        q_norm.variance_epsilon is not None
+        and k_norm.variance_epsilon is not None
         and not torch.compiler.is_compiling()
         and can_use_aten_head_rmsnorm(q, q_norm.weight)
         and can_use_aten_head_rmsnorm(k, k_norm.weight)
@@ -690,10 +693,10 @@ def _apply_qk_norm_rope(
         return _ATEN_HEAD_RMSNORM_ROPE.run(
             lambda: (
                 aten_head_rmsnorm(
-                    q, q_norm.weight, q_norm.eps, cos_sin_cache, positions
+                    q, q_norm.weight, q_norm.variance_epsilon, cos_sin_cache, positions
                 ),
                 aten_head_rmsnorm(
-                    k, k_norm.weight, k_norm.eps, cos_sin_cache, positions
+                    k, k_norm.weight, k_norm.variance_epsilon, cos_sin_cache, positions
                 ),
             ),
             unfused,
@@ -1019,7 +1022,7 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
             cos_sin_cache,
             positions,
             is_neox=True,
-            eps=attention.q_norm.eps,
+            eps=attention.q_norm.variance_epsilon,
             head_dim=head_dim,
             rope_dim=cos_sin_cache.shape[-1],
             round_norm_before_rope=True,
@@ -1042,7 +1045,7 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
             cos_sin_cache,
             positions,
             is_neox=True,
-            eps=attention.q_norm.eps,
+            eps=attention.q_norm.variance_epsilon,
             head_dim=head_dim,
             rope_dim=cos_sin_cache.shape[-1],
             round_norm_before_rope=True,
@@ -1271,8 +1274,7 @@ class MiniMaxH3Attention(nn.Module):
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         # cache width covers cos/sin for temporal, height, and width frequencies
         rope_dim = 6 * arch.rope_inv_freq_len
-        # Not apply_qk_norm_rope: Q/K are [tokens, heads, head_dim] and the norms
-        # are torch nn.RMSNorm, so the fused kernel is called directly.
+        # Q/K are [tokens, heads, head_dim]; preserve rounding before RoPE.
         self._use_fused_qknorm_rope = (
             current_platform.is_cuda()
             and can_use_fused_inplace_qknorm_rope(
@@ -1634,7 +1636,7 @@ class MiniMaxH3Attention(nn.Module):
                     cos_sin_cache,
                     positions,
                     is_neox=True,
-                    eps=self.q_norm.eps,
+                    eps=self.q_norm.variance_epsilon,
                     head_dim=self.head_dim,
                     rope_dim=cos_sin_cache.shape[-1],
                     round_norm_before_rope=True,
@@ -1710,6 +1712,7 @@ class MiniMaxH3MLP(nn.Module):
         self.reuse_fc1_activation = quant_config is None or (
             quant_config.get_name() == "gguf"
         )
+        self._npu_swiglu = SiluAndMul() if current_platform.is_npu() else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not isinstance(x, tuple) and x.device.type == "mps":
@@ -1728,7 +1731,13 @@ class MiniMaxH3MLP(nn.Module):
         if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
             out, _ = self.fc2(silu_mul_mxfp8(hidden))
             return out
-        hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+        if self._npu_swiglu is not None and hidden.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            hidden = self._npu_swiglu(hidden)
+        else:
+            hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
 
@@ -1825,15 +1834,15 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         cu_seqlens_host: tuple[int, ...] | None = None,
         max_seqlen: int,
     ) -> torch.Tensor:
-        x = x + self.attn(
+        h = self.attn(
             self.norm1(x),
             rope_cache=None,
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
         )
-        x = x + self.mlp(self.norm2(x))
-        return x
+        h, x = self.norm2(h, x)
+        return x + self.mlp(h)
 
 
 class MiniMaxH3TokenRefiner(nn.Module):

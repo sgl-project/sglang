@@ -44,17 +44,45 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3Attention,
     MiniMaxH3DiTBlock,
     MiniMaxH3DiTModel,
+    _apply_qk_norm,
     _copy_grouped_qkv_tp_shard,
     _diffusers_h3_checkpoint,
     _minimax_h3_group_attend,
     _modulate_gate,
+    _norm,
     _qkv_scale_block_rows,
     _reorder_grouped_qkv_to_qkv,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.srt.utils import get_device
 
 pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
+
+
+@torch.no_grad()
+def test_qk_norm_uses_shared_rmsnorm_epsilon():
+    device = current_platform.device_type
+    q = torch.randn(4, 2, 128, dtype=torch.bfloat16, device=device)
+    k = torch.randn_like(q)
+    q_norm = _norm(128, eps=1e-4).to(device)
+    k_norm = _norm(128, eps=3e-3).to(device)
+    q_norm.weight.uniform_(0.5, 1.5)
+    k_norm.weight.uniform_(0.5, 1.5)
+
+    def reference(x, weight, eps):
+        x = x.float()
+        return (
+            x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * weight.float()
+        ).to(weight.dtype)
+
+    expected_q = reference(q, q_norm.weight, 1e-4)
+    expected_k = reference(k, k_norm.weight, 3e-3)
+    actual_q, actual_k = _apply_qk_norm(q, k, q_norm, k_norm, 128)
+    torch.testing.assert_close(actual_q, expected_q, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(actual_k, expected_k, rtol=1e-2, atol=2e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay")

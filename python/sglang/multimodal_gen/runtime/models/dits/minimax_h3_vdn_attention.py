@@ -287,7 +287,7 @@ def _vdn_window_softmax(
             cos_sin_cache,
             positions,
             is_neox=True,
-            eps=attention.q_norm.eps,
+            eps=attention.q_norm.variance_epsilon,
             head_dim=attention.head_dim,
             rope_dim=cos_sin_cache.shape[-1],
             round_norm_before_rope=True,
