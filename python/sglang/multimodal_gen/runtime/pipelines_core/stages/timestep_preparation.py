@@ -43,7 +43,6 @@ class TimestepPreparationFingerprint:
     height: int | None
     width: int | None
     num_frames: int | None
-    rollout_stop_step_index: int | None
 
 
 class TimestepPreparationStage(PipelineStage):
@@ -161,15 +160,6 @@ class TimestepPreparationStage(PipelineStage):
             )
             timesteps = scheduler.timesteps
 
-        if batch.rollout and batch.rollout_stop_step_index is not None:
-            from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
-                truncate_rollout_schedule,
-            )
-
-            timesteps = truncate_rollout_schedule(
-                scheduler, batch.rollout_stop_step_index
-            )
-
         # Update batch with prepared timesteps
         batch.timesteps = timesteps
         batch.scheduler = scheduler
@@ -194,7 +184,6 @@ class TimestepPreparationStage(PipelineStage):
             height=batch.height,
             width=batch.width,
             num_frames=batch.num_frames,
-            rollout_stop_step_index=batch.rollout_stop_step_index,
         )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

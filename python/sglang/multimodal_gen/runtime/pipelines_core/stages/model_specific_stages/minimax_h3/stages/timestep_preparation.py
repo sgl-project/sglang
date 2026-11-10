@@ -140,6 +140,8 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         stop_step_index = batch.rollout_stop_step_index
         if not batch.rollout or stop_step_index is None:
             return
+        # TODO(rockdu): H3's denoise loop runs its own rollout state, not a
+        # FlowRolloutController; the stage cuts both grids until it does.
         sigmas = batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY]
         for modality in ("video", "audio"):
             sigmas[modality] = truncate_rollout_sigmas(

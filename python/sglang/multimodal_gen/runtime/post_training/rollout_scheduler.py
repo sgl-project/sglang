@@ -12,9 +12,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
     get_or_create_request_scheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
-    truncate_rollout_sigmas,
-)
 
 
 def rollout_scheduler_for(serving):
@@ -44,17 +41,6 @@ def get_or_create_rollout_request_scheduler(
         scheduler,
         isolate=needs_clone,
     )
-
-
-def truncate_rollout_schedule(
-    scheduler: FlowMatchEulerDiscreteScheduler, stop_step_index: int
-) -> torch.Tensor:
-    """Keep steps 0..stop_step_index and send the last one to the terminal sigma."""
-    scheduler.sigmas = truncate_rollout_sigmas(
-        scheduler.sigmas, stop_step_index=stop_step_index
-    )
-    scheduler.timesteps = scheduler.timesteps[: stop_step_index + 1]
-    return scheduler.timesteps
 
 
 def prepare_rollout_request_scheduler(
