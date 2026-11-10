@@ -1332,6 +1332,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
 
+    # TODO(weireweire): add the decode headroom (add_spec_decode_headroom_pages) as DFlash does.
     cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
         batch.reqs,
         reserve=double_alloc,
