@@ -17,11 +17,10 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     enable_num_token_non_padded,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
@@ -32,7 +31,7 @@ from sglang.srt.speculative.spec_info import (
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import draft_tp_context
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 if TYPE_CHECKING:
@@ -350,7 +349,7 @@ class DraftBlockProposer:
     _staged_params_key = None
     num_staged_params_skips = 0
     num_staged_params_calls = 0
-    deferred_commit = None
+    deferred_draft_kv = None
 
     def __init__(
         self,
@@ -394,8 +393,8 @@ class DraftBlockProposer:
                 )
             )
         )
-        # SGLANG_DSPARK_DEFER_CONTEXT_KV's staged commit, set by the worker.
-        self.deferred_commit = None
+        # SGLANG_DSPARK_DEFER_CONTEXT_KV's draft KV store, set by its attach_draft.
+        self.deferred_draft_kv = None
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
@@ -662,22 +661,22 @@ class DraftBlockProposer:
             self._stage_sampling_params(
                 draft_sampler, bs=bs, sampling_info=sampling_info
             )
-        commit = self.deferred_commit
-        if commit is not None:
-            commit.before_draft_forward(
+        deferred_draft_kv = self.deferred_draft_kv
+        if deferred_draft_kv is not None:
+            deferred_draft_kv.before_draft_forward(
                 graph_bs=(
                     graph_runner.capture_bs[
                         bisect.bisect_left(graph_runner.capture_bs, bs)
                     ]
                     if runs_graph
                     else None
-                )
+                ),
+                reqs=batch.reqs,
             )
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
-        if commit is not None:
-            assert draft_out.can_run_graph == runs_graph
-            commit.after_draft_forward(graph_ran=draft_out.can_run_graph)
+        # before_draft_forward took runs_graph as whether the graph writes the staging.
+        assert deferred_draft_kv is None or draft_out.can_run_graph == runs_graph
         logits_output = draft_out.logits_output
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:
