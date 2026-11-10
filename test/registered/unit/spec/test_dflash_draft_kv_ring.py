@@ -1,4 +1,4 @@
-"""DFLASH draft KV ring resolution.
+"""DFLASH draft KV ring: its row layout and its resolution.
 
 The ring is resolved once at startup into speculative_dflash_draft_kv_ring:
 on by default for an all-sliding MLA draft on trtllm_mla / cutedsl_mla, off
@@ -10,10 +10,16 @@ import contextlib
 import unittest
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import _resolve_dflash_draft_kv_ring
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dflash_draft_ring import (
+    DFlashDraftKVRing,
+    draft_kv_ring_rows_per_req,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -114,6 +120,54 @@ class TestResolveDraftKVRing(CustomTestCase):
     def test_explicit_off_is_kept(self):
         with _switch(False):
             self.assertFalse(self._resolve(_args(), draft_cfg=None))
+
+
+WINDOW_LEFT = 1023
+BLOCK = 8
+
+
+def _ring(dcp, req_pool_rows=4):
+    return DFlashDraftKVRing(
+        rows_per_req=draft_kv_ring_rows_per_req(
+            window_left=WINDOW_LEFT, block_size=BLOCK, dcp_size=dcp
+        ),
+        dcp_size=dcp,
+        req_pool_rows=req_pool_rows,
+        device="cpu",
+    )
+
+
+class TestDraftKVRingLayout(CustomTestCase):
+    def test_window_and_block_never_share_a_row(self):
+        for dcp in (1, 8):
+            with self.subTest(dcp=dcp):
+                ring = _ring(dcp)
+                p = 123457
+                # The block's rows and every row a query in that block can read.
+                keys = torch.arange(p - WINDOW_LEFT, p + BLOCK)
+                locs = ring.locs(torch.full_like(keys, 2), keys)
+                self.assertEqual(locs.unique().numel(), keys.numel())
+                self.assertGreaterEqual(ring.span, WINDOW_LEFT + 1 + BLOCK)
+
+    def test_extend_keeps_only_the_readable_tail(self):
+        ring = _ring(8)
+        lens = torch.tensor([3000, 40])
+        prefix = torch.tensor([0, 100])
+        positions = torch.cat(
+            [torch.arange(int(a), int(a + n)) for a, n in zip(prefix, lens)]
+        )
+        locs = ring.extend_locs(
+            req_pool_indices=torch.tensor([1, 2]),
+            positions=positions,
+            extend_lens=lens,
+            seq_ends=prefix + lens,
+        )
+        first, second = locs[:3000], locs[3000:]
+        kept = first != 0
+        self.assertEqual(int(kept.sum()), ring.span)
+        self.assertTrue(bool(kept[-ring.span :].all()))
+        self.assertEqual(first[kept].unique().numel(), ring.span)
+        self.assertTrue(bool((second != 0).all()))
 
 
 if __name__ == "__main__":
