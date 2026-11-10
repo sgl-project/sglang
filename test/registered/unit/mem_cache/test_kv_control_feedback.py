@@ -5,6 +5,7 @@ The separate file owns publisher/replay teardown and feedback capacity fixtures;
 it reuses the native cache and request lifecycle fixtures without changing them.
 """
 
+import threading
 import time
 import unittest
 import uuid
@@ -56,11 +57,8 @@ class TestKVControlFeedback(cache_fixtures.KVCacheTestCase):
     def test_pin_completed_receipt_and_idle_expiry_share_general_feedback(self):
         with transfer_fixtures.hicache(self) as owner:
             _, cache, service, dma = owner
-            transfer_fixtures.seed(cache)
-            transfer_fixtures.transfer(service)
-            service.progress()
-            dma.finish()
-            service.progress()
+            node = transfer_fixtures.seed(cache)
+            transfer_fixtures.backup_prefix(cache, dma, node)
             done = self.submit(
                 service.control,
                 "pin",
@@ -107,10 +105,11 @@ class TestKVControlFeedback(cache_fixtures.KVCacheTestCase):
     def test_local_association_and_partial_demote_preserve_coordinates_and_actual_effects(
         self,
     ):
-        with transfer_fixtures.hicache(self) as owner:
+        with transfer_fixtures.hicache(self, storage=True) as owner:
             _, cache, service, dma = owner
             ancestor = transfer_fixtures.seed(cache, (1, 2))
-            transfer_fixtures.seed(cache)
+            leaf = transfer_fixtures.seed(cache)
+            transfer_fixtures.backup_prefix(cache, dma, leaf, evict=True)
             associated = self.submit(
                 service.control,
                 "associate",
@@ -129,9 +128,8 @@ class TestKVControlFeedback(cache_fixtures.KVCacheTestCase):
             lock = cache.lock(ancestor.id)
             try:
                 result = transfer_fixtures.public_transfer(
-                    service, "demote", "gpu", "host", "partial", caller="A"
+                    service, "demote", "host", "storage", "partial", caller="A"
                 )
-                transfer_fixtures.stage(service, dma)
                 done = transfer_fixtures.wait(service, result)
             finally:
                 cache.unlock(lock)
@@ -199,17 +197,17 @@ class TestKVControlFeedback(cache_fixtures.KVCacheTestCase):
             )
 
     def test_owner_watermark_orders_real_ready_remove_and_scoped_reconciliation(self):
-        with transfer_fixtures.hicache(self) as owner:
+        with transfer_fixtures.hicache(self, storage=True) as owner:
             _, cache, service, dma = owner
             self.assertFalse(cache.tree_core.kv_events.enabled)
             before = service.cache_watermark()
             node = transfer_fixtures.seed(cache)
             self.assertGreater(service.cache_watermark().version, before.version)
+            transfer_fixtures.persist_prefix(cache, service, dma, node)
+            self.assertEqual(cache.evict_host(4), 4)
             result = transfer_fixtures.transfer(service)
-            service.progress()
-            dma.finish()
-            service.progress()
-            complete = transfer_fixtures.current(service, result)
+            complete = transfer_fixtures.wait(service, result)
+            node = transfer_fixtures.prefix_path(cache, service)[-1][0]
             self.assertEqual(complete.status, Status.COMPLETED)
             ready = complete.cache_watermark
             page = events(service)
@@ -252,32 +250,37 @@ class TestKVControlFeedback(cache_fixtures.KVCacheTestCase):
     def test_cancellation_progress_and_caller_filtered_replay_have_distinct_sequences(
         self,
     ):
-        with transfer_fixtures.hicache(self) as owner:
+        with transfer_fixtures.hicache(self, storage=True) as owner:
             _, cache, service, dma = owner
-            transfer_fixtures.seed(cache)
-            a = transfer_fixtures.transfer(service, caller="A", message="a")
-            service.progress()
-            self.submit(
-                service.control,
-                "set_priority",
-                {
-                    "target": msgspec.json.decode(
-                        msgspec.json.encode(cache_fixtures.target())
-                    ),
-                    "location": {"tier": "gpu"},
-                    "claim_id": "b",
-                    "revision": 1,
-                    "value": 1,
-                    "ttl_seconds": 10,
-                },
-                caller="B",
-                message="b",
-            )
-            cancelled = service.control.cancel(a.ref)
-            self.assertEqual(cancelled.status, Status.CANCELLING)
-            before = events(service)
-            dma.finish()
-            service.progress()
+            node = transfer_fixtures.seed(cache)
+            transfer_fixtures.backup_prefix(cache, dma, node, evict=True)
+            entered, release = threading.Event(), threading.Event()
+            controller = cache.cache_controller
+            page_set = controller.page_set_func
+
+            def blocked(*args, **kwargs):
+                saved = page_set(*args, **kwargs)
+                entered.set()
+                assert release.wait(5)
+                return saved
+
+            with patch.object(controller, "page_set_func", blocked):
+                a = transfer_fixtures.public_transfer(
+                    service, "demote", "host", "storage", "a", caller="A"
+                )
+                try:
+                    self.assertTrue(entered.wait(5))
+                    # Same physical work, separately owned receipt.
+                    b = transfer_fixtures.public_transfer(
+                        service, "demote", "host", "storage", "b", caller="B"
+                    )
+                    service.control.cancel(b.ref)
+                    cancelled = service.control.cancel(a.ref)
+                    self.assertEqual(cancelled.status, Status.CANCELLING)
+                    before = events(service)
+                finally:
+                    release.set()
+                transfer_fixtures.wait(service, a)
             after = events(service, cursor=before["next_cursor"])
             self.assertTrue(
                 all(
@@ -316,7 +319,7 @@ class TestKVControlFeedback(cache_fixtures.KVCacheTestCase):
                 max_events=2, max_bytes=4096, max_event_bytes=2048
             ),
         )
-        with transfer_fixtures.hicache(self, config=config) as owner:
+        with transfer_fixtures.hicache(self, config=config, storage=True) as owner:
             _, _, service, _ = owner
             start = events(service)["next_cursor"]
             for n in range(4):
@@ -460,20 +463,22 @@ class TestKVControlFeedback(cache_fixtures.KVCacheTestCase):
         old_sub.connect(old_channel)
         publisher = None
         try:
-            with transfer_fixtures.hicache(self, config=config) as owner:
+            with transfer_fixtures.hicache(self, config=config, storage=True) as owner:
                 _, cache, service, dma = owner
                 publisher = service.feedback.publisher
                 sub.connect(channel)
                 dealer.connect(replay_endpoint)
                 time.sleep(0.05)  # ZMQ subscription handshake, external boundary.
-                transfer_fixtures.seed(cache)
-                operation = transfer_fixtures.transfer(service)
+                node = transfer_fixtures.seed(cache)
+                transfer_fixtures.backup_prefix(cache, dma, node, evict=True)
+                operation = transfer_fixtures.public_transfer(
+                    service, "demote", "host", "storage", "save", caller="A"
+                )
                 with patch.object(publisher, "try_publish", return_value=False):
-                    service.progress()
+                    transfer_fixtures.wait(service, operation)
                 self.assertTrue(service.has_background_work)
                 self.assertGreater(service.next_deadline, self.clock.now)
                 self.clock.now += 0.02
-                dma.finish()
                 service.progress()
                 publisher._event_queue.join()
                 frames = sub.recv_multipart()

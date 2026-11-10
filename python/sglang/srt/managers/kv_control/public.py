@@ -36,7 +36,7 @@ def public_capabilities(caps):
         (
             "sglang.demote",
             "move_to",
-            (("gpu", "host"), ("gpu", "storage"), ("host", "storage")),
+            (("host", "storage"),),
         ),
     ):
         available = (

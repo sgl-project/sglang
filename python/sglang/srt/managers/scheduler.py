@@ -225,7 +225,6 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
     mamba_prefill_chunk_grid,
-    running_request_token_offset,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -722,9 +721,6 @@ class Scheduler(
                 self.tree_cache,
                 runtime_config(),
                 namespace_keys=True,
-            )
-            self.kv_control_service.control.executor.gpu_copy_capacity = (
-                self._kv_control_gpu_copy_capacity
             )
 
         # Init request dispatcher
@@ -3068,27 +3064,6 @@ class Scheduler(
             request_id=recv_req.request_id,
             result=dispatch(self.kv_control_service, recv_req.command),
         )
-
-    def _kv_control_gpu_copy_capacity(self):
-        # Called for native transfer approval, after holding selected cache
-        # prefixes. Reuse the allocator budget and the prefill growth estimate;
-        # no extra reservation is carried into ordinary request admission.
-        budget = self.token_to_kv_pool_allocator.create_prefill_budget(self.tree_cache)
-        requests = list(self.running_batch.reqs)
-        if self.chunked_req is not None and not any(
-            req is self.chunked_req for req in requests
-        ):
-            requests.append(self.chunked_req)
-        ratio = self.new_token_ratio_tracker.current
-        budget.total_offset += sum(
-            max(0, running_request_token_offset(req, ratio))
-            for req in requests
-            if not req.finished()
-        )
-        # A negative remainder means selected source/destination holds already
-        # consume headroom needed by running decode. Preserve that fact even
-        # when a copy needs zero new GPU rows.
-        return int(budget.remaining_total)
 
     def handle_generate_request(
         self,

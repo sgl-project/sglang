@@ -173,12 +173,7 @@ class TestProgrammableKVCache(CustomTestCase):
                     value=slots.to(torch.int64),
                 )
             )
-            self._wait(
-                service,
-                public_action(
-                    service, "demote", target, {"tier": "gpu"}, {"tier": "host"}, "host"
-                ).ref,
-            )
+            self._evict_to_host(cache, len(tokens))
             host = cache.host_pool_group.anchor_entry.host_pool
             available = host.available_size()
             location = {"tier": "storage", "backend": "mooncake"}
@@ -287,20 +282,7 @@ class TestProgrammableKVCache(CustomTestCase):
                     )
                 ).last_device_node
                 node = cache.tree_core.node_by_id(node_id)
-                cold_tier = "storage" if storage else "host"
-                result = public_action(
-                    service,
-                    "demote",
-                    target,
-                    {"tier": "gpu"},
-                    {"tier": cold_tier},
-                    "save",
-                )
-                moved = self._wait(service, result.ref)
-                self.assertEqual(
-                    moved.update.completed_steps,
-                    ("destination_ready", "source_reclaimed"),
-                )
+                self._evict_to_host(cache, 4)
                 self.assertIsNone(node.component_data[ComponentType.FULL].value)
                 self.assertEqual(allocator.available_size(), 64)
                 host = cache.host_pool_group.anchor_entry.host_pool
@@ -308,7 +290,21 @@ class TestProgrammableKVCache(CustomTestCase):
                 self.assertTrue(torch.all(host.k_buffer[0][host_slots] == 17).item())
                 self.assertTrue(torch.all(host.v_buffer[0][host_slots] == 18).item())
                 if storage:
-                    self.assertEqual(cache.evict_host(4), 4)
+                    moved = self._wait(
+                        service,
+                        public_action(
+                            service,
+                            "demote",
+                            target,
+                            {"tier": "host"},
+                            {"tier": "storage"},
+                            "save",
+                        ).ref,
+                    )
+                    self.assertEqual(
+                        moved.update.completed_steps,
+                        ("destination_ready", "source_reclaimed"),
+                    )
                 # Reusing the same allocator slots must still require an actual copy.
                 pool.k_buffer[0].fill_(-17)
                 pool.v_buffer[0].fill_(-18)
@@ -420,8 +416,9 @@ class TestProgrammableKVCache(CustomTestCase):
                 [p["storage_digest"] for p in desc_a["pages"]],
             )
             writer_available = a.token_to_kv_pool_allocator.available_size()
+            self._evict_to_host(a, 4)
             saved = public_action(
-                sa, "demote", target, {"tier": "gpu"}, location, "save"
+                sa, "demote", target, {"tier": "host"}, location, "save"
             )
             saved = self._wait(sa, saved.ref)
             self.assertTrue(saved.public_result.preserved_scope)
@@ -519,6 +516,11 @@ class TestProgrammableKVCache(CustomTestCase):
             self.assertFalse(sb.has_pending)
             a.sanity_check()
             b.sanity_check()
+
+    def _evict_to_host(self, cache, count):
+        # Let the test's DEMOTE perform the first storage write.
+        with patch.object(cache, "write_backup_storage"):
+            cache.evict(EvictParams(num_tokens=count))
 
     def _load_for_inference(self, cache, node):
         with patch.object(cache, "load_back_threshold", 1):

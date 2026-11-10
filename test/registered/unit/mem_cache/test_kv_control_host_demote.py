@@ -13,7 +13,8 @@ from test_kv_control_transfers import (
     hicache,
     public_transfer,
     seed,
-    stage,
+    backup_prefix,
+    wait_for,
     start_inference_load,
     wait,
 )
@@ -22,14 +23,6 @@ from sglang.srt.managers.kv_control.contracts import Status
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-
-
-def host_source(
-    service, dma, *, tokens=(1, 2, 3, 4), message="host", status=Status.COMPLETED
-):
-    result = public_transfer(service, "demote", "gpu", "host", message, tokens=tokens)
-    stage(service, dma)
-    assert wait(service, result).status == status
 
 
 def ranges(outcomes):
@@ -60,7 +53,7 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
             ):
                 _, cache, service, dma = owner
                 node = seed(cache)
-                host_source(service, dma)
+                backup_prefix(cache, dma, node, evict=True)
                 pool = cache.host_pool_group.anchor_entry.host_pool
                 initial = pool.available_size()
                 self.assertIn(
@@ -100,8 +93,8 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
             ancestor = seed(cache, (1, 2))
             leaf = seed(cache)
             sibling = seed(cache, (1, 2, 5, 6), value=11)
-            host_source(service, dma, message="one", status=Status.PARTIAL)
-            host_source(service, dma, tokens=(1, 2, 5, 6), message="two")
+            backup_prefix(cache, dma, leaf, evict=True)
+            backup_prefix(cache, dma, sibling, evict=True)
             pool = cache.host_pool_group.anchor_entry.host_pool
             initial = pool.available_size()
             result = public_transfer(service, "demote", "host", "storage", "cold")
@@ -128,11 +121,7 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
         with hicache(self, storage=True) as owner:
             _, cache, service, dma = owner
             node = seed(cache)
-            from test_kv_control_transfers import transfer
-
-            copied = transfer(service)
-            stage(service, dma)
-            self.assertEqual(wait(service, copied).status, Status.COMPLETED)
+            backup_prefix(cache, dma, node)
             pool = cache.host_pool_group.anchor_entry.host_pool
             initial = pool.available_size()
             done = wait(
@@ -160,7 +149,7 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
             ):
                 _, cache, service, dma = owner
                 node = seed(cache)
-                host_source(service, dma)
+                backup_prefix(cache, dma, node, evict=True)
                 pool = cache.host_pool_group.anchor_entry.host_pool
                 initial = pool.available_size()
                 if protection == "pin":
@@ -214,8 +203,8 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
 
         with hicache(self, storage=True) as owner:
             _, cache, service, dma = owner
-            seed(cache)
-            host_source(service, dma)
+            node = seed(cache)
+            backup_prefix(cache, dma, node, evict=True)
             pool = cache.host_pool_group.anchor_entry.host_pool
             initial = pool.available_size()
             entered, release = threading.Event(), threading.Event()
@@ -255,7 +244,7 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
         with hicache(self, storage=True, write_policy="write_through") as owner:
             _, cache, service, dma = owner
             node = seed(cache)
-            host_source(service, dma)
+            backup_prefix(cache, dma, node, evict=True)
             pool = cache.host_pool_group.anchor_entry.host_pool
             initial = pool.available_size()
             entered, release = threading.Event(), threading.Event()
@@ -301,7 +290,7 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
         with hicache(self, storage=True) as owner:
             _, cache, service, dma = owner
             node = seed(cache)
-            host_source(service, dma)
+            backup_prefix(cache, dma, node, evict=True)
             pool = cache.host_pool_group.anchor_entry.host_pool
             initial = pool.available_size()
             cc = cache.cache_controller
@@ -333,14 +322,17 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
     def test_missing_prior_backup_is_rewritten_before_host_reclamation(self):
         from pathlib import Path
 
-        from test_kv_control_transfers import transfer
-
         with hicache(self, storage=True) as owner:
             _, cache, service, dma = owner
             node = seed(cache)
-            host_source(service, dma)
-            saved = transfer(service, src="host", dst="storage", message="save")
-            self.assertEqual(wait(service, saved).status, Status.COMPLETED)
+            backup_prefix(cache, dma, node, evict=True)
+            cache.write_backup_storage(node.id)
+
+            def saved():
+                cache.drain_storage_control_queues()
+                return not cache.ongoing_backup
+
+            wait_for(service, saved)
             cc = cache.cache_controller
             hashes = cache.tree_core.get_hash_values(node.id)
             files = [
@@ -364,7 +356,7 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
         with hicache(self, storage=True) as owner:
             _, cache, service, dma = owner
             node = seed(cache)
-            host_source(service, dma)
+            backup_prefix(cache, dma, node, evict=True)
             pool = cache.host_pool_group.anchor_entry.host_pool
             initial = pool.available_size()
             result = public_transfer(
@@ -380,7 +372,7 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
         with hicache(self, storage=True) as owner:
             _, cache, service, dma = owner
             node = seed(cache)
-            host_source(service, dma)
+            backup_prefix(cache, dma, node, evict=True)
             pool = cache.host_pool_group.anchor_entry.host_pool
             initial = pool.available_size()
             entered, release = threading.Event(), threading.Event()

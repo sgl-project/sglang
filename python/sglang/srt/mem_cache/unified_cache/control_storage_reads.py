@@ -38,7 +38,7 @@ class _Read:
         default_factory=lambda: CacheRequestHandle("native-kv:" + uuid.uuid4().hex, 0)
     )
     interests: set[str] = field(default_factory=set)
-    gpu_locks: list = field(default_factory=list)
+    anchor_lock: object = None
     host_locks: list = field(default_factory=list)
     anchor: int | None = None
     operation: object = None
@@ -81,7 +81,6 @@ class StorageCacheReads:
 
     def __init__(self, executor):
         self.executor, self.cache = executor, executor.cache
-        self.host = executor.transfers
         self.jobs: dict[bytes, _Read] = {}
         self.interests: dict[str, _Interest] = {}
         self.demands: dict[CacheRequestHandle, _Demand] = {}
@@ -225,21 +224,9 @@ class StorageCacheReads:
             raise ControlError(
                 "unsupported", "Storage prefetch requires a local host destination"
             )
-        if len(work.target.branches) != 1:
-            raise ControlError(
-                "unsupported", "Storage reads require one complete prefix"
-            )
         if min(work.max_result_targets, self.executor.config.max_result_targets) < 2:
             raise ControlError("capacity", "Storage reads reserve two outcome ranges")
-        projection = msgspec.structs.replace(
-            work,
-            payload=CopyTo(
-                target=payload.target,
-                src=Location(tier="gpu"),
-                dst=Location(tier="host"),
-            ),
-        )
-        return self.host._prefixes(projection)[0]
+        return self.executor._storage_prefix(work)
 
     def _rows(self, job):
         path = self.executor._walk(job.tokens, job.compatibility)
@@ -253,10 +240,10 @@ class StorageCacheReads:
         rows = self._rows(job)
         if rows and rows[-1][0].id != job.anchor:
             new = self.cache.lock(rows[-1][0].id)
-            self.host._release_gpu(job)
-            job.gpu_locks.append(new)
+            self._release_anchor(job)
+            job.anchor_lock = new
             job.anchor = rows[-1][0].id
-        self.host._host_hold(job, [n for n, _, _ in rows])
+        self.executor._hold_host(job.host_locks, [n for n, _, _ in rows])
 
     def _published(self, job):
         # Called on the owner thread inside actual host publication, before
@@ -266,9 +253,14 @@ class StorageCacheReads:
         except Exception as error:
             job.failure = ("publication_error", str(error)[:512])
 
+    def _release_anchor(self, job):
+        if job.anchor_lock is not None:
+            self.cache.unlock(job.anchor_lock)
+            job.anchor_lock = None
+
     def _release(self, job):
-        self.host._release_host(job)
-        self.host._release_gpu(job)
+        self.executor._release_host(job.host_locks)
+        self._release_anchor(job)
         job.anchor = None
 
     def _host_length(self, job):
@@ -324,7 +316,7 @@ class StorageCacheReads:
                 return
             rows = self._rows(job)
             if any(
-                n.write_through_pending_id is not None or self.host._load_pending(n)
+                n.write_through_pending_id is not None or self.executor._load_pending(n)
                 for n, _, _ in rows
             ):
                 job.waiting = "source_pending"

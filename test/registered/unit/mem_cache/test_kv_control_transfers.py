@@ -15,7 +15,6 @@ import test_kv_control_cache as cache_fixtures
 import torch
 
 from sglang.srt.managers.kv_control.contracts import (
-    Location,
     Status,
 )
 from sglang.srt.managers.kv_control.service import (
@@ -106,39 +105,24 @@ class ControlledDMA:
 def transfer(
     service,
     *,
-    kind="copy_to",
-    src="gpu",
+    src="storage",
     dst="host",
     caller="A",
     message="copy",
     tokens=(1, 2, 3, 4),
     selection=None,
-    submission=False,
 ):
-    result = service.control.submit(
-        KvHintsEnvelope(
-            protocol_version="0.1",
-            message_id=message,
-            actions=[
-                KvHintAction(
-                    action_id="a",
-                    action_type="sglang." + kind,
-                    action_version="1.0",
-                    payload={
-                        "target": msgspec.json.decode(
-                            msgspec.json.encode(
-                                selection or cache_fixtures.target(tokens)
-                            )
-                        ),
-                        "src": {"tier": src},
-                        "dst": {"tier": dst},
-                    },
-                )
-            ],
-        ),
-        service.control.context(caller),
+    return public_transfer(
+        service,
+        "prefetch",
+        src,
+        dst,
+        message,
+        caller=caller,
+        tokens=selection.token_ids if selection is not None else tokens,
+        salt=selection.cache_salt if selection is not None else None,
+        timeout_ms=None,
     )
-    return result if submission else result.results[0]
 
 
 def current(service, result):
@@ -278,6 +262,7 @@ def public_transfer(
     tokens=(1, 2, 3, 4),
     caller="router",
     salt=None,
+    timeout_ms=5000,
 ):
     from sglang.srt.managers.kv_control.contracts import HASH_SCHEME
 
@@ -305,7 +290,7 @@ def public_transfer(
                         },
                         "source": {"tier": source},
                         "destination": {"tier": destination},
-                        "timeout_ms": 5000,
+                        "timeout_ms": timeout_ms,
                     },
                 )
             ],
@@ -315,362 +300,33 @@ def public_transfer(
 
 
 class TestKVControlTransfers(cache_fixtures.KVCacheTestCase):
-    def test_gpu_destination_is_rejected_and_native_load_preserves_bytes(self):
-        with hicache(self, storage=True) as owner:
-            _, cache, service, dma = owner
+    def test_gpu_transfer_directions_are_rejected_and_inference_loads_host_bytes(self):
+        with hicache(self, storage=True) as (_, cache, service, dma):
             node = seed(cache)
-            initial = cache.token_to_kv_pool_allocator.available_size()
-            result = public_transfer(service, "demote", "gpu", "host", "demote")
-            assert result.status == Status.RUNNING, result
-            assert not result.public_result.ready_scope
-            assert result.public_result.ready_location is None
-            assert not result.public_result.reclaimed_scope
-            assert node.component_data[FULL].value is not None
-            service.progress()
-            dma.finish()
-            service.progress()
-            done = current(service, result)
-            assert done.status == Status.COMPLETED, done
-            assert done.public_result.preserved_scope
-            assert done.public_result.reclaimed_scope
-            assert node.component_data[FULL].value is None
-            assert cache.token_to_kv_pool_allocator.available_size() == initial + 4
-            for source in ("host", "storage"):
-                rejected = public_transfer(
-                    service, "prefetch", source, "gpu", f"{source}-to-gpu"
+            for kind, source, destination in (
+                ("prefetch", "host", "gpu"),
+                ("prefetch", "storage", "gpu"),
+                ("demote", "gpu", "host"),
+                ("demote", "gpu", "storage"),
+            ):
+                result = public_transfer(
+                    service, kind, source, destination, f"{source}-{destination}"
                 )
-                assert rejected.status == Status.UNSUPPORTED
-            assert not dma.pending
-            start_inference_load(cache, node)
-            dma.finish()
-            cache.loading_check()
+                self.assertEqual(result.status, Status.UNSUPPORTED)
+            self.assertFalse(dma.pending)
+            backup_prefix(cache, dma, node, evict=True)
             cd = node.component_data[FULL]
+            self.assertIsNone(cd.value)
             pool = cache.token_to_kv_pool_allocator.get_kvcache()
-            assert torch.all(pool.k_buffer[0][cd.value] == 7)
-            assert cd.lock_ref == cd.host_lock_ref == 0
-            cache.sanity_check()
-
-    def test_demote_retains_live_ancestors_and_reclaims_only_eligible_ranges(self):
-        for destination in ("host", "storage"):
-            for blocker in ("active_reference", "structural_dependency"):
-                with (
-                    self.subTest(destination=destination, blocker=blocker),
-                    hicache(self, storage=destination == "storage") as owner,
-                ):
-                    _, cache, service, dma = owner
-                    ancestor = seed(cache, (1, 2))
-                    leaf = seed(cache)
-                    sibling = (
-                        seed(cache, (1, 2, 5, 6))
-                        if blocker == "structural_dependency"
-                        else None
-                    )
-                    lock = (
-                        cache.lock(ancestor.id)
-                        if blocker == "active_reference"
-                        else None
-                    )
-                    initial = cache.token_to_kv_pool_allocator.available_size()
-                    try:
-                        result = public_transfer(
-                            service, "demote", "gpu", destination, "partial"
-                        )
-                        stage(service, dma)
-                        done = wait(service, result)
-                        self.assertEqual(done.status, Status.PARTIAL)
-                        self.assertEqual(
-                            cache.token_to_kv_pool_allocator.available_size(),
-                            initial + 2,
-                        )
-                        self.assertIsNone(leaf.component_data[FULL].value)
-                        self.assertIsNotNone(ancestor.component_data[FULL].value)
-                        self.assertEqual(
-                            [
-                                (o.coverage.start_token, o.coverage.end_token, o.code)
-                                for o in done.public_result.blocked_scope
-                            ],
-                            [(0, 2, blocker)],
-                        )
-                        self.assertEqual(
-                            [
-                                (o.coverage.start_token, o.coverage.end_token)
-                                for o in done.public_result.reclaimed_scope
-                            ],
-                            [(2, 4)],
-                        )
-                        self.assertEqual(
-                            sum(
-                                o.coverage.end_token - o.coverage.start_token
-                                for o in done.public_result.preserved_scope
-                            ),
-                            4,
-                        )
-                        if sibling is not None:
-                            self.assertIsNotNone(sibling.component_data[FULL].value)
-                        else:
-                            cache.unlock(lock)
-                            lock = None
-                            submissions = list(dma.submitted)
-                            retry = public_transfer(
-                                service,
-                                "demote",
-                                "gpu",
-                                destination,
-                                "retry",
-                                tokens=(1, 2),
-                            )
-                            self.assertEqual(
-                                wait(service, retry).status, Status.COMPLETED
-                            )
-                            self.assertEqual(
-                                dma.submitted, submissions
-                            )  # existing host copy
-                            self.assertEqual(
-                                cache.token_to_kv_pool_allocator.available_size(),
-                                initial + 4,
-                            )
-                        self.assertEqual(
-                            current(service, result), done
-                        )  # immutable historical outcome
-                        cache.sanity_check()
-                    finally:
-                        if lock is not None:
-                            cache.unlock(lock)
-
-    def test_demote_does_not_wait_for_foreign_load_or_cancel_it(self):
-        with hicache(self) as owner:
-            _, cache, service, dma = owner
-            node = seed(cache)
-            saved = transfer(service, kind="move_to")
-            stage(service, dma)
-            self.assertEqual(wait(service, saved).status, Status.COMPLETED)
+            pool.k_buffer[0].fill_(-7)
+            pool.v_buffer[0].fill_(-8)
             start_inference_load(cache, node)
-            initial = cache.token_to_kv_pool_allocator.available_size()
-            result = public_transfer(service, "demote", "gpu", "host", "blocked")
-            self.assertEqual(result.status, Status.PARTIAL)
-            self.assertEqual(
-                {o.code for o in result.public_result.blocked_scope}, {"inflight_load"}
-            )
-            self.assertTrue(result.public_result.preserved_scope)
-            self.assertFalse(result.public_result.reclaimed_scope)
-            self.assertEqual(cache.token_to_kv_pool_allocator.available_size(), initial)
-            self.assertTrue(cache.ongoing_load_back)
             dma.finish()
             cache.loading_check()
-            self.assertFalse(cache.ongoing_load_back)
-            retry = public_transfer(service, "demote", "gpu", "host", "retry")
-            self.assertEqual(wait(service, retry).status, Status.COMPLETED)
-            self.assertIsNone(node.component_data[FULL].value)
-
-    def test_cancelled_shared_demote_keeps_published_scope_and_other_demand(self):
-        with hicache(self) as owner:
-            _, cache, service, dma = owner
-            seed(cache, (1, 2))
-            seed(cache)
-            copied = transfer(service, tokens=(1, 2))
-            stage(service, dma)
-            self.assertEqual(wait(service, copied).status, Status.COMPLETED)
-            a = public_transfer(service, "demote", "gpu", "host", "a", caller="A")
-            b = public_transfer(service, "demote", "gpu", "host", "b", caller="B")
-            self.assertEqual(len(service.control.executor.transfers.jobs), 1)
-            service.progress()
-            self.assertEqual(len(dma.pending), 1)
-            cancelled = service.control.cancel(a.ref)
-            self.assertEqual(cancelled.status, Status.CANCELLED)
-            self.assertEqual(
-                [
-                    (o.coverage.start_token, o.coverage.end_token)
-                    for o in cancelled.public_result.preserved_scope
-                ],
-                [(0, 2)],
-            )
-            self.assertFalse(cancelled.public_result.reclaimed_scope)
-            self.assertFalse(cancelled.public_result.missing_scope)
-            dma.finish()
-            done = wait(service, b)
-            self.assertEqual(done.status, Status.COMPLETED)
-            self.assertTrue(done.public_result.reclaimed_scope)
-            self.assertEqual(
-                cache.token_to_kv_pool_allocator.available_size(),
-                cache.token_to_kv_pool_allocator.size,
-            )
-            self.assertEqual(current(service, a), cancelled)
-            cache.sanity_check()
-
-    def test_failed_public_host_backup_preserves_ready_prefix_and_all_source(self):
-        with hicache(self) as owner:
-            _, cache, service, dma = owner
-            ancestor = seed(cache, (1, 2))
-            leaf = seed(cache)
-            initial = cache.token_to_kv_pool_allocator.available_size()
-            original = cache.cache_controller.write
-            calls = 0
-
-            def fail_tail(*args, **kwargs):
-                nonlocal calls
-                calls += 1
-                return original(*args, **kwargs) if calls == 1 else None
-
-            with patch.object(cache.cache_controller, "write", fail_tail):
-                result = public_transfer(service, "demote", "gpu", "host", "failed")
-            service.progress()
-            self.assertFalse(current(service, result).update.quiescent)
-            dma.finish()
-            done = wait(service, result)
-            self.assertEqual(done.status, Status.FAILED)
-            self.assertEqual(
-                [
-                    (o.coverage.start_token, o.coverage.end_token)
-                    for o in done.public_result.preserved_scope
-                ],
-                [(0, 2)],
-            )
-            self.assertEqual(
-                [
-                    (o.coverage.start_token, o.coverage.end_token)
-                    for o in done.public_result.missing_scope
-                ],
-                [(2, 4)],
-            )
-            self.assertEqual(
-                {o.code for o in done.public_result.blocked_scope}, {"capacity"}
-            )
-            self.assertFalse(done.public_result.reclaimed_scope)
-            self.assertEqual(cache.token_to_kv_pool_allocator.available_size(), initial)
-            self.assertIsNotNone(ancestor.component_data[FULL].value)
-            self.assertIsNotNone(leaf.component_data[FULL].value)
-            self.assertEqual(cache.tree_core.full_protected_size(), 0)
-            cache.sanity_check()
-
-    def test_cancelled_demote_drains_backup_and_preserves_source(self):
-        with hicache(self) as owner:
-            _, cache, service, dma = owner
-            node = seed(cache)
-            initial = cache.token_to_kv_pool_allocator.available_size()
-            result = public_transfer(service, "demote", "gpu", "host", "cancel")
-            service.progress()
-            cancelled = service.control.cancel(result.ref)
-            self.assertFalse(cancelled.update.quiescent)
-            self.assertFalse(cancelled.public_result.ready_scope)
-            self.assertGreater(node.component_data[FULL].lock_ref, 0)
-            dma.finish()
-            done = wait(service, result)
-            self.assertEqual(done.status, Status.CANCELLED)
-            self.assertEqual(done.update.completed_steps, ("destination_ready",))
-            self.assertTrue(done.public_result.preserved_scope)
-            self.assertEqual(
-                {o.code for o in done.public_result.blocked_scope}, {"cancelled"}
-            )
-            self.assertFalse(done.public_result.reclaimed_scope)
-            self.assertEqual(cache.token_to_kv_pool_allocator.available_size(), initial)
-            self.assertIsNotNone(node.component_data[FULL].value)
-            self.assertEqual(node.component_data[FULL].lock_ref, 0)
-
-    def test_copy_waits_for_fence_preserves_bytes_and_pool_ownership(self):
-        with hicache(self) as owner:
-            _, cache, service, dma = owner
-            node = seed(cache)
-            initial = cache.token_to_kv_pool_allocator.available_size()
-            result = transfer(service)
-            assert result.status == Status.RUNNING
-            service.progress()
-            assert current(service, result).status == Status.RUNNING
-            assert node.component_data[ComponentType.FULL].lock_ref > 0
-            assert node not in cache.tree_core.evictable_device_leaves
-            assert cache.tree_core.full_protected_size() == 4
-            assert len(dma.pending) == 1
-            dma.finish()
-            service.progress()
-            assert current(service, result).status == Status.COMPLETED, current(
-                service, result
-            )
-            cd = node.component_data[ComponentType.FULL]
-            host = cache.host_pool_group.anchor_entry.host_pool
-            assert torch.all(host.k_buffer[0][cd.host_value] == 7)
-            assert cd.value is not None and cd.lock_ref == cd.host_lock_ref == 0
-            assert cache.token_to_kv_pool_allocator.available_size() == initial
-            assert not service.control.executor.transfers.interests
-            snapshot = service.control.executor.residency(
-                service.control.index.resolve(cache_fixtures.target()),
-                location=Location(tier="host"),
-            )
-            assert snapshot.items[0].location.tier == "host"
-            assert snapshot.items[0].lock_ref == 0
-            cache.sanity_check()
-
-    def test_shared_waiter_cancel_does_not_cancel_other_interest_or_release_dma(self):
-        with hicache(self) as owner:
-            _, cache, service, dma = owner
-            node = seed(cache)
-            first = transfer(service, caller="A")
-            second = transfer(service, caller="B")
-            service.progress()
-            service.control.cancel(first.ref)
-            assert current(service, first).status == Status.CANCELLED
-            assert node.component_data[ComponentType.FULL].lock_ref > 0
-            assert len(dma.submitted) == 1
-            service.control.cancel(second.ref)
-            assert current(service, second).status == Status.CANCELLING
-            assert node.component_data[ComponentType.FULL].lock_ref > 0
-            dma.finish()
-            service.progress()
-            assert current(service, second).status == Status.CANCELLED
-            assert node.component_data[ComponentType.FULL].lock_ref == 0
-            assert not service.control.executor.transfers.jobs
-            cache.sanity_check()
-
-    def test_partial_submission_failure_keeps_cause_after_cancel_ack_and_retry(self):
-        with hicache(self) as owner:
-            _, cache, service, dma = owner
-            seed(cache, (1, 2), value=7)
-            seed(cache, (1, 2, 3, 4), value=11)
-            controller = cache.cache_controller
-            original = controller.write
-            calls = 0
-
-            def write(*args, **kwargs):
-                nonlocal calls
-                calls += 1
-                return original(*args, **kwargs) if calls == 1 else None
-
-            with patch.object(controller, "write", side_effect=write):
-                failed = transfer(service)
-            assert failed.status == Status.CANCELLING, failed
-            assert failed.update.code == "capacity"
-            service.control.cancel(failed.ref)
-            service.progress()
-            assert current(service, failed).status == Status.CANCELLING
-            assert cache.tree_core.full_protected_size() == 4
-            dma.finish()
-            service.progress()
-            result = current(service, failed)
-            assert (
-                result.status == Status.FAILED and result.update.code == "capacity"
-            ), result
-            assert any(
-                (
-                    o.completed_steps == ("destination_ready",)
-                    for o in result.update.target_outcomes
-                )
-            )
-            acknowledgement = service.control.registry.acknowledge(
-                failed.ref.context, failed.ref.message_id
-            )
-            assert acknowledgement.summaries[0].status == Status.FAILED
-            replay = transfer(service, submission=True)
-            assert replay.replayed and replay.acknowledged
-            assert (
-                replay.summaries[0].status == Status.FAILED
-                and replay.summaries[0].code == "capacity"
-            )
-            retried = transfer(service, message="retry")
-            service.progress()
-            dma.finish()
-            service.progress()
-            assert current(service, retried).status == Status.COMPLETED, current(
-                service, retried
-            )
-            assert cache.tree_core.full_protected_size() == 0
+            self.assertTrue(torch.all(pool.k_buffer[0][cd.value] == 7))
+            self.assertTrue(torch.all(pool.v_buffer[0][cd.value] == 8))
+            self.assertEqual(cd.lock_ref, 0)
+            self.assertEqual(cd.host_lock_ref, 0)
             cache.sanity_check()
 
 
@@ -689,157 +345,50 @@ def start_inference_load(cache, node):
     cache.ready_to_load_host_cache()
 
 
-def stage(service, dma):
-    service.progress()
-    if dma.pending:
+def start_inference_backup(cache, node):
+    from sglang.srt.mem_cache.unified_cache.cache_action import BackupKV
+
+    chain = []
+    while node.parent is not None:
+        chain.append(node.id)
+        node = node.parent
+    cache._execute_and_commit_kv_backup(BackupKV(node_ids=chain[::-1]))
+    cache.flush_pending_backups()
+
+
+def finish_inference_backup(cache, dma, *, persist=False):
+    while dma.pending:
         dma.finish()
-    service.progress()
+    if persist:
+        cache.writing_check()
+    else:
+        # Leave L3 empty in tests that exercise a new DEMOTE write.
+        with patch.object(cache, "write_backup_storage"):
+            cache.writing_check()
 
 
-def assert_files(cache, node):
-    cc = cache.cache_controller
-    pool = cache.host_pool_group.anchor_entry.host_pool
-    indices = node.component_data[FULL].host_value
-    hashes = cache.tree_core.get_hash_values(node.id)
-    for i, key in enumerate(hashes):
-        expected = pool.get_data_page(indices[i]).clone()
-        actual = torch.zeros_like(expected)
-        assert cc.storage_backend.get(key, actual) is not None
-        assert torch.equal(actual, expected)
+def backup_prefix(cache, dma, node, *, evict=False, persist=False):
+    start_inference_backup(cache, node)
+    finish_inference_backup(cache, dma, persist=persist)
+    assert node.component_data[FULL].host_value is not None
+    if evict:
+        tracker = {FULL: 0}
+        while node.parent is not None and cache.tree_core._is_device_leaf(node):
+            assert cache._evict_device_leaf(node.id, tracker) is None
+            node = node.parent
+
+
+def persist_prefix(cache, service, dma, node):
+    backup_prefix(cache, dma, node, evict=True, persist=True)
+
+    def finished():
+        cache.drain_storage_control_queues()
+        return not cache.ongoing_backup
+
+    wait_for(service, finished)
 
 
 class TestKVControlStorage(cache_fixtures.KVCacheTestCase):
-    def test_demote_classifies_foreign_storage_backup_without_waiting(self):
-        with hicache(self, storage=True) as owner:
-            _, cache, service, dma = owner
-            node = seed(cache)
-            cc = cache.cache_controller
-            entered, release = threading.Event(), threading.Event()
-            original = cc.page_set_func
-
-            def blocked(*args, **kwargs):
-                entered.set()
-                assert release.wait(5)
-                return original(*args, **kwargs)
-
-            try:
-                with patch.object(cc, "page_set_func", blocked):
-                    copied = transfer(service, dst="storage")
-                    stage(service, dma)
-                    self.assertTrue(entered.wait(5))
-                    result = public_transfer(service, "demote", "gpu", "host", "demote")
-                    service.progress()
-                    done = current(service, result)
-                    self.assertEqual(done.status, Status.PARTIAL)
-                    self.assertEqual(
-                        {o.code for o in done.public_result.blocked_scope},
-                        {"inflight_backup"},
-                    )
-                    self.assertTrue(done.public_result.preserved_scope)
-                    self.assertFalse(done.public_result.reclaimed_scope)
-                    self.assertIsNotNone(node.component_data[FULL].value)
-                    self.assertEqual(current(service, copied).status, Status.RUNNING)
-                    release.set()
-                    self.assertEqual(wait(service, copied).status, Status.COMPLETED)
-            finally:
-                release.set()
-            retried = public_transfer(service, "demote", "gpu", "storage", "retry")
-            # Native file backend must confirm existing copies without rewriting.
-            with patch(
-                "sglang.srt.mem_cache.hicache_storage.os.replace",
-                side_effect=AssertionError("redundant write"),
-            ):
-                self.assertEqual(wait(service, retried).status, Status.COMPLETED)
-            self.assertIsNone(node.component_data[FULL].value)
-            assert_files(cache, node)
-
-    def test_cancelled_storage_demote_keeps_confirmed_backup_without_reclaiming(self):
-        with hicache(self, storage=True) as owner:
-            _, cache, service, dma = owner
-            node = seed(cache)
-            initial = cache.token_to_kv_pool_allocator.available_size()
-            entered, release = threading.Event(), threading.Event()
-            cc = cache.cache_controller
-            original = cc.page_set_func
-
-            def blocked(*args, **kwargs):
-                success = original(*args, **kwargs)
-                entered.set()
-                assert release.wait(5)
-                return success
-
-            try:
-                with patch.object(cc, "page_set_func", blocked):
-                    result = public_transfer(
-                        service, "demote", "gpu", "storage", "cancel"
-                    )
-                    stage(service, dma)
-                    self.assertTrue(entered.wait(5))
-                    cancelling = service.control.cancel(result.ref)
-                    self.assertFalse(cancelling.update.quiescent)
-                    self.assertFalse(cancelling.public_result.preserved_scope)
-                    self.assertGreater(node.component_data[FULL].host_lock_ref, 0)
-                    release.set()
-                    done = wait(service, result)
-            finally:
-                release.set()
-            self.assertEqual(done.status, Status.CANCELLED)
-            self.assertTrue(done.public_result.preserved_scope)
-            self.assertFalse(done.public_result.reclaimed_scope)
-            self.assertEqual(
-                {o.code for o in done.public_result.blocked_scope}, {"cancelled"}
-            )
-            self.assertEqual(done.update.completed_steps, ("destination_ready",))
-            self.assertEqual(cache.token_to_kv_pool_allocator.available_size(), initial)
-            self.assertEqual(node.component_data[FULL].lock_ref, 0)
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            assert_files(cache, node)
-
-    def test_public_demote_partial_storage_ack_preserves_source_and_scopes(self):
-        with hicache(self, storage=True) as owner:
-            _, cache, service, dma = owner
-            node = seed(cache)
-            cc = cache.cache_controller
-            original = cc.page_set_func
-            calls = 0
-
-            def partial(*args, **kwargs):
-                nonlocal calls
-                calls += 1
-                return original(*args, **kwargs) if calls == 1 else False
-
-            initial = cache.token_to_kv_pool_allocator.available_size()
-            with (
-                patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 2),
-                patch.object(cc, "page_set_func", partial),
-            ):
-                result = public_transfer(service, "demote", "gpu", "storage", "partial")
-                stage(service, dma)
-                done = wait(service, result)
-            self.assertEqual(done.status, Status.FAILED)
-            self.assertEqual(
-                [
-                    (o.coverage.start_token, o.coverage.end_token)
-                    for o in done.public_result.preserved_scope
-                ],
-                [(0, 2)],
-            )
-            self.assertEqual(
-                [
-                    (o.coverage.start_token, o.coverage.end_token)
-                    for o in done.public_result.missing_scope
-                ],
-                [(2, 4)],
-            )
-            self.assertEqual(
-                {o.code for o in done.public_result.blocked_scope},
-                {"incomplete_storage_write"},
-            )
-            self.assertFalse(done.public_result.reclaimed_scope)
-            self.assertEqual(cache.token_to_kv_pool_allocator.available_size(), initial)
-            self.assertIsNotNone(node.component_data[FULL].value)
-            self.assertEqual(node.component_data[FULL].lock_ref, 0)
-
     def test_storage_namespace_description_and_backend_mismatch(self):
         from pathlib import Path
 
@@ -882,10 +431,9 @@ class TestKVControlStorage(cache_fixtures.KVCacheTestCase):
                             type=Command,
                         )
                     )
-            seed(cache)
-            result = transfer(service, dst="storage")
-            service.progress()
-            dma.finish()
+            node = seed(cache)
+            backup_prefix(cache, dma, node, evict=True)
+            result = public_transfer(service, "demote", "host", "storage", "save")
             done = wait(service, result)
             self.assertEqual(done.status, Status.COMPLETED)
             self.assertTrue(all(path.exists() for path in paths))
@@ -954,95 +502,10 @@ class TestKVControlStorage(cache_fixtures.KVCacheTestCase):
             ):
                 self.assertEqual(store.batch_set_v1(["digest"], indices), [True])
 
-    def test_copy_and_move_wait_for_storage_worker_not_enqueue(self):
-        with hicache(self, storage=True) as owner:
-            _, cache, service, dma = owner
-            node = seed(cache)
-            cc = cache.cache_controller
-            entered, release = (threading.Event(), threading.Event())
-            original = cc.page_set_func
-
-            def blocked(*args, **kwargs):
-                entered.set()
-                assert release.wait(5)
-                return original(*args, **kwargs)
-
-            try:
-                with patch.object(cc, "page_set_func", blocked):
-                    result = transfer(service, dst="storage", kind="move_to")
-                    stage(service, dma)
-                    assert entered.wait(5)
-                    for _ in range(3):
-                        service.progress()
-                    assert current(service, result).status == Status.RUNNING
-                    cd = node.component_data[FULL]
-                    assert (
-                        cd.value is not None
-                        and cd.lock_ref > 0
-                        and (cd.host_lock_ref > 0)
-                    )
-                    assert not current(service, result).update.completed_steps
-                    assert cache._storage_attachment.detach()[0] is False
-                    release.set()
-                    done = wait(service, result)
-            finally:
-                release.set()
-            assert done.status == Status.COMPLETED, done
-            assert done.update.completed_steps == (
-                "destination_ready",
-                "source_reclaimed",
-            )
-            assert node.component_data[FULL].value is None
-            assert_files(cache, node)
-            assert not service.control.executor.storage.jobs
-            assert not cache._native_storage_write_results
-            assert cd.lock_ref == cd.host_lock_ref == 0
-
-    def test_short_ack_preserves_source_and_actual_prefix_and_failure_on_ack(self):
-        with hicache(self, storage=True) as owner:
-            _, cache, service, dma = owner
-            node = seed(cache)
-            cc = cache.cache_controller
-            original = cc.page_set_func
-            count = 0
-
-            def fail_second(*args, **kwargs):
-                nonlocal count
-                count += 1
-                return original(*args, **kwargs) if count == 1 else False
-
-            with (
-                patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 2),
-                patch.object(cc, "page_set_func", fail_second),
-            ):
-                result = transfer(service, dst="storage", kind="move_to")
-                stage(service, dma)
-                done = wait(service, result)
-            assert (
-                done.status == Status.FAILED
-                and done.update.code == "incomplete_storage_write"
-            ), done
-            assert node.component_data[FULL].value is not None
-            assert [
-                (o.coverage.start_token, o.coverage.end_token, o.completed_steps)
-                for o in done.update.target_outcomes
-            ] == [(0, 2, ("destination_ready",)), (2, 4, ())]
-            acknowledged = service.control.registry.acknowledge(
-                result.ref.context, result.ref.message_id
-            )
-            assert acknowledged.summaries[0].status == Status.FAILED
-            assert acknowledged.summaries[0].code == done.update.code
-            retry = transfer(service, dst="storage", kind="move_to", message="retry")
-            assert wait(service, retry).status == Status.COMPLETED
-            assert_files(cache, node)
-
 
 def cold_prefix(owner):
     _, cache, service, dma = owner
-    seed(cache)
-    result = transfer(service, kind="move_to", dst="storage")
-    stage(service, dma)
-    assert wait(service, result).status == Status.COMPLETED
+    persist_prefix(cache, service, dma, seed(cache))
     assert cache.evict_host(4) == 4
     assert not service.control.executor._walk(
         (1, 2, 3, 4), service.control.executor._compatibility(cache_fixtures.target())
@@ -1081,16 +544,10 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
     def _cold_scopes(self, owner, scopes):
         _, cache, service, dma = owner
         for index, target in enumerate(scopes):
-            seed(cache, target.token_ids, value=7 + index * 2, salt=target.cache_salt)
-            result = transfer(
-                service,
-                kind="move_to",
-                dst="storage",
-                selection=target,
-                message=f"publish-{index}",
+            node = seed(
+                cache, target.token_ids, value=7 + index * 2, salt=target.cache_salt
             )
-            stage(service, dma)
-            self.assertEqual(wait(service, result).status, Status.COMPLETED)
+            persist_prefix(cache, service, dma, node)
             self.assertEqual(
                 cache.evict_host(len(target.token_ids)), len(target.token_ids)
             )
@@ -2331,7 +1788,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 cache.sanity_check()
 
     def _host_pressure(self, owner, *, leave_free=0):
-        """Fill real host rows via CPU DMA and native MOVE; keep GPU empty."""
+        """Fill real host rows via native HiCache backup; keep GPU empty."""
         _, cache, service, dma = owner
         pool = cache.cache_controller.mem_pool_host
         nodes = []
@@ -2344,11 +1801,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 range(1000 + len(nodes) * 100, 1000 + len(nodes) * 100 + count)
             )
             node = seed(cache, tokens, value=11 + len(nodes))
-            result = transfer(
-                service, kind="move_to", tokens=tokens, message=f"pressure-{len(nodes)}"
-            )
-            stage(service, dma)
-            self.assertEqual(wait(service, result).status, Status.COMPLETED)
+            backup_prefix(cache, dma, node, evict=True)
             self.assertIsNone(node.component_data[FULL].value)
             self.assertIsNotNone(node.component_data[FULL].host_value)
             nodes.append((node, tokens))

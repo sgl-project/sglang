@@ -317,15 +317,14 @@ class KVControlService:
             self.feedback.register_request(context, req.rid)
         return context
 
-    def _bind_executor(self, capacity=None):
+    def _bind_executor(self):
         executor = self.cache.create_kv_control_executor(
             engine_id=self.control.registry.engine_id,
             engine_epoch=self.control.registry.engine_epoch,
         )
-        executor.gpu_copy_capacity = capacity
         if self.namespace_keys:
             executor.cache_salt_transform = self.cache_salt
-        if executor.transfers is not None:
+        if executor.host_control:
             executor.protection = HostCacheProtection(
                 executor,
                 limits=self.config.protection_limits,
@@ -461,9 +460,8 @@ class KVControlService:
         self.feedback.flush()
 
     def reset_after_cache_flush(self):
-        capacity = self.control.executor.gpu_copy_capacity
         self.control.reset(self.config.namespace)
-        self.control.executor = self._bind_executor(capacity)
+        self.control.executor = self._bind_executor()
         self._bind_feedback()
 
     def attach(self, req, envelope, *, unsupported_request=False):

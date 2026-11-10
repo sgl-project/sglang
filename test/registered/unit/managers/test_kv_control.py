@@ -685,8 +685,8 @@ class TestPublicKVProtocol(CustomTestCase):
             "actions": ("sglang.copy_to", "sglang.move_to"),
             "cache_generation": 7,
             "directions": {
-                "copy_to": (("storage", "host"), ("host", "gpu")),
-                "move_to": (("gpu", "host"),),
+                "copy_to": (("storage", "host"),),
+                "move_to": (("host", "storage"),),
                 "storage_backend": "file",
                 "page_alignment": 4,
             },
@@ -778,12 +778,12 @@ class TestPublicKVProtocol(CustomTestCase):
         )
         self.assertEqual(done.public_result.outcome_sequence, done.sequence)
 
-    def test_host_to_storage_demote_remains_unsupported(self):
+    def test_gpu_source_demote_is_unsupported(self):
         control, executor, _ = self.owner()
         a = self.public_action()
         a = action(
             "demote",
-            dict(a.payload, source={"tier": "host"}, destination={"tier": "storage"}),
+            dict(a.payload, source={"tier": "gpu"}, destination={"tier": "storage"}),
         )
         result = control.submit(envelope(a), control.context("A")).results[0]
         self.assertEqual(result.status, Status.UNSUPPORTED)
@@ -833,14 +833,14 @@ class TestPublicKVProtocol(CustomTestCase):
         a = self.public_action()
         a = action(
             "demote",
-            dict(a.payload, source={"tier": "gpu"}, destination={"tier": "host"}),
+            dict(a.payload, source={"tier": "host"}, destination={"tier": "storage"}),
         )
         ref = control.submit(envelope(a), control.context("A")).results[0].ref
         coverage = TokenRange(start_token=0, end_token=4, component="full")
         outcome = TargetOutcome(
             coverage=coverage,
             status=Status.PARTIAL,
-            location=Location(tier="host"),
+            location=Location(tier="storage"),
             completed_steps=("destination_ready",),
             code="active_request_reference",
         )

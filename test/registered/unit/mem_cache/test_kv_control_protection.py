@@ -67,20 +67,10 @@ def registry(owner, **limits):
     return result
 
 
-def host_copy(owner, tokens=(1, 2, 3, 4), *, message="save"):
-    _, cache, service, dma = owner
+def host_copy(owner, tokens=(1, 2, 3, 4)):
+    _, cache, _, dma = owner
     node = transfer_fixtures.seed(cache, tokens)
-    selection = msgspec.structs.replace(
-        cache_fixtures.target(tokens), namespace=service.config.namespace
-    )
-    result = transfer_fixtures.transfer(
-        service, tokens=tokens, message=message, selection=selection
-    )
-    service.progress()
-    assert transfer_fixtures.current(service, result).status == Status.RUNNING
-    dma.finish()
-    service.progress()
-    assert transfer_fixtures.current(service, result).status == Status.COMPLETED
+    transfer_fixtures.backup_prefix(cache, dma, node)
     return node
 
 
@@ -94,7 +84,7 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
         with transfer_fixtures.hicache(self) as owner:
             _, cache, _, _ = owner
             held = host_copy(owner)
-            ordinary = host_copy(owner, (8, 9, 10, 11), message="ordinary")
+            ordinary = host_copy(owner, (8, 9, 10, 11))
             pins = registry(owner)
             accepted = pins.acquire(
                 key=claim(), revision=1, prefixes=prefixes((1, 2, 3, 4)), ttl_seconds=10
@@ -126,7 +116,7 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
             pins.acquire(
                 key=claim(), revision=1, prefixes=prefixes((1, 2, 3, 4)), ttl_seconds=5
             )
-            branch = host_copy(owner, (1, 2, 5, 6), message="branch")
+            branch = host_copy(owner, (1, 2, 5, 6))
             parent = leaf.parent
             self.assertEqual(parent.component_data[FULL].host_lock_ref, 1)
             self.assertEqual(leaf.component_data[FULL].host_lock_ref, 1)
@@ -264,7 +254,7 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
     def test_capacity_rejects_before_holds_and_keeps_terminal_revision_records(self):
         with transfer_fixtures.hicache(self) as owner:
             held = host_copy(owner)
-            extra = host_copy(owner, (8, 9), message="extra")
+            extra = host_copy(owner, (8, 9))
             pins = registry(owner, max_protected_tokens=4, max_claims=2, max_records=3)
             scope = prefixes((1, 2, 3, 4))
             pins.acquire(key=claim(), revision=1, prefixes=scope, ttl_seconds=10)
@@ -320,7 +310,7 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
             pins.acquire(
                 key=claim(), revision=1, prefixes=prefixes((1, 2, 3, 4)), ttl_seconds=10
             )
-            branch = host_copy(owner, (1, 2, 5, 6), message="branch")
+            branch = host_copy(owner, (1, 2, 5, 6))
             pins.acquire(
                 key=claim("B"), revision=1, prefixes=prefixes((1, 2)), ttl_seconds=10
             )
@@ -425,8 +415,7 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
         with transfer_fixtures.hicache(self) as owner:
             _, cache, service, dma = owner
             node = transfer_fixtures.seed(cache)
-            result = transfer_fixtures.transfer(service)
-            service.progress()
+            transfer_fixtures.start_inference_backup(cache, node)
             self.assertIsNotNone(node.component_data[FULL].host_value)
             self.assertIsNotNone(node.write_through_pending_id)
             pins = registry(owner)
@@ -439,14 +428,10 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
                 ttl_seconds=10,
             )
             self.assertEqual(pins.protected_tokens, 0)
-            # The native transfer still owns its single temporary host hold.
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 1)
+            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
+            self.assertGreater(node.component_data[FULL].lock_ref, 0)
             self.clock.now = 105
-            dma.finish()
-            service.progress()
-            self.assertEqual(
-                transfer_fixtures.current(service, result).status, Status.COMPLETED
-            )
+            transfer_fixtures.finish_inference_backup(cache, dma)
             active = pins.acquire(
                 key=claim(),
                 revision=1,
@@ -463,7 +448,7 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
         with transfer_fixtures.hicache(self) as owner:
             _, cache, _, _ = owner
             leaf = host_copy(owner)
-            host_copy(owner, (1, 2, 5, 6), message="branch")
+            host_copy(owner, (1, 2, 5, 6))
             pins = registry(owner)
             native_hold = cache.inc_host_lock_ref
             count = 0
@@ -1030,7 +1015,7 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
         with transfer_fixtures.hicache(self, config=config) as owner:
             _, cache, service, _ = owner
             node = host_copy(owner)
-            ordinary = host_copy(owner, (8, 9, 10, 11), message="other")
+            ordinary = host_copy(owner, (8, 9, 10, 11))
             self.assertEqual(run_pin(service)["update"]["status"], "completed")
             self.assertEqual(
                 run_pin(service, caller="B", message="b", ttl=20)["update"]["status"],
@@ -1203,15 +1188,7 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
             node = cache_fixtures.insert(
                 cache, (1, 2, 3, 4), salt=service.cache_salt("raw")
             )
-            copied = transfer_fixtures.transfer(
-                service, selection=cache_fixtures.target(cache_salt="raw")
-            )
-            service.progress()
-            dma.finish()
-            service.progress()
-            self.assertEqual(
-                transfer_fixtures.current(service, copied).status, Status.COMPLETED
-            )
+            transfer_fixtures.backup_prefix(cache, dma, node)
             pinned = run_pin(service, salt="raw")
             self.assertEqual(pinned["public_result"]["claim"]["state"], "active")
             ok, reason = cache.detach_storage_backend()
@@ -1285,16 +1262,11 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
             self.assertTrue(missing["public_result"]["missing_scope"])
             self.assertIsNone(missing["public_result"]["claim"])
             node = transfer_fixtures.seed(cache)
-            result = transfer_fixtures.transfer(service)
-            service.progress()
+            transfer_fixtures.start_inference_backup(cache, node)
             incomplete = run_pin(service, message="pending")
             self.assertEqual(incomplete["update"]["code"], "incomplete")
             self.assertFalse(incomplete["public_result"]["accepted_scope"])
-            dma.finish()
-            service.progress()
-            self.assertEqual(
-                transfer_fixtures.current(service, result).status, Status.COMPLETED
-            )
+            transfer_fixtures.finish_inference_backup(cache, dma)
             request = pin_command(service, message="l3")
             request["envelope"]["actions"][0]["payload"]["location"] = {
                 "tier": "storage",

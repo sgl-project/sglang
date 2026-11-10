@@ -96,21 +96,69 @@ class UnifiedCacheExecutor:
         )
         self.generation = self.control_state.generation
         self._thread = threading.get_ident()
-        self.gpu_copy_capacity = None
         self.cache_salt_transform = None
-        self.transfers = None
         self.storage = None
         self.storage_adapter = None
         self.storage_reason = "Storage is not attached"
         self.storage_reads = None
         self.protection = None
-        if self.core.enable_hicache and not self._transfer_unsupported_reason():
-            from sglang.srt.mem_cache.unified_cache.control_transfers import (
-                HostCacheTransfers,
-            )
-
-            self.transfers = HostCacheTransfers(self)
+        self.host_control = (
+            self.core.enable_hicache and not self._transfer_unsupported_reason()
+        )
+        if self.host_control:
             self._refresh_storage_adapter()
+
+    def _storage_prefix(self, work):
+        self._check(work.target)
+        if len(work.target.branches) != 1:
+            raise ControlError(
+                "unsupported", "Storage control requires one complete prefix"
+            )
+        branch = work.target.branches[0]
+        end = branch.requested.end_token
+        if (
+            not isinstance(branch.content, TokensTarget)
+            or branch.requested.start_token
+            or end % self.core.page_size
+        ):
+            raise ControlError(
+                "unsupported",
+                "Storage control requires a token-backed page-aligned prefix",
+            )
+        if branch.missing or branch.unaligned or end > len(branch.content.token_ids):
+            raise ControlError("missing", "Requested prefix history is incomplete")
+        if end // self.core.page_size > self.config.max_query_nodes:
+            raise ControlError(
+                "capacity", "Transfer scope exceeds its page traversal budget"
+            )
+        return branch.content.token_ids[:end], self._compatibility(branch.content)
+
+    def _load_pending(self, node):
+        if node.load_back_pending_id is not None:
+            return True
+        # Write-through loads may only be tracked by their in-flight anchor.
+        for anchor in self.cache.ongoing_load_back:
+            current = self.core.node_by_id(anchor)
+            while current is not None and current is not self.core.root_node:
+                if current is node:
+                    return True
+                current = current.parent
+        return False
+
+    def _hold_host(self, holds, nodes):
+        known = {node_id for node_id, _ in holds}
+        for node in nodes:
+            if (
+                node.id not in known
+                and node.component_data[ComponentType.FULL].host_value is not None
+            ):
+                receipt = self.cache.inc_host_lock_ref(node.id).to_dec_params()
+                holds.append((node.id, receipt))
+
+    def _release_host(self, holds):
+        for node_id, receipt in reversed(holds):
+            self.cache.dec_host_lock_ref(node_id, receipt)
+        holds.clear()
 
     def _refresh_storage_adapter(self):
         from sglang.srt.mem_cache.unified_cache.storage_execution import (
@@ -118,7 +166,7 @@ class UnifiedCacheExecutor:
         )
 
         adapter, reason = (None, "Storage is not attached")
-        if self.transfers is not None and self.cache.enable_storage:
+        if self.host_control and self.cache.enable_storage:
             adapter, reason = storage_execution_adapter(self.cache)
         changed = self.storage_adapter is not None and (
             adapter is None
@@ -219,7 +267,7 @@ class UnifiedCacheExecutor:
             "tree_core": "python",
             "layout_id": self.layout_id,
             "actions": ("sglang.copy_to", "sglang.move_to")
-            if supported and self.transfers is not None
+            if supported and self.host_control
             else (),
             "components": tuple(ct.name.lower() for ct in self.core.component_types)
             if supported
@@ -227,18 +275,12 @@ class UnifiedCacheExecutor:
             "tier": "gpu",
             "directions": (
                 {
-                    "copy_to": (("gpu", "host"),)
-                    + (
-                        self.storage_adapter.copy_paths
-                        if self.storage_adapter is not None
-                        else ()
-                    ),
-                    "move_to": (("gpu", "host"),)
-                    + (
-                        self.storage_adapter.move_paths
-                        if self.storage_adapter is not None
-                        else ()
-                    ),
+                    "copy_to": self.storage_adapter.copy_paths
+                    if self.storage_adapter
+                    else (),
+                    "move_to": self.storage_adapter.move_paths
+                    if self.storage_adapter
+                    else (),
                     "storage_backend": self.storage_adapter.backend
                     if self.storage_adapter
                     else None,
@@ -255,12 +297,9 @@ class UnifiedCacheExecutor:
                     else None,
                     "granularity": "whole_token_prefix_at_existing_radix_boundary",
                     "page_alignment": self.core.page_size,
-                    "gpu_copy_approval": "scheduler_prefill_budget"
-                    if self.gpu_copy_capacity is not None
-                    else "allocator_capacity",
                     "max_scope_pages": self.config.max_query_nodes,
                 }
-                if supported and self.transfers is not None
+                if supported and self.host_control
                 else {}
             ),
             "reason": reason or ("" if supported else "Linker is unsupported"),
@@ -465,9 +504,7 @@ class UnifiedCacheExecutor:
                     node.load_back_pending_id is not None
                     or node.write_through_pending_id is not None
                     or (
-                        tier == "gpu"
-                        and self.transfers is not None
-                        and self.transfers._load_pending(node)
+                        tier == "gpu" and self.host_control and self._load_pending(node)
                     )
                 ):
                     raise ControlError(
@@ -727,13 +764,13 @@ class UnifiedCacheExecutor:
                 or work.ref.context.engine_epoch != self.engine_epoch
             ):
                 raise ControlError("stale_epoch", "Executor owner identity differs")
-            if self.transfers is None:
+            if not self.host_control:
                 raise ControlError("unsupported", "Cache movement requires HiCache")
             if payload.dst.tier == "storage" and self.storage is not None:
                 return self.storage.start(work)
             if payload.src.tier == "storage" and self.storage_reads is not None:
                 return self.storage_reads.start(work)
-            return self.transfers.start(work)
+            raise ControlError("unsupported", "Only L2 to/from storage is supported")
         except ControlError as error:
             status = {
                 "unsupported": Status.UNSUPPORTED,
@@ -752,11 +789,9 @@ class UnifiedCacheExecutor:
             return self.storage_reads.poll(ref)
         if self.storage is not None and ref.operation_id in self.storage.interests:
             return self.storage.poll(ref)
-        return self.transfers.poll(ref) if self.transfers is not None else None
+        return None
 
     def begin_poll(self, *, limit=64):
-        if self.transfers is not None:
-            self.transfers.begin_poll(limit=limit)
         if self.storage is not None:
             self.storage.begin_poll(limit=limit)
         if self.storage_reads is not None:
@@ -770,11 +805,7 @@ class UnifiedCacheExecutor:
             return self.storage_reads.cancel(ref)
         if self.storage is not None and ref.operation_id in self.storage.interests:
             return self.storage.cancel(ref)
-        return (
-            self.transfers.cancel(ref)
-            if self.transfers is not None
-            else ExecutionUpdate(status=Status.CANCELLED, quiescent=True)
-        )
+        return ExecutionUpdate(status=Status.CANCELLED, quiescent=True)
 
     def residency(
         self,
@@ -792,7 +823,7 @@ class UnifiedCacheExecutor:
             raise ControlError(
                 "unsupported", "Residency inspection supports local GPU/host tiers"
             )
-        if location.tier == "host" and self.transfers is None:
+        if location.tier == "host" and not self.host_control:
             raise ControlError(
                 "unsupported", "Host residency inspection is not configured"
             )

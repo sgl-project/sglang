@@ -34,12 +34,8 @@ class StorageExecutionAdapter(Protocol):
 
 
 class _Adapter:
-    copy_paths = (
-        ("gpu", "storage"),
-        ("host", "storage"),
-        ("storage", "host"),
-    )
-    move_paths = (("gpu", "storage"), ("host", "storage"))
+    copy_paths = (("storage", "host"),)
+    move_paths = (("host", "storage"),)
 
     def __init__(self, store, pool, domain):
         self.store, self.pool = store, pool
@@ -90,7 +86,7 @@ class FileExecutionAdapter(_Adapter):
         # Destructive host moves require fresh backend existence checks;
         # unified file chunks already bypass that cache and validate sizes.
         if store.metadata_cache is not None and store._unified_suffixes is None:
-            self.move_paths = (("gpu", "storage"),)
+            self.move_paths = ()
 
     def describe_pages(self, hashes):
         return [
