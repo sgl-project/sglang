@@ -37,13 +37,20 @@ def draft_kv_ring_unsupported_reason(
     draft_backend: Optional[str],
     draft_window_size: Optional[int],
     disaggregation_mode: str = "null",
+    disaggregation_transfer_backend: str = "mooncake",
     enable_unified_memory: bool = False,
     dcp_size: int = 1,
 ) -> Optional[str]:
     """Why a draft KV ring cannot serve this DFLASH draft, or None if it can.
     The draft config is loaded only once the launch flags allow a ring."""
-    if disaggregation_mode != "null":
-        return "PD disaggregation does not transfer the ring yet"
+    if disaggregation_mode != "null" and disaggregation_transfer_backend not in (
+        "mooncake",
+        "mooncake_tcp",
+    ):
+        return (
+            f"the {disaggregation_transfer_backend} PD transfer backend does not "
+            "send the ring"
+        )
     if enable_unified_memory:
         return "--enable-unified-memory places the draft KV in the target's pool"
     from sglang.srt.speculative.draft_worker_common import (

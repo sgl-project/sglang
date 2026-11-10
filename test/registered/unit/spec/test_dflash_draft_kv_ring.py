@@ -1,9 +1,9 @@
 """DFLASH draft KV ring: its row layout and its resolution.
 
 The ring is resolved once at startup into speculative_dflash_draft_kv_ring:
-on by default for an all-sliding MLA draft on trtllm_mla / cutedsl_mla, off
-(with a log line) where it is not served, and an explicit
-SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1 there is an error.
+on by default for an all-sliding MLA draft on trtllm_mla / cutedsl_mla,
+colocated or PD over Mooncake; off (with a log line) where it is not served;
+and an explicit SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1 there is an error.
 """
 
 import contextlib
@@ -77,10 +77,24 @@ class TestResolveDraftKVRing(CustomTestCase):
                 # The decision lives in the declaration, not in the environment.
                 self.assertFalse(SWITCH.is_set())
 
+    def test_on_under_pd_over_mooncake(self):
+        for mode in ("prefill", "decode"):
+            for backend in ("mooncake", "mooncake_tcp"):
+                with self.subTest(mode=mode, backend=backend), _switch():
+                    args = _args(
+                        disaggregation_mode=mode,
+                        disaggregation_transfer_backend=backend,
+                    )
+                    self.assertTrue(self._resolve(args))
+
     def test_off_by_launch_flags_without_loading_the_draft(self):
         cases = {
-            "prefill": _args(disaggregation_mode="prefill"),
-            "decode": _args(disaggregation_mode="decode"),
+            "prefill over nixl": _args(
+                disaggregation_mode="prefill", disaggregation_transfer_backend="nixl"
+            ),
+            "decode over mori": _args(
+                disaggregation_mode="decode", disaggregation_transfer_backend="mori"
+            ),
             "unified": _args(enable_unified_memory=True),
             "flashinfer": _args(speculative_draft_attention_backend="flashinfer"),
             "compact window": _args(speculative_draft_window_size=4096),
@@ -114,8 +128,11 @@ class TestResolveDraftKVRing(CustomTestCase):
     def test_explicit_on_where_not_served_is_an_error(self):
         for mode in ("prefill", "decode"):
             with self.subTest(mode=mode), _switch(True):
+                args = _args(
+                    disaggregation_mode=mode, disaggregation_transfer_backend="nixl"
+                )
                 with self.assertRaises(ValueError):
-                    self._resolve(_args(disaggregation_mode=mode), draft_cfg=None)
+                    self._resolve(args, draft_cfg=None)
 
     def test_explicit_off_is_kept_and_logged(self):
         with (
