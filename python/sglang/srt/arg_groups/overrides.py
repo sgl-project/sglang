@@ -369,6 +369,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "BailingMoeV3ForCausalLM",
         "BailingMoeV3VLForConditionalGeneration",
         "Qwen3NextForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "InternS2MobiusForConditionalGeneration",
@@ -527,6 +528,14 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
             "Learnable DSA attention sinks require a bfloat16 KV cache; "
             f"got kv_cache_dtype={kv_cache_dtype}."
         )
+    if kv_cache_dtype == "auto" and major < 8:
+        # Volta has no BF16 tensor cores. Leave auto so the pool follows the
+        # FP16 model dtype from SGLANG_SM70_FORCE_FP16. The SM70 sparse MLA
+        # kernel reads that pool directly.
+        logger.warning(
+            "SM70: leaving DSA KV cache dtype as auto so it follows the FP16 model dtype."
+        )
+        return {}
     if kv_cache_dtype == "auto":
         kv_cache_dtype = (
             "fp8_e4m3" if major >= 10 and not has_attention_sinks else "bfloat16"

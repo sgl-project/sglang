@@ -1292,6 +1292,27 @@ class ServerArgs(DisaggServerArgsMixin):
             )
             self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
+        if (
+            self.backend != Backend.DIFFUSERS
+            and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
+            and self.attention_backend == "tilelang_fa_v100"
+        ):
+            # The V100 kernel is the dense non-causal DiT path (head size 128).
+            # The text encoder is causal, and both VAEs declare FA/SDPA only.
+            for component_name in ("text_encoder", "video_vae", "audio_vae"):
+                if component_name in self.component_attention_backends:
+                    continue
+                if component_name in self.component_attention_backend_roles:
+                    continue
+                logger.info(
+                    "Automatically set torch_sdpa backend for the MiniMax H3 "
+                    "%s; tilelang_fa_v100 applies to the transformer",
+                    component_name,
+                )
+                self.set_automatic_component_attention_backend(
+                    component_name, "torch_sdpa"
+                )
+
         if self.ring_degree > 1:
             if (
                 self.attention_backend is not None

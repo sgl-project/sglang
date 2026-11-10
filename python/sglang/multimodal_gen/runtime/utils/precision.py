@@ -1,6 +1,7 @@
 import threading
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Iterator, List, Optional, Union
 
 import torch
@@ -9,6 +10,26 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
+
+
+@lru_cache(maxsize=1)
+def is_sm70() -> bool:
+    """True on Volta. BF16 kernels are unavailable there."""
+    try:
+        if current_platform.is_cuda():
+            capability = current_platform.get_device_capability()
+            if capability is not None:
+                return capability.to_int() == 70
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_capability() == (7, 0)
+    return False
+
+
+def volta_compute_dtype() -> torch.dtype:
+    """FP16 on SM70. BF16 on every other device."""
+    return torch.float16 if is_sm70() else torch.bfloat16
 
 
 def precision_to_dtype(precision: str, field_name: str = "precision") -> torch.dtype:

@@ -1140,7 +1140,7 @@ class ExecOffload(msgspec.Struct):
         Optional[bool],
         Arg(
             help="Offload Qwen4 PLE n-gram embedding weights to CPU pinned "
-            "memory. Enabled by default for BF16 Qwen4-Exp on CUDA; use "
+            "memory. Enabled by default for BF16/FP16 Qwen4-Exp on CUDA; use "
             "--no-ple-offload-embedding to disable.",
             action=argparse.BooleanOptionalAction,
             resolvable=True,

@@ -60,6 +60,17 @@ class TestResolveSpatialShape:
         half_pixels = half["width"] * half["height"]
         assert 3.8 < full_pixels / half_pixels < 4.2
 
+    @pytest.mark.parametrize(
+        ("short_edge", "width", "height"),
+        [(544, 544, 736), (768, 768, 1024)],
+    )
+    def test_three_by_four_is_a_portrait_canvas(self, short_edge, width, height):
+        shape = minimax_h3_resolve_spatial_shape(
+            width=3, height=4, base_short_edge=short_edge
+        )
+        assert (shape["width"], shape["height"]) == (width, height)
+        assert shape["height"] > shape["width"]
+
     def test_a_larger_short_edge_is_capped_by_the_pixel_budget(self):
         shape = minimax_h3_resolve_spatial_shape(
             width=16, height=9, base_short_edge=1536

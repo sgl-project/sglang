@@ -35,6 +35,7 @@ class Mm(msgspec.Struct):
             help="Set multimodal attention backend.",
             choices=[
                 "sdpa",
+                "fa2_v100",
                 "fa3",
                 "fa4",
                 "triton_attn",

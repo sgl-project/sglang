@@ -8,3 +8,6 @@ drafts/
 
 # Data read by test_server_args_docs_coverage.py, not a page
 advanced_features/server_arguments_undocumented.txt
+
+# V100 guides are plain Markdown linked from the README, not docs-site pages
+v100/

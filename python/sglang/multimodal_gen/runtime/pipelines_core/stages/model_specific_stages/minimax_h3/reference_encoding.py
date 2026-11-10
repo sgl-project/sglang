@@ -532,21 +532,46 @@ def minimax_h3_decode_reference_video_frames(
     )
 
 
+def _anonymous_video_fd(name: str) -> int:
+    """Open a CLOEXEC memfd, or return -1 when that is unavailable.
+
+    Some CPython builds ship without ``os.memfd_create`` even on Linux. libc
+    still has the syscall, so use that before giving up. A seccomp denial is
+    an ``OSError``; callers then decode through an ffmpeg pipe instead of
+    failing the request.
+    """
+
+    if not sys.platform.startswith("linux"):
+        return -1
+    flags = int(getattr(os, "MFD_CLOEXEC", 0x0001))
+    creator = getattr(os, "memfd_create", None)
+    if creator is not None:
+        try:
+            return int(creator(name, flags=flags))
+        except OSError:
+            return -1
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        memfd_create = libc.memfd_create
+        memfd_create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+        memfd_create.restype = ctypes.c_int
+        fd = int(memfd_create(name.encode("utf-8"), flags))
+    except (AttributeError, OSError):
+        return -1
+    if fd < 0:
+        return -1
+    return fd
+
+
 def _decode_reference_video_local(command: list[str]) -> tuple[Any, int]:
     """Write one worker's RGB stream without a large stdout aggregation."""
 
     # Linux workers can let ffmpeg write the exact RGB24 stream into an
     # anonymous file descriptor. Mapping that output avoids communicate()'s
     # chunk list and final bytes join for a several-hundred-MiB reference.
-    output_fd = -1
-    if sys.platform.startswith("linux"):
-        try:
-            output_fd = os.memfd_create(
-                "sglang-h3-reference-video",
-                flags=os.MFD_CLOEXEC,
-            )
-        except OSError:
-            output_fd = -1
+    output_fd = _anonymous_video_fd("sglang-h3-reference-video")
 
     payload: Any = b""
     payload_size = 0
@@ -625,15 +650,12 @@ def _decode_reference_video_shared(command: list[str]) -> tuple[Any, int]:
     leader_state = None
     if is_leader:
         try:
-            try:
-                leader_fd = os.memfd_create(
-                    "sglang-h3-reference-video-shared",
-                    flags=os.MFD_CLOEXEC,
-                )
-            except OSError:
-                # Anonymous file descriptors can be disabled by a container's
-                # seccomp policy. Tell every host to use the unchanged local
-                # decode path instead of failing a valid request.
+            leader_fd = _anonymous_video_fd("sglang-h3-reference-video-shared")
+            if leader_fd < 0:
+                # Anonymous file descriptors can be missing from this Python
+                # build or disabled by a container seccomp policy. Tell every
+                # host to use the unchanged local decode path instead of
+                # failing a valid request.
                 leader_state = (None, 0, None)
             else:
                 payload_size = _write_reference_video_to_fd(command, leader_fd)

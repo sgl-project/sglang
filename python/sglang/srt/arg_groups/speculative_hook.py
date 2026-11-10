@@ -1252,6 +1252,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             if model_arch not in [
                 "MistralLarge3ForCausalLM",
                 "PixtralForConditionalGeneration",
+                "Qwen4ExpForConditionalGeneration",
             ]:
                 logger.warning(
                     "DeepSeek MTP does not require setting speculative_draft_model_path."

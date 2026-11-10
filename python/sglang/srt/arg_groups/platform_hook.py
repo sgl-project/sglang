@@ -25,7 +25,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.device import is_host_cpu_arm64
+from sglang.srt.utils.device import get_device_sm, is_host_cpu_arm64
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +330,37 @@ def handle_sail_attention_backend_compatibility(server_args: Any):
         cfg.speculative_draft_attention_backend,
     ):
         envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.set(0)
+
+
+def handle_sm70_backends(server_args: Any):
+    # V100 (sm70) serves on SGLang's packaged TileLang attention kernels; no
+    # separately installed FlashAttention-V100 extension is required.
+    if not get_platform().is_cuda or get_device_sm() != 70:
+        return
+    cfg = resolving_view(server_args)
+    if cfg.attention_backend is None:
+        try:
+            import tilelang  # noqa: F401
+
+            from sglang.srt.layers.attention.tilelang_fa_v100 import (  # noqa: F401
+                paged_forward,
+            )
+        except Exception:
+            return
+        declare_resolution(
+            server_args,
+            "_handle_sm70_backends",
+            attention_backend="tilelang_fa_v100",
+        )
+        logger.info("SM70 (V100): auto-selecting 'tilelang_fa_v100'.")
+    # The TileLang paged kernels index KV in 16-token pages; the launcher passes
+    # the backend explicitly and no --page-size, so this is the live path.
+    if (
+        cfg.attention_backend in ("tilelang_fa_v100", "flash_attn_v100")
+        and cfg.page_size is None
+    ):
+        declare_resolution(server_args, "_handle_sm70_backends", page_size=16)
+        logger.info("SM70 (V100): auto-setting page_size=16.")
 
 
 def handle_cpu_backends(server_args: Any):

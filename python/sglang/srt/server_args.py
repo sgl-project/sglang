@@ -330,6 +330,9 @@ class ServerArgs:
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
+        # DSV4.1-Flash: skip ViT / aligner / DSpark. HF arch remaps to
+        # DeepseekV4ForCausalLM; keep the V41 name for the raw checkpoint.
+        "DeepseekV41ForCausalLM",
     )
 
     # The attention-backend allow-list is enforced via

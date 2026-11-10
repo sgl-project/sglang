@@ -25,6 +25,7 @@ from PIL import Image
 from transformers import BaseImageProcessor
 
 from sglang.srt import platforms
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
@@ -756,7 +757,11 @@ class BaseMultimodalProcessor(ABC):
         the same accelerator as the scheduler. A second preprocessing worker there
         adds device contention rather than CPU preprocessing parallelism.
         """
-        if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
+        if (
+            envs.SGLANG_MM_PREPROCESS_ON_CPU.get()
+            or _is_cpu
+            or get_exec().deterministic.rl_on_policy_target is not None
+        ):
             return False
         if self.disable_fast_image_processor:
             return False
@@ -797,7 +802,11 @@ class BaseMultimodalProcessor(ABC):
         tokenizer process each carry their own ``base_gpu_id``.
         """
         server_args = self.server_args
-        if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
+        if (
+            envs.SGLANG_MM_PREPROCESS_ON_CPU.get()
+            or _is_cpu
+            or get_exec().deterministic.rl_on_policy_target is not None
+        ):
             return "cpu"
         if _is_xpu:
             return "xpu"
@@ -1020,7 +1029,11 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
+                gpu_decode = (
+                    cls.gpu_image_decode
+                    and not envs.SGLANG_MM_PREPROCESS_ON_CPU.get()
+                )
+                img, _ = load_image(data, gpu_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode

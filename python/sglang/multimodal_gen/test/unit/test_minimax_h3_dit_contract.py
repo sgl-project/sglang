@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _needs_device_weight_postprocess,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.utils.precision import volta_compute_dtype
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_BUFFER_NAMES,
     MINIMAX_H3_FP32_PARAM_NAMES,
@@ -373,7 +374,7 @@ def test_lazy_attention_resolution_preserves_backend_precedence(
 
     get_attn_backend.assert_called_once_with(
         128,
-        torch.bfloat16,
+        volta_compute_dtype(),
         selected_attention_backend=expected_backend,
         attention_requirements=AttentionRequirements(packed_varlen=True),
     )
@@ -545,7 +546,7 @@ def test_model_lazy_resolver_keeps_transformer_scoped_backend():
 
     resolve.assert_called_once_with(
         model.arch.attention_head_dim,
-        torch.bfloat16,
+        volta_compute_dtype(),
         selected_attention_backend=AttentionBackendEnum.CUBE_SPARSE_ATTN,
         attention_requirements=AttentionRequirements(packed_varlen=True),
     )
@@ -590,7 +591,7 @@ def test_token_refiner_routes_cube_selection_to_exact_fa():
     assert attention._attention_backend_enum is AttentionBackendEnum.FA
     resolve.assert_called_once_with(
         128,
-        torch.bfloat16,
+        volta_compute_dtype(),
         selected_attention_backend=AttentionBackendEnum.FA,
     )
 
@@ -631,7 +632,7 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
         if name in expected_fp32:
             assert tensor.dtype == torch.float32, name
         elif tensor.is_floating_point():
-            assert tensor.dtype == torch.bfloat16, name
+            assert tensor.dtype == volta_compute_dtype(), name
 
 
 def test_pruned_meta_model_preserves_curve_adaln_fp32_island():
@@ -1072,3 +1073,42 @@ def test_adaln_graph_replay_uses_live_plan_slot(num_timesteps):
                 )
     finally:
         runner.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_volta_fp32_stream_keeps_large_residual_finite():
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+        _apply_norm,
+        _modulate_gate,
+        _packed_stream_dtype,
+        _silu_mul,
+    )
+
+    if _packed_stream_dtype() != torch.float32:
+        pytest.skip("fp32 residual stream is the Volta path")
+
+    residual = torch.full((4, 8), 40000.0, device="cuda")
+    gate = torch.ones(1, 8, device="cuda", dtype=torch.float16)
+    branch = torch.full((4, 8), 20000.0, device="cuda", dtype=torch.float16)
+    indices = torch.zeros(4, device="cuda", dtype=torch.long)
+    updated = _modulate_gate(residual, gate, branch, indices, dtype=torch.float32)
+    assert updated.dtype == torch.float32
+    assert torch.isfinite(updated).all()
+    torch.testing.assert_close(updated, torch.full_like(updated, 60000.0))
+
+    norm = torch.nn.RMSNorm(8, eps=1e-5, dtype=torch.float16).cuda()
+    with torch.no_grad():
+        norm.weight.fill_(1)
+    normalized = _apply_norm(norm, updated)
+    assert normalized.dtype == torch.float32
+    assert torch.isfinite(normalized).all()
+    assert float(normalized.detach().abs().max()) < 10
+
+    hidden = torch.full((2, 8), 512.0, device="cuda", dtype=torch.float16)
+    activated = _silu_mul(hidden, reuse_input=False)
+    assert activated.dtype == torch.float16
+    assert torch.isfinite(activated).all()
+    # silu(512) * (512 / 16) == 16384, which still fits; the unscaled product does not.
+    torch.testing.assert_close(
+        activated, torch.full_like(activated, 16384.0), rtol=1e-3, atol=1
+    )

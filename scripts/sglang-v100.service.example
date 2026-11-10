@@ -1,0 +1,58 @@
+# Example systemd unit for serving Qwen3.8-Flash-Next on 4x V100.
+#
+#   sudo cp scripts/sglang-v100.service.example /etc/systemd/system/sglang-v100.service
+#   sudo cp scripts/sglang-v100.env.example     /etc/sglang-v100.env
+#   sudoedit /etc/systemd/system/sglang-v100.service   # User/Group and the two paths
+#   sudoedit /etc/sglang-v100.env                      # venv, model, port, GPUs
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sglang-v100
+#
+# The paths below are placeholders. Set User=/Group= to the account that owns
+# the checkout and the venv, and point WorkingDirectory= and ExecStart= at
+# wherever you cloned this repository. Everything else is configured through
+# /etc/sglang-v100.env.
+
+[Unit]
+Description=SGLang V100 -- Qwen3.8-Flash-Next on 4x V100 SXM2
+After=network-online.target nvidia-persistenced.service
+Wants=network-online.target nvidia-persistenced.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=sglang
+Group=sglang
+WorkingDirectory=/opt/sglang-v100
+EnvironmentFile=/etc/sglang-v100.env
+# numactl is load-bearing on a dual-socket host, not tuning. The ~180 GB load
+# fills one NUMA node while the other idles, and the resulting swap storm wedges
+# all four TP workers in the block layer. It also underpins the serve script's
+# case for --hicache-size 8: that sizing sets SGLANG_NUMA_BIND_V2=0 so workers
+# stop re-pinning themselves to one node, which only helps if the parent process
+# is interleaved. Drop this line and the host KV/Mamba tier fills one node again.
+ExecStart=/usr/bin/numactl --interleave=all /bin/bash /opt/sglang-v100/scripts/serve_qwen38_flash_next_nvfp4_v100.sh ${SGLANG_V100_MODE}
+
+# A cold FlashInfer/sm70 JIT cache compiles on all four ranks at once and can
+# take many minutes. A start timeout would kill it mid-compile, and because the
+# cache is only written on success it would never converge.
+TimeoutStartSec=infinity
+TimeoutStopSec=180
+
+# The scheduler ranks are children of the launcher; stop the whole cgroup.
+KillMode=control-group
+KillSignal=SIGTERM
+# always, not on-failure: a TP worker OOM can bring the engine down through a
+# CLEAN exit 0, which on-failure does not catch, leaving the endpoint dead until
+# someone notices. StartLimitBurst above still stops a genuine crash loop, and
+# an explicit `systemctl stop` is still honoured.
+Restart=always
+RestartSec=20
+
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+# Prefer killing anything else on the box before the engine.
+OOMScoreAdjust=-200
+
+[Install]
+WantedBy=multi-user.target

@@ -88,6 +88,10 @@ ATTENTION_BACKEND_CHOICES = [
     "cutedsl_mla",
     "tokenspeed_mla",  # Deprecated alias for "cutedsl_mla"
     "trtllm_mha",
+    # V100 / sm70 (Volta): SGLang's packaged TileLang attention kernels.
+    "tilelang_fa_v100",
+    # Compatibility alias for older V100 launch commands.
+    "flash_attn_v100",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
     "minicpm_flashattn",
     "minicpm_flashinfer",
@@ -198,6 +202,8 @@ RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "triton",
+    # V100 / sm70: TileLang GDN kernels (linear/kernels/gdn_{,chunked_}tilelang.py).
+    "tilelang",
     "cutedsl",
     "flashinfer",
     "flashkda",

@@ -1,6 +1,6 @@
 ---
 title: DeepSeek-V4.1
-description: "Deploy DeepSeek-V4.1 Flash with SGLang — launch recipes, feature compatibility, and tuning notes for GB300, H200, B200, B300 and MI355X."
+description: "Deploy DeepSeek-V4.1 Flash with SGLang — launch recipes, feature compatibility, and tuning notes for GB300, H200, B200, B300, MI355X and 8×V100."
 tag: NEW
 ---
 
@@ -120,6 +120,67 @@ import { agentx } from "/src/snippets/agentx/deepseek-ai/deepseek-v4_1.jsx";
 `--attention-backend`, `--moe-runner-backend` and `--fp8-gemm-backend` are selected automatically from the model, hardware, forward mode and shape. On GB300 they resolve to `dsv4` / `flashinfer_mxfp4` / `flashinfer_cutedsl`. Confirm them in the startup log rather than passing them. On gfx950 the MI355X recipes pin `--fp8-gemm-backend aiter` and leave the other two to resolve.
 
 Overriding them is the most common cause of a disappointing measurement: it leaves the 32-wide ue8m0 blocks on the Triton `_w8a8_block_fp8_matmul` fallback, which dominates the decode step and costs most of the model's bs=1 throughput. If your decode rate looks like a small fraction of what you expected, check the resolved backends first.
+
+### 8×V100 (32 GB)
+
+Volta has no FlashMLA / MXFP4-on-SM90 path, so this shape is a source build (`scripts/serve_dsv41_v100.sh`) rather than the preview Docker cells above. The Deploy panel does not emit it.
+
+Best measured single-user setup on 8×V100-SXM2-32GB: **DSpark on**, **sticky last-sequence prompt cache** (radix stays off), **256k context**, chunked prefill 2048, `np=1`. Coding decodes at about **11 tok/s** at temperature 0 and **10 tok/s** at temperature 1 / top_p 0.95 (4.5–6 tokens accepted per step). Free prose accepts 2.5–3.5 per step and runs at roughly two thirds of that. A suffix that was never computed prefills at about **300 tok/s**; a 300–700-token follow-up turn reaches its first token in 2.3–3.3 s. Do not tune `--speculative-dspark-block-size`; the checkpoint is γ=5.
+
+<Accordion title="8×V100 launch (source)">
+
+```bash Command
+# Host Engram + 1G hugepages on the GPU NUMA node, then:
+export SGLANG_DSV41_DSPARK=1
+export SGLANG_DSV41_STICKY_LAST_SEQ=1
+export SGLANG_DSV41_CONTEXT_LEN=262144
+bash scripts/serve_dsv41_v100.sh
+```
+
+</Accordion>
+
+The script pins the rest: `--speculative-algorithm DSPARK` against the same checkpoint, `--attention-backend dsv4`, `--moe-runner-backend marlin`, `--mem-fraction-static 0.87`, spill 13 GiB / landing 36, `--disable-radix-cache`, `--disable-prefill-cuda-graph`, `--disable-overlap-schedule`, `--max-running-requests 1`, Tree NCCL, `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1`.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Knob</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Ship value</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Why</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>DSpark</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>on (γ=5)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Best token-generation on this box. `DSPARK=0` is greedy Tree (~5–8 tok/s cruise, no draft).</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>Prompt cache</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>sticky last-seq</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Exact continuation, or a shorter prefix saved at a chunk or request stop. Anything else prefills from 0. `/health` is a liveness probe and keeps the pin. Do not enable `--enable-streaming-session`.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Context</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>262144</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>CSA2 `kv_rows` scale with this. 512k has not been shown to leave ~300 MiB for the Engram MXFP8 unpack on 8k prefill.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>Sampling</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>temp=0 for code</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Highest DSpark accept. Reasoning evals on other cards used temp=1.0 / top_p=0.95 — expect the slower chat band here.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Overlap scheduler</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>off</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Each DSpark step waits on the host for its accepted length, so overlap hides nothing and adds one verify step (~0.55 s) before the first token and after the last.</td>
+    </tr>
+  </tbody>
+</table>
+
+<Warning>
+8×V100 is not the 15–20 tok/s product shape. NCCL wait on the hybrid NVLink mesh dominates the T=6 verify step. Treat the numbers above as the measured ceiling on this hardware, not a portable throughput claim.
+</Warning>
 
 ## 3. Advanced Usage
 

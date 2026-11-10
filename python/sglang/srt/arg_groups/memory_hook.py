@@ -364,6 +364,16 @@ def handle_gpu_memory_settings(server_args: Any):
             "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
         )
 
+    # ------------------------------------------------------------------
+    # Input logprob chunk size
+    # ------------------------------------------------------------------
+
+    # 32 GB Volta deployments run static fractions near 0.93; a 2048-row chunk
+    # of full-vocab fp32 logits (1.2 GiB at a 150k vocab, held twice) OOMs.
+    # 256 is arbitrary. LoRA reads the same env var, so its passes stay aligned.
+    if get_platform().is_sm70 and not envs.SGLANG_LOGPROB_CHUNK_SIZE.is_set():
+        envs.SGLANG_LOGPROB_CHUNK_SIZE.set(256)
+
 
 def reserve_for_graph_mb(server_args: Any) -> float:
 

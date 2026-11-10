@@ -18,6 +18,10 @@ QuantizationMethods = Literal[
     "mxfp4",
     "mxfp4_npu",
     "convrot_int8",
+    # deprecated alias of convrot_int8
+    "kitchen_int8",
+    "v100_w8a16",
+    "v100_w4a16_awq",
 ]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
@@ -53,6 +57,12 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         NPUMXFP4Config,
     )
     from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
+    from sglang.multimodal_gen.runtime.layers.quantization.v100_w4a16_awq import (
+        V100W4A16AWQConfig,
+    )
+    from sglang.multimodal_gen.runtime.layers.quantization.v100_w8a16 import (
+        V100W8A16Config,
+    )
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
         "auto-round": AutoRoundConfig,
@@ -66,6 +76,8 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "mxfp8": MXFP8Config,
         "mxfp4_npu": NPUMXFP4Config,
         "convrot_int8": ConvRotInt8Config,
+        "v100_w8a16": V100W8A16Config,
+        "v100_w4a16_awq": V100W4A16AWQConfig,
     }
 
     return method_to_config[quantization]

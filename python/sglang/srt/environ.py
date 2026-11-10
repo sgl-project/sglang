@@ -25,6 +25,26 @@ def _default_hip() -> bool:
         return False
 
 
+def _default_dsv41_engram_host_table() -> bool:
+    """SM70 v1 cannot keep 189 GiB Engram tables in HBM.
+
+    Hopper/Blackwell keep the False default (tables can sit on-device).
+    The SM90/SM100/SM120 exclusion lets tests override those facts on a live
+    V100 without flipping this default. Evaluated only when the env is unset.
+    """
+    try:
+        from sglang.srt.runtime_context import get_platform
+
+        platform = get_platform()
+        if not platform.is_cuda or platform.is_hip:
+            return False
+        if platform.is_sm90 or platform.is_sm100 or platform.is_sm120:
+            return False
+        return platform.is_sm70
+    except Exception:
+        return False
+
+
 _NON_UTF8_PREFIX = "base64:"
 
 
@@ -304,6 +324,9 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
+    # path is ported, so setting this fails loudly instead of degrading.
+    SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
     # --ple-offload-backend file: where the sparse, file-backed PLE table lives
     # (deterministic name, reused across restarts), whether prefill-sized
     # gathers hint the page cache first, and an escape hatch for the device
@@ -316,6 +339,12 @@ class Envs:
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+    # Qwen4-Exp PLE and HiCache host slabs of at least 1 GiB prefer the
+    # boot-reserved 1 GiB hugetlb pool, on the GPU's NUMA node when that node
+    # has enough free pages. Machines without the pool, or with too few free
+    # pages for a given slab, keep today's ordinary pinned allocation. This
+    # never fails the launch. Set 0 to leave the pool for another engine.
+    SGLANG_QWEN_HOST_HUGETLB = EnvBool(True)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
@@ -395,6 +424,8 @@ class Envs:
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
+    # V100 stays on sglang-kernel 0.4.6.post1 / CUDA 12.8. engine.py also skips
+    # the upstream 0.4.7 pin automatically on SM70 even when this is unset.
 
     # ===================================================================
     # Crash diagnostics and shutdown
@@ -1297,6 +1328,9 @@ class Envs:
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     # Kill switch for fusing dense-MLP SiLU*mul with the NVFP4 down_proj input quant.
     SGLANG_DISABLE_SILU_FP4_QUANT_FUSION = EnvBool(False)
+    # NVFP4 checkpoints with a BF16 NextN layer: quantize the draft's routed experts
+    # to NVFP4 on load. Draft-only, so verify still decides every emitted token.
+    SGLANG_NVFP4_CKPT_NVFP4_NEXTN_MOE = EnvBool(False)
     # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8
     # on load. Unrelated to the NVFP4 block-FP8 NextN path above.
     SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)
@@ -1323,6 +1357,8 @@ class Envs:
     # Force FlashInfer decode on (1) or off (0) tensor cores; unset picks from
     # the KV cache dtype and the GQA group size.
     SGLANG_FLASHINFER_USE_TENSOR_CORE = EnvBool(None)
+    # Skip flashinfer norm kernels (CUTLASS-DSL uses cp.async which is sm80+ only)
+    SGLANG_DISABLE_FLASHINFER_NORM = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
@@ -1483,6 +1519,11 @@ class Envs:
     # colliding pad top-ks also inflate the DeepGEMM masked-GEMM workspace to
     # OOM at saturation.  Capture-safe (reads only global_num_tokens_gpu).
     SGLANG_OPT_MASK_DP_PAD_MOE = EnvBool(False)
+    # Route decode-size HC mix through the fused CuTe split-K GEMM pair
+    # instead of the persistent Triton mix.
+    SGLANG_HC_MIX_CUDA = EnvBool(True)
+    # Split the HC combine gate dot across CTAs instead of one CTA per row.
+    SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
@@ -1667,6 +1708,81 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
+    # Restrict all-reduce to a single algorithm family: "1stage"/"oneshot" or
+    # "2stage"/"twoshot" (unset = size heuristic). Needed on partially
+    # NVLink-connected meshes such as V100 SXM2, where two-stage is pathological.
+    SGLANG_CUSTOM_ALLREDUCE_ALGO = EnvStr(None)
+    # Opt-in custom all-reduce on >2 GPUs without a full NVLink clique
+    # (PCIe P2P, e.g. 4x V100 on one PLX switch). Default off: identical to
+    # upstream (NCCL). When set, only one-shot push is used — pull kernels
+    # hang on PCIe P2P — and only up to SGLANG_CUSTOM_AR_PCIE_MAX_BYTES.
+    # Do not enable on an 8x V100 hybrid NVLink mesh (TP8 DSV41).
+    SGLANG_CUSTOM_AR_ALLOW_PCIE = EnvBool(False)
+    SGLANG_CUSTOM_AR_PCIE_MAX_BYTES = EnvInt(128 * 1024)
+
+    # ===================================================================
+    # SM70 / V100 (Volta) adaptations
+    # ===================================================================
+    # This section owns the SM70 flags no other stack cluster defines.
+    # SGLANG_SM70_FORCE_FP16 lives in the cache/runner cluster;
+    # SGLANG_SM70_{MTP_LOCAL_TOP1,PROMPT_LOOKUP} in the speculative cluster;
+    # SGLANG_SM70_QSA_DENSE_PREFILL_MAX_TOKENS in the attention cluster.
+    #
+    # Native-CUDA small-batch (1/2/4-row) decode paths, measured on V100 SXM2
+    # for the Qwen3.8 TP4 MTP shapes. 0 falls back to the Triton/cuBLAS
+    # implementation for comparisons.
+    SGLANG_SM70_DENSE_GEMV = EnvBool(False)
+    SGLANG_SM70_QWEN_FUSIONS = EnvBool(False)
+    SGLANG_SM70_HC_NATIVE = EnvBool(True)
+    SGLANG_SM70_MTP_HC = EnvBool(True)
+    SGLANG_SM70_MTP_HC_GATE = EnvBool(True)
+    SGLANG_SM70_MTP_SMALL_GEMM = EnvBool(True)
+    SGLANG_SM70_MTP_QKVZBA = EnvBool(True)
+    SGLANG_SM70_MTP_GDN = EnvBool(True)
+    # Fuse the HC combine with the next stage's grouped Gemma norm in one
+    # kernel (FP16 boundaries preserved). Opt-in: needs FP16, hc_count 4,
+    # hidden 2560 and up to 32 rows.
+    SGLANG_SM70_HC_COMBINE_NORM = EnvBool(False)
+    # Extend the row-exact shared-expert sigmoid-gate fusion from one row to the
+    # 2/4-row native MTP verify shapes. Each row keeps the one-row arithmetic;
+    # unmatched shapes fall back to the per-row calls.
+    SGLANG_SM70_MTP_SHARED_GATE = EnvBool(False)
+    # Two measured 2K-prefill Marlin MoE stages (2048x320x2560 topk10 w13 and
+    # 20480x2560x160 topk1 w2) that use 64-row CTAs. Off keeps the generic
+    # prefill selector; only Qwen3.8-Flash-Next NVFP4 2K prefill is affected.
+    SGLANG_SM70_MOE_PREFILL_2K = EnvBool(False)
+    # Native MTP verification wider than four rows. The NVFP4 routed-expert
+    # decode and its top-k select kernel are row-independent, so the row cap
+    # is the only gate; 8 for the draft chain, 16/32 for batched verify.
+    SGLANG_SM70_MTP_WIDE_MOE = EnvBool(False)
+    SGLANG_SM70_BATCHED_MOE = EnvBool(False)
+    SGLANG_SM70_BATCHED_MOE32 = EnvBool(False)
+    # Wider rows for the FP16 shared-expert/projection fusions (8..32 rows,
+    # multiples of four); off keeps the 1/2/4-row shapes.
+    SGLANG_SM70_BATCHED_FUSIONS = EnvBool(False)
+    # Fewer resident push CTAs for the TP4 NVLink all-reduce. Small messages
+    # (the decode norm/projection reductions) were measured faster with 16
+    # blocks; only applies to a full 4-way NVLink clique on SM70.
+    SGLANG_SM70_AR_PUSH16 = EnvBool(False)
+    SGLANG_SM70_QSA_COMBINE = EnvBool(True)
+    SGLANG_SM70_QSA_DRAFT_EXTEND_GRAPH = EnvBool(True)
+    # Optional grouped Page4 QSA chunk-prefill through the out-of-tree
+    # Flash-V100 grouped planner/attention bindings. Restricted to the measured
+    # 2048-row FP16/Page16 Qwen shape; a missing library or any other shape
+    # keeps the native QSA prefill.
+    SGLANG_SM70_QSA_GROUPED_PREFILL = EnvBool(False)
+    # Optional V100 (SM70) multimodal encoder attention from the ai-bond
+    # flash_attn_v100 package: zero-pads the 72-wide Qwen3.8 vision heads to the
+    # 128-wide kernel, keeps the original scale and crops the output. Without
+    # the package (or off SM70 / in ViT cuda-graph mode) the backend selection
+    # is unchanged.
+    SGLANG_SM70_VISION_ATTENTION = EnvBool(False)
+    # GLM-5.3-Flash NVFP4 batch-1..4 decode on Volta HMMA instead of Marlin:
+    # dense/shared-expert GEMV and routed experts. fp32 accumulation, so
+    # outputs differ from Marlin in the last fp16 bit.
+    SGLANG_SM70_GLM_NVFP4_GEMV = EnvBool(False)
+    SGLANG_SM70_GLM_NVFP4_MOE_DECODE = EnvBool(False)
+    SGLANG_SM70_GLM_NVFP4_BUILD_DIR = EnvStr("~/.cache/sglang/glm_nvfp4_gemv")
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
@@ -1800,6 +1916,9 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # Keep pixel preprocessing and JPEG decoding out of the serving GPU.
+    # Vision encoding in the model workers is unaffected.
+    SGLANG_MM_PREPROCESS_ON_CPU = EnvBool(False)
     # Supported by Kimi-K2.5 and native diffusion RGB input preprocessing.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
@@ -1904,6 +2023,8 @@ class Envs:
     # Shorter prompts use the single-call encode; below this the gain is eaten
     # by rayon dispatch and the id merge.
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
+    # Prompts encode each piece between added tokens once and reuse it.
+    SGLANG_DISABLE_PROMPT_SEGMENT_CACHE = EnvBool(False)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
@@ -2025,8 +2146,9 @@ class Envs:
     SGLANG_DSV4_FP8_HCA_PERSIST_MIN_ROWS = EnvInt(15)
 
     # Deprecated for --engram-config "placement". The deprecated engram variables
-    # are read only by _resolve_engram_config.
-    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    # are read only by _resolve_engram_config. The default is platform-aware:
+    # SM70 cannot hold the 189 GiB tables in HBM, so they live in host memory.
+    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(_default_dsv41_engram_host_table)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
     # Deprecated for --engram-config "replication".
@@ -2062,6 +2184,138 @@ class Envs:
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
+    # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
+    # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
+    SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Prefill sparse attn: unpack + torch einsum instead of the packed SM70
+    # kernel (test oracle / fallback). Default is the packed kernel.
+    SGLANG_DSV41_TORCH_PREFILL_SPARSE = EnvBool(False)
+    # DeepSeek-V4.1 two-level indexer on DeepGEMM's paged sparse MQA logits for the
+    # index-source layers after the candidate source (decode). Needs a DeepGEMM
+    # with fp8_fp4_paged_sparse_mqa_logits on SM100; off = the torch masks.
+    SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER = EnvBool(False)
+    # use multistream to overlap the publish-side with other computation
+    SGLANG_DSV41_DEEP_GEMM_CANDIDATE_OVERLAP = EnvBool(True)
+    # Overlap layer 14's shared-host lookup and WKV with earlier layers at BS=1.
+    SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH = EnvBool(False)
+    # Pin and map the host table with cudaHostRegister. False leaves the plain
+    # mapping to the platform (Grace-Blackwell ATS reaches it directly).
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN = EnvBool(True)
+    # posix_fadvise(DONTNEED) on safetensors around Engram prefault. Can help
+    # hugepage allocation when page cache is fragmented; costs a cold
+    # checkpoint re-read. Leave off unless the launch script sets it.
+    SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE = EnvBool(False)
+    # NUMA node for Engram host tables. Unset: the node of the first visible
+    # GPU (sysfs). -1 skips mbind (tests).
+    SGLANG_DSV41_ENGRAM_NUMA_NODE = EnvInt(None)
+    # If the preferred NUMA node cannot hold the tables, split layers/shards
+    # across nodes instead of failing. Split gathers are cross-socket; fail
+    # loud is the default so Linux cannot silently place pages off-node.
+    SGLANG_DSV41_ENGRAM_NUMA_SPLIT = EnvBool(False)
+    # Map Engram host tables from the boot-reserved 1 GiB hugetlb pool when
+    # the mapping is at least 1 GiB. Tiny tests stay on 4K/THP. Fail loud if
+    # the pool is short; do not silently fall back to 4 KiB.
+    SGLANG_ENABLE_DSV41_ENGRAM_HUGETLB = EnvBool(True)
+    # Ablation: skip the Engram residual add (return x). Tables still load.
+    # Default False is the real gather. Not a production kill-switch.
+    SGLANG_DSV41_ENGRAM_ZERO = EnvBool(False)
+    # Host-table gather on a side stream, overlapped with the previous
+    # layer. TP all-reduce / wkv / gate stay on the default stream. Off during
+    # CUDA-graph capture. Default on for the host-table v1 path.
+    SGLANG_DSV41_ENGRAM_OVERLAP = EnvBool(True)
+    # TP all-reduce (and all-to-all) via two NVLink quads then the
+    # four cross-quad pairs (8×V100 hybrid mesh). Decode-sized tensors only.
+    # Default off: in-graph custom-AR is capturable but RankSignals-
+    # bound (~67 ms/tok) while spill_copy is rank-divergent; leave off.
+    SGLANG_DSV41_HIER_AR = EnvBool(False)
+    SGLANG_DSV41_HIER_AR_CA = EnvBool(False)
+    # Quad and pair steps of the custom-AR chain fused into one push kernel
+    # (sm70_hier_push_ar), bitwise equal to the chain. Needs HIER_AR_CA.
+    SGLANG_DSV41_HIER_AR_PUSH = EnvBool(False)
+    # Bind expert-spill pins to the preferred NUMA node with THP. Does not
+    # consume the Engram hugetlb pool.
+    SGLANG_ENABLE_DSV41_EXPERT_SPILL_NUMA = EnvBool(True)
+    # NUMA nodes the packed spill mirror is striped over, by MoE
+    # layer ordinal (layer i -> nodes[i % len]). Each node gets an equal share
+    # so HtoD and (later) host GEMV can draw on both sockets' DRAM bandwidth.
+    # Unset: the GPU-local node first, then every other memory node.
+    SGLANG_DSV41_EXPERT_SPILL_NUMA_NODES = EnvTuple(())
+    # Path to a torch file {"cold_ids": int64 [layers, ep, S]} with
+    # local routed expert ids in coldness order (coldest first) per
+    # (layer, ep_rank); the first n_spilled become the host-resident set.
+    # Built by scripts/dsv41_cold_set_from_dumps.py from expert-distribution
+    # recorder dumps. Unset -> today's tail placement (ids n_kept..n_routed-1).
+    SGLANG_DSV41_EXPERT_SPILL_COLD_SET = EnvStr(None)
+    # Per-rank GiB of routed-expert MXFP4 to keep on host (attention stays GPU).
+    # 0 disables. Size this from the launch script / HBM budget, not here.
+    SGLANG_DSV41_EXPERT_SPILL_GB = EnvFloat(0.0)
+    # Shrink FusedMoE expert rows after attaching the spill plan. Marlin remaps
+    # topk_ids through RoutedExpertLru; ensure() is an eager BCG break.
+    SGLANG_DSV41_EXPERT_SPILL_APPLY = EnvBool(False)
+    # Shared GPU landing slots for in-graph UVA page-in of spilled
+    # decode hits. 0 keeps the Python LRU on decode (and the MoE BCG break).
+    SGLANG_DSV41_SPILL_LANDING = EnvInt(6)
+    # Prefill copies spilled rows into the landing slots instead of swapping
+    # them into GPU slots (no write-back, no host sync). 0 restores the LRU swap.
+    SGLANG_DSV41_PREFILL_LANDING = EnvBool(True)
+    # Box knob for the V100 serve script. Engine still keys off
+    # --speculative-algorithm DSPARK. Default off; the serve script sets it.
+    SGLANG_DSV41_DSPARK = EnvBool(False)
+    # Rollback: keep decoder mlp/moe as BCG eager breaks even if
+    # landing slots are on.
+    SGLANG_DSV41_EAGER_MOE_SPILL = EnvBool(False)
+    # Rollback: keep CSA2 + mHC as BCG eager breaks. Default off so
+    # those ops capture in the decode graph. MoE capture is separate
+    # (SGLANG_DSV41_SPILL_LANDING / SGLANG_DSV41_EAGER_MOE_SPILL).
+    SGLANG_DSV41_EAGER_CSA2_HC = EnvBool(False)
+    # Keep Engram hash as a BCG eager break. Default off; decode
+    # hash is one Triton launch with a host-side forward_mode switch.
+    SGLANG_DSV41_EAGER_ENGRAM = EnvBool(False)
+    # Force `--cuda-graph-backend-decode breakable` even when
+    # landing/MoE/CSA2 are capturable. Default off = one plain decode graph.
+    SGLANG_DSV41_BREAKABLE_DECODE = EnvBool(False)
+    # SM70 MXFP4 decode GEMV (M<=4, DSV4.1 Flash shapes) instead of
+    # Marlin grouped GEMM. Default on; 0 falls back to the pinned Marlin CTA.
+    SGLANG_DSV41_MOE_GEMV = EnvBool(True)
+    # Fuse SM70 mHC mix_stats+Sinkhorn (and combine) into one CTA.
+    # Default on; 0 keeps the four unfused launches.
+    SGLANG_DSV41_MHC_FUSION = EnvBool(True)
+    # Keep dense MXFP8 as e4m3+UE8M0 g32 (decode GEMV M<=4).
+    # marlin_v100 FP8 W8A16 has no group-32; 0 unpacks to FP16 as before.
+    SGLANG_DSV41_MXFP8_W8A16 = EnvBool(True)
+    # SM70 CSA2 decode glue. Pack writes into the static ring/table
+    # and sparse decode gathers KV in-kernel. 0 restores pack + index_copy +
+    # gather + ring_valid.
+    SGLANG_DSV41_ATTN_GLUE = EnvBool(True)
+    # Host MXFP4 GEMV for spilled decode hits (mailbox + CPU
+    # workers overlapping the kept GPU GEMV). Default off: the marlin_v100
+    # packed CPU kernel is still ~11 ms/hit @ 4 threads vs ~1.6 ms UVA
+    # page-in. 1 turns it on. Restart after toggling; the decode graph captures
+    # whichever path ran at capture time.
+    SGLANG_DSV41_HOST_GEMV = EnvBool(False)
+    SGLANG_DSV41_HOST_GEMV_THREADS = EnvInt(4)
+    # Debug: cuda.synchronize after eager-extend embed/layer, and after each
+    # breakable-decode graph segment/break, so an IndexKernel assert prints at
+    # the site that launched it. Off in prod.
+    SGLANG_DSV41_PREFILL_SYNC = EnvBool(False)
+    # One-slot exact token-id continuation on ChunkCache (radix stays off).
+    # Next HTTP turn reuses KV only if new_ids starts with the last finished
+    # sequence. Miss /health / flush drops the pin. Off in generic prod.
+    SGLANG_DSV41_STICKY_LAST_SEQ = EnvBool(False)
+    # Directory of N spilled CSA2 conversations. Unset keeps
+    # the one resident image only. Each rank writes its own file. LRU cap
+    # is whole conversations, oldest first.
+    SGLANG_DSV41_CSA2_SESSION_DIR = EnvStr(None)
+    SGLANG_DSV41_CSA2_SESSION_KEEP = EnvInt(4)
+    # Scalar stats of DSV4.1 intermediates (RMS/NaN/MoE topk/logits). Off in prod.
+    SGLANG_DEBUG_DSV41_PROBE_STATS = EnvBool(False)
+    SGLANG_DEBUG_DSV41_PROBE_STATS_DIR = EnvStr("/tmp/dsv41-probe")
+    # Row-level TARGET_VERIFY vs EXTEND fingerprints. Off in prod. Host-syncs.
+    SGLANG_DEBUG_DSV41_ALIGN_DUMP = EnvBool(False)
+    SGLANG_DEBUG_DSV41_ALIGN_DUMP_DIR = EnvStr("/tmp/dsv41-align-dump")
+    # Construct RequestWindow on the DSV4.1 KV pool (encoder SWA bounded replay).
+    # v1 keeps this off; the dry-run still sizes it when the flag is on.
+    SGLANG_ENABLE_DSV41_REQUEST_WINDOW = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

@@ -529,6 +529,33 @@ class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
         return AttentionBackendEnum.FA
 
 
+class _TileLangFlashAttentionV100BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.TILELANG_FA_V100
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        capability_int = capability.to_int() if capability is not None else None
+        if capability_int != 70:
+            raise ValueError(
+                "TileLang V100 FlashAttention requires compute capability 7.0, "
+                f"got {capability_int}."
+            )
+        try:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.tilelang_fa_v100 import (  # noqa: F401
+                TileLangFlashAttentionV100Backend,
+            )
+        except ImportError as error:
+            raise ImportError(
+                "TileLang V100 FlashAttention requires the tilelang package."
+            ) from error
+        logger.info("Using TileLang V100 FlashAttention backend")
+        return (
+            "sglang.multimodal_gen.runtime.layers.attention.backends."
+            "tilelang_fa_v100.TileLangFlashAttentionV100Backend"
+        )
+
+
 class _FP8FlashAttentionSM120BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FP8_FA_SM120
 
@@ -582,6 +609,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SubBlockSparseAttentionBackendResolver,
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,
+        _TileLangFlashAttentionV100BackendResolver,
         _FP8FlashAttentionSM120BackendResolver,
     )
 }
@@ -838,6 +866,13 @@ class CudaPlatformBase(Platform):
                             f"SageAttention 2 does not support head size {head_size}; "
                             "supported head sizes are 1 through 128"
                         )
+                if selected_backend == AttentionBackendEnum.TILELANG_FA_V100 and (
+                    dtype != torch.float16 or head_size != 128
+                ):
+                    raise ValueError(
+                        "TileLang V100 attention requires FP16 and head size "
+                        f"128, got dtype={dtype} head_size={head_size}"
+                    )
                 return resolved_backend
             target_backend = resolved_backend
 

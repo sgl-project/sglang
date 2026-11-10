@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
+from sglang.multimodal_gen.runtime.utils.precision import volta_compute_dtype
 from sglang.multimodal_gen.runtime.weights.source import (
     materialize_weight,
     resolve_weight,
@@ -379,19 +380,24 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
         }
         if position_ids is not None:
             call_kwargs["position_ids"] = position_ids.to(self.device)
+        compute_dtype = volta_compute_dtype()
         if pixel_values is not None:
-            call_kwargs["pixel_values"] = pixel_values.to(self.device, torch.bfloat16)
+            call_kwargs["pixel_values"] = pixel_values.to(self.device, compute_dtype)
             call_kwargs["image_grid_thw"] = host_image_grid_thw
         if pixel_values_videos is not None:
             call_kwargs["pixel_values_videos"] = pixel_values_videos.to(
-                self.device, torch.bfloat16
+                self.device, compute_dtype
             )
             call_kwargs["video_grid_thw"] = host_video_grid_thw
 
         hidden = self(**call_kwargs).last_hidden_state[0]
         if self.conditioning_projection is not None:
             hidden = self.conditioning_projection(hidden)
-        hidden = hidden.to(torch.bfloat16)
+        hidden = hidden.to(compute_dtype)
+        if not torch.isfinite(hidden).all():
+            raise RuntimeError(
+                "MiniMax H3 text encoder produced non-finite embeddings"
+            )
         expected_shape = [int(ids.shape[1]), self.hidden_dim]
         if list(hidden.shape) != expected_shape:
             raise ValueError(

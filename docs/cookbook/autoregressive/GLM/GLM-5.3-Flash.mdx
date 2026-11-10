@@ -201,6 +201,97 @@ All strategies enable multimodal serving. Image and video input use `Glm5NextPro
 
 The default multimodal feature transport is automatic, and on a single CUDA node auto resolves to CPU transport. The MI355X selection explicitly emits CPU transport, matching its image-serving check. CUDA IPC is opt-in: pass `--mm-feature-transport cuda_ipc` when lower transfer latency matters more than the GPU memory the IPC pool reserves. CUDA VMM transport applies only to multi-node GB200/GB300 systems on the MNNVL fabric, where auto selects it.
 
+### 8×V100 (32 GB)
+
+Volta has no FP4, bf16 or FlashMLA support, so this shape is a source build of the V100 fork (`scripts/serve_glm53_flash_nvfp4_v100.sh`) rather than the Docker cells above. The Deploy panel does not emit it. Weights run as NVFP4 W4A16 with FP16 activations and an FP16 KV cache; the server is text only (`--language-only`).
+
+Best measured single-session setup on 8×V100-SXM2-32GB, TP=8 with TP-sliced experts (`--ep-size 1`): MTP 3 steps, one running request, 240,640-token context. Decode is about **168 tok/s** at temperature 0 (accept length ~2.9). A tool-call turn on a cached conversation answers in about **0.4–0.6 s at 32k** and **0.6–0.8 s at 190k**; a cold prompt prefills at about **1.8–2.0k tok/s**.
+
+<Accordion title="8×V100 launch (source)">
+
+```bash Command
+export GLM53_MODEL=/path/to/GLM-5.3-Flash-NVFP4
+bash scripts/serve_glm53_flash_nvfp4_v100.sh   # GLM53_MTP_STEPS=0 for no MTP
+```
+
+</Accordion>
+
+<Accordion title="8×V100 expanded launch (what the script runs with MTP)">
+
+```bash Command
+export TORCH_CUDA_ARCH_LIST=7.0 FLASHINFER_DISABLE_VERSION_CHECK=1 SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
+export NCCL_ALGO=allreduce:tree
+export SGLANG_SM70_FORCE_FP16=1 SGLANG_MAMBA_CONV_DTYPE=float16
+export SGLANG_OPT_USE_TILELANG_MHC_PRE=0 SGLANG_OPT_USE_TILELANG_MHC_POST=0
+export SGLANG_SM70_GLM_NVFP4_GEMV=1 SGLANG_SM70_GLM_NVFP4_MOE_DECODE=1 SGLANG_SM70_DENSE_GEMV=1
+export SGLANG_DSV41_HIER_AR=1 SGLANG_DSV41_HIER_AR_CA=1 SGLANG_DSV41_HIER_AR_PUSH=1
+export SGLANG_NVFP4_CKPT_NVFP4_NEXTN_MOE=1
+
+python -m sglang.launch_server \
+  --model-path RadixArk/GLM-5.3-Flash-NVFP4 \
+  --trust-remote-code \
+  --reasoning-parser glm45 --tool-call-parser glm47 \
+  --dtype float16 --quantization modelopt_fp4 --fp4-gemm-backend marlin \
+  --language-only \
+  --tp 8 --ep-size 1 \
+  --attention-backend dsa --linear-attn-backend triton --kv-cache-dtype auto \
+  --disable-custom-all-reduce --disable-prefill-cuda-graph --cuda-graph-bs-decode 1 \
+  --max-running-requests 1 \
+  --max-mamba-cache-size 12 --mamba-max-states-per-path 2 \
+  --mamba-full-memory-ratio 0.15 --mamba-radix-cache-strategy extra_buffer \
+  --chunked-prefill-size 2048 --max-prefill-tokens 2048 \
+  --warmups prefix_reuse \
+  --context-length 240640 --mem-fraction-static 0.935 \
+  --speculative-algorithm EAGLE \
+  --speculative-draft-model-path RadixArk/GLM-5.3-Flash-NVFP4 \
+  --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+```
+
+</Accordion>
+
+The fork's README carries the full environment block, the per-knob rationale and the measured tables.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Knob</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Ship value</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Why</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MTP</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3 steps, top-k 1, 4 draft tokens</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Fastest measured on Volta. The 2–4-row verify kernels give each row the batch-1 result; a 5-row verify falls off them.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>Draft experts</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>NVFP4 at load</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_NVFP4_CKPT_NVFP4_NEXTN_MOE=1` quantises the draft layer's BF16 routed experts (2.4 to 1.06 GB per rank), which buys KV pool. Acceptance matches the BF16 draft.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Concurrency</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--max-running-requests 1`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>One agent session. Batch invariance of the Volta kernels holds only up to 4 rows per launch.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>KDA state slots</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`--max-mamba-cache-size 12`, `--mamba-max-states-per-path 2`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Keeps a long main session cached while a subagent conversation runs. With 8 slots each subagent call evicted it.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Memory / context</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.935 / 240,640</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>242,880-token KV pool. Without MTP: 0.88 / 223,232.</td>
+    </tr>
+  </tbody>
+</table>
+
+<Warning>
+8×V100 serves one request at a time. A second request queues, and each new subagent conversation pays its own cold prefill (about 10 s at 20k tokens).
+</Warning>
+
 ## 3. Advanced usage
 
 ### 3.1 Reasoning

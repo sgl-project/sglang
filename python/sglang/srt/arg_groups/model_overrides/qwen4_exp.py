@@ -42,9 +42,12 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     if cfg.ple_offload_embedding is None:
         import torch
 
+        # sm70 has no bfloat16, so this model runs fp16; the PLE n-gram table
+        # must offload for fp16 too, or it stays on-device and OOMs at load.
         overrides["ple_offload_embedding"] = (
             get_platform().is_cuda
-            and model_config_of(server_args).dtype == torch.bfloat16
+            and model_config_of(server_args).dtype
+            in (torch.bfloat16, torch.float16)
         )
 
     text_config = getattr(hf_config, "text_config", hf_config)

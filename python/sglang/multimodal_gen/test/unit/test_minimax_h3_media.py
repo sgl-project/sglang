@@ -354,6 +354,57 @@ def test_shared_video_transform_falls_back_when_proc_fd_is_blocked(monkeypatch):
     assert len(commands) == 2
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux")
+def test_shared_video_decode_without_os_memfd_create(monkeypatch):
+    """A CPython build without os.memfd_create must still decode a reference video.
+
+    The shared path used to store that AttributeError as a host failure and
+    abort the request. libc memfd, or the pipe fallback, has to return frames.
+    """
+
+    expected = np.arange(25 * 4 * 6 * 3, dtype=np.uint8).reshape(25, 4, 6, 3)
+    commands = []
+
+    class FakeGroup:
+        world_size = 2
+        rank_in_group = 0
+        cpu_group = object()
+
+    def all_gather_object(outputs, value, **_kwargs):
+        outputs[:] = [value, value]
+
+    def run(command, **kwargs):
+        commands.append(command)
+        dest = command[-1]
+        if dest == "pipe:1":
+            return SimpleNamespace(stdout=expected.tobytes(), stderr=b"")
+        output_fd = int(dest.removeprefix("pipe:"))
+        assert kwargs["pass_fds"] == (output_fd,)
+        os.write(output_fd, expected.tobytes())
+        return SimpleNamespace(stderr=b"")
+
+    monkeypatch.delattr(os, "memfd_create", raising=False)
+    monkeypatch.delattr(os, "MFD_CLOEXEC", raising=False)
+    monkeypatch.setattr(reference_encoding, "get_replica_group", FakeGroup)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(subprocess, "run", run)
+    reference_encoding._reference_video_host_leader.cache_clear()
+    try:
+        frames = reference_encoding.minimax_h3_decode_reference_video_frames(
+            "/input/ref.mp4",
+            target_width=6,
+            target_height=4,
+            target_frame_count=25,
+            share_across_replicas=True,
+        )
+    finally:
+        reference_encoding._reference_video_host_leader.cache_clear()
+
+    assert np.array_equal(frames, expected)
+    assert commands
+    assert commands[0][-1].startswith("pipe:")
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux memfd")
 def test_shared_video_transform_propagates_any_host_decode_failure(monkeypatch):
     class FakeGroup:

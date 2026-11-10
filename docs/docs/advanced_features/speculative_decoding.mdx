@@ -555,6 +555,11 @@ print(response.choices[0].message.content)
 
 SGLang also supports **DFLASH** speculative decoding using a dedicated draft model checkpoint. Compared with EAGLE-style tree verification, DFLASH verifies a linear draft block and is configured around a block size / draft window. This path is useful when the target model has a matching DFlash draft checkpoint, such as `meta-llama/Llama-3.1-8B-Instruct` with `z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat`.
 
+DFLASH currently rejects grammar-constrained requests, including JSON schema,
+regex, EBNF, structural-tag, `tool_choice="required"`, and named tool choices.
+Parsed tool calls remain available with unconstrained `tool_choice="auto"`.
+Serve without DFLASH when the API must enforce a grammar or tool choice.
+
 Relevant parameters:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>

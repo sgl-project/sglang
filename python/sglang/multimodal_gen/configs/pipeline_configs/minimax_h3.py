@@ -2,8 +2,6 @@
 import os
 from dataclasses import dataclass, field
 
-import torch
-
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
 from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLConfig,
@@ -27,6 +25,10 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    is_sm70,
+    volta_compute_dtype,
+)
 
 logger = init_logger(__name__)
 
@@ -74,6 +76,17 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     output_audio_sample_rate: int | None = 32000
     output_audio_channels: int | None = 2
     output_av_drift_tolerance_s: float | None = 0.25
+
+    def __post_init__(self) -> None:
+        # Volta has no bf16. The W4A16 path also rejects a non-fp16 source.
+        if is_sm70():
+            if self.dit_precision == "bf16":
+                self.dit_precision = "fp16"
+            if tuple(self.text_encoder_precisions) == ("bf16",):
+                self.text_encoder_precisions = ("fp16",)
+
+    def accepts_audio_input(self) -> bool:
+        return True
 
     def supports_disaggregation(self) -> bool:
         return False
@@ -323,7 +336,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
 
         get_attn_backend(
             self.dit_config.arch_config.attention_head_dim,
-            torch.bfloat16,
+            volta_compute_dtype(),
             selected_attention_backend=selected_backend,
             attention_requirements=AttentionRequirements(packed_varlen=True),
         )
@@ -370,6 +383,7 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
     vsa_sparsity: float = 0.8
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         self.dit_config.arch_config.has_gate_compress = True
         # FastVideo's recipe decodes each rank's tiles in one call.
         self.vae_config.decoder_tile_batch = 0
