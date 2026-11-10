@@ -109,10 +109,9 @@ class UBTreeWorkerV2(DFlashWorkerV2):
             )
         target_model = self.target_worker.model_runner.model
         validate_ubtree_lm_head(target_model.lm_head)
-        if selector.tied_token_factorizer is not None:
-            selector.bind_target_embedding(
-                target_model.get_input_embeddings(), device=self.device
-            )
+        selector.bind_target_embedding(
+            target_model.get_input_embeddings(), device=self.device
+        )
         self._proposal = partial(
             build_ubtree_proposal,
             config=self.ubtree_config,

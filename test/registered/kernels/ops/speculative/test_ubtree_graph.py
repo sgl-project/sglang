@@ -46,17 +46,6 @@ def _config():
     )
 
 
-def _lookup_config():
-    config = _config()
-    config.ubtree_config = {
-        **config.ubtree_config,
-        "token_factorizer": "lookup",
-        "factorizer_hidden_width": 0,
-        "target_embedding_dim": 0,
-    }
-    return config
-
-
 def _make_fa3_verify_backend(width, algorithm, *, max_bs=1):
     from sglang.srt.configs.model_config import AttentionArch
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend

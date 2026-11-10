@@ -229,7 +229,7 @@ class DepthScoreConditioner(nn.Module):
 
 
 class UBTreeSelector(nn.Module):
-    """S1/S3 selector for target-embedding MLP and DFlash2 lookup checkpoints."""
+    """S1/S3 selector for target-embedding MLP checkpoints."""
 
     def __init__(self, config) -> None:
         super().__init__()
@@ -238,30 +238,20 @@ class UBTreeSelector(nn.Module):
         hidden_size = int(config.hidden_size)
         self.rank = cfg.rank
         self.candidate_k = cfg.candidate_k
-        self.token_factorizer = cfg.token_factorizer
         self.hidden_projection = nn.Linear(hidden_size, cfg.rank, bias=False)
-        if self.token_factorizer == "lookup":
-            self.predecessor_codebook = nn.Embedding(vocab_size, cfg.rank)
-            self.successor_codebook = nn.Embedding(vocab_size, cfg.rank)
-            self.tied_token_factorizer = None
-        else:
-            self.predecessor_codebook = self.successor_codebook = None
-            self.tied_token_factorizer = TargetEmbeddingTokenFactorizer(
-                cfg.target_embedding_dim,
-                cfg.factorizer_hidden_width,
-                cfg.rank,
-                vocab_size,
-            )
+        self.tied_token_factorizer = TargetEmbeddingTokenFactorizer(
+            cfg.target_embedding_dim,
+            cfg.factorizer_hidden_width,
+            cfg.rank,
+            vocab_size,
+        )
         self.depth_conditioner = DepthScoreConditioner(cfg.depth_count)
 
     def materialize_cache(self, target_embedding_weight: torch.Tensor) -> None:
-        if self.tied_token_factorizer is not None:
-            self.tied_token_factorizer.materialize_cache(target_embedding_weight)
+        self.tied_token_factorizer.materialize_cache(target_embedding_weight)
 
     def bind_target_embedding(self, embedding_module: nn.Module, *, device) -> None:
         """Build the serving cache and declare its online-update constraint."""
-        if self.tied_token_factorizer is None:
-            return
         weight = getattr(embedding_module, "weight", None)
         if weight is None:
             raise RuntimeError("UBTREE requires target input embeddings with weights")
@@ -295,12 +285,11 @@ class UBTreeSelector(nn.Module):
         device: torch.device,
         chunk_size: int = 4096,
     ) -> None:
-        if self.tied_token_factorizer is not None:
-            self.tied_token_factorizer.materialize_cache_from_embedding(
-                embedding_module,
-                device=device,
-                chunk_size=chunk_size,
-            )
+        self.tied_token_factorizer.materialize_cache_from_embedding(
+            embedding_module,
+            device=device,
+            chunk_size=chunk_size,
+        )
 
     def materialize_cache_from_vocab_parallel_embedding(
         self,
@@ -309,23 +298,14 @@ class UBTreeSelector(nn.Module):
         tp_group=None,
         chunk_size: int = 4096,
     ) -> None:
-        if self.tied_token_factorizer is not None:
-            self.tied_token_factorizer.materialize_cache_from_vocab_parallel_embedding(
-                embedding_module,
-                tp_group=tp_group,
-                chunk_size=chunk_size,
-            )
+        self.tied_token_factorizer.materialize_cache_from_vocab_parallel_embedding(
+            embedding_module,
+            tp_group=tp_group,
+            chunk_size=chunk_size,
+        )
 
     def _factors(self, tokens: torch.Tensor, *, role: TokenFactorRole) -> torch.Tensor:
-        if self.tied_token_factorizer is not None:
-            return self.tied_token_factorizer.factors(tokens, role=role)
-        table = (
-            self.predecessor_codebook
-            if role == "predecessor"
-            else self.successor_codebook
-        )
-        assert table is not None
-        return table(tokens)
+        return self.tied_token_factorizer.factors(tokens, role=role)
 
     def build_edge_log_probs(
         self,

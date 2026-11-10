@@ -26,7 +26,7 @@ class Qwen3UBTreeModel(DFlashDraftModel):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # The shared DFlash loader intentionally ignores unknown checkpoint keys.
         # Require the trained selector on the initial load, while allowing later
-        # partial updates for selector layouts without materialized caches.
+        # partial updates.
         loaded_selector = set()
 
         def track_selector_weights():

@@ -103,17 +103,6 @@ def _config():
     )
 
 
-def _lookup_config():
-    config = _config()
-    config.ubtree_config = {
-        **config.ubtree_config,
-        "token_factorizer": "lookup",
-        "factorizer_hidden_width": 0,
-        "target_embedding_dim": 0,
-    }
-    return config
-
-
 def _run_ubtree_hook(*, target_vocab_size=17, locked=()):
     from sglang.srt.arg_groups import speculative_hook
     from sglang.srt.arg_groups.overrides import declare_resolution
@@ -155,29 +144,6 @@ class TestUBTreeComponents(CustomTestCase):
         config = parse_ubtree_config(_config())
         assert config.block_size == 5
         assert config.verify_node_count == 6
-
-    def test_lookup_selector_has_checkpoint_compatible_five_tensor_layout(self):
-        selector = UBTreeSelector(_lookup_config())
-        assert selector.tied_token_factorizer is None
-        assert set(selector.state_dict()) == {
-            "hidden_projection.weight",
-            "predecessor_codebook.weight",
-            "successor_codebook.weight",
-            "depth_conditioner.unary_log_scale",
-            "depth_conditioner.correction_log_scale",
-        }
-
-        hidden = torch.randn(2, 4, 8)
-        candidate_ids = torch.randint(0, 17, (2, 4, 3))
-        unary = torch.randn(2, 4, 3)
-        edges = selector.build_edge_log_probs(
-            hidden,
-            torch.tensor([1, 2]),
-            candidate_ids,
-            unary_candidate_logits=unary,
-        )
-        assert edges.shape == (2, 4, 3, 3)
-        torch.testing.assert_close(edges.exp().sum(-1), torch.ones(2, 4, 3))
 
     def test_selector_cache_can_be_materialized_through_parallel_embedding_api(self):
         class FakeParallelEmbedding(torch.nn.Module):
@@ -520,33 +486,27 @@ class TestUBTreeLoading(CustomTestCase):
         return model
 
     def test_initial_load_requires_every_selector_parameter(self):
-        for config in (_config(), _lookup_config()):
-            source = self._model(config)
-            weights = [
-                (name, torch.ones_like(p)) for name, p in source.named_parameters()
-            ]
-            for missing, _ in weights:
-                with self.subTest(
-                    layout=config.ubtree_config["token_factorizer"], missing=missing
-                ):
-                    model = self._model(config)
-                    with self.assertRaisesRegex(ValueError, missing):
-                        model.load_weights(
-                            (name, value) for name, value in weights if name != missing
-                        )
-                    self.assertFalse(model._ubtree_selector_loaded)
-            for prefix in ("", "model."):
+        config = _config()
+        source = self._model(config)
+        weights = [(name, torch.ones_like(p)) for name, p in source.named_parameters()]
+        for missing, _ in weights:
+            with self.subTest(missing=missing):
                 model = self._model(config)
-                model.load_weights((prefix + name, value) for name, value in weights)
-                for name, p in model.named_parameters():
-                    torch.testing.assert_close(p, torch.ones_like(p))
-                # A successful initial load must not turn subsequent partial
-                # updates into a false missing-checkpoint error.
-                name, value = weights[0]
-                model.load_weights([(name, value * 2)])
-                torch.testing.assert_close(
-                    dict(model.named_parameters())[name], value * 2
-                )
+                with self.assertRaisesRegex(ValueError, missing):
+                    model.load_weights(
+                        (name, value) for name, value in weights if name != missing
+                    )
+                self.assertFalse(model._ubtree_selector_loaded)
+        for prefix in ("", "model."):
+            model = self._model(config)
+            model.load_weights((prefix + name, value) for name, value in weights)
+            for name, p in model.named_parameters():
+                torch.testing.assert_close(p, torch.ones_like(p))
+            # A successful initial load must not turn subsequent partial
+            # updates into a false missing-checkpoint error.
+            name, value = weights[0]
+            model.load_weights([(name, value * 2)])
+            torch.testing.assert_close(dict(model.named_parameters())[name], value * 2)
 
     def test_quantized_head_is_rejected_before_matmul(self):
         for dtype in (torch.float8_e4m3fn, torch.int8):
@@ -605,13 +565,6 @@ class TestUBTreeLoading(CustomTestCase):
                 self.assertIn("UBTREE", message)
             for name, p in model.named_parameters():
                 torch.testing.assert_close(p, original[name])
-
-    def test_lookup_selector_does_not_restrict_target_updates(self):
-        selector = UBTreeSelector(_lookup_config())
-        embedding = torch.nn.Embedding(17, 8)
-        selector.bind_target_embedding(embedding, device="cpu")
-        self.assertFalse(hasattr(selector, "_derived_weight_cache_error"))
-        self.assertFalse(hasattr(embedding, "_derived_weight_cache_error"))
 
 
 if __name__ == "__main__":

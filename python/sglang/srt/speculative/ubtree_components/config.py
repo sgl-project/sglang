@@ -21,7 +21,6 @@ class UBTreeConfig:
     factorizer_hidden_width: int
     target_embedding_dim: int
     depth_count: int
-    token_factorizer: str
 
     @property
     def verify_node_count(self) -> int:
@@ -66,7 +65,6 @@ def parse_ubtree_config(config: Any) -> UBTreeConfig:
             )
         ),
         depth_count=int(metadata.get("depth_condition_count", 0)),
-        token_factorizer=str(metadata.get("token_factorizer", "target_embedding_mlp")),
     )
     positive = {
         "block_size": parsed.block_size,
@@ -74,12 +72,9 @@ def parse_ubtree_config(config: Any) -> UBTreeConfig:
         "tree_budget": parsed.tree_budget,
         "tree_supertree_width": parsed.supertree_width,
         "rank": parsed.rank,
+        "factorizer_hidden_width": parsed.factorizer_hidden_width,
+        "target_embedding_dim": parsed.target_embedding_dim,
     }
-    if parsed.token_factorizer == "target_embedding_mlp":
-        positive.update(
-            factorizer_hidden_width=parsed.factorizer_hidden_width,
-            target_embedding_dim=parsed.target_embedding_dim,
-        )
     invalid = {name: value for name, value in positive.items() if value <= 0}
     if invalid:
         raise ValueError(f"Invalid UBTree configuration values: {invalid}")
@@ -98,10 +93,11 @@ def parse_ubtree_config(config: Any) -> UBTreeConfig:
         raise ValueError("UBTree tree_depth_bonus must be non-positive")
     if metadata.get("objective") != "kl" or not metadata.get("adds_unary_logits"):
         raise ValueError("UBTree serving requires the trained S1/S3 KL selector")
-    if parsed.token_factorizer not in {"lookup", "target_embedding_mlp"}:
+    if metadata.get("token_factorizer", "target_embedding_mlp") != (
+        "target_embedding_mlp"
+    ):
         raise ValueError(
-            "UBTree serving requires token_factorizer to be lookup or "
-            "target_embedding_mlp"
+            "UBTree serving requires token_factorizer target_embedding_mlp"
         )
     if metadata.get("hidden_projection_type", "shared") != "shared":
         raise ValueError(
