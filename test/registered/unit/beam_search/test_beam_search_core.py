@@ -255,14 +255,22 @@ class TestBeamGroup(CustomTestCase):
         """Out-of-vocab stop ids never match and must not break the group's tensor."""
         from sglang.srt.beam_search.coordinator import BeamCoordinator
 
-        req = SimpleNamespace(eos_token_ids={2}, tokenizer=None)
         params = SimpleNamespace(
             ignore_eos=False, stop_token_ids={-1, 0, 5, 31, 32, 2**63}
         )
-        ids = BeamCoordinator._collect_stop_token_ids(req, params, vocab_size=32)
-        self.assertEqual(ids, [0, 2, 5, 31])
-        group = self._make_group(stop_token_ids=ids)
-        self.assertEqual(group.stop_token_ids.tolist(), ids)
+        for disable, expected in ((False, [0, 2, 5, 31]), (True, [0, 5, 31])):
+            with self.subTest(disable_model_stop_tokens=disable):
+                req = SimpleNamespace(
+                    eos_token_ids={2},
+                    tokenizer=None,
+                    disable_model_stop_tokens=disable,
+                )
+                ids = BeamCoordinator._collect_stop_token_ids(
+                    req, params, vocab_size=32
+                )
+                self.assertEqual(ids, expected)
+                group = self._make_group(stop_token_ids=ids)
+                self.assertEqual(group.stop_token_ids.tolist(), ids)
 
 
 if __name__ == "__main__":

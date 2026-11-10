@@ -294,9 +294,9 @@ class TestCollectStopTokenIds(CustomTestCase):
         )
         params = SimpleNamespace(ignore_eos=False, stop_token_ids={5})
         collect = BeamCoordinator._collect_stop_token_ids
-        self.assertEqual(collect(req, params), [2, 3, 4, 5])
+        self.assertEqual(collect(req, params, vocab_size=32), [2, 3, 4, 5])
         req.disable_model_stop_tokens = True
-        self.assertEqual(collect(req, params), [5])
+        self.assertEqual(collect(req, params, vocab_size=32), [5])
 
 
 if __name__ == "__main__":
