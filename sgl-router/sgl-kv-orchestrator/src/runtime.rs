@@ -306,7 +306,7 @@ struct Job {
     result: Arc<Value>,
     operation_ref: Option<Value>,
     claim_view: Value,
-    claim_absent: bool,
+    pin_cleanup_confirmed: bool,
     submitted: bool,
     attempted: bool,
     message_id: String,
@@ -325,25 +325,12 @@ impl Job {
         !self.releasing_pin && !self.attempted && !self.submitted && !self.quiescent
     }
 
-    fn has_final_receipt(&self) -> bool {
-        // A terminal action receipt is independent of current residency.
+    fn has_terminal_result(&self) -> bool {
         // A queued operation can also be physically quiescent.
-        if !self.submitted || !self.quiescent {
-            return false;
-        }
-        let update = &self.result["update"];
-        if self.action == "sglang.pin" {
-            // Only the recorded release is immutable. A PIN acquisition or
-            // a claim observation can still need cleanup.
-            return self.payload["mode"] == "release"
-                && update["status"] == "completed"
-                && update["completed_steps"]
-                    .as_array()
-                    .is_some_and(|steps| steps.iter().any(|step| step == "protection_released"));
-        }
-        matches!(self.action.as_str(), "sglang.prefetch" | "sglang.demote")
+        self.submitted
+            && self.quiescent
             && matches!(
-                update["status"].as_str(),
+                self.result["update"]["status"].as_str(),
                 Some(
                     "completed"
                         | "partial"
@@ -356,6 +343,38 @@ impl Job {
                         | "unconsumed"
                 )
             )
+    }
+
+    fn observe_claim(&mut self, claim: Value, cancel: bool) {
+        // A finished acquisition cannot create a claim after the owner has
+        // confirmed it is absent or inactive. Residency feedback can still
+        // invalidate the claim view without invalidating this cleanup proof.
+        if cancel
+            && self.has_terminal_result()
+            && (claim.is_null()
+                || matches!(
+                    claim["state"].as_str(),
+                    Some("released" | "expired" | "invalidated")
+                ))
+        {
+            self.pin_cleanup_confirmed = true;
+        }
+        self.claim_view = claim;
+    }
+
+    fn has_final_receipt(&self) -> bool {
+        if self.action == "sglang.pin" {
+            let update = &self.result["update"];
+            return self.pin_cleanup_confirmed
+                || (self.has_terminal_result()
+                    && self.payload["mode"] == "release"
+                    && update["status"] == "completed"
+                    && update["completed_steps"].as_array().is_some_and(|steps| {
+                        steps.iter().any(|step| step == "protection_released")
+                    }));
+        }
+        matches!(self.action.as_str(), "sglang.prefetch" | "sglang.demote")
+            && self.has_terminal_result()
     }
 }
 struct Intent {
@@ -717,7 +736,6 @@ impl Actor {
                         job.ready_end = 0;
                         job.ready_at = None;
                         job.claim_view = Value::Null;
-                        job.claim_absent = false;
                     }
                 }
                 job.polls += 1;
@@ -742,7 +760,6 @@ impl Actor {
             job.ready_end = 0;
             job.ready_at = None;
             job.claim_view = Value::Null;
-            job.claim_absent = false;
             job.last_error = Some("worker unavailable".into());
             return;
         }
@@ -797,7 +814,6 @@ impl Actor {
             }
             if effect.claims {
                 job.claim_view = Value::Null;
-                job.claim_absent = false;
             }
         }
     }
@@ -827,11 +843,6 @@ impl Actor {
             && (job.action != "sglang.pin"
                 || !job.attempted
                 || !self.book.job(&job.id).is_some_and(|b| b.cancel_requested)
-                || job.claim_absent
-                || matches!(
-                    job.claim_view["state"].as_str(),
-                    Some("released" | "expired" | "invalidated")
-                )
                 || self.shares_live_claim(job))
     }
     fn record(
@@ -1448,7 +1459,7 @@ impl Actor {
                         result: Arc::new(Value::Null),
                         operation_ref: None,
                         claim_view: Value::Null,
-                        claim_absent: false,
+                        pin_cleanup_confirmed: false,
                         submitted: false,
                         attempted: false,
                         message_id: id.clone(),
@@ -1689,24 +1700,21 @@ impl WorkerPoll {
         if cancel
             && job.action == "sglang.pin"
             && job.payload["mode"] != "release"
-            && job.quiescent
+            && job.has_terminal_result()
             && !job.releasing_pin
         {
             let current = self.client.command(&job.url, &json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?;
-            job.claim_absent = current.is_null();
-            if job.claim_absent
-                || matches!(
-                    current["state"].as_str(),
-                    Some("released" | "expired" | "invalidated")
-                )
-            {
-                job.claim_view = current;
+            if !current.is_null() && current["owner_epoch"] != job.caps.epoch {
+                return Err("stale claim owner epoch".into());
+            }
+            job.observe_claim(current, cancel);
+            if job.pin_cleanup_confirmed {
                 job.last_error = None;
                 return Ok(());
             }
             let payload = Arc::make_mut(&mut job.payload);
             payload["mode"] = json!("release");
-            payload["revision"] = json!(current["revision"]
+            payload["revision"] = json!(job.claim_view["revision"]
                 .as_u64()
                 .ok_or("claim revision absent")?
                 .saturating_add(1));
@@ -1772,8 +1780,7 @@ impl WorkerPoll {
             if !self.feedback.accept_claim(&job.url, &ticket) {
                 return Err("claim query crossed feedback invalidation".into());
             }
-            job.claim_absent = claim.is_null();
-            job.claim_view = claim;
+            job.observe_claim(claim, cancel);
         }
         if job.action == "sglang.prefetch" && !cancel && !request_only {
             // A terminal result alone cannot establish current location.

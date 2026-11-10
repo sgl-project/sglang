@@ -58,6 +58,7 @@ struct EngineState {
     residency_override: Option<Value>,
     delayed_query: Option<Arc<DelayedQuery>>,
     delayed_capabilities: Option<Arc<DelayedQuery>>,
+    delayed_claim: Option<Arc<DelayedQuery>>,
     delayed_submit: Option<Arc<DelayedQuery>>,
 }
 #[derive(Default)]
@@ -107,6 +108,7 @@ async fn command(
 ) -> (axum::http::StatusCode, Json<Value>) {
     let delayed = match body["kind"].as_str() {
         Some("residency") => state.lock().unwrap().delayed_query.take(),
+        Some("claim") => state.lock().unwrap().delayed_claim.take(),
         Some("submit") => state.lock().unwrap().delayed_submit.take(),
         _ => None,
     };
@@ -1109,21 +1111,7 @@ async fn l2_pin_queries_claim_state_and_task_finish_releases_without_engine_task
     })
     .await
     .unwrap();
-    let delayed = Arc::new(DelayedQuery::default());
-    engine.state.lock().unwrap().delayed_capabilities = Some(delayed.clone());
-    let view =
-        tokio::time::timeout(Duration::from_millis(500), query(&router, "task", "keep")).await;
-    delayed.release.notify_one();
-    let view = view.expect("released PIN receipt does not need another worker RPC");
-    assert_eq!(view["quiescent"], true);
-    assert_eq!(
-        api(
-            &router,
-            json!({"kind":"ack","task":task("task"),"message_id":"keep"}),
-        )
-        .await["acknowledged"],
-        true
-    );
+    acknowledge_drained_pin(&engine, &router).await;
     let state = engine.state.lock().unwrap();
     assert_eq!(state.claims.len(), 1);
     assert!(state.commands.iter().any(|c| {
@@ -1139,11 +1127,35 @@ async fn l2_pin_queries_claim_state_and_task_finish_releases_without_engine_task
             .is_none()));
 }
 
+async fn acknowledge_drained_pin(engine: &Engine, router: &TestRouter) {
+    let delayed = Arc::new(DelayedQuery::default());
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.delayed_capabilities = Some(delayed.clone());
+        state.delayed_claim = Some(delayed.clone());
+    }
+    let view =
+        tokio::time::timeout(Duration::from_millis(500), query(router, "task", "keep")).await;
+    delayed.release.notify_one();
+    let view = view.expect("confirmed PIN cleanup does not need another worker RPC");
+    assert_eq!(view["quiescent"], true);
+    assert_eq!(
+        api(
+            router,
+            json!({"kind":"ack","task":task("task"),"message_id":"keep"}),
+        )
+        .await["acknowledged"],
+        true
+    );
+}
+
 #[tokio::test]
 async fn missing_l2_pin_drains_without_issuing_a_release() {
     let engine = Engine::start().await;
     engine.state.lock().unwrap().pin_missing = true;
-    let router = router(&[&engine], false, true).await;
+    let mut cfg = orchestration();
+    cfg.poll_ms = cfg.operation_ttl_ms;
+    let router = router_with(&[&engine], false, Some(cfg)).await;
     start(&router, "task").await;
     api(&router,json!({"kind":"submit","task":task("task"),"message_id":"keep","action":"sglang.pin","target":prefix(vec![1,2,3,4]),
         "location":{"tier":"host"},"mode":"acquire","claim_id":"keep","revision":1,"ttl_seconds":1})).await;
@@ -1166,6 +1178,7 @@ async fn missing_l2_pin_drains_without_issuing_a_release() {
     .unwrap();
     assert!(view["operations"][0]["claim"].is_null());
     assert!(view["operations"][0]["error"].is_null());
+    acknowledge_drained_pin(&engine, &router).await;
     let state = engine.state.lock().unwrap();
     assert!(state.claims.is_empty());
     assert!(state.commands.iter().any(|c| c["kind"] == "claim"));
