@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -19,6 +20,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
@@ -161,6 +163,25 @@ def _commit_disagg_handoff(
     )
 
     queue._commit_transfer_to_req(decode_req)
+
+
+class TestPrefillDiscardGrammar(CustomTestCase):
+    def test_extend_barrier_skips_discarded_and_middle_chunk_rows(self):
+        """An eager spec grammar barrier must not consume a discarded prefill token."""
+        discarded, live, middle = [_make_req(99) for _ in range(3)]
+        discarded.request_discard(FINISH_ABORT())
+        batch = _FakeBatch([discarded, live, middle])
+        batch.forward_mode = ForwardMode.EXTEND
+        batch.chunked_req = middle
+        result = GenerationBatchResult(next_token_ids=torch.tensor([101, 202, 303]))
+        processor = _make_processor()
+
+        processor.advance_grammar_fsm(result, batch)
+        processor.advance_grammar_fsm(result, batch)
+
+        self.assertEqual(discarded.grammar.accepted, [])
+        self.assertEqual(live.grammar.accepted, [202])
+        self.assertEqual(middle.grammar.accepted, [])
 
 
 class TestSpecV2GrammarTruncation(CustomTestCase):

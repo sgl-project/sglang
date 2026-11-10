@@ -1073,6 +1073,7 @@ class SchedulerBatchResultProcessor:
                 if (
                     req.grammar is None
                     or not still_in_batch_rows[i]
+                    or req.discard_output_reason is not None
                     or req is batch.chunked_req
                 ):
                     continue

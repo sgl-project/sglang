@@ -1,4 +1,4 @@
-"""Regression tests for the SWA chunked-req stash gate (#24252)."""
+"""Regression tests for scheduler prefill/decode transition gates."""
 
 import unittest
 from array import array
@@ -11,7 +11,14 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
+from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import (
+    NextBatchPlan,
+    Req,
+    ReqKvInfo,
+    ScheduleBatch,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -19,6 +26,10 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.test.scheduler_test_utils import empty_request_lists
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -149,6 +160,86 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         s.tree_cache.checkpoint.assert_called_once_with(
             req, up_to=self.POST_RESET_FILL_LEN
         )
+
+
+class TestPendingPrefillAbortGate(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args(model_path="dummy")
+        override.install()
+        self.addCleanup(override.restore)
+        self.scheduler = Scheduler.__new__(Scheduler)
+        empty_request_lists(self.scheduler)
+        self.scheduler.disaggregation_mode = DisaggregationMode.NULL
+        self.scheduler.enable_continuous_input_polling = False
+        self.scheduler.enable_skip_finishing_decode = True
+        self.scheduler.mm_receiver = None
+        self.reqs = [
+            Req(
+                rid=rid,
+                origin_input_text="",
+                origin_input_ids=array("q", [1, 2, 3]),
+                sampling_params=SamplingParams(max_new_tokens=8),
+            )
+            for rid in ("aborted-prefill", "live-prefill", "aborted-decode")
+        ]
+        self.reqs[2].output_ids.append(7)
+        for req in self.reqs:
+            req.sampling_params.normalize(None)
+        self.scheduler.running_reqs.join([self.reqs[2]])
+        self.scheduler.running_batch = ScheduleBatch(reqs=[self.reqs[2]])
+        self.batch = ScheduleBatch(
+            reqs=self.reqs,
+            forward_mode=ForwardMode.EXTEND,
+            decoding_reqs=[self.reqs[2]],
+        )
+        self.batch.add_inflight_step()
+        self.scheduler._join_prefill_launched(self.batch)
+        self.scheduler.last_batch = self.batch
+
+    def test_abort_discards_only_the_inflight_prefill_before_decode(self):
+        """An abort between final-prefill launch and commit must not schedule
+        another step; a decode row in the same batch keeps its partial output."""
+        for message in (None, "Running request timeout"):
+            with self.subTest(message=message):
+                self.scheduler.abort_request(
+                    AbortReq(rid="aborted", abort_message=message)
+                )
+                prefill, live, decode = self.reqs
+                self.assertIsInstance(prefill.discard_output_reason, FINISH_ABORT)
+                self.assertIs(prefill.discard_output_reason, prefill.to_finish)
+                self.assertEqual(prefill.to_finish.message, message or "Aborted")
+                self.assertEqual(
+                    prefill.to_finish.status_code, 503 if message else None
+                )
+                self.assertIsNone(live.to_finish)
+                self.assertIsNone(decode.discard_output_reason)
+                self.assertIsInstance(decode.to_finish, FINISH_ABORT)
+                self.assertEqual(list(decode.output_ids), [7])
+                self.assertFalse(prefill.finished())
+                self.assertEqual(
+                    self.scheduler._reqs_finishing_inflight(self.batch), [prefill]
+                )
+                next_batch = self.scheduler.update_running_batch(
+                    ScheduleBatch(reqs=[prefill])
+                )
+                self.assertTrue(next_batch.is_empty())
+                self.assertEqual(prefill.decode_batch_idx, 0)
+
+    def test_processed_prefill_and_pd_keep_existing_abort_semantics(self):
+        """A committed prefill or a PD transfer must not acquire discard semantics."""
+        for mode, inflight_steps in (
+            (DisaggregationMode.NULL, 0),
+            (DisaggregationMode.PREFILL, 1),
+            (DisaggregationMode.DECODE, 1),
+        ):
+            with self.subTest(mode=mode):
+                self.scheduler.disaggregation_mode = mode
+                prefill = self.reqs[0]
+                prefill.inflight_steps = inflight_steps
+                self.scheduler.abort_request(AbortReq(rid=prefill.rid))
+                self.assertIsInstance(prefill.to_finish, FINISH_ABORT)
+                self.assertIsNone(prefill.discard_output_reason)
 
 
 if __name__ == "__main__":
