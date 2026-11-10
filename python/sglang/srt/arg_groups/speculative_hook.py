@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -290,6 +291,161 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             # stash on that instead.
             algo.handle_server_args(server_args)
 
+    # Last, so the derivation observes every declaration above it -- the per-algorithm handlers,
+    # a model hook's limit, and the memory tier's ladder.
+    _speculative_admission_default(server_args)
+
+
+_SPEC_MIN_MAX_RUNNING_REQUESTS = 48
+_SPEC_GRAPH_LADDER_CEILING = 48
+
+
+def _speculative_admission_default(server_args: ServerArgs) -> None:
+    """Derive a speculative server's admission limit from the decode CUDA-graph ladder.
+
+    Five per-algorithm handlers above pin ``max_running_requests`` to the same constant, 48 --
+    one global number for every device since #3986 introduced it as 32 and #4908 raised it. This
+    scales that limit with the hardware instead, deriving it from ``cuda_graph_config.decode.max_bs``
+    -- a bound the engine already computes from measured device memory, and already uses as this
+    field's stand-in when it is unset (``memory_hook``, ``overrides._max_num_reqs_estimate`` and
+    ``kv_pool_runtime`` all read ``max_running_requests or decode.max_bs``). The historical 48
+    survives as a floor, so no built-in algorithm admits fewer requests than it does today.
+
+    The constant is doing two jobs, and raising it alone is unsafe because of that: the capture
+    path clips the decode ladder to ``req_to_token_pool.size``, which is sized from the admission
+    limit, so the same 48 also decides how far the ladder is captured. This therefore separates
+    the two -- admission scales with the device, while the capture ceiling is held exactly where
+    the 48 puts it today, by narrowing the ladder with the same predicate the capture path applies.
+    Graph memory does not grow, structurally rather than by a tunable margin.
+
+    Runs last in ``handle_speculative_decoding`` and reads ``resolving_view``, so it observes the
+    declarations of everything before it -- a model hook's limit (``deepseek_v4_hook``'s 256) and
+    the memory tier's ladder. A field read cannot see those: resolution accumulates in the
+    declaration stash and leaves the record pristine, so ``server_args.max_running_requests`` is
+    still None here however the question was answered.
+
+    Not a ``register_post_process`` pass: ``validate_declarations`` limits those to
+    model-overridable fields, and neither of these two is one. It declares at its slot, the way
+    the per-algorithm handlers and ``deepseek_v4_hook`` do for this same field.
+    """
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+
+    view = resolving_view(server_args)
+
+    if view.speculative_algorithm is None:
+        # This slot runs unconditionally; a non-speculative server must be left with
+        # max_running_requests=None so the KV-capacity estimator in resolve_max_num_reqs decides,
+        # exactly as before this change.
+        return
+
+    if isinstance(
+        SpeculativeAlgorithm.from_string(view.speculative_algorithm), CustomSpecAlgo
+    ):
+        # Externally registered algorithms never received the historical 48 -- CustomSpecAlgo's
+        # handle_server_args is a no-op -- so they resolve through the KV-capacity estimator
+        # today. Leave them there; this replaces the five built-in constants, it does not extend
+        # a default to algorithms that never had one.
+        return
+
+    if view.max_running_requests is not None:
+        # An explicit --max-running-requests, or an earlier model-specific writer such as
+        # deepseek_v4_hook, whose 256 is a declaration and so is visible here only through the
+        # view. Never clobber either -- and never touch the ladder, which the capture path
+        # already sizes against the limit they chose.
+        return
+
+    if (
+        view.cuda_graph_max_bs_decode is not None
+        or view.cuda_graph_bs_decode is not None
+    ):
+        # An explicitly configured decode-graph ladder without an explicit admission limit.
+        # Today that ladder is silently clipped to 48 by the capture path; deriving a higher
+        # limit here would un-clip it and grow graph memory on a configuration whose author never
+        # asked for more admission. Keep the historical limit.
+        logger.info(
+            "max_running_requests defaults to %d for speculative decoding: an explicit decode "
+            "CUDA-graph configuration is present, and raising the default limit would un-clip "
+            "it. Pass --max-running-requests to raise the limit.",
+            _SPEC_MIN_MAX_RUNNING_REQUESTS,
+        )
+        declare_resolution(
+            server_args,
+            "_speculative_admission_default",
+            max_running_requests=_SPEC_MIN_MAX_RUNNING_REQUESTS,
+        )
+        return
+
+    # The ladder is resolved by now: handle_cuda_graph_config parses the flags and
+    # handle_gpu_memory_settings fills the memory-tier max_bs, both earlier in the pipeline.
+    # A few later hooks can still disable the decode graph; there this default is simply a number
+    # the eager path never benefits from, exactly as the constant it replaces was.
+    graph_config = view.cuda_graph_config
+    decode_graph = graph_config.decode if graph_config is not None else None
+    if (
+        decode_graph is None
+        or decode_graph.backend == Backend.DISABLED
+        or not decode_graph.max_bs
+    ):
+        # No ladder to derive from. Hybrid (mamba / linear-attention) servers assert this field is
+        # set under speculation before resolve_max_num_reqs runs, so fall back to the historical
+        # value rather than leaving it None.
+        declare_resolution(
+            server_args,
+            "_speculative_admission_default",
+            max_running_requests=_SPEC_MIN_MAX_RUNNING_REQUESTS,
+        )
+        return
+
+    # Both this limit and the constant it replaces are global figures: resolve_max_num_reqs divides
+    # by the attention-DP degree to get the per-worker limit. So the derived value is the ladder
+    # as-is, with no attn_dp_size factor -- the raise is the same multiple of today's limit at every
+    # DP degree. Scaling it by the degree instead would multiply the *per-worker* limit by that
+    # degree (at dp8 on an H200 tier: 48 // 8 = 6 today against 512), and admission carries a memory
+    # cost of its own even with the capture ceiling held: measured on
+    # test/registered/models_e2e/test_dsa_glm52_dp_mtp.py, a global 4096 exhausts device memory
+    # during startup while 512 serves.
+    attn_dp_size = view.dp_size if view.enable_dp_attention else 1
+    derived = max(_SPEC_MIN_MAX_RUNNING_REQUESTS, decode_graph.max_bs)
+
+    # Hold the capture ceiling where the admission limit used to put it. The capture path clips per
+    # attention-DP worker (req_to_token_pool.size is the per-worker figure), so the ceiling the 48
+    # imposes on the ladder today is 48 // attn_dp_size, not 48. The runtime clip additionally
+    # rounds its bound up to the graph-batch alignment, which is not knowable here; omitting that
+    # can only make the held ladder shorter than today's, never longer. Only ever narrows: a memory
+    # tier whose ladder already tops out below the ceiling keeps the ladder it has.
+    ladder_ceiling = max(1, _SPEC_GRAPH_LADDER_CEILING // attn_dp_size)
+    declared = {"max_running_requests": derived}
+    held_max_bs = decode_graph.max_bs
+    if decode_graph.max_bs > ladder_ceiling:
+        # The record is read-only during resolution and the view's object is shared, so the
+        # narrowed ladder is a detached copy declared whole -- mutating decode_graph in place
+        # would either raise or leave the declaration stash disagreeing with the record.
+        narrowed = copy.deepcopy(graph_config)
+        narrowed.decode.max_bs = ladder_ceiling
+        if narrowed.decode.bs is not None:
+            # The predicate get_batch_sizes_to_capture already applies (bs <= the per-worker
+            # limit), evaluated here against the historical ceiling instead of the raised limit,
+            # so the captured set is the one this configuration captures today.
+            narrowed.decode.bs = [
+                bs for bs in narrowed.decode.bs if bs <= ladder_ceiling
+            ]
+        held_max_bs = ladder_ceiling
+        declared["cuda_graph_config"] = narrowed
+
+    logger.info(
+        "max_running_requests defaults to %d for speculative decoding (decode CUDA-graph ladder "
+        "max_bs=%d), with the captured ladder held at max_bs=%d (attn_dp_size=%d). Batches above "
+        "the captured ladder run eager; pass --max-running-requests to override the limit (the "
+        "captured ladder then follows it).",
+        derived,
+        decode_graph.max_bs,
+        held_max_bs,
+        attn_dp_size,
+    )
+    declare_resolution(server_args, "_speculative_admission_default", **declared)
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
@@ -441,16 +597,6 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
 
     _resolve_dflash_draft_attention_backend(server_args)
-
-    if cfg.max_running_requests is None:
-        declare_resolution(
-            server_args,
-            "_handle_dflash",
-            max_running_requests=48,
-        )
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
 
 
 def _handle_uno(server_args: ServerArgs) -> None:
@@ -859,14 +1005,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             f"got {cfg.speculative_num_draft_tokens}."
         )
 
-    if cfg.max_running_requests is None:
-        declare_resolution(
-            server_args,
-            "_handle_dspark",
-            max_running_requests=48,
-        )
         logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+            "Mixed chunked prefill is disabled because of using dspark speculative decoding."
         )
 
     from sglang.srt.speculative.ragged_verify import (
@@ -1046,15 +1186,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
-    if cfg.max_running_requests is None:
-        declare_resolution(
-            server_args,
-            "_handle_frozen_kv_mtp",
-            max_running_requests=48,
-        )
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
 
     if cfg.enable_mixed_chunk:
         declare_resolution(
@@ -1182,16 +1313,6 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         # TODO: support dp attention for standalone speculative decoding
         raise ValueError(
             "Currently standalone speculative decoding does not support dp attention."
-        )
-
-    if cfg.max_running_requests is None:
-        declare_resolution(
-            server_args,
-            "_handle_eagle_family",
-            max_running_requests=48,
-        )
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
     _disable_overlap_schedule_for_cpu(server_args)
@@ -1393,16 +1514,6 @@ def _handle_ngram(server_args: ServerArgs) -> None:
         )
 
     _disable_overlap_schedule_for_cpu(server_args)
-
-    if cfg.max_running_requests is None:
-        declare_resolution(
-            server_args,
-            "_handle_ngram",
-            max_running_requests=48,
-        )
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
 
     declare_resolution(
         server_args,
