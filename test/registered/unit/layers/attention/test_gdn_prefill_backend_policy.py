@@ -139,6 +139,42 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
                 self.assertEqual(backend.supports_prefill_graph_extend(), captured)
 
 
+class TestAiterGDNPrefillConvFallback(CustomTestCase):
+    def test_a_declined_batch_lands_on_triton(self):
+        """A ValueError from the AITER conv means "unsupported batch": the same call
+        must reach the Triton conv. An accepted batch must not run Triton too."""
+
+        def declines(*args, **kwargs):
+            raise ValueError("unsupported shape")
+
+        def accepts(*args, **kwargs):
+            return sentinel.aiter_out
+
+        for name, aiter_fn, expected in (
+            ("declines", declines, sentinel.triton_out),
+            ("accepts", accepts, sentinel.aiter_out),
+        ):
+            with (
+                self.subTest(name=name),
+                patch.object(
+                    gdn_backend, "_aiter_gdn_prefill_conv", return_value=aiter_fn
+                ),
+                patch.object(
+                    gdn_backend, "causal_conv1d_fn", return_value=sentinel.triton_out
+                ) as triton_conv,
+            ):
+                out = gdn_backend._prefill_causal_conv1d(
+                    sentinel.x, sentinel.weight, conv_states=sentinel.conv_states
+                )
+                self.assertIs(out, expected)
+                if expected is sentinel.triton_out:
+                    triton_conv.assert_called_once_with(
+                        sentinel.x, sentinel.weight, conv_states=sentinel.conv_states
+                    )
+                else:
+                    triton_conv.assert_not_called()
+
+
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def test_prefill_conv_table_covers_only_nonempty_chunks(self):
         backend = object.__new__(GDNAttnBackend)
