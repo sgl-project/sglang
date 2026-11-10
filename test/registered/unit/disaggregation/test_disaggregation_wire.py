@@ -544,6 +544,37 @@ class TestDisaggregationWire(unittest.TestCase):
                     self.assertFalse(fully_checked)
                     self.assertIn("same physical TP size", reason)
 
+    def test_mooncake_dflash_tp_mismatch_allows_a_draft_kv_ring(self):
+        """A DFLASH draft KV ring registers no draft KV entries to reslice."""
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            state_types=[], num_draft_entries=0, kv_layer_ids=[], kv_item_lens=[]
+        )
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.pp_size = 1
+        manager.state_tp_size = 2
+        manager.attn_tp_size = 1
+        registration_info = SimpleNamespace(
+            mooncake_session_id="decode",
+            dst_attn_tp_size=8,
+            dst_draft_rows_dcp_collapsed=False,
+            dst_kv_layer_ids=[],
+            dst_kv_item_lens=[],
+            dst_dcp_size=1,
+            requires_dcp_relayout=False,
+        )
+        with get_context().override_server_args(
+            enable_unified_memory=False,
+            speculative_algorithm="DFLASH",
+            speculative_dflash_draft_kv_ring=True,
+        ):
+            fully_checked, reason = manager._validate_peer_state_layout(
+                registration_info
+            )
+        self.assertTrue(fully_checked)
+        self.assertIsNone(reason)
+
     def test_mooncake_rejects_a_decode_kv_page_stride_at_registration(self):
         """A decode KV pool with another page stride is rejected at registration.
 
