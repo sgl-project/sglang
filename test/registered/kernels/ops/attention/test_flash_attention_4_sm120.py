@@ -19,6 +19,7 @@ from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
     flash_attn_with_kvcache,
     get_flash_attention_v4_sm120_runtime_policy,
 )
+from sglang.kernels.ops.attention.flash_attn.cute.interface import _flash_attn_fwd
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -31,6 +32,89 @@ if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 1
     pytest.skip(
         "SM12x FlashAttention-4 test requires CUDA SM 12.x.",
         allow_module_level=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides,expected_tile",
+    [
+        ({}, (128, 64)),
+        ({"arch": 120}, (64, 64)),
+        ({"seqlen_q": 4095, "seqlen_k": 4095}, (64, 64)),
+        ({"seqlen_k": 8192}, (64, 64)),
+        ({"is_causal": True}, (64, 64)),
+        ({"is_local": True}, (64, 64)),
+        ({"paged_kv": True}, (64, 64)),
+        ({"qhead_per_kvhead": 2}, (64, 64)),
+        ({"tile_mn": (64, 128)}, (64, 128)),
+        ({"has_bias": True}, (64, 128)),
+    ],
+)
+def test_sm121_dense_image_tile_policy(overrides, expected_tile):
+    args = dict(
+        arch=121,
+        head_dim=128,
+        head_dim_v=128,
+        tile_mn=None,
+        has_bias=False,
+        total_q_rows=4096 * 56,
+        num_sms=48,
+        num_batch=1,
+        seqlen_q=4096,
+        seqlen_k=4096,
+        num_head_kv=56,
+        qhead_per_kvhead=1,
+        is_causal=False,
+        is_local=False,
+        window_size_left=None,
+        window_size_right=None,
+        pack_gqa=False,
+        paged_kv=False,
+    )
+    args.update(overrides)
+    config = sm120_forward_host.select_config(**args)
+    assert (config.tile_m, config.tile_n) == expected_tile
+
+
+@pytest.mark.parametrize("used", [4096, 4453, 16741, 18867])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_sm121_dense_image_tile_preserves_packed_attention(monkeypatch, used, dtype):
+    torch.manual_seed(42)
+    total = (used + 63) // 64 * 64
+    qkv = torch.randn((total, 3, 56, 128), device="cuda", dtype=dtype)
+    q, k, v = qkv.unbind(1)
+    cu_seqlens = torch.tensor([0, used, total], device="cuda", dtype=torch.int32)
+    args = dict(
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=used,
+        max_seqlen_k=used,
+        causal=False,
+    )
+    reference = _flash_attn_fwd(q, k, v, tile_mn=(64, 64), **args)[0]
+    select_config = Sm120ForwardHost.select_config
+    selected = []
+
+    def spark_config(**kwargs):
+        # exercise the GB10 policy on any SM12x test runner
+        kwargs["arch"] = 121
+        config = select_config(**kwargs)
+        selected.append((config.tile_m, config.tile_n))
+        return config
+
+    monkeypatch.setattr(Sm120ForwardHost, "select_config", staticmethod(spark_config))
+    actual = _flash_attn_fwd(q, k, v, **args)[0]
+    assert selected == [(128, 64)]
+    torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+    # selected live rows still attend to every live key, never the padding
+    rows = [0, used // 2, used - 1]
+    scores = torch.einsum("qhd,khd->hqk", q[rows, :2].double(), k[:used, :2].double())
+    expected = torch.einsum(
+        "hqk,khd->qhd", (scores / math.sqrt(128)).softmax(-1), v[:used, :2].double()
+    )
+    torch.testing.assert_close(
+        actual[rows, :2].double(), expected, atol=5e-4, rtol=5e-3
     )
 
 

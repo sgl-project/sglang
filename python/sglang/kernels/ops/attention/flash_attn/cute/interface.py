@@ -739,6 +739,7 @@ def _flash_attn_fwd(
     arch_forward_config = None
     if arch_forward_host is not None:
         arch_forward_config = arch_forward_host.select_config(
+            arch=arch,
             head_dim=head_dim,
             head_dim_v=head_dim_v,
             tile_mn=tile_mn,

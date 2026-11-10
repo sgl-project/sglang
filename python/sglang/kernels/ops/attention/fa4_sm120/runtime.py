@@ -605,6 +605,7 @@ class Sm120ForwardPolicy:
     @staticmethod
     def select_config(
         *,
+        arch: int,
         head_dim: int,
         head_dim_v: int,
         tile_mn: Optional[tuple[int, int]],
@@ -632,6 +633,19 @@ class Sm120ForwardPolicy:
             if tile_mn is not None and tile_mn != (64, 128):
                 raise ValueError("SM120 relative bias requires tile_mn=(64, 128)")
             tile_m, tile_n = 64, 128
+        elif (
+            tile_mn is None
+            and arch == 121
+            and (head_dim, head_dim_v) == (128, 128)
+            and qhead_per_kvhead == 1
+            and not (is_causal or is_local or paged_kv)
+            and seqlen_q is not None
+            and seqlen_q == seqlen_k
+            and seqlen_q >= 4096
+        ):
+            # GB10 dense image attention reuses each K/V tile for twice as many
+            # query rows; keep N64 so the reduction order stays unchanged
+            tile_m, tile_n = 128, 64
         elif tile_mn is None:
             tile_m, tile_n = FlashAttentionForwardSm120.get_fwd_tile_size(
                 head_dim,
