@@ -499,9 +499,9 @@ def _pre_permute_allgather(
     first_expert = runner_config.moe_ep_rank * num_local_experts
     last_expert = first_expert + num_local_experts
     is_local = (topk_ids >= first_expert) & (topk_ids < last_expert)
-    # Padded TopK entries can be -1. Use an in-range ID outside this rank's
-    # expert range if one exists, and always skip these entries in combine.
-    padding_expert = last_expert if last_expert < num_experts else 0
+    # Padded TopK entries can be -1. Give them an ID outside this rank's
+    # active range. With one EP rank, reserve a dummy expert outside the range.
+    padding_expert = 0 if first_expert > 0 else last_expert
     routing_ids = topk_ids.masked_fill(
         (topk_ids < 0) | (topk_ids >= num_experts), padding_expert
     )
@@ -509,7 +509,7 @@ def _pre_permute_allgather(
     routed = npu_moe_init_routing(
         dispatch_output.hidden_states,
         routing_ids,
-        num_experts,
+        max(num_experts, padding_expert + 1),
         quant_mode=dispatch_output.quant_mode,
         scale=dispatch_output.hidden_states_scale,
         active_num=topk_ids.numel(),
@@ -519,10 +519,11 @@ def _pre_permute_allgather(
     state = dispatch_output.forward_state
     if state is None:
         raise RuntimeError("allgather dispatch output is missing forward state")
-    state.topk_weights = dispatch_output.topk_weights
+    state.topk_weights = dispatch_output.topk_weights.masked_fill(~is_local, 0)
     state.expanded_row_idx = routed.expanded_row_idx.masked_fill(
-        ~is_local.flatten(), -1
+        ~is_local.flatten(), topk_ids.numel() - 1
     )
+    state.expert_tokens = routed.expert_tokens
     running_state["ascend_ops_forward_state"] = state
     return AscendRunnerInput(
         hidden_states=routed.hidden_states,
@@ -642,10 +643,17 @@ def post_permute_ascend_to_ascend_ops(
                 hidden_states, local_expanded_row_idx
             )
     elif isinstance(state, _AllGatherState):
-        if state.expanded_row_idx is None or state.topk_weights is None:
+        if (
+            state.expanded_row_idx is None
+            or state.topk_weights is None
+            or state.expert_tokens is None
+        ):
             raise RuntimeError("allgather forward state is incomplete")
         hidden_states = combine_local_expert_routes(
-            runner_output.hidden_states, state.expanded_row_idx, state.topk_weights
+            runner_output.hidden_states,
+            state.expanded_row_idx,
+            state.topk_weights,
+            state.expert_tokens,
         )
     else:
         # MC2 / decode: the combine op applies the top-k weights itself.

@@ -81,7 +81,7 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
             dispatcher._quant_mode("mc2")
 
     def test_alltoallv_communicates_mode_specific_payload_and_scale(self):
-        """Prefill dtype controls the wire format independently of MC2."""
+        """Ascend Ops routing honors the low-latency wire dtype before fallback."""
         module = "sglang.srt.layers.moe.token_dispatcher.ascend_ops"
         hidden = torch.arange(128).reshape(2, 64).to(torch.bfloat16)
         ids = torch.tensor([[0], [1]], dtype=torch.int32)
@@ -103,20 +103,18 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
             (
                 {
                     "normal_dispatcher_output_dtype": "bf16",
-                    "prefill_dispatcher_output_dtype": "mxfp8",
-                    "low_latency_dispatcher_output_dtype": "bf16",
+                    "low_latency_dispatcher_output_dtype": "mxfp8",
                 },
                 True,
             ),
             (
                 {
                     "dispatcher_output_dtype": "mxfp8",
-                    "prefill_dispatcher_output_dtype": "bf16",
+                    "low_latency_dispatcher_output_dtype": "bf16",
                 },
                 False,
             ),
             ({"dispatcher_output_dtype": "mxfp8"}, True),
-            ({"low_latency_dispatcher_output_dtype": "mxfp8"}, False),
             ({}, False),
         )
         for config, quantized in cases:
@@ -157,7 +155,7 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
         """AllGather must quantize before communication when prefill requests it."""
         module = "sglang.srt.layers.moe.token_dispatcher.ascend_ops"
         dispatcher = self._dispatcher_for_quant_mode(
-            {"prefill_dispatcher_output_dtype": "mxfp8"}
+            {"low_latency_dispatcher_output_dtype": "mxfp8"}
         )
         hidden = torch.ones((1, 64), dtype=torch.bfloat16)
         payload = hidden.to(torch.float8_e4m3fn)
@@ -282,28 +280,32 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
 
         self.assertIsNone(get_forward().ascend_allgather_row_sizes)
 
-    def test_allgather_combine_skips_invalid_routes_and_sums_in_fp32(self):
-        """Nonlocal routes must not leak NaNs or round local sums before reduce."""
-        weights = torch.tensor([[1.003, 0.003], [1.0, 1.0]])
-        rank0_output = torch.tensor([[1.0], [float("nan")]], dtype=torch.bfloat16)
-        rank1_output = rank0_output.flip(0)
-        rank0 = combine_local_expert_routes(
-            rank0_output, torch.tensor([0, -1, -1, -1], dtype=torch.int32), weights
-        )
-        rank1 = combine_local_expert_routes(
-            rank1_output, torch.tensor([-1, 1, -1, -1], dtype=torch.int32), weights
-        )
-        torch.testing.assert_close(rank0 + rank1, torch.tensor([[1.006], [0.0]]))
-        torch.testing.assert_close(
-            (rank0 + rank1).bfloat16(),
-            torch.tensor([[1.0078125], [0.0]], dtype=torch.bfloat16),
-        )
-        torch.testing.assert_close(
-            combine_local_expert_routes(
-                rank0_output[:0], torch.full((4,), -1, dtype=torch.int32), weights
-            ),
-            torch.zeros_like(rank0),
-        )
+    def test_allgather_finalize_uses_zero_padding_and_fp32(self):
+        """A dropped route must never read an unwritten expert output row."""
+        module = "sglang.srt.hardware_backend.npu.moe.routing"
+        hidden = torch.tensor([[1.0], [float("nan")]], dtype=torch.bfloat16)
+        indices = torch.tensor([0, 3, 3, 3], dtype=torch.int32)
+        weights = torch.tensor([[1.003, 0.0], [0.0, 0.0]])
+
+        def finalize(expert_output, row_idx, topk_weights):
+            rows = expert_output.index_select(0, row_idx).reshape(2, 2, 1)
+            return (rows * topk_weights[:, :, None]).sum(dim=1)
+
+        with patch(f"{module}.npu_moe_finalize_routing", side_effect=finalize):
+            for output in (hidden, torch.cat((hidden, hidden))):
+                result = combine_local_expert_routes(
+                    output, indices, weights, torch.tensor([1])
+                )
+                torch.testing.assert_close(result, torch.tensor([[1.003], [0.0]]))
+
+            # With a full set of valid routes, the last row is live.
+            result = combine_local_expert_routes(
+                torch.arange(1, 5, dtype=torch.bfloat16)[:, None],
+                torch.arange(4, dtype=torch.int32),
+                torch.ones(2, 2),
+                torch.tensor([4]),
+            )
+            torch.testing.assert_close(result, torch.tensor([[3.0], [7.0]]))
 
     # Protects the forward-state handoff: combine must work without a cached
     # dispatch result stored on the dispatcher instance.

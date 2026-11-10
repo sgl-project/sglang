@@ -2,9 +2,9 @@
 
 Every Ascend MoE path — no-A2A ``standard``, ``ascend_ops`` alltoallv and
 allgather — permutes tokens into expert order with
-``npu_moe_init_routing_v2``. Standard and AllToAllV undo the permutation
-with ``npu_moe_finalize_routing``, while AllGather combines a rank's subset
-of the global routes.
+``npu_moe_init_routing_v2`` and undoes the permutation with
+``npu_moe_finalize_routing``. AllGather prepares a full-capacity FP32
+input for finalize from each rank's subset of the global routes.
 
 - :func:`npu_moe_init_routing`: quantizing pass (``quant_mode``), or
   scale-reuse pass (``scale``) that re-permutes already-quantized tokens
@@ -183,25 +183,17 @@ def combine_local_expert_routes(
     hidden_states: torch.Tensor,
     expanded_row_idx: torch.Tensor,
     topk_weights: torch.Tensor,
+    expert_tokens: torch.Tensor,
 ) -> torch.Tensor:
-    """Sum local expert contributions in FP32, with -1 marking skipped routes."""
-    num_tokens, top_k = topk_weights.shape
-    contributions = hidden_states.new_zeros(
-        (num_tokens, hidden_states.shape[1]), dtype=torch.float32
+    """Finalize local expert contributions in FP32 for ReduceScatter."""
+    num_routes = expanded_row_idx.numel()
+    expert_output = hidden_states.new_zeros(
+        (num_routes, hidden_states.shape[1]), dtype=torch.float32
     )
-    if hidden_states.shape[0] == 0:
-        return contributions
-
-    route_rows = expanded_row_idx.reshape(num_tokens, top_k)
-    # Process one top-k slot at a time to bound FP32 scratch space by the
-    # number of tokens. Invalid routes can read a NaN at the safe index;
-    # explicitly clear their contribution before accumulating.
-    for slot in range(top_k):
-        indices = route_rows[:, slot]
-        valid = (indices >= 0) & (indices < hidden_states.shape[0])
-        safe_indices = indices.masked_fill(~valid, 0)
-        weighted = hidden_states.index_select(0, safe_indices).float()
-        weighted.mul_(topk_weights[:, slot : slot + 1])
-        weighted.masked_fill_(~valid[:, None], 0)
-        contributions.add_(weighted)
-    return contributions
+    expert_output[: hidden_states.shape[0]].copy_(hidden_states)
+    # Routing packs valid expert rows at the front. When there are dropped
+    # routes, the caller maps them to the last capacity row with zero weight.
+    expert_output[-1:].masked_fill_(expert_tokens.sum() < num_routes, 0)
+    return npu_moe_finalize_routing(
+        expert_output, expanded_row_idx, topk_weights=topk_weights
+    )
