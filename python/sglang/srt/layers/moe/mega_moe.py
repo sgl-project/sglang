@@ -166,6 +166,9 @@ def _get_mega_moe_symm_buffer(
                 activation=activation,
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
+            # Caches the SM locality map, then stops DeepGEMM's MLOPart MPS helper,
+            # which would otherwise keep the worker from being checkpointed.
+            deep_gemm.destroy_localizer()
     return buf
 
 
