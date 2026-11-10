@@ -852,12 +852,9 @@ class FlashAttentionBackend(AttentionBackend):
             if forward_mode.is_target_verify() and self.topk > 1:
                 # topk>1 target verify: replay needs spec_info.positions and .custom_mask
                 # which are not populated at capture time.
-                verify_key = bs
-                self.forward_metadata = self.target_verify_metadata_topk_normal[
-                    verify_key
-                ]
+                self.forward_metadata = self.target_verify_metadata_topk_normal[bs]
                 self.forward_metadata_spec_decode_expand = (
-                    self.target_verify_metadata_topk_expand[verify_key]
+                    self.target_verify_metadata_topk_expand[bs]
                 )
                 return
 
@@ -3037,8 +3034,6 @@ class FlashAttentionBackend(AttentionBackend):
                 self.decode_cuda_graph_metadata[bs] = metadata
 
         elif forward_mode.is_target_verify():
-            verify_width = self.speculative_num_draft_tokens
-            verify_key = bs
             if self.topk <= 1:
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
@@ -3058,20 +3053,16 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
                         :num_tokens
                     ]
-                self.target_verify_metadata[verify_key] = metadata
+                self.target_verify_metadata[bs] = metadata
             else:
                 # Target Verify topk>1: two (or three with SWA) metadata objects
                 metadata.cache_seqlens_int32 = self.target_verify_metadata_topk_normal[
                     "cache_seqlens"
                 ][:bs]
-                metadata.max_seq_len_q = verify_width
-                metadata.cu_seqlens_q = torch.arange(
-                    0,
-                    bs * verify_width + 1,
-                    step=verify_width,
-                    dtype=torch.int32,
-                    device=device,
-                )
+                metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                metadata.cu_seqlens_q = self.target_verify_metadata_topk_normal[
+                    "cu_seqlens_q"
+                ][: bs + 1]
                 metadata.cu_seqlens_k = self.target_verify_metadata_topk_normal[
                     "cu_seqlens_k"
                 ][: bs + 1]
@@ -3081,25 +3072,22 @@ class FlashAttentionBackend(AttentionBackend):
 
                 metadata_expand.cache_seqlens_int32 = (
                     self.target_verify_metadata_topk_expand["cache_seqlens"][
-                        : bs * verify_width
+                        : bs * self.speculative_num_draft_tokens
                     ]
                 )
                 metadata_expand.max_seq_len_q = 1
-                metadata_expand.cu_seqlens_q = torch.arange(
-                    0,
-                    bs * verify_width + 1,
-                    dtype=torch.int32,
-                    device=device,
-                )
+                metadata_expand.cu_seqlens_q = self.target_verify_metadata_topk_expand[
+                    "cu_seqlens_q"
+                ][: bs * self.speculative_num_draft_tokens + 1]
                 metadata_expand.cu_seqlens_k = self.target_verify_metadata_topk_expand[
                     "cu_seqlens_k"
-                ][: bs * verify_width + 1]
+                ][: bs * self.speculative_num_draft_tokens + 1]
                 metadata_expand.page_table = self.target_verify_metadata_topk_expand[
                     "page_table"
-                ][: bs * verify_width, :verify_width]
+                ][: bs * self.speculative_num_draft_tokens]
 
-                self.target_verify_metadata_topk_normal[verify_key] = metadata
-                self.target_verify_metadata_topk_expand[verify_key] = metadata_expand
+                self.target_verify_metadata_topk_normal[bs] = metadata
+                self.target_verify_metadata_topk_expand[bs] = metadata_expand
                 # topk>1 target-verify early-returns before _apply; bind the
                 # view here (buffer refilled at replay).
                 if self.use_sliding_window_kv_pool:
@@ -3111,23 +3099,20 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata_swa = FlashAttentionMetadata()
                     metadata_swa.cache_seqlens_int32 = (
                         self.target_verify_metadata_topk_swa["cache_seqlens"][
-                            : bs * verify_width
+                            : bs * self.speculative_num_draft_tokens
                         ]
                     )
                     metadata_swa.max_seq_len_q = 1
-                    metadata_swa.cu_seqlens_q = torch.arange(
-                        0,
-                        bs * verify_width + 1,
-                        dtype=torch.int32,
-                        device=device,
-                    )
+                    metadata_swa.cu_seqlens_q = self.target_verify_metadata_topk_swa[
+                        "cu_seqlens_q"
+                    ][: bs * self.speculative_num_draft_tokens + 1]
                     metadata_swa.cu_seqlens_k = self.target_verify_metadata_topk_swa[
                         "cu_seqlens_k"
-                    ][: bs * verify_width + 1]
+                    ][: bs * self.speculative_num_draft_tokens + 1]
                     metadata_swa.page_table = self.target_verify_metadata_topk_swa[
                         "page_table"
-                    ][: bs * verify_width, : self.max_context_len + verify_width]
-                    self.target_verify_metadata_topk_swa[verify_key] = metadata_swa
+                    ][: bs * self.speculative_num_draft_tokens]
+                    self.target_verify_metadata_topk_swa[bs] = metadata_swa
                     metadata.swa_spec_metadata = metadata_swa
 
         elif forward_mode.is_draft_extend_v2():
@@ -3398,8 +3383,6 @@ class FlashAttentionBackend(AttentionBackend):
                         self._sched_meta_buf[n:] = 0
 
         elif forward_mode.is_target_verify():
-            verify_width = self.speculative_num_draft_tokens
-            verify_key = bs
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
                 if ragged_verify_layout is not None:
@@ -3425,9 +3408,9 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
                 # 1. The first half of metadata for prefix tokens
-                metadata = self.target_verify_metadata_topk_normal[verify_key]
+                metadata = self.target_verify_metadata_topk_normal[bs]
                 metadata.cache_seqlens_int32.copy_(seq_lens)
-                # metadata.max_seq_len_q = verify_width, already set in capture
+                # metadata.max_seq_len_q = self.speculative_num_draft_tokens, already set in capture
                 # Page table built on-device (self-guards on cache_seqlens).
                 # max_seq_len_k stays the static bound; its only replay reader
                 # is the SWA-merge capacity assert, capture-sized to match.
@@ -3445,36 +3428,38 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
                 # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
-                metadata_expand = self.target_verify_metadata_topk_expand[verify_key]
+                metadata_expand = self.target_verify_metadata_topk_expand[bs]
 
                 # metadata_expand.max_seq_len_q = 1, already set in capture
                 # metadata_expand.cu_seqlens_q already set in capture
-                offsets = torch.arange(verify_width, device=device).unsqueeze(
-                    0
-                )  # shape: (1, verify_width)
+                offsets = torch.arange(
+                    self.speculative_num_draft_tokens, device=device
+                ).unsqueeze(0)  # shape: (1, self.speculative_num_draft_tokens)
 
                 cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
                 mask = _extract_target_verify_tree_mask(
                     spec_info,
                     bs=bs,
-                    verify_width=verify_width,
+                    verify_width=self.speculative_num_draft_tokens,
                     seq_lens=seq_lens,
                     cols=cols,
                     valid_num_tokens=spec_info.positions.numel(),
                 )
 
-                col_indices = offsets.expand(mask.shape[0], verify_width)
+                col_indices = offsets.expand(
+                    mask.shape[0], self.speculative_num_draft_tokens
+                )
                 keys = torch.where(
                     mask,
                     col_indices,
-                    col_indices + verify_width,
+                    col_indices + self.speculative_num_draft_tokens,
                 )
                 _, sort_order = torch.sort(keys, dim=1)
 
                 non_masked_page_table = (
                     self.req_to_token[req_pool_indices, :]
                     .gather(1, cols)
-                    .repeat_interleave(verify_width, dim=0)
+                    .repeat_interleave(self.speculative_num_draft_tokens, dim=0)
                 )  # (bsz, draft_num)
 
                 metadata_expand.page_table.copy_(
@@ -3498,13 +3483,13 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata_expand.scheduler_metadata = (
                         self._compute_ubtree_verify_scheduler_metadata(
                             metadata_expand,
-                            batch_size=bs * verify_width,
-                            max_seq_len_k=verify_width,
+                            batch_size=bs * self.speculative_num_draft_tokens,
+                            max_seq_len_k=self.speculative_num_draft_tokens,
                         )
                     )
 
                 if self.has_swa:
-                    metadata_swa = self.target_verify_metadata_topk_swa[verify_key]
+                    metadata_swa = self.target_verify_metadata_topk_swa[bs]
                     self._init_sliding_window_attn_spec_metadata(
                         metadata, metadata_expand, metadata_swa
                     )
