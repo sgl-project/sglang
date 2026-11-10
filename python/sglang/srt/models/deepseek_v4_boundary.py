@@ -23,7 +23,10 @@ from sglang.srt.layers.layer_boundary.row_transport import (
     RowTransport,
     TransportRows,
 )
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    post_experts_output_is_complete,
+)
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     can_fuse_all_reduce,
 )
@@ -188,6 +191,12 @@ class HcReadCall(HcRead):
             hc=hc,
             accepts_mxfp8_deepgemm=self.attention
             and self.layer.self_attn.accepts_deepgemm_mxfp8_input(),
+            mega_moe_input=(
+                None
+                if self.attention
+                else mhc.mega_moe_input_of(self.layer, self.batch)
+            ),
+            extend=mhc.is_local_extend(self.batch),
         )
 
     def _after_post(self, residual, norm):
@@ -212,7 +221,14 @@ class HcReadCall(HcRead):
                 if mhc.use_stats_stream(layer.hc_cfg, self.batch, streams)
                 else None
             )
-            mhc.fork_stats_stream(stream)
+            if (
+                self.attention
+                and stream is not None
+                and layer.self_attn.use_mega_attention
+            ):
+                mhc.defer_attn_stats_fork(stream)
+            else:
+                mhc.fork_stats_stream(stream)
             quantized = (
                 []
                 if self.attention and layer.self_attn.accepts_mxfp8_swizzled_input()
@@ -403,10 +419,10 @@ def stages(config, layer_id, *, layer=None):
                 None if ep else SumGroup.MOE_OUTPUT,
             )
     if layer is None:
-        from sglang.srt.models.deepseek_v4 import (
-            _is_fused_mhc_post_pre_enabled_xpu,
+        from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
             is_cross_layer_mhc_fusion_enabled,
         )
+        from sglang.srt.models.deepseek_v4 import _is_fused_mhc_post_pre_enabled_xpu
 
         lagged = config.hc_pre_from_prev_sublayer
         fused = (
@@ -524,9 +540,14 @@ class MoeTransport(MoeRowTransport):
         self.input = None
         if isinstance(hidden_states, MoEOutput):
             completion = MoeFinalize(hidden_states)
+            # Without a declared group, only an a2a combine that already summed
+            # the experts finalizes locally; a fallback that did not still owes it.
+            summed = self.rows.group is None and post_experts_output_is_complete(
+                is_tp_path=False
+            )
             return (
                 completion.complete(reduce=False)
-                if self.mlp_reduce_scatter
+                if self.mlp_reduce_scatter or summed
                 else completion
             )
         if self.rows.group is not None and not self.mlp_reduce_scatter:

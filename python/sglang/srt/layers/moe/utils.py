@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -28,7 +29,7 @@ from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
 
-from sglang.srt.utils.common import log_info_on_rank0
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +41,8 @@ class MoeA2ABackend(Enum):
     NIXL = "nixl"
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
-    ASCEND_TP = "ascend_tp"
-    FLASHINFER = "flashinfer"
+    ASCEND_OPS = "ascend_ops"
+    FLASHINFER = "flashinfer_nvlink_one_sided"
     MEGAMOE = "megamoe"
     DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
@@ -52,6 +53,8 @@ class MoeA2ABackend(Enum):
     def _missing_(cls, value):
         if value is None:
             return cls.NONE
+        if value == "flashinfer":  # Deprecated alias for FLASHINFER.
+            return cls.FLASHINFER
         for member in cls:
             if value == member.value:
                 return member
@@ -75,8 +78,8 @@ class MoeA2ABackend(Enum):
     def is_ascend_fuseep(self):
         return self == MoeA2ABackend.ASCEND_FUSEEP
 
-    def is_ascend_tp(self):
-        return self == MoeA2ABackend.ASCEND_TP
+    def is_ascend_ops(self):
+        return self == MoeA2ABackend.ASCEND_OPS
 
     def is_mori(self):
         return self == MoeA2ABackend.MORI
@@ -106,6 +109,83 @@ class MoeA2ABackend(Enum):
             MoeA2ABackend.MOONCAKE,
             MoeA2ABackend.NIXL,
             MoeA2ABackend.MORI,
+        )
+
+
+@dataclass
+class AscendOpsConfig:
+    """Configuration for the ``ascend_ops`` MoE A2A backend.
+
+    Selects the prefill and decode execution paths:
+    - ``prefill``: ``allgather`` (TP AllGather -> local compute -> TP ReduceScatter)
+      or ``alltoallv`` (TP AllToAllv -> compute -> TP AllToAllv).
+    - ``decode``: ``low_latency`` (EP MC2 dispatch_v2 -> gmm -> activation ->
+      gmm -> combine_v2) or ``fused_op`` (single dispatch_ffn_combine).
+    - ``ll_dispatch_alg`` / ``ll_combine_alg``: the ``comm_alg`` handed to the
+      MC2 dispatch/combine ops of the ``low_latency`` path. The defaults are the
+      ones recommended by the operator owners (full-mesh dispatch, default
+      combine).
+    """
+
+    PREFILL_CHOICES = ("allgather", "alltoallv")
+    DECODE_CHOICES = ("low_latency", "fused_op")
+
+    prefill: str = "alltoallv"
+    decode: str = "low_latency"
+    ll_dispatch_alg: str = "fullmesh_v1"
+    ll_combine_alg: str = ""
+
+    def __post_init__(self) -> None:
+        if self.prefill not in self.PREFILL_CHOICES:
+            raise ValueError(
+                f"invalid moe-ascend-ops-config prefill mode {self.prefill!r}; "
+                f"expected one of {self.PREFILL_CHOICES}"
+            )
+        if self.decode not in self.DECODE_CHOICES:
+            raise ValueError(
+                f"invalid moe-ascend-ops-config decode mode {self.decode!r}; "
+                f"expected one of {self.DECODE_CHOICES}"
+            )
+        if self.decode == "fused_op":
+            raise ValueError(
+                "moe-ascend-ops-config decode mode 'fused_op' is not implemented; "
+                "use 'low_latency'"
+            )
+
+    @classmethod
+    def from_json_str(cls, s: Optional[str]) -> AscendOpsConfig:
+        """Parse ``--moe-ascend-ops-config`` JSON into a validated config.
+
+        ``None`` or an empty string returns the defaults. Unknown keys or an
+        invalid mode raise ``ValueError``.
+        """
+        if s is None or not s.strip():
+            return cls()
+        try:
+            data = json.loads(s)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"moe-ascend-ops-config is not valid JSON: {s!r}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"moe-ascend-ops-config must be a JSON object, got {type(data).__name__}"
+            )
+        unknown = set(data) - {
+            "prefill",
+            "decode",
+            "ll_dispatch_alg",
+            "ll_combine_alg",
+        }
+        if unknown:
+            raise ValueError(
+                f"moe-ascend-ops-config has unknown keys {sorted(unknown)}; "
+                "only 'prefill', 'decode', 'll_dispatch_alg' and "
+                "'ll_combine_alg' are supported"
+            )
+        return cls(
+            prefill=data.get("prefill", cls.prefill),
+            decode=data.get("decode", cls.decode),
+            ll_dispatch_alg=data.get("ll_dispatch_alg", cls.ll_dispatch_alg),
+            ll_combine_alg=data.get("ll_combine_alg", cls.ll_combine_alg),
         )
 
 
@@ -190,6 +270,9 @@ class _MoeRunnerBackendPredicates:
     def is_intel_xpu(self):
         return self.value == MoeRunnerBackend.INTEL_XPU.value
 
+    def is_gluon(self):
+        return self.value == MoeRunnerBackend.GLUON.value
+
 
 class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AUTO = "auto"
@@ -214,6 +297,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
     INTEL_XPU = "intel_xpu"
+    GLUON = "gluon"
 
 
 @dataclass(frozen=True)
@@ -502,6 +586,9 @@ def initialize_moe_config():
     )
     moe.deepep_mode = DeepEPMode(exec_moe.deepep_mode)
     moe.deepep_config = exec_moe.deepep_config or ""
+    moe.moe_ascend_ops_config = AscendOpsConfig.from_json_str(
+        exec_moe.moe_ascend_ops_config
+    )
     moe.tbo_enabled = overlap.enable_two_batch_overlap
     moe.sbo_enabled = overlap.enable_single_batch_overlap
     if moe.sbo_enabled and is_cuda():
@@ -637,6 +724,14 @@ def get_deepep_config() -> str:
         logger.warning("DEEPEP_CONFIG is not initialized, using default config")
         moe.deepep_config = ""
     return moe.deepep_config
+
+
+def get_moe_ascend_ops_config() -> AscendOpsConfig:
+    """Return the validated ``ascend_ops`` configuration for the active scope."""
+    moe = get_flags().moe
+    if moe.moe_ascend_ops_config is None:
+        moe.moe_ascend_ops_config = AscendOpsConfig()
+    return moe.moe_ascend_ops_config
 
 
 def is_tbo_enabled() -> bool:
@@ -1082,3 +1177,11 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
             w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
+
+
+def route_dropped_experts_to_local(
+    topk_weights: torch.Tensor, topk_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map -1 ids (EP-dropped, padded) to expert 0 at weight 0 for sgl-kernel-xpu."""
+    dropped = topk_ids < 0
+    return topk_weights.masked_fill(dropped, 0), topk_ids.masked_fill(dropped, 0)

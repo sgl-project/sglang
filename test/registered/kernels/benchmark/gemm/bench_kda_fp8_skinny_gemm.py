@@ -18,7 +18,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 
 def _make_inputs(m: int, n: int, k: int):

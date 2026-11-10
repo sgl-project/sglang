@@ -30,13 +30,19 @@ validate actually addresses the bytes the collective delivers:
    exact KV bytes, separate target/draft storage and scratch plans, fragmented
    pages, partial tail pages, both MLA write APIs, and local/nonzero draft
    layer IDs across batches.
+4. Symmetric-window buffer lifetime: deregistration before the free.
 
-Registered as a base-b 2-gpu-large unit test; skips when fewer than 2 CUDA
-devices are visible. Run directly with:
+The copy-engine (zero-SM) gathers need NCCL >= 2.31.2 and live in
+``test/manual/mem_cache/test_page_interleave_zero_sm_gather.py``.
+
+Registered for base-b 2-gpu-large and base-c 4-gpu-b200; multi-GPU tests skip
+when too few CUDA devices are visible. Run directly with:
     CUDA_VISIBLE_DEVICES=0,1 python3 \
         test/registered/unit/mem_cache/test_page_interleave_gather_multi_gpu.py
 """
 
+import ctypes
+import gc
 import os
 import unittest
 from types import SimpleNamespace
@@ -47,6 +53,9 @@ import torch.multiprocessing as mp
 from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    allocate_symmetric_buffer,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -62,6 +71,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=120, stage="extra-b", runner_config="4-gpu-b200")
 
 _GATHER_WORLD = 2
 _GATHER_LAYER_NUM = 4
@@ -263,6 +273,7 @@ def _run_mla(rank, world, port):
     torch.distributed.barrier()
     if rank == 0:
         print("PASS: MLA page-interleave shard (attn-TP axis)")
+    return pool, req_to_token, prefix_len, seq_len
 
 
 def _run_mha(rank, world, port):
@@ -449,7 +460,7 @@ def _mtp_make_draft_pool(target, allocator, kind, start_layer):
         pool = kvc._build_token_to_kv_pool(
             sizes=SimpleNamespace(max_total_num_tokens=target.size),
             is_dsa_model=False,
-            is_dsv4_model=False,
+            is_compressed_kv_model=False,
             req_to_token_pool=None,
         )
     assert pool.shard_spec is target.shard_spec
@@ -681,6 +692,36 @@ class TestPageInterleaveGatherMultiGpu(CustomTestCase):
 
     def test_mtp_mha_shard_over_attention_cp(self):
         mp.spawn(_run_mtp, args=(29814, "mha"), nprocs=_GATHER_WORLD, join=True)
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA device")
+class TestSymmetricBufferLifetime(CustomTestCase):
+    def test_zeroed_buffer_deregisters_before_free(self):
+        """The allocation needs only window registration and memory ownership."""
+        released = []
+
+        def free(ptr):
+            released.append(("free", ptr))
+            torch.cuda.caching_allocator_delete(ptr)
+
+        comm = SimpleNamespace(
+            device=torch.device("cuda", torch.cuda.current_device()),
+            nccl=SimpleNamespace(
+                ncclMemAlloc=torch.cuda.caching_allocator_alloc,
+                ncclMemFree=free,
+            ),
+            register_comm_window_raw=lambda ptr, size: ctypes.c_void_p(ptr),
+            deregister_comm_window=lambda window: released.append(
+                ("deregister", window.value)
+            ),
+        )
+        buf, registered = allocate_symmetric_buffer(comm, 8192)
+        self.assertTrue(registered)
+        self.assertEqual(int(buf.count_nonzero()), 0)
+        ptr = buf.data_ptr()
+        del buf
+        gc.collect()
+        self.assertEqual(released, [("deregister", ptr), ("free", ptr)])
 
 
 if __name__ == "__main__":

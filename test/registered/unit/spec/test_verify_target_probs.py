@@ -14,15 +14,27 @@ import torch.nn.functional as F
 
 import sglang.kernels.ops.sampling.topk as topk_ops
 from sglang.srt.speculative.dflash_utils import (
+    _adjust_top_p_for_top_k,
     _dflash_top_p_renorm_prob,
     build_speculative_verify_target_probs,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
 
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 _DRAFT_TOKEN_NUM = 8
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_renorm():
+    override = get_context().override_server_args(
+        tp_size=1, enable_deterministic_inference=True
+    )
+    override.install()
+    yield
+    override.restore()
 
 
 def _skip_unsupported_top_p(device, need_top_p):
@@ -68,9 +80,9 @@ def _reference(next_token_logits, sampling_info, draft_token_num, bs, max_top_k,
     top_vals = top_vals.masked_fill(ranks >= top_ks[:, None], float("-inf"))
     top_probs = F.softmax(top_vals, dim=-1)
     if info.need_top_p_sampling:
-        top_probs = _dflash_top_p_renorm_prob(
-            top_probs, torch.repeat_interleave(info.top_ps, draft_token_num, dim=0)
-        )
+        top_ps = torch.repeat_interleave(info.top_ps, draft_token_num, dim=0)
+        top_ps = _adjust_top_p_for_top_k(top_vals, scaled, top_ps[:, None])
+        top_probs = _dflash_top_p_renorm_prob(top_probs, top_ps.squeeze(-1))
     probs = torch.zeros_like(scaled).scatter_(1, top_ids, top_probs)
     return probs.view(bs, draft_token_num, -1)
 

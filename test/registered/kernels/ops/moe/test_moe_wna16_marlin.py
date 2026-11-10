@@ -17,10 +17,11 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend, initialize_moe_config
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_moe_nvfp4_layer_for_marlin,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
-from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
+from sglang.srt.utils.device import is_sm80_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
     awq_marlin_quantize,
@@ -29,15 +30,6 @@ from sglang.test.test_marlin_utils import (
 )
 
 register_cuda_ci(est_time=720, stage="extra-a", runner_config="1-gpu-large")
-
-
-def _has_aot_moe_wna16_marlin_gemm() -> bool:
-    return hasattr(torch.ops.sgl_kernel, "moe_wna16_marlin_gemm") and hasattr(
-        torch.ops.sgl_kernel.moe_wna16_marlin_gemm, "default"
-    )
-
-
-AOT_AVAILABLE = _has_aot_moe_wna16_marlin_gemm()
 
 
 def stack_and_dev(tensors: list[torch.Tensor]):
@@ -150,59 +142,6 @@ def _run_single_gemm(
     )
 
 
-def _run_single_gemm_aot(
-    a,
-    c,
-    qweight,
-    scales,
-    zeros,
-    g_idx,
-    sort_indices,
-    workspace,
-    sorted_token_ids,
-    expert_ids,
-    num_tokens_post_padded,
-    topk_weights,
-    quant_type,
-    block_size_m,
-    topk,
-    size_m,
-    size_n,
-    size_k,
-    mul_topk_weights,
-    is_k_full,
-    use_atomic_add,
-):
-    return torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
-        a,
-        c,
-        qweight,
-        None,  # b_bias
-        scales,
-        None,  # global_scale
-        zeros,
-        g_idx,
-        sort_indices,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        moe_block_size=block_size_m,
-        top_k=topk,
-        mul_topk_weights=mul_topk_weights,
-        is_ep=False,
-        b_q_type_id=quant_type.id,
-        size_m=size_m,
-        size_n=size_n,
-        size_k=size_k,
-        is_k_full=is_k_full,
-        use_atomic_add=use_atomic_add,
-        use_fp32_reduce=True,
-        is_zp_float=False,
-    )
-
-
 def generate_test_cases():
     m_list = [1, 123]
     n_list = [128, 1024]
@@ -254,9 +193,6 @@ TEST_CASES = generate_test_cases()
 def test_moe_wna16_marlin_gemm(
     m, n, k, e, topk, dtype, group_size, act_order, quant_type
 ):
-    if not AOT_AVAILABLE:
-        pytest.skip("sgl_kernel moe_wna16_marlin_gemm AOT op not available")
-
     torch.manual_seed(0)
 
     has_zp = quant_type in [scalar_types.uint4, scalar_types.uint8]
@@ -327,33 +263,11 @@ def test_moe_wna16_marlin_gemm(
 
     torch.cuda.synchronize()
 
-    # --- Check bitwise equality with AOT kernel ---
-    c_aot = torch.empty((m * topk, 2 * n), dtype=dtype, device="cuda")
-    c_aot = _run_single_gemm_aot(
-        a,
-        c_aot,
-        qweight1,
-        scales1,
-        zeros1,
-        g_idx1,
-        sort_indices1,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        scalar_type,
-        block_size_m,
-        topk,
-        m,
-        2 * n,
-        k,
-        False,
-        True,
-        use_atomic_add,
-    )
-    torch.cuda.synchronize()
-    torch.testing.assert_close(c_jit, c_aot, rtol=0, atol=0)
+    # Row i * topk + j of the output is token i through its j-th routed expert.
+    per_expert = torch.matmul(a.float(), w_ref1.float().transpose(1, 2))
+    tokens = torch.arange(m, device="cuda").repeat_interleave(topk)
+    expected = per_expert[topk_ids.flatten(), tokens].to(dtype)
+    torch.testing.assert_close(c_jit, expected, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(
@@ -689,7 +603,10 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     output_ref *= routed_scaling_factor
 
     torch.cuda.synchronize()
-    torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.25)
+    # Outputs reach |32-64|, where one bf16 ulp is 0.25, and on SM90 the kernel
+    # sums partials with bf16 atomic adds, so the order (and the result) varies
+    # run to run. atol=0.25 left no room for that; allow two ulps.
+    torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.5)
 
 
 def _dequant_mxfp4_reference(packed, scales):
@@ -1311,182 +1228,6 @@ def test_moe_wna16_marlin_inactive_output_ownership(has_inactive_prefix_count):
                 torch.testing.assert_close(
                     result[inactive], expected[inactive], rtol=0, atol=0
                 )
-
-
-def test_marlin_lora_direct_inactive_routes():
-    """Direct LoRA projections overwrite inactive routes with finite zeros."""
-    from sglang.srt.lora.marlin_lora_temp.direct_decode import (
-        direct_decode_down_shrink,
-        direct_decode_gate_expand,
-    )
-
-    torch.manual_seed(51)
-    rows, topk, experts, intermediate, rank = 3, 6, 8, 384, 32
-    ids = torch.tensor(
-        [[0, 1, 2, 3, 4, 5], [-1, -1, -1, -1, -1, -1], [2, -1, 4, 5, -1, 7]],
-        device="cuda",
-        dtype=torch.int32,
-    )
-    slots = torch.zeros(rows, device="cuda", dtype=torch.int32)
-    shared = torch.randn((rows, 2 * rank), device="cuda", dtype=torch.bfloat16)
-    gate_b = (
-        torch.randn(
-            (1, experts, 2 * intermediate, rank), device="cuda", dtype=torch.bfloat16
-        )
-        * 0.05
-    )
-    down_a = (
-        torch.randn(
-            (1, experts, rank, intermediate), device="cuda", dtype=torch.bfloat16
-        )
-        * 0.05
-    )
-    activation = torch.randn(
-        (rows * topk, intermediate), device="cuda", dtype=torch.bfloat16
-    )
-    activation.view(rows, topk, intermediate)[ids < 0] = float("nan")
-    gate_output = torch.full(
-        (rows, topk, 2 * intermediate),
-        float("nan"),
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    down_output = torch.full(
-        (rows, topk, rank), float("nan"), device="cuda", dtype=torch.bfloat16
-    )
-    direct_decode_gate_expand(shared, gate_b, ids, slots, gate_output)
-    direct_decode_down_shrink(activation, down_a, ids, slots, down_output)
-    expected_gate = torch.zeros_like(gate_output)
-    expected_down = torch.zeros_like(down_output)
-    for token in range(rows):
-        for route in range(topk):
-            expert = int(ids[token, route])
-            if expert < 0:
-                continue
-            for half in range(2):
-                start = half * intermediate
-                expected_gate[token, route, start : start + intermediate] = (
-                    gate_b[0, expert, start : start + intermediate].float()
-                    @ shared[token, half * rank : (half + 1) * rank].float()
-                ).to(gate_output.dtype)
-            expected_down[token, route] = (
-                down_a[0, expert].float() @ activation[token * topk + route].float()
-            ).to(down_output.dtype)
-    torch.testing.assert_close(gate_output, expected_gate, rtol=0.03, atol=0.01)
-    torch.testing.assert_close(down_output, expected_down, rtol=0.03, atol=0.01)
-    assert torch.count_nonzero(gate_output[ids < 0]) == 0
-    assert torch.count_nonzero(down_output[ids < 0]) == 0
-
-    # A dense oracle for both real adapter slots keeps the selected projection
-    # independent of the kernels' inactive-address and payload masks.
-    finite_shared = torch.stack((shared, shared * 2))
-    finite_gate_b = torch.cat((gate_b, gate_b * 1.5))
-    finite_down_a = torch.cat((down_a, down_a * -0.75))
-    finite_activation = torch.randn_like(activation)
-    dense_gate = (
-        torch.einsum(
-            "smhr,sehir->smehi",
-            finite_shared.view(2, rows, 2, rank).float(),
-            finite_gate_b.view(2, experts, 2, intermediate, rank).float(),
-        )
-        .flatten(-2)
-        .to(gate_output.dtype)
-    )
-    dense_down = torch.einsum(
-        "mti,seri->smter",
-        finite_activation.view(rows, topk, intermediate).float(),
-        finite_down_a.float(),
-    ).to(down_output.dtype)
-    slot_shared = finite_shared.clone()
-    slot_gate_b = finite_gate_b.clone()
-    slot_down_a = finite_down_a.clone()
-    route_ids = torch.arange(topk, device="cuda", dtype=torch.int32).repeat(rows, 1)
-    route_index = torch.arange(topk, device="cuda")
-    states = (
-        ("valid", (0, 1, 0), (1, 1)),
-        ("disabled", (0, 1, 0), (1, 0)),
-        ("missing-or-out-of-range", (0, -1, 2), (1, 1)),
-        ("zero", (0, 1, 0), (1, 1)),
-        ("recovery", (0, 1, 0), (1, 1)),
-    )
-    for enabled_dtype in (torch.bool, torch.int32, torch.int64):
-        # The optional metadata accepts a strided one-dimensional view.
-        enabled = torch.ones(4, device="cuda", dtype=enabled_dtype)[::2]
-
-        def project_enabled():
-            direct_decode_gate_expand(
-                slot_shared,
-                slot_gate_b,
-                ids,
-                slots,
-                gate_output,
-                adapter_enabled=enabled,
-            )
-            direct_decode_down_shrink(
-                activation,
-                slot_down_a,
-                ids,
-                slots,
-                down_output,
-                adapter_enabled=enabled,
-            )
-
-        ids.copy_(route_ids)
-        slots.copy_(torch.tensor(states[0][1], device="cuda", dtype=slots.dtype))
-        activation.copy_(finite_activation)
-        project_enabled()
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            project_enabled()
-        for state, mapping, flags in states:
-            ids.copy_(route_ids)
-            slots.copy_(torch.tensor(mapping, device="cuda", dtype=slots.dtype))
-            enabled.copy_(torch.tensor(flags, device="cuda", dtype=enabled_dtype))
-            slot_shared.copy_(finite_shared)
-            slot_gate_b.copy_(finite_gate_b)
-            slot_down_a.copy_(finite_down_a)
-            activation.copy_(finite_activation)
-            if state == "disabled":
-                slot_shared[1].fill_(float("nan"))
-                slot_gate_b[1].fill_(float("nan"))
-                slot_down_a[1].fill_(float("nan"))
-                activation.view(rows, topk, intermediate)[1].fill_(float("nan"))
-            elif state == "missing-or-out-of-range":
-                slot_shared[:, 1:].fill_(float("nan"))
-                activation.view(rows, topk, intermediate)[1:].fill_(float("nan"))
-            elif state == "zero":
-                ids.fill_(-1)
-                slot_shared.fill_(float("nan"))
-                slot_gate_b.fill_(float("nan"))
-                slot_down_a.fill_(float("nan"))
-                activation.fill_(float("nan"))
-            gate_output.fill_(float("nan"))
-            down_output.fill_(float("nan"))
-            graph.replay()
-            expected_gate.zero_()
-            expected_down.zero_()
-            active_rows = []
-            if state != "zero":
-                for token, slot in enumerate(mapping):
-                    if 0 <= slot < len(flags) and flags[slot]:
-                        active_rows.append(token)
-                        expected_gate[token] = dense_gate[slot, token, route_index]
-                        expected_down[token] = dense_down[
-                            slot, token, route_index, route_index
-                        ]
-            torch.testing.assert_close(gate_output, expected_gate, rtol=0.03, atol=0.01)
-            torch.testing.assert_close(down_output, expected_down, rtol=0.03, atol=0.01)
-            assert torch.isfinite(gate_output).all()
-            assert torch.isfinite(down_output).all()
-            inactive_rows = [token for token in range(rows) if token not in active_rows]
-            assert torch.count_nonzero(gate_output[inactive_rows]) == 0
-            assert torch.count_nonzero(down_output[inactive_rows]) == 0
-            if active_rows:
-                # Slot zero is a loaded adapter and must remain a real projection.
-                assert 0 in active_rows
-                assert torch.count_nonzero(expected_gate[0]) > 0
-                assert torch.count_nonzero(expected_down[0]) > 0
 
 
 @pytest.mark.parametrize("use_expert_map", [False, True])

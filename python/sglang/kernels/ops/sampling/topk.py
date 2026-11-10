@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.utils import is_flashinfer_available
-from sglang.utils import LazyImport
+from sglang._lazy_import import LazyImport
 
 if is_flashinfer_available():
     # Resolved on first call, like the renorm kernels.

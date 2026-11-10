@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_conf
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -65,6 +66,52 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     process_model_weights_after_loading,
 )
 from sglang.srt.layers.linear import LinearBase as SrtLinearBase
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("starts_on_cpu", [False, True])
+def test_encoder_load_copies_host_checkpoint_into_final_parameters(
+    tmp_path, single_process_model_parallel, starts_on_cpu
+):
+    """GPU-resident encoders must not stage a second full GPU weight tensor."""
+    hf_config = transformers.T5Config(
+        vocab_size=64, d_model=32, d_kv=8, d_ff=64, num_layers=1, num_heads=4
+    )
+    reference = transformers.T5EncoderModel(hf_config)
+    weights = {name: p.detach().clone() for name, p in reference.named_parameters()}
+    save_file(weights, tmp_path / "model.safetensors")
+    config = T5Config()
+    config.update_model_arch(hf_config.to_dict())
+    config.arch_config.architectures = ["T5EncoderModel"]
+    read_weights = TextEncoderLoader._get_all_weights
+
+    def check_checkpoint_device(self, *args, **kwargs):
+        for name, tensor in read_weights(self, *args, **kwargs):
+            assert tensor.device.type == "cpu"
+            torch.testing.assert_close(tensor, weights[name], rtol=0, atol=0)
+            yield name, tensor
+
+    with mock.patch.object(
+        TextEncoderLoader, "_get_all_weights", check_checkpoint_device
+    ):
+        loaded = TextEncoderLoader().load_model(
+            str(tmp_path),
+            config,
+            SimpleNamespace(pipeline_config=None),
+            dtype="bf16",
+            component_starts_on_cpu=starts_on_cpu,
+        )
+    for name, parameter in loaded.named_parameters():
+        if ".qkv_proj." in name:
+            expected = torch.cat(
+                [weights[name.replace(".qkv_proj.", f".{part}.")] for part in "qkv"]
+            )
+        else:
+            expected = weights[name]
+        assert parameter.device.type == ("cpu" if starts_on_cpu else "cuda")
+        torch.testing.assert_close(
+            parameter.cpu(), expected.to(parameter.dtype), rtol=0, atol=0
+        )
 
 
 @pytest.mark.parametrize("backend", ["int8", "nvfp4"])
@@ -226,6 +273,7 @@ def test_comfy_marker_conflicting_values_rejected(tmp_path):
 
 @pytest.mark.parametrize("missing", [False, True])
 @pytest.mark.parametrize("competing_index", [False, True])
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_native_encoder_restoration_checks_checkpoint_before_fallback(
     tmp_path, missing, competing_index
 ):
@@ -633,23 +681,36 @@ class TestTextEncoderQuantization(unittest.TestCase):
         self.assertIs(model_config.quant_config, self.serialized)
 
     def test_explicit_online_quantization_configures_native_encoder(self):
-        model_config = SimpleNamespace(quant_config=None)
         self.get_quant_config.return_value = None
-
-        _configure_encoder_quantization(
-            model_config,
-            TextEncoder,
-            {},
-            "/model/text_encoder",
-            "/model/text_encoder",
-            "text_encoder",
-            explicit_quantization="convrot_int8",
-            ignored_layers=["lm_head"],
-        )
-
-        self.assertIsInstance(model_config.quant_config, ConvRotInt8Config)
-        self.assertFalse(model_config.quant_config.is_checkpoint_int8_serialized)
-        self.assertEqual(model_config.quant_config.ignored_layers, ["lm_head"])
+        for method, config_cls in (
+            ("convrot_int8", ConvRotInt8Config),
+            ("fp8", Fp8Config),
+            ("mxfp8", MXFP8Config),
+        ):
+            with self.subTest(method=method):
+                model_config = SimpleNamespace(quant_config=None)
+                _configure_encoder_quantization(
+                    model_config,
+                    TextEncoder,
+                    {},
+                    "/model/text_encoder",
+                    "/model/text_encoder",
+                    "text_encoder",
+                    explicit_quantization=method,
+                    ignored_layers=["lm_head"],
+                )
+                self.assertIsInstance(model_config.quant_config, config_cls)
+                self.assertFalse(
+                    getattr(
+                        model_config.quant_config, "is_checkpoint_fp8_serialized", False
+                    )
+                    or getattr(
+                        model_config.quant_config,
+                        "is_checkpoint_int8_serialized",
+                        False,
+                    )
+                )
+                self.assertEqual(model_config.quant_config.ignored_layers, ["lm_head"])
 
     def test_weight_file_metadata_configures_native_encoder(self):
         model_config = SimpleNamespace(quant_config=None)

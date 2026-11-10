@@ -8,13 +8,13 @@ import torch
 from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 from PIL import Image
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanI2V480PConfig,
     WanI2V720PConfig,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.pipelines.flux_2 import Flux2Pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
@@ -210,7 +210,7 @@ class TestFlux2ConditionImagePreprocess(unittest.TestCase):
         )
 
         self.assertEqual(processed_size, (expected_width, expected_height))
-        self.assertTrue(torch.equal(processed, expected))
+        self.assertTrue(torch.equal(processed.cpu(), expected))
 
     @patch.object(Flux2Pipeline, "add_standard_ti2i_stages")
     def test_runtime_pipeline_uses_flux2_image_processor(self, mock_add_stages):

@@ -35,10 +35,11 @@ from sglang.kernels.ops.diffusion import (
     NVFP4_BIAS_GELU,
     QWEN_IMAGE_ADDED_QKV,
     SANA_VIDEO_LINEAR_ATTENTION,
+    WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT,
     QualityGatedFusion,
 )
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
+from sglang.multimodal_gen.configs.pipeline_configs.base import STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2PipelineConfig,
     FluxPipelineConfig,
@@ -48,7 +49,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     quality_allows,
     resolve_skip_softmax_params,
 )
-from sglang.multimodal_gen.configs.task_type import get_request_task_type
+from sglang.multimodal_gen.configs.task_type import ModelTaskType, get_request_task_type
 from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
     prompt_padding as bcg_utils,
 )
@@ -105,7 +106,10 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    DENOISING_LOOP_STATE,
+    set_forward_context,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -188,6 +192,8 @@ _QUALITY_FUSION_HANDLERS: tuple[tuple[str, QualityGatedFusion], ...] = (
     # Ideogram's reference keeps the norm statistics in fp32; the
     # BF16-native kernel rounds them, which lowers accumulation precision
     ("high", FUSED_GATE_RMSNORM),
+    # Wan FlyDSL converts FP32 gate/modulation operands and residuals to BF16.
+    ("high", WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT),
     ("lossless", HUNYUAN_QKNORM),
     ("lossless", LINGBOT_VIDEO_RMSNORM),
     ("lossless", LINGBOT_VIDEO_GATED_RESIDUAL),
@@ -1751,6 +1757,8 @@ class DenoisingStage(PipelineStage):
         *args,
         **kwargs,
     ):
+        # what the models kept for this loop is freed before decode
+        batch.extra.pop(DENOISING_LOOP_STATE, None)
         # Gather results if using sequence parallelism
         if trajectory_latents:
             trajectory_tensor = torch.stack(trajectory_latents, dim=1)
@@ -2117,6 +2125,7 @@ class DenoisingStage(PipelineStage):
                         if collect_trajectory:
                             self._record_trajectory(ctx, step, batch, server_args)
 
+                        self.check_cancelled(batch)
                         if step_index == num_timesteps - 1 or (
                             (step_index + 1) > ctx.num_warmup_steps
                             and (step_index + 1) % progress_step_interval == 0
@@ -2212,6 +2221,7 @@ class DenoisingStage(PipelineStage):
                 current_timestep=timestep_index,
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
+                quality=batch.sampling_params.quality,
             ):
                 raw = self._predict_noise(
                     current_model=current_model,
@@ -2563,6 +2573,19 @@ class DenoisingStage(PipelineStage):
         if padder is not None:
             return padder(call_kwargs, current_model, buckets)
         return bcg_utils.pad_masked_prompt_kwargs(call_kwargs, buckets)
+
+    def drop_breakable_cuda_graphs(self, reason: str) -> None:
+        """Disable graphs whose weights changed after capture; serving never re-captures."""
+        dropped = sum(len(runner.entries) for runner in self._bcg_runners.values())
+        for runner in self._bcg_runners.values():
+            runner.reset(disabled_reason=reason)
+        if dropped:
+            logger.warning(
+                "[Diffusion BCG] %s after capture: dropped %d graph(s); "
+                "requests run eager until restart.",
+                reason,
+                dropped,
+            )
 
     def _maybe_get_bcg_runner(self, current_model):
         """Return (lazily creating) the breakable CUDA graph runner for
