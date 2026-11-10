@@ -39,6 +39,7 @@ export const Gemma4Deployment = () => {
     reasoning: {
       name: 'reasoning',
       title: 'Reasoning Parser',
+      condition: (values) => !(values.hardware === 'xeon' && values.checkpoint === 'qat'),
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled', label: 'Enabled', default: true }
@@ -48,6 +49,7 @@ export const Gemma4Deployment = () => {
     toolcall: {
       name: 'toolcall',
       title: 'Tool Call Parser',
+      condition: (values) => !(values.hardware === 'xeon' && values.checkpoint === 'qat'),
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled', label: 'Enabled', default: true }
@@ -57,7 +59,8 @@ export const Gemma4Deployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding (MTP)',
-      condition: (values) => !['mi300x'].includes(values.hardware),
+      condition: (values) => !['mi300x'].includes(values.hardware) &&
+        !(values.hardware === 'xeon' && values.checkpoint === 'qat'),
       items: [
         { id: 'disabled', label: 'Disabled', subtitle: 'Baseline', default: true },
         { id: 'enabled', label: 'Enabled', subtitle: 'Lower Latency', default: false }
@@ -103,6 +106,10 @@ export const Gemma4Deployment = () => {
     },
   };
 
+  const xeonQatConfigs = {
+    e2b: { tp: 4, revision: '6befbaca7398925921802abd1f277b495b78b738' },
+  };
+
   const generateCommand = (values) => {
     const { hardware, modelSize } = values;
 
@@ -110,6 +117,12 @@ export const Gemma4Deployment = () => {
     if (!hwConfig) return `# Error: Unknown hardware/model combination`;
 
     let { tp, mem } = hwConfig;
+    const xeonQat = hardware === 'xeon' && values.checkpoint === 'qat';
+    const xeonQatConfig = xeonQatConfigs[modelSize];
+    if (xeonQat) {
+      if (!xeonQatConfig) return '# Error: No validated Xeon QAT recipe for this model size';
+      tp = xeonQatConfig.tp;
+    }
 
     const modelNames = {
       'e2b': 'google/gemma-4-E2B-it',
@@ -119,12 +132,11 @@ export const Gemma4Deployment = () => {
       '26b-a4b': 'google/gemma-4-26B-A4B-it',
     };
 
-    // QAT releases keep bf16 weights (q4_0-unquantized), so the only change is
-    // the model-path suffix; TP/memory requirements match the standard checkpoints.
+    // QAT releases keep BF16 weights; Xeon uses separately validated presets.
     const qatSuffix = values.checkpoint === 'qat' ? '-qat-q4_0-unquantized' : '';
     const modelPath = `${modelNames[modelSize]}${qatSuffix}`;
 
-    const mtpEnabled = values.speculative === 'enabled';
+    const mtpEnabled = values.speculative === 'enabled' && !xeonQat;
     if (mtpEnabled && modelSize === '26b-a4b' && hardware !== 'mi300x' && hardware !== 'xeon') {
       tp = 2;
     }
@@ -132,6 +144,11 @@ export const Gemma4Deployment = () => {
     let cmd = `sglang serve --model-path ${modelPath}`;
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+      if (xeonQat) {
+        cmd += ` \\\n  --revision ${xeonQatConfig.revision}`;
+        cmd += ` \\\n  --dtype bfloat16 \\\n  --max-total-tokens 8192`;
+        cmd = `SGLANG_USE_CPU_ENGINE=1 RAYON_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false OPENBLAS_NUM_THREADS=1 ${cmd}`;
+      }
     }
     if (tp > 1) {
       cmd += ` \\\n  --tp ${tp}`;
@@ -139,6 +156,7 @@ export const Gemma4Deployment = () => {
 
     Object.entries(options).forEach(([key, option]) => {
       if (key === 'modelSize' || key === 'hardware') return;
+      if (xeonQat && ['reasoning', 'toolcall', 'speculative'].includes(key)) return;
       if (option.commandRule) {
         const rule = option.commandRule(values[key]);
         if (rule) cmd += ` \\\n  ${rule}`;
@@ -165,7 +183,7 @@ export const Gemma4Deployment = () => {
       cmd += ` \\\n  --device xpu`;
     }
 
-    cmd += ` \\\n  --mem-fraction-static ${mem}`;
+    if (!xeonQat) cmd += ` \\\n  --mem-fraction-static ${mem}`;
     cmd += ` \\\n  --host 0.0.0.0 --port 30000`;
 
     return cmd;
@@ -248,8 +266,14 @@ export const Gemma4Deployment = () => {
         next.checkpoint = 'standard';
         next.speculative = 'disabled';
       }
-      if (optionName === 'hardware' && value === 'xeon') {
-        next.checkpoint = 'standard';
+      if (next.hardware === 'xeon' && next.checkpoint === 'qat') {
+        if (!xeonQatConfigs[next.modelSize]) {
+          next.checkpoint = 'standard';
+        } else {
+          next.reasoning = 'disabled';
+          next.toolcall = 'disabled';
+          next.speculative = 'disabled';
+        }
       }
       return next;
     });
@@ -441,7 +465,8 @@ export const Gemma4Deployment = () => {
                   const isXeonQatLocked =
                     values.hardware === 'xeon' &&
                     option.name === 'checkpoint' &&
-                    item.id === 'qat';
+                    item.id === 'qat' &&
+                    !xeonQatConfigs[values.modelSize];
                   const isXeon12bLocked =
                     values.hardware === 'xeon' &&
                     option.name === 'modelSize' &&
