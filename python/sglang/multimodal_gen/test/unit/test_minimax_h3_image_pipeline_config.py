@@ -84,6 +84,23 @@ def test_image_deployment_has_no_cfg_parallel():
 @pytest.mark.parametrize(
     "override",
     [
+        {"component_attention_backends": {"transformer": "fp8_fa_sm120"}},
+        {"attention_backend": "fp8_fa_sm120"},
+    ],
+)
+def test_image_config_preserves_explicit_fp8_attention(override):
+    args = normalized_args(**override)
+    args.pipeline_config.validate_server_args(args)
+    assert args.component_attention_backends["transformer"] == "fp8_fa_sm120"
+
+    args.ring_degree = 2
+    with pytest.raises(ValueError, match="Ring parallelism requires FlashAttention"):
+        args.pipeline_config.validate_server_args(args)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
         {"num_gpus": 2, "sp_degree": 2, "ulysses_degree": 2},
         {"num_gpus": 2, "tp_size": 2},
         {"num_gpus": 4, "sp_degree": 2, "ring_degree": 2},

@@ -218,8 +218,22 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
         if self._server_arg_value(server_args.backend) not in ("auto", "sglang"):
             raise ValueError("MiniMax H3 image requires the native SGLang backend")
         selected_backend = self.resolve_transformer_attention_backend(server_args)
-        if selected_backend not in (None, AttentionBackendEnum.FA):
-            raise ValueError("MiniMax H3 image requires dense FlashAttention")
+        if selected_backend not in (
+            None,
+            AttentionBackendEnum.FA,
+            AttentionBackendEnum.FP8_FA_SM120,
+        ):
+            raise ValueError(
+                "MiniMax H3 image supports dense FlashAttention or explicit "
+                "fp8_fa_sm120 attention"
+            )
+        if (
+            server_args.ring_degree > 1
+            and selected_backend is AttentionBackendEnum.FP8_FA_SM120
+        ):
+            raise ValueError(
+                "MiniMax H3 image Ring parallelism requires FlashAttention"
+            )
         for name in ("nnodes", "dp_size"):
             value = getattr(server_args, name)
             if type(value) is not int or value != 1:
@@ -287,11 +301,11 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
             "transformer"
         )
         if component_backend is None:
-            # Request FA for the transformer through the generic explicit-request
-            # path, so the loader refuses a transformer that does not run FA.
-            # Explicit global/component/forced choices were checked above.
-            server_args.component_attention_backends["transformer"] = "fa"
-            server_args._requested_component_attention_backends["transformer"] = "fa"
+            # Preserve global/forced choices through the component loader's
+            # strict explicit-request path. Native FlashAttention is the default.
+            backend = (selected_backend or AttentionBackendEnum.FA).name.lower()
+            server_args.component_attention_backends["transformer"] = backend
+            server_args._requested_component_attention_backends["transformer"] = backend
 
     def _configure_online_adaln(self, server_args) -> None:
         # Measured H200/B300, GB10 and RTX PRO 6000 Blackwell recipes avoid keeping

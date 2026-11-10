@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FP8 attention backend for SM120 GPUs (GeForce RTX 50, RTX PRO Blackwell).
+"""FP8 attention for SM120/SM121 (GeForce RTX 50, RTX PRO Blackwell, GB10).
 
 Opt in with ``--attention-backend fp8_fa_sm120``. Q, K and V are quantized per head to
 E4M3 on the fly (two fused Triton passes), attention runs in FP8 with FP32
 accumulation, and the output is BF16. Expect about 5% relative RMS against cuDNN BF16
 per call on normally distributed inputs.
 
-Scope: dense, non-causal, batch 1, head_dim 128, BF16 inputs on an SM120 device.
+Scope: dense, non-causal, batch 1, head_dim 128, BF16 inputs on SM120/SM121.
 Everything else goes to cuDNN SDPA. Each distinct sequence length compiles once
 (about 10 s); later calls with the same shape reuse the compiled kernel. The FP8 and
 output buffers are allocated per call and belong to the caller.
@@ -83,8 +83,8 @@ class FP8FlashAttentionSM120Impl(AttentionImpl):
             return f"dtype {query.dtype} (kernel takes BF16)"
         if not query.is_cuda:
             return "non-CUDA tensors"
-        if torch.cuda.get_device_capability(query.device) != (12, 0):
-            return "device is not SM120"
+        if torch.cuda.get_device_capability(query.device) not in ((12, 0), (12, 1)):
+            return "device is not SM120/SM121"
         return None
 
     def _report_fallback(self, reason: str) -> None:

@@ -533,13 +533,13 @@ class _FP8FlashAttentionSM120BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FP8_FA_SM120
 
     # CuTe-DSL mma.sync FP8 kernel written for SM120 (GeForce RTX 50 / RTX PRO
-    # Blackwell). Dense non-causal head_dim 128 only; the backend itself falls
+    # Blackwell) and SM121 (GB10). Dense non-causal head_dim 128 only; it falls
     # back to cuDNN SDPA for other calls.
     @classmethod
     def resolve(cls, platform) -> str | AttentionBackendEnum:
-        if platform.get_device_capability() != (12, 0):
+        if platform.get_device_capability() not in ((12, 0), (12, 1)):
             logger.warning(
-                "fp8_fa_sm120 attention needs an SM120 device; falling back to cuDNN SDPA."
+                "fp8_fa_sm120 attention needs SM120/SM121; falling back to cuDNN SDPA."
             )
             return AttentionBackendEnum.TORCH_CUDNN_SDPA
         try:
