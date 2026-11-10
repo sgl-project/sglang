@@ -324,7 +324,7 @@ return {
       docsHref: "/docs/sglang-diffusion/api/cli#component-residency",
       description: "Keep weights resident for latency; shard or offload only when capacity requires it.",
       quality: "Memory policy",
-      learnMore: "#7-feature-contracts-and-advanced-recipes",
+      learnMore: "#9-feature-contracts-and-advanced-recipes",
       default: "resident",
       options: [
         {
@@ -389,7 +389,7 @@ return {
       docsHref: "/docs/sglang-diffusion/attention_backends",
       description: "Select the packed-attention kernel used by H3 transformer modules.",
       quality: "Kernel policy",
-      learnMore: "#7-feature-contracts-and-advanced-recipes",
+      learnMore: "#9-feature-contracts-and-advanced-recipes",
       default: "platform",
       options: [
         {
@@ -425,7 +425,7 @@ return {
       docsHref: "/docs/sglang-diffusion/quantization",
       description: "Choose native mixed precision or a validated online weight quantization path.",
       quality: "Weight precision",
-      learnMore: "#7-feature-contracts-and-advanced-recipes",
+      learnMore: "#9-feature-contracts-and-advanced-recipes",
       default: "native",
       options: [
         {
@@ -453,7 +453,7 @@ return {
       docsHref: "/docs/sglang-diffusion/encoder_parallel",
       description: "Control text-encoder work placement independently from DiT topology.",
       quality: "Parallel policy",
-      learnMore: "#7-feature-contracts-and-advanced-recipes",
+      learnMore: "#9-feature-contracts-and-advanced-recipes",
       default: "auto",
       options: [
         {
@@ -500,7 +500,7 @@ return {
       scope: "serve",
       description: "Choose eager execution or the measured breakable CUDA graph path.",
       quality: "Graph policy",
-      learnMore: "#7-feature-contracts-and-advanced-recipes",
+      learnMore: "#9-feature-contracts-and-advanced-recipes",
       default: "eager",
       options: [
         {
