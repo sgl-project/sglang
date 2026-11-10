@@ -104,7 +104,19 @@
 /sgl-model-gateway/src/routers @CatherineSue @key4ng @slin1237
 /sgl-model-gateway/src/wasm @slin1237
 /sgl-model-gateway/examples/wasm @slin1237
-/test/registered/ @sundar24295s @fortunecookiee
+/test/registered/prefill_only @sundar24295s @fortunecookiee
+/test/registered/e2e/scoring @sundar24295s @fortunecookiee
+/test/registered/basic_perf/test_score_api.py @sundar24295s @fortunecookiee
+/test/registered/unit/managers/test_setwise_score_mixin.py @sundar24295s @fortunecookiee
+/test/registered/unit/layers/test_pooler_score_and_pool.py @sundar24295s @fortunecookiee
+/test/registered/unit/test_token_scoring.py @sundar24295s @fortunecookiee
+/test/registered/unit/entrypoints/openai/test_serving_decisions.py @sundar24295s @fortunecookiee
+/test/registered/e2e/gdn/test_qwen35_gdn_multi_item_scoring.py @sundar24295s @fortunecookiee
+/test/registered/unit/managers/test_embed_overrides.py @sundar24295s @fortunecookiee
+/test/registered/basic_perf/test_embeddings_api.py @sundar24295s @fortunecookiee
+/test/registered/unit/entrypoints/openai/test_serving_embedding.py @sundar24295s @fortunecookiee
+/test/registered/unit/entrypoints/test_embedding_responses.py @sundar24295s @fortunecookiee
+/test/registered/unit/configs/test_embedding_model_spec.py @sundar24295s @fortunecookiee
 /test/manual/prefill_only @sundar24295s @fortunecookiee
 /benchmark/prefill_only @sundar24295s @fortunecookiee
 /docs/docs/supported-models/decision_models.mdx @wisclmy0611 @zijiexia @Richardczl98 @sundar24295s @fortunecookiee
