@@ -519,7 +519,7 @@ def test_factorized_tree_cuda_graph_replay_reads_new_inputs(width):
         MambaAttnBackendBase,
     )
     from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.runtime_context import get_context
     from sglang.srt.speculative.ubtree_info import create_ubtree_verify_input
 
