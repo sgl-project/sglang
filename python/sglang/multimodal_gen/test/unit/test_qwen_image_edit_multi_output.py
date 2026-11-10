@@ -35,16 +35,19 @@ class TestQwenImageEditMultipleOutputs(unittest.TestCase):
             QwenImageEditPipelineConfig,
             QwenImageEditPlusPipelineConfig,
             QwenImageEditPlus_2511_PipelineConfig,
-            QwenImageLayeredPipelineConfig,
         ):
             with self.subTest(config_cls.__name__):
                 outputs = _sequential_requests(config_cls(), 2)
                 self.assertEqual([r.num_outputs_per_prompt for r in outputs], [1, 1])
                 self.assertEqual([r.seeds for r in outputs], [[0], [1]])
 
-    def test_text_to_image_keeps_batched_outputs(self):
-        outputs = _sequential_requests(QwenImagePipelineConfig(), 2)
-        self.assertEqual([r.num_outputs_per_prompt for r in outputs], [2])
+    def test_text_to_image_and_layered_keep_batched_outputs(self):
+        for config_cls in (QwenImagePipelineConfig, QwenImageLayeredPipelineConfig):
+            with self.subTest(config_cls.__name__):
+                config = config_cls()
+                self.assertFalse(config.supports_sequential_multi_output_inference())
+                outputs = _sequential_requests(config, 2)
+                self.assertEqual([r.num_outputs_per_prompt for r in outputs], [2])
 
 
 if __name__ == "__main__":

@@ -757,6 +757,11 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
     # promoting the auxiliary components regresses first-request latency
     supports_auto_residency: bool = False
 
+    def supports_sequential_multi_output_inference(self):
+        # The Layered pipeline's first stage does not split an n > 1 request, so the
+        # worker must not expect one result per output.
+        return False
+
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             keep_resident_min_available_gb=70,
