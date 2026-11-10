@@ -69,7 +69,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.waiting_queue = IndexedReqList(ListKind.WAITING)
         s.waiting_queue.join(waiting)
         s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
-        s.chunked_req = final_chunk
+        s.chunked_reqs.join([final_chunk])
         s.min_free_slots_delayer = None
         s.invariant_checker = Mock()
         s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
@@ -113,6 +113,7 @@ class TestHeldRowAdmission(CustomTestCase):
         )
         s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
         s.running_reqs = KeyedReqList(ListKind.DECODING)
+        s.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         return s
 
     def _admitted(self, disaggregation_mode):

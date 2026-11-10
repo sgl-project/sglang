@@ -4,7 +4,8 @@
 //! Chat rendering via dynamo-render for cache-aware routing and input ID forwarding.
 //!
 //! Mirrors SGLang reasoning controls and assistant continuations; DeepSeek-V4,
-//! V4.1, GLM-5.3, Kimi-K3, MiniMax-M3 and Qwen3.8 render through `sglang_processor`.
+//! V4.1, GLM-5.3, Kimi-K3, MiniMax-M3, Qwen3.8 and StepFun (Step-3.5-Flash,
+//! Step-3.7-Flash, Step-5-Preview) render through `sglang_processor`.
 //! Forwarding remains guarded until parity has been verified for each request
 //! shape.
 
@@ -42,8 +43,8 @@ pub struct ChatFormatter {
     defaults: ChatTemplateKwargs,
     /// Stripped from a separately tokenized continuation prefix, as SGLang does.
     bos_token: Option<String>,
-    /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3 and Qwen3.8 render through
-    /// `sglang_processor`.
+    /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3, Qwen3.8 and StepFun render
+    /// through `sglang_processor`.
     processor: Option<ProcessorFormatter>,
     /// MiniMax-M3.1: an M3 template with no `thinking_mode` switch, so thinking
     /// is always adaptive (M3's template can turn it off).
@@ -53,6 +54,9 @@ pub struct ChatFormatter {
     /// DeepSeek-V4/V4.1 prompt ids come from the router's tokenizer rather than
     /// the processor's own HF one; see [`Self::with_router_segment_encoding`].
     router_encodes_deepseek: bool,
+    /// The special tokens the tokenizer adds around a text, which SGLang keeps on
+    /// a separately encoded continuation prefix; `None` adds none.
+    prompt_affixes: Option<super::adapter::PromptAffixes>,
 }
 
 impl ChatFormatter {
@@ -181,9 +185,9 @@ impl ChatFormatter {
                 *entry = serde_json::json!({ name: template });
             }
         }
-        // GLM-5.3, MiniMax-M3 and Qwen3.8 render through `sglang_processor`. M3 is
-        // keyed on the checkpoint's `model_type` (Python's `is_minimax_m3`), the
-        // others on their template.
+        // GLM-5.3, MiniMax-M3, Qwen3.8 and StepFun render through `sglang_processor`.
+        // M3 is keyed on the checkpoint's `model_type` (Python's `is_minimax_m3`),
+        // the others on their template.
         let processor = ProcessorFormatter::from_tokenizer_config_with_type(&cfg, model_type)
             .ok()
             .filter(|formatter| {
@@ -192,6 +196,7 @@ impl ChatFormatter {
                     ProcessorFormatter::Glm53(_)
                         | ProcessorFormatter::MiniMaxM3 { .. }
                         | ProcessorFormatter::Qwen38 { .. }
+                        | ProcessorFormatter::Step3p5 { .. }
                 )
             });
         let minimax_m31 = matches!(processor, Some(ProcessorFormatter::MiniMaxM3 { .. }))
@@ -213,6 +218,7 @@ impl ChatFormatter {
             minimax_m31,
             worker_defaults: ChatTemplateKwargs::new(),
             router_encodes_deepseek: false,
+            prompt_affixes: None,
         }))
     }
 
@@ -230,6 +236,7 @@ impl ChatFormatter {
             minimax_m31: false,
             worker_defaults: ChatTemplateKwargs::new(),
             router_encodes_deepseek: false,
+            prompt_affixes: None,
         })
     }
 
@@ -277,6 +284,7 @@ impl ChatFormatter {
             minimax_m31: false,
             worker_defaults: ChatTemplateKwargs::new(),
             router_encodes_deepseek: false,
+            prompt_affixes: None,
         })
     }
 
@@ -294,8 +302,8 @@ impl ChatFormatter {
             .and_then(ProcessorFormatter::reasoning_toggle)
     }
 
-    /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3 and Qwen3.8 are fixture-verified
-    /// against SGLang for every text chat.
+    /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3, Qwen3.8 and StepFun are
+    /// fixture-verified against SGLang for every text chat.
     pub fn forwarding_scope(&self) -> super::ForwardingScope {
         match self.processor {
             Some(_) => super::ForwardingScope::AllText,
@@ -349,6 +357,12 @@ impl ChatFormatter {
                 self.processor,
                 Some(ProcessorFormatter::DeepSeekV4(_) | ProcessorFormatter::DeepSeekV41(_))
             );
+        self
+    }
+
+    /// The tokenizer's own special tokens around a text (`adapter::prompt_affixes`).
+    pub fn with_prompt_affixes(mut self, affixes: Option<&super::adapter::PromptAffixes>) -> Self {
+        self.prompt_affixes = affixes.cloned();
         self
     }
 
@@ -484,11 +498,16 @@ impl ChatFormatter {
             None => super::adapter::encode(tokenizer, prompt.as_str())?,
         };
         if !prefix.is_empty() {
-            // SGLang encodes the assistant prefix separately and removes its leading BOS.
-            let mut suffix = if self.is_kimi_k3() {
+            // `_append_assistant_prefix_to_prompt_ids`: SGLang encodes the assistant
+            // prefix separately, special tokens included, and removes its leading BOS.
+            let text = if self.is_kimi_k3() {
                 super::kimi::encode(tokenizer, &[EncodeSegment::control(&prefix)])?
             } else {
                 super::adapter::encode(tokenizer, &prefix)?
+            };
+            let mut suffix = match &self.prompt_affixes {
+                Some(affixes) => [affixes.prefix.as_slice(), &text, &affixes.suffix].concat(),
+                None => text,
             };
             if let Some(bos) = self.bos_token.as_deref().filter(|s| !s.is_empty()) {
                 let bos = super::adapter::encode(tokenizer, bos)?;
@@ -879,6 +898,29 @@ mod tests {
         assert!(!other.is_minimax_m31());
     }
 
+    /// StepFun, known by its template, renders every text chat through `sglang_processor`:
+    /// the template sees SGLang's messages, so a later system turn keeps its name.
+    #[test]
+    fn step3p5_renders_through_the_processor() {
+        use crate::tokenizer::ForwardingScope;
+        let template = "{# <|im_start|>tool_response <im_patch> <function= <parameter= image #}\
+            {{ bos_token }}{% for m in messages %}<|im_start|>\
+            {% if m.role == 'system' and m.name == 'observation' %}observation\
+            {% else %}{{ m.role }}{% endif %}|{{ m.content }}{% endfor %}";
+        let enc = jinja(json!({ "chat_template": template, "bos_token": "<s>" }));
+        assert_eq!(enc.forwarding_scope(), ForwardingScope::AllText);
+        let req = request(json!([
+            {"role": "user", "content": "Q"},
+            {"role": "system", "name": "observation", "content": "O"},
+        ]));
+        assert_eq!(
+            enc.render(&req).unwrap(),
+            "<s><|im_start|>user|Q<|im_start|>observation|O"
+        );
+        let other = jinja(json!({ "chat_template": template.replace("<im_patch>", "") }));
+        assert_eq!(other.forwarding_scope(), ForwardingScope::Guarded);
+    }
+
     #[test]
     fn raise_exception_surfaces_as_error() {
         let enc = jinja(json!({"chat_template": "{{ raise_exception('bad messages') }}"}));
@@ -1223,6 +1265,19 @@ mod tests {
         );
         req["messages"][1]["content"] = json!("<|endoftext|>b");
         assert_eq!(formatter.encode(&tokenizer, &req).unwrap(), vec![97, 98]);
+        // A tokenizer that adds BOS itself keeps the prefix's own: SGLang encodes
+        // `[BOS, BOS, b]` and drops only the first.
+        let bos = super::super::adapter::encode(&tokenizer, "<|endoftext|>").unwrap();
+        let affixes = super::super::adapter::PromptAffixes {
+            prefix: bos.clone(),
+            ..Default::default()
+        };
+        let auto_bos = jinja(json!({"chat_template":"a", "bos_token":"<|endoftext|>"}))
+            .with_prompt_affixes(Some(&affixes));
+        assert_eq!(
+            auto_bos.encode(&tokenizer, &req).unwrap(),
+            [vec![97], bos, vec![98]].concat()
+        );
         req["continue_final_message"] = json!(false);
         req["messages"][1]["content"] = json!("b");
         let out = deepseek_v4().render(&req).unwrap();
