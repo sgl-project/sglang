@@ -2423,6 +2423,82 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_bandwidth,
         )
 
+        # Queue depths along the write path (device -> host -> L3), so a
+        # stalled drain or a dead backup worker is visible before host memory
+        # runs out.
+        self.hicache_d2h_pending_ops = Gauge(
+            name="sglang:hicache_d2h_pending_ops",
+            documentation="Device-to-host (L2) write operations submitted and "
+            "not yet acked.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hicache_d2h_ack_queue_depth = Gauge(
+            name="sglang:hicache_d2h_ack_queue_depth",
+            documentation="Device-to-host write acks waiting for the scheduler "
+            "to confirm their completion event.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hicache_l3_pending_ops = Gauge(
+            name="sglang:hicache_l3_pending_ops",
+            documentation="Host-to-storage (L3) backup operations submitted and "
+            "not yet acked.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hicache_l3_backup_queue_depth = Gauge(
+            name="sglang:hicache_l3_backup_queue_depth",
+            documentation="L3 backup operations waiting for the backup worker thread.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hicache_l3_ack_queue_depth = Gauge(
+            name="sglang:hicache_l3_ack_queue_depth",
+            documentation="L3 backup operations finished by the backup worker "
+            "and waiting for the scheduler to ack them.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hicache_l3_backup_worker_alive = Gauge(
+            name="sglang:hicache_l3_backup_worker_alive",
+            documentation="1 if the L3 backup worker thread is alive, 0 otherwise.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.hicache_l3_backup_submitted_tokens_total = Counter(
+            name="sglang:hicache_l3_backup_submitted_tokens_total",
+            documentation="Primary KV tokens submitted for host-to-storage (L3) "
+            "backup. On a storage-writer rank, compare with "
+            "sglang:backuped_tokens_total for the written part.",
+            labelnames=labels.keys(),
+        )
+        self.hicache_l3_backup_failed_ops_total = Counter(
+            name="sglang:hicache_l3_backup_failed_ops_total",
+            documentation="L3 backup operations that did not fully reach storage "
+            "(backend refused a write or raised).",
+            labelnames=labels.keys(),
+        )
+        self.hicache_l3_backup_unwritten_pages_total = Counter(
+            name="sglang:hicache_l3_backup_unwritten_pages_total",
+            documentation="Primary KV pages of failed L3 backups that were not "
+            "written to storage.",
+            labelnames=labels.keys(),
+        )
+        self.hicache_l3_backup_unwritten_tokens_total = Counter(
+            name="sglang:hicache_l3_backup_unwritten_tokens_total",
+            documentation="Primary KV tokens of failed L3 backups that were not "
+            "written to storage.",
+            labelnames=labels.keys(),
+        )
+        self.hicache_l3_backup_sidecar_unwritten_pages_total = Counter(
+            name="sglang:hicache_l3_backup_sidecar_unwritten_pages_total",
+            documentation="Sidecar pool pages (mamba, swa, indexer, ...) of "
+            "failed L3 backups that were not written to storage, by pool.",
+            labelnames=list(labels.keys()) + ["pool"],
+        )
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -2460,6 +2536,52 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self.prefetch_aux_alloc_failed_tokens_total.labels(**self.labels).inc(
                 num_tokens
             )
+
+    def set_hicache_gauges(
+        self,
+        d2h_pending: int,
+        d2h_ack_queue: int,
+        l3_pending: int,
+        l3_backup_queue: int,
+        l3_ack_queue: int,
+        worker_alive: int,
+    ):
+        self.hicache_d2h_pending_ops.labels(**self.labels).set(d2h_pending)
+        self.hicache_d2h_ack_queue_depth.labels(**self.labels).set(d2h_ack_queue)
+        self.hicache_l3_pending_ops.labels(**self.labels).set(l3_pending)
+        self.hicache_l3_backup_queue_depth.labels(**self.labels).set(l3_backup_queue)
+        self.hicache_l3_ack_queue_depth.labels(**self.labels).set(l3_ack_queue)
+        self.hicache_l3_backup_worker_alive.labels(**self.labels).set(worker_alive)
+
+    def clear_hicache_gauges(self):
+        self.set_hicache_gauges(0, 0, 0, 0, 0, 0)
+
+    def log_backup_submitted_tokens(self, num_tokens: int):
+        if num_tokens > 0:
+            self.hicache_l3_backup_submitted_tokens_total.labels(**self.labels).inc(
+                num_tokens
+            )
+
+    def log_backup_failed_op(
+        self,
+        page_size: int,
+        unwritten_pages: int,
+        sidecar_unwritten_by_pool: Dict[str, int],
+    ):
+        """Count one failed L3 backup; primary KV and sidecar pages separately."""
+        self.hicache_l3_backup_failed_ops_total.labels(**self.labels).inc(1)
+        if unwritten_pages > 0:
+            self.hicache_l3_backup_unwritten_pages_total.labels(**self.labels).inc(
+                unwritten_pages
+            )
+            self.hicache_l3_backup_unwritten_tokens_total.labels(**self.labels).inc(
+                unwritten_pages * page_size
+            )
+        for pool, num_pages in sidecar_unwritten_by_pool.items():
+            if num_pages > 0:
+                self.hicache_l3_backup_sidecar_unwritten_pages_total.labels(
+                    **self.labels, pool=pool
+                ).inc(num_pages)
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)

@@ -227,6 +227,7 @@ class StorageAttachment:
 
         cache.enable_storage = False
         cache.enable_storage_metrics = False
+        cache.clear_hicache_gauges()
         return True, "Detached HiCache storage backend successfully."
 
     def shutdown(self) -> None:

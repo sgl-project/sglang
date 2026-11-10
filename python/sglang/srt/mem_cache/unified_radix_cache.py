@@ -239,6 +239,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._enable_metrics_flag = params.enable_metrics
         self.enable_storage_metrics = False
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
+        # Last published drain-gauge sample and when, to skip unchanged writes.
+        self._hicache_gauge_last_state: Optional[tuple[int, ...]] = None
+        self._hicache_gauge_last_ts = 0.0
         self.extra_metric_labels = None
 
         assert params.tree_slots is not None
@@ -522,6 +525,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.mem_pool_host.clear()
             self.enable_storage = self.cache_controller.enable_storage
 
+        self.clear_hicache_gauges()
         self.tree_core.kv_events.record_all_cleared()
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
@@ -2516,6 +2520,10 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
         )
+        if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+            self.storage_metrics_collector.log_backup_submitted_tokens(
+                len(spec.hash_value) * self.cache_controller.page_size
+            )
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -3765,6 +3773,12 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+                    if operation.failed:
+                        self.storage_metrics_collector.log_backup_failed_op(
+                            cc.page_size,
+                            operation.unwritten_pages,
+                            operation.sidecar_unwritten_by_pool,
+                        )
             return drained
 
         def _drain_release():
@@ -4271,6 +4285,38 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+            self._update_hicache_gauges()
+
+    def _update_hicache_gauges(self) -> None:
+        """Publish the write-path queue depths: on change, else once a second."""
+        cc = self.cache_controller
+        # Buffer mode tracks its D2H and L3 writes on the pipeline.
+        tracker = self.buffer_pipeline if self.buffer_pipeline is not None else self
+        state = (
+            len(tracker.ongoing_write_through),
+            len(cc.ack_write_queue),
+            len(tracker.ongoing_backup),
+            cc.backup_queue.qsize(),
+            cc.ack_backup_queue.qsize(),
+            int(cc.backup_thread.is_alive()),
+        )
+        now = time.monotonic()
+        if (
+            state == self._hicache_gauge_last_state
+            and now - self._hicache_gauge_last_ts < 1.0
+        ):
+            return
+        self._hicache_gauge_last_state = state
+        self._hicache_gauge_last_ts = now
+        self.storage_metrics_collector.set_hicache_gauges(*state)
+
+    def clear_hicache_gauges(self) -> None:
+        """Zero the write-path gauges, which otherwise keep their last value
+        after a reset or a storage detach."""
+        if self.storage_metrics_collector is not None:
+            self.storage_metrics_collector.clear_hicache_gauges()
+        self._hicache_gauge_last_state = None
+        self._hicache_gauge_last_ts = 0.0
 
     def transfers_in_flight(self) -> bool:
         # The buffer-mode pipeline (storage without a host pool) tracks its

@@ -521,6 +521,11 @@ class BufferModePipeline:
         if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
             cache.storage_metrics_collector.log_backup_dropped_tokens(num_tokens)
 
+    def _log_backup_submitted(self, num_tokens: int) -> None:
+        cache = self._cache
+        if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
+            cache.storage_metrics_collector.log_backup_submitted_tokens(num_tokens)
+
     def _pool_covered(self, pool: PoolName, keys: list[str]) -> bool:
         """Beliefs plus content past a D2H launch (republished content must
         not re-write while the original write drains)."""
@@ -1178,6 +1183,9 @@ class BufferModePipeline:
             extra_pools=storage_xfers or None,
         )
         self.ongoing_backup[operation_id] = entry
+        self._log_backup_submitted(
+            len(hash_value) * self._cache.cache_controller.page_size
+        )
 
     @staticmethod
     def _storage_transfers(staged: list[PoolTransfer]) -> list[PoolTransfer]:
