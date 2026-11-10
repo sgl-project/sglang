@@ -8,11 +8,12 @@ KV move. A GPU implementation may replace this module with the same public
 signatures and the same invariants; the rest of the speculative stack must not
 contain any other device-specific tree code.
 
-The four device operators follow the vllm-ascend reference backend switch:
+Projection, compression and indexing use the in-tree Triton package.
+The backend switch selects the compressed tree attention implementation:
 
 * ``sgl_kernel_npu`` (default): use the in-tree Triton package.
 * ``vendor``: load the vllm-ascend ``_C_ascend`` bindings listed in
-  ``SGLANG_DSPARK_TREE_OPS`` and call the AscendC operators.
+  ``SGLANG_DSPARK_TREE_OPS`` and call its AscendC tree attention operator.
 
 The public functions keep the same signatures for every backend. If an
 operator is unavailable the selected backend raises ``RuntimeError`` instead of
@@ -255,8 +256,8 @@ def _vendor_compressor_is_fused(project) -> bool:
     return all(name in schema for name in ("state", "ancestors", "norm_weight"))
 
 
-def _load_compressor_ops():
-    if _tree_backend() != "sgl_kernel_npu":
+def _load_compressor_ops(*, backend: str | None = None):
+    if (backend or _tree_backend()) == "vendor":
         _ensure_vendor_ops()
         namespace = _vendor_namespace()
         try:
@@ -390,7 +391,9 @@ def compress_nodes(
         plan.residue_cache[ratio] = residue
     # build_node_plan keeps hidden_ids as arange(n); avoid a redundant gather.
     hidden_nodes = hidden[: plan.n]
-    compressor_tree_project, compressor_tree, fused = _load_compressor_ops()
+    compressor_tree_project, compressor_tree, fused = _load_compressor_ops(
+        backend="sgl_kernel_npu"
+    )
     if fused:
         node_kv = compressor_tree_project(
             hidden_nodes,
@@ -634,7 +637,7 @@ def build_tree_attn_kwargs(
 
 
 def _tree_attention(**kwargs) -> torch.Tensor:
-    """Call the sgl_kernel_npu tree attention op (never the CPU reference)."""
+    """Call the selected compressed tree attention operator."""
     op = _load_attention_op()
     op_kwargs = build_tree_attn_kwargs(**kwargs)
     q = op_kwargs.pop("q")
@@ -923,8 +926,7 @@ def tree_indexer(
     schedule: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return the TopK compressed-KV indices for every tree node, ``[n, 1, topk]``."""
-    backend = _tree_backend()
-    common = dict(
+    return _sgl_kernel_tree_indexer(
         query=query,
         weights=weights,
         query_scale=query_scale,
@@ -939,9 +941,6 @@ def tree_indexer(
         residual=residual,
         schedule=schedule,
     )
-    if backend == "sgl_kernel_npu":
-        return _sgl_kernel_tree_indexer(**common)
-    return _vendor_tree_indexer(**common)
 
 
 # ---------------------------------------------------------------------------
