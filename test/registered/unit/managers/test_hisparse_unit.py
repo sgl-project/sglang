@@ -366,8 +366,8 @@ class TestHiSparseUnit(unittest.TestCase):
         return self.coordinator.swap_in_selected_pages(rpi, sls, batch, layer_id)
 
     def _cleanup_req(self, req, kv_loc, *, logical_only=False):
-        """request_finished -> free KV -> free req slot."""
-        self.coordinator.request_finished(req)
+        """release_request -> free KV -> free req slot."""
+        self.coordinator.release_request(req)
         if logical_only:
             self.allocator.logical_attn_allocator.free(kv_loc)
         else:
@@ -619,7 +619,7 @@ class TestHiSparseUnit(unittest.TestCase):
             initial[1] - seq_len,
         )
 
-        self.coordinator.request_finished(req)
+        self.coordinator.release_request(req)
         self.allocator.logical_attn_allocator.free(torch.cat([kv_loc, out_loc]))
         self._free_req_slot(req)
         self._assert_sizes_restored(initial, "decode_remap")

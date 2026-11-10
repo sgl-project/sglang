@@ -40,6 +40,10 @@ finish() {
     # The suite's step summary lands in the checkout; the launcher appends it
     # to the workflow's.
     [[ -n "${CI_SUMMARY_FILE:-}" ]] && cp "$WS/github_summary.md" "$CI_SUMMARY_FILE" 2>/dev/null || true
+    # Hand the suite's artifacts to the launcher before the checkout goes.
+    if [[ -n "${CI_ARTIFACT_RUN_DIR:-}" && -d "$WS/ci_artifacts" ]]; then
+        mkdir -p "$CI_ARTIFACT_RUN_DIR" && cp -r "$WS/ci_artifacts/." "$CI_ARTIFACT_RUN_DIR/" || true
+    fi
     remove_job "$CI_CONTAINER_NAME" "$WS"
     echo "$rc" > "$CI_EXIT_FILE"
     echo "[amd-ci-job] exit $rc"
@@ -109,6 +113,9 @@ mkdir -p "$WS" "$CI_NODE_SCRATCH/sglang-data"
 cp -a "$CI_SRC/." "$WS/"
 cd "$WS"
 touch github_summary.md
+# What a suite writes to $CI_ARTIFACT_DIR (this directory, in the container)
+# reaches the runner's $GITHUB_WORKSPACE/ci_artifacts; see the launcher.
+rm -rf ci_artifacts && mkdir ci_artifacts
 
 # The scripts read these instead of an ARC pod hostname and /home/runner.
 export GITHUB_WORKSPACE="$WS"
@@ -134,7 +141,11 @@ bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$CI_ROCM_VERSION"
 bash scripts/ci/amd/amd_ci_install_dependency.sh
 # --env pairs from the launcher, one KEY=VAL per line. amd_ci_exec.sh keeps the
 # last value given for a key, so they can override the summary path too.
-EXEC_ENV_ARGS=(-e GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md)
+# CI_IMAGE: the image amd_ci_start_container.sh picked, which can be an older
+# day's when today's is not out yet.
+EXEC_ENV_ARGS=(-e GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md
+               -e CI_ARTIFACT_DIR=/sglang-checkout/ci_artifacts
+               -e "CI_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$CI_CONTAINER_NAME")")
 while IFS= read -r kv; do
     [[ -n "$kv" ]] && EXEC_ENV_ARGS+=(-e "$kv")
 done <<< "${CI_EXEC_ENV:-}"

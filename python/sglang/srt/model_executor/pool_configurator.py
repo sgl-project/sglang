@@ -33,7 +33,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
     is_unlimited_ocr_v2,
     uses_compressed_kv_attention,
-    uses_minimax_m3_nvfp4_native_stack,
+    uses_minimax_m3_packed_nvfp4_kv,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
@@ -405,7 +405,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if dcp_size is None:
             dcp_size = get_parallel().attn_dcp_size
 
-        if kvc.use_mla_backend:
+        if kvc.modelslim_cache_layout is not None:
+            cell_size = (
+                kvc.modelslim_cache_layout.bytes_per_token * effective_num_layers
+            )
+        elif kvc.use_mla_backend:
             if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
                 # NPU sparse KV offload uses an index-only device pool.
                 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
@@ -427,16 +431,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim,
             )
 
-            if kvc.modelslim_cache_layout is not None:
-                per_layer_bytes = kvc.modelslim_cache_layout.bytes_per_token
-            else:
-                per_layer_bytes = (
-                    calculate_mla_kv_cache_dim(
-                        model_config=model_config,
-                        kv_cache_dtype=kv_cache_dtype,
-                    )
-                    * kv_size
+            per_layer_bytes = (
+                calculate_mla_kv_cache_dim(
+                    model_config=model_config,
+                    kv_cache_dtype=kv_cache_dtype,
                 )
+                * kv_size
+            )
             cell_size = per_layer_bytes * effective_num_layers
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
@@ -510,7 +511,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             # Must match the pool class picked in _build_minimax_sparse_kv_pool;
             # the packed layout is about four times smaller per token.
-            if uses_minimax_m3_nvfp4_native_stack(model_config.quantization):
+            if uses_minimax_m3_packed_nvfp4_kv(
+                model_config.quantization,
+                speculative_algorithm=get_spec().speculative_algorithm,
+            ):
                 from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import (
                     MSA_V1_PAGE_SIZE,
                     msa_v1_page_row_bytes,
@@ -831,7 +835,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
         self._fused_full_entry = kvc.fused_entry_bytes("full")
-        self._fused_swa_entry = kvc.fused_entry_bytes("swa")
+        window = kvc.target_window_sub_pool()
+        self._fused_swa_entry = (
+            None if window is None else kvc.fused_entry_bytes(window)
+        )
         if self._fused_full_entry is not None or self._fused_swa_entry is not None:
             self._draft_full_layers_num = 0
             self._draft_swa_layers_num = 0

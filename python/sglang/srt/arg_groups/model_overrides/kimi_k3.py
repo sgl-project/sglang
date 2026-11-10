@@ -188,14 +188,15 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
         raise ValueError("Kimi-K3.1 does not support --enable-unified-memory yet.")
     overrides = {}
     if cfg.dcp_size > 1:
-        if (
-            cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH")
-            or cfg.disaggregation_mode != "null"
-        ):
+        if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
             raise ValueError(
-                "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative "
-                "decoding, and not PD disaggregation yet."
+                "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative decoding."
             )
+        if (
+            cfg.disaggregation_mode != "null"
+            and cfg.disaggregation_transfer_backend != "mooncake"
+        ):
+            raise ValueError("Kimi-K3.1 DCP supports PD only over Mooncake.")
         if cfg.speculative_algorithm == "DSPARK":
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
@@ -226,6 +227,12 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Kimi-K3.1 DCP needs the fused sgl-kernel v2 DSA top-k "
                 "(--dsa-topk-backend sgl-kernel, SGLANG_OPT_USE_TOPK_V2 and "
                 "SGLANG_DSA_FUSE_TOPK on)."
+            )
+        if cfg.enable_return_indexer_topk or envs.SGLANG_DSA_TOPK_BROADCAST.get():
+            # the sharded indexer returns only this rank's local KV slots
+            raise ValueError(
+                "Kimi-K3.1 DCP does not support --enable-return-indexer-topk "
+                "or SGLANG_DSA_TOPK_BROADCAST."
             )
         if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
             "a2a",

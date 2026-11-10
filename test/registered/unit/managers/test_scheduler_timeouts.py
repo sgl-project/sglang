@@ -36,12 +36,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
-from sglang.test.scheduler_test_utils import empty_request_lists
+from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-class _FakeReq:
+class _FakeReq(FakeReq):
     release_mm_inputs_on_abort = Req.release_mm_inputs_on_abort
     request_finish = Req.request_finish
     finish_outside_step = Req.finish_outside_step

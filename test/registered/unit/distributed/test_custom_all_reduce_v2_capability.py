@@ -42,6 +42,7 @@ def _patch_group(monkeypatch, *, world_size, same_node):
     ],
 )
 def test_topology_capability(monkeypatch, same_node, has_fabric_clique, expected):
+    monkeypatch.setattr(custom_all_reduce_v2, "_is_hip", False)
     world_size = 8 if same_node else 16
     group, device = _patch_group(
         monkeypatch,
@@ -101,6 +102,28 @@ def test_rocm_runtime_gate(monkeypatch, hip_version, expected):
     assert topology_check.called is expected
 
 
+@pytest.mark.parametrize("in_clique", [True, False])
+def test_rocm_multinode_uses_fabric_clique(monkeypatch, in_clique):
+    """A multi-node ROCm group is admitted only by the gfx1250 fabric probe."""
+    from sglang.srt.utils import hip_vmm_utils
+
+    group, device = _patch_group(monkeypatch, world_size=16, same_node=False)
+    monkeypatch.setattr(custom_all_reduce_v2, "_is_hip", True)
+    monkeypatch.setattr(hip_vmm_utils, "hip_runtime_version", lambda: (7, 17, 0))
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "is_one_nvlink_clique",
+        lambda group, device: pytest.fail("ROCm has no NVLink clique to query"),
+    )
+    from sglang.srt.distributed.device_communicators import gfx1250_fabric
+
+    probe = Mock(return_value=in_clique)
+    monkeypatch.setattr(gfx1250_fabric, "probe_fabric_clique", probe)
+
+    assert custom_all_reduce_v2.can_use_custom_all_reduce_v2(group, device) is in_clique
+    probe.assert_called_once_with(group, device)
+
+
 @pytest.mark.parametrize(
     ("disabled", "has_multicast", "nbytes", "num_blocks", "expected"),
     [
@@ -124,6 +147,118 @@ def test_supports_push(disabled, has_multicast, nbytes, num_blocks, expected):
     assert comm.supports_push(nbytes=nbytes, num_blocks=num_blocks) is expected
 
 
+_KB, _MB = 1024, 1024 * 1024
+
+
+def test_gfx1250_table_enables_hier_only_at_tp16():
+    from sglang.srt.distributed.device_communicators.configs import (
+        custom_all_reduce_v2 as cfg,
+    )
+
+    configs = cfg._rocm_gfx1250_configs.__wrapped__(96)
+    assert configs[16].graph.hier_2shot_push == cfg.Range(256 * _KB, 64 * _MB)
+    assert configs[16].eager.hier_2shot_push == cfg.Range(256 * _KB, 64 * _MB)
+    for world_size in range(2, 9):
+        assert configs[world_size].graph.hier_2shot_push.max_bytes == 0
+
+
+@pytest.mark.parametrize(
+    ("max_size", "sizes_own_push", "hier_max", "two_shot"),
+    [
+        # a pair slot holds half a message and stays within max_size; 2shot_push
+        # keeps the sizes above a hier range it no longer covers
+        (16 * _MB, False, 32 * _MB, 64 * _MB),
+        # hier covers 2shot_push: its slots stay at the hier minimum
+        (32 * _MB, False, 64 * _MB, 256 * _KB),
+        # push-only, explicit or forced push sizes: no hier planes
+        (32 * _MB, True, 0, 64 * _MB),
+        # a cap at or below the hier minimum disables it
+        (128 * _KB, False, 0, 64 * _MB),
+    ],
+)
+def test_hier_sizing(max_size, sizes_own_push, hier_max, two_shot):
+    from sglang.srt.distributed.device_communicators.configs import (
+        custom_all_reduce_v2 as cfg,
+    )
+
+    config = cfg._rocm_gfx1250_configs.__wrapped__(96)[16]
+    got = custom_all_reduce_v2._hier_max_bytes(
+        config, max_size, sizes_own_push=sizes_own_push
+    )
+    assert got == hier_max
+    fitted = custom_all_reduce_v2._fit_hier(config, got)
+    for heuristic in (fitted.graph, fitted.eager):
+        assert heuristic.hier_2shot_push.max_bytes == hier_max
+        assert heuristic.two_shot_push_threshold == two_shot
+
+
+@pytest.mark.parametrize(
+    ("nbytes", "expected"),
+    [
+        (16 * _MB, "HIER_2SHOT_PUSH"),
+        (32 * _MB, "HIER_2SHOT_PUSH"),
+        # above the clipped hier range, 2shot_push keeps its tuned sizes
+        (48 * _MB, "TWO_SHOT_PUSH"),
+        (64 * _MB + 32, None),
+    ],
+)
+def test_pick_config_hier_at_default_cap(nbytes, expected):
+    from sglang.srt.distributed.device_communicators.configs import (
+        custom_all_reduce_v2 as cfg,
+    )
+
+    config = cfg._rocm_gfx1250_configs.__wrapped__(96)[16]
+    hier_max = custom_all_reduce_v2._hier_max_bytes(
+        config, 16 * _MB, sizes_own_push=False
+    )
+    comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
+    comm.disabled = True
+    comm.config = custom_all_reduce_v2._fit_hier(config, hier_max)
+    picked = comm._pick_config(nbytes, False)
+    assert (None if picked is None else picked.algo.name) == expected
+
+
+@pytest.mark.parametrize(
+    ("nbytes", "expected"),
+    [
+        (256 * _KB, "ONE_SHOT_PUSH"),
+        (256 * _KB + 32, "HIER_2SHOT_PUSH"),
+        (64 * _MB, "HIER_2SHOT_PUSH"),
+        # cannot be halved into whole 16 B vectors; 2shot_push stops at the
+        # hier minimum, so NCCL takes it
+        (4 * _MB + 16, None),
+        (64 * _MB + 32, None),
+    ],
+)
+def test_pick_config_hier_2shot_push(nbytes, expected):
+    """With hier_2shot_push enabled, 2shot_push keeps only the sizes below it."""
+    from sglang.srt.distributed.device_communicators.configs import (
+        custom_all_reduce_v2 as cfg,
+    )
+
+    heuristic = cfg.Heuristic(
+        256 * _KB,
+        0,
+        0,
+        two_shot_push_threshold=256 * _KB,
+        hier_2shot_push=cfg.Range(256 * _KB, 64 * _MB),
+    )
+    comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
+    # dispatch does not look at it; close() at teardown does
+    comm.disabled = True
+    comm.config = cfg.AllReduceConfig(
+        graph=heuristic,
+        eager=heuristic,
+        num_push_blocks=96,
+        num_pull_blocks=32,
+        num_mc_blocks=None,
+    )
+    for use_graph in (False, True):
+        picked = comm._pick_config(nbytes, use_graph)
+        algo = None if picked is None else picked.algo.name
+        assert algo == expected
+
+
 @pytest.mark.parametrize(
     ("cluster_uuid", "peer_host", "expected"),
     [
@@ -137,6 +272,7 @@ def test_supports_push(disabled, has_multicast, nbytes, num_blocks, expected):
 def test_zero_cluster_uuid_clique_ends_at_its_node(
     monkeypatch, cluster_uuid, peer_host, expected
 ):
+    monkeypatch.setattr(custom_all_reduce_utils, "_is_hip", False)
     monkeypatch.setattr(
         custom_all_reduce_utils, "_gpu_fabric_clique", lambda device: (cluster_uuid, 0)
     )

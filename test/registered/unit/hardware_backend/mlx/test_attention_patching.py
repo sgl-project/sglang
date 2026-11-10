@@ -8,6 +8,7 @@ from collections import deque
 from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.test.ci.ci_register import register_mlx_ci
 
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
@@ -1167,7 +1168,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler.ingest_requests = lambda: []
         scheduler.increment_scheduler_iterations = lambda: None
         scheduler.gracefully_exit = False
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
         scheduler._on_step_launch = lambda batch: None
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
@@ -1205,12 +1206,10 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         processor = SchedulerBatchResultProcessor(
             is_generation=True,
             disaggregation_mode=None,
-            enable_overlap=False,
-            enable_overlap_mlx=False,
             model_config=None,
             token_to_kv_pool_allocator=None,
             tree_cache=tree_cache,
-            hisparse_coordinator=SimpleNamespace(request_finished=lambda req: None),
+            hisparse_coordinator=SimpleNamespace(release_request=lambda req: None),
             req_to_token_pool=None,
             kv_weight_version_tracker=None,
             decode_offload_manager=None,
@@ -1227,9 +1226,10 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             beam_coordinator=None,
             request_retirer=release_only_retirer(
                 tree_cache=tree_cache,
-                hisparse_coordinator=SimpleNamespace(request_finished=lambda req: None),
+                hisparse_coordinator=SimpleNamespace(release_request=lambda req: None),
             ),
             abort_request=lambda req: None,
+            still_in_batch=lambda req: True,
         )
         # Stub out the methods _handle_finish_state_updated_req calls that
         # are not relevant to this test.  SchedulerBatchResultProcessor is
@@ -1247,6 +1247,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             setattr(SchedulerBatchResultProcessor, name, value)
         req = SimpleNamespace(
             rid="r0",
+            exit_via=None,
             kv=SimpleNamespace(
                 holds_kv=True, holds_mamba=False, retraction_backup=None
             ),

@@ -162,9 +162,10 @@ class TestMambaCapacity(unittest.TestCase):
                 )
                 self.assertGreaterEqual(pool.mamba_allocator.available_size(), 3)
                 if expected_eviction:
+                    # The cache is asked for the whole demand, not the shortfall.
                     self.assertEqual(
-                        cache.evict_for_alloc.call_args.args[0].mamba_num,
-                        expected_eviction,
+                        cache.evict_for_alloc.call_args.args[0].state_slots,
+                        free + expected_eviction,
                     )
                 else:
                     cache.evict_for_alloc.assert_not_called()
@@ -185,7 +186,7 @@ class TestMambaCapacity(unittest.TestCase):
         cache = make_cache(pool, held, 1)
         reqs = [make_req(), make_req(holds_mamba=True, has_buffer=True)]
         self.assertTrue(ensure_mamba_capacity(pool, pool.state, reqs, cache))
-        self.assertEqual(cache.evict_for_alloc.call_args.args[0].mamba_num, 1)
+        self.assertEqual(cache.evict_for_alloc.call_args.args[0].state_slots, 3)
 
         for holds_mamba, has_buffer, free, release, expected_eviction in [
             (True, False, 1, 1, 1),
@@ -198,9 +199,10 @@ class TestMambaCapacity(unittest.TestCase):
                 req = make_req(holds_mamba=holds_mamba, has_buffer=has_buffer)
                 self.assertTrue(ensure_mamba_capacity(pool, pool.state, [req], cache))
                 if expected_eviction:
+                    # The cache is asked for the whole demand, not the shortfall.
                     self.assertEqual(
-                        cache.evict_for_alloc.call_args.args[0].mamba_num,
-                        expected_eviction,
+                        cache.evict_for_alloc.call_args.args[0].state_slots,
+                        free + expected_eviction,
                     )
                 else:
                     cache.evict_for_alloc.assert_not_called()
@@ -209,12 +211,12 @@ class TestMambaCapacity(unittest.TestCase):
         pool, held = make_pool(1, lazy=True)
         cache = make_cache(pool, held, 1)
         self.assertTrue(ensure_mamba_capacity(pool, pool.state, [make_req()], cache))
-        self.assertEqual(cache.evict_for_alloc.call_args.args[0].mamba_num, 1)
+        self.assertEqual(cache.evict_for_alloc.call_args.args[0].state_slots, 2)
 
         pool, held = make_pool(1, track_buffer_size=1)
         cache = make_cache(pool, held, 1)
         self.assertTrue(ensure_mamba_capacity(pool, pool.state, [make_req()], cache))
-        self.assertEqual(cache.evict_for_alloc.call_args.args[0].mamba_num, 1)
+        self.assertEqual(cache.evict_for_alloc.call_args.args[0].state_slots, 2)
 
         pool, held = make_pool(1, extra_buffer=False)
         cache = make_cache(pool, held, 0)
@@ -281,11 +283,9 @@ class TestMambaCapacity(unittest.TestCase):
         queue._pre_alloc.assert_not_called()
         self.assertIsNone(req.kv.req_pool_idx)
 
-        queue._prealloc_required_tokens = MagicMock(return_value=(1, 0))
-        queue._prealloc_reservation_fits = MagicMock(return_value=True)
-        queue.token_to_kv_pool_allocator = SimpleNamespace(
-            state=pool.state, prealloc_fits_assumes_reclaim=lambda: False
-        )
+        queue._prealloc_required = MagicMock(return_value=(1, {}))
+        queue._admit_preallocation = MagicMock(return_value=True)
+        queue.token_to_kv_pool_allocator = SimpleNamespace(state=pool.state)
         with patch(
             "sglang.srt.disaggregation.decode.get_disagg",
             return_value=SimpleNamespace(

@@ -1372,6 +1372,19 @@ class SchedulerMetricsReporter:
             self.scheduler_stage_metrics.start(now_wall_ns)
             return
 
+        # CRIU restore can move monotonic time below the saved baseline.
+        # Skip the unknowable gap, but flush buffered idle and stage totals
+        # before rebasing. drain() also preserves the current stage.
+        clock_reset = now_wall_ns < accounting.last_sample_ns
+        if clock_reset:
+            accounting.last_sample_ns = now_wall_ns
+            if ENABLE_METRICS_DEVICE_TIMER:
+                self._forward_occupancy_log_window.reset(now_wall_ns)
+                # perf_counter() reads the same clock, so restart its window too.
+                self._device_timer_window_batch_count = 0
+            if not self.enable_metrics:
+                accounting.reset(now_wall_ns, 0, is_idle)
+
         # Clamp delayed events to the still-unaccounted wall-time range.
         event_ns = max(accounting.last_sample_ns, min(event_ns, now_wall_ns))
         if ENABLE_METRICS_DEVICE_TIMER and is_idle and not accounting.is_idle:
@@ -1388,11 +1401,17 @@ class SchedulerMetricsReporter:
             self._forward_occupancy_log_window.idle_ns += (
                 accounting.accumulate_idle_ns - idle_ns_before
             )
-        if not self.enable_metrics or not accounting.should_record(now_wall_ns):
+        if not self.enable_metrics or (
+            not clock_reset and not accounting.should_record(now_wall_ns)
+        ):
             return
 
         now_process_cpu_ns = time.process_time_ns()
         elapsed_process_cpu_ns = now_process_cpu_ns - accounting.start_process_cpu_ns
+        if elapsed_process_cpu_ns < 0:
+            # CRIU restore restarts the process CPU clock near zero, so its
+            # reading is the CPU time since restore. Never decrement the counter.
+            elapsed_process_cpu_ns = now_process_cpu_ns
         if accounting.accumulate_idle_ns > 0:
             self.metrics_collector.increment_scheduler_idle_seconds(
                 accounting.accumulate_idle_ns / 1e9
@@ -1448,17 +1467,29 @@ class SchedulerMetricsReporter:
         self.stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(
             host_reqs, priority_enabled
         )
-        full_tokens, swa_tokens = (
-            self.scheduler.disagg_decode_prealloc_queue.pre_allocated_token_counts()
-        )
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
+        full_tokens, window_tokens = (
+            self.scheduler.disagg_decode_prealloc_queue.pre_allocated_token_counts(
+                tuple(window.sub_pool for window in pool_stats.windows)
+            )
+        )
         self.stats.prealloc_full_token_usage = (
             full_tokens / pool_stats.full_capacity if pool_stats.full_capacity else 0.0
         )
+        # Each window's pending rows, by that window's own cursor.
+        self.stats.prealloc_window_token_usage = {
+            window.name: (
+                window_tokens[window.sub_pool] / window.capacity
+                if window.capacity
+                else 0.0
+            )
+            for window in pool_stats.windows
+        }
+        target = pool_stats.target_window_stats()
         self.stats.prealloc_swa_token_usage = (
-            swa_tokens / pool_stats.swa_capacity
-            if pool_stats.is_hybrid_swa and pool_stats.swa_capacity
-            else 0.0
+            0.0
+            if target is None
+            else self.stats.prealloc_window_token_usage[target.name]
         )
 
     def _maybe_log_idle_metrics(self):
