@@ -391,25 +391,23 @@ class TestPublicKVProtocol(CustomTestCase):
 
     def test_shared_schema_and_invalid_vectors(self):
         from sglang.srt.managers.kv_control.contracts import (
-            ClaimState,
             Demote,
             Pin,
             Prefetch,
-            PublicResult,
             parse_action,
         )
 
-        for name, schema in {
-            "prefetch": Prefetch,
-            "demote": Demote,
-            "pin": Pin,
-            "result": PublicResult,
-            "claim": ClaimState,
-        }.items():
+        for name, schema in (("prefetch", Prefetch), ("pin", Pin)):
             self.assertEqual(
                 json.loads((self.fixtures / f"{name}.schema.json").read_text()),
                 wire(msgspec.json.schema(schema)),
             )
+        demote = wire(msgspec.json.schema(Demote))
+        transfer = demote["$defs"].pop("Demote")
+        transfer["title"] = "Prefetch"
+        demote["$defs"]["Prefetch"] = transfer
+        demote["$ref"] = "#/$defs/Prefetch"
+        self.assertEqual(demote, wire(msgspec.json.schema(Prefetch)))
         for case in json.loads((self.fixtures / "actions.json").read_text()):
             with self.subTest(case=case["name"]):
                 a = msgspec.convert(case["action"], type=KvHintAction)

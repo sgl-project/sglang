@@ -550,6 +550,8 @@ def validate_prefix(target: PrefixTarget) -> None:
 
 def validate_public(payload):
     if isinstance(payload, Pin):
+        if payload.location.tier != "host":
+            raise ControlError("unsupported", "PIN requires a host location")
         if (payload.mode == "release") != (
             payload.ttl_seconds is None and payload.priority is None
         ):
@@ -562,11 +564,15 @@ def validate_public(payload):
         locations = (payload.location,)
     else:
         locations = (payload.source, payload.destination)
-        ranks = {"gpu": 0, "host": 1, "storage": 2}
-        src, dst = ranks[payload.source.tier], ranks[payload.destination.tier]
-        if (isinstance(payload, Demote) and src >= dst) or (
-            not isinstance(payload, Demote) and src <= dst
-        ):
+        path = (payload.source.tier, payload.destination.tier)
+        expected = (
+            ("host", "storage") if isinstance(payload, Demote) else ("storage", "host")
+        )
+        if "gpu" in path:
+            raise ControlError(
+                "unsupported", "Explicit transfers require host and storage"
+            )
+        if path != expected:
             raise ControlError("invalid_payload", "Invalid public transfer direction")
     for location in locations:
         if location.tier == "storage":

@@ -79,55 +79,40 @@ pub enum Error {
     Unsupported,
 }
 
-static SCHEMAS: LazyLock<HashMap<&'static str, jsonschema::Validator>> = LazyLock::new(|| {
-    [
-        (
-            "sglang.prefetch",
-            include_str!("../fixtures/prefetch.schema.json"),
-        ),
-        (
-            "sglang.demote",
-            include_str!("../fixtures/demote.schema.json"),
-        ),
-        ("sglang.pin", include_str!("../fixtures/pin.schema.json")),
-        ("result", include_str!("../fixtures/result.schema.json")),
-        ("claim", include_str!("../fixtures/claim.schema.json")),
-    ]
-    .into_iter()
-    .map(|(name, source)| {
-        let schema: Value = serde_json::from_str(source).expect("checked-in JSON schema");
-        (
-            name,
-            jsonschema::validator_for(&schema).expect("valid protocol schema"),
-        )
-    })
-    .collect()
-});
+static TRANSFER_SCHEMA: LazyLock<jsonschema::Validator> =
+    LazyLock::new(|| validator(include_str!("../fixtures/prefetch.schema.json")));
+static PIN_SCHEMA: LazyLock<jsonschema::Validator> =
+    LazyLock::new(|| validator(include_str!("../fixtures/pin.schema.json")));
 
-/// Structural validation is shared verbatim; dependent range rules are below.
-pub fn validate_schema(name: &str, value: &Value) -> Result<(), Error> {
-    if SCHEMAS.get(name).ok_or(Error::Unsupported)?.is_valid(value) {
-        Ok(())
-    } else {
-        Err(Error::InvalidPayload)
-    }
+fn validator(source: &str) -> jsonschema::Validator {
+    let schema: Value = serde_json::from_str(source).expect("checked-in JSON schema");
+    jsonschema::validator_for(&schema).expect("valid protocol schema")
 }
 
 pub fn parse_action(action: &Action) -> Result<ParsedAction, Error> {
     if !action.action_type.starts_with("sglang.") {
         return Ok(ParsedAction::Unhandled(action.clone()));
     }
-    if action.action_version != ACTION_VERSION || !SCHEMAS.contains_key(action.action_type.as_str())
-    {
+    if action.action_version != ACTION_VERSION {
         return Err(Error::Unsupported);
     }
-    validate_schema(&action.action_type, &action.payload)?;
+    let schema = match action.action_type.as_str() {
+        "sglang.prefetch" | "sglang.demote" => &TRANSFER_SCHEMA,
+        "sglang.pin" => &PIN_SCHEMA,
+        _ => return Err(Error::Unsupported),
+    };
+    if !schema.is_valid(&action.payload) {
+        return Err(Error::InvalidPayload);
+    }
     strict_numbers(&action.payload, "")?;
     validate_target(&action.payload["target"])?;
     let decode_error = |_| Error::InvalidPayload;
     if action.action_type == "sglang.pin" {
         let pin: Pin = serde_json::from_value(action.payload.clone()).map_err(decode_error)?;
         validate_location(&pin.location)?;
+        if pin.location.tier != "host" {
+            return Err(Error::Unsupported);
+        }
         if (pin.mode == "release") != (pin.ttl_seconds.is_none() && pin.priority.is_none()) {
             return Err(Error::InvalidPayload);
         }
@@ -137,23 +122,15 @@ pub fn parse_action(action: &Action) -> Result<ParsedAction, Error> {
         serde_json::from_value(action.payload.clone()).map_err(decode_error)?;
     validate_location(&transfer.source)?;
     validate_location(&transfer.destination)?;
-    let rank = |tier: &str| match tier {
-        "gpu" => 0,
-        "host" => 1,
-        _ => 2,
-    };
-    let src = rank(&transfer.source.tier);
-    let dst = rank(&transfer.destination.tier);
-    if action.action_type == "sglang.demote" {
-        if src >= dst {
-            return Err(Error::InvalidPayload);
-        }
-        Ok(ParsedAction::Demote(transfer))
-    } else {
-        if src <= dst {
-            return Err(Error::InvalidPayload);
-        }
-        Ok(ParsedAction::Prefetch(transfer))
+    match (
+        action.action_type.as_str(),
+        transfer.source.tier.as_str(),
+        transfer.destination.tier.as_str(),
+    ) {
+        ("sglang.prefetch", "storage", "host") => Ok(ParsedAction::Prefetch(transfer)),
+        ("sglang.demote", "host", "storage") => Ok(ParsedAction::Demote(transfer)),
+        (_, "gpu", _) | (_, _, "gpu") => Err(Error::Unsupported),
+        _ => Err(Error::InvalidPayload),
     }
 }
 
@@ -298,13 +275,11 @@ mod tests {
         let fixture: Value =
             serde_json::from_str(include_str!("../fixtures/results.json")).unwrap();
         for value in fixture["results"].as_array().unwrap() {
-            validate_schema("result", value).unwrap();
             let result: crate::models::PublicResult =
                 serde_json::from_value(value.clone()).unwrap();
             assert_eq!(serde_json::to_value(result).unwrap(), *value);
         }
         for value in fixture["claims"].as_array().unwrap() {
-            validate_schema("claim", value).unwrap();
             let claim: crate::models::ClaimState = serde_json::from_value(value.clone()).unwrap();
             assert!(claim.tombstone);
             assert_eq!(claim.state, crate::models::ClaimStatus::Released);

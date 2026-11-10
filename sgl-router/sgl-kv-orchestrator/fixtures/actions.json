@@ -230,11 +230,12 @@
           ]
         },
         "source": {
-          "tier": "gpu",
+          "tier": "host",
           "engine_id": "engine"
         },
         "destination": {
-          "tier": "host"
+          "tier": "storage",
+          "backend": "file"
         },
         "allow_partial": false,
         "timeout_ms": 5000
