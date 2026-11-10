@@ -423,6 +423,12 @@ class HiCacheController:
         # write D2H behind in-flight forwards (see start_loading, start_writing).
         self.load_fence_stream = None
         self.write_fence_stream = None
+        # Write-back eviction fences (record_forward_start, record_war_barrier).
+        self.forward_start_event: Optional[device_module.Event] = None
+        self.war_barrier_event: Optional[device_module.Event] = None
+        self.war_barrier_seq = 0
+        # True while the schedule stream waits on the latest launched forward.
+        self.war_barrier_after_forward = False
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
@@ -1018,7 +1024,24 @@ class HiCacheController:
         self.start_writing()
         return host_indices
 
-    def start_writing(self) -> None:
+    def record_forward_start(self, event: device_module.Event) -> None:
+        """Take the event recorded on the forward stream before a forward's
+        kernels: it covers earlier forwards and the scheduler work the forward
+        waited on, but not the forward itself."""
+        self.forward_start_event = event
+        self.war_barrier_after_forward = False
+
+    def record_war_barrier(self, event: device_module.Event) -> None:
+        """Take the event recorded on the schedule stream just before it waits
+        on the in-flight forward (the WAR barrier)."""
+        self.war_barrier_event = event
+        self.war_barrier_seq += 1
+        self.war_barrier_after_forward = self.forward_start_event is not None
+
+    def start_writing(self, fence_event: Optional[device_module.Event] = None) -> None:
+        """Submit the queued D2H writes behind the forward stream, or only behind
+        ``fence_event``. Pass the event only if no forward launched after it can
+        still write the queued sources."""
         if len(self.write_queue) == 0:
             return
 
@@ -1026,7 +1049,9 @@ class HiCacheController:
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
 
-        if self.write_fence_stream is not None:
+        if fence_event is not None:
+            self.l2_transfer_engine.device_to_host_stream.wait_event(fence_event)
+        elif self.write_fence_stream is not None:
             # The copy may read KV a forward is still writing: under overlap
             # scheduling a finished request is cached while the next forward
             # writes its last token, and an evicted SWA page can belong to an

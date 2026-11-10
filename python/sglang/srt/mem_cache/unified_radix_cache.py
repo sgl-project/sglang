@@ -74,6 +74,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PPPrefetchDecision,
     PrefetchOperation,
 )
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.plan import (
@@ -133,7 +134,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align
-from sglang.srt.utils.device import get_device_module
+from sglang.srt.utils.device import get_device_module, is_cuda, is_hip
 from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
@@ -376,6 +377,22 @@ class UnifiedRadixCache(BasePrefixCache):
         self.buffer_pipeline: Optional[BufferModePipeline] = None
         # Session of the insert whose actions are being applied (see ``insert``).
         self.insert_session_id: Optional[str] = None
+        # Write-back device-eviction fences (see _wb_evict_overlap_stream).
+        self._wb_evict_pd_prefill = False  # Set by init_hicache.
+        self._wb_evict_relaxed_fence_logged = False
+        # ChainAllocator relocates pages; SWA trees evict older windows of
+        # in-flight checkpoints.
+        self._wb_overlap_in_scope = not self.is_swa_enabled and not isinstance(
+            self.token_to_kv_pool_allocator, ChainAllocator
+        )
+        self._wb_overlap_stream: Optional[torch.Stream] = None
+        self._wb_overlap_max_seen_id = -1
+        self._wb_overlap_watermark = -1
+        self._wb_overlap_barrier_seq = 0
+        self._wb_overlap_counts = {"overlap": 0, "fresh": 0, "scope": 0}
+        # Streams the queued device-eviction backups were built on.
+        self._wb_batch_on_overlap = False
+        self._wb_batch_on_current = False
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
@@ -626,6 +643,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        self._wb_evict_pd_prefill = get_disagg().disaggregation_mode == "prefill"
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -757,6 +775,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
+                    self._wb_overlap_observe(step.result.last_device_node)
                     return step.result
                 step = self.tree_core.resume_insert()
         finally:
@@ -1016,6 +1035,8 @@ class UnifiedRadixCache(BasePrefixCache):
         start_time = time.perf_counter()
         tracker = {ct: 0 for ct in self.tree_components}
 
+        if self._wb_evict_relaxed_fence():
+            self._flush_queued_writes_fenced()
         if (
             demand is None
             and self.evicts_by_joint_lru
@@ -1280,16 +1301,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 else:
                     backup_kv = self._evict_device_leaf(node_id, tracker)
                     if backup_kv is not None:
-                        written = self._execute_and_commit_kv_backup(
-                            backup_kv, write_back=True
-                        )
+                        written = self._queue_write_back_victim(backup_kv)
                         if written == 0 and pending:
                             # Make the queued victims host-evictable, as the
                             # per-victim walk would have by now, and retry once.
                             demote_queued()
-                            written = self._execute_and_commit_kv_backup(
-                                backup_kv, write_back=True
-                            )
+                            written = self._queue_write_back_victim(backup_kv)
                         if written > 0:
                             pending.append(node_id)
                             pending_tokens += self.tree_core.mark_write_back_queued(
@@ -1326,7 +1343,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Wait once for the queued copies, then demote the nodes in order."""
         if not node_ids:
             return
-        self.writing_check(write_back=True)
+        self._wait_write_back_victims()
         for node_id in node_ids:
             self._demote(node_id, tracker)
         node_ids.clear()
@@ -4061,17 +4078,207 @@ class UnifiedRadixCache(BasePrefixCache):
         # the request broadcast stays on gloo there, a one-source broadcast does not gain.
         return get_shm_exchange(group, "hicache", multihost=True)
 
+    def _is_pd_prefill_write_back(self) -> bool:
+        cc = self.cache_controller
+        return (
+            cc is not None
+            and cc.write_policy == "write_back"
+            and self._wb_evict_pd_prefill
+        )
+
+    def _wb_evict_relaxed_fence(self) -> bool:
+        """Whether a device-eviction backup may fence its D2H on the in-flight
+        forward's start event instead of on the whole forward.
+
+        On a PD prefill server the in-flight forward writes only its own
+        requests' pages and state slots; the only tree nodes among them belong
+        to a chunked request's checkpoint, which holds the Full lock on its path.
+        A device-eviction victim has no Full lock, and its backup chain (the
+        leaf, its unbacked ancestors and their SWA window) cannot descend from
+        that checkpoint, so earlier forwards wrote all of it. Internal SWA/Mamba
+        state backups (backup_node_for_write_back) keep the full fence: an older
+        SWA window of the in-flight checkpoint is evictable.
+        """
+        return (
+            self._is_pd_prefill_write_back()
+            and envs.SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE.get()
+            and self.cache_controller.forward_start_event is not None
+        )
+
+    def _queue_write_back_victim(self, backup_kv: BackupKV) -> int:
+        """Queue a device-eviction victim's backup; _wait_write_back_victims
+        submits the batch."""
+        stream = self._wb_evict_overlap_stream(backup_kv)
+        if stream is None:
+            self._wb_batch_on_current = True
+            return self._execute_and_commit_kv_backup(backup_kv, write_back=True)
+        self._wb_batch_on_overlap = True
+        with device_module.stream(stream):
+            written = self._execute_and_commit_kv_backup(backup_kv, write_back=True)
+        # A submit from the current stream must see the indices built here; it
+        # already waits for the forward, which the overlap work does not outlast.
+        device_module.current_stream().wait_stream(stream)
+        return written
+
+    def _wait_write_back_victims(self) -> None:
+        """Submit the queued device-eviction backups and wait for every ack.
+        A batch built only on the overlap stream is submitted there, so its
+        copy does not wait for the forward; a mixed batch is submitted on the
+        current stream."""
+        on_overlap = self._wb_batch_on_overlap
+        on_current = self._wb_batch_on_current
+        self._wb_batch_on_overlap = self._wb_batch_on_current = False
+        submit_on_overlap = on_overlap and not on_current
+        with (
+            device_module.stream(self._wb_overlap_stream)
+            if submit_on_overlap
+            else nullcontext()
+        ):
+            self.writing_check(write_back=True, relaxed_fence=True)
+
+    def _wb_overlap_sync_watermark(self) -> None:
+        # Node ids only grow: at the first look after a WAR barrier, every id
+        # seen so far belongs to a node created before that barrier.
+        seq = self.cache_controller.war_barrier_seq
+        if seq != self._wb_overlap_barrier_seq:
+            self._wb_overlap_barrier_seq = seq
+            self._wb_overlap_watermark = self._wb_overlap_max_seen_id
+
+    def _wb_overlap_observe(self, node_id: Optional[NodeId]) -> None:
+        if not isinstance(node_id, int) or not self._is_pd_prefill_write_back():
+            return
+        self._wb_overlap_sync_watermark()
+        self._wb_overlap_max_seen_id = max(self._wb_overlap_max_seen_id, node_id)
+
+    def _wb_overlap_chain_is_fresh(self, node_ids: Sequence[NodeId]) -> bool:
+        """Whether a chain node may hold a device value written after the latest
+        WAR barrier: a node created since (insert, split head) has an id above
+        the watermark, and a split tail gets a new parent. Nodes not seen before
+        the barrier count as fresh."""
+        node_ids = list(node_ids)
+        if not node_ids:
+            return True
+        self._wb_overlap_sync_watermark()
+        watermark = self._wb_overlap_watermark
+        paths = self.tree_core.collect_path_info(node_ids)
+        for node_id, path in zip(node_ids, paths):
+            if not path or path[-1].node_id != node_id:
+                return True
+            if node_id > watermark or path[-1].parent_id > watermark:
+                return True
+        return False
+
+    def _wb_evict_overlap_stream(self, backup_kv: BackupKV) -> Optional[torch.Stream]:
+        """The private stream a relaxed device-eviction backup is built on after
+        a WAR barrier, or None to stay on the current stream.
+
+        After the barrier the schedule stream waits on the in-flight forward, and
+        an L2 transfer started there (it records its start event on the current
+        stream) would wait for that forward too. The private stream waits only on
+        ``forward_start_event`` and ``war_barrier_event``, so every device tensor
+        the backup reads must have been produced before those events. Inserts and
+        splits after the barrier copy node values on the schedule stream, behind
+        the forward, so a chain with such a node stays on the current stream.
+        """
+        if not self._wb_evict_relaxed_fence():
+            return None
+        cc = self.cache_controller
+        if not cc.war_barrier_after_forward or cc.war_barrier_event is None:
+            return None
+        counts = self._wb_overlap_counts
+        if not self._wb_overlap_in_scope:
+            counts["scope"] += 1
+            return None
+        if self._wb_overlap_chain_is_fresh(backup_kv.node_ids):
+            counts["fresh"] += 1
+            stream = None
+        else:
+            counts["overlap"] += 1
+            stream = self._wb_overlap_get_stream(cc)
+            stream.wait_event(cc.forward_start_event)
+            stream.wait_event(cc.war_barrier_event)
+        if sum(counts.values()) % 1024 == 0:
+            logger.info(
+                "HiCache write_back eviction overlap: %d overlapped, "
+                "%d fenced (fresh chain), %d out of scope.",
+                counts["overlap"],
+                counts["fresh"],
+                counts["scope"],
+            )
+        return stream
+
+    def _wb_overlap_get_stream(self, cc: HybridCacheController) -> torch.Stream:
+        if self._wb_overlap_stream is not None:
+            return self._wb_overlap_stream
+        engine = cc.l2_transfer_engine
+        redrawn = []
+        if is_cuda() or is_hip():
+            from sglang.srt.managers.utils import allocate_distinct_stream
+
+            # Pooled streams can alias: an L2 stream that is the schedule or
+            # forward stream would queue the copy behind the forward.
+            scheduler_streams = [device_module.current_stream()]
+            if cc.write_fence_stream is not None:
+                scheduler_streams.append(cc.write_fence_stream)
+            scheduler_handles = {s.cuda_stream for s in scheduler_streams}
+
+            def avoid(*extra):
+                l2 = [engine.device_to_host_stream, engine.index_stream]
+                return scheduler_streams + l2 + list(extra)
+
+            if engine.device_to_host_stream.cuda_stream in scheduler_handles:
+                engine.device_to_host_stream = allocate_distinct_stream(
+                    device_module, avoid()
+                )
+                redrawn.append("device_to_host_stream")
+            if engine.index_stream.cuda_stream in scheduler_handles:
+                engine.index_stream = allocate_distinct_stream(device_module, avoid())
+                redrawn.append("index_stream")
+            stream = allocate_distinct_stream(
+                device_module, avoid(engine.host_to_device_stream)
+            )
+        else:
+            stream = device_module.Stream()
+        self._wb_overlap_stream = stream
+        logger.info(
+            "HiCache write_back eviction: device-eviction backups after a WAR "
+            "barrier use a private stream (redrawn L2 streams: %s).",
+            ", ".join(redrawn) or "none",
+        )
+        return stream
+
+    def _flush_queued_writes_fenced(self) -> None:
+        # Writes queued before eviction (insert-time backups) keep the full
+        # fence; the relaxed submit must not carry them.
+        cc = self.cache_controller
+        if cc is not None and cc.write_queue:
+            cc.start_writing()
+
     def writing_check(
-        self, write_back: bool = False, finish_count: Optional[int] = None
+        self,
+        write_back: bool = False,
+        finish_count: Optional[int] = None,
+        relaxed_fence: bool = False,
     ) -> None:
-        """Poll write-through completions."""
+        """Poll write-through completions. Only device-eviction victims pass
+        ``relaxed_fence`` (see _wb_evict_relaxed_fence)."""
         cc = self.cache_controller
         if cc is None:
             return
 
         if write_back:
             # Blocking: submit what is still queued, then wait for every ack.
-            cc.start_writing()
+            fence_event = None
+            if relaxed_fence and self._wb_evict_relaxed_fence():
+                fence_event = cc.forward_start_event
+                if not self._wb_evict_relaxed_fence_logged:
+                    self._wb_evict_relaxed_fence_logged = True
+                    logger.info(
+                        "HiCache write_back eviction: relaxed D2H fence for "
+                        "device-eviction victims "
+                        "(SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE)."
+                    )
+            cc.start_writing(fence_event=fence_event)
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()

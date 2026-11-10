@@ -673,9 +673,12 @@ class Scheduler(
         )
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        # Told about forward launches and WAR barriers (write-back eviction fences).
+        self._hicache_fence_controller = None
         if self.enable_hierarchical_cache:
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
+                self._hicache_fence_controller = cache_controller
                 cache_controller.load_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
@@ -2112,6 +2115,11 @@ class Scheduler(
         runner = self.model_worker.last_shared_read_runner
         ev = runner.shared_read_done_event
         runner.shared_read_done_event = None
+        if self._hicache_fence_controller is not None:
+            # Recorded before the wait: covers queued scheduler work, not the forward.
+            self._hicache_fence_controller.record_war_barrier(
+                self.schedule_stream.record_event()
+            )
         if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
         else:
@@ -5234,6 +5242,10 @@ class Scheduler(
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    if self._hicache_fence_controller is not None:
+                        self._hicache_fence_controller.record_forward_start(
+                            self.forward_stream.record_event()
+                        )
                     if gpu_only_lens:
                         # publish_ready was recorded on forward_stream: stream order
                         # fences the gather, no host sync / event wait needed.
