@@ -5,8 +5,8 @@ name: Nightly Benchmark (AMD)
 # is measured. The points must be the matrix row of the test's INFERENCEX_COMMIT.
 on:
   schedule:
-    # The rocm10 MI35x image lands about 12:00 UTC; 13 points take 7-9 h, so the
-    # run ends before the Beijing (UTC+8) workday.
+    # The rocm10 MI35x image lands about 12:00 UTC. 13 points of 1.5-2 h each
+    # are an estimated 7-9 h on four perf-bench nodes, longer on fewer.
     - cron: '0 14 * * *'
   workflow_dispatch:
     inputs:
@@ -50,6 +50,7 @@ jobs:
         timeout-minutes: 350
         env:
           AGENTX_POINT: ${{ matrix.point }}
+          MATRIX_CONFIG_NAME: ${{ matrix.point }}
           TIME_LIMIT: '05:00:00'
         run: |
           bash scripts/ci/slurm/launch_amd_ci_mi35x.sh \
@@ -69,6 +70,8 @@ jobs:
           path: ci_artifacts/*.json
           if-no-files-found: ignore
           retention-days: 90
+          # A re-run attempt replaces the earlier attempt's result.
+          overwrite: true
 
       - name: Cancel cluster jobs on failure/cancel
         if: failure() || cancelled()
@@ -89,11 +92,13 @@ jobs:
     if: always() && github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
     steps:
-      # A night on which no point got as far as a result still writes an empty list.
+      # A night on which no point got as far as a result still writes an empty
+      # list. The pattern stops at the point so the summary itself is not merged
+      # back in on a re-run.
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:
-          pattern: agentx-dsv41flash-*
+          pattern: agentx-dsv41flash-tp*
           path: points
           merge-multiple: true
 
@@ -113,3 +118,4 @@ jobs:
           name: agentx-dsv41flash-summary
           path: agentx-dsv41flash-summary.json
           retention-days: 90
+          overwrite: true

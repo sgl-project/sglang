@@ -46,6 +46,8 @@
 #                    leave every node partly busy
 #   TIME_LIMIT       default 01:30:00
 #   CI_SHARED_DIR    shared-storage dir for job logs, default $HOME/.amd_ci_spur
+#   MATRIX_CONFIG_NAME
+#                    the matrix leg, added to the job name (as in launch_mi355x.sh)
 #   SUBMIT_ATTEMPTS  default 3
 
 set -euo pipefail
@@ -92,8 +94,9 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The workflow's cleanup step cancels by this prefix, so keep the two in sync.
 JOB_PREFIX="amd-ci-${RUNNER_NAME:-local}-${GITHUB_RUN_ID:-0}-"
-# The attempt keeps a re-run from deleting the run dir of the attempt before it.
-JOB_NAME="${JOB_PREFIX}${GITHUB_JOB:-job}-${GITHUB_RUN_ATTEMPT:-1}"
+# The leg and the attempt keep a matrix leg that runs next on the same runner,
+# and a re-run, from deleting the run dir before it.
+JOB_NAME="${JOB_PREFIX}${GITHUB_JOB:-job}${MATRIX_CONFIG_NAME:+-$MATRIX_CONFIG_NAME}-${GITHUB_RUN_ATTEMPT:-1}"
 RUN_DIR="${CI_SHARED_DIR:-$HOME/.amd_ci_spur}/${JOB_NAME}"
 rm -rf "$RUN_DIR"
 mkdir -p "$RUN_DIR"
