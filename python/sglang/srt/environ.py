@@ -2281,8 +2281,10 @@ class Envs:
     # =0 keeps BF16 hipBLASLt.
     SGLANG_ROCM_MUSE_PREFILL_DENSE_FP8 = EnvBool(True)
     # Greedy / simulated target verify keeps the logits vocab-sharded: each rank all-gathers its per-row
-    # softcapped argmax ([rows, 2]) and only the bonus rows a simulated sample needs, not the full logits.
+    # softcapped argmax ([rows, 2]), not the full logits.
     SGLANG_ROCM_MUSE_SHARDED_GREEDY_LOGITS = EnvBool(True)
+    # DSpark sampling accept on ROCm: split the vocabulary over CTAs, with the softmax folded in.
+    SGLANG_ROCM_DSPARK_SPLIT_ACCEPT = EnvBool(True)
     # ROCm Muse Spark model (sglang.srt.rocm_muse_spark): fused QKV projection /
     # QK norm / RoPE / FP8 cache write, QK norm / RoPE / cache write, unpooler +
     # FFN-boundary fusion, compact A4 verify MoE, a4w4 prefill MoE, sequence-

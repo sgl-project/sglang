@@ -13,6 +13,7 @@ from sglang.kernels.ops.speculative.dflash import (
     compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -29,7 +30,7 @@ except ImportError:  # pragma: no cover - a tree without the split kernels
 _SPLIT_ACCEPT = (
     is_hip()
     and chain_speculative_sampling_split is not None
-    and __import__("os").environ.get("SGLANG_ROCM_DSPARK_SPLIT_ACCEPT", "1") == "1"
+    and envs.SGLANG_ROCM_DSPARK_SPLIT_ACCEPT.get()
 )
 
 _is_npu = is_npu()

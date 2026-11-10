@@ -1347,27 +1347,6 @@ class LogitsProcessor(nn.Module):
         best_rank = gathered[..., 0].argmax(dim=0, keepdim=True)
         return gathered[..., 1].gather(0, best_rank).squeeze(0).long()
 
-    def gather_deferred_rows(
-        self, logits: torch.Tensor, row_index: torch.Tensor
-    ) -> torch.Tensor:
-        """Full softcapped logits ``[len(row_index), vocab]`` of the selected rows
-        of a target-verify vocab shard; only those rows cross the TP group."""
-        group = get_parallel().tp_group
-        local = logits.index_select(0, row_index)
-        num_rows, shard_width = local.shape
-        gathered = torch.empty(
-            (group.world_size, num_rows, shard_width),
-            dtype=local.dtype,
-            device=local.device,
-        )
-        group.all_gather_into_tensor(gathered.view(-1, shard_width), local)
-        output = torch.empty(
-            (num_rows, min(self.vocab_size, group.world_size * shard_width)),
-            dtype=torch.float32,
-            device=local.device,
-        )
-        return gathered_softcap_logits(gathered, self.final_logit_softcapping, output)
-
     def _gather_softcap_fused(
         self,
         logits: torch.Tensor,
