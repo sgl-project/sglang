@@ -737,10 +737,7 @@ class Envs:
     SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(True)
     # Write the forward's small metadata (DP token counts, extend lengths, the
     # non-padded token count) with one kernel launch per array instead of pinned
-    # host-to-device copies. Where other host-to-device DMA can be queued ahead of
-    # these small copies on the copy engine, they wait behind it and stall the
-    # forward; typically KV-cache transfers that use DMA instead of a 2-block SM
-    # copy kernel, so as not to disturb persistent kernels.
+    # host-to-device copies.
     SGLANG_ENABLE_MLP_SYNC_METADATA_FILL = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
