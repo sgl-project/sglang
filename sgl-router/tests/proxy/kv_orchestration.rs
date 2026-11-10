@@ -17,7 +17,9 @@ use sgl_router::{
         app::build_router,
         app_context::{AppContext, ChatRouting},
     },
-    state::kv_events::{HashTree, KvEventIndex, RadixTreePrefixProvider},
+    state::kv_events::{
+        compute_block_hashes, HashTree, KvEventIndex, KvWorkerId, RadixTreePrefixProvider,
+    },
     tokenizer::TokenizerRegistry,
     workers::WorkerRegistry,
 };
@@ -395,7 +397,7 @@ async fn ready(router: &TestRouter, id: &str, message: &str) -> Value {
 }
 
 #[tokio::test]
-async fn lifecycle_prefetch_scoped_query_influences_both_chat_paths_without_control_load_commits() {
+async fn lifecycle_prefetch_reports_readiness_without_overriding_worker_selection() {
     for reorg in [false, true] {
         let a = Engine::start().await;
         let b = Engine::start().await;
@@ -419,6 +421,10 @@ async fn lifecycle_prefetch_scoped_query_influences_both_chat_paths_without_cont
             .all()
             .iter()
             .all(|w| w.router_inflight_load() == 0));
+        let hashes = compute_block_hashes(&tokens[..tokens.len() - 1], 1);
+        router
+            .tree
+            .insert(&KvWorkerId::new(a.url.clone(), 0), None, &hashes);
         let response = reqwest::Client::new()
             .post(format!("{}/v1/chat/completions", router.url))
             .json(&body)
@@ -426,9 +432,9 @@ async fn lifecycle_prefetch_scoped_query_influences_both_chat_paths_without_cont
             .await
             .unwrap();
         assert!(response.status().is_success());
-        assert_eq!(response.headers()["x-sgl-worker-url"], b.url);
-        assert!(a.state.lock().unwrap().inference.is_empty());
-        assert_eq!(b.state.lock().unwrap().inference.len(), 1);
+        assert_eq!(response.headers()["x-sgl-worker-url"], a.url);
+        assert_eq!(a.state.lock().unwrap().inference.len(), 1);
+        assert!(b.state.lock().unwrap().inference.is_empty());
         let commands = &b.state.lock().unwrap().commands;
         assert!(commands
             .iter()
@@ -741,7 +747,7 @@ async fn enabled_without_preparation_preserves_pending_stakes_and_follow_account
                 .status()
                 .is_success());
         }
-        let hashes = sgl_router::state::kv_events::compute_block_hashes(&ids, 1);
+        let hashes = compute_block_hashes(&ids, 1);
         let depths = router.tree.pending().depths(&hashes);
         assert_eq!(depths.len(), 1, "routing path reorg={reorg}");
         assert_eq!(depths[0].0.as_ref(), engine.url);

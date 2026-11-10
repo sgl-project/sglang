@@ -13,7 +13,6 @@ jsonschema = { version = "0.58.6", default-features = false }
 anyhow = "1"
 bytes = "1"
 futures = "0.3"
-parking_lot = "0.12"
 reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "http2"], default-features = false }
 tokio = { version = "1.42", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"

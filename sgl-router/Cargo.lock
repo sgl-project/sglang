@@ -3628,7 +3628,6 @@ dependencies = [
  "bytes",
  "futures",
  "jsonschema",
- "parking_lot",
  "reqwest",
  "serde",
  "serde_json",

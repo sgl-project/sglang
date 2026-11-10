@@ -14,14 +14,16 @@ use crate::{
     target_resolver::{FrozenTarget, Selector},
 };
 use bytes::Bytes;
-use parking_lot::RwLock;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
@@ -52,36 +54,20 @@ impl KvContext {
         }
     }
 }
-#[derive(Clone)]
-struct Ready {
-    url: String,
-    prefix: PrefixTarget,
-    end: u64,
-    until: Instant,
-}
-#[derive(Default)]
-struct Published {
-    ready: Vec<Ready>,
-}
 enum Message {
     Api(Value, oneshot::Sender<Value>),
-    Request {
+    Routed {
         context: KvContext,
-        tokens: Vec<u32>,
+        tokens: Option<Vec<u32>>,
         salt: Option<String>,
         worker: String,
     },
-    Routed {
-        context: KvContext,
-        worker: String,
-    },
 }
-/// Cloneable bounded admission handle. All I/O happens in the actor, never under
-/// the publication lock or the normal inference task. Queue pressure drops only
-/// optional association/preparation signals; inference retains its ordinary path.
+/// Bounded admission handle. Queue pressure drops optional route observations;
+/// inference retains its ordinary path.
 pub struct Runtime {
     tx: mpsc::Sender<Message>,
-    published: Arc<RwLock<Published>>,
+    dropped_routes: Arc<AtomicU64>,
     config: OrchestrationConfig,
 }
 impl Runtime {
@@ -91,13 +77,13 @@ impl Runtime {
         auth: Option<HeaderValue>,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(config.queue_capacity);
-        let published = Arc::new(RwLock::new(Published::default()));
+        let dropped_routes = Arc::new(AtomicU64::new(0));
         let runtime = Arc::new(Self {
             tx,
-            published: published.clone(),
+            dropped_routes: dropped_routes.clone(),
             config: config.clone(),
         });
-        let actor = Actor::new(config, Box::new(workers), auth, published);
+        let actor = Actor::new(config, Box::new(workers), auth, dropped_routes);
         tokio::spawn(actor.run(rx));
         runtime
     }
@@ -160,46 +146,23 @@ impl Runtime {
             Some(meta),
         ))
     }
-    pub fn associate(
+    pub fn routed(
         &self,
-        context: KvContext,
-        tokens: Vec<u32>,
-        salt: Option<String>,
-        worker: String,
-    ) -> bool {
-        if tokens.len() > 65_536 {
-            return false;
-        }
-        self.tx
-            .try_send(Message::Request {
-                context,
-                tokens,
-                salt,
-                worker,
-            })
-            .is_ok()
-    }
-    pub fn routed(&self, context: KvContext, worker: String) {
-        let _ = self.tx.try_send(Message::Routed { context, worker });
-    }
-    /// Advisory evidence only. Final selection/admission is performed by existing
-    /// policy. Host epoch/worker health is checked again by those candidate filters.
-    pub fn prepared_depths(&self, tokens: &[u32], salt: Option<&str>) -> Vec<(String, u64)> {
-        let Some(view) = self.published.try_read() else {
-            return vec![];
+        context: &KvContext,
+        worker: &str,
+        tokens: Option<&[u32]>,
+        salt: Option<&str>,
+    ) {
+        let Ok(permit) = self.tx.try_reserve() else {
+            self.dropped_routes.fetch_add(1, Ordering::Relaxed);
+            return;
         };
-        view.ready
-            .iter()
-            .filter(|p| {
-                p.until > Instant::now()
-                    && p.prefix.compatibility.cache_salt.as_deref() == salt
-                    && p.prefix
-                        .token_ids
-                        .as_ref()
-                        .is_some_and(|prefix| tokens.starts_with(&prefix[..p.end as usize]))
-            })
-            .map(|p| (p.url.clone(), p.end))
-            .collect()
+        permit.send(Message::Routed {
+            context: context.clone(),
+            worker: worker.into(),
+            tokens: tokens.filter(|t| t.len() <= 65_536).map(<[u32]>::to_vec),
+            salt: salt.map(str::to_string),
+        });
     }
 }
 fn error(code: &str, reason: impl ToString) -> Value {
@@ -343,7 +306,7 @@ struct Actor {
     config: OrchestrationConfig,
     client: EngineClient,
     workers: Box<dyn Fn() -> Vec<String> + Send>,
-    published: Arc<RwLock<Published>>,
+    dropped_routes: Arc<AtomicU64>,
     index: SessionIndex,
     book: DemandBook,
     jobs: BTreeMap<String, Job>,
@@ -359,7 +322,7 @@ impl Actor {
         config: OrchestrationConfig,
         workers: Box<dyn Fn() -> Vec<String> + Send>,
         auth: Option<HeaderValue>,
-        published: Arc<RwLock<Published>>,
+        dropped_routes: Arc<AtomicU64>,
     ) -> Self {
         Self {
             client: EngineClient::new(config.rpc_timeout_ms, config.max_engine_bytes, auth),
@@ -367,7 +330,7 @@ impl Actor {
             book: DemandBook::new(config.limits.max_intents, config.max_operations),
             config: config.clone(),
             workers,
-            published,
+            dropped_routes,
             jobs: BTreeMap::new(),
             intents: BTreeMap::new(),
             caps: BTreeMap::new(),
@@ -388,13 +351,18 @@ impl Actor {
             tokio::select! {
                 message=rx.recv()=>match message {
                     Some(Message::Api(value,reply))=> { let result=self.api(value).await;let _=reply.send(result); }
-                    Some(Message::Request {context,tokens,salt,worker})=> { if let Err(reason)=self.record(context,tokens,salt,worker).await { tracing::debug!(%reason,"KV association unavailable"); } }
-                    Some(Message::Routed {context,worker})=> { self.changed_route(&context.task(&self.config.caller_id),&worker); }
+                    Some(Message::Routed { context, tokens, salt, worker }) => {
+                        if let Some(tokens) = tokens {
+                            if let Err(reason) = self.record(context.clone(), tokens, salt, worker.clone()).await {
+                                tracing::debug!(%reason, "KV association unavailable");
+                            }
+                        }
+                        self.changed_route(&context.task(&self.config.caller_id), &worker);
+                    }
                     None=>break,
                 },
                 _=tick.tick()=>self.pump().await,
             }
-            self.publish();
         }
         // Actor shutdown never fabricates quiescence. Engine leases/deadlines
         // remain authoritative; explicit Router cleanup drains while running.
@@ -446,8 +414,6 @@ impl Actor {
                 job.claim_view = Value::Null;
             }
         }
-        // Both normal routing paths read this publication. No I/O holds its lock.
-        self.publish();
     }
     async fn poll_feedback(&mut self, url: &str, caps: &Capabilities) -> Result<(), String> {
         let limit = self.config.queue_capacity.min(256).max(1);
@@ -533,7 +499,6 @@ impl Actor {
                 provenance: AssociationProvenance::RenderedRequest,
             })
             .map_err(|e| format!("{e:?}"))?;
-        self.changed_route(&task, &worker);
         Ok(())
     }
     fn changed_route(&mut self, task: &SessionIdentity, worker: &str) {
@@ -702,6 +667,7 @@ impl Actor {
                 "engine_session_required": false,
                 "lifecycle": "explicit",
                 "pin_tier": "host",
+                "dropped_route_events": self.dropped_routes.load(Ordering::Relaxed),
                 "feedback": self.feedback.view(),
                 "index": format!("{:?}", self.index.usage())
             }));
@@ -836,16 +802,15 @@ impl Actor {
                                 .ok_or("request_incarnation required")?
                                 .into(),
                         };
+                        let worker = value["worker_url"].as_str().ok_or("worker_url required")?;
                         self.record(
                             context,
                             tokens,
                             value["cache_salt"].as_str().map(str::to_string),
-                            value["worker_url"]
-                                .as_str()
-                                .ok_or("worker_url required")?
-                                .into(),
+                            worker.into(),
                         )
                         .await?;
+                        self.changed_route(&task, worker);
                         Ok(json!({"state":"associated","residency":"unknown"}))
                     }
                     "request_finished" => {
@@ -1342,38 +1307,6 @@ impl Actor {
         job.quiescent = result["update"]["quiescent"].as_bool().unwrap_or(false);
         job.result = result.clone();
         Ok(())
-    }
-    fn publish(&self) {
-        let now = Instant::now();
-        let healthy: BTreeSet<_> = self.workers().into_iter().collect();
-        let ready = self
-            .jobs
-            .values()
-            .filter(|j| {
-                j.ready_end > 0
-                    && self.feedback.current(&j.url, &j.cache_watermark)
-                    && self
-                        .book
-                        .job(&j.id)
-                        .is_some_and(|b| !b.interests.is_empty())
-                    && healthy.contains(&j.url)
-                    && self
-                        .caps
-                        .get(&j.url)
-                        .is_some_and(|c| c.epoch == j.caps.epoch)
-            })
-            .filter_map(|j| {
-                let at = j.ready_at?;
-                let until = at + Duration::from_millis(self.config.poll_ms * 2);
-                (until > now).then(|| Ready {
-                    url: j.url.clone(),
-                    prefix: j.prefix.clone(),
-                    end: j.ready_end,
-                    until,
-                })
-            })
-            .collect();
-        *self.published.write() = Published { ready };
     }
 }
 fn task_fn(value: &Value, caller: &str) -> Result<SessionIdentity, String> {

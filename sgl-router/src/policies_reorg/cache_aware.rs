@@ -98,7 +98,6 @@ impl CacheSource {
 /// namespaces never share an answer.
 #[derive(Default)]
 pub struct PrefixMemo {
-    prepared: Vec<(String, u64)>,
     cells: Mutex<Vec<(Arc<CacheSource>, Lookup)>>,
 }
 
@@ -109,12 +108,6 @@ impl fmt::Debug for PrefixMemo {
 }
 
 impl PrefixMemo {
-    pub fn with_prepared(prepared: Vec<(String, u64)>) -> Self {
-        Self {
-            prepared,
-            ..Default::default()
-        }
-    }
     /// The local tree's answer, once a policy has looked it up.
     pub fn local_signal(&self) -> Option<Arc<PrefixLookupResult>> {
         let cells = self.cells.lock().unwrap_or_else(|e| e.into_inner());
@@ -325,15 +318,6 @@ impl Policy for CacheAwarePolicy {
                     .await?
                     .clone(),
                 None => lookup().await?,
-            };
-            let signal = match request.prefix.filter(|memo| !memo.prepared.is_empty()) {
-                Some(memo) => crate::orchestration::merge_prepared(
-                    signal.as_deref(),
-                    &memo.prepared,
-                    request.token_ids.map_or(0, |t| t.len()),
-                )
-                .map(Arc::new),
-                None => signal,
             };
             // Capture load after remote I/O; selection and admission share it.
             let load = self.engine_load.capture_snapshot(Instant::now());

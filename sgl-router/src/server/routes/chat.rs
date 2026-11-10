@@ -210,7 +210,7 @@ async fn prepare<'a>(
             let model =
                 ModelId(model.ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?);
             let (model, routing) = ModelRouting::lookup_openai(ctx, model)?;
-            let needs_tokens = routing.needs_request_tokens(ctx) || ctx.orchestration.is_some();
+            let needs_tokens = routing.needs_request_tokens(ctx);
             let path = if matches!(endpoint, Endpoint::Chat) {
                 CHAT_PATH
             } else {
@@ -339,22 +339,16 @@ impl<'a> ModelRouting<'a> {
                 .get_or_insert_with(|| RequestDurationGuard::new(ctx, &request.model, start));
             let selected_url = workers.prefill.url.clone();
             if let (Some(runtime), Some(context)) = (&ctx.orchestration, &kv_context) {
-                if let Some(tokens) = request.tokens.as_ref().filter(|_| {
+                let tokens = request.tokens.as_ref().filter(|_| {
                     !request.cache_namespace.ambiguous
                         && request.cache_namespace.lora_name.is_none()
-                        && request
-                            .tokens
-                            .as_ref()
-                            .is_some_and(|tokens| tokens.ids.len() <= 65_536)
-                }) {
-                    runtime.associate(
-                        context.clone(),
-                        tokens.ids.clone(),
-                        request.cache_namespace.cache_salt.clone(),
-                        selected_url.clone(),
-                    );
-                }
-                runtime.routed(context.clone(), selected_url.clone());
+                });
+                runtime.routed(
+                    context,
+                    &selected_url,
+                    tokens.map(|t| t.ids.as_slice()),
+                    request.cache_namespace.cache_salt.as_deref(),
+                );
             }
             let mut attempt =
                 forward_request(ctx, &mut request, workers, headers.clone(), start, duration)
@@ -664,18 +658,6 @@ async fn lookup_prefix_matches(
             .zip(tokens)
             .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids, namespace)),
     };
-    if let (Some(runtime), Some(tokens)) = (&ctx.orchestration, tokens) {
-        if !namespace.ambiguous && namespace.lora_name.is_none() {
-            let prepared = runtime.prepared_depths(&tokens.ids, namespace.cache_salt.as_deref());
-            if !prepared.is_empty() {
-                return Ok(crate::orchestration::merge_prepared(
-                    signal.as_ref(),
-                    &prepared,
-                    tokens.ids.len(),
-                ));
-            }
-        }
-    }
     Ok(signal)
 }
 
