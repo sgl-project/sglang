@@ -129,7 +129,6 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
-from sglang.srt.models.kimi_k3_amd.attention import KimiK3MLAPreOProjMixin
 from sglang.srt.models.kimi_k3_amd.moe import (
     KimiK3MoEHipMixin,
     ffn_row_shards_hip,
@@ -2611,7 +2610,7 @@ class KimiK3DeltaAttention(nn.Module):
         return self.o_proj(core_attn_out)[0]
 
 
-class KimiK3MLAAttention(KimiK3MLAPreOProjMixin, DeepseekV2AttentionMLA):
+class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     """MLA with output gate for K3. Gate is applied in TP-local space before o_proj."""
 
     # Kimi-K3.1 DSA layers (K3 has no indexer)
