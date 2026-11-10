@@ -558,22 +558,44 @@ class SchedulerMetricsReporter:
 
         hidden_size = float(model_config.hidden_size)
         num_layers = float(getattr(model_config, "num_attention_layers", 0))
-        # Per-layer attention/MLP/Mamba split for hybrid architectures (NemotronH, etc).
+        # Per-layer attention/MLP/Mamba split for hybrid architectures.
+        #
+        # `layers_block_type` is not a standardized vocabulary across hybrid
+        # configs. NemotronH uses it as an *exclusive* per-layer block type --
+        # each layer is attention-only, mlp-only, moe-only, or mamba-only, and
+        # mixer/FFN never coexist in the same layer (see its own
+        # `valid_types = {"mamba", "attention", "mlp", "moe"}`). But
+        # Qwen3-Next/Qwen3.5, GigaChat3.5, and BailingHybrid only use the same
+        # field to label the *mixer* ("attention" vs. "linear_attention") --
+        # every layer in those architectures still builds its own FFN
+        # unconditionally. Falcon-H1 uses a single uniform label for every
+        # layer (full attention + full FFN on every layer). Blindly counting
+        # "mlp"/"moe" strings against those non-NemotronH vocabularies zeroes
+        # out FFN costing (or, for Falcon-H1, zeroes out everything).
+        #
+        # Only take the literal-string exclusive-block interpretation when the
+        # vocabulary actually matches NemotronH's; otherwise fall back to
+        # `full_attention_layer_ids`, which every one of these configs
+        # computes correctly for its own semantics, and assume (correctly,
+        # for all of them) that every layer still has an FFN.
         layers_block_type = getattr(hf_text_config, "layers_block_type", None)
-        if layers_block_type:
+        full_attention_layer_ids = getattr(
+            hf_text_config, "full_attention_layer_ids", None
+        )
+        _EXCLUSIVE_HYBRID_BLOCK_TYPES = {"mamba", "attention", "mlp", "moe"}
+        if (
+            layers_block_type
+            and set(layers_block_type) <= _EXCLUSIVE_HYBRID_BLOCK_TYPES
+        ):
             num_attn_layers = float(layers_block_type.count("attention"))
             num_mlp_layers = float(
                 layers_block_type.count("mlp") + layers_block_type.count("moe")
             )
+        elif full_attention_layer_ids is not None:
+            num_attn_layers = float(len(full_attention_layer_ids))
+            num_mlp_layers = num_layers
         else:
-            full_attention_layer_ids = getattr(
-                hf_text_config, "full_attention_layer_ids", None
-            )
-            num_attn_layers = (
-                float(len(full_attention_layer_ids))
-                if full_attention_layer_ids is not None
-                else num_layers
-            )
+            num_attn_layers = num_layers
             num_mlp_layers = num_layers
         head_dim = float(getattr(model_config, "head_dim", 0))
         num_attn_heads = float(
@@ -611,46 +633,60 @@ class SchedulerMetricsReporter:
         self._attn_dot_flops_coeff = 4.0 * num_attn_heads * head_dim * num_attn_layers
 
         # KV cache bytes (write one K and one V vector per generated token).
+        # Attention-only: Mamba/SSM layers keep their own recurrent state, not
+        # a KV cache, and (like their FLOPs) are intentionally left uncosted
+        # here rather than guessed at.
         self._kv_cache_bytes_per_token = (
-            2.0 * num_layers * num_kv_heads * head_dim * cache_bytes
+            2.0 * num_attn_layers * num_kv_heads * head_dim * cache_bytes
         )
 
-        # Weight read bytes per token.
+        # Weight read bytes per token: QKV/O projection terms are
+        # attention-only; the MLP projection term is MLP-only. Mamba-layer
+        # weight bytes are intentionally left uncosted, same as their FLOPs.
         self._weight_read_bytes_per_token = (
             hidden_size
             * head_dim
             * (num_attn_heads + 2.0 * num_kv_heads)
             * w_bytes
-            * num_layers
-            + hidden_size * head_dim * num_attn_heads * w_bytes * num_layers
+            * num_attn_layers
+            + hidden_size * head_dim * num_attn_heads * w_bytes * num_attn_layers
             + (
-                3.0 * hidden_size * intermediate_size * w_bytes * num_layers
+                3.0 * hidden_size * intermediate_size * w_bytes * num_mlp_layers
                 if intermediate_size > 0
                 else 0.0
             )
         )
 
-        # Activation movement bytes per token (coarse approximation).
+        # Activation movement bytes per token (coarse approximation). The
+        # qkv/attention terms scale with the attention layer count; the FFN
+        # term scales with the MLP layer count. Mamba-layer activation bytes
+        # are intentionally left uncosted, same as their FLOPs.
         self._qkv_act_bytes_per_token = (
-            hidden_size * act_bytes * num_layers
-            + (num_attn_heads + 2.0 * num_kv_heads) * head_dim * act_bytes * num_layers
-            + head_dim * num_attn_heads * act_bytes * num_layers
-            + hidden_size * act_bytes * num_layers
+            hidden_size * act_bytes * num_attn_layers
+            + (num_attn_heads + 2.0 * num_kv_heads)
+            * head_dim
+            * act_bytes
+            * num_attn_layers
+            + head_dim * num_attn_heads * act_bytes * num_attn_layers
+            + hidden_size * act_bytes * num_attn_layers
         )
         self._ffn_act_bytes_per_token = (
-            3.0 * intermediate_size * act_bytes * num_layers
+            3.0 * intermediate_size * act_bytes * num_mlp_layers
             if intermediate_size > 0
             else 0.0
         )
 
         # Prefill reads Q/K/V activations from on-device memory.
         self._prefill_attn_act_read_per_token = (
-            (num_attn_heads + 2.0 * num_kv_heads) * head_dim * act_bytes * num_layers
+            (num_attn_heads + 2.0 * num_kv_heads)
+            * head_dim
+            * act_bytes
+            * num_attn_layers
         )
 
         # Decode reads Q from activation memory; K/V reads are from KV cache.
         self._decode_q_read_bytes_per_token = (
-            num_attn_heads * head_dim * act_bytes * num_layers
+            num_attn_heads * head_dim * act_bytes * num_attn_layers
         )
 
     def _estimate_prefill_perf(self, batch) -> Tuple[float, float, float]:
