@@ -507,42 +507,56 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(manager.state_layout_rejections, {"decode": mismatch})
         self.assertIs(manager.decode_kv_args_table["decode"], bad)
 
+    def _validate_dflash_tp_mismatch(
+        self, *, collapsed, num_draft_entries, draft_layer_ids, pp_size=1
+    ):
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            state_types=[],
+            num_draft_entries=num_draft_entries,
+            kv_layer_ids=draft_layer_ids,
+            kv_item_lens=[1024] * len(draft_layer_ids),
+        )
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.pp_size = pp_size
+        manager.state_tp_size = 2
+        manager.attn_tp_size = 1
+        registration_info = SimpleNamespace(
+            mooncake_session_id="decode",
+            dst_attn_tp_size=8,
+            dst_draft_rows_dcp_collapsed=collapsed,
+            dst_kv_layer_ids=draft_layer_ids,
+            dst_kv_item_lens=[1024] * len(draft_layer_ids),
+            dst_dcp_size=1,
+            requires_dcp_relayout=False,
+        )
+        with get_context().override_server_args(
+            enable_unified_memory=False, speculative_algorithm="DFLASH"
+        ):
+            return manager._validate_peer_state_layout(registration_info)
+
     def test_mooncake_dflash_tp_mismatch_allows_dcp_collapsed_mla_draft(self):
         for collapsed in (False, True):
             with self.subTest(collapsed=collapsed):
-                manager = object.__new__(MooncakeKVManager)
-                manager.kv_args = SimpleNamespace(
-                    state_types=[],
-                    num_draft_entries=0,
-                    kv_layer_ids=[],
-                    kv_item_lens=[],
+                # An MHA-like draft: K and V entries of one draft layer.
+                fully_checked, reason = self._validate_dflash_tp_mismatch(
+                    collapsed=collapsed, num_draft_entries=2, draft_layer_ids=[5, 5]
                 )
-                manager.is_mla_backend = True
-                manager.is_hybrid_mla_backend = False
-                manager.pp_size = 1
-                manager.state_tp_size = 2
-                manager.attn_tp_size = 1
-                registration_info = SimpleNamespace(
-                    mooncake_session_id="decode",
-                    dst_attn_tp_size=8,
-                    dst_draft_rows_dcp_collapsed=collapsed,
-                    dst_kv_layer_ids=[],
-                    dst_kv_item_lens=[],
-                    dst_dcp_size=1,
-                    requires_dcp_relayout=False,
-                )
-                with get_context().override_server_args(
-                    enable_unified_memory=False, speculative_algorithm="DFLASH"
-                ):
-                    fully_checked, reason = manager._validate_peer_state_layout(
-                        registration_info
-                    )
                 if collapsed:
                     self.assertTrue(fully_checked)
                     self.assertIsNone(reason)
                 else:
                     self.assertFalse(fully_checked)
                     self.assertIn("same physical TP size", reason)
+
+    def test_mooncake_dflash_tp_mismatch_skips_a_stage_without_draft(self):
+        # An earlier stage of a pipelined PD prefill sends no draft KV.
+        fully_checked, reason = self._validate_dflash_tp_mismatch(
+            collapsed=False, num_draft_entries=0, draft_layer_ids=[], pp_size=2
+        )
+        self.assertTrue(fully_checked)
+        self.assertIsNone(reason)
 
     def test_mooncake_rejects_a_decode_kv_page_stride_at_registration(self):
         """A decode KV pool with another page stride is rejected at registration.
