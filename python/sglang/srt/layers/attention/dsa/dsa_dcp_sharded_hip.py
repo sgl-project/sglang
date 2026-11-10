@@ -8,7 +8,6 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.dsa.dcp_topk_hip import (
-    _all_visible_slots_kernel,
     _candidates_to_slots_kernel,
     _gather_candidates_kernel,
     _pack_candidates_kernel,
@@ -117,25 +116,6 @@ def dcp_global_topk(
         out,
         span,
         NUM_CANDIDATES=num_candidates,
-        TOPK=topk,
-    )
-    return out
-
-
-def dcp_all_visible(
-    global_lens: torch.Tensor, page_table: torch.Tensor, topk: int, span: int
-) -> torch.Tensor:
-    """``dsa_dcp_sharded.dcp_all_visible`` without the v2 top-k pass."""
-    rows = global_lens.shape[0]
-    out = torch.empty((rows, topk), dtype=torch.int32, device=global_lens.device)
-    if rows == 0:
-        return out
-    _all_visible_slots_kernel[(rows,)](
-        global_lens.to(torch.int32),
-        page_table,
-        page_table.stride(0),
-        out,
-        span,
         TOPK=topk,
     )
     return out
