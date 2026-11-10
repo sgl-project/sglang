@@ -26,7 +26,6 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
     _get_indexer_query_shard,
     _IndexerQueryShard,
@@ -154,10 +153,7 @@ class TestLocalTopkWithTokenShard(CustomTestCase):
             gathered.append(True)
             return t
 
-        with (
-            envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.override(True),
-            mock.patch.object(_IndexerQueryShard, "gather", fake_gather),
-        ):
+        with mock.patch.object(_IndexerQueryShard, "gather", fake_gather):
             out = shard.resolve(topk, total, batch)
         return out, topk, batch.npu_indexer_topk_is_local, bool(gathered)
 

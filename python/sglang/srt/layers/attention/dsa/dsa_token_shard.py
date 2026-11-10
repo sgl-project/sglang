@@ -19,16 +19,14 @@ rank swaps "my heads for every token" for "every head for my tokens", and the
 swap is undone after attention, before ``w_vc``. The KV write and the indexer
 stay full width.
 
-Composes with the indexer's query sharding
-(``SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING``): the indexer derives its
-rows from this plan, so both pick the same rows.
+Composes with the indexer's query sharding: the indexer derives its rows
+from this plan, so both pick the same rows.
 """
 
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
     DsaTokenShardPlan,
     cumulative,
@@ -36,7 +34,7 @@ from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, print_info_once
 
@@ -50,11 +48,7 @@ def dsa_token_shard_enabled() -> bool:
     ``is_npu()``: ``deepseek_v2.py`` is shared by every backend, and a true
     answer builds an extra full-head ``RadixAttention`` only NPU ever uses.
     """
-    return (
-        envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.get()
-        and is_npu()
-        and get_parallel().attn_tp_size > 1
-    )
+    return is_npu() and get_parallel().attn_tp_size > 1
 
 
 # Distinguishes "no plan cached yet" from "cached, and it is None".
@@ -69,8 +63,6 @@ def get_dsa_token_shard_plan(
     Extend only: decode is already fast under graph capture. Every refusal is
     logged once, because a silent refusal looks the same as the feature running.
     """
-    if not envs.SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD.get():
-        return None
     cached = getattr(forward_batch, "npu_dsa_token_shard_plan", _MISSING)
     if cached is not _MISSING:
         return cached
