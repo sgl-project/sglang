@@ -642,8 +642,10 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         self.assertIsNone(final_state)
         self.assertIs(chunk_states, sentinel.h)
         self.assertIs(call["ssm_states"], state)
+        # A padded row (-1) must land on the padding sink, row 0; the pool's
+        # last row is a live slot whose state the in-place write would clobber.
         torch.testing.assert_close(
-            call["cache_indices"], torch.tensor([2], dtype=torch.int32)
+            call["cache_indices"], torch.tensor([0], dtype=torch.int32)
         )
         self.assertIs(call["cu_seqlens"], cu_seqlens)
         self.assertIs(call["prefill_metadata"], sentinel.metadata)
