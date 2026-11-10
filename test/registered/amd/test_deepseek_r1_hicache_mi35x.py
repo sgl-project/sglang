@@ -8,7 +8,9 @@ established threshold. The goal is to catch regressions where HiCache
 breaks DSR1-0528 generation correctness, not to stress-test the cascade
 overflow path.
 
-Acceptance: GSM8K (1319 questions, 5-shot, completion API) score >= 0.93.
+Acceptance: GSM8K (1319 questions, 5-shot, completion API) score >= 0.93,
+matching ``test_deepseek_r1_eval_mi35x.py`` /
+``test_deepseek_r1_eval_amd.py``.
 
 Registry: nightly-amd-8-gpu-mi35x-deepseek-r1-hicache suite.
 """
@@ -40,6 +42,9 @@ register_amd_ci(
 DEEPSEEK_R1_MODEL_PATH = "deepseek-ai/DeepSeek-R1-0528"
 SERVER_LAUNCH_TIMEOUT = 3600
 
+# Threshold matches the existing nightly AMD DSR1-0528 accuracy tests:
+#   test/registered/amd/accuracy/mi35x/test_deepseek_r1_eval_mi35x.py
+#   test/registered/amd/accuracy/mi30x/test_deepseek_r1_eval_amd.py
 GSM8K_ACCURACY_THRESHOLD = 0.93
 GSM8K_NUM_EXAMPLES = None
 GSM8K_NUM_THREADS = 64
