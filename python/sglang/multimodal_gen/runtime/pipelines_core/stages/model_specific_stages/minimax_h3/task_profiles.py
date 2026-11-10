@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax H3 task profiles.
 
-Data table driving request validation and plan resolution for the three v1
-tasks (t2va / fl2va / ref2va). One row per task; stages and the request
-projector consume rows instead of branching on task names.
+Data table driving request validation and plan resolution for video tasks
+(t2va / fl2va / ref2va) and image tasks (t2i / edit). One row per task; stages
+and the request projector consume rows instead of branching on task names.
 
 Design summary: keyframes bind target geometry; references remain independent.
 Ref2VA also admits keyframes for hybrid checkpoints, matching the released
@@ -27,8 +27,10 @@ MINIMAX_H3_CONDITION_ROLE_REFERENCE = "reference"
 MINIMAX_H3_TASK_T2VA = "t2va"
 MINIMAX_H3_TASK_FL2VA = "fl2va"
 MINIMAX_H3_TASK_REF2VA = "ref2va"
+MINIMAX_H3_TASK_T2I = "t2i"
+MINIMAX_H3_TASK_EDIT = "edit"
 
-# Public dispatcher contract.  SGLang only needs the stable task mapping.
+# Keep this video-only: the hybrid video pipeline enumerates these tasks.
 MINIMAX_H3_TASK_PARTITIONS = MappingProxyType(
     {
         "t2va": "fl2va",
@@ -36,6 +38,10 @@ MINIMAX_H3_TASK_PARTITIONS = MappingProxyType(
         "ref2va": "ref2va",
     }
 )
+
+# One image checkpoint serves every task it declares, in this order.
+MINIMAX_H3_IMAGE_PARTITION = "image"
+MINIMAX_H3_IMAGE_TASKS = (MINIMAX_H3_TASK_T2I, MINIMAX_H3_TASK_EDIT)
 
 
 def canonical_minimax_h3_task(task: str) -> str:
@@ -50,6 +56,8 @@ def partition_for_task(task: str) -> str:
     if not isinstance(task, str) or not task.strip():
         raise ValueError("MiniMax H3 task must be a non-empty string")
     normalized = task.strip().lower()
+    if normalized in MINIMAX_H3_IMAGE_TASKS:
+        return MINIMAX_H3_IMAGE_PARTITION
     try:
         return MINIMAX_H3_TASK_PARTITIONS[normalized]
     except KeyError as exc:
@@ -106,8 +114,8 @@ class MiniMaxH3TaskProfile(msgspec.Struct, frozen=True):
     conditions_required: bool
     condition_rules: tuple[MiniMaxH3ConditionRule, ...]
     branches: tuple[dict, ...]
-    default_flow_shift: float
-    default_audio_flow_shift: float
+    default_flow_shift: float | None
+    default_audio_flow_shift: float | None
     required_components: tuple[str, ...]
     aspect_ratio_forced_auto: bool
     geometry_source: str  # "explicit_target" | "first_keyframe" | "model_default"
@@ -124,6 +132,7 @@ class MiniMaxH3TaskProfile(msgspec.Struct, frozen=True):
     # resolves immediately; None keeps geometry deferred to the named source.
     auto_aspect_ratio: str | None = None
     auto_geometry_source: str | None = None
+    output_modality: str = "video"
 
     def rule_for(self, *, role: str, condition_type: str) -> MiniMaxH3ConditionRule:
         for rule in self.condition_rules:
@@ -145,7 +154,43 @@ _BASE_COMPONENTS = (
 )
 
 _BRANCHES = tuple(dict(branch) for branch in MINIMAX_H3_DEFAULT_BRANCHES)
+_IMAGE_COMPONENTS = tuple(name for name in _BASE_COMPONENTS if name != "audio_vae")
+# Same tuple-of-dicts shape as the video branches; the name keys the image
+# loop's text payload.
+_IMAGE_BRANCHES = ({"name": "positive"},)
 MINIMAX_H3_TASK_PROFILES: dict[str, MiniMaxH3TaskProfile] = {
+    MINIMAX_H3_TASK_T2I: MiniMaxH3TaskProfile(
+        task=MINIMAX_H3_TASK_T2I,
+        conditions_required=False,
+        condition_rules=(),
+        branches=_IMAGE_BRANCHES,
+        default_flow_shift=None,
+        default_audio_flow_shift=None,
+        required_components=_IMAGE_COMPONENTS,
+        aspect_ratio_forced_auto=False,
+        geometry_source="explicit_target",
+        output_modality="image",
+    ),
+    MINIMAX_H3_TASK_EDIT: MiniMaxH3TaskProfile(
+        task=MINIMAX_H3_TASK_EDIT,
+        conditions_required=True,
+        condition_rules=(
+            MiniMaxH3ConditionRule(
+                role=MINIMAX_H3_CONDITION_ROLE_REFERENCE,
+                condition_type="image",
+                material_chain="image.reference_preserve",
+                visual_tokenizer_encode=True,
+            ),
+        ),
+        branches=_IMAGE_BRANCHES,
+        default_flow_shift=None,
+        default_audio_flow_shift=None,
+        required_components=_IMAGE_COMPONENTS,
+        aspect_ratio_forced_auto=False,
+        geometry_source="explicit_target",
+        min_condition_count=1,
+        output_modality="image",
+    ),
     MINIMAX_H3_TASK_T2VA: MiniMaxH3TaskProfile(
         task=MINIMAX_H3_TASK_T2VA,
         conditions_required=False,
@@ -288,8 +333,13 @@ __all__ = [
     "MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES",
     "MINIMAX_H3_CONDITION_ROLE_REFERENCE",
     "MINIMAX_H3_CANONICAL_MATERIAL_CHAINS",
+    "MINIMAX_H3_TASK_EDIT",
     "MINIMAX_H3_TASK_FL2VA",
+    "MINIMAX_H3_IMAGE_PARTITION",
+    "MINIMAX_H3_IMAGE_TASKS",
+    "MINIMAX_H3_TASK_PARTITIONS",
     "MINIMAX_H3_TASK_PROFILES",
+    "MINIMAX_H3_TASK_T2I",
     "MINIMAX_H3_TASK_REF2VA",
     "MINIMAX_H3_TASK_T2VA",
     "MiniMaxH3TaskProfile",

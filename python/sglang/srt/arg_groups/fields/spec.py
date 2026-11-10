@@ -181,7 +181,7 @@ class Spec(msgspec.Struct):
     speculative_moe_a2a_backend: A[
         Optional[str],
         Arg(
-            help="Choose the backend for MoE A2A in speculative decoding. Defaults to --moe-a2a-backend, except flashinfer_megamoe defaults the draft to none (draft layers are typically unquantized, which flashinfer_megamoe's global-expert-id dispatch doesn't support). ascend_ops is supported on NPU and uses --moe-ascend-ops-config.",
+            help="Choose the backend for MoE A2A in speculative decoding. Defaults to --moe-a2a-backend, except flashinfer_megamoe defaults the draft to none (draft layers are typically unquantized, which flashinfer_megamoe's global-expert-id dispatch doesn't support). ascend_ops is supported on NPU and uses --moe-ascend-ops-config. 'flashinfer' is a deprecated alias for 'flashinfer_nvlink_one_sided'.",
             choices=[
                 "none",
                 "deepep",
@@ -189,7 +189,8 @@ class Spec(msgspec.Struct):
                 "nixl",
                 "mori",
                 "ascend_fuseep",
-                "flashinfer",
+                "flashinfer_nvlink_one_sided",
+                "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
                 "megamoe",
                 "deepep_v2",
                 "pplx",
@@ -205,11 +206,7 @@ class Spec(msgspec.Struct):
             "mxf4xmxf4 MMA type (see --enable-w4a4-mxfp4-megamoe). Pass "
             "--no-speculative-enable-w4a4-mxfp4-megamoe to keep the draft on "
             "fp8xfp4 (W4A8) while the target runs W4A4. Same as "
-            "--enable-w4a4-mxfp4-megamoe if unset. A draft that runs MXFP4 "
-            "MegaMoE with a different MMA type from the target may allocate an "
-            "additional MegaMoE symmetric buffer after the KV pool is sized; "
-            "lower --mem-fraction-static if CUDA-graph capture runs out of "
-            "memory.",
+            "--enable-w4a4-mxfp4-megamoe if unset.",
             action=argparse.BooleanOptionalAction,
         ),
     ] = None
