@@ -37,8 +37,8 @@ except ImportError:
 
 H, KV_LORA_RANK, ROPE_DIM, TOPK, DCP = 64, 512, 64, 2048, 4
 # The RoPE rounds its own way before the fp8 cast: one e4m3 step (3 mantissa
-# bits), absolute below the smallest normal.
-FP8_RTOL, FP8_ATOL = 2**-3, torch.finfo(FP8).smallest_normal
+# bits), absolute at e4m3fn's smallest normal (fnuz's is a binade lower).
+FP8_RTOL, FP8_ATOL = 2**-3, 2**-6
 
 
 def _rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
