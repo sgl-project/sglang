@@ -836,7 +836,7 @@ def apply_aiter_small_moe_sort_patch() -> bool:
         )
         zero_moe_buf = accumulate and addend is None
         unmasked_sort = plain_sort and expert_mask is None and num_local_tokens is None
-        if plain_sort and _small_sort_supported(
+        if small_sort and _small_sort_supported(
             topk_ids,
             int(block_size),
             expert_mask,
