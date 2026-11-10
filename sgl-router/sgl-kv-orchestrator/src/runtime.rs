@@ -318,6 +318,29 @@ struct Job {
     ready_at: Option<Instant>,
     polls: u64,
 }
+impl Job {
+    fn has_final_demote_receipt(&self) -> bool {
+        // A DEMOTE receipt records what happened, not current residency.
+        // A queued operation can also be physically quiescent.
+        self.action == "sglang.demote"
+            && self.submitted
+            && self.quiescent
+            && matches!(
+                self.result["update"]["status"].as_str(),
+                Some(
+                    "completed"
+                        | "partial"
+                        | "deferred"
+                        | "missing"
+                        | "unsupported"
+                        | "rejected"
+                        | "failed"
+                        | "cancelled"
+                        | "unconsumed"
+                )
+            )
+    }
+}
 struct Intent {
     fingerprint: String,
     admission_gaps: Vec<String>,
@@ -523,9 +546,11 @@ impl Actor {
             WaitFor::Jobs(jobs) => {
                 let mut ready = true;
                 for (id, target) in jobs {
-                    if self.jobs.get(id).is_some_and(|job| job.polls < *target) {
+                    let satisfied =
+                        |job: &Job| job.polls >= *target || job.has_final_demote_receipt();
+                    if !self.jobs.get(id).is_none_or(satisfied) {
                         self.request_poll(id);
-                        ready &= self.jobs.get(id).is_none_or(|job| job.polls >= *target);
+                        ready &= self.jobs.get(id).is_none_or(satisfied);
                     }
                 }
                 ready
@@ -678,7 +703,7 @@ impl Actor {
         let Some(job) = self.jobs.get_mut(id) else {
             return;
         };
-        if self.busy.contains_key(&job.url) {
+        if job.has_final_demote_receipt() || self.busy.contains_key(&job.url) {
             return;
         }
         if !(self.workers)().contains(&job.url) {
@@ -1607,6 +1632,10 @@ impl WorkerPoll {
                     self.update_result(job, json!({"results":[reply]}))?;
                 }
             }
+        }
+        if job.has_final_demote_receipt() {
+            job.last_error = None;
+            return Ok(());
         }
         let reply = self
             .client

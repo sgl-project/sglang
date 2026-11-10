@@ -883,7 +883,11 @@ async fn explicit_prepare_freezes_scope_and_progresses_without_another_event() {
     let demote=api(&router,json!({"kind":"session_event","task":task("task"),"event":"tool_wait","event_id":"wait","revision":2,
         "target":{"kind":"session"},"pressure":true,"worker_url":engine.url})).await;
     assert_eq!(demote["operations"][0]["action"], "sglang.demote");
-    query(&router, "task", "wait").await;
+    let demote = query(&router, "task", "wait").await;
+    assert_eq!(
+        demote["operations"][0]["result"]["update"]["status"],
+        "completed"
+    );
     assert!(engine.state.lock().unwrap().commands.iter().any(|c| {
         let a = &c["envelope"]["actions"][0];
         a["action_type"] == "sglang.demote"
@@ -900,6 +904,15 @@ async fn explicit_prepare_freezes_scope_and_progresses_without_another_event() {
     assert_eq!(frozen["known_scope"].as_array().unwrap().len(), 1);
     let view = ready(&router, "task", "resume").await;
     assert_eq!(view["operations"][0]["ready_scope"]["end_token"], 4);
+    assert_eq!(query(&router, "task", "wait").await, demote);
+    let message = &demote["operations"][0]["result"]["ref"]["message_id"];
+    assert!(engine
+        .state
+        .lock()
+        .unwrap()
+        .commands
+        .iter()
+        .all(|c| { c["kind"] != "query" || c["message_id"] != *message }));
     let stale = reqwest::Client::new()
         .post(format!("{}/v1/kv/session/events", router.url))
         .bearer_auth("test-control")
@@ -908,6 +921,43 @@ async fn explicit_prepare_freezes_scope_and_progresses_without_another_event() {
         .await
         .unwrap();
     assert_eq!(stale.status(), 400);
+}
+
+#[tokio::test]
+async fn physically_quiescent_demote_keeps_polling_until_terminal() {
+    let engine = Engine::start().await;
+    let router = router(&[&engine], false, true).await;
+    start(&router, "task").await;
+    engine.state.lock().unwrap().running = true;
+    api(
+        &router,
+        json!({"kind":"submit","task":task("task"),"message_id":"demote","action":"sglang.demote",
+        "target":prefix(vec![1,2,3,4]),"source":{"tier":"host"},"destination":{"tier":"storage"}}),
+    )
+    .await;
+    let running = query(&router, "task", "demote").await;
+    let message = running["operations"][0]["result"]["ref"]["message_id"]
+        .as_str()
+        .unwrap();
+    let update = |sequence, status| {
+        let mut state = engine.state.lock().unwrap();
+        let result = state.operations.get_mut(message).unwrap();
+        result["sequence"] = json!(sequence);
+        result["update"] = json!({"status":status,"quiescent":true});
+    };
+    update(2, "queued");
+    let queued = query(&router, "task", "demote").await;
+    assert_eq!(
+        queued["operations"][0]["result"]["update"]["status"],
+        "queued"
+    );
+    update(3, "missing");
+    let missing = query(&router, "task", "demote").await;
+    assert_eq!(
+        missing["operations"][0]["result"]["update"]["status"],
+        "missing"
+    );
+    assert_eq!(missing["quiescent"], true);
 }
 
 #[tokio::test]
