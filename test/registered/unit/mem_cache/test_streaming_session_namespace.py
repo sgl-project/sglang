@@ -15,7 +15,8 @@ from array import array
 
 import torch
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH, Req
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
