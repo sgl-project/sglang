@@ -3046,13 +3046,15 @@ class ServerArgs(DisaggServerArgsMixin):
                 "auto-detected from the checkpoint config or safetensors metadata when "
                 "possible. Use this flag to override auto-detection. "
                 "Online (post-load) quantization from a BF16/FP16 checkpoint "
-                "is supported for 'fp8', 'mxfp4' and 'convrot_int8' (ConvRot INT8 "
+                "is supported for 'fp8', 'mxfp4', 'mxfp6', 'a6w4' and 'convrot_int8' "
+                "(ConvRot INT8 "
                 "W8A8; runs on SGLang's JIT-compiled fused ops on CC 9.0, 10.0, "
                 "12.0 and 12.1, else on comfy_kitchen; see "
                 "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND). Other methods "
                 "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
                 "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
-                "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
+                "Note: 'mxfp4', 'mxfp6' and 'a6w4' (MXFP6 activations by MXFP4 "
+                "weights) target ROCm + MI350+ (gfx95x); "
                 "'mxfp4_npu' / 'mxfp8' target Ascend NPU (Ascend 950 series for mxfp4_npu)."
             ),
         )
@@ -3063,7 +3065,8 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.quantization_ignored_layers,
             help=(
                 "Layer name patterns to keep unquantized during online quantization "
-                "(fp8/mxfp4/convrot_int8). Each pattern is matched against the "
+                "(fp8/mxfp4/mxfp6/a6w4/convrot_int8). Each pattern is matched against "
+                "the "
                 "layer prefix. "
                 "Example: --quantization-ignored-layers img_mod txt_mod to_out"
             ),

@@ -80,7 +80,7 @@ class ComfyUICheckpointSpec:
 
 
 # Methods whose no-arg config quantizes BF16 weights after loading.
-_ONLINE_QUANTIZATIONS = frozenset({"fp8", "mxfp4", "convrot_int8"})
+_ONLINE_QUANTIZATIONS = frozenset({"fp8", "mxfp4", "mxfp6", "a6w4", "convrot_int8"})
 
 _SPEC_REGISTRY: dict[str, ComfyUICheckpointSpec] = {}
 _SPECS_DISCOVERED = False
