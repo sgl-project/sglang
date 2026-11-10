@@ -1272,6 +1272,10 @@ class Envs:
     # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
     # Disable to save the additional weight memory or allow online updates.
     SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
+    # HIP gfx950 + aiter: requantize 128x128 block-FP8 dense linears per output channel at
+    # load and run every M on the CK per-token x per-channel GEMM. Lossy (block -> channel
+    # scales) and in place, so the weight memory does not change; no online weight updates.
+    SGLANG_OPT_BLOCK_FP8_DENSE_PTPC = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)

@@ -222,6 +222,71 @@ class TestDenseBpreshuffleScaleNoCopy(CustomTestCase):
                 )
                 self.assertTrue(torch.equal(out_tuple, out_bf16))
 
+    def test_block_fp8_requant_per_channel_keeps_the_weight(self):
+        weight, weight_scale = self._make_weight()
+        qweight, row_scale = fp8_utils.requant_block_fp8_to_per_channel(
+            weight, weight_scale, _BLOCK
+        )
+        self.assertEqual(qweight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(tuple(row_scale.shape), (_N, 1))
+        ref = fp8_utils.block_quant_dequant(weight, weight_scale, _BLOCK, torch.float32)
+        got = qweight.float() * row_scale
+        # e4m3 keeps 3 mantissa bits: half an ulp is 1/16 of the row maximum at most.
+        bound = ref.abs().amax(dim=1, keepdim=True) / 16
+        self.assertTrue(((got - ref).abs() <= bound).all())
+
+    def test_dense_ptpc_runs_every_m_on_the_rowwise_gemm(self):
+        # SGLANG_OPT_BLOCK_FP8_DENSE_PTPC: the weight is its own rowwise copy, so no M
+        # may reach a block-FP8 GEMM, and a 1 x 128-scaled input is refused
+        from aiter.ops.shuffle import shuffle_weight
+
+        weight, weight_scale = self._make_weight()
+        ref_weight = fp8_utils.block_quant_dequant(
+            weight, weight_scale, _BLOCK, torch.float32
+        )
+        qweight, row_scale = fp8_utils.requant_block_fp8_to_per_channel(
+            weight, weight_scale, _BLOCK
+        )
+        weight.copy_(shuffle_weight(qweight, (16, 16)))
+        weight._ptpc_weight = weight
+        weight._ptpc_scale = row_scale
+        weight._ptpc_all_m = True
+        bound = fp8_utils.MXFP8_DENSE_PTPC_DECODE_MAX_M
+        for m in (1, bound, bound + 1, 1000):
+            with self.subTest(m=m):
+                x = self._rand_input(m)
+                self.assertEqual(
+                    fp8_utils.fp8_input_quant_format(weight, m), "fp8_per_token"
+                )
+                with (
+                    mock.patch.object(
+                        fp8_utils,
+                        "apply_fp8_ptpc_linear",
+                        wraps=fp8_utils.apply_fp8_ptpc_linear,
+                    ) as spy_ptpc,
+                    mock.patch.object(
+                        fp8_utils,
+                        "gemm_a8w8_blockscale_bpreshuffle",
+                        wraps=fp8_utils.gemm_a8w8_blockscale_bpreshuffle,
+                    ) as spy_block,
+                ):
+                    out = fp8_utils.aiter_w8a8_block_fp8_linear(
+                        x, weight, _BLOCK, weight_scale
+                    )
+                spy_ptpc.assert_called_once()
+                spy_block.assert_not_called()
+                ref = x.float() @ ref_weight.t()
+                rel = (out.float() - ref).norm() / ref.norm()
+                self.assertLess(rel.item(), 0.1)
+
+        q, scale = fp8_utils.aiter_per1x128_quant(
+            self._rand_input(8), quant_dtype=fp8_utils.aiter.dtypes.fp8
+        )
+        with self.assertRaises(RuntimeError):
+            fp8_utils.aiter_w8a8_block_fp8_linear(
+                q, weight, _BLOCK, weight_scale, input_scale=scale
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

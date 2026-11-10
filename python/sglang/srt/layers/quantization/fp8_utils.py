@@ -1922,14 +1922,33 @@ def _unpack_ue8m0_scale_for_triton(
     return sf_fp32
 
 
+def requant_block_fp8_to_per_channel(
+    weight: torch.Tensor, weight_scale: torch.Tensor, block_size: List[int]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Requantize a block-FP8 weight (N, K) with one fp32 scale per output channel.
+    Returns the e4m3fn weight and the (N, 1) fp32 scale."""
+    weight_fp32 = block_quant_dequant(weight, weight_scale, block_size, torch.float32)
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    row_scale = weight_fp32.abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / fp8_max
+    qweight = (weight_fp32 / row_scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    return qweight, row_scale
+
+
+def ptpc_runs_all_m(weight: torch.Tensor) -> bool:
+    """Whether ``weight`` is itself the rowwise copy (SGLANG_OPT_BLOCK_FP8_DENSE_PTPC),
+    so every M runs the rowwise GEMM and no block-FP8 GEMM can read it."""
+    return getattr(weight, "_ptpc_all_m", False)
+
+
 def fp8_input_quant_format(weight: torch.Tensor, num_tokens: int) -> str:
-    """What a fused producer may quantize the input of an MXFP8-converted linear (one
-    with the rowwise copy) to: "fp8_per_token" as ``aiter.per_token_quant_hip`` for the
-    rowwise GEMM, "fp8" as ``aiter_per1x128_quant`` for the bpreshuffle block GEMM, or
-    "" when aiter_w8a8_block_fp8_linear must quantize it itself."""
+    """What a fused producer may quantize the input of a linear with a rowwise copy
+    (MXFP8-converted, or SGLANG_OPT_BLOCK_FP8_DENSE_PTPC) to: "fp8_per_token" as
+    ``aiter.per_token_quant_hip`` for the rowwise GEMM, "fp8" as ``aiter_per1x128_quant``
+    for the bpreshuffle block GEMM, or "" when aiter_w8a8_block_fp8_linear must quantize
+    it itself."""
     if getattr(weight, "_ptpc_weight", None) is None:
         return ""
-    if num_tokens <= MXFP8_DENSE_PTPC_DECODE_MAX_M:
+    if num_tokens <= MXFP8_DENSE_PTPC_DECODE_MAX_M or ptpc_runs_all_m(weight):
         return "fp8_per_token"
     return "fp8" if _use_aiter_bpreshuffle_gfx95 else ""
 
@@ -1952,12 +1971,13 @@ def aiter_w8a8_block_fp8_linear(
         return input.new_empty(output_shape, dtype=output_dtype)
 
     # dense linears converted from MXFP8 carry a rowwise-fp8 copy; its ptpc GEMM
-    # beats the block-fp8 GEMMs at decode-sized M
+    # beats the block-fp8 GEMMs at decode-sized M. With SGLANG_OPT_BLOCK_FP8_DENSE_PTPC
+    # the weight is the rowwise copy, so every M takes the ptpc GEMM.
     ptpc_weight = getattr(weight, "_ptpc_weight", None)
     if input_scale is None:
-        if (
-            ptpc_weight is not None
-            and input_2d.shape[0] <= MXFP8_DENSE_PTPC_DECODE_MAX_M
+        if ptpc_weight is not None and (
+            input_2d.shape[0] <= MXFP8_DENSE_PTPC_DECODE_MAX_M
+            or ptpc_runs_all_m(weight)
         ):
             out = apply_fp8_ptpc_linear(
                 input=input_2d,
@@ -1975,6 +1995,11 @@ def aiter_w8a8_block_fp8_linear(
             bias=bias,
         )
         return out.view(*output_shape)
+    elif ptpc_runs_all_m(weight):
+        raise RuntimeError(
+            "a rowwise-only FP8 weight (SGLANG_OPT_BLOCK_FP8_DENSE_PTPC) got an input "
+            f"with scale shape {tuple(input_scale.shape)}; it takes per-token scales only"
+        )
 
     # DeepSeek-V4 e8m0 mxscale route (SGLANG_DSV4_DENSE_MXSCALE): same
     # (16, 16)-preshuffled weight, e8m0 copy of its scale. A producer that

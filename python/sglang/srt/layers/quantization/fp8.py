@@ -73,6 +73,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     pack_mxfp8_weight_scale_for_deepgemm,
     prepare_xpu_block_scale_for_scaled_mm,
+    requant_block_fp8_to_per_channel,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_block_fp8_mxfp8_backend,
     resolve_mxfp8_dense_gemm_backend,
@@ -957,7 +958,9 @@ class Fp8LinearMethod(LinearMethodBase):
             and not getattr(layer, "keep_plain_weight_layout", False)
         ):
             n, k = layer.weight.shape
-            if not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k):
+            if self._use_dense_ptpc(layer):
+                self._prepare_dense_ptpc(layer)
+            elif not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k):
                 # TODO(1am9trash), to deal with case that this branch chance
                 # drops as use_aiter_triton_gemm_w8a8_tuned_gfx950() expands
                 t = shuffle_weight(layer.weight, (16, 16))
@@ -980,6 +983,38 @@ class Fp8LinearMethod(LinearMethodBase):
             if scale_reordered is not layer.weight_scale_inv.data:
                 with torch.no_grad():
                     layer.weight_scale_inv.set_(scale_reordered)
+
+    def _use_dense_ptpc(self, layer: Module) -> bool:
+        """SGLANG_OPT_BLOCK_FP8_DENSE_PTPC applies to a plain 128x128 block-FP8 layer:
+        not one converted from MXFP8 (it has its own rowwise copy) or served as MXFP8."""
+        return (
+            envs.SGLANG_OPT_BLOCK_FP8_DENSE_PTPC.get()
+            and self.weight_block_size == [128, 128]
+            and not self.block_fp8_as_mxfp8
+            and layer.weight.dtype == torch.float8_e4m3fn
+            and getattr(layer.weight, "_ptpc_weight", None) is None
+        )
+
+    def _prepare_dense_ptpc(self, layer: Module) -> None:
+        """Requantize the block-FP8 weight per output channel and preshuffle it in
+        place: aiter_w8a8_block_fp8_linear then runs every M on the rowwise GEMM."""
+        qweight, row_scale = requant_block_fp8_to_per_channel(
+            layer.weight.data, layer.weight_scale_inv.data, self.weight_block_size
+        )
+        t = shuffle_weight(qweight, (16, 16))
+        del qweight
+        layer.weight.copy_(t)
+        del t
+        layer.aiter_bpreshuffled = True
+        layer.weight.is_shuffled = True
+        layer.weight._ptpc_weight = layer.weight
+        layer.weight._ptpc_scale = row_scale
+        layer.weight._ptpc_all_m = True
+        layer._derived_weight_cache_error = (
+            "Online weight updates are not supported with "
+            "SGLANG_OPT_BLOCK_FP8_DENSE_PTPC: the block-FP8 weights were requantized "
+            "per channel at load. Restart without it to allow online updates."
+        )
 
     def _maybe_prepare_dense_mxscale(self, layer: Module) -> None:
         """SGLANG_DSV4_DENSE_MXSCALE: give a (16, 16)-preshuffled 128x128 block-fp8
