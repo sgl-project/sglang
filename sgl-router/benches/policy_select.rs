@@ -12,7 +12,9 @@ use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::power_of_two::PowerOfTwoChoicesPolicy;
 use sgl_router::policies::random::RandomPolicy;
 use sgl_router::policies::round_robin::RoundRobinPolicy;
+use sgl_router::policies::scoring::{prefix_cache::PrefixCachePolicy, ScoringPolicy};
 use sgl_router::policies::{Policy, SelectionContext};
+use sgl_router::state::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId};
 use sgl_router::workers::{Worker, WorkerRegistry};
 use std::sync::Arc;
 
@@ -68,5 +70,42 @@ fn bench_power_of_two(c: &mut Criterion) {
     bench_policy(c, "power_of_two", Arc::new(PowerOfTwoChoicesPolicy::new()));
 }
 
-criterion_group!(benches, bench_round_robin, bench_random, bench_power_of_two);
+fn bench_prefix_cache(c: &mut Criterion) {
+    const BLOCK_SIZE: usize = 16;
+    const BLOCKS: usize = 16;
+
+    let mut group = c.benchmark_group("policy_select::prefix_cache");
+    for &n in &[16usize, 64, 256, 1024] {
+        let workers = workers(n, "tiny");
+        let tokens: Vec<u32> = (0..(BLOCK_SIZE * BLOCKS) as u32).collect();
+        let hashes = compute_block_hashes(&tokens, BLOCK_SIZE);
+        let tree = Arc::new(HashTree::new());
+        for (rank, worker) in workers.iter().enumerate() {
+            tree.insert(
+                &KvWorkerId::new(worker.url.clone(), rank as u32),
+                None,
+                &hashes,
+            );
+        }
+        let oracle = BlockSizeOracle::new();
+        oracle.try_set(BLOCK_SIZE as u32).unwrap();
+        let policy = PrefixCachePolicy::new(tree, oracle, 1.0);
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&tokens));
+
+        group.throughput(Throughput::Elements(1));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| black_box(policy.scores(black_box(&workers), black_box(&ctx))));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_round_robin,
+    bench_random,
+    bench_power_of_two,
+    bench_prefix_cache
+);
 criterion_main!(benches);
