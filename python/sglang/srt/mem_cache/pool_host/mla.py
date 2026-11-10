@@ -37,7 +37,6 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
-    hicache_backup_copy_kwargs,
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
@@ -1138,7 +1137,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         item_size=self.token_stride_size,
                         dst_layout_dim=self.layout_dim,
                         num_layers=self.layer_num,
-                        **hicache_backup_copy_kwargs(),
                     )
             elif self.layout == "page_unified":
                 jit_transfer_hicache_all_layer_mla_staged_lf_page_unified(

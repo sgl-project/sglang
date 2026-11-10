@@ -33,16 +33,6 @@ _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
 _HOST_LOCKED_RANGE_ATTR = "_sglang_host_locked_range"
 
 
-def hicache_backup_copy_kwargs() -> dict:
-    """Extra kwargs for the all-layer device->host backup copy (``block_quota``).
-
-    Empty unless SGLANG_HICACHE_BACKUP_BLOCK_QUOTA is set, so the kernel's own default
-    (and any backend whose op has no such argument) is left untouched.
-    """
-    quota = envs.SGLANG_HICACHE_BACKUP_BLOCK_QUOTA.get()
-    return {} if quota is None else {"block_quota": quota}
-
-
 class HostTensorAllocator:
     def __init__(self):
         """Initialize the HostTensorAllocator."""

@@ -881,10 +881,6 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
-    # Workgroups launched by the all-layer device->host KV copy that backs up a write_back
-    # eviction (MLA KV and the DSA indexer). Unset keeps the kernel default (2); a larger
-    # value raises the copy bandwidth on GPUs where 2 workgroups cannot saturate the link.
-    SGLANG_HICACHE_BACKUP_BLOCK_QUOTA = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)

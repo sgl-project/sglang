@@ -25,7 +25,6 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
     get_allocator_from_storage,
-    hicache_backup_copy_kwargs,
     make_kernel_ptr_table,
 )
 from sglang.srt.platforms import current_platform
@@ -491,7 +490,6 @@ class DSAIndexerPoolHost(HostKVCache):
                         item_size=self.indexer_page_stride_size,
                         dst_layout_dim=self.indexer_layout_dim,
                         num_layers=self.layer_num,
-                        **hicache_backup_copy_kwargs(),
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
