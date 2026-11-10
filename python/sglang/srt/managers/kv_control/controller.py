@@ -586,13 +586,14 @@ class KVControl:
             self._executor_error(pending, error)
         return self.registry.get(ref)
 
-    def progress(self, *, limit: int = 64) -> tuple[OperationResult, ...]:
+    def progress(
+        self, *, limit: int = 64, background: bool = False
+    ) -> tuple[OperationResult, ...]:
         if type(limit) is not int or not 1 <= limit <= 4096:
             raise ControlError("invalid_payload", "Progress batch exceeds limit")
-        if (
-            self._pending
-            and (begin_poll := getattr(self.executor, "begin_poll", None)) is not None
-        ):
+        if (self._pending or background) and (
+            begin_poll := getattr(self.executor, "begin_poll", None)
+        ) is not None:
             try:
                 begin_poll(limit=limit)
             except Exception as error:

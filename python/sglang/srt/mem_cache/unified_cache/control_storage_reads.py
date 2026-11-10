@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 import msgspec
 
 from sglang.srt.managers.kv_control.contracts import (
+    CacheCompatibility,
     ControlError,
     CopyTo,
     ExecutionUpdate,
@@ -179,7 +180,20 @@ class StorageCacheReads:
         ):
             return False
         tokens = tuple(prefix or ()) + tuple(suffix.token_ids)
-        job = self._joinable.get(self._demand_key(tokens, extra_key, cache_salt))
+        key = self._demand_key(tokens, extra_key, cache_salt)
+        job = self._joinable.get(key)
+        if (
+            job is None
+            and len(self.demands) + 1 < self.executor.config.max_prepared_prefixes
+        ):
+            # Borrowing adds the existing reader as well as this new demand.
+            job = self._borrow_ordinary(
+                tokens,
+                CacheCompatibility(extra_key=extra_key, cache_salt=cache_salt),
+                exact=True,
+            )
+            if job is not None:
+                self._joinable[key] = job
         if job is None or job.cancel_requested or job.failure or job.retired:
             return False
         if job.operation is None and not self._has_live_interest(job):
@@ -281,15 +295,17 @@ class StorageCacheReads:
             length = end
         return length
 
-    def _borrow_ordinary(self, tokens, compatibility):
+    def _borrow_ordinary(self, tokens, compatibility, *, exact=False):
         end = len(tokens)
         for request, info in self.cache.ongoing_prefetch.items():
             op, suffix = info.operation, info.prefetch_key
             prefix = getattr(op, "control_prefix", None)
             start = op.storage_start
+            suffix_end = start + len(suffix)
             if (
                 prefix is None
-                or not start < end <= start + len(suffix)
+                or not start < end <= suffix_end
+                or (exact and end != suffix_end)
                 or suffix.cache_salt != compatibility.cache_salt
                 or suffix.extra_key != compatibility.extra_key
                 or op.is_terminated()

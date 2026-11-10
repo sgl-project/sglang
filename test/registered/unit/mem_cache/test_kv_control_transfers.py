@@ -2106,6 +2106,81 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 cache.release_aborted_request(demand)
             assert_retired(cache, service)
 
+    def test_ordinary_read_survives_original_request_abort_with_a_shared_demand(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        for abort_both in (False, True):
+            with (
+                self.subTest(abort_both=abort_both),
+                hicache(self, namespace_keys=True) as owner,
+            ):
+                cache, service, _ = cold_prefix(owner)
+                cc = cache.cache_controller
+                reads = service.control.executor.storage_reads
+                entered, release = threading.Event(), threading.Event()
+                calls = []
+                get = cc.page_get_func
+
+                def blocked_get(*args, **kwargs):
+                    calls.append("get")
+                    entered.set()
+                    assert release.wait(5)
+                    return get(*args, **kwargs)
+
+                first = CacheRequestHandle("ordinary-first", 0)
+                second = CacheRequestHandle("ordinary-second", 0)
+
+                def start(request):
+                    cache.prefetch_from_storage(
+                        request,
+                        cache.tree_core.root_node.id,
+                        cache_fixtures.array("q", [1, 2, 3, 4]),
+                        matched_prefix_tokens=[],
+                        cache_salt=service.cache_salt(None),
+                    )
+
+                try:
+                    with (
+                        patch.object(cc, "page_get_func", blocked_get),
+                        patch.object(cache, "prefetch_threshold", 1),
+                        patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                    ):
+                        start(first)
+
+                        def started():
+                            cache.drain_storage_control_queues()
+                            return entered.is_set()
+
+                        wait_for(service, started)
+                        operation = cache.ongoing_prefetch[first].operation
+                        start(second)
+                        self.assertNotIn(second, cache.ongoing_prefetch)
+                        self.assertIs(reads.demands[second].job.operation, operation)
+                        cache.release_aborted_request(first)
+                        service.progress()
+                        self.assertFalse(operation.is_terminated())
+
+                        if abort_both:
+                            cache.release_aborted_request(second)
+                            service.progress()
+                            self.assertTrue(operation.is_terminated())
+                            release.set()
+                            wait_for(service, lambda: not reads.jobs)
+                        else:
+                            release.set()
+                            self.assertEqual(
+                                self._consume_ordinary_prefetch(cache, service, second),
+                                (4, 0),
+                            )
+                        self.assertEqual(calls, ["get"])
+                        self.assertEqual(reads.stats["demand_coalesced"], 1)
+                finally:
+                    release.set()
+                    cache.release_aborted_request(first)
+                    cache.release_aborted_request(second)
+                assert_retired(cache, service)
+                cache.sanity_check()
+
     def test_late_hint_shares_covering_ordinary_io_and_its_own_receipt(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 

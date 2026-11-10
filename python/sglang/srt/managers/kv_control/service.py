@@ -375,7 +375,7 @@ class KVControlService:
     def has_pending(self):
         reads = self.control.executor.storage_reads
         return self.control.registry.capacity()["active"] != 0 or (
-            reads is not None and bool(reads.demands)
+            reads is not None and bool(reads.jobs or reads.demands)
         )
 
     @property
@@ -454,7 +454,7 @@ class KVControlService:
             self._feedback_backend = backend
 
         if self.has_pending:
-            self.control.progress()
+            self.control.progress(background=True)
         self.progress_protection()
         self.feedback.flush()
 
