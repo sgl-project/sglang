@@ -440,6 +440,17 @@ class PhysisH3Pipeline(ComposedPipelineBase):
             model_path, server_args, required_config_modules=required, **kwargs
         )
 
+    def load_modules(self, server_args, loaded_modules=None):
+        modules = None
+        error = None
+        try:
+            modules = super().load_modules(server_args, loaded_modules)
+            torch.cuda.synchronize()
+        except Exception as exc:
+            error = str(exc)
+        _raise_if_any_rank_failed(error)
+        return modules
+
     def _load_config(self):
         config = super()._load_config()
         # Diffusers ModularPipeline adds a third, descriptive item per component.

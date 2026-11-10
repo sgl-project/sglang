@@ -36,9 +36,13 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3Rope
 from sglang.multimodal_gen.runtime.pipelines.physis_h3_pipeline import (
     PhysisH3DecodingStage,
     PhysisH3DenoisingStage,
+    PhysisH3Pipeline,
     _distribute_tensor,
     _run_wavefront,
     _synchronized_component_scope,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
+    ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
@@ -135,6 +139,22 @@ def rank_main(rank, port, folder):
             assert message in str(exc), str(exc)
         else:
             raise AssertionError("Failure was not propagated to every rank")
+
+    pipeline = object.__new__(PhysisH3Pipeline)
+
+    def load_components(*args, **kwargs):
+        if rank == 0:
+            raise ValueError("injected VAE loading failure")
+        return {"rank": rank}
+
+    with patch.object(
+        ComposedPipelineBase, "load_modules", side_effect=load_components
+    ):
+        failed(lambda: pipeline.load_modules(None), "injected VAE loading failure")
+    with patch.object(
+        ComposedPipelineBase, "load_modules", return_value={"rank": rank}
+    ):
+        assert pipeline.load_modules(None) == {"rank": rank}
 
     def healthy_wave():
         result = _run_wavefront(Runner(rank) if rank < 3 else None, plan, rank, 8, 5)
