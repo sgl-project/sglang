@@ -78,59 +78,32 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## Agentic long-context deployment
 
-### NIM 2.1.6 performance recipes
+Use the B200 TP8 NVFP4 recipe below on one Linux/NVIDIA CUDA node. It matches the
+**Balanced** configuration in the Deploy panel and uses eight GPUs. Follow the
+[installation steps above](#install).
 
-[Inkling-Small campaign](https://gitlab-master.nvidia.com/nim/nim-ops/-/blob/01202ac33d5fc342ce2f5d53835ed9b29b85c563/perf_campaigns/2.1.6/inkling-small/README.md), SGLang 0.5.22.
+<Accordion title="B200 TP8 NVFP4">
 
-**Not promoted**: retain the B200 TP8 NVFP4 incumbent. The published matched-c32 comparison is 236.4 → 242.4 output tok/s/GPU (+2.54%, below the 5% threshold), with mean ITL 15.95 → 15.76 ms. The candidate c36 point (256.1 tok/s/GPU, 16.93 ms) remains in the evidence; it does not replace the campaign’s recorded promotion decision. Stock SGLang 0.5.22 fails during FlashInfer autotune warm-up with missing `g1_scale_c`; no stock-relative gain is claimed.
-
-<Note>
-These are recorded NIM release-candidate results. Public-checkpoint commands adapt the delivered NIM settings;
-NGC and public weights may differ. Run on one Linux/CUDA node with the stated GPUs and pipeline parallelism 1.
-Install SGLang 0.5.22 and supply `HF_TOKEN` where required. Commands omit calibrated synthetic acceptance
-and benchmark-only context caps. Reproduce measurements with the exact runtime, checkpoint and workload in
-the source CSV (NVIDIA access required). Fresh public-runtime GPU performance and accuracy qualification
-have not been run; these results do not change the Deploy panel’s verification status.
-</Note>
-
-<Accordion title="NIM 2.1.6 Inkling-Small measured curves and source identities">
-
-Every source CSV row is retained in selected columns, including infeasible points. SHA256 identifies the complete source CSV. Throughput is output tokens/s per allocated GPU; latency columns are milliseconds.
-
-#### inkling-small
-
-[Campaign decisions and qualification](https://gitlab-master.nvidia.com/nim/nim-ops/-/blob/01202ac33d5fc342ce2f5d53835ed9b29b85c563/perf_campaigns/2.1.6/inkling-small/README.md).
-
-[inkling-small-b200-tp8-nvfp4-sglang0-5-22-trace-agentic-64k-400-90kv-structured-4perc.csv](https://gitlab-master.nvidia.com/nim/nim-ops/-/blob/01202ac33d5fc342ce2f5d53835ed9b29b85c563/perf_campaigns/2.1.6/inkling-small/inkling-small-b200-tp8-nvfp4-sglang0-5-22-trace-agentic-64k-400-90kv-structured-4perc.csv)
-
-SHA256: `43fd731b9275ef36765ce52bad61d8b6270d9efee4cc94d9a0f6366eae68e723`
-
-```csv Measurements
-model,model_revision,engine_version,server_image,client_image,sku,precision,tp,gpu_count,arm,config_id,concurrency,replicate,trial_id,source_url,status,tok_s_per_gpu,itl_ms,ttft_ms,request_count,failed_request_count
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,d24498b580581e35acbb918af070ede7a3f8cc59740c3594c65f248ea55693cc,4,1,01M67C67DKTHBW5DDDY7N4YYB7,https://platform.athena.nvidia.com/trials/01M67C67DKTHBW5DDDY7N4YYB7,completed,110.20345479921167,4.364561032170192,233.57623618577495,942,0
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,d24498b580581e35acbb918af070ede7a3f8cc59740c3594c65f248ea55693cc,8,1,01M67C673MVJSF4BWNCHXGFFV2,https://platform.athena.nvidia.com/trials/01M67C673MVJSF4BWNCHXGFFV2,completed,166.80758715460397,5.767552396497627,267.4092692529224,941,1
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,d24498b580581e35acbb918af070ede7a3f8cc59740c3594c65f248ea55693cc,16,1,01M67C67BTDNVER4T5YG078G7W,https://platform.athena.nvidia.com/trials/01M67C67BTDNVER4T5YG078G7W,completed,214.77068403141965,8.880899636239644,331.9730271787234,940,2
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,d24498b580581e35acbb918af070ede7a3f8cc59740c3594c65f248ea55693cc,32,1,01M67C676KSY7EWBV7GVKCS12V,https://platform.athena.nvidia.com/trials/01M67C676KSY7EWBV7GVKCS12V,completed,236.41804261512831,15.94779495657652,627.2721562316684,941,1
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,d24498b580581e35acbb918af070ede7a3f8cc59740c3594c65f248ea55693cc,36,1,01M67E6PB9X1X01XYKQWZ6RC97,https://platform.athena.nvidia.com/trials/01M67E6PB9X1X01XYKQWZ6RC97,completed,214.80194144023093,20.44912568205905,664.6633822186835,942,0
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,d24498b580581e35acbb918af070ede7a3f8cc59740c3594c65f248ea55693cc,64,1,01M67E9EVP4HNZR7Z01A6DP6TA,https://platform.athena.nvidia.com/trials/01M67E9EVP4HNZR7Z01A6DP6TA,completed,249.24502281971422,29.960877379461394,1436.5580687526538,942,0
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,d24498b580581e35acbb918af070ede7a3f8cc59740c3594c65f248ea55693cc,128,1,01M67EP04KEB021Q6MXQBS38JQ,https://platform.athena.nvidia.com/trials/01M67EP04KEB021Q6MXQBS38JQ,completed,243.35144243301562,63.660580603942506,3596.455014583864,942,0
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,d24498b580581e35acbb918af070ede7a3f8cc59740c3594c65f248ea55693cc,256,1,01M67FEV5GQ103ZTZMDJPSWWKG,https://platform.athena.nvidia.com/trials/01M67FEV5GQ103ZTZMDJPSWWKG,completed,337.3555888341714,76.85583451706755,12950.593922348244,939,3
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,candidate,c698b3719196a867ea05cc38ba4b1bc25efe5abfd8e8d6ae3721fcc9f22b3fc2,4,1,01M67GJWW9DFHZHDCMND010DK4,https://platform.athena.nvidia.com/trials/01M67GJWW9DFHZHDCMND010DK4,completed,112.63214501812548,4.224376428135024,283.0360615861702,940,2
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,candidate,c698b3719196a867ea05cc38ba4b1bc25efe5abfd8e8d6ae3721fcc9f22b3fc2,8,1,01M67GV5MPFJCWWVKZ4KFKZX63,https://platform.athena.nvidia.com/trials/01M67GV5MPFJCWWVKZ4KFKZX63,completed,178.6147000296316,5.396481891495354,246.18832465711253,942,0
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,candidate,c698b3719196a867ea05cc38ba4b1bc25efe5abfd8e8d6ae3721fcc9f22b3fc2,16,1,01M67H4EEPG17Z98SCJW8WFD7K,https://platform.athena.nvidia.com/trials/01M67H4EEPG17Z98SCJW8WFD7K,completed,223.9102509716328,8.771464635246822,287.1513555802338,941,1
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,candidate,c698b3719196a867ea05cc38ba4b1bc25efe5abfd8e8d6ae3721fcc9f22b3fc2,32,1,01M67HWJRB2VQH3SEWXEVCQBHY,https://platform.athena.nvidia.com/trials/01M67HWJRB2VQH3SEWXEVCQBHY,completed,242.43109792967977,15.764401260231336,519.537387492569,942,0
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,candidate,c698b3719196a867ea05cc38ba4b1bc25efe5abfd8e8d6ae3721fcc9f22b3fc2,36,1,01M67KWN0TJDNZE7D2XZKVX12N,https://platform.athena.nvidia.com/trials/01M67KWN0TJDNZE7D2XZKVX12N,completed,256.0706954828514,16.93455004542649,651.0868301127658,940,2
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,candidate,c698b3719196a867ea05cc38ba4b1bc25efe5abfd8e8d6ae3721fcc9f22b3fc2,64,1,01M67PS4Z65G9YBRF80865REJ2,https://platform.athena.nvidia.com/trials/01M67PS4Z65G9YBRF80865REJ2,completed,255.150571177627,29.51217149706179,1110.9170716531914,940,2
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,candidate,c698b3719196a867ea05cc38ba4b1bc25efe5abfd8e8d6ae3721fcc9f22b3fc2,128,1,01M67QTAB0AG6EP8Q623Z8T4YT,https://platform.athena.nvidia.com/trials/01M67QTAB0AG6EP8Q623Z8T4YT,completed,248.9851668364183,62.439133453166775,2499.789624656051,942,0
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,candidate,c698b3719196a867ea05cc38ba4b1bc25efe5abfd8e8d6ae3721fcc9f22b3fc2,256,1,01M67VE9BC690RCR96ADFXP3BG,https://platform.athena.nvidia.com/trials/01M67VE9BC690RCR96ADFXP3BG,completed,345.91760284434105,74.06300092932521,11570.621083578555,942,0
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,e01e35c96c19bae4b354cca938fd1bb0e40493a063599638daf7a7b825de3493,4,1,01M67YJSN4A0E6MZ4Z8SJKSF9A,https://platform.athena.nvidia.com/trials/01M67YJSN4A0E6MZ4Z8SJKSF9A,completed,115.97543296377277,4.152292310790142,220.64360610721866,942,0
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,e01e35c96c19bae4b354cca938fd1bb0e40493a063599638daf7a7b825de3493,8,1,01M67ZKTE90S6HN1SR5XBJNXAC,https://platform.athena.nvidia.com/trials/01M67ZKTE90S6HN1SR5XBJNXAC,completed,175.43517176462828,5.500738756588797,243.23075424017003,941,1
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,e01e35c96c19bae4b354cca938fd1bb0e40493a063599638daf7a7b825de3493,16,1,01M680094M0GPAMCAH4VN813PY,https://platform.athena.nvidia.com/trials/01M680094M0GPAMCAH4VN813PY,completed,221.56901921042663,8.776776605741508,328.64681075876723,941,1
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,e01e35c96c19bae4b354cca938fd1bb0e40493a063599638daf7a7b825de3493,32,1,01M681AXTFKDWYWMH7VBN2JSE6,https://platform.athena.nvidia.com/trials/01M681AXTFKDWYWMH7VBN2JSE6,completed,242.42903145419658,15.61913732184712,587.903391024416,942,0
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,e01e35c96c19bae4b354cca938fd1bb0e40493a063599638daf7a7b825de3493,36,1,01M682XVTKA3M6205HEN6BVWQJ,https://platform.athena.nvidia.com/trials/01M682XVTKA3M6205HEN6BVWQJ,completed,218.46009597656158,20.03386901196104,652.1914364341826,942,0
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,e01e35c96c19bae4b354cca938fd1bb0e40493a063599638daf7a7b825de3493,64,1,01M683EA9F46BWPBKNBC4V41Y6,https://platform.athena.nvidia.com/trials/01M683EA9F46BWPBKNBC4V41Y6,completed,253.54616244228058,29.531103034345378,1091.9622776546228,941,1
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,e01e35c96c19bae4b354cca938fd1bb0e40493a063599638daf7a7b825de3493,128,1,01M683ZM2W0TG3GQ9SW7T1TCPG,https://platform.athena.nvidia.com/trials/01M683ZM2W0TG3GQ9SW7T1TCPG,completed,246.7830205220587,62.58120297680216,2526.890438417641,941,1
-thinkingmachines/Inkling-Small-NVFP4,nvfp4-1.0,0.5.22,nvcr.io/nvstaging/nim-internal/sglang-oss-nim-llm-4:2.1.6-rc.20261027175310@sha256:d758f185a88213a2fcde01c5fdf95b9aa5afdefe96533d714d017860b65543c0,nvcr.io/nvstaging/ai-dynamo/aiperf:0.13.0rc5,B200,nvfp4,8,8,baseline,e01e35c96c19bae4b354cca938fd1bb0e40493a063599638daf7a7b825de3493,256,1,01M6840KYR7HETHKDZZ2EB87XA,https://platform.athena.nvidia.com/trials/01M6840KYR7HETHKDZZ2EB87XA,completed,346.59910454326246,74.52626910036757,11414.040356800213,941,1
+```bash Launch command
+sglang serve \
+  --trust-remote-code \
+  --model-path thinkingmachines/Inkling-Small-NVFP4 \
+  --tp 8 \
+  --quantization modelopt_fp4 \
+  --attention-backend fa4 \
+  --page-size 128 \
+  --fp4-gemm-backend flashinfer_trtllm \
+  --moe-runner-backend flashinfer_trtllm_routed \
+  --enable-torch-symm-mem \
+  --mamba-radix-cache-strategy extra_buffer \
+  --mem-fraction-static 0.85 \
+  --swa-full-tokens-ratio 0.1 \
+  --mamba-full-memory-ratio 0.1 \
+  --enable-multimodal \
+  --reasoning-parser inkling \
+  --tool-call-parser inkling \
+  --host 0.0.0.0 \
+  --port 30000
 ```
 
 </Accordion>
