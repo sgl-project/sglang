@@ -1783,7 +1783,7 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
             )
             return {"disable_shared_experts_fusion": False}
         return {}
-    if view.moe_a2a_backend in ("flashinfer", "flashinfer_megamoe"):
+    if view.moe_a2a_backend in ("flashinfer_nvlink_one_sided", "flashinfer_megamoe"):
         logger.warning(
             "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
         )
@@ -1803,7 +1803,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "mooncake",
         "nixl",
         "ascend_fuseep",
-        "flashinfer",
+        "flashinfer_nvlink_one_sided",
         "flashinfer_megamoe",
         "mori",
         "pplx",
