@@ -32,6 +32,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 class _FakeOpenAIServingChat:
     native_reasoning_history = False
+    chat_encoding_spec = None
 
     def __init__(self, stream_lines=None, chat_template=None):
         self.stream_lines = stream_lines or []

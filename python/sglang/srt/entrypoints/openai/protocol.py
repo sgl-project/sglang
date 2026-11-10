@@ -1008,6 +1008,9 @@ class ChatCompletionRequest(PDRoutingFields):
     # Indices of the messages the client sent a non-empty `tools` on, including
     # user messages, whose model drops the field.
     _message_tools_indices: List[int] = PrivateAttr(default_factory=list)
+    # Set by /v1/responses and /v1/messages for DeepSeek-V4.1 dynamic tools: the
+    # original payload deepseek-recipe renders instead of `messages`.
+    _native_request: Optional[Any] = PrivateAttr(default=None)
     parallel_tool_calls: bool = True
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
@@ -1981,6 +1984,33 @@ class ResponseToolState(msgspec.Struct, frozen=True):
     public_tools: list[ResponseTool] | None = None
     public_choice: str | dict[str, Any] | None = None
     names: dict[str, dict[str, str]] = {}
+    # A natively converted request and the tools the model can call after its
+    # history, discovered ones included.
+    native: Any = None
+    chat_tools: list[Tool] | None = None
+    # A `tool_search` call is reported as a client-executed `tool_search_call`.
+    client_tool_search: bool = False
+
+
+class ResponseToolSearchCall(BaseModel):
+    """A client-executed ``tool_search`` call; the pinned openai SDK has no type."""
+
+    id: str
+    type: Literal["tool_search_call"] = "tool_search_call"
+    call_id: str
+    execution: Literal["client"] = "client"
+    arguments: Dict[str, Any]
+    status: Literal["in_progress", "completed", "incomplete"]
+
+
+class ResponseToolSearchCallEvent(BaseModel):
+    """``response.output_item.added`` / ``.done`` for a ``tool_search_call``, which
+    the SDK's event types reject."""
+
+    type: Literal["response.output_item.added", "response.output_item.done"]
+    sequence_number: int
+    output_index: int
+    item: ResponseToolSearchCall
 
 
 class ResponseInputMessageParam(EasyInputMessageParam, total=False):
@@ -2335,6 +2365,7 @@ class ResponsesResponse(BaseModel):
             ResponseOutputItem,
             ResponseReasoningItem,
             ResponseFunctionToolCall,
+            ResponseToolSearchCall,
         ]
     ] = Field(default_factory=list)
     status: Literal[
@@ -2400,6 +2431,7 @@ class ResponsesResponse(BaseModel):
                 ResponseOutputItem,
                 ResponseReasoningItem,
                 ResponseFunctionToolCall,
+                ResponseToolSearchCall,
             ]
         ],
         status: str,

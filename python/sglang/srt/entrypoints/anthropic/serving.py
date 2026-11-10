@@ -54,6 +54,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoiceFuncName,
 )
 from sglang.srt.observability.req_time_stats import monotonic_time
+from sglang.srt.parser.deepseek_recipe_renderer import DYNAMIC_TOOLS_SPEC, MODEL_NAMES
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -151,6 +152,81 @@ def _extract_system_text(
         if text:
             texts.append(text)
     return "\n".join(texts) if texts else None
+
+
+def _text_from_search_result(item: dict[str, Any]) -> str:
+    search_parts = []
+    title = item.get("title")
+    if title:
+        search_parts.append(f"Title: {title}")
+
+    source = item.get("source")
+    if isinstance(source, dict):
+        source_text = source.get("url") or source.get("text")
+        if source_text:
+            search_parts.append(f"Source: {source_text}")
+    elif source:
+        search_parts.append(f"Source: {source}")
+
+    content = item.get("content")
+    content_parts = []
+    if isinstance(content, str):
+        content_parts.append(content)
+    elif isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text" and part.get("text"):
+                content_parts.append(part["text"])
+    if content_parts:
+        search_parts.append("Content: " + "\n".join(content_parts))
+
+    return "\n".join(search_parts)
+
+
+def _block_types(messages: list[Any]) -> set[str]:
+    """The block types of `messages`, tool result contents included."""
+    types = set()
+    for message in messages:
+        for block in message.content if isinstance(message.content, list) else []:
+            types.add(block.type)
+            if block.type == "tool_result" and isinstance(block.content, list):
+                types.update(item.type for item in block.content)
+    return types
+
+
+def _native_block(block: dict[str, Any]) -> dict[str, Any]:
+    """`block` in deepseek-recipe's Messages schema: the reference and legacy field
+    names SGLang accepts, and search results as the text SGLang renders."""
+    kind = block["type"]
+    if kind == "tool_result":
+        content = block.get("content")
+        return {
+            "type": "tool_result",
+            "tool_use_id": block.get("tool_use_id") or block.get("id"),
+            "content": (
+                [_native_block(item) for item in content]
+                if isinstance(content, list)
+                else content
+            ),
+            "is_error": block.get("is_error"),
+        }
+    if kind == "tool_reference":
+        return {"type": kind, "tool_name": block.get("tool_name") or block.get("name")}
+    if kind == "tool_addition":
+        tool = block["tool"]
+        name = tool.get("name") or tool.get("tool_name")
+        return {"type": kind, "tool": {"type": "tool_reference", "name": name}}
+    if kind == "search_result":
+        return {"type": "text", "text": _text_from_search_result(block)}
+    return block
+
+
+def _native_message(message: Any) -> dict[str, Any]:
+    data = message.model_dump(exclude_none=True)
+    if isinstance(data["content"], list):
+        data["content"] = [_native_block(block) for block in data["content"]]
+    return data
 
 
 def _wrap_sse_event(data: str, event_type: str) -> str:
@@ -254,35 +330,6 @@ class AnthropicServing:
                 }
 
             return None
-
-        def _text_from_search_result(item: dict[str, Any]) -> str:
-            search_parts = []
-            title = item.get("title")
-            if title:
-                search_parts.append(f"Title: {title}")
-
-            source = item.get("source")
-            if isinstance(source, dict):
-                source_text = source.get("url") or source.get("text")
-                if source_text:
-                    search_parts.append(f"Source: {source_text}")
-            elif source:
-                search_parts.append(f"Source: {source}")
-
-            content = item.get("content")
-            content_parts = []
-            if isinstance(content, str):
-                content_parts.append(content)
-            elif isinstance(content, list):
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    if part.get("type") == "text" and part.get("text"):
-                        content_parts.append(part["text"])
-            if content_parts:
-                search_parts.append("Content: " + "\n".join(content_parts))
-
-            return "\n".join(search_parts)
 
         def _convert_tool_result_content(
             content: Any,
@@ -721,7 +768,62 @@ class AnthropicServing:
         elif chat_request.tools:
             chat_request.tool_choice = "auto"
 
+        self._attach_native_request(anthropic_request, chat_request)
         return chat_request
+
+    def _attach_native_request(
+        self,
+        anthropic_request: AnthropicMessagesRequest,
+        chat_request: ChatCompletionRequest,
+    ) -> None:
+        """DeepSeek-V4.1 converts deferred tools and the tools that results and
+        system messages load through deepseek-recipe's Messages adapter, which
+        renders each loaded schema where it loads; its tools become the active set."""
+        types = _block_types(anthropic_request.messages)
+        loads = bool(types & {"tool_reference", "tool_addition"})
+        tools = [
+            tool for tool in anthropic_request.tools or [] if not is_server_tool(tool)
+        ]
+        if not loads and not any(tool.defer_loading for tool in tools):
+            return
+        spec = self.openai_serving_chat.chat_encoding_spec
+        if spec not in MODEL_NAMES:
+            if "tool_addition" in types:
+                raise ValueError(
+                    "tool_addition blocks are a deepseek-recipe extension this "
+                    "model does not render"
+                )
+            return
+        adapter = self.openai_serving_chat.encoding_adapter
+        # V4 loads deferred tools up front; only its references are rejected.
+        if adapter is None or (spec != DYNAMIC_TOOLS_SPEC and not loads):
+            return
+        body = {
+            "messages": [_native_message(m) for m in anthropic_request.messages],
+            # recipe reads a tool with a `type` as a server tool.
+            "tools": [
+                tool.model_dump(exclude_none=True, exclude={"type", "strict"})
+                for tool in tools
+            ],
+        }
+        system = anthropic_request.system
+        if system:
+            body["system"] = (
+                system
+                if isinstance(system, str)
+                else [block.model_dump(exclude_none=True) for block in system]
+            )
+        choice = anthropic_request.tool_choice
+        if choice is not None and choice.type == "none":
+            body["tool_choice"] = {"type": "none"}
+        chat_request._native_request, chat_request.tools = adapter.native_request(
+            "messages",
+            body,
+            tool_name=choice.name
+            if choice is not None and choice.type == "tool"
+            else None,
+            strict=frozenset(tool.name for tool in tools if tool.strict),
+        )
 
     async def _handle_non_streaming(
         self,

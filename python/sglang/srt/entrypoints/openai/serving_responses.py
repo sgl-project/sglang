@@ -13,6 +13,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, Union
 
 import jinja2
+import msgspec
 import openai.types.responses as openai_responses_types
 import orjson
 from fastapi import Request
@@ -43,7 +44,7 @@ from openai.types.responses.response_reasoning_summary_part_done_event import (
     Part as ResponseReasoningSummaryDonePart,
 )
 from openai_harmony import Message as OpenAIMessage
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 
 from sglang.srt.entrypoints.context import (
     ConversationContext,
@@ -72,6 +73,8 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponsesLifecycleEvent,
     ResponsesRequest,
     ResponsesResponse,
+    ResponseToolSearchCall,
+    ResponseToolSearchCallEvent,
     Tool,
     UsageInfo,
 )
@@ -103,6 +106,11 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.parser.deepseek_recipe_renderer import (
+    DYNAMIC_TOOLS_SPEC,
+    MODEL_NAMES,
+    NativeRequest,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import (
     ResponseTemplateReasoningDetector,
@@ -124,6 +132,107 @@ logger = logging.getLogger(__name__)
 
 class _MediaInputValidationError(ValueError):
     pass
+
+
+# The client-executed search tool, named as deepseek-recipe declares it.
+TOOL_SEARCH = "tool_search"
+TOOL_SEARCH_ITEMS = ("tool_search_call", "tool_search_output")
+
+
+def _tool_search_call(
+    item_id: str, call_id: str, arguments: str, *, truncated: bool = False
+) -> ResponseToolSearchCall:
+    """A search call reports object arguments. As deepseek-recipe reports it, one
+    that is not a JSON object, or that the output limit cut off, is incomplete."""
+    try:
+        parsed = None if truncated else json.loads(arguments)
+    except ValueError:
+        parsed = None
+    complete = isinstance(parsed, dict)
+    return ResponseToolSearchCall(
+        id=item_id,
+        call_id=call_id,
+        arguments=parsed if complete else {},
+        status="completed" if complete else "incomplete",
+    )
+
+
+def _visible_tool(tool: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """`tool` without its deferred parts, or None when all of it is deferred."""
+    if tool.get("defer_loading"):
+        return None
+    if tool["type"] != "namespace":
+        return tool
+    members = [
+        member for member in tool.get("tools") or [] if not member.get("defer_loading")
+    ]
+    return {**tool, "tools": members} if members else None
+
+
+def _without_strict(value: Any) -> Any:
+    """`value` with no tool marked strict: SGLang's grammar enforces strict
+    arguments, and recipe's backend constraint refuses strict tools beside the
+    non-strict search tool, so recipe renders the schemas as declared."""
+    if isinstance(value, list):
+        return [_without_strict(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: _without_strict(item) if key == "tools" else item
+        for key, item in value.items()
+        if key != "strict"
+    }
+
+
+def _strict_names(
+    tools: list[dict[str, Any]], names: dict[str, dict[str, str]]
+) -> frozenset[str]:
+    """Call names of the strict functions in `tools`, namespace members included."""
+    joined = {(name["namespace"], name["name"]): call for call, name in names.items()}
+    strict = set()
+    for tool in tools:
+        if tool.get("type") == "namespace":
+            strict |= {
+                joined.get((tool.get("name"), member.get("name")))
+                for member in tool.get("tools") or []
+                if member.get("strict")
+            }
+        elif tool.get("strict"):
+            strict.add(tool.get("name"))
+    return frozenset(strict - {None})
+
+
+def _named_tool(
+    request: ResponsesRequest, names: dict[str, dict[str, str]]
+) -> Optional[str]:
+    """The call name a named tool choice forces: the search tool by its name, and a
+    namespace member as recipe joins it."""
+    if _chooses_search(request):
+        return TOOL_SEARCH
+    choice = request.effective_tool_choice()
+    if not isinstance(choice, dict):
+        return None
+    namespace = choice.get("namespace")
+    member = {"namespace": namespace, "name": choice["name"]}
+    call_name = next(
+        (call_name for call_name, name in names.items() if name == member), None
+    )
+    if call_name is None and namespace is not None:
+        # Never fall back to a top-level tool that shares the member's name.
+        raise ValueError(
+            f"Tool {choice['name']!r} in namespace {namespace!r} is not declared in "
+            "tools or loaded by a tool_search_output"
+        )
+    return call_name or choice["name"]
+
+
+def _chooses_search(request: ResponsesRequest) -> bool:
+    choice = request.tool_choice
+    return isinstance(choice, dict) and choice.get("type") == TOOL_SEARCH
+
+
+def _is_truncated(finish_reason: Any) -> bool:
+    return isinstance(finish_reason, dict) and finish_reason.get("type") == "length"
 
 
 def _build_output_text_logprobs(meta_info: dict) -> list[Logprob]:
@@ -352,9 +461,24 @@ class OpenAIServingResponses(OpenAIServingChat):
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
 
+        try:
+            native = self._native_request(request)
+        except ValueError as e:
+            return self.create_error_response(str(e))
+        # A native request can force the tools it has loaded, search included.
+        active = request._tool_state.chat_tools
+        if native is not None and request.tool_choice == "required" and not active:
+            return self.create_error_response(
+                'tool_choice="required" needs a tool that is loaded: deferred tools '
+                "load when a tool_search_output returns them."
+            )
         # ``tool_choice="required"`` needs a tool the parser can actually force.
-        if request.tool_choice == "required" and not any(
-            tool.type in ("function", "custom") for tool in (request.tools or [])
+        if (
+            native is None
+            and request.tool_choice == "required"
+            and not any(
+                tool.type in ("function", "custom") for tool in (request.tools or [])
+            )
         ):
             return self.create_error_response(
                 'tool_choice="required" requires at least one tool with '
@@ -363,7 +487,21 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
         tool_choice = request.effective_tool_choice()
-        if isinstance(tool_choice, dict) and not any(
+        if native is not None and native.tool_name is not None:
+            # The search selector needs the search tool, not a function named like it.
+            if _chooses_search(request) and not request._tool_state.client_tool_search:
+                return self.create_error_response(
+                    'tool_choice {"type": "tool_search"} needs a tool_search tool '
+                    'with execution "client" in tools',
+                    param="tool_choice",
+                )
+            if not any(tool.function.name == native.tool_name for tool in active):
+                return self.create_error_response(
+                    f"Tool {native.tool_name!r} is not declared in tools or "
+                    "loaded by a tool_search_output",
+                    param="tool_choice",
+                )
+        elif isinstance(tool_choice, dict) and not any(
             tool.type in ("function", "custom") and tool.name == tool_choice["name"]
             for tool in request.tools or []
         ):
@@ -738,21 +876,26 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         tool_adapter=None,
     ):
-        messages = self._construct_input_messages(
-            request, prev_response, tool_adapter=tool_adapter
+        native = self._native_request(request)
+        # A native request renders from its own payload, not chat messages.
+        messages = (
+            []
+            if native is not None
+            else self._construct_input_messages(
+                request, prev_response, tool_adapter=tool_adapter
+            )
         )
 
         chat_tools = self._response_tools_to_chat_tools(request)
+        tool_choice = self._chat_tool_choice(request.effective_tool_choice())
+        if native is not None and native.tool_name is not None:
+            tool_choice = {"type": "function", "function": {"name": native.tool_name}}
         chat_request = ChatCompletionRequest(
             model=request.model,
             messages=messages,
             stream=request.stream,
             tools=chat_tools or None,
-            tool_choice=(
-                self._chat_tool_choice(request.effective_tool_choice())
-                if chat_tools
-                else "none"
-            ),
+            tool_choice=tool_choice if chat_tools else "none",
             parallel_tool_calls=(
                 request.parallel_tool_calls
                 if request.parallel_tool_calls is not None
@@ -763,6 +906,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             chat_template_kwargs=request.chat_template_kwargs,
         )
         chat_request._template_tools = self._response_tools_to_template_tools(request)
+        chat_request._native_request = native
 
         media_error = self._validate_media_content(chat_request)
         if media_error:
@@ -1036,11 +1180,20 @@ class OpenAIServingResponses(OpenAIServingChat):
         arguments: str,
         custom_names: set[str],
         tool_names: dict[str, dict[str, str]],
-    ) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:
+        *,
+        client_tool_search: bool = False,
+        truncated: bool = False,
+    ) -> Union[
+        ResponseFunctionToolCall, ResponseCustomToolCall, ResponseToolSearchCall
+    ]:
         """A call against a ``custom`` tool reports its freeform payload rather
         than the JSON arguments of the shim function tool. A call against a
         namespace member reports ``namespace`` and the bare function ``name``."""
         call_id = f"call_{random_uuid()[:24]}"
+        if client_tool_search and name == TOOL_SEARCH:
+            return _tool_search_call(
+                f"tsc_{random_uuid()[:8]}", call_id, arguments, truncated=truncated
+            )
         if name in custom_names:
             return ResponseCustomToolCall(
                 type="custom_tool_call",
@@ -1165,6 +1318,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             calls,
             incomplete_calls,
             output_logprobs,
+            truncated=_is_truncated(finish_reason),
         )
 
     def _parse_text_output(
@@ -1245,8 +1399,11 @@ class OpenAIServingResponses(OpenAIServingChat):
         calls: list[ToolCallItem],
         incomplete_calls: set[int],
         output_logprobs: Optional[list],
+        *,
+        truncated: bool = False,
     ) -> list:
-        """Output items for the reasoning, the content and the calls."""
+        """Output items for the reasoning, the content and the calls. `truncated`
+        means the output limit cut off the last call, the item still open."""
         output_items = []
         if reasoning_content:
             output_items.append(
@@ -1285,7 +1442,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             }
         for call in calls:
             item = self._make_tool_call_item(
-                call.name, call.parameters, custom_names, tool_names
+                call.name,
+                call.parameters,
+                custom_names,
+                tool_names,
+                client_tool_search=request._tool_state.client_tool_search,
+                truncated=truncated and call is calls[-1],
             )
             if (
                 isinstance(item, ResponseFunctionToolCall)
@@ -1400,7 +1562,105 @@ class OpenAIServingResponses(OpenAIServingChat):
             return tool_choice
         return {"type": "function", "function": {"name": tool_choice["name"]}}
 
+    def _native_request(self, request: ResponsesRequest) -> Optional[NativeRequest]:
+        """A DeepSeek request that searches for tools or defers some converts
+        through deepseek-recipe's Responses adapter, which places the definitions a
+        search returns and groups its results; the request then answers with the
+        tools the model can call after its history. Cached on the tool state."""
+        state = request._tool_state
+        if state.native is not None:
+            return state.native
+        if self.chat_encoding_spec not in MODEL_NAMES or self._encoding_adapter is None:
+            return None
+        previous = request.previous_response_id
+        if previous is not None and previous not in self.msg_store:
+            return None  # the handler reports the unknown response
+        history = [
+            self._native_input_item(item)
+            for item in self._response_input_history(request)
+        ]
+        tools = [tool.model_dump(exclude_unset=True) for tool in request.tools]
+        # recipe has no deferral of request tools: V4.1 withholds a deferred one
+        # until a tool_search_output returns its definition; V4 loads it up front.
+        visible = tools
+        if self.chat_encoding_spec == DYNAMIC_TOOLS_SPEC:
+            visible = [tool for tool in map(_visible_tool, tools) if tool is not None]
+        declares_search = any(tool.type == TOOL_SEARCH for tool in request.tools)
+        # A search choice stays native even without a search tool, so admission
+        # rejects it rather than letting it reduce to `auto`.
+        if (
+            visible == tools
+            and not declares_search
+            and not _chooses_search(request)
+            and not any(
+                isinstance(item, dict) and item.get("type") in TOOL_SEARCH_ITEMS
+                for item in history
+            )
+        ):
+            return None
+        for tool in request.tools:
+            if (
+                tool.type == TOOL_SEARCH
+                and tool.model_extra.get("execution") != "client"
+            ):
+                raise ValueError(
+                    'tool_search requires execution "client": this server runs no '
+                    "searches"
+                )
+        found = [
+            tool
+            for item in history
+            if isinstance(item, dict) and item.get("type") == "tool_search_output"
+            for tool in item.get("tools") or []
+        ]
+        names = self._encoding_adapter.responses_tool_names(visible + found)
+        body = {
+            "input": _without_strict(history),
+            "tools": _without_strict(visible),
+            "tool_choice": "none"
+            if request.effective_tool_choice() == "none"
+            else "auto",
+        }
+        if request.instructions:
+            body["instructions"] = request.instructions
+        native, chat_tools = self._encoding_adapter.native_request(
+            "responses",
+            body,
+            tool_name=_named_tool(request, names),
+            strict=_strict_names(visible + found, names),
+        )
+        request._tool_state = msgspec.structs.replace(
+            state,
+            # Echo the search choice rather than the `auto` it would reduce to.
+            public_choice=(
+                request.tool_choice if _chooses_search(request) else state.public_choice
+            ),
+            names=names,
+            native=native,
+            chat_tools=chat_tools,
+            client_tool_search=declares_search,
+        )
+        return native
+
+    @classmethod
+    def _native_input_item(cls, item: Any) -> Any:
+        if isinstance(item, BaseModel):
+            item = item.model_dump(exclude_none=True)
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            # recipe reads only `content`; keep the text SGLang replays, from a
+            # summary or a store=false client's state.
+            message = cls._normalize_response_message_for_chat(item)
+            if message is not None:
+                text = message["reasoning_content"]
+                return {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": text}],
+                }
+        return item
+
     def _response_tools_to_chat_tools(self, request: ResponsesRequest) -> list[Tool]:
+        if request._tool_state.chat_tools is not None:
+            return list(request._tool_state.chat_tools)
         # ``function`` and ``custom`` tools flow to chat; built-ins go through
         # harmony. A custom tool is shimmed into a single-string function tool.
         chat_tools = []
@@ -2227,6 +2487,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     "function_call",
                     "custom_tool_call",
                     "shell_call",
+                    "tool_search_call",
                 )
                 terminal = event_type in (
                     "response.completed",
@@ -2545,12 +2806,29 @@ class OpenAIServingResponses(OpenAIServingChat):
         def _namespace_field(state: dict) -> dict:
             return {"namespace": state["namespace"]} if state["namespace"] else {}
 
-        def _close_tool_call_state(tool_index: int):
+        def _close_tool_call_state(tool_index: int, *, truncated: bool = False):
             state = tool_call_states.get(tool_index)
             if state is None or state.get("done"):
                 return []
             arguments = state["arguments"]
             events: list = []
+            if state["search"]:
+                completed_item = _tool_search_call(
+                    state["item_id"], state["call_id"], arguments, truncated=truncated
+                )
+                events.append(
+                    _send_event(
+                        ResponseToolSearchCallEvent(
+                            type="response.output_item.done",
+                            sequence_number=-1,
+                            output_index=state["output_index"],
+                            item=completed_item,
+                        )
+                    )
+                )
+                emitted_items.append(completed_item)
+                state["done"] = True
+                return events
             if state["custom"]:
                 payload = decode_custom_tool_input(arguments)
                 # Deltas cannot be retracted, so a payload that no longer
@@ -2825,12 +3103,20 @@ class OpenAIServingResponses(OpenAIServingChat):
                             current_output_index += 1
                             name = call.name or ""
                             is_custom = name in custom_names
+                            is_search = (
+                                request._tool_state.client_tool_search
+                                and name == TOOL_SEARCH
+                            )
                             namespace, name = namespace_names.get(name, (None, name))
                             state = {
                                 "item_id": (
                                     f"ctc_{random_uuid()[:8]}"
                                     if is_custom
-                                    else f"fc_{random_uuid()[:8]}"
+                                    else (
+                                        f"tsc_{random_uuid()[:8]}"
+                                        if is_search
+                                        else f"fc_{random_uuid()[:8]}"
+                                    )
                                 ),
                                 "call_id": f"call_{random_uuid()[:24]}",
                                 "output_index": current_output_index,
@@ -2838,11 +3124,28 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 "namespace": namespace,
                                 "arguments": "",
                                 "custom": is_custom,
+                                "search": is_search,
                                 "payload": "",
                                 "added": False,
                                 "done": False,
                             }
                             tool_call_states[tool_index] = state
+                        if not state["added"] and state["search"]:
+                            # Its arguments are reported whole, when it completes.
+                            state["added"] = True
+                            yield _send_event(
+                                ResponseToolSearchCallEvent(
+                                    type="response.output_item.added",
+                                    sequence_number=-1,
+                                    output_index=state["output_index"],
+                                    item=ResponseToolSearchCall(
+                                        id=state["item_id"],
+                                        call_id=state["call_id"],
+                                        arguments={},
+                                        status="in_progress",
+                                    ),
+                                )
+                            )
                         if not state["added"]:
                             state["added"] = True
                             if state["custom"]:
@@ -2877,6 +3180,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
                         if call.parameters:
                             state["arguments"] += call.parameters
+                            if state["search"]:
+                                continue
                             if state["custom"]:
                                 # The payload is a JSON string value inside the
                                 # shim arguments, so un-escape what has arrived
@@ -3007,8 +3312,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             yield ev
         for ev in _close_message_item():
             yield ev
+        # Only an item the finish leaves open is cut off by the output limit.
         for tool_index in list(tool_call_states):
-            for ev in _close_tool_call_state(tool_index):
+            for ev in _close_tool_call_state(
+                tool_index, truncated=_is_truncated(finish_reason)
+            ):
                 yield ev
 
         final_output_items = list(emitted_items)
