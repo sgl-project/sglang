@@ -10,12 +10,14 @@ from sglang.kernels.ops.attention.dsv4.sm90_deepgemm_prefill import (
 )
 from sglang.srt.environ import envs
 
-from .scoring import ChunkScores, RequestScores
+from .scoring import ChunkScores, RequestScores, _prefill_score_budget_bytes
 
 _SCORE_BUDGET_BYTES = 64 << 20
 
 
 def prefill_requests_fp8(inputs, pool):
+    if envs.SGLANG_DSV41_SM90_PREFILL_INDEXER.get() != "deepgemm":
+        raise ValueError("SGLANG_DSV41_SM90_PREFILL_INDEXER must be 'deepgemm'")
     counts, seq_lens = inputs.rows_per_request, inputs.seq_lens_cpu
     assert len(counts) == len(seq_lens)
     real_rows = sum(counts)
@@ -59,10 +61,7 @@ def prefill_requests_fp8(inputs, pool):
 def _score_chunks(request, q, weights, keys):
     stride = ((request.lc + 511) // 256) * 256
     alignment = 128 // q.shape[1]
-    budget = envs.SGLANG_DSV41_PREFILL_SCORE_BUDGET_MIB.get()
-    if budget is not None and budget <= 0:
-        raise ValueError("SGLANG_DSV41_PREFILL_SCORE_BUDGET_MIB must be positive")
-    budget_bytes = _SCORE_BUDGET_BYTES if budget is None else budget << 20
+    budget_bytes = _prefill_score_budget_bytes(_SCORE_BUDGET_BYTES)
     step = max(alignment, budget_bytes // (stride * 4 * alignment) * alignment)
     scales = torch.ones(request.lc, device=keys.device, dtype=torch.float32)
     for start in range(0, q.shape[0], step):

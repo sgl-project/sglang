@@ -379,6 +379,12 @@ def sharded_dense_prefill_topk(
 _TORCH_SCORE_BUDGET_BYTES = 1 << 30
 
 
+def _prefill_score_budget_bytes(default: int) -> int:
+    if envs.SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET.get():
+        return 2 << 30
+    return default
+
+
 class RequestScores(msgspec.Struct, frozen=True):
     lc: int  # compressed positions visible at its newest row
     k: int
@@ -416,7 +422,7 @@ def prefill_requests(
 ) -> Iterator[tuple[RequestScores, Iterator[ChunkScores]]]:
     """Requests with nothing visible yet are skipped."""
     if (
-        envs.SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL.get()
+        not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
         and inputs.x.is_cuda
         and get_platform().is_sm90
         and inputs.x.dtype == torch.bfloat16

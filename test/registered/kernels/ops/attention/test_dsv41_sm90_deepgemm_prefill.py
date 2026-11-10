@@ -170,7 +170,7 @@ class TestSM90DeepGEMMPrefill(CustomTestCase):
             use_deep_gemm_prefill=False,
             use_deep_gemm_decode=False,
         )
-        with envs.SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL.override(True):
+        with envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(False):
             backend.topk_prefill(inputs)
             for row, req in enumerate((1, 1, 5)):
                 visible = (int(positions[row]) + 1) // 2

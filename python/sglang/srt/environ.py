@@ -2026,12 +2026,15 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # Hopper uses its BF16 scorer by default. Set Torch prefill to 0 for FP8.
+    SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(True)
+    SGLANG_DSV41_SM90_PREFILL_INDEXER = EnvStr("deepgemm")
     # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels store bf16 instead
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
-    SGLANG_DSV41_PREFILL_SCORE_BUDGET_MIB = EnvInt(None)
-    SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL = EnvBool(False)
+    # Raise the per-rank prefill Indexer score tile limit to 2 GiB.
+    SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
