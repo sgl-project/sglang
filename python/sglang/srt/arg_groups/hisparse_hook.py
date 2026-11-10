@@ -116,17 +116,20 @@ def validate_hisparse_speculative(
     algorithm = (cfg.speculative_algorithm or "NONE").upper()
     if algorithm == "NONE":
         return
-    supported_algorithms = ("EAGLE", "EAGLE3")
-    if is_v4:
-        supported_algorithms += ("DSPARK",)
-    else:
-        # DSA STANDALONE uses the same linear verify/commit path as EAGLE.
-        supported_algorithms += ("STANDALONE",)
-    if is_m3 or algorithm not in supported_algorithms:
+    if (
+        is_v4
+        or is_m3
+        or algorithm
+        not in (
+            "EAGLE",
+            "EAGLE3",
+            "STANDALONE",
+            "DSPARK",
+        )
+    ):
         raise ValueError(
-            "HiSparse speculative decoding supports DSA with linear EAGLE/EAGLE3, "
-            "or STANDALONE, and DeepSeek V4 with linear EAGLE/EAGLE3 "
-            "or DSPARK."
+            "HiSparse speculative decoding supports DSA models (e.g. GLM-5) "
+            "with linear EAGLE/EAGLE3, STANDALONE, or DSPARK."
         )
     if (cfg.speculative_eagle_topk or 1) != 1:
         raise ValueError(
@@ -137,6 +140,12 @@ def validate_hisparse_speculative(
             "HiSparse uses fixed verify width; --speculative-adaptive is unsupported."
         )
     if algorithm == "DSPARK":
+        verify_width = cfg.speculative_num_draft_tokens
+        if verify_width is None or not 2 <= verify_width <= 4:
+            raise ValueError(
+                "HiSparse DSPARK requires 2-4 verify tokens; use "
+                "--speculative-dspark-block-size 3 for four verify tokens."
+            )
         from sglang.srt.speculative.ragged_verify import (
             RaggedVerifyMode,
             read_ragged_verify_mode,
@@ -147,14 +156,6 @@ def validate_hisparse_speculative(
                 "HiSparse DSPARK requires fixed verify width; "
                 "set SGLANG_RAGGED_VERIFY_MODE=static."
             )
-    if is_v4 and (get_platform().is_hip or get_platform().is_xpu):
-        raise ValueError(
-            "HiSparse DeepSeek V4 speculative transfers require NVIDIA CUDA."
-        )
-    if is_v4 and cfg.page_size != 256:
-        raise ValueError(
-            "HiSparse DeepSeek V4 speculation requires --page-size 256 (64 C4 slots)."
-        )
 
 
 def validate_hisparse(server_args: ServerArgs) -> None:

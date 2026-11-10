@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import weakref
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,87 +17,6 @@ from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
-
-
-MAX_SPEC_OCCURRENCES = 8192
-
-
-@dataclass(frozen=True)
-class HiSparseSpecLayout:
-    hot_slots: int
-    page_size: int
-    compress_ratio: int
-    verify_width: int
-    top_k: int
-
-    def __post_init__(self) -> None:
-        dimensions = (
-            self.hot_slots,
-            self.page_size,
-            self.compress_ratio,
-            self.verify_width,
-            self.top_k,
-        )
-        if any(not isinstance(n, int) or isinstance(n, bool) for n in dimensions):
-            raise ValueError("HiSparse speculative dimensions must be integers.")
-        if (
-            not 1 < self.hot_slots <= 32768
-            or self.page_size <= 0
-            or self.compress_ratio not in (1, 4)
-            or self.verify_width < 2
-            or self.top_k <= 0
-            or self.occurrences > MAX_SPEC_OCCURRENCES
-            or self.hot_slots % self.page_size
-            or self.speculative_slots + 1 > self.page_size
-        ):
-            raise ValueError(
-                "Invalid HiSparse speculative layout: require a page-aligned hot "
-                "buffer, at least two verify tokens, steps * top_k <= 8192, and "
-                "one tail slot per generated KV entry plus the newest entry. "
-                f"Got {self}."
-            )
-
-    @property
-    def occurrences(self) -> int:
-        return self.verify_width * self.top_k
-
-    @property
-    def speculative_slots(self) -> int:
-        return (self.verify_width + self.compress_ratio - 1) // self.compress_ratio
-
-    @property
-    def scratch_slots(self) -> int:
-        minimum = min(self.occurrences, max(1024, self.occurrences - self.hot_slots))
-        return (minimum + self.page_size - 1) // self.page_size * self.page_size
-
-    @property
-    def hash_slots(self) -> int:
-        return 1 << (2 * self.hot_slots - 1).bit_length()
-
-    def metadata_width(self, num_req_slots: int) -> int:
-        width = max(4 * num_req_slots, 5 * self.occurrences)
-        return width + width % 2
-
-    def fixed_state_bytes(self, *, num_layers: int, num_req_slots: int) -> int:
-        """Tensor bytes, excluding KV slots charged to the physical allocator."""
-        index = num_layers * num_req_slots * 2 * self.hash_slots * 8
-        policy = num_layers * (num_req_slots + 1) * self.hot_slots * 4
-        metadata = (num_req_slots + 1) * self.metadata_width(num_req_slots) * 4
-        scratch = num_layers * num_req_slots * self.scratch_slots * 4
-        outputs = num_req_slots * self.occurrences * 4
-        compressed_verify = (
-            outputs + num_req_slots * (8 + 8 + 4) if self.compress_ratio == 4 else 0
-        )
-        hash_initializers = self.hot_slots * 2 * 8
-        return (
-            index
-            + policy
-            + metadata
-            + scratch
-            + outputs
-            + compressed_verify
-            + hash_initializers
-        )
 
 
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -407,8 +325,6 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # C4 HiSparse allocation/device-buffer code must use the compressed page size.
         self.page_size = logical_attn_allocator.page_size
         self.hisparse_page_size = self.hisparse_kvcache.page_size
-        self._spec_scratch_capacity = 0
-        self._spec_device_buffer_size = 0
 
         self.logical_attn_allocator = logical_attn_allocator
         self._kvcache = logical_attn_allocator._kvcache
@@ -445,34 +361,6 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.hisparse_kvcache.register_mapping(
             weakref.proxy(self.full_to_hisparse_device_index_mapping)
         )
-
-    def configure_spec_scratch(
-        self, capacity: int, *, device_buffer_size: int = 0
-    ) -> None:
-        # The manager owns compressed C4 slots, whereas scheduler reservations
-        # are expressed in full tokens. Validate using the physical pool page.
-        if any(
-            size < 0 or size % self.hisparse_page_size
-            for size in (capacity, device_buffer_size)
-        ):
-            raise ValueError(
-                "HiSparse C4 spec scratch and device buffer sizes must be "
-                "non-negative multiples of "
-                f"compressed page_size={self.hisparse_page_size}."
-            )
-        self._spec_scratch_capacity = capacity
-        self._spec_device_buffer_size = device_buffer_size if capacity else 0
-
-    def request_slot_reserve(
-        self, *, has_req_pool_slot: bool, prefill_tokens: int = 0
-    ) -> int:
-        compressed_prefill = prefill_tokens // self.compress_ratio
-        paged_prefill = (
-            -(-compressed_prefill // self.hisparse_page_size) * self.hisparse_page_size
-        )
-        buffer_reserve = max(self._spec_device_buffer_size - paged_prefill, 0)
-        scratch_reserve = 0 if has_req_pool_slot else self._spec_scratch_capacity
-        return (buffer_reserve + scratch_reserve) * self.compress_ratio
 
     @property
     def size_full(self) -> int:
@@ -525,6 +413,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             (swa_capacity, self.swa_available_size()),
         )
 
+    def owner_available_size(self):
+        """What the token pool can serve now: its full-attention side."""
+        return self.full_available_size()
+
     def full_available_size(self):
         return min(
             self.logical_attn_allocator.full_available_size(),
@@ -537,13 +429,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def window_pool_names(self):
         return self.logical_attn_allocator.window_pool_names()
 
-    def reclaim_for_prealloc(
-        self, tree_cache, full_tokens: int, swa_tokens: int
-    ) -> str | None:
+    def reclaim_for_prealloc(self, tree_cache, demand) -> str | None:
         # C4 needs no reclaim here: full_available_size prices it into the budget.
-        return self.logical_attn_allocator.reclaim_for_prealloc(
-            tree_cache, full_tokens, swa_tokens
-        )
+        return self.logical_attn_allocator.reclaim_for_prealloc(tree_cache, demand)
 
     def free_swa(self, free_indices: torch.Tensor):
         self.logical_attn_allocator.free_swa(free_indices)

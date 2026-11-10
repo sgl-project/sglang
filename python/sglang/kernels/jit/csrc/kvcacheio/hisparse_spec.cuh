@@ -1,14 +1,12 @@
 #pragma once
 
 // Multi-step speculative HiSparse cache-management kernels.
-// Linear and page-padded C4 transfers share the same speculative swap state.
+// DSv4 cache transfer remains in hisparse.cuh.
 
 #include <sgl_kernel/tensor.h>  // TensorMatcher and symbolic tensor validation
 #include <sgl_kernel/utils.h>   // RuntimeCheck and host utilities
 
 #include <sgl_kernel/utils.cuh>  // LaunchKernel and PDL helpers
-
-#include <sgl_kernel/deepseek_v4/kvcacheio.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -27,8 +25,6 @@ using BallotMask = unsigned int;
 constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFu;
 #endif
 constexpr int64_t HASH_DELETED = -2;
-constexpr int32_t COMPACT_HASH_BITS = 13;
-constexpr int32_t COMPACT_HASH_MASK = (1 << COMPACT_HASH_BITS) - 1;
 constexpr int32_t COMPACT_APPROX_CLAIM_FLAG = int32_t{1} << 29;
 constexpr int32_t COMPACT_APPROX_ADMIT_FLAG = int32_t{1} << 30;
 constexpr int32_t APPROX_ADMISSION_STEPS = 1;
@@ -64,6 +60,14 @@ constexpr int32_t ceil_log2_constexpr(int32_t value) {
   }
   return bits;
 }
+
+// Compact miss entries keep the scratch-union hash position in the low bits,
+// below the approximate-admission flags; the table spans WORKSPACE_CAPACITY slots.
+template <int64_t TABLE_SLOTS>
+struct CompactHashPosition {
+  static constexpr int32_t MASK = (int32_t{1} << ceil_log2_constexpr(static_cast<int32_t>(TABLE_SLOTS))) - 1;
+  static_assert(MASK < COMPACT_APPROX_CLAIM_FLAG, "compact hash positions overlap the admission flags.");
+};
 
 template <int32_t HOT_BUFFER_SIZE>
 struct PackedRingState {
@@ -422,7 +426,6 @@ template <
     int ITEM_SIZE_BYTES,
     int NUM_STEPS,
     bool RecordMissPlan,
-    bool IsDsv4Layout,
     bool PassThroughDeviceLocs,
     bool LateBoundHostBase,
     int WORKSPACE_CAPACITY>
@@ -461,17 +464,8 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
         miss_count_out[bid] = 0;
       }
     }
-    if constexpr (IsDsv4Layout) {
-      // Empty C4 histories still have a clamped attention length of one.
-      // Preserve the indexer's mask and the offsets within padding page zero.
-      for (int64_t i = tid; i < total_occurrences; i += BLOCK_SIZE) {
-        const int32_t token = top_k_tokens[bid * top_k_tokens_stride + i];
-        req_top_k_device_locs[i] = token >= 0 ? token % page_size : -1;
-      }
-    } else {
-      for (int64_t i = tid; i < total_occurrences; i += BLOCK_SIZE)
-        req_top_k_device_locs[i] = PassThroughDeviceLocs ? -1 : 0;
-    }
+    for (int64_t i = tid; i < total_occurrences; i += BLOCK_SIZE)
+      req_top_k_device_locs[i] = PassThroughDeviceLocs ? -1 : 0;
     return;
   }
 
@@ -637,14 +631,9 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
           miss_dst_out[bid * plan_stride + copy_miss_idx] = copy_loc;
         }
       }
-      if constexpr (IsDsv4Layout) {
-        device::hisparse::transfer_item(
-            device_buffer_k, const_cast<void*>(host_cache_k), copy_loc, static_cast<int32_t>(copy_src_loc));
-      } else {
-        const auto src_k = host_base + copy_src_loc * host_row_bytes;
-        auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(copy_loc) * ITEM_SIZE_BYTES;
-        transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
-      }
+      const auto src_k = host_base + copy_src_loc * host_row_bytes;
+      auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(copy_loc) * ITEM_SIZE_BYTES;
+      transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
     }
     copy_mask &= ~(static_cast<BallotMask>(1) << owner_lane);
   }
@@ -657,7 +646,6 @@ template <
     int NUM_STEPS,
     bool RecordMissPlan,
     bool USE_PDL,
-    bool IsDsv4Layout,
     bool LateBoundHostBase,
     int WORKSPACE_CAPACITY>
 __global__ void load_cache_to_device_buffer_spec_commit_kernel(
@@ -805,7 +793,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
 
     if (compact_idx < miss_count) {
       const int32_t compact_entry = req_compact_hash_positions[compact_idx];
-      hash_pos = compact_entry & COMPACT_HASH_MASK;
+      hash_pos = compact_entry & CompactHashPosition<WORKSPACE_CAPACITY>::MASK;
       const auto packed = req_scratch_table[hash_pos];
       const auto index_entry = req_scratch_indices[hash_pos];
       if (static_cast<uint32_t>(packed >> 32) == static_cast<uint32_t>(scratch_epoch) &&
@@ -929,14 +917,9 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
             miss_dst_out[bid * plan_stride + miss_idx] = dst_loc;
           }
         }
-        if constexpr (IsDsv4Layout) {
-          device::hisparse::transfer_item(
-              device_buffer_k, const_cast<void*>(host_cache_k), dst_loc, static_cast<int32_t>(src_loc));
-        } else {
-          const auto src_k = host_base + src_loc * host_row_bytes;
-          auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(dst_loc) * ITEM_SIZE_BYTES;
-          transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
-        }
+        const auto src_k = host_base + src_loc * host_row_bytes;
+        auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(dst_loc) * ITEM_SIZE_BYTES;
+        transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
       }
       copy_mask &= ~(static_cast<BallotMask>(1) << owner_lane);
     }
@@ -998,7 +981,6 @@ template <
     int NUM_STEPS,
     bool RecordMissPlan,
     bool USE_PDL,
-    bool IsDsv4Layout,
     bool PassThroughDeviceLocs = false,
     bool LateBoundHostBase = false,
     int WORKSPACE_CAPACITY = NUM_STEPS * NUM_TOP_K>
@@ -1025,18 +1007,11 @@ void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView host_binding) {
   using namespace host;
 
-  if constexpr (IsDsv4Layout) {
-    static_assert(NUM_STEPS > 1, "HiSparse speculative swap requires at least two steps.");
-    static_assert(NUM_TOP_K > 0, "HiSparse speculative swap requires positive top_k.");
-    static_assert(
-        !PassThroughDeviceLocs && !LateBoundHostBase, "HiSparse C4 speculative swap requires a private host cache.");
-  } else {
-    static_assert(NUM_STEPS >= 1 && NUM_STEPS <= 4, "HiSparse speculative swap requires 1-4 steps.");
-    static_assert(NUM_TOP_K >= 1024, "HiSparse speculative swap requires top_k >= 1024.");
-  }
-  static_assert(NUM_STEPS * NUM_TOP_K <= 8192, "HiSparse speculative swap supports at most 8192 occurrences.");
+  static_assert(NUM_STEPS >= 1 && NUM_STEPS <= 8, "HiSparse speculative swap requires 1-8 steps.");
+  static_assert(NUM_TOP_K >= 1024, "HiSparse speculative swap requires top_k >= 1024.");
+  static_assert(NUM_STEPS * NUM_TOP_K <= 16384, "HiSparse speculative swap supports at most 16384 occurrences.");
   static_assert(
-      WORKSPACE_CAPACITY >= NUM_STEPS * NUM_TOP_K && WORKSPACE_CAPACITY <= 8192,
+      WORKSPACE_CAPACITY >= NUM_STEPS * NUM_TOP_K && WORKSPACE_CAPACITY <= 16384,
       "HiSparse speculative metadata must cover every occurrence and fit the compact hash index.");
 
   const auto* device_locs_ptr = PassThroughDeviceLocs ? static_cast<const int32_t*>(device_locs.data_ptr()) : nullptr;
@@ -1139,7 +1114,6 @@ void load_cache_to_device_buffer_spec(
           ITEM_SIZE_BYTES,
           NUM_STEPS,
           RecordMissPlan,
-          IsDsv4Layout,
           PassThroughDeviceLocs,
           LateBoundHostBase,
           WORKSPACE_CAPACITY>,
@@ -1177,7 +1151,6 @@ void load_cache_to_device_buffer_spec(
               NUM_STEPS,
               RecordMissPlan,
               USE_PDL,
-              IsDsv4Layout,
               LateBoundHostBase,
               WORKSPACE_CAPACITY>,
           static_cast<const int32_t*>(top_k_tokens.data_ptr()),

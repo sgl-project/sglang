@@ -762,6 +762,9 @@ def _post_fusion(
         and _can_use_decode_post_combine(cfg, y.shape[0])
     ):
         quant = next.accepts_mxfp8
+        moe_input = None
+        if not quant and next.mega_moe_input is not None:
+            moe_input = next.mega_moe_input(y)
         updated, normalized, q, sf = mhc_post_combine_norm_decode(
             y,
             residual,
@@ -771,11 +774,14 @@ def _post_fusion(
             next.norm.weight,
             next.norm.variance_epsilon,
             quant=quant,
+            moe_input=None if moe_input is None else moe_input.views(),
         )
         if quant:
             return HcState(
                 updated, pre, HcQuantized(normalized, Mxfp8SwizzledInput(q, sf))
             )
+        if moe_input is not None:
+            moe_input.mark(normalized)
         return HcState(updated, pre, HcNormed(normalized))
     if (
         next is not None

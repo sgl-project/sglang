@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from sglang.srt.arg_groups.hisparse_hook import validate_hisparse_speculative
+from sglang.srt.environ import envs
 from sglang.srt.managers.hisparse_coordinator import (
     HiSparseCoordinator,
     HiSparseSpecSwapManager,
@@ -22,6 +24,40 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestHiSparseSpecCoordinator(CustomTestCase):
+    def test_dspark_requires_fixed_linear_dsa(self):
+        defaults = dict(
+            speculative_algorithm="DSPARK",
+            speculative_eagle_topk=1,
+            speculative_adaptive=False,
+            speculative_num_draft_tokens=4,
+        )
+        view = "sglang.srt.arg_groups.hisparse_hook.resolving_view"
+        for width in (2, 4):
+            cfg = SimpleNamespace(
+                **(defaults | {"speculative_num_draft_tokens": width})
+            )
+            with (
+                self.subTest(width=width),
+                patch(view, return_value=cfg),
+                envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
+            ):
+                validate_hisparse_speculative(cfg, is_v4=False, is_m3=False)
+        for overrides, is_v4, mode, message in (
+            ({"speculative_num_draft_tokens": 8}, False, "static", "2-4"),
+            ({"speculative_eagle_topk": 2}, False, "static", "linear"),
+            ({"speculative_adaptive": True}, False, "static", "fixed verify"),
+            ({}, False, "compact", "fixed verify"),
+            ({}, True, "static", "DSA models"),
+        ):
+            cfg = SimpleNamespace(**(defaults | overrides))
+            with (
+                self.subTest(overrides=overrides, is_v4=is_v4, mode=mode),
+                patch(view, return_value=cfg),
+                envs.SGLANG_RAGGED_VERIFY_MODE.override(mode),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                validate_hisparse_speculative(cfg, is_v4=is_v4, is_m3=False)
+
     def test_spec_decode_reserve_allocates_logical_pages_only(self):
         logical_locs = torch.tensor([64, 65, 66, 67], dtype=torch.int64)
         allocator = SimpleNamespace(
@@ -85,7 +121,7 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         )
         coordinator = MagicMock(
             token_to_kv_pool_allocator=token_allocator,
-            mem_pool_device=SimpleNamespace(layer_num=3, page_size=64),
+            mem_pool_device=SimpleNamespace(layer_num=3),
             req_to_token_pool=SimpleNamespace(req_to_token=torch.empty((2, 16))),
             device="cpu",
             is_dsv4_hisparse=False,
@@ -167,7 +203,6 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
     def test_accept_commit_keeps_hot_and_newest_device_slots(self):
         coordinator = object.__new__(HiSparseCoordinator)
         coordinator.compress_ratio = 1
-        coordinator.is_dsv4_hisparse = False
         coordinator.device_buffer_size = 5
         coordinator.page_size = 8
         coordinator.req_to_device_buffer = torch.tensor(
@@ -286,6 +321,88 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
             torch.tensor([[4, 5, 6, 7], [4, 5, 6, 7]], dtype=torch.int32),
         )
         self.assertTrue(coordinator._skip_first_backup[0])
+
+    def test_dspark_prefix_commit_uses_captured_lengths_after_publish(self):
+        for commits, destinations, routes in (
+            ([1, 3], [24, 27, 28, 29, 46, 47, 45, 49], [24, 0, 0, 0, 0, 0, 45, 0]),
+            ([0, 4], [26, 27, 28, 29, 46, 47, 48, 45], [0, 0, 0, 0, 0, 0, 0, 45]),
+        ):
+            with self.subTest(commit_lens=commits):
+                coordinator = object.__new__(HiSparseCoordinator)
+                coordinator.device_buffer_size = 5
+                coordinator.req_to_device_buffer = torch.tensor(
+                    [list(range(20, 33)), list(range(40, 53))], dtype=torch.int64
+                )
+                coordinator.req_device_buffer_tokens = torch.full(
+                    (2, 2, 13), -1, dtype=torch.int32
+                )
+                coordinator.req_device_buffer_token_locs = (
+                    coordinator.req_to_device_buffer.to(torch.int32)
+                    .unsqueeze(0)
+                    .repeat(2, 1, 1)
+                )
+                coordinator._skip_first_backup = [False, False]
+                verify_locs = torch.tensor(
+                    [50, 51, 52, 53, 60, 61, 62, 63], dtype=torch.int64
+                )
+                req_to_token = torch.zeros((2, 16), dtype=torch.int64)
+                req_to_token[0, 4:8] = verify_locs[:4]
+                req_to_token[1, 7:11] = verify_locs[4:]
+                coordinator.req_to_token_pool = SimpleNamespace(
+                    req_to_token=req_to_token
+                )
+                mapping = torch.zeros(128, dtype=torch.int64)
+                mapping[verify_locs] = torch.tensor([26, 27, 28, 29, 46, 47, 48, 49])
+                coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+                    full_to_hisparse_device_index_mapping=mapping
+                )
+                coordinator.mem_pool_device = SimpleNamespace(
+                    transfer_values_on_device=MagicMock()
+                )
+                coordinator.req_to_host_pool = torch.stack(
+                    (torch.arange(1000, 1016), torch.arange(2000, 2016))
+                )
+                spec_swap = object.__new__(HiSparseSpecSwapManager)
+                spec_swap._coordinator = coordinator
+                spec_swap._backup_device_locs_to_host = MagicMock()
+                prefixes = torch.tensor([4, 7])
+                commit_lens = torch.tensor(commits, dtype=torch.int32)
+                batch = SimpleNamespace(
+                    forward_mode=SimpleNamespace(is_idle=lambda: False),
+                    req_pool_indices=torch.tensor([0, 1]),
+                    out_cache_loc=verify_locs,
+                    # Publishing has advanced the batch; host positions still
+                    # start at the prefix captured before target verification.
+                    seq_lens=prefixes + commit_lens,
+                    reqs=[
+                        SimpleNamespace(kv=SimpleNamespace(req_pool_idx=i))
+                        for i in range(2)
+                    ],
+                )
+
+                spec_swap.commit_accepted_prefix(
+                    batch, prefix_lens=prefixes, commit_lens=commit_lens
+                )
+
+                transfer = coordinator.mem_pool_device.transfer_values_on_device
+                torch.testing.assert_close(
+                    transfer.call_args.kwargs["src_indices"],
+                    torch.tensor([26, 27, 28, 29, 46, 47, 48, 49]),
+                )
+                torch.testing.assert_close(
+                    transfer.call_args.kwargs["dst_indices"],
+                    torch.tensor(destinations),
+                )
+                host_locs, device_locs = (
+                    spec_swap._backup_device_locs_to_host.call_args.args
+                )
+                torch.testing.assert_close(
+                    host_locs,
+                    torch.tensor([1004, 1005, 1006, 1007, 2007, 2008, 2009, 2010]),
+                )
+                torch.testing.assert_close(device_locs, torch.tensor(destinations))
+                torch.testing.assert_close(mapping[verify_locs], torch.tensor(routes))
+                self.assertEqual(coordinator._skip_first_backup, [True, True])
 
 
 if __name__ == "__main__":

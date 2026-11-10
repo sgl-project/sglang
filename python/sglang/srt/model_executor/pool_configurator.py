@@ -38,7 +38,6 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
-from sglang.srt.mem_cache.allocator.hisparse import HiSparseSpecLayout
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
@@ -406,7 +405,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if dcp_size is None:
             dcp_size = get_parallel().attn_dcp_size
 
-        if kvc.use_mla_backend:
+        if kvc.modelslim_cache_layout is not None:
+            cell_size = (
+                kvc.modelslim_cache_layout.bytes_per_token * effective_num_layers
+            )
+        elif kvc.use_mla_backend:
             if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
                 # NPU sparse KV offload uses an index-only device pool.
                 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
@@ -428,16 +431,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim,
             )
 
-            if kvc.modelslim_cache_layout is not None:
-                per_layer_bytes = kvc.modelslim_cache_layout.bytes_per_token
-            else:
-                per_layer_bytes = (
-                    calculate_mla_kv_cache_dim(
-                        model_config=model_config,
-                        kv_cache_dtype=kv_cache_dtype,
-                    )
-                    * kv_size
+            per_layer_bytes = (
+                calculate_mla_kv_cache_dim(
+                    model_config=model_config,
+                    kv_cache_dtype=kv_cache_dtype,
                 )
+                * kv_size
+            )
             cell_size = per_layer_bytes * effective_num_layers
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
@@ -1144,7 +1144,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
-    _hisparse_spec_layout = None
     # A subclass that adds the draft's KV to the per-token bytes itself sets this,
     # replacing the (T+D)/T inflation.
     _draft_kv_priced_exactly = False
@@ -1228,16 +1227,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if get_memory().enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            hisparse = parse_hisparse_config()
-            self.c4_shrink_factor = hisparse.host_to_device_ratio
-            if self.is_speculative and not kvc.is_draft_worker:
-                self._hisparse_spec_layout = HiSparseSpecLayout(
-                    hot_slots=hisparse.device_buffer_size,
-                    page_size=self.page_size // 4,
-                    compress_ratio=4,
-                    verify_width=get_spec().speculative_num_draft_tokens,
-                    top_k=getattr(cfg.hf_text_config, "index_topk", hisparse.top_k),
-                )
+            self.c4_shrink_factor = parse_hisparse_config().host_to_device_ratio
         else:
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
@@ -1636,14 +1626,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             return max_running_requests + self.disaggregation_decode_extra_slots + 1
         return max_running_requests + 1
 
-    def _hisparse_spec_fixed_bytes(self, max_running_requests: int) -> int:
-        if self._hisparse_spec_layout is None:
-            return 0
-        return self._hisparse_spec_layout.fixed_state_bytes(
-            num_layers=self.num_layers(4),
-            num_req_slots=self._get_num_req_slots(max_running_requests),
-        )
-
     def _get_c128_state_fixed_bytes(self, max_running_requests: int) -> int:
         num_layers = self.num_layers(128)
         if num_layers == 0:
@@ -1793,9 +1775,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_state_fixed_bytes = self._fixed_c4_state_bytes(
             max_running_requests_per_worker
         )
-        hisparse_spec_fixed_bytes = self._hisparse_spec_fixed_bytes(
-            max_running_requests_per_worker
-        )
 
         swa_fixed_bytes = self._get_swa_fixed_bytes()
         fixed_bytes = (
@@ -1804,7 +1783,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             + swa_fixed_bytes
             + swa_ring_fixed_bytes
             + c4_state_fixed_bytes
-            + hisparse_spec_fixed_bytes
         )
         available_bytes_for_tokens = max(available_bytes - fixed_bytes, 0)
         full_token = int(available_bytes_for_tokens / self.bytes_per_full_token)
@@ -1838,7 +1816,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             f"swa_fixed={swa_fixed_bytes / (1 << 30):.2f} GB, "
             f"swa_ring_fixed={swa_ring_fixed_bytes / (1 << 30):.2f} GB, "
             f"c4_state_fixed={c4_state_fixed_bytes / (1 << 30):.2f} GB, "
-            f"hisparse_spec_fixed={hisparse_spec_fixed_bytes / (1 << 30):.2f} GB, "
             f"full_token={sizes.full_max_total_num_tokens}"
         )
         return self._to_config(sizes)

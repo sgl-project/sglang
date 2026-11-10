@@ -45,7 +45,6 @@ def _jit_spec_module(
     hot_buffer_size: int,
     num_steps: int,
     record_miss_plan: bool,
-    is_dsv4_layout: bool = False,
     pass_through_device_locs: bool = False,
     late_bound_host_base: bool = False,
     workspace_capacity: int | None = None,
@@ -58,7 +57,6 @@ def _jit_spec_module(
         num_steps,
         record_miss_plan,
         is_arch_support_pdl(),
-        is_dsv4_layout,
         pass_through_device_locs,
         late_bound_host_base,
         workspace_capacity if workspace_capacity is not None else num_steps * num_top_k,
@@ -74,6 +72,11 @@ def _jit_spec_module(
             )
         ],
     )
+
+
+# Mirrors the static_asserts in kvcacheio/hisparse_spec.cuh.
+SPEC_SWAP_MAX_STEPS = 8
+SPEC_SWAP_MAX_OCCURRENCES = 16384
 
 
 def load_cache_to_device_buffer_spec_mla(
@@ -92,7 +95,6 @@ def load_cache_to_device_buffer_spec_mla(
     miss_src: torch.Tensor | None = None,
     miss_dst: torch.Tensor | None = None,
     miss_count: torch.Tensor | None = None,
-    is_dsv4_layout: bool = False,
     device_locs: torch.Tensor | None = None,
     host_binding: torch.Tensor | None = None,
 ) -> None:
@@ -107,31 +109,16 @@ def load_cache_to_device_buffer_spec_mla(
     [host base address, row stride in bytes] for the shared HiCache host pool.
     """
     _, num_steps, num_top_k = top_k_tokens.shape
-    if is_dsv4_layout:
-        if num_steps < 2 or num_top_k <= 0 or num_steps * num_top_k > 8192:
-            raise ValueError(
-                "HiSparse speculative swap requires at least two steps, positive "
-                f"top_k, and steps * top_k <= 8192, got {num_steps} * {num_top_k}."
-            )
-        if device_locs is not None or host_binding is not None:
-            raise ValueError(
-                "HiSparse C4 speculative transfers require a private host cache."
-            )
-    elif not 2 <= num_steps <= 4 and not (num_steps == 1 and device_locs is not None):
+    if not 2 <= num_steps <= SPEC_SWAP_MAX_STEPS and not (
+        num_steps == 1 and device_locs is not None
+    ):
         raise ValueError(
-            f"HiSparse speculative swap requires 2-4 steps, or one resident-device step; got {num_steps}."
+            f"HiSparse speculative swap requires 2-{SPEC_SWAP_MAX_STEPS} steps, "
+            f"or one resident-device step; got {num_steps}."
         )
     hot_buffer_size = state.cache_policy.size(1)
     page_size = device_buffer_tokens.size(1) - hot_buffer_size
-    # C4 rows are split into value and scale runs inside a padded page.
-    # The paged copy computes both addresses and ignores the linear stride.
-    item_size_bytes = (
-        584
-        if is_dsv4_layout
-        else device_buffer.stride(0) * device_buffer.element_size()
-    )
-    if is_dsv4_layout and page_size != 64:
-        raise ValueError("HiSparse C4 speculative transfers require 64-slot V4 pages.")
+    item_size_bytes = device_buffer.stride(0) * device_buffer.element_size()
     if host_cache is None and host_binding is None:
         raise ValueError(
             "HiSparse swap requires a host cache or a late-bound host address."
@@ -155,10 +142,8 @@ def load_cache_to_device_buffer_spec_mla(
         or host_binding.device != device_buffer.device
     ):
         raise ValueError("host_binding must be a contiguous GPU int64 pair.")
-    if (
-        not is_dsv4_layout
-        and host_binding is None
-        and (host_cache.stride(0) * host_cache.element_size() != item_size_bytes)
+    if host_binding is None and (
+        host_cache.stride(0) * host_cache.element_size() != item_size_bytes
     ):
         raise ValueError("Host and device KV row widths must match.")
     if top_k_tokens.size(0) == 0:
@@ -206,11 +191,10 @@ def load_cache_to_device_buffer_spec_mla(
         hot_buffer_size,
         num_steps,
         record_miss_plan,
-        is_dsv4_layout,
         device_locs is not None,
         host_binding is not None,
         # Draft and verification reuse metadata without changing its hash layout.
-        min(8192, state.scratch_state.size(1) // 5),
+        min(SPEC_SWAP_MAX_OCCURRENCES, state.scratch_state.size(1) // 5),
     )
     empty_device = torch.empty(0, device=device_buffer.device)
 
@@ -342,10 +326,7 @@ def transfer_cache_dsv4_mla(
     dst_indices: torch.Tensor,
     block_size: int = 1024,
 ) -> None:
-    """Copy C4 tokens with shared [item] or per-layer [layer, item] indices.
-
-    Negative indices skip a copy, including its value and scale writes.
-    """
+    """Transfer DSv4 C4 tokens between page-padded C4 buffers."""
     module = _jit_dsv4_transfer_module(block_size)
     module.transfer_cache_dsv4_mla(
         src_ptrs,
@@ -705,151 +686,4 @@ def load_cache_to_device_buffer_dsv4_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
-    )
-
-
-def prepare_hisparse_spec_verify(
-    *,
-    req_pool_indices: torch.Tensor,
-    prefix_lens: torch.Tensor,
-    hisparse_out_locs: torch.Tensor,
-    req_to_device_buffer: torch.Tensor,
-    device_buffer_tokens: torch.Tensor,
-    num_real_reqs: torch.Tensor,
-    logical_to_device_mapping: torch.Tensor,
-    verify_width: int,
-    hot_buffer_size: int,
-) -> None:
-    """Bind completed C4 boundaries to the request's fixed verify tail."""
-    batch = req_pool_indices.numel()
-    if hisparse_out_locs.numel() != batch * verify_width:
-        raise ValueError(
-            "HiSparse speculative output locations must contain batch_size * verify_width entries."
-        )
-    assert prefix_lens.shape == req_pool_indices.shape
-    assert device_buffer_tokens.shape[1:] == req_to_device_buffer.shape
-    assert (
-        req_pool_indices.dtype
-        == prefix_lens.dtype
-        == hisparse_out_locs.dtype
-        == torch.int64
-    )
-    assert req_to_device_buffer.dtype == logical_to_device_mapping.dtype == torch.int64
-    assert device_buffer_tokens.dtype == num_real_reqs.dtype == torch.int32
-    assert num_real_reqs.numel() == 1
-    slots = (verify_width + 3) // 4
-    active = torch.arange(batch, device=req_pool_indices.device) < num_real_reqs
-    # Padding may carry an invalid request ID. Mask before every pool lookup.
-    rows = torch.where(active, req_pool_indices, 0)
-    prefix = torch.where(active, prefix_lens, 0)[:, None]
-    old_count = prefix // 4
-    ordinal = torch.arange(slots, device=prefix.device)[None, :]
-    generated = (prefix + verify_width) // 4 - old_count
-    positions = torch.where(
-        active[:, None] & (ordinal < generated), old_count + ordinal, -1
-    ).to(torch.int32)
-    tail = device_buffer_tokens[:, :, hot_buffer_size + 1 : hot_buffer_size + 1 + slots]
-    # Padded rows safely reduce into reserved row zero with neutral value -1.
-    tail.scatter_reduce_(
-        1,
-        rows[None, :, None].expand(tail.size(0), batch, slots),
-        positions[None].expand(tail.size(0), batch, slots),
-        reduce="amax",
-        include_self=False,
-    )
-    seq_lens = prefix + torch.arange(verify_width, device=prefix.device)[None, :] + 1
-    boundary = active[:, None] & (seq_lens % 4 == 0)
-    columns = hot_buffer_size + 1 + (seq_lens // 4 - 1 - old_count).clamp(0, slots - 1)
-    device_locs = req_to_device_buffer[rows[:, None], columns]
-    logical_locs = torch.where(boundary, hisparse_out_locs.view(batch, verify_width), 0)
-    # Mapping zero is the reserved null route, never an allocated C4 location.
-    logical_to_device_mapping.scatter_reduce_(
-        0,
-        logical_locs.flatten(),
-        torch.where(boundary, device_locs, 0).flatten(),
-        reduce="amax",
-        include_self=False,
-    )
-
-
-def finalize_hisparse_spec(
-    *,
-    device_ptrs: torch.Tensor,
-    host_ptrs: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    prefix_lens: torch.Tensor,
-    commit_lens: torch.Tensor,
-    req_to_host_pool: torch.Tensor,
-    device_buffer_locs: torch.Tensor,
-    req_to_token: torch.Tensor,
-    device_buffer_tokens: torch.Tensor,
-    logical_to_device_mapping: torch.Tensor,
-    verify_width: int,
-    hot_buffer_size: int,
-) -> None:
-    """Back up accepted C4 KV, promote persistent entries, then clear verify routes."""
-    assert prefix_lens.shape == commit_lens.shape == req_pool_indices.shape
-    assert device_buffer_locs.shape == device_buffer_tokens.shape
-    assert (
-        req_pool_indices.dtype
-        == prefix_lens.dtype
-        == req_to_host_pool.dtype
-        == torch.int64
-    )
-    assert (
-        commit_lens.dtype
-        == device_buffer_locs.dtype
-        == device_buffer_tokens.dtype
-        == req_to_token.dtype
-        == torch.int32
-    )
-    layers = device_buffer_locs.size(0)
-    rows = req_pool_indices[:, None]
-    ordinal = torch.arange((verify_width + 3) // 4, device=rows.device)[None, :]
-    old_count = prefix_lens[:, None] // 4
-    positions = old_count + ordinal
-    accepted = (prefix_lens[:, None] + commit_lens[:, None]) // 4 - old_count
-    valid = ordinal < accepted
-    sources = device_buffer_locs[:, rows, hot_buffer_size + 1 + ordinal].to(torch.int64)
-    source_plan = torch.where(valid, sources, -1).reshape(layers, -1)
-    host_locs = req_to_host_pool[rows, torch.where(valid, positions, 0)]
-    # Host slot zero can be allocated: rejected entries must skip, never write it.
-    transfer_cache_dsv4_mla(
-        device_ptrs, host_ptrs, source_plan, torch.where(valid, host_locs, -1).flatten()
-    )
-    persistent = valid & ((positions < hot_buffer_size) | (ordinal == accepted - 1))
-    destinations = device_buffer_locs[:, rows, positions.clamp(max=hot_buffer_size)].to(
-        torch.int64
-    )
-    transfer_cache_dsv4_mla(
-        device_ptrs,
-        device_ptrs,
-        torch.where(persistent, sources, -1).reshape(layers, -1),
-        torch.where(persistent, destinations, -1).reshape(layers, -1),
-    )
-
-    # All metadata changes follow both copies on the caller's current stream.
-    tail = device_buffer_tokens[
-        :, :, hot_buffer_size + 1 : hot_buffer_size + 1 + ordinal.numel()
-    ]
-    tail.index_fill_(1, req_pool_indices, -1)
-    hot = valid & (positions < hot_buffer_size)
-    # Invalid hot updates target distinct tail slots, avoiding duplicate writes
-    # to H-1/C when a verify window crosses the end of the hot buffer.
-    columns = torch.where(hot, positions, hot_buffer_size + 1 + ordinal)
-    device_buffer_tokens[:, rows, columns] = torch.where(hot, positions, -1).to(
-        torch.int32
-    )[None]
-    newest = (old_count + accepted - 1).flatten()
-    canonical = device_buffer_tokens[:, req_pool_indices, hot_buffer_size]
-    device_buffer_tokens[:, req_pool_indices, hot_buffer_size] = torch.where(
-        accepted.flatten() > 0,
-        torch.where(newest >= hot_buffer_size, newest, -1).to(torch.int32),
-        canonical,
-    )
-    generated = ordinal < (prefix_lens[:, None] + verify_width) // 4 - old_count
-    boundaries = torch.where(generated, (positions + 1) * 4 - 1, 0)
-    logical_locs = req_to_token[rows, boundaries].to(torch.int64) // 4
-    logical_to_device_mapping.index_fill_(
-        0, torch.where(generated, logical_locs, 0).flatten(), 0
     )
