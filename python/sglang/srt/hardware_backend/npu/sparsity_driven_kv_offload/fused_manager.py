@@ -412,10 +412,27 @@ class FusedSparseKVCacheManager:
         # kv_device: [num_new_tokens, nhead, kv_lora_rank + qk_rope_head_dim]
         src_tensor = torch.cat([k, k_rope], dim=-1).contiguous()
         dst_tensor = self.host_kv_buffer[layer_idx] if self.host_pool is None else None
-        src_index = torch.arange(src_tensor.shape[0], device=device, dtype=torch.long)
         num_src_kvs = int(src_tensor.shape[0])
+        fused_mtp_rows = (
+            device.type == "npu"
+            and not forward_batch.forward_mode.is_extend_without_speculative()
+        )
+        if not fused_mtp_rows:
+            src_index = torch.arange(num_src_kvs, device=device, dtype=torch.long)
 
-        if not forward_batch.forward_mode.is_extend_without_speculative():
+        if fused_mtp_rows:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (
+                mtp_publication_rows,
+            )
+
+            src_index, dst_index, token_positions, valid_mask = mtp_publication_rows(
+                forward_batch,
+                num_src_kvs,
+                self.size,
+                self.logical_max_context_len,
+                self.host_token_capacity,
+            )
+        elif not forward_batch.forward_mode.is_extend_without_speculative():
             req_ids, token_pos, valid_mask = prepare_mtp_rows(
                 forward_batch, num_src_kvs, self.size, self.logical_max_context_len
             )
@@ -545,10 +562,11 @@ class FusedSparseKVCacheManager:
                 )
             valid_mask = valid_mask.contiguous()
 
-        dst_index = forward_batch.out_cache_loc.to(torch.long).reshape(-1)
-        valid_mask = (
-            valid_mask & (dst_index >= 0) & (dst_index < self.host_token_capacity)
-        )
+        if not fused_mtp_rows:
+            dst_index = forward_batch.out_cache_loc.to(torch.long).reshape(-1)
+            valid_mask = (
+                valid_mask & (dst_index >= 0) & (dst_index < self.host_token_capacity)
+            )
         if dst_tensor is not None:
             assert src_tensor.shape[1:] == dst_tensor.shape[2:]
         assert src_index.shape == dst_index.shape == valid_mask.shape

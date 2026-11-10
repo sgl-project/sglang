@@ -36,6 +36,15 @@ def exact(actual, expected):
         torch.testing.assert_close(a.cpu(), b.cpu(), rtol=0, atol=0)
 
 
+def checkpoint(args, results):
+    if args.output:
+        args.output.write_text(json.dumps(results, indent=2) + "\n")
+    print(
+        f"CHECKPOINT cases={len(results['cases'])} benchmarks={len(results['benchmarks'])}",
+        flush=True,
+    )
+
+
 def mode(name):
     return SimpleNamespace(
         is_target_verify=lambda: name == "verify",
@@ -63,6 +72,27 @@ def mtp_reference(batch, q, request_rows, context):
     if batch.out_cache_loc is not None:
         valid &= batch.out_cache_loc[: b * q].view(b, q) >= 0
     return slots, pos, valid
+
+
+def publication_reference(batch, q, request_rows, context, capacity, prepare_rows=None):
+    n = batch.positions.numel()
+    slots, positions, valid = (
+        mtp_reference(batch, q, request_rows, context)
+        if prepare_rows is None
+        else prepare_rows(batch, n, request_rows, context)
+    )
+    padding = n - slots.numel()
+    # The original publication path also materializes and pads request IDs.
+    torch.nn.functional.pad(slots.reshape(-1).contiguous(), (0, padding), value=0)
+    positions = torch.nn.functional.pad(
+        positions.reshape(-1).contiguous(), (0, padding), value=-1
+    )
+    valid = torch.nn.functional.pad(
+        valid.reshape(-1).contiguous(), (0, padding), value=False
+    )
+    destination = batch.out_cache_loc.long().reshape(-1)
+    valid = valid & (destination >= 0) & (destination < capacity)
+    return torch.arange(n, device=destination.device), destination, positions, valid
 
 
 def copy_reference(sources, destinations, source_rows, destination_rows, valid):
@@ -198,6 +228,7 @@ def main():
         import torch_npu  # noqa: F401
 
         torch.npu.set_device(0)
+    load(PKG + ".mtp", SOURCE / "mtp.py")
     kernels = load(PKG + ".row_metadata", SOURCE / "row_metadata.py")
     results = {
         "device": args.device,
@@ -211,6 +242,7 @@ def main():
         "reference_source": str(args.reference_source),
         "cases": [],
         "benchmarks": {},
+        "complete": False,
     }
     torch.manual_seed(1703)
     d = args.device
@@ -242,17 +274,27 @@ def main():
                 ref = lambda: mtp_reference(batch, q, 32, 128)
                 fused = lambda: kernels.mtp_rows(batch, q, 32, 128)
                 exact(fused(), ref())
+                pub_ref = lambda: publication_reference(batch, q, 32, 128, 32)
+                pub = lambda: kernels.mtp_publication_rows(
+                    batch, batch.positions.numel(), 32, 128, 32
+                )
+                exact(pub(), pub_ref())
                 if d == "npu" and b == 16 and dtype == torch.int32:
                     graph, output = replay(fused, ref)
+                    pub_graph, pub_output = replay(pub, pub_ref)
                     batch.positions.add_(1)
                     graph.replay()
+                    pub_graph.replay()
                     torch.npu.synchronize()
                     exact(output, ref())
+                    exact(pub_output, pub_ref())
                 results["cases"].append(f"mtp/{dtype}/{b}/{q}/{kind}")
+                results["cases"].append(f"mtp-publication/{dtype}/{b}/{q}/{kind}")
                 if args.benchmark and b == 16 and dtype == torch.int32:
                     results["benchmarks"][f"mtp/{kind}/B{b}Q{q}"] = measure(
                         ref, fused, d, 100
                     )
+                checkpoint(args, results)
     # Non-unit input strides and optional location tensors have the same ABI.
     if args.benchmark and args.reference_source:
         old_mtp = load(
@@ -277,6 +319,15 @@ def main():
             results["benchmarks"][f"prepare_mtp_rows/{kind}/B16Q4/context67584"] = (
                 measure(ref, fused, d, 100)
             )
+            pub_ref = lambda: publication_reference(
+                batch, 4, 17, 67584, 163840, old_mtp.prepare_mtp_rows
+            )
+            pub = lambda: kernels.mtp_publication_rows(batch, 64, 17, 67584, 163840)
+            exact(pub(), pub_ref())
+            results["benchmarks"][f"mtp_publication_rows/{kind}/B16Q4/context67584"] = (
+                measure(pub_ref, pub, d, 100)
+            )
+            checkpoint(args, results)
     for kind in ("decode", "verify", "draft"):
         q = 1 if kind == "decode" else 4
         batch = SimpleNamespace(
@@ -291,6 +342,7 @@ def main():
         )
         exact(kernels.mtp_rows(batch, q, 32, 128), mtp_reference(batch, q, 32, 128))
         results["cases"].append(f"mtp/strided/{kind}/no-locations")
+        checkpoint(args, results)
     for n in (1, 65, 1024, 8192):
         sources = [
             torch.empty((32, 1, w), dtype=torch.bfloat16, device=d) for w in (512, 64)
@@ -317,6 +369,7 @@ def main():
         results["cases"].append(f"copy_rows/{n}")
         if args.benchmark:
             results["benchmarks"][f"copy_rows/{n}"] = measure(ref, fused, d, 100)
+        checkpoint(args, results)
     src = torch.arange(66, device=d, dtype=torch.int32)[::2]
     dst = torch.arange(99, device=d, dtype=torch.int64)[::3]
     valid = torch.arange(132, device=d)[::4] % 3 != 0
@@ -325,6 +378,7 @@ def main():
         copy_reference(sources, destinations, src, dst, valid),
     )
     results["cases"].append("copy_rows/strided")
+    checkpoint(args, results)
     for req, lens, prefixes, extends, slots in (
         ([1, 2], [4, 4], [2, 2], [2, 2], [2, 2]),
         ([1, 2], [3, 4], [2, 2], [1, 2], [2, 2]),
@@ -380,10 +434,12 @@ def main():
             )
             exact(fused(), ref())
             results["cases"].append(f"mapping/{req}/{variation}")
+            checkpoint(args, results)
     if d == "npu":
         large_prefill_cases(args, kernels, results)
     if args.mf:
         mf_case(args, results)
+    results["complete"] = True
     print(json.dumps(results, indent=2), flush=True)
     if args.output:
         args.output.write_text(json.dumps(results, indent=2) + "\n")
@@ -533,6 +589,7 @@ def large_prefill_cases(args, kernels, results):
                         30,
                     )
                 )
+        checkpoint(args, results)
 
 
 def mf_case(args, results):
@@ -601,6 +658,7 @@ def mf_case(args, results):
         results["benchmarks"]["MF/copy_rows/transport/B16Q4"] = measure(
             ref, fused, d, 100
         )
+    checkpoint(args, results)
 
 
 if __name__ == "__main__":

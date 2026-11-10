@@ -15,15 +15,9 @@ def sparse_query_width(forward_batch):
     return width
 
 
-def prepare_mtp_rows(forward_batch, num_tokens, request_rows, context_len):
-    """Return [B,Q] request IDs, absolute positions and live-query masks.
-
-    seq_lens is the prefix length in draft/verify, whereas positions already
-    includes the draft step. Draft-extend has a fixed Q stride but only its
-    num_accept_tokens leading columns contain KV to publish.
-    """
-    token_to_slots = forward_batch.req_pool_indices
-    batch = token_to_slots.numel()
+def mtp_row_geometry(forward_batch, num_tokens):
+    """Validate the fixed request window independently of TP suffix padding."""
+    batch = forward_batch.req_pool_indices.numel()
     query_width = getattr(forward_batch.spec_info, "num_tokens_per_req", -1)
     if not (
         forward_batch.forward_mode.is_target_verify()
@@ -39,6 +33,18 @@ def prepare_mtp_rows(forward_batch, num_tokens, request_rows, context_len):
         raise ValueError("Sparse MTP query window exceeds the padded token rows")
     if forward_batch.positions.numel() != num_tokens:
         raise ValueError("Sparse MTP requires one absolute position per query")
+    return batch, query_width, logical_tokens
+
+
+def prepare_mtp_rows(forward_batch, num_tokens, request_rows, context_len):
+    """Return [B,Q] request IDs, absolute positions and live-query masks.
+
+    seq_lens is the prefix length in draft/verify, whereas positions already
+    includes the draft step. Draft-extend has a fixed Q stride but only its
+    num_accept_tokens leading columns contain KV to publish.
+    """
+    batch, query_width, logical_tokens = mtp_row_geometry(forward_batch, num_tokens)
+    token_to_slots = forward_batch.req_pool_indices
     if token_to_slots.device.type == "npu":
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (
             mtp_rows,

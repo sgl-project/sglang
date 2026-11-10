@@ -17,7 +17,9 @@ def _mtp_rows_kernel(
     slots_out,
     positions_out,
     valid_out,
+    destination_out,
     N: tl.constexpr,
+    OUT_N: tl.constexpr,
     Q: tl.constexpr,
     REQUEST_ROWS: tl.constexpr,
     CONTEXT: tl.constexpr,
@@ -28,6 +30,8 @@ def _mtp_rows_kernel(
     POS_STRIDE: tl.constexpr,
     LOC_STRIDE: tl.constexpr,
     COUNT_STRIDE: tl.constexpr,
+    PUBLISH: tl.constexpr,
+    HOST_CAPACITY: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -41,31 +45,55 @@ def _mtp_rows_kernel(
         count = tl.load(counts + row * COUNT_STRIDE, i < N, other=0)
         live = live & (i % Q < count)
     if HAS_LOC:
-        loc = tl.load(locations + i * LOC_STRIDE, i < N, other=-1)
+        loc = tl.load(locations + i * LOC_STRIDE, i < OUT_N, other=-1).to(tl.int64)
         live = live & (loc >= 0)
-    tl.store(slots_out + i, req, i < N)
-    tl.store(positions_out + i, pos, i < N)
-    tl.store(valid_out + i, live, i < N)
+    if PUBLISH:
+        live = live & (loc < HOST_CAPACITY) & (i < N)
+        tl.store(slots_out + i, i, i < OUT_N)
+        tl.store(destination_out + i, loc, i < OUT_N)
+    else:
+        tl.store(slots_out + i, req, i < OUT_N)
+    tl.store(positions_out + i, pos, i < OUT_N)
+    tl.store(valid_out + i, live, i < OUT_N)
 
 
-def mtp_rows(batch, query_width, request_rows, context_len):
+def mtp_rows(
+    batch,
+    query_width,
+    request_rows,
+    context_len,
+    *,
+    publication_rows=None,
+    host_capacity=0,
+):
     """Materialize request IDs, positions and masks in a single device launch."""
-    shape = (batch.req_pool_indices.numel(), query_width)
+    logical_tokens = batch.req_pool_indices.numel() * query_width
+    shape = (
+        (batch.req_pool_indices.numel(), query_width)
+        if publication_rows is None
+        else (publication_rows,)
+    )
     slots = torch.empty(shape, dtype=torch.long, device=batch.positions.device)
     positions = torch.empty_like(slots)
     valid = torch.empty(shape, dtype=torch.bool, device=slots.device)
+    destination = torch.empty_like(slots) if publication_rows is not None else None
     draft = batch.forward_mode.is_draft_extend_v2()
     counts = batch.spec_info.num_accept_tokens if draft else None
-    locations = batch.out_cache_loc
+    input_positions = batch.positions.reshape(-1)
+    locations = (
+        batch.out_cache_loc.reshape(-1) if batch.out_cache_loc is not None else None
+    )
     _mtp_rows_kernel[(triton.cdiv(slots.numel(), 256),)](
         batch.req_pool_indices,
         batch.seq_lens,
-        batch.positions,
+        input_positions,
         locations,
         counts,
         slots,
         positions,
         valid,
+        destination,
+        logical_tokens,
         slots.numel(),
         query_width,
         request_rows,
@@ -74,12 +102,35 @@ def mtp_rows(batch, query_width, request_rows, context_len):
         draft,
         batch.req_pool_indices.stride(0),
         batch.seq_lens.stride(0),
-        batch.positions.stride(0),
+        input_positions.stride(0),
         locations.stride(0) if locations is not None else 0,
         counts.stride(0) if counts is not None else 0,
+        publication_rows is not None,
+        host_capacity,
         256,
     )
+    if publication_rows is not None:
+        return slots, destination, positions, valid
     return slots, positions, valid
+
+
+def mtp_publication_rows(batch, num_tokens, request_rows, context_len, host_capacity):
+    """Fuse MTP masks, TP padding, physical bounds and publication indices."""
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
+        mtp_row_geometry,
+    )
+
+    _, width, _ = mtp_row_geometry(batch, num_tokens)
+    if batch.out_cache_loc is None or batch.out_cache_loc.numel() != num_tokens:
+        raise ValueError("Sparse MTP publication requires one physical row per token")
+    return mtp_rows(
+        batch,
+        width,
+        request_rows,
+        context_len,
+        publication_rows=num_tokens,
+        host_capacity=host_capacity,
+    )
 
 
 @triton.jit
