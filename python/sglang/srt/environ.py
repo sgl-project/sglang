@@ -1286,6 +1286,11 @@ class Envs:
     SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
+    # On by default; set SGLANG_ENABLE_FP8_SMALL_M_W8A16=0 as a kill switch.
+    # SM10x W8A16 GEMM for the block-FP8 decode projections at M <= 16
+    # (kernels/ops/gemm/fused_a_gemm.py). An explicit --fp8-gemm-backend also
+    # keeps every layer on that backend.
+    SGLANG_ENABLE_FP8_SMALL_M_W8A16 = EnvBool(True)
 
     # ===================================================================
     # Humming quantization

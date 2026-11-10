@@ -12,6 +12,10 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.gemm.fused_a_gemm import (
+    fp8_small_m_eligible,
+    fp8_small_m_linear,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     is_fp8_fnuz,
@@ -777,6 +781,8 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        # Per layer, not on self: a DCP q_b_proj replica shares this method.
+        layer.small_m_w8a16 = False
         if self.use_npu_block_fp8:
             # G-B consumes checkpoint-layout E4M3 weights and FP32 scales.
             return
@@ -980,6 +986,10 @@ class Fp8LinearMethod(LinearMethodBase):
             if scale_reordered is not layer.weight_scale_inv.data:
                 with torch.no_grad():
                     layer.weight_scale_inv.set_(scale_reordered)
+
+        layer.small_m_w8a16 = fp8_small_m_eligible(
+            layer=layer, weight_block_size=self.weight_block_size
+        )
 
     def _maybe_prepare_dense_mxscale(self, layer: Module) -> None:
         """SGLANG_DSV4_DENSE_MXSCALE: give a (16, 16)-preshuffled 128x128 block-fp8
@@ -1499,6 +1509,11 @@ class Fp8LinearMethod(LinearMethodBase):
                     x.dtype,
                     True,  # is_vnni
                 )
+
+            if layer.small_m_w8a16 and bias is None and not isinstance(x, tuple):
+                small_m_out = fp8_small_m_linear(layer, x)
+                if small_m_out is not None:
+                    return small_m_out
 
             cached_weight = getattr(layer, "_block_fp8_bf16_weight", None)
             extra_kwargs = (
