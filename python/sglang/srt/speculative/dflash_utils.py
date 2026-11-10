@@ -324,13 +324,15 @@ def _get_or_create_chain_verify_buffers(
         retrieve_next_sibling = torch.full(
             (new_cap, draft_token_num), -1, dtype=torch.int64, device=device
         )
-        predicts = torch.empty(
+        # The accept kernel skips rows with no verify candidates (padded graph
+        # rows); zeros keep their first-use slots in range for the bonus gather.
+        predicts = torch.zeros(
             (new_cap * draft_token_num,), dtype=torch.int32, device=device
         )
-        accept_index = torch.empty(
+        accept_index = torch.zeros(
             (new_cap, draft_token_num), dtype=torch.int32, device=device
         )
-        accept_token_num = torch.empty((new_cap,), dtype=torch.int32, device=device)
+        accept_token_num = torch.zeros((new_cap,), dtype=torch.int32, device=device)
         cached = {
             "cap_bs": int(new_cap),
             "retrieve_index": retrieve_index,
@@ -945,6 +947,7 @@ def apply_dflash_simulated_acceptance(
     simulate_acc_token_mode: str,
     next_token_logits: Optional[torch.Tensor] = None,
     fixed_token_id: int = 100,
+    generator: Optional[torch.Generator] = None,
 ) -> None:
     """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob).
     ``next_token_logits`` gives the target argmax when ``target_predict`` is None."""
@@ -955,7 +958,7 @@ def apply_dflash_simulated_acceptance(
 
     # sample_simulated_acc_len clamps to [1, block_size].
     forced_commit_len = sample_simulated_acc_len(
-        simulate_acc_len, simulate_acc_method, block_size
+        simulate_acc_len, simulate_acc_method, block_size, generator=generator
     )
     forced_accept_len = forced_commit_len - 1
 

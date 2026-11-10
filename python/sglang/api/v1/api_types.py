@@ -378,6 +378,7 @@ class GenerateMetaInfo(msgspec.Struct, kw_only=True, frozen=True):
     audio_tokens: Optional[int] = None
     video_tokens: Optional[int] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
+    dp_rank: Optional[int] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateMetaInfo":
@@ -739,6 +740,8 @@ class GetModelInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     load_format: Optional[str] = None
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
+    model_type: Optional[str] = None
+    architectures: List[str] = []
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GetModelInfoResponse":
@@ -778,6 +781,9 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     incremental_streaming_output: bool = False
     disaggregation_mode: str = ""
     deployment_info: Optional[DeploymentInfo] = None
+    allow_auto_truncate: bool = False
+    skip_tokenizer_init: bool = False
+    num_reserved_tokens: int = 0
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GetServerInfoResponse":
@@ -811,6 +817,7 @@ class DeploymentInfo(msgspec.Struct, kw_only=True, frozen=True):
     hicache_write_policy: Optional[str] = None
     hicache_host_total_tokens: Optional[int] = None
     kv_event_sources: List[KvEventSource] = []
+    node_listeners: List[NodeRustListener] = []
 
     @classmethod
     def from_json_value(cls, value: Any) -> "DeploymentInfo":
@@ -820,6 +827,24 @@ class DeploymentInfo(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_DeploymentInfo(self)
+
+
+class NodeRustListener(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.NodeRustListener: JSON object (unknown keys ignored)."""
+
+    port_offset: int = 0
+    dp_rank: int = 0
+    http_port: int = 0
+    grpc_port: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "NodeRustListener":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_NodeRustListener(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_NodeRustListener(self)
 
 
 class KvEventSource(msgspec.Struct, kw_only=True, frozen=True):
@@ -1806,6 +1831,8 @@ def decode_GenerateMetaInfo(value: Any) -> GenerateMetaInfo:
             kw["video_tokens"] = None if x is None else _expect_uint(x, expected="u32")
         elif key == "cached_tokens_details":
             kw["cached_tokens_details"] = None if x is None else decode_CachedTokensDetails(x)
+        elif key == "dp_rank":
+            kw["dp_rank"] = None if x is None else _expect_uint(x, expected="u32")
     return GenerateMetaInfo(**kw)
 
 
@@ -1846,6 +1873,7 @@ def encode_GenerateMetaInfo(v: GenerateMetaInfo) -> Dict[str, Any]:
     if v.video_tokens is not None:
         d["video_tokens"] = v.video_tokens
     d["cached_tokens_details"] = None if v.cached_tokens_details is None else encode_CachedTokensDetails(v.cached_tokens_details)
+    d["dp_rank"] = v.dp_rank
     return d
 
 
@@ -2373,6 +2401,10 @@ def decode_GetModelInfoResponse(value: Any) -> GetModelInfoResponse:
             kw["reasoning_parser"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "tool_call_parser":
             kw["tool_call_parser"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "model_type":
+            kw["model_type"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "architectures":
+            kw["architectures"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
     return GetModelInfoResponse(**kw)
 
 
@@ -2387,6 +2419,9 @@ def encode_GetModelInfoResponse(v: GetModelInfoResponse) -> Dict[str, Any]:
     d["load_format"] = v.load_format
     d["reasoning_parser"] = v.reasoning_parser
     d["tool_call_parser"] = v.tool_call_parser
+    d["model_type"] = v.model_type
+    if v.architectures:
+        d["architectures"] = list(v.architectures)
     return d
 
 
@@ -2428,6 +2463,12 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
             kw["disaggregation_mode"] = _expect_str(x, expected="a string")
         elif key == "deployment_info":
             kw["deployment_info"] = None if x is None else decode_DeploymentInfo(x)
+        elif key == "allow_auto_truncate":
+            kw["allow_auto_truncate"] = _expect_bool(x, expected="a boolean")
+        elif key == "skip_tokenizer_init":
+            kw["skip_tokenizer_init"] = _expect_bool(x, expected="a boolean")
+        elif key == "num_reserved_tokens":
+            kw["num_reserved_tokens"] = _expect_uint(x, expected="u64")
     return GetServerInfoResponse(**kw)
 
 
@@ -2448,6 +2489,9 @@ def encode_GetServerInfoResponse(v: GetServerInfoResponse) -> Dict[str, Any]:
     d["disaggregation_mode"] = v.disaggregation_mode
     if v.deployment_info is not None:
         d["deployment_info"] = encode_DeploymentInfo(v.deployment_info)
+    d["allow_auto_truncate"] = v.allow_auto_truncate
+    d["skip_tokenizer_init"] = v.skip_tokenizer_init
+    d["num_reserved_tokens"] = v.num_reserved_tokens
     return d
 
 
@@ -2493,6 +2537,8 @@ def decode_DeploymentInfo(value: Any) -> DeploymentInfo:
             kw["hicache_host_total_tokens"] = None if x is None else _expect_uint(x, expected="u64")
         elif key == "kv_event_sources":
             kw["kv_event_sources"] = [] if x is None else [decode_KvEventSource(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "node_listeners":
+            kw["node_listeners"] = [] if x is None else [decode_NodeRustListener(e) for e in _expect_seq(x, expected="a sequence")]
     return DeploymentInfo(**kw)
 
 
@@ -2527,6 +2573,33 @@ def encode_DeploymentInfo(v: DeploymentInfo) -> Dict[str, Any]:
         d["hicache_host_total_tokens"] = v.hicache_host_total_tokens
     if v.kv_event_sources:
         d["kv_event_sources"] = [encode_KvEventSource(e) for e in v.kv_event_sources]
+    if v.node_listeners:
+        d["node_listeners"] = [encode_NodeRustListener(e) for e in v.node_listeners]
+    return d
+
+
+def decode_NodeRustListener(value: Any) -> NodeRustListener:
+    m = _expect_map(value, expected="struct NodeRustListener")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "port_offset":
+            kw["port_offset"] = _expect_uint(x, expected="u32")
+        elif key == "dp_rank":
+            kw["dp_rank"] = _expect_uint(x, expected="u32")
+        elif key == "http_port":
+            kw["http_port"] = _expect_uint(x, expected="u32")
+        elif key == "grpc_port":
+            kw["grpc_port"] = None if x is None else _expect_uint(x, expected="u32")
+    return NodeRustListener(**kw)
+
+
+def encode_NodeRustListener(v: NodeRustListener) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["port_offset"] = v.port_offset
+    d["dp_rank"] = v.dp_rank
+    d["http_port"] = v.http_port
+    if v.grpc_port is not None:
+        d["grpc_port"] = v.grpc_port
     return d
 
 
