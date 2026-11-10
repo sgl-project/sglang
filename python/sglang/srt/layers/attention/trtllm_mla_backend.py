@@ -50,7 +50,6 @@ from sglang.kernels.ops.attention.utils import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
-from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
@@ -78,7 +77,6 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.speculative.dflash_utils import mla_draft_compact_window_narrows
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
 
 if is_flashinfer_available():
@@ -306,21 +304,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self._window_counter_buffer = None
         self._window_row_indptr = None
 
-        self._megakernel = megakernel_enabled()
-        # A compact draft req_to_token holds the committed suffix at [0, seq_len)
-        # followed by the draft block.
-        draft_window = get_spec().speculative_draft_window_size
-        parallel = get_parallel()
-        self._compact_draft_window = (
-            draft_window
-            if draft_window is not None
-            and mla_draft_compact_window_narrows(
-                dcp_size=parallel.dcp_size if parallel.dcp_enabled else 1,
-                page_size=self.page_size,
-                megakernel=self._megakernel,
-            )
-            else None
-        )
         # Without DCP the window path drops the LSE and every row owns a key.
         self._swa_need_lse = get_parallel().dcp_enabled or not (
             envs.SGLANG_OPT_DFLASH_SWA_SKIP_LSE.get()
@@ -1472,12 +1455,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self._window_index_cache = (forward_batch, layer.layer_id, *cache[2:])
             return cache[2], cache[3]
         parallel = get_parallel()
-        positions, window_left = self._window_key_positions(layer, forward_batch)
         indices, counts = mla_window_sparse_indices(
             req_to_token=self.req_to_token,
             req_pool_indices=forward_batch.req_pool_indices,
-            positions=positions,
-            window_left=window_left,
+            positions=forward_batch.positions,
+            window_left=layer.sliding_window_size,
             dcp_size=parallel.dcp_size if parallel.dcp_enabled else 1,
             dcp_rank=parallel.dcp_rank if parallel.dcp_enabled else 0,
             page_size=self.page_size,
@@ -1485,20 +1467,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         self._window_index_cache = (forward_batch, layer.layer_id, indices, counts)
         return indices, counts
-
-    def _window_key_positions(
-        self, layer: RadixAttention, forward_batch: ForwardBatch
-    ) -> tuple[torch.Tensor, int]:
-        """Key-lookup positions and window; RoPE keeps forward_batch.positions."""
-        if self._compact_draft_window is None:
-            return forward_batch.positions, layer.sliding_window_size
-        num_reqs = forward_batch.req_pool_indices.shape[0]
-        rows_per_req = forward_batch.positions.shape[0] // num_reqs
-        offsets = torch.arange(rows_per_req, device=forward_batch.positions.device)
-        # Request-major [bs, q_len] rows; the block starts at the compact prefix length.
-        local = forward_batch.seq_lens[:num_reqs].to(torch.int64).unsqueeze(1) + offsets
-        window_left = min(layer.sliding_window_size, self._compact_draft_window)
-        return local.reshape(-1), window_left
 
     def _forward_sliding_window(
         self,

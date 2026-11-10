@@ -1086,9 +1086,6 @@ def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
         draft_hf_config,
         window_size=int(window_size),
         dcp_size=cfg.dcp_size,
-        # Unresolved (None) here means the default page size of 1.
-        page_size=cfg.page_size or 1,
-        megakernel=bool(cfg.enable_nvidia_megakernel),
     )
     if kept is None:
         logger.warning(

@@ -32,22 +32,19 @@ def _mla_draft(layer_types, sliding_window=None):
     }
 
 
-def _compact_rows(prefix_len: int, window: int, page_size: int) -> range:
+def _compact_rows(prefix_len: int, window: int) -> range:
     # The compact table's committed suffix (dflash_worker_v2
-    # _compute_compact_draft_seq_lens): the last min(prefix, window) positions,
-    # extended left to a page boundary, then the BLOCK draft positions.
-    visible = min(prefix_len, window)
-    start = prefix_len - visible
-    start -= start % page_size
-    return range(start, prefix_len + BLOCK)
+    # _compute_compact_draft_seq_lens) at page size 1, its narrowest: the last
+    # min(prefix, window) positions, then the BLOCK draft positions.
+    return range(prefix_len - min(prefix_len, window), prefix_len + BLOCK)
 
 
-def _compact_changes_nothing(hf_window: int, window: int, page_size: int) -> bool:
+def _compact_changes_nothing(hf_window: int, window: int) -> bool:
     """Brute force: for every committed length, each draft row's own window
     [p - (hf_window - 1), p] lies inside the compact rows."""
     window_left = hf_window - 1
-    for prefix_len in range(0, 3 * max(window, hf_window) + 2 * page_size):
-        rows = _compact_rows(prefix_len, window, page_size)
+    for prefix_len in range(0, 3 * max(window, hf_window)):
+        rows = _compact_rows(prefix_len, window)
         for p in range(prefix_len, prefix_len + BLOCK):
             if max(p - window_left, 0) < rows.start:
                 return False
@@ -58,20 +55,19 @@ class TestResolveMlaDraftCompactWindow(CustomTestCase):
     def test_all_sliding_drops_exactly_when_the_compact_window_covers(self):
         window = 64
         for hf_window in (16, 63, 64, 65, 66, 80):
-            for page_size in (1, 16):
-                cfg = _mla_draft(["sliding_attention"] * 5, hf_window)
-                with self.subTest(hf_window=hf_window, page_size=page_size):
-                    if _compact_changes_nothing(hf_window, window, page_size):
-                        self.assertIsNone(
-                            resolve_mla_draft_compact_window(
-                                cfg, window_size=window, dcp_size=16
-                            )
+            cfg = _mla_draft(["sliding_attention"] * 5, hf_window)
+            with self.subTest(hf_window=hf_window):
+                if _compact_changes_nothing(hf_window, window):
+                    self.assertIsNone(
+                        resolve_mla_draft_compact_window(
+                            cfg, window_size=window, dcp_size=16
                         )
-                    else:
-                        with self.assertRaises(ValueError):
-                            resolve_mla_draft_compact_window(
-                                cfg, window_size=window, dcp_size=16
-                            )
+                    )
+                else:
+                    with self.assertRaises(ValueError):
+                        resolve_mla_draft_compact_window(
+                            cfg, window_size=window, dcp_size=16
+                        )
 
     def test_five_layer_swa_drafter_shape_is_dropped(self):
         # A five-layer sliding-window drafter (window 1024) with
