@@ -643,7 +643,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
         launched = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         launched.join([req])
-        self.coordinator.admit_request_into_staging(req, src=launched)
+        self.coordinator.admit_request_into_staging(req)
         self.assertTrue(req.hisparse_staging)
 
         get_device_module().synchronize()
@@ -683,7 +683,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
         launched = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         launched.join([req])
-        self.coordinator.admit_request_into_staging(req, src=launched)
+        self.coordinator.admit_request_into_staging(req)
         get_device_module().synchronize()
         ready = self.coordinator.move_ready_reqs(KeyedReqList(ListKind.DECODING))
         self.assertEqual(ready, [req])

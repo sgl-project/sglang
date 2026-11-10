@@ -65,6 +65,7 @@ register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 class _FakeReq(SimpleNamespace):
     """A request stand-in compared and hashed by identity, like Req."""
 
+    owner_list = None
     __eq__ = object.__eq__
     __hash__ = object.__hash__
 
@@ -201,11 +202,11 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def _spy_requeue(self, scheduler: Scheduler) -> List[dict]:
         requeue_log: List[dict] = []
 
-        def record(req, *, src=None):
+        def record(req, is_retracted=False):
             requeue_log.append({"req": req, "is_retracted": req.is_retracted})
-            # The queue door takes every request out of its source.
-            if src is not None:
-                src.leave([req])
+            # The queue door takes every request out of its list.
+            if req.owner_list is not None:
+                req.owner_list.leave([req])
 
         scheduler._add_request_to_queue = MagicMock(side_effect=record)
         return requeue_log
@@ -344,7 +345,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.last_batch = MagicMock()
         scheduler.cur_batch_for_debug = MagicMock()
-        scheduler.chunked_reqs.join([MagicMock()])
+        scheduler.chunked_reqs.join([MagicMock(owner_list=None)])
 
         original_last_batch = scheduler.last_batch
         original_cur_batch = scheduler.cur_batch_for_debug
@@ -446,7 +447,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             forward_mode=ForwardMode.EXTEND,
             with_tensors=True,
         )
-        scheduler.chunked_reqs.join([MagicMock()])
+        scheduler.chunked_reqs.join([MagicMock(owner_list=None)])
         scheduler.running_reqs.join([run_req_a, run_req_b, last_req])
         requeue_log = self._spy_requeue(scheduler)
 
@@ -624,7 +625,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         """retract with nothing to retract still clears chunked_req and batch_is_full."""
         scheduler = self._new_scheduler()
         scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
-        scheduler.chunked_reqs.join([MagicMock()])
+        scheduler.chunked_reqs.join([MagicMock(owner_list=None)])
         requeue_log = self._spy_requeue(scheduler)
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
@@ -671,7 +672,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler._add_request_to_queue = MagicMock()
         scheduler.last_batch = None
 
-        chunked_req = MagicMock()
+        chunked_req = MagicMock(owner_list=None)
         chunked_req.finished.return_value = False
         scheduler.chunked_reqs.join([chunked_req])
 
@@ -714,7 +715,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue = MagicMock()
         held = IndexedReqList(ListKind.PD_HELD)
         scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.side_effect = (
-            lambda req, *, src=None: move([req], src, held)
+            lambda req: move([req], held)
         )
 
         def _req(rid, req_pool_idx):
@@ -940,9 +941,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.continue_generation(
             ContinueGenerationReqInput(torch_empty_cache=False)
         )
-        prealloc_queue.add.assert_called_once_with(
-            kept, is_rebootstrap=True, src=prealloc_queue.held_rebootstrap_reqs
-        )
+        prealloc_queue.add.assert_called_once_with(kept, is_rebootstrap=True)
 
     def test_pd_decode_abort_finishes_a_retracted_request(self):
         """A retracted request aborted while queued must leave finished, with its

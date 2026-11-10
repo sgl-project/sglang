@@ -623,7 +623,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
             ):
                 queue.move_preallocated(queue.transfer_queue.queue)
             transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
-            transfer.queue = decode_queue(ListKind.PD_RECEIVING, [entry])
+            transfer.queue = queue.transfer_queue.queue
             transfer.gloo_group = object()
             transfer.scheduler = queue.scheduler
             with patch(
@@ -681,7 +681,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
         moved = queue.token_to_kv_pool_allocator
         moved.translate_kv_indices_for_transfer = lambda indices: indices + 100
         transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
-        transfer.queue = decode_queue(ListKind.PD_RECEIVING, [decode_req])
+        transfer.queue = queue.transfer_queue.queue
         transfer.gloo_group = object()
         transfer.scheduler = queue.scheduler
         with patch(
@@ -718,7 +718,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue.move_preallocated(queue.transfer_queue.queue)
         queue._submit_prefill_recompute.assert_not_called()
         transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
-        transfer.queue = decode_queue(ListKind.PD_RECEIVING, [decode_req])
+        transfer.queue = queue.transfer_queue.queue
         transfer.gloo_group = object()
         transfer.scheduler = queue.scheduler
         with patch(

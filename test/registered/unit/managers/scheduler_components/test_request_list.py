@@ -104,19 +104,51 @@ def _reqs(rids):
 
 class TestMove(CustomTestCase):
     def test_move_wraps_into_a_wrapper_list_and_keeps_its_index(self):
-        a, b, c = _reqs("abc")
+        a, b, c, d = _reqs("abcd")
         src = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         src.join([a, b, c])
         dst = IndexedReqList(ListKind.PD_RELEASING, req_of=lambda x: x[0])
-        held = (c, "held")
+        held = (d, "held")
         dst.join([held])
 
         wrapped = [(a, "a"), (b, "b")]
-        move(wrapped, src, dst)
+        move(wrapped, dst)
 
         self.assertEqual(list(src), [c])
         self.assertEqual(list(dst.items()), [held, *wrapped])
-        self.assertEqual(list(dst), [c, a, b])
+        self.assertEqual(list(dst), [d, a, b])
+
+    def test_a_request_is_in_at_most_one_list(self):
+        a, b = _reqs("ab")
+        held = IndexedReqList(ListKind.PD_BOOTSTRAP)
+        held.join([a])
+        dst = KeyedReqList(ListKind.DECODING)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "a is in PD_BOOTSTRAP, cannot join DECODING"
+        ):
+            dst.join([b, a])
+        with self.assertRaisesRegex(RuntimeError, "a is already in PD_BOOTSTRAP"):
+            move([a], held)
+
+        self.assertEqual(list(held), [a])
+        self.assertEqual(list(dst), [])
+        self.assertIs(a.owner_list, held)
+        self.assertIsNone(b.owner_list)
+
+    def test_every_way_out_of_a_list_clears_the_owner(self):
+        a, b, c, d = _reqs("abcd")
+        queue = IndexedReqList(ListKind.WAITING)
+        queue.join([a, b])
+        running = KeyedReqList(ListKind.DECODING)
+        running.join([c])
+
+        queue.leave([a])
+        running.clear()
+        queue.replace([d])
+
+        self.assertEqual([r.owner_list for r in (a, b, c)], [None, None, None])
+        self.assertIs(d.owner_list, queue)
 
 
 if __name__ == "__main__":
