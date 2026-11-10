@@ -347,6 +347,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        allocate_intermediate_ssm: bool = True,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -403,6 +404,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            allocate_intermediate_ssm=allocate_intermediate_ssm,
             short_conv_layer_ids=short_conv_layer_ids,
             short_conv_state_shape=short_conv_state_shape,
             replayssm_request_ring=replayssm_request_ring,
@@ -1714,11 +1716,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                if not getattr(decode_req.req, "finished_output", False):
-                    self.scheduler.output_streamer.stream_output(
-                        [decode_req.req],
-                        decode_req.req.return_logprob,
-                    )
+                self.scheduler.output_streamer.stream_output(
+                    [decode_req.req],
+                    decode_req.req.return_logprob,
+                )
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)

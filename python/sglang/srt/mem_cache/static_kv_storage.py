@@ -920,7 +920,10 @@ def _static_state_entries(
     them."""
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.disaggregation.utils import remap_draft_layer_ids
-    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+        NPUMHATokenToKVPool,
+        NPUMLATokenToKVPool,
+    )
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
     from sglang.srt.mem_cache.memory_pool import (
@@ -1201,9 +1204,8 @@ def _static_state_entries(
                 c128_item_lens,
             )
 
-        # On Ascend 950 (CYCLE cache_mode), C4 state uses request-local ring rows rather
-        # than SWA pages.  Register it separately so P and D can independently
-        # map logical positions when their local ring sizes differ.
+        # On Ascend 950, register C4 state by row so prefill and decode can
+        # pair logical positions even when their SWA-page ring sizes differ.
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
         if is_npu_arch35():
@@ -1322,6 +1324,13 @@ def _static_state_entries(
                 conv_shard_groups,
                 slice_outer_counts,
             )
+
+    if isinstance(owner_view, NPUMHATokenToKVPool) and owner_view.is_modelslim_mxfp8:
+        add(
+            StateType.BLOCK_SCALE,
+            *owner_view.get_kv_scale_buf_infos(),
+            layer_ids=owner_view.model_layer_ids,
+        )
 
     regions = {}
     views = {}
