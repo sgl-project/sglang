@@ -704,15 +704,21 @@ class TestRequestRetirerHostRadixSplit(CustomTestCase):
     teardown runs after release_kv_cache, so the checkpoint insert still sees
     the request's host table."""
 
-    def _release(self, host_radix: bool, checkpoint: bool):
+    def _release(self, host_radix: bool, checkpoint: bool, staging: bool = False):
         from unittest import mock
 
         from sglang.srt.managers.scheduler_components import request_retirer
 
         calls = []
+
+        def release_request_device(req):
+            # A staging request is freed whole, so no host half is owed.
+            calls.append("staging" if staging else "device")
+            return not staging
+
         coord = SimpleNamespace(
-            request_finished=lambda req: calls.append("finished"),
-            request_finished_device=lambda req: calls.append("device"),
+            release_request=lambda req: calls.append("full"),
+            release_request_device=release_request_device,
             release_host_after_insert=lambda req: calls.append("host"),
         )
         retirer = request_retirer.RequestRetirer(
@@ -751,7 +757,15 @@ class TestRequestRetirerHostRadixSplit(CustomTestCase):
     def test_without_host_radix_tears_down_before_release(self):
         self.assertEqual(
             self._release(host_radix=False, checkpoint=True),
-            ["finished", "release(checkpoint=True)"],
+            ["full", "release(checkpoint=True)"],
+        )
+
+    def test_host_radix_staging_request_skips_the_host_half(self):
+        # _release_staging already freed the host slots; a second host release
+        # would find neither req_pool_idx nor the stash and assert.
+        self.assertEqual(
+            self._release(host_radix=True, checkpoint=True, staging=True),
+            ["staging", "release(checkpoint=True)"],
         )
 
 

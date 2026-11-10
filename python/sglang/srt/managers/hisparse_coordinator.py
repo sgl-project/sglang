@@ -698,7 +698,12 @@ class HiSparseCoordinator:
                 self.item_size_bytes = self.mem_pool_device.bytes_per_token_k
             else:
                 self.mem_pool_device: HiSparseDSATokenToKVPool = kvcache
-                if any(self.mem_pool_device.skip_topk_layers):
+                # A decoupled host pool is fixed by host_token_capacity, so
+                # elision does not grow it.
+                if (
+                    any(self.mem_pool_device.skip_topk_layers)
+                    and not self.host_pool_decoupled
+                ):
                     _log_index_k_elision(self.mem_pool_device, host_to_device_ratio)
                 self.mem_pool_host = MLATokenToKVPoolHost(
                     buffer_info=self.mem_pool_device.get_device_pool_infos()[
@@ -1630,12 +1635,8 @@ class HiSparseCoordinator:
                 io_backend="kernel",
             )
 
-    def abort_staging_request(self, req: Req) -> None:
-        """Remove a request from the staging queue and free its host + device resources.
-
-        Must be called when aborting a request that has been admitted into staging
-        but has not yet completed (i.e. req.hisparse_staging is True).
-        """
+    def _release_staging(self, req: Req) -> None:
+        """Remove a request from the staging queue and free its host + device resources."""
         # Remove from staging queue
         self.ack_staging_queue.leave([req])
         # Wait for any in-flight staging DMA to complete before freeing
@@ -1653,19 +1654,21 @@ class HiSparseCoordinator:
         self._skip_first_backup[req.kv.req_pool_idx] = False
         req.hisparse_staging = False
 
-    def retract_req(self, req: Req) -> None:
+    def release_request(self, req: Req):
+        """Free what a request holds here, whether finished, aborted or retracted."""
+        if self.release_request_device(req):
+            self.release_host_after_insert(req)
+
+    def release_request_device(self, req: Req) -> bool:
+        """Device half of release_request; return whether the host half is still owed.
+
+        A request still staging is freed whole, host included, so the caller must
+        not release its host slots again.
+        """
         if req.hisparse_staging:
-            self.abort_staging_request(req)
-        else:
-            self.request_finished(req)
+            self._release_staging(req)
+            return False
 
-    def request_finished(self, req: Req):
-        """Full teardown for the non-radix path (device half + host half)."""
-        self.request_finished_device(req)
-        self.release_host_after_insert(req)
-
-    def request_finished_device(self, req: Req):
-        """Device-side teardown."""
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
@@ -1722,6 +1725,7 @@ class HiSparseCoordinator:
 
         # Stash the slot index, release_kv_cache will have nulled req.kv.req_pool_idx.
         req._hisparse_host_pool_idx = req_pool_idx
+        return True
 
     # once the decode radix tree exists, the tree owns the borrow/publish receipts,
     _host_borrow_release_fn = None
@@ -1786,13 +1790,13 @@ class HiSparseCoordinator:
         """
         # On the radix path this runs after release_kv_cache, which has nulled
         # req.kv.req_pool_idx, so fall back to the stashed index. The
-        # abort_staging_request path has no device teardown and still holds one.
+        # _release_staging path has no device teardown and still holds one.
         req_pool_idx = req.kv.req_pool_idx
         if req_pool_idx is None:
             req_pool_idx = getattr(req, "_hisparse_host_pool_idx", None)
         assert req_pool_idx is not None, (
             "release_host_after_insert needs a req_pool_idx: neither req nor the "
-            "request_finished_device stash has one, so this request's host slots "
+            "release_request_device stash has one, so this request's host slots "
             "cannot be identified and would leak."
         )
         allocated_len = int(self.req_to_host_pool_allocated_len[req_pool_idx])

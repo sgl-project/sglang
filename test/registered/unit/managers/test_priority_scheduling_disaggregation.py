@@ -386,7 +386,6 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler = SimpleNamespace(
             tree_cache=cache,
             request_retirer=release_only_retirer(cache),
-            clear_pending_chunk_send=MagicMock(),
             ps=SimpleNamespace(tp_rank=0),
             req_to_metadata_buffer_idx_allocator=MagicMock(),
             output_streamer=MagicMock(),
@@ -568,6 +567,12 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         queue.req_to_metadata_buffer_idx_allocator.alloc.side_effect = iter(range(100))
 
         queue.token_to_kv_pool_allocator = MagicMock()
+
+        queue.token_to_kv_pool_allocator.sub_pool_roles.return_value = (
+            "full",
+            (),
+            None,
+        )
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.token_to_kv_pool_allocator.page_size = 1
         queue.token_to_kv_pool_allocator.available_size.return_value = 1000
@@ -576,7 +581,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
             queue=decode_queue(ListKind.PD_RECEIVING), enable_staging=False
         )
         queue.kv_manager = SimpleNamespace(
-            kv_args=SimpleNamespace(state_types=[]),
+            kv_args=SimpleNamespace(state_types=[], state_sub_pools=[]),
         )
         queue.tree_cache = MagicMock()
 

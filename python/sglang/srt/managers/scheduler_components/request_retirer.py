@@ -99,16 +99,14 @@ class RequestRetirer:
         # HiSparse clears its mapping of the row before the row is freed. Under
         # host-radix the host half waits until the checkpoint insert has claimed
         # the host slots the tree keeps.
-        hisparse_host_after = (
-            req.kv.holds_kv
-            and self.hisparse_coordinator is not None
-            and self.enable_hisparse_host_radix
-        )
+        hisparse_host_after = False
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
-            if hisparse_host_after:
-                self.hisparse_coordinator.request_finished_device(req)
+            if self.enable_hisparse_host_radix:
+                hisparse_host_after = self.hisparse_coordinator.release_request_device(
+                    req
+                )
             else:
-                self.hisparse_coordinator.request_finished(req)
+                self.hisparse_coordinator.release_request(req)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
         if hisparse_host_after:
@@ -117,7 +115,7 @@ class RequestRetirer:
     def retract(self, req: Req, *, offload_kv: bool) -> bool:
         """Release a retracted request's memory uncheckpointed; return whether it can resume."""
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.retract_req(req)
+            self.hisparse_coordinator.release_request(req)
 
         # PD decode backs the KV up to host to restore it without recompute; a caller
         # that will rebootstrap passes offload_kv=False to skip the copy.
