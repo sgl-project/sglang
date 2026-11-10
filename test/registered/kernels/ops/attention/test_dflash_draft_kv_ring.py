@@ -23,7 +23,7 @@ WINDOW_LEFT = 1023
 BLOCK = 8
 
 
-def _ring(dcp, req_pool_rows, device, dcp_rank=0):
+def _ring(dcp, req_pool_rows, device):
     return DFlashDraftKVRing(
         rows_per_req=draft_kv_ring_rows_per_req(
             window_left=WINDOW_LEFT, block_size=BLOCK, dcp_size=dcp
@@ -31,8 +31,6 @@ def _ring(dcp, req_pool_rows, device, dcp_rank=0):
         dcp_size=dcp,
         req_pool_rows=req_pool_rows,
         device=device,
-        window_left=WINDOW_LEFT,
-        dcp_rank=dcp_rank,
     )
 
 
@@ -105,42 +103,11 @@ def test_extend_keeps_only_the_readable_tail():
     assert bool((second != 0).all())
 
 
-@pytest.mark.parametrize("seq_len", [5000, 300])
-def test_pd_window_rows_pair_prefill_with_each_decode_rank(seq_len):
-    """PD: a DCP-1 prefill's window rows, paired positionally with each DCP-8
-    decode rank's (sink pairs dropped as the transfer does), cover every window
-    position exactly once, each landing on the row that rank's window reads."""
-    prefill = _ring(1, 4, "cpu")
-    src = prefill.transfer_rows(2, seq_len)
-    window = list(range(max(0, seq_len - WINDOW_LEFT - 1), seq_len))
-    assert len(src) == len(window) and (src != 0).all()
-    covered = []
-    for rank in range(8):
-        decode = _ring(8, 6, "cpu", dcp_rank=rank)
-        dst = decode.transfer_rows(5, seq_len)
-        assert len(dst) == len(src)
-        for p, a, b in zip(window, src, dst):
-            if a and b:
-                covered.append(p)
-                assert p % 8 == rank
-                assert a == int(prefill.locs(torch.tensor([2]), torch.tensor([p])))
-                assert b * 8 + rank == int(
-                    decode.locs(torch.tensor([5]), torch.tensor([p]))
-                )
-    assert sorted(covered) == window
-
-
-def test_decode_floor_reset_and_unsupported_drafts():
-    """PD decode resets a slot's floor to its prompt end at preallocation; the
-    ring is resolved off for drafts and backends it does not fit."""
+def test_unsupported_drafts():
+    """The ring is resolved off for drafts and backends it does not fit."""
     from unittest import mock
 
     from sglang.srt.speculative import dflash_utils
-
-    ring = _ring(8, 4, "cpu")
-    ring.min_pos[2] = 7
-    ring.reset_floor(2, 900)
-    assert ring.min_pos.tolist() == [0, 0, 900, 0]
 
     def reason(
         mla=True, layers=("sliding_attention",) * 5, backend="trtllm_mla", window=None

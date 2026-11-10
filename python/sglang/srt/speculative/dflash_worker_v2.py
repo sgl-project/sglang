@@ -64,7 +64,6 @@ from sglang.srt.speculative.dflash_draft_ring import (
     draft_kv_ring_enabled,
     draft_kv_ring_rows_per_req,
     draft_kv_ring_window_left,
-    set_draft_kv_ring,
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -742,13 +741,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             dcp_size=dcp_size,
             req_pool_rows=req_pool_rows,
             device=self.device,
-            window_left=window_left,
-            dcp_rank=parallel.dcp_rank if parallel.dcp_enabled else 0,
-            pool=pool,
-            mem_pool=pool.maybe_get_custom_mem_pool(),
         )
         self.draft_model_runner.draft_kv_ring = self.draft_kv_ring
-        set_draft_kv_ring(self.draft_kv_ring)
         if get_parallel().tp_rank == 0:
             logger.info(
                 "DFLASH draft KV ring: %d rows per request per rank (%d positions), "
