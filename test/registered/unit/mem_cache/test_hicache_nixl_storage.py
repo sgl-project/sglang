@@ -1074,6 +1074,7 @@ class TestDocaMemosNixl(unittest.TestCase):
         dummy.backend_selector = MagicMock(backend_name="DOCA_MEMOS")
         dummy.needs_page_alignment = True
         dummy.config_suffix = "@test"
+        dummy.tp_config_suffix = "@test_tp0"
         dummy._hybrid_pool_ctx = {}
         dummy.registered_pools = {}
         dummy._pre_register_host = MagicMock()
@@ -1198,6 +1199,90 @@ class TestDocaMemosNixl(unittest.TestCase):
                 k_page.zero_()
                 v_page.zero_()
                 memos.batch_get_v1(keys, host_indices)
+                self.assertTrue(torch.equal(k_page, expected[0]))
+                self.assertTrue(torch.equal(v_page, expected[1]))
+
+    def test_asymmetric_kv_set_get_v2(self):
+        from unittest.mock import patch
+
+        from sglang.srt.mem_cache.pool_host.mha import (
+            AsymmetricMHATokenToKVPoolHost,
+        )
+
+        for layout in ("page_first", "page_first_direct"):
+            with self.subTest(layout=layout):
+                host = AsymmetricMHATokenToKVPoolHost.__new__(
+                    AsymmetricMHATokenToKVPoolHost
+                )
+                host.layout = layout
+                host.page_size = 2
+                host.layer_num = 2
+                host.head_num = 1
+                host.head_dim = 4
+                host.v_head_dim = 6
+                host.dtype = torch.uint8
+                host.device = "cpu"
+                host.pin_memory = False
+                if layout == "page_first":
+                    host.kv_buffer = (
+                        torch.zeros((4, 2, 1, 4), dtype=host.dtype),
+                        torch.zeros((4, 2, 1, 6), dtype=host.dtype),
+                    )
+                else:
+                    host.kv_buffer = (
+                        torch.zeros((2, 2, 2, 1, 4), dtype=host.dtype),
+                        torch.zeros((2, 2, 2, 1, 6), dtype=host.dtype),
+                    )
+
+                memos = self._make_registration_target()
+                with patch(
+                    "sglang.srt.mem_cache.storage.nixl.hicache_nixl.tensor_uses_hugepage",
+                    return_value=True,
+                ):
+                    memos.register_mem_host_pool_v2(host, PoolName.SWA)
+                ctx = memos._hybrid_pool_ctx[PoolName.SWA]
+                # Tiny test strides cannot be 4KiB-aligned: bounce path.
+                self.assertFalse(ctx.is_zero_copy)
+
+                k_page = (
+                    host.k_buffer[: host.page_size]
+                    if layout == "page_first"
+                    else host.k_buffer[0]
+                )
+                v_page = (
+                    host.v_buffer[: host.page_size]
+                    if layout == "page_first"
+                    else host.v_buffer[0]
+                )
+                k_page.copy_(
+                    torch.arange(k_page.numel(), dtype=host.dtype).reshape_as(k_page)
+                )
+                v_page.copy_(
+                    torch.arange(
+                        100, 100 + v_page.numel(), dtype=host.dtype
+                    ).reshape_as(v_page)
+                )
+                expected = (k_page.clone(), v_page.clone())
+                stored_page = None
+
+                def fake_xfer(keys, key_strs, host_buffers, direction):
+                    nonlocal stored_page
+                    if direction == "WRITE":
+                        stored_page = ctx.bounce_set[0].clone()
+                    else:
+                        ctx.bounce_get[0].copy_(stored_page)
+                    return [True] * len(key_strs)
+
+                transfer = PoolTransfer(
+                    name=PoolName.SWA,
+                    keys=[f"asymmetric-v2-{layout}"],
+                    host_indices=torch.tensor([0, 1], dtype=torch.int64),
+                )
+                memos._batch_xfer = fake_xfer
+                self.assertEqual(memos.batch_set_v2([transfer]), {PoolName.SWA: [True]})
+                k_page.zero_()
+                v_page.zero_()
+                self.assertEqual(memos.batch_get_v2([transfer]), {PoolName.SWA: [True]})
                 self.assertTrue(torch.equal(k_page, expected[0]))
                 self.assertTrue(torch.equal(v_page, expected[1]))
 
