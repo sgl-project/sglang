@@ -285,10 +285,8 @@ class TestServerInfoTransportParity(CustomTestCase):
         load.return_value.start_metadata_server.assert_not_called()
 
 
-class TestServerInfoInternalStatesRedaction(CustomTestCase):
-    """`internal_states` is the scheduler's readback of the resolved config,
-    which `/server_info` and `Engine.get_server_info` report next to the
-    redacted top-level fields: the credentials must not reach it either."""
+class TestServerInfoInternalStates(CustomTestCase):
+    """Check scheduler readback through `/server_info` and the Python engine."""
 
     # Every word is distinctive, so a value split at its space cannot hide.
     SECRETS = {
@@ -303,7 +301,9 @@ class TestServerInfoInternalStatesRedaction(CustomTestCase):
         # the Python server against an inherited SGLANG_RUST_SERVER=1.
         self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
 
-    def _scheduler_readback(self, server_args: ServerArgs) -> dict:
+    def _scheduler_readback(
+        self, server_args: ServerArgs, *, idle: bool = False
+    ) -> dict:
         from sglang.srt.managers.io_struct import GetInternalStateReq
         from sglang.srt.managers.scheduler_components.internal_state import (
             SchedulerInternalStateController,
@@ -316,7 +316,8 @@ class TestServerInfoInternalStatesRedaction(CustomTestCase):
             if name.startswith("_add_")
         }
         controller = SchedulerInternalStateController(
-            scheduler=SimpleNamespace(), record_step_time=False
+            scheduler=SimpleNamespace(is_fully_idle=lambda: idle),
+            record_step_time=False,
         )
         publish(server_args, role="scheduler")
         self.addCleanup(reset_context)
@@ -338,7 +339,9 @@ class TestServerInfoInternalStatesRedaction(CustomTestCase):
         server_args = ServerArgs(model_path="dummy", **self.SECRETS)
         readback = self._scheduler_readback(server_args)
 
-        self._assert_redacted(_call_server_info_with(server_args, [readback]))
+        payload = _call_server_info_with(server_args, [readback])
+        self._assert_redacted(payload)
+        self.assertIs(payload["internal_states"][0]["scheduler_fully_idle"], False)
 
         async def _internal_state():
             return [readback]
@@ -350,7 +353,13 @@ class TestServerInfoInternalStatesRedaction(CustomTestCase):
         engine._scheduler_init_result = SimpleNamespace(
             scheduler_infos=[{"max_req_input_len": 1024}]
         )
-        self._assert_redacted(engine.get_server_info())
+        payload = engine.get_server_info()
+        self._assert_redacted(payload)
+        self.assertIs(payload["internal_states"][0]["scheduler_fully_idle"], False)
+
+    def test_idle_scheduler_readback(self):
+        readback = self._scheduler_readback(ServerArgs(model_path="dummy"), idle=True)
+        self.assertIs(readback["scheduler_fully_idle"], True)
 
 
 class TestModelInfoTransportParity(CustomTestCase):

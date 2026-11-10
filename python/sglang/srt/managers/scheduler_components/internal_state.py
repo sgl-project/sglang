@@ -61,6 +61,7 @@ class SchedulerInternalStateController:
         # A bound signal handler is not msgpack-serializable, and no reader
         # consumes it.
         state.pop("custom_sigquit_handler", None)
+        state["scheduler_fully_idle"] = self.scheduler.is_fully_idle()
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(state))
 
     def _add_topology(self, state: Dict[str, Any]) -> None:
