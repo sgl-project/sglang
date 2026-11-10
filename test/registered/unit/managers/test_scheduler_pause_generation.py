@@ -406,12 +406,51 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             "flush_cache while paused was not published by the paused loop",
         )
 
-    def test_abort_mode_rejected_at_scheduler(self):
-        """abort mode must be rejected by the scheduler-side assert."""
+    def test_abort_pause_leaves_the_engine_idle_for_a_release(self):
+        """A running request aborted by a client disconnect frees its KV only at
+        its next step. pause_generation(mode="abort") returned before that step,
+        so a release_memory_occupation sent right after it was refused. The
+        pause and the abort_all after it must leave the engine idle."""
         scheduler = self._new_scheduler()
+        scheduler.mm_receiver = None
+        scheduler.enable_continuous_input_polling = False
+        scheduler.grammar_manager = SimpleNamespace(
+            grammar_queue=IndexedReqList(ListKind.GRAMMAR)
+        )
+        scheduler.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            send_abort=None,
+        )
+        scheduler.waiting_queue = IndexedReqList(
+            ListKind.WAITING, abort=scheduler._abort_waiting
+        )
+        scheduler._add_request_to_queue = MagicMock(
+            side_effect=lambda req: scheduler.waiting_queue.join([req])
+        )
+        scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
+        scheduler.dllm_manager = MagicMock()
+        scheduler.dllm_manager.any_staging_reqs.return_value = False
+        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_lmcache = False
+        scheduler.enable_unified_cache_external_linker = False
+        req = self._make_req("disconnected")
+        scheduler.running_batch = self._make_batch(
+            scheduler, reqs=[req], with_tensors=True
+        )
 
-        with self.assertRaises(AssertionError):
-            scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
+        # The disconnect, then what pause_generation(mode="abort") sends.
+        scheduler.abort_request(AbortReq(rid="disconnected"))
+        scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
+        scheduler.abort_request(AbortReq(abort_all=True))
+
+        # The gate release_memory_occupation checks.
+        self.assertTrue(
+            scheduler.is_fully_idle(ignore_waiting=scheduler.pause_state.paused)
+        )
+        self.assertEqual(list(scheduler.waiting_queue), [])
+        aborted = [c.args[1] for c in scheduler.send_abort_output.call_args_list]
+        self.assertEqual(aborted, [req])
 
     def test_retract_clears_last_batch_state(self):
         """retract mode should clear last_batch and cur_batch_for_debug."""

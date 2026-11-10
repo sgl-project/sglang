@@ -36,6 +36,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     BatchStrOutput,
     EmbeddingReqInput,
     GenerateReqInput,
+    PauseGenerationReqInput,
     RequestOutputStats,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
@@ -1570,6 +1571,26 @@ class TestAbortBeforeDispatch(CustomTestCase):
         self.assertEqual(len(sent), 2)
         self.assertEqual(list(sent[1].batch), [tokenized_objs[0]])
         self.assertTrue(tm.rid_to_state[kept].dispatched)
+
+
+class TestPauseGenerationAbortMode(CustomTestCase):
+    def test_abort_pause_reaches_scheduler_before_abort_all(self):
+        """pause_generation(mode="abort") returned while a request aborted by a
+        client disconnect still held KV in the scheduler, so a
+        release_memory_occupation sent right after it was refused. The scheduler
+        must be paused, ahead of the abort_all on the same socket."""
+        tm = _make_tm_for_generate(self)
+        tm.tokenizer_ipc_name = None
+        sent = []
+        tm._dispatch_to_scheduler = Mock(side_effect=sent.append)
+        tm._async_dispatch_to_scheduler = AsyncMock(side_effect=sent.append)
+        tm.model_update_lock.is_locked = AsyncMock(return_value=False)
+
+        asyncio.run(tm.pause_generation(PauseGenerationReqInput(mode="abort")))
+
+        self.assertEqual([type(m) for m in sent], [PauseGenerationReqInput, AbortReq])
+        self.assertEqual(sent[0].mode, "abort")
+        self.assertTrue(sent[1].abort_all)
 
 
 class TestLoRARequestLifecycle(CustomTestCase):

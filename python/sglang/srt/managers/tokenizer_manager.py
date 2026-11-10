@@ -2461,9 +2461,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         async with self.is_pause_cond:
             self.is_pause = True
-            if obj.mode != "abort":
-                await self._async_dispatch_to_scheduler(obj)
-            else:
+            # Abort mode pauses the scheduler before the abort_all, on the same
+            # socket, so a release_memory_occupation sent after it finds it idle.
+            await self._async_dispatch_to_scheduler(obj)
+            if obj.mode == "abort":
                 await self._abort_all_until_unlocked()
 
     async def _abort_all_until_unlocked(self):

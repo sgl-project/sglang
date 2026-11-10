@@ -497,12 +497,9 @@ class MultiTokenizerRouter:
                 for ipc_name in self.all_worker_ipcs:
                     self.socket_mapping.send_output(ipc_name, broadcast)
                 # Forward to scheduler rank 0 (it broadcasts to all TP/PP/DP
-                # ranks internally). Skip for abort mode which drains via polling.
-                if not (
-                    isinstance(recv_obj, PauseGenerationReqInput)
-                    and recv_obj.mode == "abort"
-                ):
-                    await async_sock_send(self.send_to_scheduler, recv_obj)
+                # ranks internally). An abort pause reaches it before the
+                # originating worker's abort_all, which follows the broadcast.
+                await async_sock_send(self.send_to_scheduler, recv_obj)
                 continue
 
             await async_sock_send(self.send_to_scheduler, recv_obj)

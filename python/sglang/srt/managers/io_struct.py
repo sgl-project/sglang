@@ -2007,7 +2007,9 @@ class DetachHiCacheStorageReqOutput(BaseReq, kw_only=True):
 class PauseGenerationReqInput(BaseReq, kw_only=True):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.
-    abort: Abort and return all requests currently being processed.
+    abort: Abort and return all requests currently being processed, and pause
+            the scheduler's event loop like retract until continue_generation,
+            so the KV cache can be flushed or released once it returns.
 
     in_place: Pause the scheduler's event_loop from performing inference;
             only non-inference requests (e.g., control commands) will be handled.
