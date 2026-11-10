@@ -376,13 +376,6 @@ jobs:
           #   test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_1p1d_32p_dcp_gpqa.py
           #   test_type: 'accuracy'
           #   prefill_decode_deployment: 'separation'
-          # - name: glm_5_2_w8a8_1p1d_32p_pcp_gpqa
-          #   prefill_size: 2
-          #   decode_size: 2
-          #   router_size: 1
-          #   test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_1p1d_32p_pcp_gpqa.py
-          #   test_type: 'accuracy'
-          #   prefill_decode_deployment: 'separation'
           # glm_5_3 accuracy tests (2 prefill + 2 decode nodes)
           - name: glm_5_3_w8a8_1p1d_32p_pcp_gpqa
             prefill_size: 2
@@ -424,11 +417,6 @@ jobs:
       max-parallel: 1
       matrix:
         test_config:
-          # glm_5_2 accuracy tests
-          # - name: glm_5_2_w8a8_16p_gpqa
-          #   node_size: 2
-          #   test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py
-          #   test_type: 'accuracy'
           # glm_5_3 accuracy tests
           - name: glm_5_3_w8a8_16p_gpqa
             node_size: 2
