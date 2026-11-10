@@ -14,6 +14,7 @@ import torch
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dflash import _prepare_dflash_draft_block_unchecked
+from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -21,11 +22,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -34,7 +32,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, eagle_prepare_for_verify
+from sglang.srt.speculative.eagle_utils import eagle_prepare_for_verify
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.ubtree_components.config import parse_ubtree_config
 from sglang.srt.speculative.ubtree_components.draft_graph import (

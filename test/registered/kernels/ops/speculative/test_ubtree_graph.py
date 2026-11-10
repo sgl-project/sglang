@@ -125,8 +125,8 @@ def _make_fa3_verify_backend(width, algorithm, enabled, *, max_bs=1):
     ],
 )
 def test_eagle_full_mask_metadata_reuses_tree_columns(width, mode, batch_size, live_bs):
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.speculative.eagle_utils import TreeMaskMode
+    from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     backend = _make_fa3_verify_backend(width, "EAGLE", True, max_bs=batch_size)
     lengths = [4, 7][:live_bs] + [0] * (batch_size - live_bs)
@@ -195,8 +195,8 @@ def test_eagle_full_mask_metadata_reuses_tree_columns(width, mode, batch_size, l
 def test_fa3_verify_metadata_graph_isolated_and_refreshes_live_inputs(
     width, algorithm, enabled
 ):
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.speculative.eagle_utils import TreeMaskMode
+    from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     backend = _make_fa3_verify_backend(width, algorithm, enabled)
     optimized = algorithm == "UBTREE" and enabled
@@ -719,7 +719,7 @@ def test_worker_commits_once_and_keeps_scheduler_outputs_alive(
     monkeypatch, graph_replay
 ):
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.speculative import ubtree_worker_v2 as worker_module
     from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
     from sglang.srt.speculative.ubtree_components.tree import build_ubtree_batch
@@ -800,7 +800,7 @@ def test_worker_commits_once_and_keeps_scheduler_outputs_alive(
 
 
 def test_worker_rejects_penalties_before_prefill():
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.speculative.ubtree_worker_v2 import UBTreeWorkerV2
 
     worker = UBTreeWorkerV2.__new__(UBTreeWorkerV2)
@@ -960,7 +960,7 @@ def test_tree_metadata_all_widths_matches_cpu_after_replay(width):
 def test_sampling_and_tree_walk_match_joint_ar_distribution(
     capture_sampling, full_tree, temperature, top_k, top_p, min_p, uniform
 ):
-    from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
+    from sglang.kernels.ops.speculative.spec_tree import verify_tree_greedy_func
     from sglang.srt.speculative.ubtree_components.sampling_graph import (
         _sample_target_tokens,
     )

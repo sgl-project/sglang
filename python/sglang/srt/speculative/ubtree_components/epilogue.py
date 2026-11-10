@@ -17,6 +17,7 @@ from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     fused_commit_track_indices,
 )
+from sglang.kernels.ops.speculative.spec_tree import verify_tree_greedy_func
 from sglang.kernels.ops.speculative.ubtree import (
     prepare_draft_commit_metadata,
     prepare_target_kv_move_metadata,
@@ -24,7 +25,6 @@ from sglang.kernels.ops.speculative.ubtree import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.ubtree_info import UBTreeVerifyInput
 
 

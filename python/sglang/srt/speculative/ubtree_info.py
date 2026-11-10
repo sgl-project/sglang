@@ -10,8 +10,8 @@ from dataclasses import dataclass
 
 import torch
 
+from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
-from sglang.srt.speculative.eagle_utils import TreeMaskMode
 
 
 @dataclass
@@ -48,7 +48,7 @@ def create_ubtree_verify_input(
     custom_mask, num_tokens_per_req: int
 ) -> UBTreeVerifyInput:
     """Build the fixed-width target input used during CUDA Graph capture."""
-    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+    from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
     from sglang.srt.runtime_context import get_spec
 
     spec = get_spec()
