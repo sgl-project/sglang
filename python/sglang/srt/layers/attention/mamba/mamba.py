@@ -586,6 +586,16 @@ class MambaMixer2(torch.nn.Module):
             has_initial_states_p = mixed_metadata.has_initial_states
             prep_initial_states = mixed_metadata.prep_initial_states
             cache_indices = state_indices_tensor_p
+            # NOTE: for size-1 token slices, .contiguous() may keep a larger stride
+            # on dim0 (still considered contiguous by PyTorch), which turns into an
+            # invalid transposed stride for causal_conv1d_fwd_cpu after transpose.
+            # Repack to canonical contiguous layout only when needed.
+            if hidden_states_B_C_p.size(0) == 1 and hidden_states_B_C_p.stride(
+                0
+            ) != hidden_states_B_C_p.size(1):
+                hidden_states_B_C_p = torch.empty_like(
+                    hidden_states_B_C_p, memory_format=torch.contiguous_format
+                ).copy_(hidden_states_B_C_p)
             x = hidden_states_B_C_p.contiguous().transpose(
                 0, 1
             )  # this is the form that causal-conv see
