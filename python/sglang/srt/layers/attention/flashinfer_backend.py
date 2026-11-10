@@ -304,7 +304,8 @@ def fast_prefill_plan(
         packed_lengths = (kv_lens_host * uniform_verify_width + 7) // 8
         packed_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device="cpu")
         packed_indptr[1:] = torch.cumsum(packed_lengths, dim=0)
-        assert int(packed_indptr[-1]) <= self._custom_mask_buf.numel()
+        # FlashInfer's SM90 fp8-KV verify kernel reads up to 8 bytes past the mask.
+        assert int(packed_indptr[-1]) + 8 <= self._custom_mask_buf.numel()
         self._mask_indptr_buf.copy_(packed_indptr, non_blocking=non_blocking)
         pack_verify_mask_into(
             custom_mask,
@@ -322,9 +323,8 @@ def fast_prefill_plan(
     )
     self._cached_o_data_type = o_data_type
     self._block_tables = None
-    # FlashInfer's plan() clears this on every call and may set it again for its
-    # SM90 fp8-KV verify kernel. This plan never takes that route, so clear it
-    # here too rather than let run() launch it with a previous plan's state.
+    # The captured graph may hold FlashInfer's SM90 fp8-KV verify kernel, which
+    # reads only the buffers refreshed above; this plan does not rebuild its state.
     self._eagle_verify_fp8kv_sm90_state = None
 
     args = [
