@@ -108,6 +108,11 @@ class TestNPUGLM_5_3_W8A8_16P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
     dataset_baselines = {
         "gsm8k": 0.92,
     }
+    # Strip the reasoning trace before answer extraction, matching how GLM-5.3
+    # gsm8k is evaluated upstream.
+    dataset_args = {
+        "gsm8k": {"filters": {"remove_until": "</think>"}},
+    }
     eval_batch_size = 32
     generation_config = {
         "max_tokens": 131072,

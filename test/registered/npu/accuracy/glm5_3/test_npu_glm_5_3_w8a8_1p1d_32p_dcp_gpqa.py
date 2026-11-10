@@ -247,7 +247,8 @@ class TestNPUGLM5_3_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
         "gpqa_diamond": {
             "filters": {"remove_until": "</think>"},
             "system_prompt": "Your response should be in the following format:\nExplanation: {your explanation for your final answer}\nExact Answer: {your succinct, final answer}\nConfidence: {your confidence score between 0% and 100% for your answer}.",
-        }
+        },
+        "gsm8k": {"filters": {"remove_until": "</think>"}},
     }
     eval_batch_size = 48
     generation_config = {
