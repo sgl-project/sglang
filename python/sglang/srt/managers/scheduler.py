@@ -336,6 +336,7 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     allocate_distinct_stream,
+    get_preserve_last_token_id,
     is_health_check_generate_req,
     is_war_barrier_enabled,
     make_abort_req,
@@ -1040,13 +1041,9 @@ class Scheduler(
                     )
                 ]
 
-        # Encoder embeddings depend on the trailing separator token; preserve it
-        # when auto-truncating instead of head-slicing it off (embedding-only).
-        self._embedding_preserve_last_token_id = None
-        if not self.is_generation and self.tokenizer is not None:
-            self._embedding_preserve_last_token_id = getattr(
-                self.tokenizer, "sep_token_id", None
-            )
+        self._embedding_preserve_last_token_id = get_preserve_last_token_id(
+            tokenizer=self.tokenizer, is_generation=self.is_generation
+        )
 
     def init_mamba_backend(self) -> None:
         if initialize_mamba_selective_state_update_backend is not None:
