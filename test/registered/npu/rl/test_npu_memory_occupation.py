@@ -9,7 +9,7 @@ import os
 import unittest
 
 import requests
-from npu_rl_utils import (
+from conftest import (
     checkpoint_weight_bytes,
     generate,
     generation_signature,

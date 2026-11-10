@@ -11,7 +11,7 @@ import unittest
 
 import requests
 import torch
-from npu_rl_utils import (
+from conftest import (
     begin_weight_update,
     checkpoint_manifest,
     checkpoint_tensor_index,
