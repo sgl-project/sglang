@@ -108,8 +108,8 @@ def main() -> int:
         "runner_configs", os.path.join("scripts", "ci", "runner_configs.py")
     )
     known_runner_configs = set(runner_configs.load())
-    # No CUDA/CPU workflow passes `run_suite.py --nightly`, so a nightly=True
-    # registration on these backends is filtered out of every run.
+    # CUDA and most CPU suites do not pass --nightly. The Xeon model workflow
+    # explicitly runs its dedicated suite with that flag.
     no_nightly_flag = (cuda, ci_register.HWBackend.CPU)
 
     # Same exclusion as run_suite.py: pytest+package structure files.
@@ -144,7 +144,11 @@ def main() -> int:
         if _defines_testcase(tree) and not _main_runs_tests(tree):
             dead_tests.append(f)
         for r in registries:
-            if r.nightly and r.backend in no_nightly_flag:
+            xeon_nightly = (
+                r.backend == ci_register.HWBackend.CPU
+                and r.effective_suite == "nightly-xeon-e2e"
+            )
+            if r.nightly and r.backend in no_nightly_flag and not xeon_nightly:
                 nightly_flagged.append((f, r.backend.name, r.effective_suite))
             if (
                 r.backend == cuda
@@ -204,8 +208,8 @@ def main() -> int:
         exit_code = 1
     if nightly_flagged:
         print(
-            "ERROR: CUDA/CPU test(s) register with nightly=True. No CUDA/CPU "
-            "workflow passes `run_suite.py --nightly`, so these tests never run. "
+            "ERROR: CUDA/CPU test(s) register with nightly=True, but no workflow "
+            "runs these suites with `run_suite.py --nightly`, so these tests never run. "
             'Drop nightly=True; `stage="nightly"` (or "weekly") alone selects '
             "the scheduled suite:\n"
         )

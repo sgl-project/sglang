@@ -10,22 +10,39 @@ on:
         required: false
         type: string
         default: main
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Exact commit to test'
+        required: true
+        type: string
+      repository:
+        description: 'Repository containing the commit, including fork PRs'
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: nightly-test-xeon-${{ github.ref }}
+  group: nightly-test-xeon-${{ github.event_name }}-${{ inputs.ref || github.ref }}
   cancel-in-progress: false
 
 jobs:
   nightly-xeon-models:
+    name: Xeon models (GNR shard ${{ matrix.shard }})
     if: github.repository == 'sgl-project/sglang'
     runs-on: xeon-gnr
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [0, 1]
     env:
-      IMAGE: sglang-xeon-nightly:${{ github.run_id }}-${{ github.run_attempt }}
-      CONTAINER: sglang_xeon_nightly_${{ github.run_id }}_${{ github.run_attempt }}
+      SHARD: ${{ matrix.shard }}
+      IMAGE: sglang-xeon-nightly:${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
+      CONTAINER: sglang_xeon_nightly_${{ github.run_id }}_${{ github.run_attempt }}_${{ matrix.shard }}
     steps:
       - name: Restore workspace ownership
         run: sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
@@ -33,26 +50,28 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
+          repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || 'main' }}
 
       - name: Build CPU image for the checked-out commit
         run: |
           docker build . -f docker/xeon.Dockerfile --no-cache \
-            --build-arg SGLANG_REPO="https://github.com/${{ github.repository }}.git" \
+            --build-arg SGLANG_REPO="https://github.com/${{ inputs.repository || github.repository }}.git" \
             --build-arg VER_SGLANG="$(git rev-parse HEAD)" \
             -t "$IMAGE"
 
       - name: Start full-machine Xeon container
         run: |
-          touch nightly-xeon-summary.md nightly-xeon-metrics.jsonl
+          touch "nightly-xeon-${SHARD}-summary.md" "nightly-xeon-${SHARD}-metrics.jsonl"
           docker run -dt --name "$CONTAINER" --shm-size=64g \
             -v "$GITHUB_WORKSPACE:/sglang-checkout" \
             -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
             -v "$HOME/.cache/sgl_eval:/root/.cache/sgl_eval" \
             -e HF_TOKEN="$(cat "$HOME/huggingface_token.txt")" \
             -e SGLANG_IS_IN_CI=true \
-            -e GITHUB_STEP_SUMMARY=/sglang-checkout/nightly-xeon-summary.md \
-            -e SGLANG_TEST_METRICS_FILE=/sglang-checkout/nightly-xeon-metrics.jsonl \
+            -e SGLANG_XEON_NIGHTLY_SHARD="$SHARD" \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/nightly-xeon-${SHARD}-summary.md" \
+            -e SGLANG_TEST_METRICS_FILE="/sglang-checkout/nightly-xeon-${SHARD}-metrics.jsonl" \
             "$IMAGE"
 
       - name: Check AMX CPU backend
@@ -68,13 +87,13 @@ jobs:
           docker exec -w /sglang-checkout/test "$CONTAINER" \
             python3 run_suite.py --hw cpu --suite nightly-xeon-e2e \
             --nightly --continue-on-error --timeout-from-est-time \
-            2>&1 | tee nightly-xeon.log
+            2>&1 | tee "nightly-xeon-${SHARD}.log"
 
       - name: Publish summary and restore artifact ownership
         if: always()
         run: |
-          if [ -f nightly-xeon-summary.md ]; then
-            cat nightly-xeon-summary.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "nightly-xeon-${SHARD}-summary.md" ]; then
+            cat "nightly-xeon-${SHARD}-summary.md" >> "$GITHUB_STEP_SUMMARY"
           fi
           docker exec -u root "$CONTAINER" \
             chown -R "$(id -u):$(id -g)" /sglang-checkout || true
@@ -83,12 +102,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nightly-xeon-models-${{ github.run_id }}-${{ github.run_attempt }}
+          name: nightly-xeon-models-${{ github.run_id }}-${{ github.run_attempt }}-shard-${{ matrix.shard }}
           if-no-files-found: warn
           path: |
-            nightly-xeon.log
-            nightly-xeon-summary.md
-            nightly-xeon-metrics.jsonl
+            nightly-xeon-${{ matrix.shard }}.log
+            nightly-xeon-${{ matrix.shard }}-summary.md
+            nightly-xeon-${{ matrix.shard }}-metrics.jsonl
 
       - name: Clean up container and image
         if: always()

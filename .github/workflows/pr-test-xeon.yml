@@ -38,6 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests}}
+      xeon_nightly: ${{ steps.filter.outputs.xeon_nightly }}
     env:
       PYTHONDONTWRITEBYTECODE: 1
     steps:
@@ -77,8 +78,14 @@ jobs:
               - "test/**/!(*.md)"
               - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-xeon.yml"
+              - ".github/workflows/nightly-test-xeon.yml"
               - ".github/workflows/pr-test-extra.yml"
               - "docker/xeon.Dockerfile"
+            xeon_nightly:
+              - ".github/workflows/nightly-test-xeon.yml"
+              - ".github/workflows/pr-test-xeon.yml"
+              - "test/registered/cpu/test_nightly_xeon_e2e.py"
+              - "test/run_suite.py"
 
   # ==================== PR Gate ==================== #
   pr-gate:
@@ -88,6 +95,17 @@ jobs:
     with:
       # Extra is called by the NVIDIA/shared Extra workflow; Base is unchanged.
       require-label: ${{ inputs.extra_only == true && 'run-ci-nv-extra' || '' }}
+    secrets: inherit
+
+  # Validate the nightly entry point before merging workflow/suite changes.
+  # Reuse the normal PR gate before running fork code on the Xeon runner.
+  validate-xeon-nightly:
+    needs: [check-changes, pr-gate]
+    if: github.event_name == 'pull_request' && inputs.extra_only != true && needs.check-changes.outputs.xeon_nightly == 'true'
+    uses: ./.github/workflows/nightly-test-xeon.yml
+    with:
+      repository: ${{ github.event.pull_request.head.repo.full_name }}
+      ref: ${{ github.event.pull_request.head.sha }}
     secrets: inherit
 
   build-test:
