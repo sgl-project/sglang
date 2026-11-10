@@ -301,6 +301,14 @@ def update_expert_weights_single_layer(
             routed_experts_weights[i], temp_buffers[i], send = views
         send_weights[i] = send.copy_(routed_experts_weights[i])
 
+    # Index each placement once instead of scanning every slot for every expert.
+    old_expert_ranks = _expert_ranks_by_logical_id(
+        old_physical_to_logical_map, num_local_physical_experts
+    )
+    new_expert_ranks = _expert_ranks_by_logical_id(
+        new_physical_to_logical_map, num_local_physical_experts
+    )
+
     self_node_id = rank // num_gpu_per_node
 
     local_expert_location_range = (
@@ -495,26 +503,14 @@ def update_expert_weights_single_layer(
         )
 
     def _compute_comm_info(logical_expert_id: int):
-        all_src_ranks = _deduplicate_ordered(
-            [
-                x // num_local_physical_experts
-                for x in range(num_physical_experts)
-                if old_physical_to_logical_map[x] == logical_expert_id
-            ]
-        )
+        all_src_ranks = old_expert_ranks[logical_expert_id]
         all_src_nodes = [x // num_gpu_per_node for x in all_src_ranks]
         self_node_src_ranks = [
             x for x in all_src_ranks if x // num_gpu_per_node == self_node_id
         ]
-
-        need_comm_dst_ranks = _deduplicate_ordered(
-            [
-                x // num_local_physical_experts
-                for x in range(num_physical_experts)
-                if new_physical_to_logical_map[x] == logical_expert_id
-                and x // num_local_physical_experts not in all_src_ranks
-            ]
-        )
+        need_comm_dst_ranks = [
+            x for x in new_expert_ranks[logical_expert_id] if x not in all_src_ranks
+        ]
         need_comm_self_node_dst_ranks = (
             [x for x in need_comm_dst_ranks if x // num_gpu_per_node == self_node_id]
             if len(self_node_src_ranks) > 0
@@ -668,12 +664,15 @@ class _ChunkUtils:
         return slice(start, end)
 
 
-def _deduplicate_ordered(arr: List[int]):
-    output = []
-    for item in arr:
-        if len(output) == 0 or item != output[-1]:
-            output.append(item)
-    return output
+def _expert_ranks_by_logical_id(placement: List[int], num_local_experts: int):
+    """List each expert's group-local ranks in placement order, without duplicates."""
+    expert_ranks = defaultdict(list)
+    for location, expert_id in enumerate(placement):
+        rank = location // num_local_experts
+        ranks = expert_ranks[expert_id]
+        if not ranks or ranks[-1] != rank:
+            ranks.append(rank)
+    return expert_ranks
 
 
 def _log_p2p_op_metrics(
