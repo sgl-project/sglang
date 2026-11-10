@@ -37,9 +37,32 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCall,
     UsageInfo,
 )
+from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+
+
+class TestStreamTokenIdSSE(unittest.TestCase):
+    def test_opt_in_token_ids_do_not_change_default_chunk(self):
+        args = dict(chunk_id="chatcmpl-test", created=1, model="test", index=0)
+        default = json.loads(build_sse_content(**args).removeprefix("data: "))
+        default_choice = default["choices"][0]
+        self.assertNotIn("response_token_ids", default_choice)
+        self.assertNotIn("prompt_token_ids", default_choice)
+        self.assertIsNone(default_choice["logprobs"])
+        self.assertIsNone(default_choice["finish_reason"])
+
+        with_ids = json.loads(
+            build_sse_content(
+                **args,
+                response_token_ids=[4, 5],
+                prompt_token_ids=[1, 2, 3],
+            ).removeprefix("data: ")
+        )
+        choice = with_ids["choices"][0]
+        self.assertEqual(choice["response_token_ids"], [4, 5])
+        self.assertEqual(choice["prompt_token_ids"], [1, 2, 3])
 
 
 class TestCompletionRequest(unittest.TestCase):
@@ -701,6 +724,38 @@ class TestModelSerialization(unittest.TestCase):
         self.assertNotIn("token_ids", data)
         self.assertEqual(data["response_token_ids"], [4, 5])
         self.assertEqual(data["meta_info"], {"prompt_tokens": 3})
+
+    def test_stream_choice_token_ids_serialization(self):
+        """Test that stream token ID fields serialize only when set."""
+        default_choice = ChatCompletionResponseStreamChoice(
+            index=0,
+            delta=DeltaMessage(role="assistant", content="Hello"),
+            finish_reason=None,
+        )
+        default_data = default_choice.model_dump()
+        self.assertNotIn("response_token_ids", default_data)
+        self.assertNotIn("prompt_token_ids", default_data)
+        self.assertNotIn("tool_calls", default_data["delta"])
+
+        choice = ChatCompletionResponseStreamChoice(
+            index=0,
+            delta=DeltaMessage(role="assistant", content="Hello"),
+            finish_reason=None,
+            response_token_ids=[4, 5],
+            prompt_token_ids=[1, 2, 3],
+        )
+        data = choice.model_dump()
+        self.assertEqual(data["response_token_ids"], [4, 5])
+        self.assertEqual(data["prompt_token_ids"], [1, 2, 3])
+        self.assertNotIn("tool_calls", data["delta"])
+
+        response = ChatCompletionStreamResponse(
+            id="chatcmpl-test", model="test-model", choices=[choice]
+        )
+        nested_choice = json.loads(response.model_dump_json())["choices"][0]
+        self.assertEqual(nested_choice["response_token_ids"], [4, 5])
+        self.assertEqual(nested_choice["prompt_token_ids"], [1, 2, 3])
+        self.assertNotIn("tool_calls", nested_choice["delta"])
 
 
 class TestFunctionDeferLoading(unittest.TestCase):
