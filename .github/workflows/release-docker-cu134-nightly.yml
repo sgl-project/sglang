@@ -141,7 +141,9 @@ jobs:
   merge:
     needs: [meta, build]
     # Runs after a partial failure too; the step below decides what to publish.
-    if: always() && needs.meta.result == 'success' && (github.event_name == 'schedule' || !inputs.build_only)
+    if: |
+      !cancelled() && needs.meta.result == 'success' &&
+      (github.event_name == 'schedule' || !inputs.build_only)
     runs-on: ubuntu-latest
     environment: prod
     steps:
