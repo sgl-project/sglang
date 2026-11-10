@@ -281,5 +281,23 @@ class TestNeutralParams(CustomTestCase):
         self.assertGreater(params.max_new_tokens, 8)
 
 
+class TestCollectStopTokenIds(CustomTestCase):
+    def test_model_stop_tokens_are_optional(self):
+        """Beams stop on the model's EOS tokens by default; with
+        disable_model_stop_tokens only the request's stop_token_ids end them."""
+        from sglang.srt.beam_search.coordinator import BeamCoordinator
+
+        req = SimpleNamespace(
+            eos_token_ids={2},
+            tokenizer=SimpleNamespace(eos_token_id=3, additional_stop_token_ids={4}),
+            disable_model_stop_tokens=False,
+        )
+        params = SimpleNamespace(ignore_eos=False, stop_token_ids={5})
+        collect = BeamCoordinator._collect_stop_token_ids
+        self.assertEqual(collect(req, params, vocab_size=32), [2, 3, 4, 5])
+        req.disable_model_stop_tokens = True
+        self.assertEqual(collect(req, params, vocab_size=32), [5])
+
+
 if __name__ == "__main__":
     unittest.main()

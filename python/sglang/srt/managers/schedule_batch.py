@@ -480,6 +480,7 @@ class Req(ReqDllmMixin):
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        disable_model_stop_tokens: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -599,6 +600,9 @@ class Req(ReqDllmMixin):
         self.to_finish: Optional[BaseFinishReason] = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids
+        # True under --disable-model-stop-tokens: the model's EOS tokens (eos_token_ids
+        # and the tokenizer's) don't finish the request; its stop_token_ids still do.
+        self.disable_model_stop_tokens = disable_model_stop_tokens
         self.vocab_size = vocab_size
         self.priority = priority
 
@@ -1299,12 +1303,15 @@ class Req(ReqDllmMixin):
         for i, token_id in enumerate(new_accepted_tokens):
             if self.sampling_params.stop_token_ids:
                 matched_eos |= token_id in self.sampling_params.stop_token_ids
-            if self.eos_token_ids:
-                matched_eos |= token_id in self.eos_token_ids
-            if self.tokenizer is not None:
-                matched_eos |= token_id == self.tokenizer.eos_token_id
-                if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
+            if not self.disable_model_stop_tokens:
+                if self.eos_token_ids:
+                    matched_eos |= token_id in self.eos_token_ids
+                if self.tokenizer is not None:
+                    matched_eos |= token_id == self.tokenizer.eos_token_id
+                    if self.tokenizer.additional_stop_token_ids:
+                        matched_eos |= (
+                            token_id in self.tokenizer.additional_stop_token_ids
+                        )
             if matched_eos:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
                 matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i

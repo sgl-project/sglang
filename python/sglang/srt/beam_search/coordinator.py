@@ -247,12 +247,15 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if user_params.ignore_eos:
             return []
         stop_ids = set(user_params.stop_token_ids or ())
-        stop_ids |= set(req.eos_token_ids or ())
-        tokenizer = req.tokenizer
-        if tokenizer is not None:
-            if getattr(tokenizer, "eos_token_id", None) is not None:
-                stop_ids.add(tokenizer.eos_token_id)
-            stop_ids |= set(getattr(tokenizer, "additional_stop_token_ids", None) or ())
+        if not req.disable_model_stop_tokens:
+            stop_ids |= set(req.eos_token_ids or ())
+            tokenizer = req.tokenizer
+            if tokenizer is not None:
+                if getattr(tokenizer, "eos_token_id", None) is not None:
+                    stop_ids.add(tokenizer.eos_token_id)
+                stop_ids |= set(
+                    getattr(tokenizer, "additional_stop_token_ids", None) or ()
+                )
         # Out-of-vocab ids never match; past int64 they would break BeamGroup's tensor.
         return sorted(t for t in stop_ids if 0 <= t < vocab_size)
 

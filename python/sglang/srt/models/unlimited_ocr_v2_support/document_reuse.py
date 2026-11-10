@@ -536,12 +536,14 @@ def _doc_params(req) -> Optional[dict]:
 
 
 def _stop_ids(req) -> set:
-    ids = set(req.eos_token_ids or ())
-    tok = req.tokenizer
-    # Tokenizer backends are duck-typed; not every one exposes eos_token_id.
-    eos = getattr(tok, "eos_token_id", None) if tok is not None else None
-    if isinstance(eos, int):
-        ids.add(eos)
+    ids = set()
+    if not req.disable_model_stop_tokens:
+        ids.update(req.eos_token_ids or ())
+        tok = req.tokenizer
+        # Tokenizer backends are duck-typed; not every one exposes eos_token_id.
+        eos = getattr(tok, "eos_token_id", None) if tok is not None else None
+        if isinstance(eos, int):
+            ids.add(eos)
     stop = req.sampling_params.stop_token_ids
     if stop:
         ids.update(stop)
