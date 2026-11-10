@@ -37,10 +37,13 @@ def draft_kv_ring_unsupported_reason(
     draft_backend: Optional[str],
     draft_window_size,
     disaggregation_mode: str = "null",
+    enable_unified_memory: bool = False,
 ) -> Optional[str]:
     """Why a draft KV ring cannot serve this DFLASH draft, or None if it can."""
     if disaggregation_mode != "null":
         return "PD disaggregation does not transfer the ring yet"
+    if enable_unified_memory:
+        return "--enable-unified-memory places the draft KV in the target's pool"
     from sglang.srt.speculative.dflash_utils import (
         get_dflash_layer_types,
         is_dflash_mla_draft_config,

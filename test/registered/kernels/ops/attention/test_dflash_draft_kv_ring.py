@@ -115,6 +115,7 @@ def test_unsupported_drafts():
         backend="trtllm_mla",
         window=None,
         disaggregation_mode="null",
+        unified=False,
     ):
         with (
             mock.patch.object(
@@ -129,6 +130,7 @@ def test_unsupported_drafts():
                 draft_backend=backend,
                 draft_window_size=window,
                 disaggregation_mode=disaggregation_mode,
+                enable_unified_memory=unified,
             )
 
     assert reason() is None
@@ -139,6 +141,7 @@ def test_unsupported_drafts():
     assert reason(window=4096) is not None
     assert reason(disaggregation_mode="prefill") is not None
     assert reason(disaggregation_mode="decode") is not None
+    assert reason(unified=True) is not None
 
 
 if __name__ == "__main__":

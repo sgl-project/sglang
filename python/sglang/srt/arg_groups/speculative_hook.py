@@ -1135,6 +1135,7 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         draft_backend=cfg.speculative_draft_attention_backend,
         draft_window_size=cfg.speculative_draft_window_size,
         disaggregation_mode=cfg.disaggregation_mode,
+        enable_unified_memory=cfg.enable_unified_memory,
     )
     if reason is None:
         logger.info("DFLASH draft KV ring: on.")
