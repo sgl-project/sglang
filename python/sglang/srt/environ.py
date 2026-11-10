@@ -1930,6 +1930,9 @@ class Envs:
     # Sequences a captured GDN extend bucket accepts (at most the request pool); a
     # larger prefill batch runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # Opt GDN models into padded prefill CUDA graph replay on architectures or
+    # quantizations where in-graph GEMM tiles vary with token count M.
+    SGLANG_ENABLE_PADDED_GDN_PREFILL_GRAPH = EnvBool(False)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls

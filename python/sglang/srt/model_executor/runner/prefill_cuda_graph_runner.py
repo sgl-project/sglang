@@ -54,6 +54,7 @@ from sglang.kernels.ops.attention.kv_indices import (
 )
 from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
@@ -174,6 +175,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_memory,
     get_parallel,
+    get_platform,
     get_schedule,
 )
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
@@ -193,6 +195,41 @@ _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2
 # Prefix attention adds one loop body per chunk to the captured topology, so
 # capture a small geometric set and round each replay up to the nearest one.
 _CHUNKED_PREFIX_VARIANTS = (1, 2, 4, 8, 16)
+_SM100_M_INVARIANT_GDN_QUANTIZATIONS = (
+    "modelopt",
+    "modelopt_fp4",
+    "modelopt_fp8",
+    "modelopt_mixed",
+    "fp8",
+)
+
+
+def _uses_gdn_linear_attention(attn_backend: Any) -> bool:
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+    from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+    return isinstance(attn_backend, GDNAttnBackend) or (
+        isinstance(attn_backend, HybridLinearAttnBackend)
+        and isinstance(attn_backend.linear_attn_backend, GDNAttnBackend)
+    )
+
+
+def _requires_exact_gdn_prefill_bucket(model_runner: ModelRunner) -> bool:
+    if (
+        envs.SGLANG_ENABLE_PADDED_GDN_PREFILL_GRAPH.get()
+        or get_schedule().enable_mixed_chunk
+        or not _uses_gdn_linear_attention(model_runner.attn_backend)
+    ):
+        return False
+    if (
+        get_platform().is_sm100
+        and model_runner.model_config.quantization
+        in _SM100_M_INVARIANT_GDN_QUANTIZATIONS
+    ):
+        return False
+    return True
 
 
 def get_prefill_num_tokens_to_capture(capture_tokens: Sequence[int]) -> list[int]:
@@ -336,6 +373,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     _dcp_extend_active = False
+    _requires_exact_prefill_bucket: bool = False
     dllm_attention = None
 
     @property
@@ -396,6 +434,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 "prefer_eager_mixed_prefill_under_dp_attention",
                 False,
             )
+        )
+        self._requires_exact_prefill_bucket = _requires_exact_gdn_prefill_bucket(
+            model_runner
         )
         # bs in prefill carries the captured shape (token count for
         # tc_piecewise) — one shape knob per phase.
@@ -1517,9 +1558,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return True
         if num_tokens > self.max_num_tokens:
             return False
-        # No exact-shape check: load_batch bucket-pads; only reject
-        # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        if self._requires_exact_prefill_bucket and padded_num_tokens != num_tokens:
+            return False
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
             return False
         return True
