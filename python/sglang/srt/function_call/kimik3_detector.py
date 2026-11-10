@@ -180,7 +180,7 @@ class KimiK3Detector(BaseFormatDetector):
     ) -> StreamingParseResult:
         self._buffer += new_text
         try:
-            open_idx = self._buffer.find(self.bot_token)
+            open_idx = self._buffer.find(self.bot_token, self._sent_normal_idx)
             if open_idx == -1:
                 return StreamingParseResult(normal_text=self._emit_normal_text())
 
@@ -219,15 +219,19 @@ class KimiK3Detector(BaseFormatDetector):
             return StreamingParseResult()
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
-        open_idx = self._buffer.find(self.bot_token)
+        open_idx = self._buffer.find(self.bot_token, self._sent_normal_idx)
         if open_idx != -1:
-            section = self._buffer[open_idx + len(self.bot_token) :]
-            if not self._parse_calls(section):
-                logger.warning(
-                    "Kimi K3 tools section ended with no complete tool call; "
-                    "dropping %d buffered chars",
-                    len(section),
-                )
+            has_completed_call = any(
+                "arguments" in call for call in self.prev_tool_call_arr
+            )
+            if not has_completed_call:
+                section = self._buffer[open_idx + len(self.bot_token) :]
+                if not self._parse_calls(section):
+                    logger.warning(
+                        "Kimi K3 tools section ended with no complete tool call; "
+                        "dropping %d buffered chars",
+                        len(section),
+                    )
             return StreamingParseResult()
         pending = self._emit_normal_text(limit=len(self._buffer))
         return StreamingParseResult(normal_text=strip_partial_marker_suffix(pending))

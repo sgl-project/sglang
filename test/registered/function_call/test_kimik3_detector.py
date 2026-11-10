@@ -193,6 +193,27 @@ def test_streaming_plain_text_only() -> None:
     assert calls == []
 
 
+def test_finish_skips_reparse_when_call_already_completed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detector = KimiK3Detector()
+    tools = [_make_tool("python")]
+    text = (
+        f"{RESPONSE_OPEN}thinking{RESPONSE_CLOSE}{TOOLS_OPEN}"
+        + _call_block("python", 1, {"code": ("string", "x" * 200)})
+        + TOOLS_CLOSE
+    )
+    normal_text, calls = _stream(detector, _chunks(text, 7), tools)
+    assert normal_text == "thinking"
+    assert calls
+
+    def fail_parse_calls(_section: str) -> list[dict]:
+        raise AssertionError("finish() should not re-parse completed tool calls")
+
+    monkeypatch.setattr(detector, "_parse_calls", fail_parse_calls)
+    assert detector.finish(tools).calls == []
+
+
 def test_streaming_bookkeeping_for_serving_layer() -> None:
     detector = KimiK3Detector()
     tools = [_make_tool("python")]
