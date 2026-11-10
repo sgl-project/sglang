@@ -127,7 +127,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.DSPARK
 
     def is_dflash_family(self) -> bool:
-        return self.is_dflash() or self.is_dspark() or self.is_ubtree()
+        return self in _DFLASH_FAMILY
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
@@ -145,7 +145,7 @@ class SpeculativeAlgorithm(Enum):
         """
         # DSPARK's draft KV inject runs after the target prefill, but on write
         # locations it computes before the target forward.
-        return self.is_none() or (self.is_dflash_family() and not self.is_ubtree())
+        return self in _PREFILL_SHARED_READ_DONE
 
     def supports_mixed_chunk(self) -> bool:
         """Whether mixed chunk prefill may stay enabled with this algorithm.
@@ -172,11 +172,7 @@ class SpeculativeAlgorithm(Enum):
         # Needs a GPU draft phase to hide the grammar CPU work under: NGRAM drafts
         # from a host corpus lookup, so it stays synchronous by design.
         # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
-        return (
-            self.is_eagle()
-            or self.is_standalone()
-            or (self.is_dflash_family() and not self.is_ubtree())
-        )
+        return self.is_eagle() or self in _GRAMMAR_OVERLAP
 
     def create_cuda_graph_verify_input(
         self, *, custom_mask, num_tokens_per_req: int, is_draft_worker: bool
@@ -396,6 +392,23 @@ class SpeculativeAlgorithm(Enum):
             return NGRAMWorker
 
         raise ValueError("Unreachable code path in create_worker.")
+
+
+_DFLASH_FAMILY = (
+    SpeculativeAlgorithm.DFLASH,
+    SpeculativeAlgorithm.DSPARK,
+    SpeculativeAlgorithm.UBTREE,
+)
+_PREFILL_SHARED_READ_DONE = (
+    SpeculativeAlgorithm.NONE,
+    SpeculativeAlgorithm.DFLASH,
+    SpeculativeAlgorithm.DSPARK,
+)
+_GRAMMAR_OVERLAP = (
+    SpeculativeAlgorithm.STANDALONE,
+    SpeculativeAlgorithm.DFLASH,
+    SpeculativeAlgorithm.DSPARK,
+)
 
 
 class SpecInputType(IntEnum):
