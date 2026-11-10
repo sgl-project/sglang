@@ -292,6 +292,7 @@ class TestIntelXpuGDNDispatch(CustomTestCase):
     def test_sycl_prefill_defers_gates_and_fallback_computes_them(self):
         kernel = XpuGDNKernel()
         self.assertTrue(kernel.defers_prefill_gates)
+        self.assertFalse(kernel.supports_strided_target_verify_qkv)
         q = k = v = torch.zeros(1, 100, 1, 2)
         indices = torch.tensor([0], dtype=torch.int32)
         starts = torch.tensor([0, 100], dtype=torch.int32)

@@ -54,7 +54,7 @@ class XpuGDNKernel(TritonGDNKernel):
     """Standalone SYCL GDN recurrence, with Triton for unsupported prefill modes."""
 
     supports_packed_decode = False
-    supports_strided_target_verify_qkv = True
+    supports_strided_target_verify_qkv = False
     defers_prefill_gates = True
 
     @staticmethod

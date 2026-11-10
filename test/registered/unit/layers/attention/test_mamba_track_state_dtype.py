@@ -271,7 +271,9 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     backend._prefill_gates = Mock(return_value=(None, None))
                     backend.kernel_dispatcher = object.__new__(GDNKernelDispatcher)
                     backend.kernel_dispatcher.extend_kernel = SimpleNamespace(
-                        supports_track_state_snapshot=snapshot, extend=extend
+                        supports_track_state_snapshot=snapshot,
+                        defers_prefill_gates=False,
+                        extend=extend,
                     )
                     # Exercise the GPU gather policy with CPU tensors and fake kernels.
                     with (
