@@ -885,6 +885,122 @@ class TestDllmStagingGatePinsOwnPrefix(CustomTestCase):
         self.assertEqual(tree.locked, 1)
 
 
+class _ResolveReq:
+    """Just enough of Req for the FDFO branch of process_batch_result_dllm."""
+
+    def __init__(self, *, origin_len, output, extend_end, block_size):
+        self.rid = "resolve"
+        self.origin_input_ids = array("q", range(1000, 1000 + origin_len))
+        self.output_ids = array("q", output)
+        self.full_untruncated_fill_ids = array(
+            "q", list(self.origin_input_ids) + list(output)
+        )
+        self.full_untruncated_fill_ids.extend(
+            [0] * (extend_end - len(self.full_untruncated_fill_ids) + block_size)
+        )
+        self.extend_end = extend_end
+        self.dllm_incomplete_ids = array("q", [7] * block_size)
+        self.dllm_algo_state = object()
+        self.accepted_lens = []
+
+    def update_finish_state(self, new_accepted_len=0):
+        self.accepted_lens.append(new_accepted_len)
+
+    def finished(self):
+        return False
+
+
+class TestFdfoResolveOutputBoundary(CustomTestCase):
+    """A resolved block must extend output_ids only with tokens past the
+    COMMITTED length (prompt + output), not past the prompt. Trimming against
+    the prompt alone re-appends committed output tokens whenever an extend
+    crosses them — a stall retraction's re-prefill boundary chunk does — and
+    the duplicated tokens shift every later fill rebuild: the next checkpoint
+    re-keys the row's suffix, the radix walk diverges inside the protected
+    span, and the insert creates a sibling node claiming the same KV slots
+    (live repro: evictable+protected grew past the 1024-token pool)."""
+
+    BLOCK_SIZE = 4
+
+    def _run(self, req, resolved_ids):
+        from unittest.mock import Mock
+
+        scheduler = SimpleNamespace(
+            dllm_config=SimpleNamespace(
+                requires_separate_context_encoding=False,
+                first_done_first_out_mode=True,
+                block_size=self.BLOCK_SIZE,
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                free_group_begin=Mock(), free_group_end=Mock()
+            ),
+            metrics_reporter=SimpleNamespace(
+                num_generated_tokens=0, report_prefill_stats=Mock()
+            ),
+            output_streamer=SimpleNamespace(stream_output=Mock()),
+            _finish_dllm_request_if_needed=lambda r: None,
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            batch_size=lambda: 1,
+            return_logprob=False,
+            prefill_stats=object(),
+            dp_cooperation_info=None,
+            forward_mode=SimpleNamespace(is_dllm_extend=lambda: True),
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            next_token_ids=[list(resolved_ids)],
+            accept_length_per_req_cpu=[1],
+            dllm_algo_state=None,
+            can_run_cuda_graph=False,
+        )
+        SchedulerDllmMixin.process_batch_result_dllm(scheduler, batch, result)
+        return scheduler
+
+    def test_reencode_chunk_within_committed_appends_nothing(self):
+        # A re-prefill boundary chunk: every position is already committed
+        # (origin 6 + output 6 = 12 >= extend_end 8+4). Before the fix this
+        # appended resolved_ids[-2:] again (trim against origin alone).
+        req = _ResolveReq(
+            origin_len=6,
+            output=[21, 22, 23, 24, 25, 26],
+            extend_end=8,
+            block_size=self.BLOCK_SIZE,
+        )
+        scheduler = self._run(req, [1005, 21, 22, 23])
+        self.assertEqual(list(req.output_ids), [21, 22, 23, 24, 25, 26])
+        self.assertEqual(scheduler.metrics_reporter.num_generated_tokens, 0)
+        self.assertEqual(req.accepted_lens, [])
+
+    def test_boundary_block_appends_only_new_positions(self):
+        # committed = 6 + 2 = 8; the block covers [6, 10): positions 8 and 9
+        # are new.
+        req = _ResolveReq(
+            origin_len=6,
+            output=[21, 22],
+            extend_end=10,
+            block_size=self.BLOCK_SIZE,
+        )
+        scheduler = self._run(req, [21, 22, 31, 32])
+        self.assertEqual(list(req.output_ids), [21, 22, 31, 32])
+        self.assertEqual(scheduler.metrics_reporter.num_generated_tokens, 2)
+        self.assertEqual(req.accepted_lens, [2])
+
+    def test_fresh_block_appends_all_tokens(self):
+        # committed = 6 + 2 = 8 = extend_end - block: the whole block is new.
+        req = _ResolveReq(
+            origin_len=6,
+            output=[21, 22],
+            extend_end=12,
+            block_size=self.BLOCK_SIZE,
+        )
+        scheduler = self._run(req, [31, 32, 33, 34])
+        self.assertEqual(list(req.output_ids), [21, 22, 31, 32, 33, 34])
+        self.assertEqual(scheduler.metrics_reporter.num_generated_tokens, 4)
+        self.assertEqual(req.accepted_lens, [4])
+
+
 class _InflightStubReq:
     owner_list = None
 

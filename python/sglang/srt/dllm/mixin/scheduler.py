@@ -170,13 +170,23 @@ class SchedulerDllmMixin:
                     req.extend_end - block_size : req.extend_end
                 ] = array("q", next_token_ids)
 
-                len_input = len(req.origin_input_ids)
+                # Only positions past the COMMITTED length are new output.
+                # Trimming against the prompt alone re-appends committed
+                # output tokens whenever an extend crosses them — a stall
+                # retraction's re-prefill boundary chunk does exactly that —
+                # and the duplicated tokens shift every later fill rebuild,
+                # re-keying the row's suffix: the next checkpoint's radix walk
+                # then diverges inside the tree-protected span and inserts a
+                # sibling node claiming the same KV slots (evictable +
+                # protected grow past the pool), on top of the duplicated
+                # tokens reaching the client.
+                committed_len = len(req.origin_input_ids) + len(req.output_ids)
                 len_fill = req.extend_end
-                if len_fill <= len_input:
+                if len_fill <= committed_len:
                     continue
 
-                if len_fill - len(next_token_ids) < len_input:
-                    next_token_ids = next_token_ids[len_input - len_fill :]
+                if len_fill - len(next_token_ids) < committed_len:
+                    next_token_ids = next_token_ids[committed_len - len_fill :]
 
                 self.metrics_reporter.num_generated_tokens += len(next_token_ids)
                 req.output_ids.extend(next_token_ids)
