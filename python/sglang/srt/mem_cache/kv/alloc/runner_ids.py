@@ -235,13 +235,14 @@ class RunnerIds:
                 # rank-local slots (-1: another rank's); the scheduler,
                 # `req_to_token` and the replicated draft pool keep the
                 # allocator-global ones the window is planned in.
+                kv_view = (
+                    token_to_kv_pool.layer_router.wrapped_view() or token_to_kv_pool
+                )
                 localize = functools.partial(
                     localize_dcp_indices,
                     dcp_size=parallel.dcp_size,
                     dcp_rank=parallel.dcp_rank,
-                    interleave_size=getattr(
-                        token_to_kv_pool, "dcp_interleave_size", page_size
-                    ),
+                    interleave_size=getattr(kv_view, "dcp_interleave_size", page_size),
                 )
                 self._call_spaces = self._spaces
                 self._spaces = {

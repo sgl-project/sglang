@@ -33,6 +33,7 @@ from sglang.srt.configs.model_config import (
     get_unlimited_ocr_v2_sparse_config,
     is_deepseek_dsa,
     is_deepseek_v4,
+    is_kimi_k3,
     is_kimi_k31,
     is_minimax_sparse,
     is_unlimited_ocr_v2,
@@ -2698,6 +2699,8 @@ class KVCacheConfigurator:
                     NPUMLATokenToKVPool,
                 )
 
+                if is_kimi_k3(self.model_config.hf_config):
+                    return partial(NPUMLATokenToKVPool, token_interleaved_dcp=True)
                 return NPUMLATokenToKVPool
             assert not is_float4_e2m1fn_x2(self.kv_cache_dtype), (
                 "FP4 is not supported on NPU yet."

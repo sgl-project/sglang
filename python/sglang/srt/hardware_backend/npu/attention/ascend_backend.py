@@ -344,7 +344,6 @@ class AscendAttnBackend(AttentionBackend):
         # Only DSA models (GLM-5.2, DeepSeek-V3-DSA, ...) consume the per-token DSA
         # CP metadata built by prepare_dsa_cp_metadata; V4 keeps its own variant.
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
-        self.dcp_interleave_size = 1 if self.use_dsa else self.page_size
         parallel = get_parallel()
         # Draft KV remains replicated even when the target uses DCP.
         self.dcp_size = 1 if self.is_draft_worker else parallel.attn_dcp_size
@@ -388,6 +387,12 @@ class AscendAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        kv_view = (
+            self.token_to_kv_pool.layer_router.wrapped_view() or self.token_to_kv_pool
+        )
+        self.dcp_interleave_size = getattr(
+            kv_view, "dcp_interleave_size", 1 if self.use_dsa else self.page_size
+        )
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
@@ -536,7 +541,7 @@ class AscendAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         is_spec: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build rank-local paged KV metadata for NPU DSA DCP."""
+        """Build rank-local paged KV metadata for NPU DCP."""
         parallel = get_parallel()
         if is_spec:
             local_kv_lens = get_dcp_chain_spec_lens(
@@ -760,7 +765,7 @@ class AscendAttnBackend(AttentionBackend):
                     query_len,
                     self.dcp_size,
                     self.dcp_rank,
-                    interleave_size=self.page_size,
+                    interleave_size=self.dcp_interleave_size,
                 )
                 # FIA checks S2 against the full paged capacity, not just valid KV.
                 required_mask_width = metadata.block_tables.shape[1] * self.page_size
@@ -1291,7 +1296,7 @@ class AscendAttnBackend(AttentionBackend):
                     query_len,
                     self.dcp_size,
                     self.dcp_rank,
-                    interleave_size=self.page_size,
+                    interleave_size=self.dcp_interleave_size,
                 )
                 active_mask_width = max(1, num_pages) * self.page_size
                 dcp_mask = build_mla_dcp_mtp_mask(
@@ -1994,7 +1999,7 @@ class AscendAttnBackend(AttentionBackend):
                 kv_cached,
                 k_rope_cached,
                 self.forward_metadata.prefix_lens,
-                interleave_size=self.page_size,
+                interleave_size=self.dcp_interleave_size,
             )
             return gathered.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         return kv_cached, k_rope_cached

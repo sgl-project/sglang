@@ -652,6 +652,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         is_draft_worker: bool = False,
         use_combined_kv_buffer: bool = False,
         modelslim_cache_layout=None,
+        token_interleaved_dcp: bool = False,
     ):
         # MLAPO historically owned NZ writes. Keep the allocation unchanged and
         # write into the NZ-addressed view below so ordinary MLA (including
@@ -724,7 +725,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         parallel = get_parallel()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
-        self.dcp_interleave_size = 1 if index_head_dim is not None else page_size
+        self._token_interleaved_dcp = (
+            token_interleaved_dcp or index_head_dim is not None
+        )
+        self.dcp_interleave_size = 1 if self._token_interleaved_dcp else page_size
         self.use_combined_kv_buffer = use_combined_kv_buffer
         global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
         kv_page_padding = global_page_padding if is_draft_worker else 1
@@ -1012,18 +1016,20 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         ]
 
     def configure_pd_dcp(self, kv_args):
-        if self.index_head_dim is None or self.is_draft_worker:
+        if not self._token_interleaved_dcp or self.is_draft_worker:
             return
         disagg = get_disagg()
         backend = disagg.disaggregation_transfer_backend
         if backend not in ("ascend", "mooncake"):
             if self.dcp_size > 1 and backend != "fake":
                 raise ValueError(
-                    "NPU DSA DCP PD requires the Ascend or Mooncake transfer backend."
+                    "NPU token-interleaved DCP PD requires the Ascend or Mooncake transfer backend."
                 )
             return
         if self.use_fia_nz and self.dcp_size > 1:
-            raise ValueError("NPU DSA token PD requires a row-contiguous KV pool.")
+            raise ValueError(
+                "NPU token-interleaved PD requires a row-contiguous KV pool."
+            )
         if disagg.disaggregation_mode == "prefill":
             # Index-K and its scales precede the appended draft entries. All
             # entries in this suffix keep allocator-global slots on Decode.
@@ -1037,10 +1043,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         if self.use_fia_nz or peer.dst_draft_rows_dcp_collapsed:
             raise ValueError(
-                "NPU DSA token PD requires row-contiguous KV and replicated draft rows."
+                "NPU token-interleaved PD requires row-contiguous KV and replicated draft rows."
             )
         if len(peer.dst_kv_ptrs) != len(peer.dst_kv_item_lens):
-            raise ValueError("NPU DSA token DCP requires per-entry destination widths")
+            raise ValueError("NPU token DCP requires per-entry destination widths")
         dst_entries = resolve_dcp_dst_entry_indices(
             kv_args.kv_layer_ids,
             peer.dst_kv_layer_ids,
@@ -1055,10 +1061,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             width, remainder = divmod(src_bytes, kv_args.page_size)
             scale = 1 if i < num_target else peer.dst_dcp_size
             if remainder or width <= 0 or dst_entry >= len(peer.dst_kv_item_lens):
-                raise ValueError("Invalid NPU DSA token DCP page geometry")
+                raise ValueError("Invalid NPU token DCP page geometry")
             if peer.dst_kv_item_lens[dst_entry] != src_bytes * scale:
                 raise ValueError(
-                    f"NPU DSA token DCP entry {dst_entry} has incompatible page bytes: "
+                    f"NPU token DCP entry {dst_entry} has incompatible page bytes: "
                     f"prefill={src_bytes}, decode={peer.dst_kv_item_lens[dst_entry]}, "
                     f"scale={scale}"
                 )
