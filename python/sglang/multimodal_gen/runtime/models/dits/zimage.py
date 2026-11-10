@@ -592,6 +592,16 @@ class ZImageTransformerBlock(nn.Module):
                 ReplicatedLinear(min(dim, ADALN_EMBED_DIM), 4 * dim, bias=True)
             )
 
+    def _norm_scale(self, x, scale, norm):
+        return zimage_rmsnorm_scale(
+            x, scale, norm, self.enable_zimage_native_norm_fusion
+        )
+
+    def _norm_tanh_mul_add(self, x, gate, residual, norm):
+        return zimage_rmsnorm_tanh_mul_add(
+            x, gate, residual, norm, self.enable_zimage_native_norm_fusion
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -615,11 +625,10 @@ class ZImageTransformerBlock(nn.Module):
 
             # Attention block
             attn_out = self.attention(
-                zimage_rmsnorm_scale(
+                self._norm_scale(
                     x,
                     scale_msa,
                     self.attention_norm1,
-                    self.enable_zimage_native_norm_fusion,
                 ),
                 freqs_cis=freqs_cis,
                 rope_cos_sin_cache=rope_cos_sin_cache,
@@ -630,28 +639,25 @@ class ZImageTransformerBlock(nn.Module):
                 num_replicated_suffix=num_replicated_suffix,
                 skip_sequence_parallel_override=skip_sequence_parallel_override,
             )
-            x = zimage_rmsnorm_tanh_mul_add(
+            x = self._norm_tanh_mul_add(
                 attn_out,
                 gate_msa,
                 x,
                 self.attention_norm2,
-                self.enable_zimage_native_norm_fusion,
             )
-            ffn_in = zimage_rmsnorm_scale(
+            ffn_in = self._norm_scale(
                 x,
                 1.0 + scale_mlp,
                 self.ffn_norm1,
-                self.enable_zimage_native_norm_fusion,
             )
 
             # FFN block
             ffn_out = self.feed_forward(ffn_in)
-            x = zimage_rmsnorm_tanh_mul_add(
+            x = self._norm_tanh_mul_add(
                 ffn_out,
                 gate_mlp,
                 x,
                 self.ffn_norm2,
-                self.enable_zimage_native_norm_fusion,
             )
         else:
             # Attention block
@@ -771,6 +777,7 @@ class RopeEmbedder:
 
 class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     norm_cls = ZImageRMSNorm
+    block_cls = ZImageTransformerBlock
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     _fsdp_shard_conditions = [is_zimage_layer]
@@ -854,7 +861,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         self.noise_refiner = nn.ModuleList(
             [
-                ZImageTransformerBlock(
+                self.block_cls(
                     1000 + layer_id,
                     self.dim,
                     self.n_heads,
@@ -871,7 +878,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         self.context_refiner = nn.ModuleList(
             [
-                ZImageTransformerBlock(
+                self.block_cls(
                     layer_id,
                     self.dim,
                     self.n_heads,
@@ -900,7 +907,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         self.layers = nn.ModuleList(
             [
-                ZImageTransformerBlock(
+                self.block_cls(
                     layer_id,
                     self.dim,
                     self.n_heads,

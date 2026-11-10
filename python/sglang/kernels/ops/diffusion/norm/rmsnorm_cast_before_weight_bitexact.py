@@ -73,6 +73,10 @@ def _ordered_norm_kernel(
     ROWS: tl.constexpr,
     BLOCK: tl.constexpr,
     EPS: tl.constexpr,
+    Scale=None,
+    Residual=None,
+    SEQ: tl.constexpr = 1,
+    SCALE_STRIDE: tl.constexpr = 0,
 ):
     rows = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
     rstd = _ordered_rstd(X, M, DIM, ROWS, EPS=EPS)
@@ -82,11 +86,18 @@ def _ordered_norm_kernel(
     x = tl.load(X + rows[:, None] * DIM + cols[None, :], mask, 0).to(tl.float32)
     weight = tl.load(Weight + cols, cols < DIM, 0).to(tl.float32)
     normalized = mul_rn_f32(x, rstd[:, None]).to(tl.bfloat16).to(tl.float32)
-    tl.store(
-        Out + rows[:, None] * DIM + cols[None, :],
-        mul_rn_f32(normalized, weight[None, :]),
-        mask,
-    )
+    result = mul_rn_f32(normalized, weight[None, :])
+    if Scale is not None:
+        scale = tl.load(
+            Scale + (rows // SEQ)[:, None] * SCALE_STRIDE + cols[None, :], mask, 0
+        ).to(tl.float32)
+        result = mul_rn_f32(result.to(tl.bfloat16).to(tl.float32), scale)
+        if Residual is not None:
+            residual = tl.load(
+                Residual + rows[:, None] * DIM + cols[None, :], mask, 0
+            ).to(tl.float32)
+            result = residual + result.to(tl.bfloat16).to(tl.float32)
+    tl.store(Out + rows[:, None] * DIM + cols[None, :], result, mask)
 
 
 @triton.jit
@@ -388,6 +399,72 @@ def rmsnorm_cast_before_weight_bitexact(
             x.shape[-1],
             1024,
             eps,
+            enable_fp_fusion=False,
+        )
+    return out
+
+
+def can_use_rmsnorm_cast_before_weight_scale(x, weight, scale, residual=None):
+    return (
+        _valid_rmsnorm_cast_before_weight(x, weight)
+        and x.ndim == 3
+        and x.shape[-1] == 3840
+        and 16 <= x.numel() // 3840
+        and x.numel() < 2**29
+        and scale.shape == (x.shape[0], 1, 3840)
+        and scale.dtype == x.dtype
+        and scale.device == x.device
+        and scale.stride(-1) == 1
+        and (
+            residual is None
+            or (
+                residual.shape == x.shape
+                and residual.dtype == x.dtype
+                and residual.device == x.device
+                and residual.is_contiguous()
+            )
+        )
+    )
+
+
+def _fake_rmsnorm_scale(x, weight, scale, residual=None, eps=1e-5):
+    return torch.empty_like(x)
+
+
+@register_custom_op(
+    op_name="rmsnorm_cast_before_weight_scale_bitexact",
+    mutates_args=[],
+    fake_impl=_fake_rmsnorm_scale,
+)
+def rmsnorm_cast_before_weight_scale_bitexact(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    residual: torch.Tensor | None = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """Ming norm + scale, optionally adding a residual after BF16 rounding."""
+    if not can_use_rmsnorm_cast_before_weight_scale(
+        x, weight, scale, residual
+    ) or eps not in (1e-6, 1e-5):
+        raise ValueError("Unsupported Ming RMSNorm + scale inputs.")
+    with torch.cuda.device(x.device):
+        out = torch.empty_like(x)
+        rows = x.numel() // 3840
+        _ordered_norm_kernel[(triton.cdiv(rows, 4),)](
+            x,
+            weight,
+            out,
+            rows,
+            3840,
+            4,
+            4096,
+            eps,
+            scale,
+            residual,
+            x.shape[1],
+            scale.stride(0),
+            num_warps=4,
             enable_fp_fusion=False,
         )
     return out
