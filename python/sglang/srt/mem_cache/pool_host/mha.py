@@ -1486,9 +1486,6 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         )
         return (k_buffer, v_buffer)
 
-    def get_hybrid_pool_buffer(self):
-        return [self.k_buffer, self.v_buffer]
-
     def _k_token_stride_size(self) -> int:
         return self.head_num * self.head_dim * self.dtype.itemsize
 
