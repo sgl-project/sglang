@@ -13,6 +13,9 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.kimik3_format import (
+    ARGUMENT_CLOSE,
+    CALL_CLOSE,
+    CALL_OPEN,
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
@@ -40,6 +43,36 @@ _ARG_RE = re.compile(
     re.DOTALL,
 )
 _ATTR_RE = re.compile(r'(?P<k>\w+)="(?P<v>[^"]*)"')
+
+_ARG_OPEN = "<|open|>argument"
+_SEP = "<|sep|>"
+
+# Incremental scanner states for the tools section.
+_ST_SEEK_CALL = "seek_call"  # between calls, waiting for <|open|>call
+_ST_CALL_ATTRS = "call_attrs"  # inside a call header, waiting for its <|sep|>
+_ST_SEEK_ARG = "seek_arg"  # in a call body, awaiting an argument or the call close
+_ST_ARG_ATTRS = "arg_attrs"  # inside an argument header, waiting for its <|sep|>
+_ST_ARG_VALUE = "arg_value"  # inside an argument value, streaming it
+
+# Markers whose trailing partial form must never be flushed as payload text.
+_HOLDBACK_MARKERS = [
+    ARGUMENT_CLOSE,
+    CALL_CLOSE,
+    _ARG_OPEN,
+    CALL_OPEN,
+    "<|open|>",
+    "<|close|>",
+]
+
+
+def _json_escape(text: str) -> str:
+    """Escape ``text`` for use inside a JSON string literal.
+
+    ``json.dumps`` escapes per code point and never re-interprets a fragment
+    boundary, so escaping fragments independently and concatenating the results
+    is identical to escaping their concatenation.
+    """
+    return json.dumps(text, ensure_ascii=False)[1:-1]
 
 
 def _unescape_attr(value: str) -> str:
@@ -75,6 +108,18 @@ class KimiK3Detector(BaseFormatDetector):
         self.bot_token = TOOLS_OPEN
         self.eot_token = TOOLS_CLOSE
         self._sent_normal_idx = 0
+        self._reset_call_stream()
+
+    def _reset_call_stream(self):
+        """Reset the incremental tools-section scanner to a clean state."""
+        self._k3_pos = 0
+        self._k3_state = _ST_SEEK_CALL
+        self._k3_call_name = ""
+        self._k3_args: dict = {}
+        self._k3_arg_key: Optional[str] = None
+        self._k3_arg_type = ""
+        self._k3_val_start = 0
+        self._k3_val_streamed = 0
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -175,6 +220,170 @@ class KimiK3Detector(BaseFormatDetector):
             logger.error("Error in Kimi K3 detect_and_parse: %s", e, exc_info=True)
             return StreamingParseResult(normal_text=before)
 
+    def _start_call(self, name: str) -> List[ToolCallItem]:
+        """Open a new tool call: register bookkeeping and emit the name delta."""
+        self.current_tool_id += 1
+        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+            self.prev_tool_call_arr.append({})
+        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+            self.streamed_args_for_tool.append("")
+        self._k3_call_name = name
+        self._k3_args = {}
+        self.prev_tool_call_arr[self.current_tool_id] = {"name": name, "arguments": {}}
+        self.current_tool_name_sent = True
+        # The name delta follows the base-detector contract: name first, with
+        # empty parameters, then the argument deltas stream behind it.
+        return [
+            ToolCallItem(tool_index=self.current_tool_id, name=name, parameters=""),
+            self._emit_arg_delta("{"),
+        ]
+
+    def _emit_arg_delta(self, delta: str) -> ToolCallItem:
+        """Record an argument fragment and wrap it as a streaming delta."""
+        if delta:
+            self.streamed_args_for_tool[self.current_tool_id] += delta
+        return ToolCallItem(tool_index=self.current_tool_id, parameters=delta)
+
+    def _stream_calls(self, section_start: int) -> List[ToolCallItem]:
+        """Incrementally emit tool-call deltas for the in-progress tools section.
+
+        Every ``parameters`` delta recorded here keeps ``streamed_args_for_tool``
+        a byte-exact prefix of ``json.dumps(arguments, ensure_ascii=False)``,
+        which is what the serving layer's final-diff logic assumes.
+        """
+        calls: List[ToolCallItem] = []
+        buf = self._buffer
+        i = max(self._k3_pos, section_start)
+
+        while True:
+            state = self._k3_state
+
+            if state == _ST_ARG_VALUE:
+                close_idx = buf.find(ARGUMENT_CLOSE, self._k3_val_start)
+                if close_idx == -1:
+                    # Hold back a trailing partial marker so a split
+                    # "<|close|>argument<|sep|>" is never leaked as payload.
+                    hold = partial_suffix_len(
+                        buf[self._k3_val_start :], _HOLDBACK_MARKERS
+                    )
+                    raw_end = len(buf) - hold
+                else:
+                    raw_end = close_idx
+                if raw_end < self._k3_val_start:
+                    raw_end = self._k3_val_start
+                # Only raw string payloads can be streamed character by
+                # character. Everything else is JSON-decoded in one go once its
+                # closing tag arrives, so buffering it here would emit the raw
+                # text *and* the decoded value.
+                if (
+                    self._k3_arg_type == "string"
+                    and raw_end > self._k3_val_start + self._k3_val_streamed
+                ):
+                    delta = buf[self._k3_val_start + self._k3_val_streamed : raw_end]
+                    calls.append(self._emit_arg_delta(_json_escape(delta)))
+                    self._k3_val_streamed = raw_end - self._k3_val_start
+                if close_idx == -1:
+                    self._k3_pos = max(i, raw_end)
+                    break
+                # The value is complete: flush its tail and the closing quote.
+                raw = buf[self._k3_val_start : close_idx]
+                if self._k3_arg_type == "string":
+                    remainder = raw[self._k3_val_streamed :]
+                    if remainder:
+                        calls.append(self._emit_arg_delta(_json_escape(remainder)))
+                    calls.append(self._emit_arg_delta('"'))
+                    self._k3_args[self._k3_arg_key] = raw
+                else:
+                    try:
+                        self._k3_args[self._k3_arg_key] = json.loads(raw)
+                    except json.JSONDecodeError:
+                        self._k3_args[self._k3_arg_key] = raw
+                    calls.append(
+                        self._emit_arg_delta(
+                            json.dumps(
+                                self._k3_args[self._k3_arg_key], ensure_ascii=False
+                            )
+                        )
+                    )
+                self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
+                    self._k3_args
+                )
+                self._k3_arg_key = None
+                self._k3_state = _ST_SEEK_ARG
+                i = close_idx + len(ARGUMENT_CLOSE)
+                self._k3_pos = i
+                continue
+
+            if state == _ST_ARG_ATTRS:
+                sep_idx = buf.find(_SEP, i)
+                if sep_idx == -1:
+                    self._k3_pos = i
+                    break
+                arg_attrs = _parse_attrs(buf[i:sep_idx])
+                key = arg_attrs.get("key", "")
+                arg_type = arg_attrs.get("type", "string")
+                # ``{`` was emitted with the call name, so only the key needs a
+                # leading comma when it is not the first argument. The key must be
+                # quoted exactly like ``json.dumps`` would quote it.
+                prefix = (", " if self._k3_args else "") + json.dumps(
+                    key, ensure_ascii=False
+                )
+                if arg_type == "string":
+                    calls.append(self._emit_arg_delta(prefix + ': "'))
+                else:
+                    calls.append(self._emit_arg_delta(prefix + ": "))
+                self._k3_arg_key = key
+                self._k3_arg_type = arg_type
+                self._k3_val_start = sep_idx + len(_SEP)
+                self._k3_val_streamed = 0
+                self._k3_state = _ST_ARG_VALUE
+                i = self._k3_val_start
+                self._k3_pos = i
+                continue
+
+            if state == _ST_CALL_ATTRS:
+                sep_idx = buf.find(_SEP, i)
+                if sep_idx == -1:
+                    self._k3_pos = i
+                    break
+                name = _parse_attrs(buf[i:sep_idx]).get("tool", "")
+                if name:
+                    calls.extend(self._start_call(name))
+                self._k3_state = _ST_SEEK_ARG
+                i = sep_idx + len(_SEP)
+                self._k3_pos = i
+                continue
+
+            if state == _ST_SEEK_ARG:
+                close_idx = buf.find(CALL_CLOSE, i)
+                arg_idx = buf.find(_ARG_OPEN, i)
+                if close_idx != -1 and (arg_idx == -1 or close_idx < arg_idx):
+                    calls.append(self._emit_arg_delta("}"))
+                    self.current_tool_name_sent = False
+                    self._k3_state = _ST_SEEK_CALL
+                    i = close_idx + len(CALL_CLOSE)
+                    self._k3_pos = i
+                    continue
+                if arg_idx == -1:
+                    self._k3_pos = i
+                    break
+                self._k3_state = _ST_ARG_ATTRS
+                i = arg_idx + len(_ARG_OPEN)
+                self._k3_pos = i
+                continue
+
+            # _ST_SEEK_CALL
+            open_idx = buf.find(CALL_OPEN, i)
+            if open_idx == -1:
+                hold = partial_suffix_len(buf[i:], _HOLDBACK_MARKERS)
+                self._k3_pos = max(i, len(buf) - hold)
+                break
+            self._k3_state = _ST_CALL_ATTRS
+            i = open_idx + len(CALL_OPEN)
+            self._k3_pos = i
+
+        return calls
+
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
@@ -185,27 +394,7 @@ class KimiK3Detector(BaseFormatDetector):
                 return StreamingParseResult(normal_text=self._emit_normal_text())
 
             normal_text = self._emit_normal_text(limit=open_idx)
-            section = self._buffer[open_idx + len(self.bot_token) :]
-            calls = []
-            parsed = self._parse_calls(section)
-            for call in parsed[self.current_tool_id + 1 :]:
-                self.current_tool_id += 1
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
-                self.prev_tool_call_arr[self.current_tool_id] = {
-                    "name": call["name"],
-                    "arguments": json.loads(call["arguments"]),
-                }
-                self.streamed_args_for_tool[self.current_tool_id] = call["arguments"]
-                calls.append(
-                    ToolCallItem(
-                        tool_index=self.current_tool_id,
-                        name=call["name"],
-                        parameters=call["arguments"],
-                    )
-                )
+            calls = self._stream_calls(open_idx + len(self.bot_token))
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(
@@ -216,6 +405,7 @@ class KimiK3Detector(BaseFormatDetector):
             # and silently drops the rest of the response.
             self._buffer = ""
             self._sent_normal_idx = 0
+            self._reset_call_stream()
             return StreamingParseResult()
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
