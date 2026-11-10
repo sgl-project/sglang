@@ -77,6 +77,8 @@ jobs:
         run: python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
 
       - uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: 'call-multimodal-gen-tests /'
 
       - uses: ./.github/actions/check-maintenance
 
