@@ -616,6 +616,7 @@ def run_npu_e2e_test_case(
     trouble_shotting=False,
     transformers_version="",
     run_id: str = "",
+    accuracy_dataset: str = "",
 ):
     """The method for running a npu e2e test case.
     Args:
@@ -633,6 +634,8 @@ def run_npu_e2e_test_case(
         env (str): the environment to run the test on.  Choose one in ["debug", "ci"]
         run_id (str): the GitHub Actions run_id, used to label pods for run-scoped
             isolation when multiple runs share the same k8s namespace.
+        accuracy_dataset (str): dataset name injected into multi-node pods as
+            NPU_ACCURACY_DATASET (gsm8k on weekdays, gpqa_diamond on weekends).
     """
     random_str = get_unique_random_string(16, True)
 
@@ -710,6 +713,7 @@ def run_npu_e2e_test_case(
                 "transformers_version": transformers_version,
                 "run_label": run_label,
                 "run_id": run_id,
+                "accuracy_dataset": accuracy_dataset,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_MIX_GREEN if env == "green" else kube_job_type
@@ -739,6 +743,7 @@ def run_npu_e2e_test_case(
                 "transformers_version": transformers_version,
                 "run_label": run_label,
                 "run_id": run_id,
+                "accuracy_dataset": accuracy_dataset,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_SEPARATION_GREEN if env == "green" else kube_job_type
@@ -942,6 +947,15 @@ if __name__ == "__main__":
         help="GitHub Actions run_id, used to label pods for run-scoped isolation.",
     )
 
+    parser.add_argument(
+        "--accuracy-dataset",
+        type=str,
+        required=False,
+        default="",
+        help="Dataset injected into multi-node pods as NPU_ACCURACY_DATASET "
+        "(gsm8k on weekdays, gpqa_diamond on weekends).",
+    )
+
     args = parser.parse_args()
 
     docker_image_url = args.image
@@ -959,6 +973,7 @@ if __name__ == "__main__":
     trouble_shotting = args.trouble_shotting
     transformers_version = args.transformers_version
     run_id = args.run_id
+    accuracy_dataset = args.accuracy_dataset
 
     kube_name_space = args.kube_name_space
     kube_job_type = args.kube_job_type
@@ -989,4 +1004,5 @@ if __name__ == "__main__":
         trouble_shotting=trouble_shotting,
         transformers_version=transformers_version,
         run_id=run_id,
+        accuracy_dataset=accuracy_dataset,
     )

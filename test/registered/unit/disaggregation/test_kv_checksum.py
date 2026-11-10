@@ -590,7 +590,7 @@ class TestKvChecksumMismatchHiSparse(unittest.TestCase):
         sched = _FakeScheduler(None, None)
         calls = []
         hisparse_coordinator = Mock()
-        hisparse_coordinator.request_finished.side_effect = lambda req: calls.append(
+        hisparse_coordinator.release_request.side_effect = lambda req: calls.append(
             ("hisparse", req)
         )
         sched.request_retirer = release_only_retirer(Mock(), hisparse_coordinator)
