@@ -1162,7 +1162,6 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
             + HIDREAM_O1_BOI_TOKEN
             + HIDREAM_O1_TMS_TOKEN
         )
-        print(f"[DBG encode] prompt={prompt!r} text_len={input_ids.shape[-1]}", flush=True)
         input_ids = self.tokenizer.encode(
             template_caption, return_tensors="pt", add_special_tokens=False
         )

@@ -747,14 +747,6 @@ class HiDreamO1ImageModel(nn.Module):
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        import torch.distributed as dist
-        _r = dist.get_rank() if dist.is_initialized() else -1
-        print(
-            f"[DBG r{_r}] ids{tuple(input_ids.shape)} "
-            f"pos{tuple(position_ids.shape)} mask{tuple(attention_mask.shape)} "
-            f"lat{tuple(patchified_latents.shape)}",
-            flush=True,
-        )
         inputs_embeds = self.language_model.embed_tokens(input_ids)
         # <|tms_token|> slots carry the flow timestep instead of a token embedding.
         timestep_embeds = self.t_embedder1(timestep).to(inputs_embeds.dtype)
