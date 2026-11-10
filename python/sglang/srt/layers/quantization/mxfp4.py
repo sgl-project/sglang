@@ -209,6 +209,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
+_TRITON_KERNELS_PADDING_ALIGNMENT = 64
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
 
@@ -451,6 +452,56 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "or SM120."
                 )
 
+    def padded_intermediate_size(self, intermediate_size_per_partition: int) -> int:
+        """Backend-specific intermediate alignment for this method.
+
+        Single source of truth for the rule ``create_weights`` applies, kept
+        pure so ``FusedMoE.ep_to_tp_transform`` can ask what the TP-shaped
+        partitioning would allocate while the layer is still EP-shaped.
+        Branch order must mirror ``create_weights``.
+        """
+        isp = intermediate_size_per_partition
+        if self.use_marlin and not self.use_mega_moe:
+            return round_up(isp, 128)
+        if self.use_deep_gemm or self.use_mega_moe:
+            # Consumes the checkpoint layout directly; no padding.
+            return isp
+        if get_platform().is_sm100:
+            if self.use_flashinfer:
+                return round_up(isp, 128)
+            return round_up(isp, _TRITON_KERNELS_PADDING_ALIGNMENT)
+        if self._fi_kernel in ("cutlass_sm90", "cutlass_sm120"):
+            # Unpadded on purpose so the loader's naive-copy fast path is
+            # correct; the CUTLASS post-load processor rebuilds a padded buffer.
+            return isp
+        if _use_aiter:
+            return round_up(isp, 128 if _aiter_k3_opt else 256)
+        if _is_xpu:
+            # The XPU grouped GEMM takes the checkpoint dims, but gpt_oss.py shards
+            # the intermediate by whole mxfp4 blocks, so align to the 32-wide block;
+            # this must precede the triton_kernels rule.
+            return round_up(isp, 32)
+        if has_triton_kernels:
+            return round_up(isp, _TRITON_KERNELS_PADDING_ALIGNMENT)
+        return isp
+
+    def rebind_partition_dims(
+        self, *, num_experts: int, intermediate_size_per_partition: int
+    ) -> None:
+        # This method caches per-partition dims (unlike fp8 / modelopt, which
+        # read them off the layer), so a redistribution has to re-point them or
+        # process_weights_after_loading validates against the old partitioning.
+        # hidden_size / hidden_pad are untouched: the hidden dim is not sharded
+        # by moe_tp, so the split cannot change them.
+        self.num_experts = num_experts
+        self.intermediate_size_per_partition = self.padded_intermediate_size(
+            intermediate_size_per_partition
+        )
+        self.intermediate_pad = (
+            self.intermediate_size_per_partition - intermediate_size_per_partition
+        )
+        self._padded_intermediate = round_up(intermediate_size_per_partition, 128)
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -466,15 +517,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scale_dtype = torch.uint8
         self.with_bias = with_bias
         mxfp4_block = 32
-        triton_kernels_padding_alignment = 64
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
-        # for to hold non-uniform sharded tensor as well as swizzling
-        intermediate_size_per_partition_after_pad = intermediate_size_per_partition
+        # for to hold non-uniform sharded tensor as well as swizzling.
+        # The intermediate rule itself lives in padded_intermediate_size() so
+        # callers can ask what a *different* partitioning would allocate; only
+        # the hidden-size padding and the pad bookkeeping stay inline here.
+        intermediate_size_per_partition_after_pad = self.padded_intermediate_size(
+            intermediate_size_per_partition
+        )
         if self.use_marlin and not self.use_mega_moe:
-            intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size_per_partition, 128
-            )
             hidden_size = round_up(hidden_size, 256)
             self.hidden_pad = hidden_size - layer.hidden_size
             self.intermediate_pad = (
@@ -492,14 +544,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # hidden: finalize kernel needs K%32==0, block quant needs K%32==0
                 # Using 128 alignment (not 256) since 256 was overly conservative
                 # and causes 60GB/GPU waste for models like K3 (384 intermediate).
-                intermediate_size_per_partition_after_pad = round_up(
-                    intermediate_size_per_partition, 128
-                )
                 hidden_size = round_up(hidden_size, 128)
-            else:
-                intermediate_size_per_partition_after_pad = round_up(
-                    intermediate_size_per_partition, triton_kernels_padding_alignment
-                )
         elif self._fi_kernel in ("cutlass_sm90", "cutlass_sm120"):
             # CUTLASS mixed-input GEMM dimensions must be % 128 == 0. The
             # kernels also expect ``fc1_expert_weights`` in halved
@@ -521,43 +566,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # processor can exclude the never-written tail from Humming's
             # per-expert scale range.
             self._unpadded_hidden = getattr(layer, "hidden_size_unpadded", hidden_size)
-            # create_weights below uses the *unpadded* sizes so the loader's
-            # naive-copy fast path is correct.
-            intermediate_size_per_partition_after_pad = intermediate_size_per_partition
+            # padded_intermediate_size() returns the *unpadded* size on this
+            # branch so the loader's naive-copy fast path stays correct.
         elif _use_aiter:
             # Expert intermediate is padded to 128 or 256. On K3 (TP8) the 256
             # default costs +33% mem (3072/8=384 -> 512). K3 FlyDSL MoE works with
             # 128 padding, so relaxing to 128 saves that memory and lets the TP8
             # decode CUDA graph range grow from 20 to 120.
-            _inter_align = 128 if _aiter_k3_opt else 256
-            intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size_per_partition, _inter_align
-            )
-
             hidden_size = round_up(hidden_size, 256)
             self.hidden_pad = hidden_size - layer.hidden_size
             self.intermediate_pad = (
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
-            )
-        elif _is_xpu:
-            # The XPU grouped GEMM recovers K/N from the packed weight shapes and
-            # the group size from the scale shape, so it takes the checkpoint
-            # dims. Keep this ahead of the triton_kernels branch so an installed
-            # triton_kernels does not pad the XPU layout.
-            #
-            # Align to mxfp4_block anyway: gpt_oss.py shards the intermediate by
-            # whole mxfp4 blocks (ceil(blocks / tp) * 32), so a rank's slice can
-            # exceed intermediate_size / tp -- 736 vs 720 for gpt-oss-20b at
-            # tp=4, which overflows an unaligned buffer during load. round_up to
-            # 32 reproduces the loader's shard exactly, so no rows are wasted and
-            # the kernel still sees the true dims.
-            intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size_per_partition, mxfp4_block
-            )
-        elif has_triton_kernels:
-            intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size_per_partition, triton_kernels_padding_alignment
             )
 
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad

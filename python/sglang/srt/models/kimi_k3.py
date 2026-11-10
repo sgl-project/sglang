@@ -83,6 +83,9 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import route_quant_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.ep_to_tp_transform import (
+    maybe_ep_to_tp_transform_all_layers,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import (
     TopK,
@@ -3704,6 +3707,12 @@ class KimiK3LinearForCausalLM(nn.Module):
 
         self._check_dsa_indexer_loaded(loaded_params)
         self.post_load_weights()
+
+        # Redistribute EP-loaded MoE weights back to TP layout when
+        # load_tp_by_experts is set (no-op otherwise). self.model is the
+        # decoder stack, which is what the transform walks.
+        maybe_ep_to_tp_transform_all_layers(self.model)
+
         return loaded_params
 
     def _check_dsa_indexer_loaded(self, loaded_params: set[str]) -> None:
