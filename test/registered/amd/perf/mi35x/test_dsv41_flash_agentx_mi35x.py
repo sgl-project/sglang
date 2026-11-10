@@ -36,7 +36,6 @@ Registry: nightly-perf-8-gpu-mi35x-dsv41-flash-agentx suite
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -78,33 +77,19 @@ SUMMARY_HEADER = (
 )
 
 
-def _cache_dir() -> Path:
-    # /sgl-data persists on each runner node, so a node clones a commit once.
-    if os.path.isdir("/sgl-data") and os.access("/sgl-data", os.W_OK):
-        return Path("/sgl-data/inferencex")
-    return Path(tempfile.gettempdir()) / "inferencex"
-
-
 def _checkout_inferencex() -> Path:
-    """InferenceX's ``inferencex-e2e`` tree at INFERENCEX_COMMIT."""
-    root = _cache_dir() / INFERENCEX_COMMIT
-    if not (root / ".complete").is_file():
-        root.parent.mkdir(parents=True, exist_ok=True)
-        staging = Path(tempfile.mkdtemp(dir=root.parent, prefix=f"{root.name}."))
-        git = ["git", "-C", str(staging)]
-        subprocess.run([*git, "init", "-q"], check=True)
-        subprocess.run(
-            [*git, "fetch", "-q", "--depth", "1", INFERENCEX_REPO, INFERENCEX_COMMIT],
-            check=True,
-        )
-        subprocess.run([*git, "checkout", "-q", "FETCH_HEAD"], check=True)
-        (staging / ".complete").touch()
-        if (root / ".complete").is_file():
-            # Another job on this cache finished first; keep its tree.
-            shutil.rmtree(staging, ignore_errors=True)
-        else:
-            shutil.rmtree(root, ignore_errors=True)
-            os.replace(staging, root)
+    """InferenceX's ``inferencex-e2e`` tree at INFERENCEX_COMMIT, in a temp dir.
+
+    Not cached under /sgl-data: the clone takes seconds and goes with the container.
+    """
+    root = Path(tempfile.mkdtemp(prefix="inferencex-"))
+    git = ["git", "-C", str(root)]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run(
+        [*git, "fetch", "-q", "--depth", "1", INFERENCEX_REPO, INFERENCEX_COMMIT],
+        check=True,
+    )
+    subprocess.run([*git, "checkout", "-q", "FETCH_HEAD"], check=True)
     return root / "inferencex-e2e"
 
 
