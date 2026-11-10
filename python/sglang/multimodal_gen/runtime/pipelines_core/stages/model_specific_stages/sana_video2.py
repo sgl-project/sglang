@@ -214,6 +214,7 @@ class SanaVideo2DenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
         self._bcg_runner = None
+        self._bcg_ropes = {}
 
     @property
     def role_affinity(self) -> RoleType:
@@ -252,7 +253,24 @@ class SanaVideo2DenoisingStage(PipelineStage):
                     encoder_hidden_states=embeds,
                     encoder_attention_mask=mask,
                 )
+            # Captured graphs read these tables by address, and the transformer
+            # replaces them when a request has another shape.
+            self._bcg_ropes[self.transformer._ropes_key] = self.transformer._ropes
         return self._bcg_runner
+
+    def drop_breakable_cuda_graphs(self, reason):
+        if self._bcg_runner is None:
+            return
+        dropped = len(self._bcg_runner.entries)
+        self._bcg_runner.reset(disabled_reason=reason)
+        self._bcg_ropes.clear()
+        if dropped:
+            self.log_warning(
+                "%s after capture: dropped %d breakable CUDA graph(s); "
+                "requests run eager until restart.",
+                reason,
+                dropped,
+            )
 
     @torch.no_grad()
     def forward(self, batch, server_args):

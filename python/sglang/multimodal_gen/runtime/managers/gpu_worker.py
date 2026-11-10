@@ -87,7 +87,6 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
     initialize_current_platform,
@@ -1775,8 +1774,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _drop_breakable_cuda_graphs(self, reason: str) -> None:
         # captured graphs replay the weights and LoRA branches of capture time
         for stage in self.pipeline.stages:
-            if isinstance(stage, DenoisingStage):
-                stage.drop_breakable_cuda_graphs(reason)
+            stage.drop_breakable_cuda_graphs(reason)
 
     def _update_lora_metrics(self) -> None:
         if self.metrics is not None and isinstance(self.pipeline, LoRAPipeline):
