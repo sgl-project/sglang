@@ -173,17 +173,16 @@ def init_parallel_runtime(
     ):
         _prewarm_tp_lm_head_all_to_all()
 
-    # EPLB uses the default process group, not the TP/EP coordinators.
-    # Limit warmup to static full-EP layouts for now.
+    # Prime EPLB's TP peer channels before migration can involve only a subset
+    # of a pipeline stage. Elastic EP manages its own WORLD membership.
     if (
-        device == "cuda"
-        and backend == "nccl"
+        backend in ("nccl", "hccl")
+        and device in ("cuda", "npu")
         and get_exec().moe.enable_eplb
         and get_exec().moe.elastic_ep_backend is None
-        and parallel.pp_size == 1
         and parallel.moe_ep_size == parallel.tp_size > 1
     ):
-        _prewarm_eplb_p2p()
+        _prewarm_eplb_p2p(device)
 
     logger.info(f"Init parallel ends. elapsed={time.perf_counter() - tic:.2f} s")
 
@@ -366,39 +365,39 @@ def _prewarm_nccl() -> None:
     )
 
 
-def _prewarm_eplb_p2p() -> None:
-    """Materialize EPLB's default-group NCCL transports before KV sizing."""
+def _prewarm_eplb_p2p(device: str) -> None:
+    """Materialize the TP transports used by EPLB before KV sizing."""
     warmup_start = time.perf_counter()
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    tp_group = get_tp_group()
+    group = tp_group.device_group
     free_before, _ = torch.cuda.mem_get_info()
-    # Exercise bulk transfers as well as communicator creation.
+    # Exercise bulk byte transfers to materialize the P2P buffers.
     bytes_per_peer = 4 << 20
-    send = torch.empty(bytes_per_peer, dtype=torch.uint8, device="cuda")
+    send = torch.empty(bytes_per_peer, dtype=torch.uint8, device=device)
     recv = torch.empty(
-        (world_size - 1, bytes_per_peer), dtype=torch.uint8, device="cuda"
+        (tp_group.world_size - 1, bytes_per_peer), dtype=send.dtype, device=device
     )
     ops = []
-    for slot, peer in enumerate(p for p in range(world_size) if p != rank):
+    for slot, peer in enumerate(p for p in tp_group.ranks if p != tp_group.rank):
         ops.extend(
             [
-                dist.P2POp(dist.isend, send, peer),
-                dist.P2POp(dist.irecv, recv[slot], peer),
+                dist.P2POp(dist.isend, send, peer, group=group),
+                dist.P2POp(dist.irecv, recv[slot], peer, group=group),
             ]
         )
     for work in dist.batch_isend_irecv(ops):
         work.wait()
-    # The rebalance also all-reduces the recorded expert counts on this group.
-    dist.all_reduce(send.view(torch.int32))
+    # Expert counts use int32. Reuse the P2P buffer for collective warmup.
+    dist.all_reduce(send.view(torch.int32), group=group)
     current_platform.synchronize()
     del ops, send, recv
     current_platform.empty_cache()
     free_after, _ = torch.cuda.mem_get_info()
     logger.info(
-        "EPLB default-group P2P and all-reduce warmup completed in %.3fs "
-        "(world_size=%d, free memory delta=%.2f MiB)",
+        "EPLB TP P2P and all-reduce warmup completed in %.3fs "
+        "(tp_size=%d, free memory delta=%.2f MiB)",
         time.perf_counter() - warmup_start,
-        world_size,
+        tp_group.world_size,
         (free_before - free_after) / (1 << 20),
     )
 

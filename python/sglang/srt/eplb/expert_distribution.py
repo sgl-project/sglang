@@ -40,6 +40,7 @@ import torch.distributed
 
 from sglang.kernels.ops.moe.eplb_map_record import record_physical_counts
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_location import get_eplb_group
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import (
@@ -50,6 +51,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import get_device as get_device_namespace
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_platform,
     get_schedule,
     logs_expert_balancedness_to_server_log,
@@ -145,12 +147,6 @@ class ExpertDistributionRecorder(ABC):
             )
             "reason is that you are using a model that does not support expert distribution"
             "recording. Try setting `get_model_config_for_expert_location` in your model."
-            if get_platform().is_npu:
-                from sglang.srt.hardware_backend.npu.eplb import (
-                    create_eplb_recorder,
-                )
-
-                return create_eplb_recorder(expert_location_metadata, rank)
             return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
         else:
             return _ExpertDistributionRecorderNoop()
@@ -786,8 +782,15 @@ class _Accumulator(ABC):
     ):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
-        # None selects WORLD; NPU may supply a WORLD-equivalent TP group.
-        self._communication_group = None
+        self._communication_group = get_eplb_group()
+        self._communication_root = (
+            0
+            if self._communication_group is None
+            else torch.distributed.get_global_rank(self._communication_group, 0)
+        )
+        self._is_communication_root = (
+            torch.distributed.get_rank(self._communication_group) == 0
+        )
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
@@ -818,6 +821,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         self._enable = reports_expert_balancedness()
 
         if self._enable:
+            self._is_pipeline_parallel = get_parallel().pp_size > 1
             self.window_sizes = EPLB_BALANCEDNESS_WINDOW_SIZES
             self._history = _DequeCollection(maxlens=self.window_sizes)
             self._reset_server_log_history = True
@@ -863,17 +867,29 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
         torch.distributed.reduce(
             gpu_physical_count,
-            dst=0,
+            dst=self._communication_root,
             op=torch.distributed.ReduceOp.SUM,
             group=self._communication_group,
         )
 
-        if self._rank == 0:
+        if self._is_communication_root:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
-            utilization_rate_gpu = torch.mean(
-                compute_utilization_rate(gpu_physical_count)
-            )
+            layer_utilization = compute_utilization_rate(gpu_physical_count)
+            if self._is_pipeline_parallel:
+                from sglang.srt.distributed import get_pp_indices
+
+                start_layer, end_layer = get_pp_indices(
+                    self._expert_location_metadata.num_layers,
+                    get_parallel().pp_rank,
+                    get_parallel().pp_size,
+                )
+                # Counts are reduced within this stage but indexed by global
+                # layer ID. Use ownership rather than observed traffic so a
+                # valid layer with zero sampled tokens is still included.
+                utilization_rate_gpu = layer_utilization[start_layer:end_layer].mean()
+            else:
+                utilization_rate_gpu = layer_utilization.mean()
             should_track_history = not math.isclose(
                 get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
             )
@@ -1045,7 +1061,8 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         )
 
         if output_mode == "file":
-            if self._rank == 0:
+            output = _merge_pipeline_record(output, self._is_communication_root)
+            if torch.distributed.get_rank() == 0:
                 _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
         elif output_mode == "object":
             return output
@@ -1058,7 +1075,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         ):
             return None
 
-        if self._rank == 0:
+        if self._is_communication_root:
             utilization_mean_rates = self._history.mean()
             window_index = self.window_sizes[-1]
             average_utilization_rate_over_window = (
@@ -1079,9 +1096,39 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                 device=get_device_namespace().device,
             )
         torch.distributed.broadcast(
-            avg_rate_tensor, src=0, group=self._communication_group
+            avg_rate_tensor,
+            src=self._communication_root,
+            group=self._communication_group,
         )
         return avg_rate_tensor.item()
+
+
+def _merge_pipeline_record(output: Dict, is_communication_root: bool) -> Dict:
+    """Merge one TP-root record from every PP stage into a static file."""
+    if get_parallel().pp_size == 1 or not torch.distributed.is_initialized():
+        return output
+
+    local_record = (
+        output["logical_count"].detach().cpu() if is_communication_root else None
+    )
+    world_group = get_parallel().world_group
+    records = world_group.all_gather_object(local_record)
+    if world_group.rank_in_group != 0:
+        return output
+
+    merged_record = None
+    for record in records:
+        if record is not None:
+            merged_record = record if merged_record is None else merged_record + record
+    if merged_record is None:
+        raise RuntimeError("EPLB static record has no TP-root contribution.")
+    return dict(
+        rank=0,
+        logical_count=merged_record,
+        average_utilization_rate_over_window=None,
+        pipeline_parallel_size=get_parallel().pp_size,
+        pipeline_record_merged=True,
+    )
 
 
 def _dump_to_file(name, data):

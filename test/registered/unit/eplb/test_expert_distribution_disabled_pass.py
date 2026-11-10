@@ -9,13 +9,14 @@ import contextlib
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderNoop,
     _ExpertDistributionRecorderReal,
+    _merge_pipeline_record,
     _SelectExpertsSinglePassGatherer,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -157,6 +158,29 @@ class TestDisabledForwardPass(CustomTestCase):
             with recorder.with_forward_pass(1, _batch()):
                 ran.append(1)
         self.assertEqual(ran, [1])
+
+    def test_static_pipeline_records_merge_by_global_layer(self):
+        record = torch.tensor([[[1, 2], [3, 4]]])
+        gathered = [record, None, record * 2, None]
+
+        world_group = SimpleNamespace(
+            rank_in_group=0, all_gather_object=lambda _record: gathered
+        )
+        with (
+            patch(
+                "sglang.srt.eplb.expert_distribution.torch.distributed.is_initialized",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.eplb.expert_distribution.get_parallel",
+                return_value=SimpleNamespace(pp_size=2, world_group=world_group),
+            ),
+        ):
+            merged = _merge_pipeline_record({"logical_count": record}, True)
+
+        self.assertTrue(torch.equal(merged["logical_count"], record * 3))
+        self.assertEqual(merged["rank"], 0)
+        self.assertTrue(merged["pipeline_record_merged"])
 
     def test_model_runner_disables_draft_before_entering_forward_pass(self):
         source = _model_runner_path().read_text()
