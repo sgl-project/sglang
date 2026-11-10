@@ -1481,6 +1481,10 @@ class BufferModePipeline:
     def has_staged(self, request: CacheRequestHandle) -> bool:
         return request in self.staged_prefetches
 
+    def staged_prefix_end(self, request: CacheRequestHandle) -> int:
+        f = self.staged_prefetches.get(request)
+        return 0 if f is None else f.matched_len + f.num_tokens
+
     def prepare_staged_prefetch(self, req: Req) -> bool:
         """Rebuild the admission plan from this pass's joint component match."""
         req.staged_prefetch_plan = None

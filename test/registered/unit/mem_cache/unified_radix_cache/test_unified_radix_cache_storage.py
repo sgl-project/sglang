@@ -2825,7 +2825,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache.page_size = 1
         cache.enable_storage_metrics = False
         cache.buffer_pipeline = None  # cache-mode commit path
-        cache.cache_controller.pp_prefetch_decisions = {}
+        cache._is_pp_ticketed.return_value = False
         walk_action = object()
         insert_result = mock.MagicMock()
         insert_result.cache_actions = [walk_action]

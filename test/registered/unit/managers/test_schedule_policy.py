@@ -3,7 +3,11 @@ from array import array
 from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
+from sglang.srt.managers.schedule_policy import (
+    CacheAgnosticPolicy,
+    CacheAwarePolicy,
+    SchedulePolicy,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -224,6 +228,44 @@ class TestShortestPrefillFirst(CustomTestCase):
                 4096,
                 256,
             )
+        )
+
+    def test_staged_storage_prefix_counts_as_cached(self):
+        # A buffer-mode storage hit stays outside the tree until admission.
+        staged = self.make_req("staged", 4096, cached=512)
+        short = self.make_req("short", 1024)
+        tree_cache = self.policy.tree_cache
+        staged_end = {staged.cache_request_handle: 4600}
+        with (
+            patch.object(
+                tree_cache, "can_poll_prefetch_progress", return_value=True
+            ) as can_poll,
+            patch.object(tree_cache, "poll_prefetch_progress", create=True) as poll,
+            patch.object(
+                tree_cache,
+                "staged_storage_prefix_end",
+                side_effect=lambda handle: staged_end.get(handle, 0),
+            ),
+        ):
+            queue = [short, staged]
+            self.policy.poll_storage_prefetches(queue)
+            self.policy._sort_by_shortest_prefill(queue, set())
+            self.assertEqual(queue, [staged, short])
+            self.assertEqual(
+                self.policy.shortest_prefill_chunk_limit(
+                    self.make_req("continuation", 16384), [staged], 4096, 256
+                ),
+                3840,
+            )
+            # Neither a stop policy that polling would cut short nor another
+            # schedule policy polls.
+            can_poll.return_value = False
+            self.policy.poll_storage_prefetches(queue)
+            can_poll.return_value = True
+            self.policy.policy = CacheAgnosticPolicy.FCFS
+            self.policy.poll_storage_prefetches(queue)
+        poll.assert_called_once_with(
+            [short.cache_request_handle, staged.cache_request_handle]
         )
 
 

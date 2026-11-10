@@ -280,6 +280,7 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
 
         policy = object.__new__(SchedulePolicy)
         policy.policy = CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        policy.tree_cache = SimpleNamespace(staged_storage_prefix_end=lambda handle: 0)
         adder = self._adder(strict=True)
         prompt, prefix, chunks = 4096, 0, []
         while prefix < prompt:
@@ -287,7 +288,10 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
                 full_untruncated_fill_ids=[0] * prompt, prefix_len=prefix
             )
             arrival = SimpleNamespace(
-                origin_input_ids=[0] * 32, output_ids=[], num_matched_prefix_tokens=0
+                origin_input_ids=[0] * 32,
+                output_ids=[],
+                num_matched_prefix_tokens=0,
+                cache_request_handle=None,
             )
             limit = policy.shortest_prefill_chunk_limit(chunked, [arrival], 64, 16)
             self.assertEqual(limit, 32)
