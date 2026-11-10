@@ -44,7 +44,7 @@
 //
 // NVFP4 is Blackwell-only → no h200×nvfp4 cells (same rule as Laguna-M.1).
 //
-// verified:true = ran that command shape and it served correctly + passed full GSM8K
+// GPU verified:true = ran that command shape and it served correctly + passed full GSM8K
 // (see laguna-xs21-benchmarks.jsx). GB300 cells verified (4×GB300, tp 4); H200 cells
 // verified (8×H200: bf16 tp8, fp8/int4 tp8+ep8). B300 cells verified with the identical
 // commands run as tp8 across 2×(4×GB300) over MNNVL — same GPU (GB300/B300 = Blackwell
@@ -54,7 +54,11 @@
 export const config = {
   modelName: "Laguna-XS-2.1",
 
-  supportedHardware: ["h200", "b300", "gb300"],
+  supportedHardware: ["h200", "b300", "gb300", "xeon"],
+  hardware: [
+    { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
+  ],
+  runModes: (base) => base.hw === "xeon" ? ["python"] : ["python", "docker"],
 
   variants: [
     { id: "default", label: "Default" },
@@ -154,11 +158,13 @@ sgl-eval run aime25 \\
   },
 
   playgroundFeatures: {
+    normalizeDeltas: (deltas, derived, base) => base.hw === "xeon" ? {} : deltas,
 
     // Hybrid-SWA GQA model (48 Q / 8 KV heads) — TP shards cleanly at 1/2/4/8.
     // Accuracy verified TP-independent on the trtllm_mha backend (tp1 == tp4 on GB300).
     // No DP-Attention / CP knobs: unvalidated on this model family — not exposed.
     attention: {
+      showWhen: (base) => base.hw !== "xeon",
       knobs: [
         { id: "tp", label: "TP", values: [null, 1, 2, 4, 8] },
       ],
@@ -169,6 +175,7 @@ sgl-eval run aime25 \\
     // (`Auto-detected template features: reasoning_parser=poolside_v1, tool_call_parser=poolside_v1`),
     // so these are explicit-but-redundant on transformers ≥ 5.10.
     parsers: {
+      showWhen: (base) => base.hw !== "xeon",
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser poolside_v1" },
         { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser poolside_v1" },
@@ -179,6 +186,29 @@ sgl-eval run aime25 \\
   // Cells: (h200 × {bf16,fp8,int4} + b300/gb300 × {bf16,fp8,nvfp4,int4}) × {low-latency, high-throughput}.
   // Draft model precision always matches the target's.
   cells: [
+    {
+      match: { hw: "xeon", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      warn: "Basic text generation verified on Intel Xeon 6972P at TP4 with an 8,192-token cache. Dataset accuracy, full context, DFlash, parser overrides and performance are unverified.",
+      env: [
+        "SGLANG_USE_CPU_ENGINE=1",
+        "RAYON_NUM_THREADS=1",
+        "TOKENIZERS_PARALLELISM=false",
+        "OPENBLAS_NUM_THREADS=1",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--revision c5f36269bbdbd3f27fddc9a9f9dbae0cf2cf57db",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 4",
+        "--dtype bfloat16",
+        "--max-total-tokens 8192",
+        "--trust-remote-code",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
 
     // ══════════════ NVIDIA Hopper H200 (8-GPU HGX) — BF16 / FP8 / INT4 — VERIFIED ══════════════
     // All 6 cells ran on 8×H200 with full-GSM8K accuracy (laguna-xs21-benchmarks.jsx).
