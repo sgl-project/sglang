@@ -53,7 +53,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx1250_supported, is_hip
 from sglang.srt.utils.cuda_vmm_utils import (
     VmmGraphInputManager,
     compute_graph_capture_bases,
@@ -91,7 +91,6 @@ _DEFAULT_MAX_SIZE = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.get() * 1024
 # tuned config and explicit constructor sizes (None = not forced)
 _FORCE_PULL_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB.get()
 _FORCE_PUSH_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB.get()
-_FUSED_RMSNORM_1SHOT = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_FUSED_RMSNORM_1SHOT.get()
 
 
 def _ceil_align(nbytes: int, align: int) -> int:
@@ -653,10 +652,11 @@ class CustomAllReduceV2:
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """All-reduce ``input``, add ``residual`` and RMSNorm the sum.
 
-        Returns ``(output, residual_out)``, or None when neither push algorithm
-        would serve this size; the caller then all-reduces and norms separately.
+        Returns ``(output, residual_out)``, or None outside gfx1250 or when the
+        all-reduce would not take 2shot_push; the caller then all-reduces and
+        norms separately.
         """
-        if self.disabled or input.dim() != 2:
+        if self.disabled or not is_gfx1250_supported() or input.dim() != 2:
             return None
         if input.dtype not in (torch.bfloat16, torch.float16):
             return None
@@ -675,20 +675,15 @@ class CustomAllReduceV2:
         # the kernel holds a row in one 1024-thread block, 4 vectors per thread
         if num_rows == 0 or row_bytes % 16 or row_bytes > 1024 * 4 * 16:
             return None
-        nbytes = num_rows * row_bytes
-        if self.uses_one_shot_push(nbytes):
-            if not _FUSED_RMSNORM_1SHOT:
-                return None
-            algo, rows_per_slot = AllReduceAlgo.ONE_SHOT_PUSH, num_rows
-        elif self.uses_two_shot_push(nbytes):
-            algo = AllReduceAlgo.TWO_SHOT_PUSH
-            rows_per_slot = -(-num_rows // self.world_size)
-        else:
+        # 1shot sizes stay unfused: on gfx1250 TP8 the fused 1shot trailed
+        # all-reduce + a separate norm
+        if not self.uses_two_shot_push(num_rows * row_bytes):
             return None
-        # both kernels stage the reduced rows in a second half of the slot
-        if 2 * rows_per_slot * row_bytes > self.max_push_size:
+        # a slot holds the partial and the reduced copy of each rank's rows
+        rows_per_rank = -(-num_rows // self.world_size)
+        if 2 * rows_per_rank * row_bytes > self.max_push_size:
             return None
-        return custom_all_reduce_rmsnorm(self.obj, input, residual, weight, eps, algo)
+        return custom_all_reduce_rmsnorm(self.obj, input, residual, weight, eps)
 
     def _allocate_graph_row(self, input: torch.Tensor, nbytes: int) -> torch.Tensor:
         index = self._graph_counter + len(self._graph_inputs)

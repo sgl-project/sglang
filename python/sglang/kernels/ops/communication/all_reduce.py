@@ -284,20 +284,16 @@ def custom_all_reduce_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    algo: AllReduceAlgo,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``residual_out = all_reduce(input) + residual``;
-    ``output = rmsnorm(residual_out) * weight``. Push algorithms only.
+    ``output = rmsnorm(residual_out) * weight``, over the 2shot_push plane.
 
     :returns: ``(output, residual_out)``
     """
-    assert algo.is_push(), algo
     module = get_all_reduce_rmsnorm_module(input.dtype, comm.world_size)
     output = torch.empty_like(input)
     residual_out = torch.empty_like(residual)
-    module.all_reduce_rmsnorm(
-        comm, input, residual, weight, output, residual_out, eps, algo.algo_name
-    )
+    module.all_reduce_rmsnorm(comm, input, residual, weight, output, residual_out, eps)
     return output, residual_out
 
 

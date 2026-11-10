@@ -3,17 +3,13 @@
 //   residual_out = all_reduce(input) + residual
 //   output       = rmsnorm(residual_out) * weight
 //
-// Both algorithms share the push plane, the per-block epoch counters and the
-// slot layout conventions of `custom_all_reduce.cuh`, so they interleave freely
-// with the plain push all-reduce. The exchange and reduction are spread over
-// the whole grid exactly as in the plain kernels; the reduced bf16 sum then
-// lands in this rank's own slot with a Lamport marker, and one block per row
-// (block b takes rows b, b + grid, ...) drains it and normalises it:
-//   - 1shot_push: every rank reduces every row and stages the sum in the
-//     spare half of its (r, r) slot.
-//   - 2shot_push: ownership is by whole rows (rank c owns rows
-//     [c * R, (c + 1) * R)), so the owner reduces its rows and fans the sum
-//     out to every rank, itself included.
+// A 2shot_push variant: it shares the push plane, the per-block epoch counters
+// and the slot layout conventions of `custom_all_reduce.cuh`, so it interleaves
+// freely with the plain push all-reduce. Ownership is by whole rows (rank c
+// owns rows [c * R, (c + 1) * R)). The exchange and the owner's reduction are
+// spread over the whole grid as in the plain kernel; the owner fans the bf16 sum
+// out to every rank, itself included, and one block per row (block b takes rows
+// b, b + grid, ...) drains it from local memory and normalises it.
 #include <sgl_kernel/ffi.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -30,7 +26,6 @@
 #include <tvm/ffi/object.h>
 
 #include <cstdint>
-#include <string>
 
 namespace sglang {
 
@@ -46,26 +41,12 @@ struct AllReduceRMSNormParams {
   void* __restrict__ residual_out;
   uint32_t num_rows;
   uint32_t row_vecs;
-  uint32_t rows_per_rank;  // 2shot only
+  uint32_t rows_per_rank;
   uint32_t rank;
   float eps;
   float inv_hidden;
   PushWorkSpace<kWorldSize> ws;
 };
-
-/// Store to this GPU's own workspace for another block of the same kernel: the
-/// agent scope is enough, and its polling load (agent scope on ROCm) hits L2.
-template <typename V>
-SGL_DEVICE void st_local_16B(const V& x, void* addr, int64_t vec_offset) {
-#if defined(USE_ROCM) && defined(__HIP_DEVICE_COMPILE__) && __has_builtin(__builtin_amdgcn_global_store_b128)
-  using u32x4_t = uint32_t __attribute__((ext_vector_type(4)));
-  using global_u32x4_t = __attribute__((address_space(1))) u32x4_t;
-  const auto ptr = static_cast<u32x4_t*>(addr) + vec_offset;
-  __builtin_amdgcn_global_store_b128((global_u32x4_t*)ptr, *reinterpret_cast<const u32x4_t*>(&x), "agent");
-#else
-  device::ptx::st_relaxed_16B(x, addr, vec_offset);
-#endif
-}
 
 /// Round-robin warps to blocks, as `custom_all_reduce.cuh` does: a decode-sized
 /// push then spreads over many CUs instead of saturating the first few.
@@ -187,80 +168,6 @@ struct RowEpilogue {
 
 #define ALL_REDUCE_RMSNORM_KERNEL __global__ __launch_bounds__(1024, 1)
 
-template <typename T, uint32_t kWorldSize, uint32_t kBlockSize, uint32_t kMaxVecs, bool kUsePDL>
-ALL_REDUCE_RMSNORM_KERNEL void
-all_reduce_rmsnorm_1shot_push_kernel(const __grid_constant__ AllReduceRMSNormParams<kWorldSize> params) {
-  using namespace device;
-  using Epilogue = RowEpilogue<T, kBlockSize, kMaxVecs>;
-  using vec_t = typename Epilogue::vec_t;
-  using Lamport = distributed::LamportTrait<T, Epilogue::kVecSize * 2, /*kAtom=*/4>;
-  __shared__ float smem[kBlockSize / kWarpThreads];
-  const auto r = params.rank;
-  const auto row_vecs = params.row_vecs;
-  const auto num_vecs = params.num_rows * row_vecs;
-  const auto num_threads = kBlockSize * gridDim.x;
-  const auto global_tid = round_robin_tid();
-  PDLWaitPrimary<kUsePDL>();
-  const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};
-
-  void* push_ptrs[kWorldSize];
-#pragma unroll
-  for (uint32_t i = 0; i < kWorldSize; ++i) {
-    push_ptrs[i] = epoch.slot_ptr(/*dst=*/i, /*src=*/r);
-  }
-  for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
-    vec_t vec;
-    vec.load(params.input, vid);
-    Lamport::clear_pos_zero(vec.data());
-#pragma unroll
-    for (uint32_t i = 0; i < kWorldSize; ++i) {
-      ptx::st_relaxed_16B(vec, push_ptrs[i], vid);
-    }
-  }
-
-  void* poll_ptrs[kWorldSize];
-#pragma unroll
-  for (uint32_t i = 0; i < kWorldSize; ++i) {
-    poll_ptrs[i] = epoch.slot_ptr(/*dst=*/r, /*src=*/i);
-  }
-  vec_t pos_zero_vec;
-  Lamport::fill_pos_zero(pos_zero_vec.data());
-
-  // reduce across the whole grid, staging the sum in the spare half of the
-  // (r, r) slot for the per-row norm below
-  const auto stage_ptr = poll_ptrs[r];
-  for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
-    vec_t vec[kWorldSize];
-    do {
-      bool has_zero = false;
-#pragma unroll
-      for (uint32_t i = 0; i < kWorldSize; ++i) {
-        ptx::ld_relaxed_16B(vec[i], poll_ptrs[i], vid);
-      }
-#pragma unroll
-      for (uint32_t i = 0; i < kWorldSize; ++i) {
-        has_zero |= Lamport::has_pos_zero(vec[i].data());
-      }
-      if (!has_zero) break;
-    } while (true);
-    auto out_vec = reduce_vec(vec);
-    Lamport::clear_pos_zero(out_vec.data());
-#pragma unroll
-    for (uint32_t i = 0; i < kWorldSize; ++i) {
-      ptx::st_global_16B(pos_zero_vec, poll_ptrs[i], vid);
-    }
-    st_local_16B(out_vec, stage_ptr, num_vecs + vid);
-  }
-
-  for (auto row = blockIdx.x; row < params.num_rows; row += gridDim.x) {
-    Epilogue::template drain_apply<Lamport>(params, row, stage_ptr, num_vecs + row * row_vecs, smem);
-  }
-
-  PDLTriggerSecondary<kUsePDL>();
-  __syncthreads();
-  epoch.flip();
-}
-
 /// A slot (dst, src) holds two `chunk_vecs = rows_per_rank * row_vecs` halves:
 /// [0, chunk) takes src's partial of dst's rows, and [chunk, 2 * chunk) takes
 /// src's reduced rows. Only the second half of the (r, r) slot is used.
@@ -363,11 +270,9 @@ struct AllReduceRMSNormKernel {
       const tvm::ffi::TensorView weight,
       const tvm::ffi::TensorView out,
       const tvm::ffi::TensorView residual_out,
-      const double eps,
-      const std::string algo) {
+      const double eps) {
     using namespace host;
     const auto& comm = *comm_ref.get();
-    CHECK_HOST(algo == "1shot_push" || algo == "2shot_push") << algo;
     CHECK_HOST(comm.get_world_size() == kWorldSize) << comm.get_world_size();
     CHECK_HOST(in.ndim() == 2 && in.IsContiguous() && is_type<T>(in.dtype()) && in.device().device_type == kDLGPU);
     const auto num_rows = in.size(0);
@@ -386,8 +291,7 @@ struct AllReduceRMSNormKernel {
     const auto rows = static_cast<uint32_t>(num_rows);
 
     const auto& push = comm.get_push_obj();
-    const auto two_shot = algo == "2shot_push";
-    const auto rows_per_rank = two_shot ? div_ceil(rows, kWorldSize) : rows;
+    const auto rows_per_rank = div_ceil(rows, kWorldSize);
     const auto slot_bytes = int64_t{2} * rows_per_rank * row_vecs * 16;
     const auto params = AllReduceRMSNormParams<kWorldSize>{
         .input = in.data_ptr(),
@@ -405,8 +309,7 @@ struct AllReduceRMSNormKernel {
     };
     const auto stream = LaunchKernel::resolve_device(in.device());
     const auto launch = [&]<uint32_t kThreads, uint32_t kVecs>() {
-      const auto kernel = two_shot ? all_reduce_rmsnorm_2shot_push_kernel<T, kWorldSize, kThreads, kVecs, kUsePDL>
-                                   : all_reduce_rmsnorm_1shot_push_kernel<T, kWorldSize, kThreads, kVecs, kUsePDL>;
+      const auto kernel = all_reduce_rmsnorm_2shot_push_kernel<T, kWorldSize, kThreads, kVecs, kUsePDL>;
       // the grid is bound to the counter array and must stay constant
       LaunchKernel(push.num_blocks, kThreads, stream)  //
           .enable_pdl(kUsePDL)(kernel, params);
