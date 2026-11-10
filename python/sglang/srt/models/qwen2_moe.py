@@ -575,9 +575,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     )
 
                     gate = self.shared_expert_gate(hidden_states)
-                    shared_output = fused_sigmoid_mul_broadcast(
-                        shared_output, gate, impl="auto"
-                    )
+                    shared_output = fused_sigmoid_mul_broadcast(shared_output, gate)
                 else:
                     shared_output = (
                         F.sigmoid(self.shared_expert_gate(hidden_states))
