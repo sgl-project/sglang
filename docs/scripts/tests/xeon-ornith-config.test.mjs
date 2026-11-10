@@ -19,13 +19,13 @@ for (const [vendor, name, model, revision] of [
   const { config } = await import("data:text/javascript," + encodeURIComponent(text));
   const api = engine(config);
 
-  test(`${name} offers only the independently validated Python-only CPU recipe`, () => {
+  test(`${name} offers only independently validated Python-only CPU recipes`, () => {
     assert.ok(config.supportedHardware.includes("xeon"));
     assert.ok(config.hardware.some((hw) => hw.id === "xeon" && hw.vendor === "cpu"));
     assert.deepEqual(config.runModes({ hw: "xeon" }), ["python"]);
     assert.deepEqual(config.runModes({ hw: "h100" }), ["python", "docker"]);
     const cells = config.cells.filter((cell) => cell.match.hw === "xeon");
-    assert.equal(cells.length, name === "ornith-1.0" ? 2 : 1);
+    assert.equal(cells.length, 2);
     const [cell] = cells;
     assert.equal(cell.match.variant, "9b");
     assert.equal(cell.match.quant, "bf16");
@@ -78,6 +78,19 @@ test("Ornith 1.0 35B uses its independent BF16 TP6 record, not its FP8 sibling",
   for (const flag of [
     "--model deepreinforce-ai/Ornith-1.0-35B", "--served-model-name Ornith-1.0-35B",
     "--revision 5df2ed3f675c7beaa490328cc70bb573b65fb660",
+    "--device cpu", "--tp 6", "--dtype bfloat16", "--max-total-tokens 8192",
+  ]) assert.ok(command.includes(flag), flag);
+  assert.doesNotMatch(command, /-FP8|--reasoning-parser|--tool-call-parser|--speculative/);
+});
+
+test("Ornith 1.5 35B-A3B uses its independent BF16 TP6 record, not its FP8 sibling", async () => {
+  const text = readFileSync(new URL("../../src/snippets/configs/ornith-ai/ornith-1.5.jsx", import.meta.url), "utf8");
+  const { config } = await import("data:text/javascript," + encodeURIComponent(text));
+  const cell = config.cells.find((candidate) => candidate.match.hw === "xeon" && candidate.match.variant === "35b");
+  const command = engine(config).renderCommand(cell, cell.match, {});
+  for (const flag of [
+    "--model ornith-ai/Ornith-1.5-35B-A3B", "--served-model-name Ornith-1.5-35B-A3B",
+    "--revision 10fbf86fed7ecee4a061f8b499a618f46001cac1",
     "--device cpu", "--tp 6", "--dtype bfloat16", "--max-total-tokens 8192",
   ]) assert.ok(command.includes(flag), flag);
   assert.doesNotMatch(command, /-FP8|--reasoning-parser|--tool-call-parser|--speculative/);

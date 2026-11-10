@@ -101,6 +101,29 @@ export const config = {
       ],
     },
     {
+      match: { hw: "xeon", variant: "35b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      warn: "Quick generation verified on Intel Xeon 6972P at TP6. The 8,192-token cache does not cover the full context. Playground overrides, dataset accuracy, and performance are unverified.",
+      env: [
+        "SGLANG_USE_CPU_ENGINE=1",
+        "RAYON_NUM_THREADS=1",
+        "TOKENIZERS_PARALLELISM=false",
+        "OPENBLAS_NUM_THREADS=1",
+      ],
+      flags: [
+        "--model ornith-ai/Ornith-1.5-35B-A3B",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--revision 10fbf86fed7ecee4a061f8b499a618f46001cac1",
+        "--served-model-name {{MODEL_NAME}}",
+        "--tp 6",
+        "--dtype bfloat16",
+        "--max-total-tokens 8192",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "h100", variant: "122b", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
