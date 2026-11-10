@@ -13,6 +13,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
+from sglang.srt.managers.scheduler_components.request_list import move
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -239,7 +240,7 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
             Mock(rid=rid, owner_list=None)
             for rid in ("abort-staged", "abort-waiting", "keep")
         )
-        manager.waiting_queue.join([staged, waiting, keep])
+        move([staged, waiting, keep], manager.waiting_queue)
         manager.staging_queue = [staged, keep]
 
         manager.waiting_queue.abort(AbortReq(rid="abort"))

@@ -43,7 +43,10 @@ class ListKind(enum.Enum):
 
 class ReqList(ABC):
     """A list of live requests. Every live request is in at most one list,
-    which its `owner_list` names: joining a second list raises."""
+    which its `owner_list` names: joining a second list raises. Requests come
+    in and move between lists through `move`, and an ended request leaves
+    through the retirer; the underscored edits are for those two and the
+    places `test_request_list` lists."""
 
     kind: ListKind
 
@@ -51,10 +54,10 @@ class ReqList(ABC):
     def __iter__(self) -> Iterator[Req]: ...
 
     @abstractmethod
-    def join(self, items, *, at: Optional[int] = None) -> None: ...
+    def _join(self, items, *, at: Optional[int] = None) -> None: ...
 
     @abstractmethod
-    def leave(self, reqs: Iterable[Req]) -> None: ...
+    def _leave(self, reqs: Iterable[Req]) -> None: ...
 
     def req_of(self, item) -> Req:
         """The request an item of this list stands for."""
@@ -63,16 +66,9 @@ class ReqList(ABC):
     def abort(self, recv_req: AbortReq) -> None:
         """Abort the requests `recv_req` names."""
 
-    def take(self, pred: Optional[Callable[[Req], bool]] = None) -> List[Req]:
-        """Drop the requests matching `pred`, or all of them, and return them in
-        list order."""
-        taken = [req for req in self if pred is None or pred(req)]
-        self.leave(taken)
-        return taken
-
-    def clear(self) -> None:
-        """Drop every request."""
-        self.leave(list(self))
+    @abstractmethod
+    def _drop_all(self) -> None:
+        """Drop every request without ending it: for a teardown."""
 
     def __len__(self) -> int:
         return sum(1 for _ in self)
@@ -96,26 +92,25 @@ class KeyedReqList(ReqList):
         self.kind = kind
         self._reqs: Dict[Req, None] = {}
 
-    def join(self, reqs: Iterable[Req], *, at: Optional[int] = None) -> None:
-        """Add the given requests; ones already in keep their place."""
+    def _join(self, reqs: Iterable[Req], *, at: Optional[int] = None) -> None:
         if at is not None:
             raise TypeError(f"{self.kind.name} has no positions to insert at")
-        reqs = [req for req in reqs if req.owner_list is not self]
+        reqs = list(reqs)
         self._adopt(reqs)
         for req in reqs:
             self._reqs[req] = None
 
-    def leave(self, reqs: Iterable[Req]) -> None:
+    def _leave(self, reqs: Iterable[Req]) -> None:
         """Drop the given requests; ones not in are ignored."""
         for req in reqs:
             if req in self._reqs:
                 del self._reqs[req]
                 req.owner_list = None
 
-    def leave_finished(self) -> None:
-        self.leave([req for req in self._reqs if req.finished()])
+    def _leave_finished(self) -> None:
+        self._leave([req for req in self._reqs if req.finished()])
 
-    def clear(self) -> None:
+    def _drop_all(self) -> None:
         for req in self._reqs:
             req.owner_list = None
         self._reqs.clear()
@@ -147,7 +142,7 @@ class IndexedReqList(ReqList):
         self._req_of = req_of
         self._items: List[Any] = []
 
-    def join(self, items: Iterable, *, at: Optional[int] = None) -> None:
+    def _join(self, items: Iterable, *, at: Optional[int] = None) -> None:
         """Add the given items in order: at the back, or before position `at`."""
         items = list(items)
         self._adopt([self._req_of(item) for item in items])
@@ -156,20 +151,16 @@ class IndexedReqList(ReqList):
         else:
             self._items[at:at] = items
 
-    def replace(self, items: Iterable) -> None:
-        """Hold `items` instead, in their order: a reorder or a filter of the
-        list, or new requests."""
+    def reorder(self, items: Iterable) -> None:
+        """Hold the same items in the order given."""
         items = list(items)
-        reqs = [self._req_of(item) for item in items]
-        # Checked before anything changes: one owned elsewhere raises.
-        self._adopt([req for req in reqs if req.owner_list is not self])
-        for item in self._items:
-            self._req_of(item).owner_list = None
-        for req in reqs:
-            req.owner_list = self
+        if len(items) != len(self._items) or {
+            id(self._req_of(item)) for item in items
+        } != {id(self._req_of(item)) for item in self._items}:
+            raise RuntimeError(f"A reorder of {self.kind.name} changed its requests")
         self._items = items
 
-    def leave(self, reqs: Iterable[Req]) -> None:
+    def _leave(self, reqs: Iterable[Req]) -> None:
         """Drop the items of the given requests; ones not in are ignored."""
         leaving = set(reqs)
         if not leaving:
@@ -183,7 +174,7 @@ class IndexedReqList(ReqList):
                 kept.append(item)
         self._items = kept
 
-    def clear(self) -> None:
+    def _drop_all(self) -> None:
         for item in self._items:
             self._req_of(item).owner_list = None
         self._items = []
@@ -229,5 +220,5 @@ def move(items: Iterable, dst: ReqList, *, at: Optional[int] = None) -> None:
         if req.owner_list is not None:
             by_owner.setdefault(req.owner_list, []).append(req)
     for owner, reqs in by_owner.items():
-        owner.leave(reqs)
-    dst.join(items, at=at)
+        owner._leave(reqs)
+    dst._join(items, at=at)

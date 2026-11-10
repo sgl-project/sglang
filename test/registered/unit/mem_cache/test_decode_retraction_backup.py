@@ -20,6 +20,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.managers.utils import allocate_distinct_stream
 from sglang.srt.mem_cache.allocator import (
@@ -853,7 +854,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 )
 
             queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
-            queue.retracted_queue.join([req])
+            move([req], queue.retracted_queue)
             with (
                 patch.object(queue, "_uses_swa_reservation", return_value=False),
                 patch.object(queue, "_allocatable_token_budgets", return_value=1 << 20),

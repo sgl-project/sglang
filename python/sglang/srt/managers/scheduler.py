@@ -326,7 +326,10 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.managers.scheduler_components.request_retirer import (
+    RequestRetirer,
+    take_for_abort,
+)
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -4140,7 +4143,7 @@ class Scheduler(
             req, finished_reason=req.discard_output_reason and reason.to_json()
         )
 
-        self.chunked_reqs.clear()
+        self.chunked_reqs._drop_all()
         self._pending_chunked_abort_req = None
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
@@ -4514,7 +4517,7 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
-        self.waiting_queue.replace(
+        self.waiting_queue.reorder(
             self.policy.calc_priority(
                 self.waiting_queue,
                 running_batch,
@@ -5008,8 +5011,8 @@ class Scheduler(
         if forward_steps is not None:
             forward_steps.forward_processed(getattr(result, "forward_launch", None))
         # Requests finish only in a step's processing.
-        self.running_reqs.leave_finished()
-        self.prefill_launched_reqs.leave_finished()
+        self.running_reqs._leave_finished()
+        self.prefill_launched_reqs._leave_finished()
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose step in flight commits their last output by length."""
@@ -6308,7 +6311,7 @@ class Scheduler(
     def _abort_waiting(self, recv_req: AbortReq) -> None:
         is_decode = self.disaggregation_mode == DisaggregationMode.DECODE
         is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
-        for req in self.waiting_queue.take(lambda req: recv_req.matches(req.rid)):
+        for req in take_for_abort(self.waiting_queue, recv_req):
             if is_prefill:
                 # A PD prefill request may hold KV its sender still reads; abort
                 # the sender before that KV is freed.
@@ -6482,7 +6485,7 @@ class Scheduler(
         # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             # A finished chunked request was not retracted.
-            self.chunked_reqs.clear()
+            self.chunked_reqs._drop_all()
 
     def _publish_paused_state(self):
         # Surface the paused state to dashboards immediately. The scheduler

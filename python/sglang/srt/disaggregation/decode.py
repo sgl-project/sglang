@@ -107,6 +107,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ReqList,
     move,
 )
+from sglang.srt.managers.scheduler_components.request_retirer import take_for_abort
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -1297,14 +1298,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _abort_retracted(self, recv_req: AbortReq) -> None:
         # Retracted requests hold a KV backup.
-        for req in self.retracted_queue.take(lambda req: recv_req.matches(req.rid)):
+        for req in take_for_abort(self.retracted_queue, recv_req):
             self.scheduler.request_retirer.abort(req)
 
     def _abort_held(self, recv_req: AbortReq) -> None:
         # Held requests hold no KV.
-        for req in self.held_rebootstrap_reqs.take(
-            lambda req: recv_req.matches(req.rid)
-        ):
+        for req in take_for_abort(self.held_rebootstrap_reqs, recv_req):
             self.scheduler.request_retirer.abort(
                 req, finished_reason=recv_req.finished_reason
             )
@@ -1318,7 +1317,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def release_memory_occupation(self):
         self._cancel_prefill_dp_rank_queries()
-        self.queue.clear()
+        self.queue._drop_all()
         if self._pending_publish:
             storage = self._storage()
             for entry in self._pending_publish:
@@ -1326,7 +1325,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._pending_publish.clear()
         for req in self.retracted_queue:
             discard_kv_cache_backup(req, self.tree_cache)
-        self.retracted_queue.clear()
+        self.retracted_queue._drop_all()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 
@@ -1701,7 +1700,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 1 if self.scheduler.schedule_low_priority_values_first else -1
             )
             queue.sort(key=lambda r: r.req.priority * priority_sign)
-            self.queue.replace(queue)
+            self.queue.reorder(queue)
 
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(queue):
@@ -2031,7 +2030,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             for decode_req in failed_reqs:
                 self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
 
-        self.queue.leave([decode_req.req for decode_req in failed_reqs])
+        self.queue._leave([decode_req.req for decode_req in failed_reqs])
         move(preallocated_reqs, dst)
         self.note_destinations_queued(len(preallocated_reqs))
 
@@ -3840,7 +3839,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         move(transferred_reqs, dst)
-        self.queue.leave([queue[i].req for i in indices_to_remove])
+        self.queue._leave([queue[i].req for i in indices_to_remove])
         polls = [poll for i, poll in enumerate(polls) if i not in indices_to_remove]
 
         self.publish_pending_metadata(polls)
@@ -4020,7 +4019,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
         # Drop the released entries before releasing so a _do_release exception
         # can't leave one in the list (double-free / None receiver on retry).
-        self._deferred_releases.leave([decode_req.req for decode_req, *_ in to_release])
+        self._deferred_releases._leave(
+            [decode_req.req for decode_req, *_ in to_release]
+        )
         for decode_req, start_time, idx, room, drained in to_release:
             if not drained:
                 logger.warning(
@@ -4042,9 +4043,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
-        self.queue.clear()
+        self.queue._drop_all()
         # Pool is being torn down; drop held entries without per-request release.
-        self._deferred_releases.clear()
+        self._deferred_releases._drop_all()
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""
@@ -4209,7 +4210,7 @@ class SchedulerDisaggregationDecodeMixin:
                 new_prebuilt_batch
             )
             # A request the prebuilt result finished never runs.
-            self.running_reqs.leave(
+            self.running_reqs._leave(
                 [req for req in new_prebuilt_batch.reqs if req.finished()]
             )
             new_prebuilt_batch.filter_batch()
@@ -4341,7 +4342,7 @@ class SchedulerDisaggregationDecodeMixin:
         if not any(mismatched):
             return
         # A mismatched request never runs.
-        self.running_reqs.leave(
+        self.running_reqs._leave(
             [req for req, bad in zip(batch.reqs, mismatched) if bad]
         )
         for i, req in enumerate(batch.reqs):
@@ -4391,7 +4392,7 @@ class SchedulerDisaggregationDecodeMixin:
             return None
 
         if self.enable_priority_scheduling:
-            self.waiting_queue.replace(
+            self.waiting_queue.reorder(
                 self.policy.calc_priority(self.waiting_queue, running_batch)
             )
 

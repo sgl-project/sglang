@@ -13,6 +13,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 
@@ -53,7 +54,7 @@ def decode_queue(kind: ListKind, decode_reqs: Iterable = ()) -> IndexedReqList:
     """A PD decode queue of `kind` holding `decode_reqs`, each a wrapper with
     `.req`."""
     queue = IndexedReqList(kind, req_of=lambda x: x.req)
-    queue.join(decode_reqs)
+    move(decode_reqs, queue)
     return queue
 
 

@@ -256,7 +256,7 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
             if km is not None:
                 km.teardown()
             scheduler.disagg_prefill_bootstrap_queue = None
-        scheduler.disagg_prefill_transfer_queue.clear()
+        scheduler.disagg_prefill_transfer_queue._drop_all()
     elif mode == DisaggregationMode.DECODE:
         q = getattr(scheduler, "disagg_decode_prealloc_queue", None)
         if q is not None:

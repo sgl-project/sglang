@@ -34,6 +34,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
@@ -196,7 +197,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 scheduler.init_request_retirer()
                 queued = self._new_req(priority=1)
                 queued.rid = "queued"
-                scheduler.waiting_queue.join([queued])
+                move([queued], scheduler.waiting_queue)
                 incoming = self._new_req(priority=priority)
 
                 with patch(
@@ -295,7 +296,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             time_stats=MagicMock(),
         )
         queue.queue = IndexedReqList(ListKind.PD_BOOTSTRAP)
-        queue.queue.join([req])
+        move([req], queue.queue)
 
         with (
             patch(
@@ -478,7 +479,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         req.finish_outside_step.side_effect = lambda reason: setattr(
             req, "finished_reason", reason
         )
-        scheduler.waiting_queue.join([req])
+        move([req], scheduler.waiting_queue)
         scheduler.beam_coordinator = MagicMock()
         scheduler.enable_hicache_storage = False
         scheduler.ipc_channels = MagicMock()
@@ -1049,7 +1050,7 @@ class TestDecodePrebuilt(unittest.TestCase):
             MagicMock(rid="low", owner_list=None),
             MagicMock(rid="high", owner_list=None),
         ]
-        scheduler.waiting_queue.join(original_waiting_queue)
+        move(original_waiting_queue, scheduler.waiting_queue)
         scheduler.waiting_queue[0].priority = 1
         scheduler.waiting_queue[1].priority = 10
         scheduler.enable_priority_scheduling = True
@@ -1084,7 +1085,7 @@ class TestDecodePrebuilt(unittest.TestCase):
 
     def test_overlap_waits_for_forward_before_processing_prebuilt(self):
         scheduler = self._new_scheduler(enable_overlap=True)
-        scheduler.waiting_queue.join([MagicMock(rid="request", owner_list=None)])
+        move([MagicMock(rid="request", owner_list=None)], scheduler.waiting_queue)
 
         call_order = []
         new_batch = MagicMock()
@@ -1140,7 +1141,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         )
         for req in (kept, done):
             req.finished = partial(lambda req: req.finished_reason is not None, req)
-        scheduler.waiting_queue.join([kept, done])
+        move([kept, done], scheduler.waiting_queue)
 
         def lists_of(req):
             return [

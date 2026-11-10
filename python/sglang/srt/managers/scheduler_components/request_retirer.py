@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_components.exit_ledger import record_exit
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.io_struct import AbortReq, FinishReasonDict
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.scheduler_components.request_list import ReqList
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
         UocrSchedulerRuntime,
@@ -154,6 +155,14 @@ class RequestRetirer:
             self.uocr_runtime.on_req_dropped(req)
 
 
+def take_for_abort(req_list: ReqList, recv_req: AbortReq) -> List[Req]:
+    """Take the requests `recv_req` names out of `req_list` in one pass and
+    return them, for the caller to abort each through the retirer."""
+    reqs = [req for req in req_list if recv_req.matches(req.rid)]
+    req_list._leave(reqs)
+    return reqs
+
+
 def _leave_owner_list(req: Req) -> None:
     if req.owner_list is not None:
-        req.owner_list.leave([req])
+        req.owner_list._leave([req])

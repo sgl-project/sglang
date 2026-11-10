@@ -28,6 +28,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -381,7 +382,7 @@ class TestAllocationIntegration(CustomTestCase):
             patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
             patch("sglang.srt.disaggregation.prefill.release_kv_cache"),
         ):
-            launched.join([req])
+            move([req], launched)
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
                 scheduler, req
             )
@@ -398,8 +399,8 @@ class TestAllocationIntegration(CustomTestCase):
             with get_context().override_server_args(
                 disaggregation_decode_allocation_policy="early"
             ):
-                scheduler.waiting_queue.clear()
-                launched.join([req])
+                scheduler.waiting_queue._drop_all()
+                move([req], launched)
                 SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
                     scheduler, req
                 )
@@ -453,7 +454,7 @@ class TestAllocationIntegration(CustomTestCase):
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
         )
-        scheduler.prefill_launched_reqs.join([req])
+        move([req], scheduler.prefill_launched_reqs)
         with (
             patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
             patch("sglang.srt.disaggregation.prefill.release_kv_cache"),
@@ -494,7 +495,7 @@ class TestAllocationIntegration(CustomTestCase):
                                 ListKind.PREFILL_LAUNCHED
                             ),
                         )
-                        scheduler.chunked_reqs.join([req])
+                        move([req], scheduler.chunked_reqs)
                         scheduler.checkpoint_disagg_prefill = MethodType(
                             SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill,
                             scheduler,
@@ -566,7 +567,7 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler.tree_cache = Mock()
         scheduler.scheduler_stage_metrics = None
         scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
-        scheduler.disagg_prefill_transfer_queue.join(reqs)
+        move(reqs, scheduler.disagg_prefill_transfer_queue)
         scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = object()
         scheduler.output_streamer = Mock()
         scheduler.send_kv_chunk = Mock()

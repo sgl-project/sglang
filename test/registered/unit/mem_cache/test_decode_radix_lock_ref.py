@@ -47,6 +47,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -588,7 +589,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         req.kv.kv_committed_len = 4
         req_to_token[0, :5] = torch.tensor([50, 51, 52, 53, 54], dtype=torch.int64)
         waiting_queue = IndexedReqList(ListKind.WAITING)
-        waiting_queue.join([req])
+        move([req], waiting_queue)
 
         scheduler = SimpleNamespace(
             grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),

@@ -647,13 +647,13 @@ class PrefillBootstrapQueue:
                     f"Unexpected poll state {poll} for req {req.rid} in move_bootstrapped"
                 )
 
-        self.queue.leave(failed_reqs)
+        self.queue._leave(failed_reqs)
         move(bootstrapped_reqs, dst)
 
         return bootstrapped_reqs
 
     def release_memory_occupation(self):
-        self.queue.clear()
+        self.queue._drop_all()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
 
@@ -742,7 +742,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # finalize cannot fail here; if it ever does, the request stays
                 # pending and the post-forward check resolves it.
                 self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
-        self.waiting_queue.leave(failed)
+        self.waiting_queue._leave(failed)
 
     def has_bootstrapped_waiting_req(self: Scheduler) -> bool:
         return any(
@@ -1477,7 +1477,9 @@ class SchedulerDisaggregationPrefillMixin:
                 req, self.req_to_metadata_buffer_idx_allocator
             )
 
-        self.disagg_prefill_transfer_queue.leave(set(transfer_queue) - set(undone_reqs))
+        self.disagg_prefill_transfer_queue._leave(
+            set(transfer_queue) - set(undone_reqs)
+        )
 
         return done_reqs
 
@@ -1512,7 +1514,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
-        self.prefill_launched_reqs.leave([req])
+        self.prefill_launched_reqs._leave([req])
         owns_resources = (
             req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
         )
@@ -1596,7 +1598,7 @@ class SchedulerDisaggregationPrefillMixin:
             if not self.check_bootstrap(req):
                 if is_aborted(req):
                     # bootstrap failed
-                    self.chunked_reqs.clear()
+                    self.chunked_reqs._drop_all()
                 elif (
                     get_disagg().disaggregation_decode_allocation_policy
                     != "prefill_complete"

@@ -59,7 +59,7 @@ class SchedulerDllmMixin:
             return None
 
         running_bs = len(running_batch.reqs)
-        self.waiting_queue.replace(self.policy.calc_priority(self.waiting_queue))
+        self.waiting_queue.reorder(self.policy.calc_priority(self.waiting_queue))
 
         # Create prefill adder with resource constraints
         adder = self._create_dllm_prefill_adder(running_bs, running_batch=running_batch)
@@ -493,7 +493,8 @@ class DllmManager:
 
     def take(self, pred: Callable[[Req], bool]) -> List[Req]:
         """Drop and return requests matching `pred`; staging is a subset of waiting."""
-        taken = self.waiting_queue.take(pred)
+        taken = [req for req in self.waiting_queue if pred(req)]
+        self.waiting_queue._leave(taken)
         leaving = set(taken)
         self.staging_queue = [req for req in self.staging_queue if req not in leaving]
         return taken

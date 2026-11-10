@@ -1,5 +1,7 @@
 import ast
+import collections
 import inspect
+import pathlib
 import re
 import textwrap
 import unittest
@@ -9,6 +11,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+import sglang.srt
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
 from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
@@ -82,17 +85,82 @@ class TestRequestHoldersAreLists(CustomTestCase):
         self.assertEqual(fields, _NOT_LISTS)
 
 
+_SRT = pathlib.Path(sglang.srt.__path__[0])
+_EDITS = ("_join", "_leave", "_leave_finished", "_drop_all")
+# `move`, and the retirer module, which takes ending requests out.
+_EDITORS = {
+    "managers/scheduler_components/request_list.py",
+    "managers/scheduler_components/request_retirer.py",
+}
+# The other code that edits a list directly, with its number of edits. Each
+# entry drops a request without ending it (a teardown), or ends one outside the
+# retirer; it leaves this table when its path moves to the retirer.
+_DIRECT_EDITS = {
+    "disaggregation/decode.py:DecodePreallocQueue.move_preallocated": 1,
+    "disaggregation/decode.py:DecodePreallocQueue.release_memory_occupation": 2,
+    "disaggregation/decode.py:DecodeTransferQueue.move_transferred_with_outcomes": 1,
+    "disaggregation/decode.py:DecodeTransferQueue.release_memory_occupation": 2,
+    "disaggregation/decode.py:DecodeTransferQueue.resolve_deferred_releases": 1,
+    "disaggregation/decode.py:SchedulerDisaggregationDecodeMixin._verify_kv_checksums": 1,
+    "disaggregation/decode.py:SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run": 1,
+    "disaggregation/prefill.py:PrefillBootstrapQueue.move_bootstrapped": 1,
+    "disaggregation/prefill.py:PrefillBootstrapQueue.release_memory_occupation": 1,
+    "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin._retire_aborted_prefill_result": 1,
+    "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.process_disagg_prefill_transfer_queue": 1,
+    "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.process_prefill_chunk": 1,
+    "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.resolve_waiting_queue_bootstrap": 1,
+    "disaggregation/role_switch.py:teardown_disaggregation": 1,
+    "dllm/mixin/scheduler.py:DllmManager.take": 1,
+    "managers/hisparse_coordinator.py:HiSparseCoordinator._release_staging": 1,
+    "managers/scheduler.py:Scheduler._on_step_processed": 2,
+    "managers/scheduler.py:Scheduler._retract_batches": 1,
+    "managers/scheduler.py:Scheduler.process_pending_chunked_abort": 1,
+    "managers/scheduler_components/deferred_responses.py:DeferredResponses._abort": 1,
+    "managers/scheduler_components/deferred_responses.py:DeferredResponses.stream_released": 1,
+    "models/unlimited_ocr_v2_support/document_prefetch.py:DocPrefetch._abort": 1,
+    "models/unlimited_ocr_v2_support/document_prefetch.py:DocPrefetch.reset": 2,
+}
+
+
+class _EditCalls(ast.NodeVisitor):
+    def __init__(self, path: str, found: collections.Counter):
+        self.path, self.found, self.scope = path, found, []
+
+    def _visit_scope(self, node):
+        self.scope.append(node.name)
+        self.generic_visit(node)
+        self.scope.pop()
+
+    visit_ClassDef = visit_FunctionDef = visit_AsyncFunctionDef = _visit_scope
+
+    def visit_Call(self, node):
+        if isinstance(node.func, ast.Attribute) and node.func.attr in _EDITS:
+            self.found[f"{self.path}:{'.'.join(self.scope)}"] += 1
+        self.generic_visit(node)
+
+
+class TestListEdits(CustomTestCase):
+    def test_lists_are_edited_through_move_and_the_retirer(self):
+        found = collections.Counter()
+        for file in sorted(_SRT.rglob("*.py")):
+            path = file.relative_to(_SRT).as_posix()
+            source = file.read_text()
+            if path not in _EDITORS and any(f"{e}(" in source for e in _EDITS):
+                _EditCalls(path, found).visit(ast.parse(source))
+        self.assertEqual(dict(found), _DIRECT_EDITS)
+
+
 class TestKeyedReqList(CustomTestCase):
     def test_join_keeps_order_and_leave_ignores_outsiders(self):
         a, b, c, outsider = (FakeReq(rid=rid, finished=lambda: False) for rid in "abcx")
         running = KeyedReqList(ListKind.DECODING)
-        running.join([a, b])
-        running.join([c, b])
+        move([a, b], running)
+        move([c], running)
         self.assertEqual(list(running), [a, b, c])
 
         b.finished = lambda: True
-        running.leave_finished()
-        running.leave([a, outsider])
+        running._leave_finished()
+        running._leave([a, outsider])
 
         self.assertEqual(list(running), [c])
         self.assertNotIn(a, running)
@@ -106,10 +174,10 @@ class TestMove(CustomTestCase):
     def test_move_wraps_into_a_wrapper_list_and_keeps_its_index(self):
         a, b, c, d = _reqs("abcd")
         src = KeyedReqList(ListKind.PREFILL_LAUNCHED)
-        src.join([a, b, c])
+        move([a, b, c], src)
         dst = IndexedReqList(ListKind.PD_RELEASING, req_of=lambda x: x[0])
         held = (d, "held")
-        dst.join([held])
+        move([held], dst)
 
         wrapped = [(a, "a"), (b, "b")]
         move(wrapped, dst)
@@ -121,13 +189,13 @@ class TestMove(CustomTestCase):
     def test_a_request_is_in_at_most_one_list(self):
         a, b = _reqs("ab")
         held = IndexedReqList(ListKind.PD_BOOTSTRAP)
-        held.join([a])
+        move([a], held)
         dst = KeyedReqList(ListKind.DECODING)
 
         with self.assertRaisesRegex(
             RuntimeError, "a is in PD_BOOTSTRAP, cannot join DECODING"
         ):
-            dst.join([b, a])
+            dst._join([b, a])
         with self.assertRaisesRegex(RuntimeError, "a is already in PD_BOOTSTRAP"):
             move([a], held)
 
@@ -137,18 +205,29 @@ class TestMove(CustomTestCase):
         self.assertIsNone(b.owner_list)
 
     def test_every_way_out_of_a_list_clears_the_owner(self):
-        a, b, c, d = _reqs("abcd")
+        a, b, c = _reqs("abc")
         queue = IndexedReqList(ListKind.WAITING)
-        queue.join([a, b])
+        move([a, b], queue)
         running = KeyedReqList(ListKind.DECODING)
-        running.join([c])
+        move([c], running)
 
-        queue.leave([a])
-        running.clear()
-        queue.replace([d])
+        queue._leave([a])
+        running._drop_all()
+        queue._drop_all()
 
         self.assertEqual([r.owner_list for r in (a, b, c)], [None, None, None])
-        self.assertIs(d.owner_list, queue)
+
+    def test_a_reorder_keeps_the_same_requests(self):
+        a, b, c = _reqs("abc")
+        queue = IndexedReqList(ListKind.WAITING)
+        move([a, b], queue)
+
+        queue.reorder([b, a])
+        with self.assertRaisesRegex(RuntimeError, "reorder of WAITING changed"):
+            queue.reorder([b, c])
+
+        self.assertEqual(list(queue), [b, a])
+        self.assertIsNone(c.owner_list)
 
 
 if __name__ == "__main__":

@@ -796,7 +796,7 @@ class TestPublishedDestinationHandoff(CustomTestCase):
         self.assertFalse(prealloc._host_destinations_quiescent())
 
         # The receive completes and leaves the queue.
-        transfer.queue.leave([decode_req.req])
+        transfer.queue._leave([decode_req.req])
         self.assertTrue(prealloc._host_destinations_quiescent())
 
 
