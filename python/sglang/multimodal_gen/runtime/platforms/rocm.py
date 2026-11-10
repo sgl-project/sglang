@@ -257,13 +257,16 @@ class RocmPlatform(Platform):
                     exc_info=True,
                 )
 
-        if is_gfx1250_supported():
+        # gfx11xx/gfx12xx (incl. gfx1250): AOTriton flash/mem_efficient SDPA fail
+        # above head_dim 256, which the VAE single-head attention exceeds.
+        if cls.get_gcn_arch_name().startswith(("gfx11", "gfx12")):
             count = cls._force_math_sdpa_in_attention(vae)
             if count > 0:
                 logger.info(
                     "Pinned %d VAE attention modules to the math SDPA backend "
-                    "(AOTriton fails above head_dim 256 on gfx1250)",
+                    "(AOTriton fails above head_dim 256 on %s)",
                     count,
+                    cls.get_gcn_arch_name(),
                 )
 
         if is_gfx1250_supported():
