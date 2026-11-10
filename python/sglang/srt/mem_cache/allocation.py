@@ -27,6 +27,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_allocation_size,
     get_cp_sharded_padded_cache_transfer_indices,
 )
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
@@ -186,6 +187,58 @@ def retire_window(
             eviction_interval=eviction_interval,
             window_sub_pool=sub_pool,
         )
+
+
+def prefill_window_frontier(
+    req: Req, prefix_len: int, tree_cache: BasePrefixCache, *, enable_overlap: bool
+) -> Optional[int]:
+    """The frontier behind which a prefill's window rows retire when its chunk
+    from ``prefix_len`` is placed, or None when none retire yet: a cache that
+    shares prefixes retires them through the tree, and under overlap the first
+    chunk may still be running."""
+    if tree_cache.supports_prefix_sharing():
+        return None
+    if not enable_overlap:
+        return prefix_len
+    # The previous chunk may still be running, and it reads the window before
+    # its start: one chunk back.
+    if req.extend_batch_idx < 2:
+        return None
+    chunked_prefill_size = get_schedule().chunked_prefill_size
+    if chunked_prefill_size > 0:
+        return prefix_len - chunked_prefill_size
+    return prefix_len
+
+
+def retire_window_before_chunk(
+    req: Req, tree_cache: BasePrefixCache, *, enable_overlap: bool
+) -> None:
+    """Retire a chunked prefill's window rows before its next chunk is sized.
+
+    The prefill adder sizes a continuing chunk from the window's free rows, but
+    ``ScheduleBatch.maybe_evict_swa`` retires the rows behind the window only
+    once that chunk is placed. At the pool ``compute_swa_request_cap`` gives,
+    every chunk after the second then alternates between the slack and
+    chunk - window; under overlap with a pool below two chunks plus a window,
+    no third chunk fits, so none is placed and nothing ever retires.
+
+    The frontier is ``maybe_evict_swa``'s (``prefill_window_frontier``): this
+    retires what that pass would retire later in the same step, which then
+    finds nothing left for this request."""
+    if not tree_cache.supports_swa() or not req.kv.holds_kv:
+        return
+    allocator = tree_cache.token_to_kv_pool_allocator
+    if is_swa_req_ring(allocator):
+        # A per-request ring's chunks are not sized from the free rows.
+        return
+    frontier = prefill_window_frontier(
+        req, req.prefix_len, tree_cache, enable_overlap=enable_overlap
+    )
+    if frontier is None:
+        return
+    allocator.free_group_begin()
+    retire_window(req, frontier, tree_cache)
+    allocator.free_group_end()
 
 
 def _room_in(tree_cache: BasePrefixCache):
