@@ -58,6 +58,8 @@ class MooncakeTestServices:
                 "python3",
                 "-m",
                 "mooncake.http_metadata_server",
+                "--host",
+                "127.0.0.1",
                 "--port",
                 str(self.metadata_port),
             ],

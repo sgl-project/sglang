@@ -35,12 +35,31 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 from typing_extensions import Literal
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.utils import (
-    GLM_MEDIA_CONFIG_KEYS,
-    ImageData,
-    VideoData,
-    read_system_prompt_from_file,
-)
+from sglang.srt.multimodal.media_io import GLM_MEDIA_CONFIG_KEYS, ImageData, VideoData
+from sglang.srt.utils.common import find_local_repo_dir
+
+
+def read_system_prompt_from_file(model_name: str) -> str:
+    """Read system prompt from a file in the HuggingFace cache directory.
+
+    Args:
+        model_name: The model name to construct the file path
+
+    Returns:
+        The system prompt content from the file, or empty string if file not found
+    """
+    try:
+        local_repo_dir = find_local_repo_dir(model_name)
+        if local_repo_dir:
+            system_prompt_file = os.path.join(local_repo_dir, "SYSTEM_PROMPT.txt")
+            if os.path.exists(system_prompt_file):
+                with open(system_prompt_file, "r", encoding="utf-8") as f:
+                    return f.read()
+
+        return ""
+    except Exception:
+        # If anything fails, return empty string
+        return ""
 
 
 class SeparatorStyle(IntEnum):
@@ -606,8 +625,16 @@ def _get_full_multimodal_text_prompt(
 
 
 def generate_chat_conv(
-    request: ChatCompletionRequest, template_name: str
+    request: ChatCompletionRequest,
+    template_name: str,
+    *,
+    inline_image_placeholders: bool = False,
 ) -> Conversation:
+    """Build the conversation for ``request`` under ``template_name``.
+
+    ``inline_image_placeholders`` keeps a user message whose text already
+    carries one image token per image as is, instead of adding the tokens again.
+    """
     conv = chat_templates[template_name].copy()
     conv = Conversation(
         name=conv.name,
@@ -667,6 +694,14 @@ def generate_chat_conv(
                 )
                 if add_token_as_needed:
                     image_token = ""
+                if inline_image_placeholders and num_image_url > 0:
+                    text_placeholders = sum(
+                        c.text.count(conv.image_token)
+                        for c in message.content
+                        if c.type == "text"
+                    )
+                    if text_placeholders == num_image_url:
+                        image_token = ""
 
                 audio_token = conv.audio_token
                 video_token = conv.video_token
@@ -1118,6 +1153,7 @@ MODEL_TYPE_TO_TEMPLATE = {
     "moss_vl": "moss-vl",
     "deepseek-ocr": "deepseek-ocr",
     "unlimited-ocr": "unlimited-ocr",
+    "unlimited_ocr": "unlimited-ocr",
     "paddleocr_vl": "paddle-ocr",
     "whisper": "whisper",
 }
@@ -1230,7 +1266,7 @@ def match_unlimited_ocr(model_path: str):
     if "unlimited" in model_path.lower():
         return "unlimited-ocr"
     model_type = get_model_type(model_path)
-    if model_type == "unlimited-ocr":
+    if model_type in ("unlimited-ocr", "unlimited_ocr"):
         return "unlimited-ocr"
     return None
 

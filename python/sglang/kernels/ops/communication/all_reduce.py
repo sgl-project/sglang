@@ -24,9 +24,16 @@ class AllReduceAlgo(enum.Enum):
     TWO_SHOT_PUSH = enum.auto()
     ONE_SHOT_PULL = enum.auto()
     TWO_SHOT_PULL = enum.auto()
+    # ROCm gfx1250 DPX only: pair reduce-scatter, cross-SoC 2shot_push, pair
+    # all-gather; run by CustomAllReduceV2 over its pair and cross planes
+    HIER_2SHOT_PUSH = enum.auto()
 
     def is_push(self) -> bool:
-        return self in (AllReduceAlgo.ONE_SHOT_PUSH, AllReduceAlgo.TWO_SHOT_PUSH)
+        return self in (
+            AllReduceAlgo.ONE_SHOT_PUSH,
+            AllReduceAlgo.TWO_SHOT_PUSH,
+            AllReduceAlgo.HIER_2SHOT_PUSH,
+        )
 
     @property
     def algo_name(self) -> str:
@@ -38,6 +45,7 @@ _ALGO_NAMES = {
     AllReduceAlgo.TWO_SHOT_PUSH: "2shot_push",
     AllReduceAlgo.ONE_SHOT_PULL: "1shot_pull",
     AllReduceAlgo.TWO_SHOT_PULL: "2shot_pull",
+    AllReduceAlgo.HIER_2SHOT_PUSH: "hier_2shot_push",
 }
 
 if TYPE_CHECKING:
@@ -234,6 +242,25 @@ def custom_all_reduce(
     result = module.all_reduce(comm, input, algo.algo_name, graph_params, use_multicast)
     # Already a torch.Tensor once tvm-ffi loads torch's DLPack exchange API;
     # re-wrapping it is a pure round trip (~15 us per call on GB300).
+    if isinstance(result, torch.Tensor):
+        return result
+    return torch.from_dlpack(result)
+
+
+@debug_kernel_api
+def custom_pair_stage(
+    comm: Communicator, input: torch.Tensor, *, all_gather: bool
+) -> torch.Tensor:
+    """One half of a 2-rank 2shot_push over a pair plane (ROCm only).
+
+    Reduce-scatter takes the full tensor and returns this rank's reduced half
+    (half ``comm.rank``); all-gather takes that half and returns the full
+    tensor, flattened.
+    """
+    assert comm.world_size == 2, comm.world_size
+    module = get_all_reduce_module(input.dtype, 2)
+    algo = "pair_all_gather" if all_gather else "pair_reduce_scatter"
+    result = module.all_reduce(comm, input, algo, None, False)
     if isinstance(result, torch.Tensor):
         return result
     return torch.from_dlpack(result)
