@@ -20,9 +20,13 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 class TestFlashinferA2AWideEPPlumbing(CustomTestCase):
     def test_runner_paths_are_registered(self):
-        self.assertIn(("flashinfer", "flashinfer_trtllm"), FusedOpPool._fused_funcs)
         self.assertIn(
-            ("flashinfer", "flashinfer_trtllm_routed"), FusedOpPool._fused_funcs
+            ("flashinfer_nvlink_one_sided", "flashinfer_trtllm"),
+            FusedOpPool._fused_funcs,
+        )
+        self.assertIn(
+            ("flashinfer_nvlink_one_sided", "flashinfer_trtllm_routed"),
+            FusedOpPool._fused_funcs,
         )
         self.assertIn(
             ("flashinfer", "deep_gemm"), PermuteMethodPool._pre_permute_methods
