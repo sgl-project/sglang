@@ -19,6 +19,9 @@ INDEX_HEAD_DIM = 128
 INDEX_K_PAYLOAD_BYTES = tl.constexpr(64)
 INDEX_K_SCALE_BYTES = tl.constexpr(4)
 INDEX_K_SLOT_BYTES = INDEX_K_PAYLOAD_BYTES.value + INDEX_K_SCALE_BYTES.value
+# Paged decode batches up to this many rows split all rows' tiles evenly over the GPU;
+# scores are bitwise identical to the per-row grid.
+_PAGED_BALANCED_MAX_BATCH = 4096
 
 
 @triton.jit
@@ -110,77 +113,6 @@ def finish_paged_indexer_topk(
         mask_scores,
         raw_indices is not None,
         triton.next_power_of_2(max(page_indices.shape[1], indices.shape[1])),
-        num_warps=4,
-    )
-
-
-# Visible key counts change across batches; keep them out of the JIT key.
-@triton.jit(do_not_specialize=["NUM_SLOTS"])
-def _finish_flat_indexer_topk_kernel(
-    Indices,
-    Slots,
-    Starts,
-    Pages,
-    Raw,
-    K: tl.constexpr,
-    NUM_SLOTS,
-    IDX_STRIDE: tl.constexpr,
-    PAGE_STRIDE: tl.constexpr,
-    RAW_STRIDE: tl.constexpr,
-    WRITE_RAW: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    col = tl.arange(0, BLOCK)
-    unselected = 2147483647
-    idx = tl.load(Indices + row * IDX_STRIDE + col, col < K, unselected)
-    idx = tl.sort(tl.where(idx < 0, unselected, idx), descending=False)
-    chosen = (col < K) & (idx != unselected)
-    slot = tl.load(Slots + tl.minimum(idx, NUM_SLOTS - 1), chosen, -1)
-    tl.store(Pages + row * PAGE_STRIDE + col, slot, col < K)
-    if WRITE_RAW:
-        start = tl.load(Starts + row)
-        tl.store(
-            Raw + row * RAW_STRIDE + col, tl.where(chosen, idx - start, -1), col < K
-        )
-
-
-def finish_flat_indexer_topk(
-    indices: torch.Tensor,
-    slots: torch.Tensor,
-    request_starts: torch.Tensor,
-    page_indices: torch.Tensor,
-    raw_indices: torch.Tensor | None,
-) -> None:
-    """Sort flattened prefill positions and map them to KV slots in one kernel.
-
-    Negative positions and INT32_MAX are unselected. Write only the selected
-    rows and columns; callers retain responsibility for resetting output padding.
-    """
-    rows, k = indices.shape
-    if not rows or not k:
-        return
-    assert indices.dtype == torch.int32 and indices.stride(1) == 1
-    assert slots.ndim == 1 and slots.is_contiguous() and slots.numel() > 0
-    assert request_starts.shape == (rows,) and request_starts.is_contiguous()
-    assert page_indices.shape[0] >= rows and page_indices.shape[1] >= k
-    assert page_indices.dtype == torch.int32 and page_indices.stride(1) == 1
-    if raw_indices is not None:
-        assert raw_indices.shape[0] >= rows and raw_indices.shape[1] >= k
-        assert raw_indices.dtype == torch.int32 and raw_indices.stride(1) == 1
-    _finish_flat_indexer_topk_kernel[(rows,)](
-        indices,
-        slots,
-        request_starts,
-        page_indices,
-        raw_indices,
-        k,
-        slots.numel(),
-        indices.stride(0),
-        page_indices.stride(0),
-        raw_indices.stride(0) if raw_indices is not None else 0,
-        raw_indices is not None,
-        triton.next_power_of_2(k),
         num_warps=4,
     )
 
@@ -630,9 +562,7 @@ def fp4_index_logits_paged(
     )
     if not batch or not max_len:
         return out
-    from sglang.srt.environ import envs
-
-    if envs.SGLANG_OPT_DSV41_FAST_DECODE_INDEXER.get() and batch <= 4096:
+    if batch <= _PAGED_BALANCED_MAX_BATCH:
         _launch_fp4_index_logits_paged_balanced(
             q,
             weights,
