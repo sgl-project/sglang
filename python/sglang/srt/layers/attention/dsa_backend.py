@@ -3557,14 +3557,8 @@ class DeepseekSparseAttnBackend(
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         num_q_heads = layer.tp_q_head_num
         target_q_heads = _flashmla_kv_padded_heads(num_q_heads)
-        # q from _flashmla_kv_q may already carry the padded heads
-        prepadded = q_all.dim() == 3 and q_all.shape[1] == target_q_heads
-        q_all = q_all.view(
-            -1, 1, target_q_heads if prepadded else num_q_heads, layer.head_dim
-        )
-        if prepadded:
-            q_input = q_all
-        elif target_q_heads != num_q_heads:
+        q_all = q_all.view(-1, 1, num_q_heads, layer.head_dim)
+        if target_q_heads != num_q_heads:
             # Pad q heads to match FlashMLA decode supported head-count variants.
             q_input = q_all.new_zeros(
                 q_all.shape[0], q_all.shape[1], target_q_heads, q_all.shape[3]
