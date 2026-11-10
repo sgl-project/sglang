@@ -77,7 +77,7 @@ jobs:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 1
-          node_selector: board-type=ZW-M890P
+          node_selector: board-type=ZW-810E
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
@@ -144,7 +144,7 @@ jobs:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 1
-          node_selector: board-type=ZW-M890P
+          node_selector: board-type=ZW-810E
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
@@ -212,7 +212,7 @@ jobs:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 2
-          node_selector: board-type=ZW-M890P
+          node_selector: board-type=ZW-810E
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
@@ -268,7 +268,7 @@ jobs:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 4
-          node_selector: board-type=ZW-M890P
+          node_selector: board-type=ZW-810E
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
