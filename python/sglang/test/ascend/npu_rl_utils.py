@@ -28,11 +28,11 @@ try:
 except Exception as exc:  # pragma: no cover - exercised only off NPU hosts
     _NPU_IMPORT_ERROR = exc
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     find_available_port,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 DEFAULT_TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
@@ -139,6 +139,28 @@ def wait_for_free_memory(
     )
 
 
+def _wait_for_hbm_baseline(
+    device: int,
+    baseline_free: int,
+    *,
+    timeout: float = 60,
+    interval: float = 0.5,
+) -> None:
+    """Best-effort wait for HBM to return to its pre-launch level.
+
+    SIGTERM/SIGKILL only starts driver-side teardown; the next server should
+    not race that cleanup. Teardown must not fail the test, so a timeout is
+    ignored.
+    """
+    if not npu_available():
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if npu_free_bytes(device) >= baseline_free:
+            return
+        time.sleep(interval)
+
+
 # ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
@@ -159,11 +181,13 @@ def npu_server(
     """
     port = port or find_available_port(30000)
     base_url = f"http://127.0.0.1:{port}"
+    baseline_free = 0
     if npu_available():
         # The previous test's server may still be handing HBM back; a partial
         # free is not enough for the next full KV-cache allocation. Fail instead
         # of launching a second server on a device that is still occupied.
         wait_for_free_memory(0, int(0.65 * npu_total_bytes(0)), timeout=300)
+        baseline_free = npu_free_bytes(0)
     process = popen_launch_server(
         model_path,
         base_url,
@@ -174,7 +198,14 @@ def npu_server(
     try:
         yield base_url
     finally:
-        kill_process_tree(process.pid)
+        # SIGTERM first so the server can release its NPU mempool in userspace,
+        # then SIGKILL the remaining tree. A bare SIGKILL leaves driver-side
+        # mempool/shared-handle cleanup racing the next launch.
+        if process.poll() is None:
+            terminate_and_kill_process_tree(process, terminate_timeout=30)
+        else:
+            process.wait()
+        _wait_for_hbm_baseline(0, baseline_free)
 
 
 # ---------------------------------------------------------------------------
