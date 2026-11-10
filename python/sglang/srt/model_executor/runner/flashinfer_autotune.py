@@ -182,6 +182,9 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     ]
     # Retune caches created before FlashInfer's default tactic joined the race.
     model_key_parts.append("candidate_selection=v2_default")
+    # Retune caches whose MoE tactics were profiled on the constant-token dummy.
+    if envs.SGLANG_FLASHINFER_AUTOTUNE_VARIED_TOKENS.get():
+        model_key_parts.append("dummy_tokens=varied")
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
     model_key_parts.append("skip_ops=" + ",".join(sorted(skip_ops)))
@@ -367,6 +370,44 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             tuner.save_configs(str(autotune_cache))
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")
+
+
+@contextlib.contextmanager
+def autotune_varied_input_ids(input_ids: torch.Tensor, *, vocab_size: int):
+    """Fill an autotune dummy forward's ``input_ids`` with pseudo-random token ids.
+
+    FlashInfer's MoE tuners profile every token bucket up to the forward's row
+    count with that forward's own routed top-k rows. The static buffers hold one
+    constant token, which routes every row to the same few experts and ranks
+    tactics for a load that serving never sees. The ids are restored on exit.
+    """
+    from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+
+    if (
+        not get_in_autotune_dummy_run()
+        or not envs.SGLANG_FLASHINFER_AUTOTUNE_VARIED_TOKENS.get()
+    ):
+        yield
+        return
+    # Fixed per attention-DP rank: the ranks sharing one batch feed the same
+    # rows, and attention-DP ranks feed distinct ones, as their requests differ.
+    generator = torch.Generator().manual_seed(get_parallel().attn_dp_rank)
+    # Any id below vocab_size has an embedding row; the dummy has no multimodal
+    # inputs, so special and placeholder ids embed like ordinary text.
+    ids = torch.randint(
+        vocab_size, input_ids.shape, generator=generator, dtype=input_ids.dtype
+    )
+    log_info_on_rank0(
+        logger,
+        f"FlashInfer autotune: dummy forward runs {input_ids.numel()} varied "
+        f"token ids in [0, {vocab_size}).",
+    )
+    saved = input_ids.clone()
+    input_ids.copy_(ids)
+    try:
+        yield
+    finally:
+        input_ids.copy_(saved)
 
 
 def run_flashinfer_autotune_forward(

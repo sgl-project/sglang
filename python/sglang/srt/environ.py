@@ -1382,6 +1382,9 @@ class Envs:
     # warmup. Opt-in: the extra forward needs transient activation headroom
     # that small-VRAM or tightly-packed configs may not have.
     SGLANG_FLASHINFER_AUTOTUNE_EXTEND = EnvBool(False)
+    # Run the autotune dummy forward on pseudo-random token ids so MoE tuners
+    # see a serving-like expert spread; off restores the constant-token dummy.
+    SGLANG_FLASHINFER_AUTOTUNE_VARIED_TOKENS = EnvBool(True)
     SGLANG_ENABLE_FLUX3_PRIMS_TS_AUTOTUNE = EnvBool(False)
     SGLANG_OPT_FLUX3_PRIMS_TS_TUNING_BUCKETS = EnvTuple(tuple())
     SGLANG_USE_SAGE_ATTENTION_IMPL = EnvStr("")

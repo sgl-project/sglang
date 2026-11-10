@@ -46,6 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    autotune_varied_input_ids,
     maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
@@ -794,7 +795,12 @@ class BaseRunner(ABC):
         with forward_context(
             ForwardContext(attn_backend=mr.attn_backend), forward_batch=forward_batch
         ):
-            with run_ctx or empty_context():
+            with (
+                run_ctx or empty_context(),
+                autotune_varied_input_ids(
+                    input_ids, vocab_size=mr.model_config.vocab_size
+                ),
+            ):
                 run_once()
 
     def _autotune_buffers(self) -> Tuple[Optional[Any], Optional[int]]:
