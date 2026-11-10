@@ -167,9 +167,10 @@ def _store_leaves(
 ) -> Any:
     """``_extract_single_sample_tensor`` with every tensor put in ``stored`` and a marker in its place."""
     if isinstance(obj, torch.Tensor):
-        stored[path] = obj
+        # One field per sample of a batched tensor, so a reader fetches only its samples.
         if obj.dim() >= 1 and obj.shape[0] == batch_size:
-            return {"__store__": path, "row": sample_idx}
+            path, obj = f"{path}.{sample_idx}", obj[sample_idx]
+        stored[path] = obj
         return {"__store__": path}
     if isinstance(obj, dict):
         return {
@@ -361,9 +362,9 @@ def _build_response(
     peak_memory_mb = result.peak_memory_mb if result.peak_memory_mb > 0 else None
     rollout_trajectory_data = result.rollout_trajectory_data
     if rollout:
-        assert rollout_trajectory_data is not None, (
-            "rollout_trajectory_data must be present when rollout=True"
-        )
+        assert (
+            rollout_trajectory_data is not None
+        ), "rollout_trajectory_data must be present when rollout=True"
 
     serialized_dit_timesteps = None
     serialized_dit_sigmas = None

@@ -565,28 +565,25 @@ def _store_batch(B=2, K=3, T=2, D=4, L=5):
     return batch
 
 
-def _assert_same_tensors(test, inline, via_store, stored, row):
+def _assert_same_tensors(test, inline, via_store, stored):
     """Every marker in ``via_store`` resolves to the tensor ``inline`` carries there."""
     if isinstance(via_store, dict) and "__store__" in via_store:
         tensor = stored[via_store["__store__"]]
-        if "row" in via_store:
-            test.assertEqual(via_store["row"], row)
-            tensor = tensor[row]
         test.assertTrue(torch.equal(_maybe_deserialize(inline), tensor))
     elif isinstance(via_store, dict):
         test.assertEqual(set(inline), set(via_store))
         for key in via_store:
-            _assert_same_tensors(test, inline[key], via_store[key], stored, row)
+            _assert_same_tensors(test, inline[key], via_store[key], stored)
     elif isinstance(via_store, list):
         test.assertEqual(len(inline), len(via_store))
         for a, b in zip(inline, via_store):
-            _assert_same_tensors(test, a, b, stored, row)
+            _assert_same_tensors(test, a, b, stored)
     else:
         test.assertEqual(inline, via_store)
 
 
 class TestBuildResponseViaStore(unittest.TestCase):
-    def test_large_tensors_are_stored_once_with_the_batch_axis(self):
+    def test_batched_tensors_are_stored_one_field_per_sample(self):
         batch = _store_batch()
         rtd = batch.rollout_trajectory_data
         stored = {}
@@ -594,25 +591,35 @@ class TestBuildResponseViaStore(unittest.TestCase):
         self.assertEqual(
             set(stored),
             {
-                "dit_trajectory.latents",
-                "rollout_debug_tensors.rollout_model_outputs",
-                "denoising_env.pos_cond_kwargs.encoder_hidden_states.0",
+                "dit_trajectory.latents.0",
+                "dit_trajectory.latents.1",
+                "rollout_debug_tensors.rollout_model_outputs.0",
+                "rollout_debug_tensors.rollout_model_outputs.1",
+                "denoising_env.pos_cond_kwargs.encoder_hidden_states.0.0",
+                "denoising_env.pos_cond_kwargs.encoder_hidden_states.0.1",
                 "denoising_env.pos_cond_kwargs.pooled",
             },
         )
-        self.assertIs(stored["dit_trajectory.latents"], rtd.dit_trajectory.latents)
+        self.assertTrue(
+            torch.equal(
+                stored["dit_trajectory.latents.1"], rtd.dit_trajectory.latents[1]
+            )
+        )
+        self.assertIs(
+            stored["denoising_env.pos_cond_kwargs.pooled"],
+            rtd.denoising_env.pos_cond_kwargs["pooled"],
+        )
         for row, resp in enumerate(resps):
             self.assertEqual(
                 resp.dit_trajectory["latents"],
-                {"__store__": "dit_trajectory.latents", "row": row},
+                {"__store__": f"dit_trajectory.latents.{row}"},
             )
             cond = resp.denoising_env["pos_cond_kwargs"]
             self.assertEqual(
                 cond["encoder_hidden_states"],
                 [
                     {
-                        "__store__": "denoising_env.pos_cond_kwargs.encoder_hidden_states.0",
-                        "row": row,
+                        "__store__": f"denoising_env.pos_cond_kwargs.encoder_hidden_states.0.{row}"
                     }
                 ],
             )
@@ -651,11 +658,9 @@ class TestBuildResponseViaStore(unittest.TestCase):
         stored = {}
         inline = _build_response("r", "p", 0, True, batch)
         via_store = _build_response("r", "p", 0, True, batch, stored=stored)
-        for row, (a, b) in enumerate(zip(inline, via_store)):
+        for a, b in zip(inline, via_store):
             for field in ("rollout_debug_tensors", "denoising_env", "dit_trajectory"):
-                _assert_same_tensors(
-                    self, getattr(a, field), getattr(b, field), stored, row
-                )
+                _assert_same_tensors(self, getattr(a, field), getattr(b, field), stored)
 
     def test_eval_response_stores_nothing(self):
         batch = OutputBatch(
