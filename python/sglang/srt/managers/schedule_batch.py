@@ -2756,6 +2756,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def mix_with_running(self, running_batch: ScheduleBatch):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
+        # Prefill rows without logprobs and decode tails have no input scores.
+        # Rebind once: in-flight batches may still reference the original lists.
+        prefill_starts = (
+            self.extend_lens
+            if running_batch.return_logprob and not self.return_logprob
+            else self.extend_logprob_start_lens
+        )
+        self.extend_logprob_start_lens = (
+            prefill_starts
+            + [int(self.return_logprob or running_batch.return_logprob)] * running_bs
+        )
 
         # Same invariant as convert_decode_to_extend: the caller ran
         # prepare_for_decode, so a tail's prefix is its row length - 1.
@@ -2852,10 +2863,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.prefix_lens = self.prefix_lens + running_prefix_lens
         self.extend_lens = self.extend_lens + [1] * running_bs
         self.extend_num_tokens = self.extend_num_tokens + running_bs
-        # TODO (lianmin): Revisit this. It should be seq_len - 1
-        self.extend_logprob_start_lens = (
-            self.extend_logprob_start_lens + [0] * running_bs
-        )
         self.is_prefill_only = False
 
     def convert_decode_to_extend(self):

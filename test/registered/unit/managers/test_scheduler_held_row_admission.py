@@ -1,8 +1,12 @@
 """A request that already holds a req_to_token row is not counted twice at admission (#38118, #35537)."""
 
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import torch
+from parameterized import parameterized
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -10,7 +14,8 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers import schedule_batch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
@@ -18,7 +23,10 @@ from sglang.srt.managers.scheduler_components.request_list import (
     KeyedReqList,
     ListKind,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -137,6 +145,51 @@ class TestHeldRowAdmission(CustomTestCase):
             running_batch.batch_is_full,
             final_chunk,
             waiting,
+        )
+
+    @parameterized.expand([(False, False), (False, True), (True, False), (True, True)])
+    def test_mixed_logprobs(self, prefill_lp, decode_lp):
+        prefill, decode = [
+            Req(str(i), "", array("q", [i, i + 1]), SamplingParams(), return_logprob=lp)
+            for i, lp in enumerate((prefill_lp, decode_lp), 1)
+        ]
+        prefill.extend_end = decode.extend_end = 2
+        s = self._scheduler(DisaggregationMode.NULL, [], decode, [])
+        s.model_config = SimpleNamespace(is_encoder_decoder=False, vocab_size=17)
+        s.req_to_token_pool.device = "cpu"
+        s.is_mixed_chunk = True
+        s.spec_algorithm = SpeculativeAlgorithm.NONE
+        s.hisparse_coordinator = None
+        s.enable_hierarchical_cache = s.enable_skip_finishing_decode = False
+        s.tp_worker.model_runner.prefill_aware_swa = False
+        s.enable_priority_scheduling = False
+        s.load_inquirer = Mock()
+        allocations = [(torch.arange(2), row, row) for row in torch.arange(2).split(1)]
+        with (
+            get_context().override_server_args(pp_max_micro_batch_size=NUM_ROWS),
+            patch.object(schedule_batch, "alloc_for_extend", side_effect=allocations),
+            patch.object(
+                schedule_batch, "alloc_for_decode", return_value=torch.tensor([4])
+            ),
+            patch.object(ScheduleBatch, "check_decode_mem", return_value=True),
+            patch("sglang.srt.managers.scheduler.PrefillStats.from_adder"),
+        ):
+            running, _ = s._get_new_batch_prefill_raw(None, ScheduleBatch([]))
+            decode.output_ids.append(4)
+            s.chunked_req = prefill
+            batch, _ = s._get_new_batch_prefill_raw(None, running)
+        self.assertEqual(batch.forward_mode, ForwardMode.MIXED)
+        self.assertEqual(batch.reqs, [prefill, decode])
+        self.assertEqual(batch.return_logprob, prefill_lp or decode_lp)
+        self.assertEqual(batch.extend_lens, [2, 1])
+        self.assertEqual(
+            batch.extend_logprob_start_lens,
+            [2 if decode_lp and not prefill_lp else 0, int(prefill_lp or decode_lp)],
+        )
+        targets = batch.extend_input_logprob_token_ids
+        self.assertEqual(
+            None if targets is None else targets.tolist(),
+            [2, 0] if prefill_lp else None,
         )
 
     def test_final_chunk_leaves_the_free_row_to_a_waiting_request(self):
