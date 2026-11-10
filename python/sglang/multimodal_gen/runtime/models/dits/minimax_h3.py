@@ -1076,6 +1076,32 @@ def _minimax_h3_attention_core_impl(
 
     _minimax_h3_bind_attention_backend(attention, q.dtype)
 
+    if (
+        ulysses_active
+        and not ring_active
+        and gate_compress is None
+        and attention._attention_backend_enum
+        is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+        and attention._attention_impl.schedule.quantize_before_a2a
+    ):
+        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.sage_ulysses import (
+            prepared_sage_ulysses_forward,
+        )
+
+        out = prepared_sage_ulysses_forward(
+            q,
+            k,
+            v,
+            impl=attention._attention_impl,
+            cu_seqlens_host=cu_seqlens_host,
+            max_seqlen=max_seqlen,
+            ulysses_active=ulysses_active,
+            ring_active=ring_active,
+            query_block_mask=subblock_sparse_query_block_mask,
+        )
+        if out is not None:
+            return out
+
     if ulysses_active and not ring_active and gate_compress is None:
         pipeline_kwargs = dict(
             cu_seqlens=cu_seqlens,

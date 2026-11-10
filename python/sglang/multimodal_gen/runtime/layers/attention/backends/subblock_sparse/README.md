@@ -95,6 +95,7 @@ rejected.
 | `skip_first_layers` | 0 | leading DiT blocks kept dense |
 | `min_seq_len` | 4096 | shorter sequences run dense |
 | `compute_mode` | `"bf16"` | compute path: `"bf16"` or architecture-dispatched `"sage_fp8"` |
+| `quantize_before_a2a` | `false` | experimental H3 SM120 prepared Sage2 exchange over NCCL; requires `sage_fp8` and newer FlashInfer |
 
 `compute_mode="sage_fp8"` is the stable public name, not a promise that every
 architecture quantizes every operand identically. On SM90 it calls
@@ -206,3 +207,63 @@ Run the SM120 Sage numerical test with:
 ```bash
 python test/manual/attention/test_subblock_sage_fp8_sm120.py
 ```
+
+## Experimental H3 quantization before Ulysses (SM120)
+
+`quantize_before_a2a` defaults to `false`. An explicit opt-in uses FlashInfer's
+prepared Sage2 API to quantize local Q/K/V before NCCL all-to-all, then feeds
+INT8 Q/K, FP8 V and their scales directly to the SM120 CAKE sparse kernel:
+
+```bash
+--attention-backend subblock_sparse_attn \
+--component-attention-backends text_encoder=torch_sdpa \
+--attention-backend-config '{"compute_mode":"sage_fp8","quantize_before_a2a":true}'
+```
+
+This draft path needs FlashInfer containing
+[#4924](https://github.com/flashinfer-ai/flashinfer/pull/4924),
+[#4951](https://github.com/flashinfer-ai/flashinfer/pull/4951), and
+[#5083](https://github.com/flashinfer-ai/flashinfer/pull/5083).
+The required interfaces are available in
+[FlashInfer 0.7.4](https://github.com/flashinfer-ai/flashinfer/releases/tag/v0.7.4).
+SGLang's pinned FlashInfer **0.7.3 does not include `prepare_qkv`**. The option
+raises an actionable error with that release; no dependency pin is changed
+here. Validating and aligning the dependency and JIT-cache pins is required
+before this becomes ready to merge. Prepared exchange uses **NCCL**; the public FlashInfer API rejects
+prepared PCIe/RDMA communicators, so ordinary PCIe transport support does not
+make prepared low-precision RDMA available.
+
+Supported calls are inference on SM120, head dimension 128, Ulysses degree 4
+or 8, and one live packed H3 document followed by padding. Ring, training,
+graph capture, unsupported geometry and oversized routing metadata decline
+before communication. Dense warmup steps and skipped layers keep the original
+BF16 path. Once collective preparation starts, failures propagate. The option
+does not change the existing `quality=high` admission rules.
+
+Before exchange, the transport clears disposable padded Q/K/V projection rows
+in place as required by the prepared API. Live rows and projection-view strides
+are preserved; this keeps global K statistics independent of padding.
+
+Routing uses a **quantized-operand estimator**, including K tile scales but
+omitting Q scales and K channel means. It can select different blocks from the
+native BF16 router. This path needs its own H3 quality and latency evaluation;
+no output equivalence or end-to-end speedup is claimed for the current main.
+
+Triton pre/post fusion packs the CAKE layouts and scales, pools the quantized
+operands without full BF16 Q/K materialization, expands mixed dense/sparse
+query rows, and writes the output while zeroing padding. Set
+`SGLANG_DIFFUSION_H3_SAGE_FUSED_PREPOST=0` to compare with the unfused reference
+using the **same quantized-operand estimator**. Fusion equivalence does not
+establish equivalence to BF16 routing.
+
+Validation entry points:
+
+```bash
+python -m pytest python/sglang/multimodal_gen/test/unit/test_minimax_h3_prepared_sage.py python/sglang/multimodal_gen/test/unit/test_cake_sage_a2a_kernels.py -q
+torchrun --standalone --nproc_per_node=4 test/manual/attention/test_h3_prepared_sage_ulysses.py
+```
+
+The distributed check exercises strided QKV views, nonaligned shards, live
+tails, mixed query masks, persistent receive buffers and the output gather. It
+compares fused and unfused glue exactly; full H3 generation still needs a
+separate validation run.

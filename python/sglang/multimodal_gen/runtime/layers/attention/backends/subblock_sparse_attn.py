@@ -413,6 +413,7 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
     n_q: int
     min_seq_len: int
     compute_mode: str
+    quantize_before_a2a: bool = False
 
     @classmethod
     def from_server_args(cls) -> SubBlockSparseSchedule:
@@ -420,6 +421,13 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
 
         config = get_global_server_args().attention_backend_config or {}
         compute_mode = str(config.get("compute_mode", DEFAULT_COMPUTE_MODE))
+        quantize_before_a2a = config.get("quantize_before_a2a", False)
+        if type(quantize_before_a2a) is not bool:
+            raise ValueError("subblock quantize_before_a2a must be a boolean")
+        if quantize_before_a2a and compute_mode != "sage_fp8":
+            raise ValueError(
+                "subblock quantize_before_a2a requires compute_mode='sage_fp8'"
+            )
         # Use 16-token pooling cells for both K128 (SM90) and K64 (SM120).
         default_n_k = (
             _sage_key_block_size() // 16 if compute_mode == "sage_fp8" else DEFAULT_N_K
@@ -436,6 +444,7 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
             n_q=int(config.get("n_q", DEFAULT_N_Q)),
             min_seq_len=int(config.get("min_seq_len", DEFAULT_MIN_SEQ_LEN)),
             compute_mode=compute_mode,
+            quantize_before_a2a=quantize_before_a2a,
         )
         if not 0.0 <= schedule.sparsity < 1.0:
             raise ValueError(

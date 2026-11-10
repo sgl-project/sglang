@@ -1,0 +1,449 @@
+# SPDX-License-Identifier: Apache-2.0
+"""CPU contract tests for the CAKE adapter, without compiling a CUDA kernel."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
+    sage_ulysses as adapter,
+)
+
+
+@pytest.mark.parametrize("used", [64, 130])
+@pytest.mark.parametrize("heterogeneous", [False, True])
+def test_cake_receives_exact_tail_and_noncontiguous_routing(
+    monkeypatch, used, heterogeneous
+):
+    global_sequence = 256
+    blocks = (used + 63) // 64
+    topk = max(1, blocks - 1)
+    index = torch.arange(blocks, dtype=torch.int32)[::2][:topk]
+    topk = index.numel()
+    index = index.view(1, 1, 1, topk).expand(1, 2, blocks, topk).contiguous()
+    monkeypatch.setattr(
+        adapter,
+        "SubBlockRouter",
+        lambda **kwargs: SimpleNamespace(
+            route=lambda *args, **kwargs: SimpleNamespace(index=index, topk=topk)
+        ),
+    )
+    calls = []
+    mask = torch.arange(blocks) % 2 == 0 if heterogeneous else None
+
+    def kernel(q, k, v, qs, ks, vs, indices, count, **kwargs):
+        assert q.shape == k.shape == (1, 2, used, 128)
+        assert v.shape == (1, 2, 128, blocks * 64)
+        assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+        assert qs.shape == (1, 2, ((used + 127) // 128) * 4)
+        assert ks.shape == (1, 2, blocks)
+        assert kwargs["backend"] == "cake"
+        assert kwargs["uniform_block_count"] is not (heterogeneous)
+        assert kwargs["contiguous_block_indices"] is False
+        if heterogeneous:
+            counts = kwargs["q2k_block_nums"]
+            assert counts.shape == (1, 2, blocks)
+            assert counts[0, 0].tolist() == [
+                topk if selected else blocks for selected in mask.tolist()
+            ]
+            assert indices[0, 0, 0, :topk].tolist() == index[0, 0, 0].tolist()
+            if blocks > 1:
+                assert indices[0, 0, 1].tolist() == list(range(blocks))
+        else:
+            assert kwargs["q2k_block_nums"] is None
+        assert kwargs["block_sizes"].tolist() == [64] * (blocks - 1) + [
+            used - 64 * (blocks - 1)
+        ]
+        out = kwargs["out"]
+        assert (
+            out.shape == q.shape and out.dtype == torch.bfloat16 and out.is_contiguous()
+        )
+        calls.append((indices, count))
+        out.fill_(3)
+        return out
+
+    monkeypatch.setattr(adapter, "load_bsa_attn_sm120_blk64_sage_fwd", lambda: kernel)
+    schedule = SimpleNamespace(
+        sparsity=0.75, n_k=1, n_q=1, min_seq_len=0, skip_first_steps=10
+    )
+    q = torch.zeros((1, global_sequence, 2, 128), dtype=torch.int8)
+    v = torch.zeros((1, 128, 2, global_sequence), dtype=torch.float8_e4m3fn)
+    out = torch.full(q.shape, 99, dtype=torch.bfloat16)
+    adapter._SparseSageA2ACompute(schedule, mask)(
+        q_int8=q,
+        k_int8=q,
+        v_fp8=v,
+        q_scale=torch.ones((1, 2, 8)),
+        k_scale=torch.ones((1, 2, 4)),
+        v_scale=torch.ones((1, 2, 128)),
+        out=out,
+        used_sequence=used,
+        global_sequence=global_sequence,
+        softmax_scale=128**-0.5,
+        output_dtype=torch.bfloat16,
+    )
+    assert torch.all(out[:, :used] == 3)
+    assert torch.count_nonzero(out[:, used:]) == 0
+    indices, count = calls[0]
+    if heterogeneous:
+        assert count == blocks
+    else:
+        assert count == topk and indices is index
+
+
+@pytest.mark.parametrize("eligible", [True, False])
+def test_prepared_forward_reuses_operands_and_gathers_once(monkeypatch, eligible):
+    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
+        sage_ulysses_route as routing,
+    )
+
+    monkeypatch.setattr(
+        routing,
+        "check_prepared_sage_route",
+        lambda *args, **kw: SimpleNamespace(enabled=eligible, reason="test"),
+    )
+    q = torch.zeros((64, 8, 128), dtype=torch.bfloat16)
+    encoded = SimpleNamespace(
+        q=torch.zeros((1, 256, 2, 128), dtype=torch.int8),
+        k=torch.zeros((1, 256, 2, 128), dtype=torch.int8),
+        v=torch.zeros((1, 128, 2, 256), dtype=torch.float8_e4m3fn),
+        q_scale=torch.ones((1, 2, 8)),
+        k_scale=torch.ones((1, 2, 4)),
+        v_scale=torch.ones((1, 2, 128)),
+        used_sequence=130,
+        logical_sequence=256,
+    )
+    calls = []
+
+    def exchange(q_in, k_in, v_in):
+        assert eligible and q_in is k_in is v_in is q
+        calls.append("quantize+exchange")
+        return encoded
+
+    def compute(**kw):
+        for name, value in [
+            ("q_int8", encoded.q),
+            ("k_int8", encoded.k),
+            ("v_fp8", encoded.v),
+            ("q_scale", encoded.q_scale),
+            ("k_scale", encoded.k_scale),
+            ("v_scale", encoded.v_scale),
+        ]:
+            assert kw[name] is value
+        assert kw["used_sequence"] == 130 and kw["global_sequence"] == 256
+        calls.append("compute")
+        kw["out"].fill_(5)
+
+    def gather(output):
+        calls.append("gather")
+        return output.reshape(1, 64, 8, 128)
+
+    monkeypatch.setattr(adapter, "_SparseSageA2ACompute", lambda *args: compute)
+    impl = SimpleNamespace(
+        schedule=SimpleNamespace(quantize_before_a2a=True, min_seq_len=0),
+        layer_enabled=True,
+        _step_enabled=lambda: True,
+        softmax_scale=128**-0.5,
+    )
+    result = adapter.prepared_sage_ulysses_forward(
+        q,
+        q,
+        q,
+        impl=impl,
+        cu_seqlens_host=(0, 130, 256),
+        max_seqlen=130,
+        ulysses_active=True,
+        ring_active=False,
+        query_block_mask=torch.ones(3, dtype=torch.bool),
+        transport=SimpleNamespace(exchange=exchange, gather=gather),
+    )
+    if eligible:
+        assert calls == ["quantize+exchange", "compute", "gather"]
+        assert result.shape == q.shape and torch.all(result == 5)
+    else:
+        assert calls == [] and result is None
+
+
+@pytest.mark.parametrize("gate", ["opt_in", "layer", "step", "length"])
+def test_declines_before_transport_when_schedule_does_not_admit(monkeypatch, gate):
+    impl = SimpleNamespace(
+        schedule=SimpleNamespace(
+            quantize_before_a2a=gate != "opt_in",
+            min_seq_len=131 if gate == "length" else 0,
+        ),
+        layer_enabled=gate != "layer",
+        _step_enabled=lambda: gate != "step",
+    )
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Schedule rejection must precede transport initialization")
+
+    monkeypatch.setattr(adapter, "_get_transport", unexpected)
+    q = torch.zeros((64, 8, 128), dtype=torch.bfloat16)
+    assert (
+        adapter.prepared_sage_ulysses_forward(
+            q,
+            q,
+            q,
+            impl=impl,
+            cu_seqlens_host=(0, 130, 256),
+            max_seqlen=130,
+            ulysses_active=True,
+            ring_active=False,
+        )
+        is None
+    )
+
+
+def test_workspace_and_received_storage_are_reused(monkeypatch):
+    import flashinfer.comm
+    import torch.distributed as dist
+
+    calls = []
+    encoded = object()
+
+    class Communicator:
+        def __init__(self, group, **kwargs):
+            assert kwargs["backend"] == "nccl"
+            assert kwargs["max_bytes"] == 3 * q.numel() * q.element_size()
+
+        def prepare_qkv(self, shape, **kwargs):
+            calls.append("prepare")
+            assert shape == (1, *q.shape) and kwargs == {
+                "quantization": "sage2",
+                "used_sequence": 130,
+            }
+            return "workspace"
+
+        def scatter_qkv(self, *args, workspace, out):
+            assert workspace == "workspace" and out is (
+                None if len(calls) == 1 else encoded
+            )
+            calls.append("scatter")
+            return encoded
+
+        def gather_heads(self, source, out):
+            calls.append("gather")
+            return out
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(flashinfer.comm, "UlyssesCommunicator", Communicator)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+    q = torch.zeros((64, 8, 128), dtype=torch.bfloat16)
+    transport = adapter._PreparedSageTransport("group", q, 130)
+    assert transport.exchange(q, q, q) is encoded
+    assert transport.exchange(q, q, q) is encoded
+    assert transport.gather(q) is transport.gathered
+    transport.close()
+    assert calls == ["prepare", "scatter", "scatter", "gather", "close"]
+
+
+def test_missing_prepared_api_fails_with_actionable_error(monkeypatch):
+    import flashinfer.comm
+
+    monkeypatch.setattr(flashinfer.comm, "UlyssesCommunicator", object)
+    with pytest.raises(ImportError, match="#4924"):
+        adapter._PreparedSageTransport("group", torch.zeros(64, 8, 128), 130)
+
+
+@pytest.mark.parametrize("value", [False, True])
+def test_schedule_requires_explicit_prepared_qkv_opt_in(monkeypatch, value):
+    from sglang.multimodal_gen.runtime import server_args
+    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
+        SubBlockSparseSchedule,
+    )
+
+    config = {"compute_mode": "sage_fp8"}
+    if value:
+        config["quantize_before_a2a"] = True
+    monkeypatch.setattr(
+        server_args,
+        "get_global_server_args",
+        lambda: SimpleNamespace(attention_backend_config=config),
+    )
+    assert SubBlockSparseSchedule.from_server_args().quantize_before_a2a is value
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"quantize_before_a2a": "false"},
+        {"quantize_before_a2a": 1},
+        {"quantize_before_a2a": True, "compute_mode": "bf16"},
+    ],
+)
+def test_invalid_prepared_qkv_configuration_is_rejected(monkeypatch, config):
+    from sglang.multimodal_gen.runtime import server_args
+    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
+        SubBlockSparseSchedule,
+    )
+
+    monkeypatch.setattr(
+        server_args,
+        "get_global_server_args",
+        lambda: SimpleNamespace(attention_backend_config=config),
+    )
+    with pytest.raises(ValueError, match="quantize_before_a2a"):
+        SubBlockSparseSchedule.from_server_args()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "valid",
+        "ring",
+        "training",
+        "capture",
+        "architecture",
+        "rocm",
+        "head_dim",
+        "dtype",
+        "world",
+        "group",
+        "heads",
+        "documents",
+        "live_length",
+        "metadata",
+        "compile",
+    ],
+)
+def test_geometry_guards_precede_collectives(monkeypatch, case):
+    from contextlib import nullcontext
+
+    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
+        sage_ulysses_route as route,
+    )
+
+    monkeypatch.setattr(torch.version, "hip", "test" if case == "rocm" else None)
+    monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_PREPARED_SAGE_QKV", raising=False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda device: (9, 0) if case == "architecture" else (12, 0),
+    )
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: case == "capture"
+    )
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: case == "compile")
+    monkeypatch.setattr(
+        route, "get_ulysses_parallel_world_size", lambda: 2 if case == "world" else 4
+    )
+    monkeypatch.setattr(
+        route, "get_sp_group", lambda: SimpleNamespace(ulysses_group="group")
+    )
+    monkeypatch.setattr(
+        route.dist, "get_world_size", lambda group: 3 if case == "group" else 4
+    )
+    total = 2**21 if case == "metadata" else 256
+    used = total - 17 if case == "metadata" else 130
+    q = SimpleNamespace(
+        shape=(
+            total // 4,
+            10 if case == "heads" else 8,
+            64 if case == "head_dim" else 128,
+        ),
+        dtype=torch.float32 if case == "dtype" else torch.bfloat16,
+        device=torch.device("cuda", 0),
+        is_cuda=True,
+        requires_grad=False,
+        ndim=3,
+    )
+    with nullcontext() if case == "training" else torch.inference_mode():
+        result = route.check_prepared_sage_route(
+            q,
+            q,
+            q,
+            cu_seqlens_host=(0, total) if case == "documents" else (0, used, total),
+            max_seqlen=used + 1 if case == "live_length" else used,
+            ulysses_active=True,
+            ring_active=case == "ring",
+        )
+    assert result.enabled is (case == "valid")
+
+
+def test_transport_cache_budget_and_cleanup(monkeypatch):
+    calls = []
+
+    class Transport:
+        def __init__(self, *args):
+            calls.append("prepare")
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(adapter, "_TRANSPORTS", {})
+    monkeypatch.setattr(adapter, "_MAX_GEOMETRIES", 1)
+    monkeypatch.setattr(adapter, "_PreparedSageTransport", Transport)
+    q = torch.zeros(64, 8, 128)
+    first = adapter._get_transport("group", q, 130)
+    assert adapter._get_transport("group", q, 130) is first
+    with pytest.raises(RuntimeError, match="budget"):
+        adapter._get_transport("group", q, 131)
+    adapter.shutdown_prepared_sage_ulysses()
+    assert not adapter._TRANSPORTS and calls == ["prepare", "close"]
+
+
+@pytest.mark.parametrize(
+    "local,peer", [(True, True), (True, False), (False, True), (False, False)]
+)
+def test_hardware_admission_is_collective_and_cached(monkeypatch, local, peer):
+    import torch.distributed as dist
+
+    calls = []
+    monkeypatch.setattr(adapter, "_HARDWARE_SUPPORT", {})
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(adapter, "_TRANSPORTS", {})
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device: (12, 0) if local else (9, 0)
+    )
+
+    def all_reduce(vote, *, op, group):
+        assert op == dist.ReduceOp.MIN and group == "group"
+        calls.append(int(vote[0]))
+        vote.fill_(int(local and peer))
+
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
+    for _ in range(2):
+        assert adapter._hardware_supported_by_all_ranks(
+            "group", torch.device("cpu")
+        ) is (local and peer)
+    assert calls == [int(local)]
+    adapter.shutdown_prepared_sage_ulysses()
+    assert not adapter._HARDWARE_SUPPORT
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_prepared_exchange_zeros_only_rank_local_padding(monkeypatch, rank):
+    import flashinfer.comm
+    import torch.distributed as dist
+
+    received = []
+
+    class Communicator:
+        def __init__(self, group, **kwargs):
+            pass
+
+        def prepare_qkv(self, *args, **kwargs):
+            return "workspace"
+
+        def scatter_qkv(self, *operands, **kwargs):
+            received.extend(operand.clone() for operand in operands)
+            return "encoded"
+
+    monkeypatch.setattr(flashinfer.comm, "UlyssesCommunicator", Communicator)
+    monkeypatch.setattr(dist, "get_rank", lambda group: rank)
+    packed = torch.empty((64, 8, 3, 128), dtype=torch.bfloat16)
+    q, k, v = packed.unbind(dim=2)
+    for i, operand in enumerate((q, k, v), 1):
+        operand.fill_(i)
+    valid = max(0, min(64, 130 - rank * 64))
+    transport = adapter._PreparedSageTransport("group", q, 130)
+    assert transport.exchange(q, k, v) == "encoded"
+    for i, (operand, sent) in enumerate(zip((q, k, v), received), 1):
+        assert not operand.is_contiguous()
+        assert torch.all(operand[:valid] == i)
+        assert not operand[valid:].count_nonzero()
+        torch.testing.assert_close(sent[0], operand, rtol=0, atol=0)
