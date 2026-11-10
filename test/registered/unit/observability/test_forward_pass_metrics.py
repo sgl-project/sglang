@@ -1783,6 +1783,109 @@ class TestEstimatedPerfConstants(CustomTestCase):
         )
         self.assertGreater(self.reporter._kv_cache_bytes_per_token, 0.0)
 
+    def test_qwen3_next_style_mixer_only_labels_keep_full_mlp_layer_count(self):
+        # Qwen3-Next/Qwen3.5/GigaChat3.5/BailingHybrid's own layers_block_type
+        # labels only the *mixer* ("attention" vs "linear_attention"); every
+        # layer still builds its own FFN unconditionally, and these configs
+        # expose a separate full_attention_layer_ids property for the real
+        # full-attention layer indices. This vocabulary is NOT a subset of
+        # NemotronH's exclusive {"mamba","attention","mlp","moe"} labels (it
+        # contains "linear_attention"), so counting "attention"/"mlp"/"moe"
+        # literally against it -- or treating every non-mamba/mlp/moe label
+        # as attention -- would either zero num_mlp_layers or overcount
+        # num_attn_layers by including linear_attention layers. Must fall
+        # back to full_attention_layer_ids for num_attn_layers and keep
+        # num_mlp_layers at the full layer count.
+        hidden, head_dim, heads, kv_heads = 4096, 128, 32, 8
+        layers_block_type = ["attention", "linear_attention"] * 5
+        full_attention_layer_ids = [
+            i for i, t in enumerate(layers_block_type) if t == "attention"
+        ]
+        total_layers = float(len(layers_block_type))
+        num_attn_layers = float(len(full_attention_layer_ids))
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_kv_heads=kv_heads,
+                num_attention_layers=int(total_layers),
+                hf_text_config_overrides={
+                    "layers_block_type": layers_block_type,
+                    "full_attention_layer_ids": full_attention_layer_ids,
+                    "intermediate_size": 14336,
+                },
+            )
+        )
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        mlp_flops = 6.0 * hidden * 14336
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * num_attn_layers + mlp_flops * total_layers,
+        )
+        self.assertGreater(self.reporter._ffn_act_bytes_per_token, 0.0)
+
+    def test_byte_estimates_scale_by_attention_and_mlp_layer_counts(self):
+        # The same attention/MLP layer-count split that FLOPs and KV-cache
+        # bytes use must also apply to the weight-read and activation byte
+        # estimates -- otherwise hybrid models keep the old per-total-layer
+        # overcount on these terms even after the FLOPs/KV-cache split is
+        # fixed (e.g. ~13x overcounted KV-cache bytes for a 52-layer/
+        # 4-attention NemotronH-style model if left unsplit).
+        hidden, head_dim, heads, kv_heads, intermediate = 4096, 128, 32, 8, 14336
+        layers_block_type = (
+            ["attention"] * 2 + ["mlp"] * 3 + ["moe"] * 2 + ["mamba"] * 3
+        )
+        num_attn_layers, num_mlp_layers = 2.0, 5.0
+        dtype_bytes = 2.0
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_kv_heads=kv_heads,
+                num_attention_layers=len(layers_block_type),
+                hf_text_config_overrides={
+                    "layers_block_type": layers_block_type,
+                    "intermediate_size": intermediate,
+                },
+            )
+        )
+        expected_qkv_act = (
+            hidden * dtype_bytes * num_attn_layers
+            + (heads + 2.0 * kv_heads) * head_dim * dtype_bytes * num_attn_layers
+            + head_dim * heads * dtype_bytes * num_attn_layers
+            + hidden * dtype_bytes * num_attn_layers
+        )
+        expected_ffn_act = 3.0 * intermediate * dtype_bytes * num_mlp_layers
+        expected_prefill_attn_read = (
+            (heads + 2.0 * kv_heads) * head_dim * dtype_bytes * num_attn_layers
+        )
+        expected_decode_q_read = heads * head_dim * dtype_bytes * num_attn_layers
+
+        self.assertAlmostEqual(self.reporter._qkv_act_bytes_per_token, expected_qkv_act)
+        self.assertAlmostEqual(self.reporter._ffn_act_bytes_per_token, expected_ffn_act)
+        self.assertAlmostEqual(
+            self.reporter._prefill_attn_act_read_per_token, expected_prefill_attn_read
+        )
+        self.assertAlmostEqual(
+            self.reporter._decode_q_read_bytes_per_token, expected_decode_q_read
+        )
+
+        # Regression guard: the old unsplit total layer count (8) would
+        # overcount every one of these by 8 / num_attn_layers or
+        # 8 / num_mlp_layers.
+        stale_qkv_act = (
+            hidden * dtype_bytes * 8
+            + (heads + 2.0 * kv_heads) * head_dim * dtype_bytes * 8
+            + head_dim * heads * dtype_bytes * 8
+            + hidden * dtype_bytes * 8
+        )
+        self.assertLess(self.reporter._qkv_act_bytes_per_token, stale_qkv_act)
+
     def test_jamba_style_attention_mamba_only_labels_still_charge_mlp_everywhere(self):
         # Jamba/Bamba's layers_block_type only ever contains "attention" or
         # "mamba" -- there is no separate "mlp"/"moe" label, because every
