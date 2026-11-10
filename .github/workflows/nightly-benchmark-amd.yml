@@ -12,7 +12,9 @@ name: Nightly Benchmark (AMD)
 # one artifact for the sglang-ci-bot daily report.
 on:
   schedule:
-    - cron: '17 10 * * *'  # after the 09:00 UTC rocm10 image
+    # The rocm10 MI35x image lands about 12:00 UTC; 13 points take 7-9 h, so the
+    # run ends before the Beijing (UTC+8) workday.
+    - cron: '0 14 * * *'
   workflow_dispatch:
     inputs:
       point:

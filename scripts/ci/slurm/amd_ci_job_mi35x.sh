@@ -136,7 +136,10 @@ fi
 bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$CI_ROCM_VERSION"
 bash scripts/ci/amd/amd_ci_install_dependency.sh
 # --env pairs from the launcher, one KEY=VAL per line.
-EXEC_ENV_ARGS=(-e CI_ARTIFACT_DIR=/sglang-checkout/ci_artifacts)
+# CI_IMAGE: the image amd_ci_start_container.sh picked, which can be an older
+# day's when today's is not out yet.
+EXEC_ENV_ARGS=(-e CI_ARTIFACT_DIR=/sglang-checkout/ci_artifacts
+               -e "CI_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$CI_CONTAINER_NAME")")
 while IFS= read -r kv; do
     [[ -n "$kv" ]] && EXEC_ENV_ARGS+=(-e "$kv")
 done <<< "${CI_EXEC_ENV:-}"

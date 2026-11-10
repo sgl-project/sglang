@@ -350,6 +350,7 @@ def _write_artifacts(
         "variant": variant,
         "inferencex_commit": INFERENCEX_COMMIT,
         "sglang_commit": _sglang_commit(),
+        "image": os.environ.get("CI_IMAGE", ""),
         "client_exit_code": client_exit_code,
         "aggregate": aggregate,
     }
