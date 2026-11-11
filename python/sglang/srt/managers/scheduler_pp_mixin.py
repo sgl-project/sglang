@@ -27,6 +27,7 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.mem_cache.kv.alloc.invariants import STAGE_CAPACITY_AGREEMENT
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -38,6 +39,7 @@ from sglang.srt.sampling.sampling_observer_pp import (
     pop_auxiliary_output_from_pp_tensors,
 )
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import is_npu
 from sglang.srt.utils.invariants import expect_host, resolve_level
 
@@ -83,7 +85,11 @@ def _pp_exchange_outputs_before_forward(
         return True
     if not spec_relay or is_last_rank or cur_batch is None:
         return False
-    return not (cur_batch.forward_mode.is_extend() or cur_batch.is_extend_in_batch)
+    return not (
+        cur_batch.forward_mode.is_extend()
+        or cur_batch.forward_mode.is_prebuilt()
+        or cur_batch.is_extend_in_batch
+    )
 
 
 @dataclass
@@ -111,12 +117,19 @@ class SchedulerPPMixin:
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
+    _pp_spec_decode: bool = False
     # Side stream of `_pp_result_done_event`; made on first use.
     _pp_skip_output_stream = None
     # Unified memory under PP with invariant checks: the allocator whose decisions
     # the stages compare, and their digest up to this iteration (`init_pp_loop_state`).
     _pp_checked_allocator: Optional[ChainAllocator] = None
     _pp_capacity_digest: Optional[bytes] = None
+
+    def _pp_requires_output(self, batch: Optional[ScheduleBatch]) -> bool:
+        # PD bootstrap produces a proposal that must visit every pipeline stage.
+        return batch is not None and (
+            not batch.forward_mode.is_prebuilt() or self._pp_spec_decode
+        )
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -480,8 +493,14 @@ class SchedulerPPMixin:
                     if not cur_batch.forward_mode.is_prebuilt():
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
-                # early send output if possible
-                if get_parallel().pp_async_batch_depth > 0:
+                # Verify needs the previous proposal; bootstrap can launch first.
+                exchange_outputs_before_forward = _pp_exchange_outputs_before_forward(
+                    cur_batch=cur_batch,
+                    spec_relay=self._pp_spec_relay,
+                    is_last_rank=self.pp_group.is_last_rank,
+                    async_batch_depth=get_parallel().pp_async_batch_depth,
+                )
+                if exchange_outputs_before_forward:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -499,7 +518,7 @@ class SchedulerPPMixin:
                         self.last_rank_comm_queue,
                     )
 
-                if get_parallel().pp_async_batch_depth == 0:
+                if not exchange_outputs_before_forward:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -559,10 +578,26 @@ class SchedulerPPMixin:
 
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
-                    if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
+                    completed = self.mbs[next_mb_id]
+                    if self._pp_spec_decode and completed.forward_mode.is_prebuilt():
                         d2h_event.synchronize()
+                        self.running_mbs[next_mb_id] = (
+                            self._merge_disagg_decode_prebuilt_batch(
+                                self.running_mbs[next_mb_id], completed
+                            )
+                        )
+                        # Bootstrap has a launch, but emits no additional token.
+                        self._on_step_processed(completed, next_batch_result)
+                    elif not completed.forward_mode.is_prebuilt():
+                        d2h_event.synchronize()
+                        metadata = self.mb_metadata[next_mb_id]
                         self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
+                            (
+                                metadata.fwd_batch
+                                if self._pp_spec_decode
+                                and metadata.fwd_batch is not None
+                                else completed
+                            ),
                             next_batch_result,
                         )
                     else:
@@ -652,6 +687,34 @@ class SchedulerPPMixin:
             and get_parallel().pp_size > 1
             and not self.spec_algorithm.is_none()
         )
+        self._pp_spec_decode = (
+            self._pp_spec_relay and get_disagg().disaggregation_mode == "decode"
+        )
+        if self._pp_spec_decode:
+            if get_disagg().disaggregation_decode_retraction_backup != "cpu_tensor":
+                raise ValueError(
+                    "PD decode PP speculative decoding requires cpu_tensor backup"
+                )
+            draft_pool = (
+                self.draft_worker.primary_draft_kv_pool
+                if self.draft_worker is not None
+                else None
+            )
+            pools = [self.token_to_kv_pool_allocator.get_kvcache(), draft_pool]
+            if any(getattr(pool, "use_fia_nz", False) for pool in pools):
+                raise ValueError(
+                    "PD decode PP speculative decoding does not support FIA NZ backup"
+                )
+            self.request_retirer.draft_token_to_kv_pool = draft_pool
+            # The first draft writes KV before the first target verify.
+            queue = self.disagg_decode_prealloc_queue
+            queue.num_reserved_decode_tokens = max(
+                queue.num_reserved_decode_tokens,
+                ceil_align(
+                    get_alloc_reserve_per_decode(),
+                    self.token_to_kv_pool_allocator.page_size,
+                ),
+            )
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -931,9 +994,8 @@ class SchedulerPPMixin:
     def _pp_prepare_tensor_dict(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> Dict[str, torch.Tensor]:
-        tensor_dict = {
-            "next_token_ids": result.next_token_ids,
-        }
+        bootstrap = self._pp_spec_decode and batch.forward_mode.is_prebuilt()
+        tensor_dict = {} if bootstrap else {"next_token_ids": result.next_token_ids}
 
         if self._pp_spec_relay and result.accept_lens is not None:
             # PP+spec verify round: earlier stages need the accept results to
@@ -945,14 +1007,16 @@ class SchedulerPPMixin:
             if result.accept_index is not None:
                 # Relayed recurrent commits also need chain accept indices.
                 tensor_dict["spec_accept_index"] = result.accept_index
+        if self._pp_spec_relay and (bootstrap or result.accept_lens is not None):
             if result.next_verify_chain is not None:
-                # Tail-drafted tree for the next verify round (root = bonus),
-                # with the topology its tokens were arranged by.
+                # Bootstrap and tail-draft share the next verify proposal.
                 tensor_dict["spec_next_chain"] = result.next_verify_chain
                 tensor_dict["spec_next_parents"] = result.next_verify_parent_list
                 tensor_dict["spec_next_top_scores"] = (
                     result.next_verify_top_scores_index
                 )
+        if bootstrap:
+            return tensor_dict
 
         # Draft extend runs only on the last stage, but every rank needs its relayed
         # output to fill PD auxiliary buffers.
@@ -1138,6 +1202,16 @@ class SchedulerPPMixin:
         mb_metadata: PPBatchMetadata,
         pp_outputs: PPProxyTensors,
     ):
+        if self._pp_spec_decode and batch.forward_mode.is_prebuilt():
+            assert "spec_next_chain" in pp_outputs.tensors
+            self._pp_spec_adopt_relayed_tree(
+                batch, [req.rid for req in mb_metadata.fwd_batch.reqs], pp_outputs
+            )
+            return GenerationBatchResult(
+                forward_launch=mb_metadata.forward_launch,
+                unified_forward_done=mb_metadata.unified_forward_done,
+            )
+
         logits_output = None
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
@@ -1576,9 +1650,8 @@ class SchedulerPPMixin:
             target = mbs[next_first_rank_mb_id]
             if target is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if (
-                    not target.forward_mode.is_prebuilt()
-                    and not _pp_can_skip_output_comm(target)
+                if self._pp_requires_output(target) and not _pp_can_skip_output_comm(
+                    target
                 ):
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
@@ -1654,7 +1727,7 @@ class SchedulerPPMixin:
         def _do_recv():
             nonlocal next_pp_outputs, batch_result, d2h_event
             target = mbs[next_mb_id]
-            if target is None or target.forward_mode.is_prebuilt():
+            if not self._pp_requires_output(target):
                 return
             if _pp_can_skip_output_comm(target):
                 next_pp_outputs, batch_result, d2h_event = (
@@ -1747,7 +1820,7 @@ class SchedulerPPMixin:
             target_send = mbs[next_first_rank_mb_id]
             if target_send is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if not target_send.forward_mode.is_prebuilt():
+                if self._pp_requires_output(target_send):
                     if _pp_can_skip_output_comm(target_send):
                         send_dict = {"__msg_type__": "output", "__skip__": True}
                     else:
@@ -1767,9 +1840,7 @@ class SchedulerPPMixin:
         # marker.  The receiver always participates in the
         # batch_isend_irecv and inspects the marker after recv.
         target_recv = mbs[next_mb_id]
-        should_recv = (
-            target_recv is not None and not target_recv.forward_mode.is_prebuilt()
-        )
+        should_recv = self._pp_requires_output(target_recv)
 
         def _handle_recv_dict(recv_dict):
             nonlocal next_pp_outputs, batch_result, d2h_event

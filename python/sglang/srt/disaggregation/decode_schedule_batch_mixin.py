@@ -29,7 +29,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         self.forward_mode = ForwardMode.PREBUILT
         reqs = self.reqs
-        # PREBUILT never enters a model forward. Keep the legacy scalar metadata,
+        # PREBUILT never enters a target forward. Keep the legacy scalar metadata,
         # but do not flatten and copy every transferred prompt to the GPU only to
         # discard it before the first decode step.
         seq_lens = []
@@ -110,6 +110,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
     def process_prebuilt(
         self: ScheduleBatch,
         future_map: FutureMap,
+        *,
+        pp_spec_decode: bool = False,
     ):
         """Assign the buffered last input id to schedule batch"""
         last_tokens: List[int] = []
@@ -138,10 +140,34 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         FINISH_ABORT(error_message, HTTPStatus.INTERNAL_SERVER_ERROR)
                     )
                 req.grammar.finished = req.finished()
+        if pp_spec_decode:
+            backups = [req.kv.retraction_backup for req in self.reqs]
+            restored = [b is not None and b.pp_spec_relay is not None for b in backups]
+            if any(restored):
+                assert all(restored), (
+                    "Fresh and restored PP spec requests must be grouped"
+                )
+                relay = None
+                for req, backup in zip(self.reqs, backups, strict=True):
+                    assert backup.pp_spec_seq_len == req.seqlen - 1
+                    row = backup.pp_spec_relay
+                    assert row.rids == [req.rid]
+                    assert row.tokens[0, 0].item() == req.output_ids[-1]
+                    row = row.to(self.device)
+                    if relay is None:
+                        relay = row
+                    else:
+                        relay.merge_batch(row)
+                # The prefill seed is stale after retraction. Resume from the
+                # proposal that was saved alongside the committed draft KV.
+                self.spec_info = relay
+                for req in self.reqs:
+                    req.kv.retraction_backup = None
+                return
+
         last_tokens_tensor = async_h2d(
             last_tokens, dtype=torch.int64, device=self.device
         )
-
         spec_info = self.spec_algorithm.build_disagg_draft_input(
             self,
             last_tokens_tensor,

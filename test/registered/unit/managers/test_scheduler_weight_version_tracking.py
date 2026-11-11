@@ -421,6 +421,31 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
 
 class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
+    def test_pd_pp_spec_rejects_updates_before_mutating_weights_or_session(self):
+        target, draft = _runner(), _runner()
+        manager = self._manager(target, draft, session=False)
+        manager.scheduler._pp_spec_decode = True
+        target.weight_updater.reset_mock()
+        draft.weight_updater.reset_mock()
+        for method in (
+            "begin_weight_update",
+            "update_weights_from_disk",
+            "update_weights_from_ipc",
+            "update_weights_from_distributed",
+            "update_weights_from_tensor",
+            "plugin_weight_update",
+            "end_weight_update",
+        ):
+            with self.subTest(method=method):
+                with patch("torch.distributed.barrier") as barrier:
+                    output = getattr(manager, method)(_request())
+                self.assertFalse(output.success)
+                self.assertIsNone(manager._session)
+                self.assertEqual(target.weight_updater.mock_calls, [])
+                self.assertEqual(draft.weight_updater.mock_calls, [])
+                self.assertEqual(self.recorded, [])
+                barrier.assert_not_called()
+
     def test_rejects_all_runners_before_restoring_any_derived_weights(self):
         target, draft = _runner(), _runner()
         draft.weight_updater.get_model.return_value._derived_weight_cache_error = (

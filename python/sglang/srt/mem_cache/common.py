@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,10 @@ class RetractionBackup(NamedTuple):
     pool_transfers: Optional[list[PoolTransfer]] = None
     # Set when the KV pool leaves the recurrent state to the caller.
     mamba_cpu: Any = None
+    # Separate draft KV, when it is not already part of the target pool.
+    draft_cpu_tensors: Any = None
+    pp_spec_relay: Optional[PPSpecRelayInput] = None
+    pp_spec_seq_len: Optional[int] = None
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
@@ -298,6 +303,9 @@ def backup_kv_cache(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
+    *,
+    draft_token_to_kv_pool=None,
+    pp_spec_relay: Optional[PPSpecRelayInput] = None,
 ) -> bool:
     """Returns False when the request can be neither backed up nor recomputed;
     the caller aborts it."""
@@ -311,8 +319,15 @@ def backup_kv_cache(
         torch.get_device_module(device).synchronize(device)
         return True
     if backend == "cpu_tensor":
-        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        req.offload_kv_cache(
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+            draft_token_to_kv_pool=draft_token_to_kv_pool,
+            pp_spec_relay=pp_spec_relay,
+        )
         return True
+    if pp_spec_relay is not None:
+        raise ValueError("PP speculative decode requires cpu_tensor retraction backup")
     if backend != "host_pool":
         raise ValueError(f"Unknown retraction backup backend: {backend}")
     if req.seqlen <= 1:
@@ -329,9 +344,15 @@ def restore_kv_cache(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
+    *,
+    draft_token_to_kv_pool=None,
 ) -> None:
     if backend == "cpu_tensor":
-        req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        req.load_kv_cache(
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+            draft_token_to_kv_pool=draft_token_to_kv_pool,
+        )
         return
     if backend != "host_pool":
         raise ValueError(f"Unknown retraction backup backend: {backend}")

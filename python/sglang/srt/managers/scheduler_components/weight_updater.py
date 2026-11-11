@@ -169,8 +169,19 @@ class SchedulerWeightUpdaterManager:
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
         self.scheduler.record_weight_version_change(new_version=weight_version)
 
+    def _reject_pp_spec_decode_update(self, output_type):
+        # Retracted KV and relayed proposals belong to the original weights.
+        if getattr(self.scheduler, "_pp_spec_decode", False):
+            return output_type(
+                success=False,
+                message="PD decode PP speculative decoding requires fixed weights",
+            )
+        return None
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        if error := self._reject_pp_spec_decode_update(UpdateWeightFromDiskReqOutput):
+            return error
         with self._observe_weight_load("disk"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
@@ -307,6 +318,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        if error := self._reject_pp_spec_decode_update(UpdateWeightsFromIPCReqOutput):
+            return error
         with self._observe_weight_load("ipc"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
@@ -351,6 +364,9 @@ class SchedulerWeightUpdaterManager:
 
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
         """Open the session: restore in-place-packed weights on the selected runners."""
+        # Tensor, distributed, and plugin transports all require this session.
+        if error := self._reject_pp_spec_decode_update(BeginWeightUpdateReqOutput):
+            return error
         if self._session is not None:
             return BeginWeightUpdateReqOutput(
                 success=False,

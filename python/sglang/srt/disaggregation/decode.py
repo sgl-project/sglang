@@ -154,6 +154,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, kv_storage_of
 from sglang.srt.mem_cache.utils import get_num_new_pages
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -1402,6 +1403,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.req_to_token_pool,
                 self.token_to_kv_pool_allocator,
                 get_disagg().disaggregation_decode_retraction_backup,
+                draft_token_to_kv_pool=(
+                    self.draft_token_to_kv_pool
+                    if getattr(self.scheduler, "_pp_spec_decode", False)
+                    else None
+                ),
             )
 
         move(resumed_reqs, dst)
@@ -2692,8 +2698,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 stats.num_device_transfer_reqs = num_device_transfer_reqs
         else:
             num_device_transfer_reqs = stats.num_device_transfer_reqs
+        # Ownership lists are disjoint. Under PP, reserve for every microbatch,
+        # including bootstrap requests not yet merged into a running batch.
+        running_reqs = (
+            self.scheduler.running_reqs
+            if getattr(self.scheduler, "_pp_spec_decode", False)
+            else self.scheduler.running_batch.reqs
+        )
         return (
-            len(self.scheduler.running_batch.reqs)
+            len(running_reqs)
             + num_device_transfer_reqs
             + len(self.scheduler.waiting_queue)
             + extra_reserved_reqs
@@ -2792,7 +2805,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Note: if the last prebuilt extend just finishes, and we enter `move_preallocated` immediately in the next iteration
         #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
         if (
-            self.scheduler.last_batch
+            not getattr(self.scheduler, "_pp_spec_decode", False)
+            and self.scheduler.last_batch
             and self.scheduler.last_batch.forward_mode.is_prebuilt()
         ):
             allocatable_tokens -= self.num_reserved_decode_tokens * len(
@@ -2827,7 +2841,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         running = self.scheduler.running_batch.reqs
         prebuilt_n = (
             len(self.scheduler.last_batch.reqs)
-            if self.scheduler.last_batch
+            if not getattr(self.scheduler, "_pp_spec_decode", False)
+            and self.scheduler.last_batch
             and self.scheduler.last_batch.forward_mode.is_prebuilt()
             else 0
         )
@@ -4162,7 +4177,41 @@ class SchedulerDisaggregationDecodeMixin:
             batch.inner_idle_batch = None
             return self.run_batch(idle_batch)
 
+        if getattr(self, "_pp_spec_decode", False) and self.pp_group.is_last_rank:
+            # Prefill already emitted the first token. Only draft here; target
+            # verification and committed lengths advance in the next round.
+            with self._forward_isolation(batch, overlap=False):
+                batch.forward_mode = ForwardMode.DECODE
+                batch.input_ids = None
+                tokens, parents, top_scores = self.draft_worker.draft_pp_proposal(batch)
+            result = GenerationBatchResult(
+                next_verify_chain=tokens,
+                next_verify_parent_list=parents,
+                next_verify_top_scores_index=top_scores,
+            )
+            if self.enable_unified_memory:
+                # Bootstrap writes draft KV even though the target prefill is
+                # already complete. Page moves must wait for those writes too.
+                result.unified_forward_done = self._record_unified_forward(
+                    batch=batch,
+                    stream=self.device_module.current_stream(),
+                    written_tokens=None,
+                )
+            return result
+
         return GenerationBatchResult()
+
+    def _merge_disagg_decode_prebuilt_batch(
+        self: Scheduler,
+        running_batch: ScheduleBatch,
+        new_batch: ScheduleBatch,
+    ) -> ScheduleBatch:
+        if running_batch.is_empty():
+            if self.enable_hisparse:
+                new_batch.hisparse_coordinator = self.hisparse_coordinator
+            return new_batch
+        running_batch.merge_batch(new_batch)
+        return running_batch
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_decode_batch_to_run(
@@ -4178,12 +4227,26 @@ class SchedulerDisaggregationDecodeMixin:
             )
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
-                if running_batch.is_empty():
-                    running_batch = new_prebuilt_batch
-                    if self.enable_hisparse:
-                        running_batch.hisparse_coordinator = self.hisparse_coordinator
-                else:
-                    running_batch.merge_batch(new_prebuilt_batch)
+                if getattr(self, "_pp_spec_decode", False):
+                    from sglang.srt.speculative.eagle_utils import (
+                        eagle_prepare_for_decode,
+                    )
+                    from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+
+                    if not isinstance(new_prebuilt_batch.spec_info, PPSpecRelayInput):
+                        # Reserve the first speculative write window on every
+                        # stage, after any forward still reading req_to_token.
+                        self.schedule_stream.wait_stream(self.forward_stream)
+                        eagle_prepare_for_decode(new_prebuilt_batch, is_bootstrap=True)
+                        new_prebuilt_batch.extend_num_tokens = 0
+                        set_schedule_time_batch(new_prebuilt_batch)
+                        return NextBatchPlan(
+                            batch_to_run=new_prebuilt_batch,
+                            running_batch=running_batch,
+                        )
+                running_batch = self._merge_disagg_decode_prebuilt_batch(
+                    running_batch, new_prebuilt_batch
+                )
 
         # Schedule decode batch
         if running_batch.is_empty():
@@ -4224,7 +4287,10 @@ class SchedulerDisaggregationDecodeMixin:
             batch.req_pool_indices.record_stream(self.forward_stream)
             batch.seq_lens.record_stream(self.forward_stream)
         else:
-            batch.process_prebuilt(self.future_map)
+            if getattr(self, "_pp_spec_decode", False):
+                batch.process_prebuilt(self.future_map, pp_spec_decode=True)
+            else:
+                batch.process_prebuilt(self.future_map)
         return batch
 
     def _nonblocking_admit_in_scope(self: Scheduler, batch: ScheduleBatch) -> bool:
@@ -4369,8 +4435,18 @@ class SchedulerDisaggregationDecodeMixin:
 
         # pop req from waiting queue
         can_run_list: List[Req] = []
+        restored_batch = None
 
         for req in self.waiting_queue:
+            if getattr(self, "_pp_spec_decode", False):
+                backup = req.kv.retraction_backup
+                restored = backup is not None and backup.pp_spec_relay is not None
+                if restored_batch is None:
+                    restored_batch = restored
+                if restored != restored_batch:
+                    # Fresh requests need a first draft; restored requests
+                    # already carry a proposal, so their spec inputs cannot mix.
+                    continue
             # we can only add at least `num_not_used_batch` new batch to the running queue;
             # a request restored from host memory waits until its copy has finished
             if len(can_run_list) < num_not_used_batch and (

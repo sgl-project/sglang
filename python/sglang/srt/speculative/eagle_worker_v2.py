@@ -1583,24 +1583,30 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # per round (TODO: async or upper-bound estimate).
                 batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-                with (
-                    draft_tp_context(self.draft_worker.parallel_layout),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft"),
-                ):
-                    next_verify_input, parent_list, top_scores_index = (
-                        self.draft_worker.draft(batch, with_topology=True)
-                    )
-                batch_output.next_verify_chain = next_verify_input.draft_token
-                # The tree shape is data-dependent once topk > 1, so the other
-                # stages cannot re-derive it; relay it alongside the tokens.
-                # clone(): both come out of cuda-graph-owned buffers under
-                # decode replay and would be overwritten before the relay.
-                batch_output.next_verify_parent_list = parent_list.clone()
-                batch_output.next_verify_top_scores_index = top_scores_index.clone()
+                (
+                    batch_output.next_verify_chain,
+                    batch_output.next_verify_parent_list,
+                    batch_output.next_verify_top_scores_index,
+                ) = self.draft_pp_proposal(batch)
 
             return batch_output
+
+    def draft_pp_proposal(
+        self, batch: ScheduleBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build a PP proposal from prepared draft state, including PD bootstrap."""
+        with (
+            draft_tp_context(self.draft_worker.parallel_layout),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft"),
+        ):
+            verify_input, parent_list, top_scores_index = self.draft_worker.draft(
+                batch, with_topology=True
+            )
+        # Topology can alias graph-owned buffers; preserve it until the PP relay
+        # completes. The tree builder already allocates independent token storage.
+        return verify_input.draft_token, parent_list.clone(), top_scores_index.clone()
 
     def _forward_prefill_batch(
         self, batch, on_publish=None, pp_proxy_tensors=None, coordination_plan=None

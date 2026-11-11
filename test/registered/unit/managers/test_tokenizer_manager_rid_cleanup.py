@@ -30,12 +30,14 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
     EmbeddingReqInput,
     GenerateReqInput,
+    PauseGenerationReqInput,
     RequestOutputStats,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
@@ -2006,6 +2008,56 @@ class TestChatStreamDisconnect(CustomTestCase):
             self.assertFalse(live.abort_sent)
 
         asyncio.run(drive())
+
+
+class TestPPSpecPauseGuard(unittest.IsolatedAsyncioTestCase, CustomTestCase):
+    @staticmethod
+    def _manager(**overrides):
+        cfg = {
+            "pp_size": 2,
+            "disaggregation_mode": "decode",
+            "speculative_algorithm": "EAGLE",
+            **overrides,
+        }
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.config_value = cfg.__getitem__
+        manager.is_pause = False
+        manager.is_pause_cond = asyncio.Condition()
+        manager.tokenizer_ipc_name = None
+        manager._async_dispatch_to_scheduler = AsyncMock()
+        manager._pause_continue_through_router = AsyncMock()
+        return manager
+
+    async def test_retract_rejected_before_pause_or_ipc(self):
+        with envs.SGLANG_ENABLE_PP_SPEC.override(True):
+            for ipc_name in (None, "router"):
+                with self.subTest(ipc_name=ipc_name):
+                    manager = self._manager()
+                    manager.tokenizer_ipc_name = ipc_name
+                    with self.assertRaisesRegex(ValueError, "pause/retract"):
+                        await manager.pause_generation(
+                            PauseGenerationReqInput(mode="retract")
+                        )
+                    self.assertFalse(manager.is_pause)
+                    manager._async_dispatch_to_scheduler.assert_not_called()
+                    manager._pause_continue_through_router.assert_not_called()
+
+    async def test_other_modes_keep_pause_behavior(self):
+        for gate, mode, overrides in (
+            (True, "in_place", {}),
+            (False, "retract", {}),
+            (True, "retract", {"pp_size": 1}),
+            (True, "retract", {"speculative_algorithm": None}),
+            (True, "retract", {"disaggregation_mode": "null"}),
+            (True, "retract", {"disaggregation_mode": "prefill"}),
+        ):
+            with self.subTest(gate=gate, mode=mode, **overrides):
+                manager = self._manager(**overrides)
+                request = PauseGenerationReqInput(mode=mode)
+                with envs.SGLANG_ENABLE_PP_SPEC.override(gate):
+                    await manager.pause_generation(request)
+                self.assertTrue(manager.is_pause)
+                manager._async_dispatch_to_scheduler.assert_awaited_once_with(request)
 
 
 if __name__ == "__main__":

@@ -2469,6 +2469,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
+        if (
+            obj.mode == "retract"
+            and envs.SGLANG_ENABLE_PP_SPEC.get()
+            and self.config_value("pp_size") > 1
+            and self.config_value("disaggregation_mode") == "decode"
+            and self.config_value("speculative_algorithm") is not None
+        ):
+            # Reject before changing pause state or forwarding to the router.
+            raise ValueError(
+                "PD decode PP speculative decoding does not support pause/retract"
+            )
         if self.tokenizer_ipc_name is not None:
             # Send to router which will broadcast to all workers
             # (router also handles forwarding to scheduler for non-abort modes)
