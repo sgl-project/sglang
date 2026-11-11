@@ -54,6 +54,22 @@ def state_entry_layout(parts) -> TensorEntryLayout:
     return TensorEntryLayout(parts, row_alignments=alignments)
 
 
+def _as_widest_words(rows: torch.Tensor) -> torch.Tensor:
+    """Byte rows ``(n, row_bytes)`` as the widest integer words that their row
+    size, row stride and address allow, so a fill stores words, not bytes."""
+    for dtype in (torch.int64, torch.int32):
+        width = dtype.itemsize
+        if (
+            rows.stride(1) == 1
+            and rows.shape[1] % width == 0
+            and rows.stride(0) % width == 0
+            and rows.storage_offset() % width == 0
+            and rows.data_ptr() % width == 0
+        ):
+            return rows.view(dtype)
+    return rows
+
+
 @dataclass(frozen=True, kw_only=True)
 class MambaSubPoolSpec(SubPoolSpec):
     """Per-slot layout of one Mamba-shaped sub-pool.
@@ -230,6 +246,7 @@ class StateView:
         self._arena = arena
         self._sub_pool_name = spec.name
         self._entry_bytes = spec.entry_bytes()
+        self._entry_words = _as_widest_words(arena.entries(spec.name))
         # PD state transfer maps entries by global layer id.
         self.mamba_layer_ids = list(mamba_layer_ids)
         self.num_mamba_layers = spec.layer_num
@@ -333,9 +350,7 @@ class StateView:
     def clear_slots(self, indices: torch.Tensor) -> None:
         # index_fill_, not `view[indices] = 0`: assigning a Python scalar
         # through an index tensor synchronizes the host.
-        self._arena.entries(self._sub_pool_name).index_fill_(
-            0, indices.to(torch.int64), 0
-        )
+        self._entry_words.index_fill_(0, indices.to(torch.int64), 0)
         for part in self.extra_parts:
             if part.reset_value != 0:
                 self.extra_views[part.name].index_fill_(
