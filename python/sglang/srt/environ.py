@@ -1095,6 +1095,9 @@ class Envs:
     # 128 KiB default; the JIT kernel reads it from the environment once, at first use
     # (sgl-project/sglang#40910).
     SGLANG_HICACHE_BATCH_COPY_THRESHOLD = EnvInt(None)
+    # With SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION: CTA quota of the HiCache per-layer
+    # KV load (layer_first / page_first JIT kernel); None keeps the stock quota.
+    SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(None)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
