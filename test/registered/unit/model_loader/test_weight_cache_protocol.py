@@ -22,10 +22,21 @@ import socket
 import struct
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.platforms.cpu import CpuSRTPlatform
+from sglang.srt.platforms.cuda import CudaSRTPlatform
+from sglang.srt.platforms.mlu import MluSRTPlatform
+from sglang.srt.platforms.mps import MpsSRTPlatform
+from sglang.srt.platforms.musa import MusaSRTPlatform
+from sglang.srt.platforms.npu import NPUSRTPlatform
+from sglang.srt.platforms.rocm import RocmSRTPlatform
+from sglang.srt.platforms.sail import SailSRTPlatform
+from sglang.srt.platforms.xpu import XpuSRTPlatform
+from sglang.srt.weight_cache import transport as transport_mod
 from sglang.srt.weight_cache.protocol import (
     CacheConfig,
     UnsupportedQuantForIPCError,
@@ -43,13 +54,30 @@ from sglang.srt.weight_cache.protocol import (
 )
 from sglang.srt.weight_cache.transport import (
     TORCH_IPC_BACKEND,
+    TRANSPORT_BACKENDS,
+    VMM_FD_BACKEND,
     TorchIpcTransportBackend,
+    choose_daemon_transport_backend,
     get_client_transport_backend,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+
+# Every in-tree platform, so a new one cannot declare a transport name that no
+# backend implements without a test noticing.
+_ALL_SRT_PLATFORMS = (
+    CpuSRTPlatform,
+    CudaSRTPlatform,
+    MluSRTPlatform,
+    MpsSRTPlatform,
+    MusaSRTPlatform,
+    NPUSRTPlatform,
+    RocmSRTPlatform,
+    SailSRTPlatform,
+    XpuSRTPlatform,
+)
 
 
 def _make_cache_config(**overrides) -> CacheConfig:
@@ -160,6 +188,68 @@ class TestTransportBackend(CustomTestCase):
         finally:
             a.close()
             b.close()
+
+
+class TestTransportSelection(CustomTestCase):
+    """The daemon picks a transport from what the platform declares.
+
+    Selection reads ``capabilities.weight_cache_transports`` instead of asking
+    which platform family this is, so a device becomes serveable by declaring a
+    transport rather than by being added to a condition in the daemon.
+    """
+
+    @staticmethod
+    def _platform(transports):
+        return SimpleNamespace(
+            device_type="fake",
+            capabilities=SimpleNamespace(weight_cache_transports=transports),
+        )
+
+    def _choose(self, transports, state_tensors=None):
+        with patch.object(
+            transport_mod, "current_platform", self._platform(transports)
+        ):
+            return choose_daemon_transport_backend(state_tensors or {})
+
+    def test_every_declared_transport_is_registered(self):
+        # A capability string is a plain literal in each platform file, so a
+        # typo or a renamed backend would otherwise surface only when a daemon
+        # starts on that hardware.
+        for platform_cls in _ALL_SRT_PLATFORMS:
+            for name in platform_cls.capabilities.weight_cache_transports:
+                self.assertIn(
+                    name,
+                    TRANSPORT_BACKENDS,
+                    f"{platform_cls.__name__} declares unregistered transport {name!r}",
+                )
+
+    def test_first_declared_transport_that_can_export_wins(self):
+        backend = self._choose((VMM_FD_BACKEND, TORCH_IPC_BACKEND))
+        # vmm_fd is declared first but reports it cannot export, so selection
+        # must fall through rather than instantiate it (its __init__ raises).
+        self.assertEqual(backend.name, TORCH_IPC_BACKEND)
+
+    def test_declared_order_is_honored(self):
+        backend = self._choose((TORCH_IPC_BACKEND, VMM_FD_BACKEND))
+        self.assertEqual(backend.name, TORCH_IPC_BACKEND)
+
+    def test_platform_declaring_no_transport_is_refused(self):
+        # The Phase 1 contract for a device with no transport yet (XPU): the
+        # capability is reported honestly and the daemon refuses, instead of
+        # falling through to a backend that cannot export its memory.
+        with self.assertRaises(RuntimeError) as ctx:
+            self._choose(())
+        self.assertIn("declares no weight cache transport", str(ctx.exception))
+
+    def test_no_declared_transport_can_export_raises(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._choose((VMM_FD_BACKEND,))
+        self.assertIn("can export", str(ctx.exception))
+
+    def test_unregistered_declared_transport_raises(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._choose(("made_up_backend",))
+        self.assertIn("made_up_backend", str(ctx.exception))
 
 
 class TestCacheConfig(CustomTestCase):

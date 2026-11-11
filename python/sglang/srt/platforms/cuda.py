@@ -27,6 +27,9 @@ class CudaDeviceMixin(DeviceMixin):
     def get_device_total_memory(self, device_id: int = 0) -> int:
         return int(torch.cuda.get_device_properties(device_id).total_memory)
 
+    def memory_reserved(self, device_id: int = 0) -> int:
+        return int(torch.cuda.memory_reserved(device_id))
+
     def get_current_memory_usage(
         self, device: Optional["torch.device"] = None
     ) -> float:
@@ -99,6 +102,28 @@ class CudaDeviceMixin(DeviceMixin):
             super().seed_everything(seed)
             torch.cuda.manual_seed_all(seed)
 
+    def validate_weight_cache_allocator(self) -> None:
+        # The expandable-segments allocator hands out memory that cannot be
+        # shared through torch's _share_cuda_ handle, so the export would fail
+        # partway with an opaque CUDA error.
+        for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+            conf = os.environ.get(var, "")
+            for field in conf.split(","):
+                key, _, value = field.partition(":")
+                if (
+                    key.strip() == "expandable_segments"
+                    and value.strip().lower() == "true"
+                ):
+                    raise RuntimeError(
+                        f"[WeightCacheDaemon] {var} sets expandable_segments:True, "
+                        f"which is incompatible with CUDA IPC weight sharing: the "
+                        f"expandable-segments allocator hands out memory that cannot "
+                        f"be exported via _share_cuda_, so the IPC handle export "
+                        f"would fail mid-way. Unset expandable_segments for the "
+                        f"weight cache daemon process (it can stay enabled for the "
+                        f"engine itself)."
+                    )
+
 
 class CudaSRTPlatform(CudaDeviceMixin, SRTPlatform):
     """Default in-tree CUDA SRT platform."""
@@ -109,4 +134,5 @@ class CudaSRTPlatform(CudaDeviceMixin, SRTPlatform):
         piecewise_graph=True,
         hicache_device_kernels=True,
         supports_pynccl=True,
+        weight_cache_transports=("vmm_fd", "torch_ipc"),
     )

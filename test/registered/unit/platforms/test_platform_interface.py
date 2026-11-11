@@ -12,6 +12,7 @@ import torch
 from sglang import _platform_stubs
 from sglang.kernels.jit.utils.arch import _sail_arch_suffix
 from sglang.srt.platforms import _load_platform_class, _resolve_platform, interface
+from sglang.srt.platforms import npu as npu_mod
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.device_mixin import (
@@ -23,6 +24,7 @@ from sglang.srt.platforms.device_mixin import (
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.mlu import MluSRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
+from sglang.srt.platforms.musa import MusaSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.sail import SailSRTPlatform
@@ -30,12 +32,22 @@ from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=16, suite="base-a-test-cpu")
 
 
 # ---------------------------------------------------------------------------
 # Helpers: factory functions to reduce boilerplate
 # ---------------------------------------------------------------------------
+
+
+def _named_fn(name):
+    """A function whose __name__ is what a reducer probe reads."""
+
+    def fn():
+        pass
+
+    fn.__name__ = name
+    return fn
 
 
 def _make_device_mixin(enum, name, dtype):
@@ -1054,6 +1066,184 @@ class TestCurrentPlatformLazyInit(CustomTestCase):
 
         with self.assertRaises(AttributeError):
             _ = plat_mod.nonexistent_attribute
+
+
+_IPC_CAPABLE_PLATFORMS = (
+    CudaSRTPlatform,
+    RocmSRTPlatform,
+    MusaSRTPlatform,
+    SailSRTPlatform,
+    NPUSRTPlatform,
+)
+_NO_TRANSPORT_PLATFORMS = (
+    XpuSRTPlatform,
+    CpuSRTPlatform,
+    MluSRTPlatform,
+    MpsSRTPlatform,
+)
+
+
+class TestWeightCacheMemoryAccounting(CustomTestCase):
+    """Reserved-memory accounting is per-platform, and never silently zero.
+
+    The weight cache daemon differences this value across the model load to
+    report ``preloaded_weights_bytes`` to the scheduler, which adds it back
+    onto the KV-cache sizing baseline. A value of 0 means "nothing was
+    preloaded" and is skipped, so a platform that answers 0 instead of
+    answering at all under-reports resident weights and oversizes the KV pool.
+    """
+
+    def test_base_platform_refuses_to_guess(self):
+        with self.assertRaises(NotImplementedError):
+            DeviceMixin().memory_reserved(0)
+        with self.assertRaises(NotImplementedError):
+            SRTPlatform().memory_reserved(0)
+
+    def test_declaring_a_transport_requires_implementing_memory_reserved(self):
+        for platform_cls in _IPC_CAPABLE_PLATFORMS:
+            self.assertNotEqual(
+                platform_cls.memory_reserved,
+                DeviceMixin.memory_reserved,
+                f"{platform_cls.__name__} declares a weight cache transport but "
+                f"inherits the unimplemented memory_reserved",
+            )
+
+    def test_cuda_alike_reads_the_cuda_allocator(self):
+        # ROCm / MUSA / SAIL reach this through CudaDeviceMixin rather than by
+        # subclassing CudaSRTPlatform, so the MRO is what makes them work.
+        for platform_cls in (
+            CudaSRTPlatform,
+            RocmSRTPlatform,
+            MusaSRTPlatform,
+            SailSRTPlatform,
+        ):
+            with patch("torch.cuda.memory_reserved", return_value=4096) as mock_cuda:
+                self.assertEqual(platform_cls().memory_reserved(3), 4096)
+            mock_cuda.assert_called_once_with(3)
+
+    def test_xpu_reads_the_xpu_allocator_and_not_cuda(self):
+        with (
+            patch("torch.xpu.memory_reserved", return_value=2048) as mock_xpu,
+            patch("torch.cuda.memory_reserved", return_value=99) as mock_cuda,
+        ):
+            self.assertEqual(XpuSRTPlatform().memory_reserved(1), 2048)
+        mock_xpu.assert_called_once_with(1)
+        mock_cuda.assert_not_called()
+
+    def test_npu_reads_the_npu_allocator_and_not_cuda(self):
+        mock_npu = MagicMock()
+        mock_npu.memory_reserved.return_value = 8192
+        with (
+            patch.object(torch, "npu", mock_npu, create=True),
+            patch("torch.cuda.memory_reserved", return_value=99) as mock_cuda,
+        ):
+            self.assertEqual(NPUSRTPlatform().memory_reserved(2), 8192)
+        mock_npu.memory_reserved.assert_called_once_with(2)
+        mock_cuda.assert_not_called()
+
+
+class TestWeightCachePlatformHooks(CustomTestCase):
+    """Which devices the weight cache daemon will serve, and how they validate.
+
+    The daemon reads ``capabilities.weight_cache_transports`` instead of
+    testing the platform family, so this set is the one place that decides
+    where it runs.
+    """
+
+    def test_ipc_capable_platforms_declare_a_transport(self):
+        for platform_cls in _IPC_CAPABLE_PLATFORMS:
+            self.assertTrue(
+                platform_cls.capabilities.weight_cache_transports,
+                f"{platform_cls.__name__} lost its weight cache transport "
+                f"declaration; each platform builds its own "
+                f"PlatformCapabilities, so the field does not inherit",
+            )
+
+    def test_platforms_without_a_transport_declare_none(self):
+        # XPU reports the capability honestly: no transport exists for it yet,
+        # so the daemon refuses rather than selecting one that cannot export
+        # its memory.
+        for platform_cls in _NO_TRANSPORT_PLATFORMS:
+            self.assertEqual(platform_cls.capabilities.weight_cache_transports, ())
+
+    def test_cuda_alike_platforms_reject_expandable_segments(self):
+        for platform_cls in (
+            CudaSRTPlatform,
+            RocmSRTPlatform,
+            MusaSRTPlatform,
+            SailSRTPlatform,
+        ):
+            for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+                with patch.dict(
+                    "os.environ",
+                    {var: "max_split_size_mb:128,expandable_segments:True"},
+                    clear=True,
+                ):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        platform_cls().validate_weight_cache_allocator()
+                    self.assertIn("expandable_segments", str(ctx.exception))
+
+    def test_cuda_accepts_allocator_configs_that_can_be_exported(self):
+        for conf in (
+            {},
+            {"PYTORCH_CUDA_ALLOC_CONF": ""},
+            {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False"},
+            {"PYTORCH_ALLOC_CONF": "max_split_size_mb:128"},
+        ):
+            with patch.dict("os.environ", conf, clear=True):
+                CudaSRTPlatform().validate_weight_cache_allocator()
+
+    def test_platform_without_a_transport_validates_nothing(self):
+        # The base hook must stay a no-op: a platform that declares no
+        # transport never reaches the export, and inventing an allocator
+        # restriction for it would reject a configuration nothing exports.
+        with patch.dict(
+            "os.environ", {"PYTORCH_ALLOC_CONF": "expandable_segments:True"}, clear=True
+        ):
+            for platform_cls in _NO_TRANSPORT_PLATFORMS:
+                platform_cls().validate_weight_cache_allocator()
+
+    def test_export_hook_is_a_noop_without_a_platform_override(self):
+        tensors = {"w": (torch.zeros(2), True)}
+        for platform_cls in (CudaSRTPlatform, XpuSRTPlatform, CpuSRTPlatform):
+            self.assertIsNone(platform_cls().prepare_weight_cache_export(tensors))
+
+    def test_npu_export_hook_warns_when_zero_copy_is_unavailable(self):
+        # torch_npu registers a reducer whose rebuild function is
+        # rebuild_npu_tensor; anything else means the tensor would be copied
+        # through the CPU instead of shared, which is degraded but not fatal.
+        tensors = {"w": (torch.zeros(2), True)}
+        with (
+            patch.dict("sys.modules", {"torch_npu": MagicMock()}),
+            patch(
+                "torch.multiprocessing.reductions.reduce_tensor",
+                return_value=(_named_fn("rebuild_cpu_tensor"), ()),
+            ),
+            self.assertLogs("sglang.srt.platforms.npu", level="WARNING") as logs,
+        ):
+            NPUSRTPlatform().prepare_weight_cache_export(tensors)
+        self.assertIn("zero-copy IPC is unavailable", "\n".join(logs.output))
+
+    def test_npu_export_hook_is_quiet_when_zero_copy_works(self):
+        tensors = {"w": (torch.zeros(2), True)}
+        with (
+            patch.dict("sys.modules", {"torch_npu": MagicMock()}),
+            patch(
+                "torch.multiprocessing.reductions.reduce_tensor",
+                return_value=(_named_fn("rebuild_npu_tensor"), ()),
+            ),
+        ):
+            with patch.object(npu_mod.logger, "warning") as mock_warning:
+                NPUSRTPlatform().prepare_weight_cache_export(tensors)
+        mock_warning.assert_not_called()
+
+    def test_npu_export_hook_tolerates_an_empty_state_dict(self):
+        with (
+            patch.dict("sys.modules", {"torch_npu": MagicMock()}),
+            patch("torch.multiprocessing.reductions.reduce_tensor") as mock_reduce,
+        ):
+            NPUSRTPlatform().prepare_weight_cache_export({})
+        mock_reduce.assert_not_called()
 
 
 if __name__ == "__main__":

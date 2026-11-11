@@ -1,6 +1,7 @@
 """NPU device operations for the SRT platform layer."""
 
-from typing import Optional
+import logging
+from typing import Mapping, Optional
 
 import torch
 
@@ -10,6 +11,8 @@ from sglang.srt.platforms.device_mixin import (
     PlatformEnum,
 )
 from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
+
+logger = logging.getLogger(__name__)
 
 
 class NPUDeviceMixin(DeviceMixin):
@@ -21,6 +24,9 @@ class NPUDeviceMixin(DeviceMixin):
 
     def get_device_total_memory(self, device_id: int = 0) -> int:
         return int(torch.npu.get_device_properties(device_id).total_memory)
+
+    def memory_reserved(self, device_id: int = 0) -> int:
+        return int(torch.npu.memory_reserved(device_id))
 
     def get_current_memory_usage(
         self, device: Optional["torch.device"] = None
@@ -74,7 +80,33 @@ class NPUSRTPlatform(NPUDeviceMixin, SRTPlatform):
     capabilities = PlatformCapabilities(
         supports_triton=True,
         graph_capture=True,
+        weight_cache_transports=("torch_ipc",),
     )
+
+    def prepare_weight_cache_export(
+        self, state_tensors: Mapping[str, tuple["torch.Tensor", bool]]
+    ) -> None:
+        # torch_npu must be imported before the first ForkingPickler dump of an
+        # NPU tensor so its reducer is registered; otherwise the tensor falls
+        # back to a CPU copy instead of zero-copy IPC. Probe once and warn
+        # (rather than error) if zero-copy is unavailable, so weight caching
+        # still works by copying the weights through the CPU.
+        import torch.multiprocessing.reductions as _reductions
+        import torch_npu  # noqa: F401
+
+        first = next(iter(state_tensors.values()), None)
+        if first is None:
+            return
+        rebuild_fn, _ = _reductions.reduce_tensor(first[0].data)
+        if rebuild_fn.__name__ != "rebuild_npu_tensor":
+            logger.warning(
+                "NPU weight-cache zero-copy IPC is unavailable: tensor "
+                "reduced to %r instead of torch_npu's rebuild_npu_tensor; "
+                "falling back to a CPU copy. Zero-copy requires Ascend HDK "
+                ">= 25.3.RC1 and CANN >= 8.3.RC1, and is unsupported on "
+                "Ascend 950DT.",
+                rebuild_fn,
+            )
 
     def get_default_attention_backend(self) -> str:
         return "ascend"

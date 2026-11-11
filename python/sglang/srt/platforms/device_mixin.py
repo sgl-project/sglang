@@ -166,6 +166,15 @@ class DeviceMixin:
         """[Active] Get total device memory in bytes."""
         raise NotImplementedError
 
+    def memory_reserved(self, device_id: int = 0) -> int:
+        """[Active] Bytes the caching allocator holds for this device.
+
+        Not defaulted to 0: a caller differencing this across a load reads 0
+        as "nothing was allocated" and would silently under-report. A platform
+        with no caching allocator raises, like the rest of this block.
+        """
+        raise NotImplementedError
+
     def get_current_memory_usage(
         self, device: Optional["torch.device"] = None
     ) -> float:
