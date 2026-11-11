@@ -5,7 +5,8 @@ One bucket is captured once, then replayed for batches of different shapes:
 several sequences, cached prefixes, padding past the batch, chunk-aligned and
 unaligned prefix-cache snapshots, and a batch without tracking. Each replay must
 match the eager path bit for bit on the output, the conv / SSM state pools and
-the track slots, for FP32 and BF16 SSM states.
+the track slots, for FP32 and BF16 SSM states. Building the eager metadata of a
+tracked batch must not sync the host.
 """
 
 import unittest
@@ -26,6 +27,7 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -278,6 +280,29 @@ class TestGDNPrefillGraph(CustomTestCase):
                         track=track,
                         seed=100 + i,
                     )
+
+    def test_eager_metadata_with_tracking_does_not_sync(self):
+        """Prefill metadata is built while the previous forward still runs; a host
+        sync there holds the scheduler until that forward ends."""
+        self._setup(torch.float32)
+        override = get_context().override_server_args(_mamba_cache_chunk_size=CHUNK)
+        override.install()
+        self.addCleanup(override.restore)
+        extend_kernel = self.backend.kernel_dispatcher.extend_kernel
+        # Row 0 snapshots mid-chunk, row 1 on a chunk boundary, row 2 untracked.
+        lens, prefixes, track = [200, 70, 33], [0, 64, 0], {0: 130, 1: 64}
+        for uses_checkpoints in (False, True):
+            with self.subTest(uses_checkpoints=uses_checkpoints):
+                batch = _batch(lens, prefixes, track=track)
+                torch.cuda.synchronize()
+                with patch.object(
+                    extend_kernel, "uses_state_checkpoints", uses_checkpoints
+                ):
+                    torch.cuda.set_sync_debug_mode("error")
+                    try:
+                        self.backend.init_forward_metadata(batch)
+                    finally:
+                        torch.cuda.set_sync_debug_mode("default")
 
 
 if __name__ == "__main__":
