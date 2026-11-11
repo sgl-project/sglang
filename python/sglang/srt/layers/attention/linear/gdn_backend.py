@@ -1636,7 +1636,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_cache_indices: torch.Tensor,
         inplace_update: bool,
         out: Optional[torch.Tensor] = None,
-        output_indices: Optional[torch.Tensor] = None,
+        output_indices: torch.Tensor,
     ) -> torch.Tensor:
         mixed_qkv = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
@@ -1676,9 +1676,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query = query.view(1, num_tokens, layer.num_q_heads, layer.head_q_dim)
             key = key.view(1, num_tokens, layer.num_k_heads, layer.head_k_dim)
             value = value.view(1, num_tokens, layer.num_v_heads, layer.head_v_dim)
-            if output_indices is not None:
-                a = a[output_indices]
-                b = b[output_indices]
+            a = a[output_indices]
+            b = b[output_indices]
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
         output, _, _ = self.kernel_dispatcher.extend(

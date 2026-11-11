@@ -673,7 +673,6 @@ def fused_qkv_split_gdn_prefill_kernel(
     BLOCK_HEAD_K: tl.constexpr,
     BLOCK_V: tl.constexpr,
     FUSE_GATING: tl.constexpr,
-    HAS_TOKEN_INDICES: tl.constexpr,
     BLOCK_GATE_HEADS: tl.constexpr,
 ):
     i_t = tl.program_id(0)
@@ -753,7 +752,7 @@ def fused_qkv_split_gdn_prefill_kernel(
         tl.store(v + i_t * v_dim + v_offsets, values, mask=v_mask)
 
     if FUSE_GATING:
-        source_token = tl.load(token_indices + i_t) if HAS_TOKEN_INDICES else i_t
+        source_token = tl.load(token_indices + i_t)
         gate_heads = tl.arange(0, BLOCK_GATE_HEADS)
         gate_mask = gate_heads < NUM_V_HEADS
         gate_a = tl.load(
@@ -829,13 +828,13 @@ def fused_qkv_gating_gdn_prefill(
     a: torch.Tensor,
     b: torch.Tensor,
     dt_bias: torch.Tensor,
-    token_indices: torch.Tensor | None = None,
+    token_indices: torch.Tensor,
 ):
     """Split/normalize post-conv QKV and compute mapped gates in one Triton launch.
 
     QKV has compact [T, Q + K + V] rows; gates have [source_T, Hv] rows.
-    Optional device int32/int64 indices map each compact row to an in-range
-    source gate row. CUDA/HIP callers retain the split's <=8192 channel gate.
+    Device int32/int64 indices map each compact row to an in-range source
+    gate row. CUDA/HIP callers retain the split's <=8192 channel gate.
     Strided inputs are supported. Outputs are contiguous Q/K/V plus FP32 g/beta,
     with sigmoid rounded through b's dtype as in standalone gating.
     """
@@ -857,10 +856,7 @@ def fused_qkv_gating_gdn_prefill(
             torch.float32,
         ):
             raise ValueError("GDN preparation requires same-device floating inputs")
-    if token_indices is None:
-        if a.shape[0] != mixed_qkv.shape[0]:
-            raise ValueError("GDN preparation requires one gate row per QKV token")
-    elif (
+    if (
         token_indices.shape != (mixed_qkv.shape[0],)
         or token_indices.device != mixed_qkv.device
         or token_indices.dtype not in (torch.int32, torch.int64)
@@ -955,7 +951,6 @@ def _prepare_gdn_prefill(
         BLOCK_HEAD_K=triton.next_power_of_2(head_k),
         BLOCK_V=triton.next_power_of_2(num_v_heads * head_v),
         FUSE_GATING=gating is not None,
-        HAS_TOKEN_INDICES=token_indices is not None,
         BLOCK_GATE_HEADS=triton.next_power_of_2(num_v_heads),
         num_warps=8,
         num_stages=3,

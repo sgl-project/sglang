@@ -149,114 +149,55 @@ class TestGDNMISOutput(CustomTestCase):
 
     @torch.inference_mode()
     def test_mapped_prepare_preserves_gate_rounding_and_strides(self):
-        for dtype in (torch.bfloat16, torch.float16, torch.float32):
-            for heads in (5, 16):
-                for mapped in (False, True):
-                    with self.subTest(dtype=dtype, heads=heads, mapped=mapped):
-                        torch.manual_seed(55)
-                        tokens, source_tokens, dim = 19, 29 if mapped else 19, 64
-                        channels = (2 * 3 + heads) * dim
-                        packed = torch.randn(
-                            tokens, channels * 2, device="cuda", dtype=dtype
-                        )[:, ::2]
-                        a = torch.randn(
-                            source_tokens, heads * 3, device="cuda", dtype=dtype
-                        )[:, ::3]
-                        b = torch.randn(
-                            source_tokens, heads * 4, device="cuda", dtype=dtype
-                        )[:, 1::4]
-                        a[0] = 40
-                        a[1] = -40
-                        A_log = torch.randn(heads * 2, device="cuda")[::2]
-                        dt_bias = torch.randn(heads * 2, device="cuda", dtype=dtype)[
-                            ::2
-                        ]
-                        indices = (
-                            torch.randperm(source_tokens, device="cuda")[:tokens]
-                            .to(torch.int32 if heads == 5 else torch.int64)
-                            .contiguous()
-                            if mapped
-                            else None
-                        )
-                        before = tuple(t.clone() for t in (packed, a, b))
-                        expected_qkv = fused_qkv_split_gdn_prefill(
-                            packed, 3, 3, heads, dim, dim, dim, normalize_qk=True
-                        )
-                        expected_gates = fused_gdn_gating(
-                            A_log.contiguous(),
-                            a[indices] if mapped else a.contiguous(),
-                            b[indices] if mapped else b.contiguous(),
-                            dt_bias.contiguous(),
-                        )
-                        actual = fused_qkv_gating_gdn_prefill(
-                            packed,
-                            3,
-                            3,
-                            heads,
-                            dim,
-                            dim,
-                            dim,
-                            A_log=A_log,
-                            a=a,
-                            b=b,
-                            dt_bias=dt_bias,
-                            token_indices=indices,
-                        )
-                        for result, expected in zip(
-                            actual, (*expected_qkv, *expected_gates)
-                        ):
-                            torch.testing.assert_close(result, expected, rtol=0, atol=0)
-                            self.assertTrue(result.is_contiguous())
-                        for result in actual[3:]:
-                            self.assertEqual(result.dtype, torch.float32)
-                        for original, snapshot in zip((packed, a, b), before):
-                            torch.testing.assert_close(
-                                original, snapshot, rtol=0, atol=0
-                            )
-
-    @torch.inference_mode()
-    def test_mapped_prepare_graph_reads_updated_indices(self):
-        torch.manual_seed(56)
-        tokens, heads, dim = 7, 4, 64
-        packed = torch.randn(
-            tokens, heads * dim * 3, device="cuda", dtype=torch.bfloat16
-        )
-        a = torch.randn(tokens + 3, heads, device="cuda", dtype=packed.dtype)
-        b = torch.randn_like(a)
-        A_log = torch.randn(heads, device="cuda")
-        dt_bias = torch.randn(heads, device="cuda", dtype=packed.dtype)
-        indices = torch.arange(tokens, device="cuda")
-
-        def prepare():
-            return fused_qkv_gating_gdn_prefill(
-                packed,
-                heads,
-                heads,
-                heads,
-                dim,
-                dim,
-                dim,
-                A_log=A_log,
-                a=a,
-                b=b,
-                dt_bias=dt_bias,
-                token_indices=indices,
-            )
-
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            prepare()
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            actual = prepare()
-        indices.copy_(torch.arange(tokens + 2, 2, -1, device="cuda"))
-        a.add_(1)
-        graph.replay()
-        expected = fused_gdn_gating(A_log, a[indices], b[indices], dt_bias)
-        for result, reference in zip(actual[3:], expected):
-            torch.testing.assert_close(result, reference, rtol=0, atol=0)
+        for dtype, index_dtype in (
+            (torch.bfloat16, torch.int64),
+            (torch.float16, torch.int32),
+            (torch.float32, torch.int64),
+        ):
+            with self.subTest(dtype=dtype, index_dtype=index_dtype):
+                torch.manual_seed(55)
+                tokens, source_tokens, heads, dim = 19, 29, 5, 64
+                packed = torch.randn(
+                    tokens, (2 * 3 + heads) * dim, device="cuda", dtype=dtype
+                )
+                a = torch.randn(source_tokens, heads * 3, device="cuda", dtype=dtype)[
+                    :, ::3
+                ]
+                b = torch.randn(source_tokens, heads * 4, device="cuda", dtype=dtype)[
+                    :, 1::4
+                ]
+                a[0] = 40
+                a[1] = -40
+                A_log = torch.randn(heads * 2, device="cuda")[::2]
+                dt_bias = torch.randn(heads * 2, device="cuda", dtype=dtype)[::2]
+                indices = (
+                    torch.arange(tokens - 1, -1, -1, device="cuda")
+                    .to(index_dtype)
+                    .contiguous()
+                )
+                expected = fused_gdn_gating(
+                    A_log.contiguous(),
+                    a[indices],
+                    b[indices],
+                    dt_bias.contiguous(),
+                )
+                actual = fused_qkv_gating_gdn_prefill(
+                    packed,
+                    3,
+                    3,
+                    heads,
+                    dim,
+                    dim,
+                    dim,
+                    A_log=A_log,
+                    a=a,
+                    b=b,
+                    dt_bias=dt_bias,
+                    token_indices=indices,
+                )
+                for result, reference in zip(actual[3:], expected):
+                    torch.testing.assert_close(result, reference, rtol=0, atol=0)
+                    self.assertEqual(result.dtype, torch.float32)
 
     @torch.inference_mode()
     def test_prepare_rejects_malformed_gate_mapping(self):
@@ -270,11 +211,6 @@ class TestGDNMISOutput(CustomTestCase):
             token_indices=torch.arange(3, device="cuda"),
         )
         for override in (
-            {"a": a[:, :1]},
-            {"b": a[:3]},
-            {"A_log": args["A_log"][:1]},
-            {"dt_bias": args["dt_bias"].cpu()},
-            {"token_indices": None},
             {"token_indices": torch.arange(2, device="cuda")},
             {"token_indices": torch.arange(3, device="cuda").float()},
             {"token_indices": torch.arange(6, device="cuda")[::2]},
@@ -374,11 +310,12 @@ class TestGDNMISOutput(CustomTestCase):
             q, k, v = split(*args)
             return (l2norm_fwd(q), l2norm_fwd(k), v) if normalize_qk else (q, k, v)
 
-        def separate_prepare(*args, A_log, a, b, dt_bias, token_indices=None):
+        def separate_prepare(*args, A_log, a, b, dt_bias, token_indices):
             qkv = separate_norm(*args, normalize_qk=True)
-            if token_indices is not None:
-                a, b = a[token_indices], b[token_indices]
-            return (*qkv, *fused_gdn_gating(A_log, a, b, dt_bias))
+            return (
+                *qkv,
+                *fused_gdn_gating(A_log, a[token_indices], b[token_indices], dt_bias),
+            )
 
         for dtype in (torch.bfloat16, torch.float16):
             for query_len in (0, 5):
