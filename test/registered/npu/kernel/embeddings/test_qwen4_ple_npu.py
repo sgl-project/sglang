@@ -77,6 +77,11 @@ def _make_case(
         token_offsets=torch.arange(width, device=device).repeat(2),
         valid_tokens=valid,
         state_indices=torch.tensor([2, 1], device=device),
+        query_start_loc=(
+            torch.cat([lengths.new_zeros(1), lengths.cumsum(0)])
+            if mode == "prefill"
+            else None
+        ),
         ngram_context=None,
         ngram_eos_token_id=None,
     )
