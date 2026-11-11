@@ -2,6 +2,7 @@
 
 import types
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -15,11 +16,14 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
     dequant_block_fp8_weight_to_bf16,
+    dequant_mxfp8_to_bf16,
     fake_quant_fp8_activation,
     fp8_grid_quantize,
+    mxfp8_e4m3_quantize,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.quantization import fp8_hip
+from sglang.srt.layers.quantization import fp8_hip, fp8_utils
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     dispatch_block_fp8_mxfp8_linear,
@@ -28,7 +32,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 # (N, K): a TP4 projection and the TP4 shared-expert down projection (K = 576, whose tail short
@@ -228,6 +232,87 @@ class TestMxfp8AiterRouteGfx95(CustomTestCase):
                 self.assertTrue(torch.equal(out_grid, out), (n, k, m))
                 xq, xs = fp8_grid_quantize(x)
                 out_q = route(Mxfp8Activation(xq, xs))
+                self.assertTrue(torch.equal(out_q, out), (n, k, m))
+
+
+# MiniMax-M3 TP4 dense (N, K): qkv, qkv + sparse index, o, dense gate/up, dense down, shared gate/up,
+# shared down; then an N the (16, 16) preshuffle does not tile, which keeps the plain weight
+NATIVE_AITER_SHAPES = [
+    (2304, 6144),
+    (2560, 6144),
+    (6144, 2048),
+    (6144, 6144),
+    (6144, 3072),
+    (1536, 6144),
+    (6144, 768),
+    (1288, 768),
+]
+# decode / verify rows, rows between tuned M, and a prefill row count off the tuned M
+NATIVE_AITER_MS = (1, 6, 33, 1025, 8320)
+
+
+@unittest.skipUnless(
+    is_hip() and is_gfx95_supported() and _aiter_has_preshuffled_mxfp8(),
+    "gfx950 aiter FlyDSL MXFP8 GEMM (ROCm/aiter#5896)",
+)
+class TestMxfp8AiterNativeRouteGfx95(CustomTestCase):
+    """A native MXFP8 checkpoint (per-row [N, K / 32] ue8m0 scales) through Fp8LinearMethod with
+    --fp8-gemm-backend=aiter."""
+
+    def _layer(self, wq, ws):
+        n, k = wq.shape
+        with patch.object(
+            fp8_utils,
+            "FP8_GEMM_RUNNER_BACKEND",
+            fp8_utils.Fp8GemmRunnerBackend.AITER,
+        ):
+            method = Fp8LinearMethod(
+                Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    use_mxfp8=True,
+                    weight_block_size=[1, 32],
+                )
+            )
+        self.assertTrue(method.mxfp8_dense_backend.is_gfx95_mxfp8_aiter_1x32())
+        layer = torch.nn.Module()
+        layer.tp_group = None
+        layer.deepgemm_mxfp8_input = False
+        method.create_weights(
+            layer,
+            input_size_per_partition=k,
+            output_partition_sizes=[n],
+            input_size=k,
+            output_size=n,
+            params_dtype=torch.bfloat16,
+            weight_loader=lambda param, loaded: param.data.copy_(loaded),
+        )
+        layer.to("cuda")
+        layer.weight.data.copy_(wq)
+        layer.weight_scale_inv.data.copy_(ws)
+        method.process_weights_after_loading(layer)
+        return layer, lambda x: method.apply(layer, x)
+
+    def test_within_one_bf16_ulp_of_the_bf16_route(self):
+        for n, k in NATIVE_AITER_SHAPES:
+            torch.manual_seed(0)
+            w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+            wq, ws = mxfp8_e4m3_quantize(w)
+            w_bf16 = dequant_mxfp8_to_bf16(wq, ws)
+            layer, route = self._layer(wq, ws)
+            self.assertEqual(layer.mxfp8_aiter_preshuffled, n % 16 == 0, (n, k))
+            for m in NATIVE_AITER_MS:
+                x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+                ref = bf16_dequant_blockscaled_linear(x, w_bf16)
+                out = route(x)
+                row_max = ref.float().abs().amax(dim=1, keepdim=True).clamp(min=1.0)
+                ulp_of_row_max = torch.exp2(torch.floor(torch.log2(row_max)) - 7)
+                diff = (out.float() - ref.float()).abs()
+                self.assertTrue(
+                    bool((diff <= ulp_of_row_max).all()),
+                    (n, k, m, (diff / ulp_of_row_max).max().item()),
+                )
+                # a fused producer's fp8 + scales operand gives the same result as the bf16 input
+                out_q = route(mxfp8_e4m3_quantize(x))
                 self.assertTrue(torch.equal(out_q, out), (n, k, m))
 
 
