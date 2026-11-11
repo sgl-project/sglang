@@ -10,6 +10,9 @@ from sglang.srt.observability.metrics_collector import (
     _StatLoggerDIMixin,
     format_metric_name,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestPrometheusMetricStyle(unittest.TestCase):
@@ -50,7 +53,9 @@ class TestPrometheusMetricStyle(unittest.TestCase):
 
         registry = CollectorRegistry()
         c = Counter("sglang:test_counter", "Test counter", registry=registry)
-        g = Gauge(name="sglang:test_gauge", documentation="Test gauge", registry=registry)
+        g = Gauge(
+            name="sglang:test_gauge", documentation="Test gauge", registry=registry
+        )
 
         self.assertEqual(c._name, "sglang:test_counter")
         self.assertEqual(g._name, "sglang:test_gauge")
@@ -62,7 +67,9 @@ class TestPrometheusMetricStyle(unittest.TestCase):
 
         registry = CollectorRegistry()
         c = Counter("sglang:test_counter", "Test counter", registry=registry)
-        g = Gauge(name="sglang:test_gauge", documentation="Test gauge", registry=registry)
+        g = Gauge(
+            name="sglang:test_gauge", documentation="Test gauge", registry=registry
+        )
 
         self.assertEqual(c._name, "sglang_test_counter")
         self.assertEqual(g._name, "sglang_test_gauge")
@@ -70,24 +77,36 @@ class TestPrometheusMetricStyle(unittest.TestCase):
     def test_storage_collector_metric_style(self):
         # Test with colon style
         server_args_colon = SimpleNamespace(prometheus_metric_style="colon")
-        collector_colon = StorageMetricsCollector(labels={}, server_args=server_args_colon)
-        self.assertTrue(collector_colon.prefetched_tokens_total._name.startswith("sglang:"))
+        collector_colon = StorageMetricsCollector(
+            labels={}, server_args=server_args_colon
+        )
+        self.assertTrue(
+            collector_colon.prefetched_tokens_total._name.startswith("sglang:")
+        )
 
         # Test with underscore style
         server_args_underscore = SimpleNamespace(prometheus_metric_style="underscore")
-        collector_underscore = StorageMetricsCollector(labels={}, server_args=server_args_underscore)
-        self.assertTrue(collector_underscore.prefetched_tokens_total._name.startswith("sglang_"))
+        collector_underscore = StorageMetricsCollector(
+            labels={}, server_args=server_args_underscore
+        )
+        self.assertTrue(
+            collector_underscore.prefetched_tokens_total._name.startswith("sglang_")
+        )
 
     def test_http_request_metrics_style(self):
         from sglang.srt.observability.http_request_metrics import _HttpRequestMetrics
 
         with patch.dict(os.environ, {"SGLANG_PROMETHEUS_METRIC_STYLE": "colon"}):
             metrics_colon = _HttpRequestMetrics()
-            self.assertEqual(metrics_colon.requests_active._name, "sglang:http_requests_active")
+            self.assertEqual(
+                metrics_colon.requests_active._name, "sglang:http_requests_active"
+            )
 
         with patch.dict(os.environ, {"SGLANG_PROMETHEUS_METRIC_STYLE": "underscore"}):
             metrics_under = _HttpRequestMetrics()
-            self.assertEqual(metrics_under.requests_active._name, "sglang_http_requests_active")
+            self.assertEqual(
+                metrics_under.requests_active._name, "sglang_http_requests_active"
+            )
 
 
 if __name__ == "__main__":

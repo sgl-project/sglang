@@ -462,6 +462,7 @@ class DPDispatcher:
         self.pending_gauge = None
         if enable_metrics:
             from prometheus_client import Gauge
+
             from sglang.srt.observability.metrics_collector import format_metric_name
 
             self.pending_gauge = Gauge(

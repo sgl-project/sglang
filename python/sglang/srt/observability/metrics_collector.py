@@ -45,7 +45,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.gauge_histogram import GaugeHistogram
 
 if TYPE_CHECKING:
     from prometheus_client import Gauge
@@ -335,7 +334,11 @@ class _StatLoggerDIMixin:
 
         @functools.wraps(factory)
         def _wrapped(*args, **kwargs):
-            if "name" in kwargs and isinstance(kwargs["name"], str) and kwargs["name"].startswith("sglang:"):
+            if (
+                "name" in kwargs
+                and isinstance(kwargs["name"], str)
+                and kwargs["name"].startswith("sglang:")
+            ):
                 kwargs = dict(kwargs, name="sglang_" + kwargs["name"][len("sglang:") :])
             elif args and isinstance(args[0], str) and args[0].startswith("sglang:"):
                 args = ("sglang_" + args[0][len("sglang:") :],) + args[1:]
@@ -343,13 +346,18 @@ class _StatLoggerDIMixin:
 
         return _wrapped
 
-    def _resolve_metric_classes(self, server_args=None, include_gauge_histogram: bool = False):
+    def _resolve_metric_classes(
+        self, server_args=None, include_gauge_histogram: bool = False
+    ):
         from prometheus_client import Counter as _PromCounter
         from prometheus_client import Gauge as _PromGauge
         from prometheus_client import Histogram as _PromHistogram
         from prometheus_client import Summary as _PromSummary
+
         from sglang.srt.environ import envs
-        from sglang.srt.utils.gauge_histogram import GaugeHistogram as _PromGaugeHistogram
+        from sglang.srt.utils.gauge_histogram import (
+            GaugeHistogram as _PromGaugeHistogram,
+        )
 
         metric_style = (
             getattr(server_args, "prometheus_metric_style", None)
@@ -357,12 +365,20 @@ class _StatLoggerDIMixin:
         )
         use_underscore = metric_style == "underscore"
 
-        Counter = self._wrap_metric_factory(self._counter_cls or _PromCounter, use_underscore)
+        Counter = self._wrap_metric_factory(
+            self._counter_cls or _PromCounter, use_underscore
+        )
         Gauge = self._wrap_metric_factory(self._gauge_cls or _PromGauge, use_underscore)
-        Histogram = self._wrap_metric_factory(self._histogram_cls or _PromHistogram, use_underscore)
-        Summary = self._wrap_metric_factory(self._summary_cls or _PromSummary, use_underscore)
+        Histogram = self._wrap_metric_factory(
+            self._histogram_cls or _PromHistogram, use_underscore
+        )
+        Summary = self._wrap_metric_factory(
+            self._summary_cls or _PromSummary, use_underscore
+        )
         if include_gauge_histogram:
-            GaugeHistogram = self._wrap_metric_factory(_PromGaugeHistogram, use_underscore)
+            GaugeHistogram = self._wrap_metric_factory(
+                _PromGaugeHistogram, use_underscore
+            )
             return Counter, Gauge, Histogram, Summary, GaugeHistogram
         return Counter, Gauge, Histogram, Summary
 
@@ -386,8 +402,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         enable_streaming_session: bool = False,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        Counter, Gauge, Histogram, Summary, GaugeHistogram = self._resolve_metric_classes(
-            server_args, include_gauge_histogram=True
+        Counter, Gauge, Histogram, Summary, GaugeHistogram = (
+            self._resolve_metric_classes(server_args, include_gauge_histogram=True)
         )
 
         self.labels = labels
@@ -2614,7 +2630,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 class EncoderMetricsCollector(_StatLoggerDIMixin):
     """Metrics collector for the EPD encoder server (--encoder-only)."""
 
-    def __init__(self, labels: Dict[str, str], server_args: Optional[ServerArgs] = None) -> None:
+    def __init__(
+        self, labels: Dict[str, str], server_args: Optional[ServerArgs] = None
+    ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         Counter, Gauge, Histogram, Summary = self._resolve_metric_classes(server_args)
 

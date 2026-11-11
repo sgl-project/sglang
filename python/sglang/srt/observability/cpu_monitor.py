@@ -6,6 +6,7 @@ import psutil
 
 def start_cpu_monitor_thread(component: str, interval: float = 5.0) -> threading.Thread:
     from prometheus_client import Counter
+
     from sglang.srt.observability.metrics_collector import format_metric_name
 
     cpu_seconds_total = Counter(

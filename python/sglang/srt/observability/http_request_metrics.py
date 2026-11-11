@@ -24,6 +24,7 @@ class RefCountedGauge:
 class _HttpRequestMetrics:
     def __init__(self):
         from prometheus_client import Counter, Gauge
+
         from sglang.srt.observability.metrics_collector import format_metric_name
 
         self.requests_total = Counter(
