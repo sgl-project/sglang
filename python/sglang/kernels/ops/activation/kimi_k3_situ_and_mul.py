@@ -87,7 +87,7 @@ def _jit_situ_masked_module() -> Module:
     return load_jit(
         _make_name("situ_and_mul_masked"),
         *args,
-        cuda_files=["kimi_k3/situ_and_mul.cuh"],
+        cuda_files=["sail/kimi_k3_situ_and_mul.cuh"],
         cuda_wrappers=[("run", f"SituAndMulMaskedKernel<{args}>::run")],
         extra_cuda_cflags=get_activation_cuda_cflags(),
     )
@@ -107,7 +107,7 @@ def _jit_situ_mxfp4_module(masked: bool) -> Module:
     return load_jit(
         _make_name("situ_and_mul_mxfp4"),
         *args,
-        cuda_files=["kimi_k3/situ_and_mul.cuh"],
+        cuda_files=["sail/kimi_k3_situ_and_mul.cuh"],
         cuda_wrappers=[("run", f"SituAndMulMxfp4Kernel<{args}>::run")],
         extra_cuda_cflags=[*get_activation_cuda_cflags(), "-DSGLANG_SITU_MXFP4"],
     )
