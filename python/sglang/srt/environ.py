@@ -313,6 +313,10 @@ class Envs:
     SGLANG_OPT_POST_VERIFY_POOL_PRESIZE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # HiCache Mamba side-state rows backed up / loaded by stream-ordered kernels.
+    SGLANG_OPT_HICACHE_MAMBA_SLOT_STATE_ASYNC = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
