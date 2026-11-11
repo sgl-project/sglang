@@ -812,23 +812,23 @@ RUN pip list --format=freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt
 RUN cd sglang \
     && cp python/pyproject_other.toml python/pyproject.toml \
     && case "${GPU_ARCH}" in \
-         *-rocm1000) srt_extras="srt_hip_rocm724,diffusion_hip"; \
+         *-rocm1000) srt_extras="srt_hip_rocm724,diffusion_hip,fastokens"; \
                      all_extras="all_hip_rocm724" ; \
                      CONS="-c /tmp/constraints.txt" ; \
                      ;; \
-         *-rocm1010) srt_extras="srt_hip_rocm101,diffusion_hip"; \
+         *-rocm1010) srt_extras="srt_hip_rocm101,diffusion_hip,fastokens"; \
                      all_extras="all_hip_rocm101" ; \
                      CONS="-c /tmp/constraints.txt" ; \
                      ;; \
-         *-rocm724) srt_extras="srt_hip_rocm724,diffusion_hip"; \
+         *-rocm724) srt_extras="srt_hip_rocm724,diffusion_hip,fastokens"; \
                     all_extras="all_hip_rocm724" ; \
                     CONS="-c /tmp/constraints.txt" ; \
                     ;; \
-         *-rocm720) srt_extras="srt_hip,diffusion_hip"; \
+         *-rocm720) srt_extras="srt_hip,diffusion_hip,fastokens"; \
                     all_extras="all_hip" ; \
                     CONS="-c /tmp/constraints.txt" ; \
                     ;; \
-         *) srt_extras="srt_hip,diffusion_hip"; \
+         *) srt_extras="srt_hip,diffusion_hip,fastokens"; \
             all_extras="all_hip" ; \
             CONS="-c /tmp/constraints.txt" ; \
             echo 'diffusers==0.37.0' >> /tmp/constraints.txt ; \

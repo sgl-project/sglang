@@ -1679,6 +1679,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                         set(merged[-1]) - {"content"} == {"role", "reasoning_content"}
                         and not merged[-1].get("content")
                     )
+                    or (
+                        merged[-1].get("phase") == "commentary"
+                        and set(msg) == {"role", "tool_calls"}
+                    )
                 )
             ):
                 prev = merged[-1] = dict(merged[-1])

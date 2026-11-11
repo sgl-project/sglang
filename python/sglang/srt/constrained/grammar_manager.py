@@ -17,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.sampling.sampling_params import (
@@ -210,7 +211,7 @@ class GrammarManager:
                 self._apply_request_reasoning_config(req)
 
         if add_to_grammar_queue:
-            self.grammar_queue.join([req])
+            move([req], self.grammar_queue)
 
         return add_to_grammar_queue
 
