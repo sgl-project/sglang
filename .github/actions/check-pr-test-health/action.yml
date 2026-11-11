@@ -95,6 +95,11 @@ runs:
               core.info(`[health-check] Filtered out multimodal-gen NPU job: ${j.name}`);
               return false;
             }
+            // coverage is a downstream summary; its prior failure must not block producer retries
+            if (j.name.split(' / ').pop() === 'diffusion-coverage-check') {
+              core.info(`[health-check] Filtered out coverage summary: ${j.name}`);
+              return false;
+            }
             // If the failing step is the health check, it's a cascade -- skip it
             const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
             if (failedStep && (failedStep.name.includes('check-pr-test-health') || failedStep.name.includes('Check PR test health'))) {

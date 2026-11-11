@@ -6,11 +6,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from sglang.srt import runtime_context as rc  # noqa: E402
 from sglang.srt.disaggregation import role_switch  # noqa: E402
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.request_list import (  # noqa: E402
+    IndexedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -42,6 +48,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         rc.get_context().set_server_args(sa)
         s.server_args = sa
         s.is_fully_idle = MagicMock(return_value=idle)
+        s.request_lists = MagicMock(return_value={})
         teardown_patcher = patch.object(role_switch, "teardown_disaggregation")
         s.teardown_disaggregation = teardown_patcher.start()
         self.addCleanup(teardown_patcher.stop)
@@ -150,6 +157,19 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertFalse(out.success)
         self.assertTrue(out.safe_to_restore)
         self.assertIn("not idle", out.message)
+        s.teardown_disaggregation.assert_not_called()
+
+    def test_rejected_while_a_retract_pause_holds_requests(self):
+        s = self._scheduler(DisaggregationMode.DECODE)
+        # is_fully_idle skips held requests, so it still reports idle.
+        held = IndexedReqList(ListKind.PD_HELD)
+        move([MagicMock(owner_list=None)], held)
+        s.request_lists.return_value = {ListKind.PD_HELD: held}
+        out = Scheduler.handle_pd_role_switch(
+            s, PdRoleSwitchReqInput(new_role="prefill")
+        )
+        self.assertFalse(out.success)
+        self.assertTrue(out.safe_to_restore)
         s.teardown_disaggregation.assert_not_called()
 
     def test_rejected_when_decode_graph_headroom_is_missing(self):
@@ -349,6 +369,14 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
     all-to-all / pipeline parallelism are sized at startup and not rebuilt, so
     a flip with those on would silently deadlock. The PD arg hook must reject
     the combination up-front instead of failing at flip time."""
+
+    def setUp(self):
+        super().setUp()
+        # Rust-server mode does not serve /pd_role_switch, and its PD arg hook
+        # imports the transfer backend (mori here, not installed in CI) to
+        # check its bootstrap server, so pin the mode against an inherited
+        # SGLANG_RUST_SERVER=1.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
 
     def _sa(self, **kw):
         base = dict(
@@ -616,6 +644,7 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
 
 def _radix_scheduler(disable_radix_cache):
     s = MagicMock()
+    s.request_lists.return_value = {}
     s.disable_radix_cache = disable_radix_cache
     tree = MagicMock()
     del tree.clear_storage_backend  # plain RadixCache has none
