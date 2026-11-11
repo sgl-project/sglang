@@ -112,6 +112,7 @@ from sglang.srt.mem_cache.kv_cache_configurator import (
 )
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -1894,6 +1895,10 @@ class ModelRunner:
 
         self.forward_pass_id += 1
 
+        # On the forward stream, outside every CUDA graph: orders a reused row's
+        # reset after its previous request's last forward.
+        self._reset_new_request_rows()
+
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = self.gpu_id if get_parallel().dp_size > 1 else None
@@ -1988,6 +1993,13 @@ class ModelRunner:
             self.maybe_join_ep_ranks()
 
         return output
+
+    def _reset_new_request_rows(self) -> None:
+        if self.req_to_token_pool is None or self.token_to_kv_pool_allocator is None:
+            return
+        kv_storage_of(
+            self.req_to_token_pool, self.token_to_kv_pool_allocator
+        ).reset_new_rows()
 
     def _maybe_execute_deferred_mamba_cow_and_clear(
         self, forward_batch: ForwardBatch

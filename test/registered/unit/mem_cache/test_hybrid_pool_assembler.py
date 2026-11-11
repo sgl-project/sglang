@@ -1,5 +1,6 @@
 """Unit tests for hybrid HiCache pool assembly."""
 
+import threading
 import unittest
 from functools import partial
 from queue import Queue
@@ -1896,6 +1897,7 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
         cc = HybridCacheController.__new__(HybridCacheController)
         cc.storage_backend = FailingStorage()
         cc.prefetch_sync_queue = Queue()
+        cc.storage_stop_event = threading.Event()
         operation = PrefetchOperation(
             CacheRequestHandle("r", 0),
             [1],
