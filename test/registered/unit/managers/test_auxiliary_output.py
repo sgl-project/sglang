@@ -153,6 +153,54 @@ def test_result_copy_opens_profiler_range_unless_fast_path_and_idle(
     assert record.call_count == ranges
 
 
+def test_result_readback_ring_reuses_a_pinned_slot_after_eight_copies():
+    from sglang.srt.managers import utils as manager_utils
+
+    tensor = SimpleNamespace(
+        device=SimpleNamespace(type="cuda"),
+        shape=(2,),
+        dtype=torch.int32,
+        record_stream=Mock(),
+    )
+    device = SimpleNamespace(current_stream=Mock(return_value=object()))
+    with (
+        patch.object(manager_utils, "_d2h_rings", {}),
+        patch.object(manager_utils, "is_pin_memory_available", return_value=True),
+        patch("torch.empty", side_effect=lambda *a, **k: Mock()) as allocate,
+        patch("torch.get_device_module", return_value=device),
+    ):
+        slots = [manager_utils._ring_d2h(tensor) for _ in range(9)]
+    assert allocate.call_count == 8
+    assert len({id(slot) for slot in slots[:8]}) == 8
+    assert slots[8] is slots[0]
+    assert tensor.record_stream.call_count == 9
+    slots[8].copy_.assert_called_with(tensor, non_blocking=True)
+    cpu = torch.arange(2)
+    assert manager_utils._ring_d2h(cpu) is cpu
+
+
+@pytest.mark.parametrize("ring", [False, True])
+@pytest.mark.parametrize("speculative", [False, True])
+def test_result_readback_ring_serves_only_speculative_tokens(ring, speculative):
+    from sglang.srt.managers import utils as manager_utils
+
+    result = GenerationBatchResult(
+        logits_output=LogitsProcessorOutput(next_token_logits=None),
+        next_token_ids=torch.arange(2),
+        accept_lens=torch.ones(2) if speculative else None,
+        copy_done=CopyDone(),
+    )
+    with (
+        patch.object(manager_utils, "_D2H_RING", ring),
+        patch.object(manager_utils, "_ring_d2h", side_effect=lambda t: t) as ring_copy,
+        patch.object(manager_utils, "_async_d2h", side_effect=lambda t: t) as copy,
+    ):
+        result.copy_to_cpu(return_logprob=False)
+    ring_copies = 2 if ring and speculative else 0
+    assert ring_copy.call_count == ring_copies
+    assert copy.call_count == 1 + speculative - ring_copies
+
+
 def test_sampling_mask_output_uses_generation_result_copy_path():
     sampling_output = SamplingMaskOutput(
         token_ids=torch.tensor([[3, 5]], dtype=torch.int32),

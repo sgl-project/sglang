@@ -330,6 +330,11 @@ class Envs:
     SGLANG_OPT_RESULT_COPY_PROFILER_FAST_PATH = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # A speculative decode result's readback (next token ids, accept lengths) copies into a
+    # ring of pinned buffers kept per shape instead of a fresh pinned allocation per tensor.
+    SGLANG_OPT_RESULT_COPY_PINNED_RING = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
