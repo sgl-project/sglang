@@ -9,7 +9,6 @@ import numpy as np
 from sglang.kernels.ops.speculative.ngram_corpus import get_ngram_corpus_cls
 from sglang.srt.mem_cache.utils import storage_namespace_seed
 
-
 logger = logging.getLogger(__name__)
 
 
