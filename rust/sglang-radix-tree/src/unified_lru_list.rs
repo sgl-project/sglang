@@ -412,12 +412,23 @@ pub struct PriorityKey(pub i64, pub i64);
 pub trait EvictionStrategy<K: ChildKeyType> {
     /// The node's eviction priority.
     fn get_priority(&self, node: &Node<K>) -> PriorityKey;
+
+    /// Whether refreshing a node's access tick can lower its priority. The
+    /// persistent Full eviction queue requeues accessed D-leaves when it can;
+    /// `true` is always correct, `false` saves queue churn.
+    fn access_can_lower_priority(&self) -> bool {
+        true
+    }
 }
 
 /// Least-recently-used.
 pub struct LruStrategy;
 
 impl<K: ChildKeyType> EvictionStrategy<K> for LruStrategy {
+    fn access_can_lower_priority(&self) -> bool {
+        false
+    }
+
     fn get_priority(&self, node: &Node<K>) -> PriorityKey {
         PriorityKey(node.last_access_counter, 0)
     }
@@ -427,6 +438,10 @@ impl<K: ChildKeyType> EvictionStrategy<K> for LruStrategy {
 pub struct LfuStrategy;
 
 impl<K: ChildKeyType> EvictionStrategy<K> for LfuStrategy {
+    fn access_can_lower_priority(&self) -> bool {
+        false
+    }
+
     fn get_priority(&self, node: &Node<K>) -> PriorityKey {
         PriorityKey(node.hit_count, node.last_access_counter)
     }
@@ -436,6 +451,10 @@ impl<K: ChildKeyType> EvictionStrategy<K> for LfuStrategy {
 pub struct FifoStrategy;
 
 impl<K: ChildKeyType> EvictionStrategy<K> for FifoStrategy {
+    fn access_can_lower_priority(&self) -> bool {
+        false
+    }
+
     fn get_priority(&self, node: &Node<K>) -> PriorityKey {
         PriorityKey(node.creation_counter, 0)
     }
@@ -454,6 +473,10 @@ impl<K: ChildKeyType> EvictionStrategy<K> for MruStrategy {
 pub struct FiloStrategy;
 
 impl<K: ChildKeyType> EvictionStrategy<K> for FiloStrategy {
+    fn access_can_lower_priority(&self) -> bool {
+        false
+    }
+
     fn get_priority(&self, node: &Node<K>) -> PriorityKey {
         PriorityKey(-node.creation_counter, 0)
     }
@@ -463,6 +486,10 @@ impl<K: ChildKeyType> EvictionStrategy<K> for FiloStrategy {
 pub struct PriorityStrategy;
 
 impl<K: ChildKeyType> EvictionStrategy<K> for PriorityStrategy {
+    fn access_can_lower_priority(&self) -> bool {
+        false
+    }
+
     fn get_priority(&self, node: &Node<K>) -> PriorityKey {
         PriorityKey(node.priority, node.last_access_counter)
     }
@@ -475,6 +502,10 @@ pub struct SlruStrategy {
 }
 
 impl<K: ChildKeyType> EvictionStrategy<K> for SlruStrategy {
+    fn access_can_lower_priority(&self) -> bool {
+        false
+    }
+
     fn get_priority(&self, node: &Node<K>) -> PriorityKey {
         PriorityKey(
             (node.hit_count >= self.protected_threshold) as i64,
@@ -525,6 +556,10 @@ impl TlruFloatConfig {
 }
 
 impl<K: ChildKeyType> EvictionStrategy<K> for TlruStrategy {
+    fn access_can_lower_priority(&self) -> bool {
+        false
+    }
+
     fn get_priority(&self, node: &Node<K>) -> PriorityKey {
         let cached_without_node = node.tlru_cached_prefix_len - node.key.atom_len();
         let tel_safe = match self.float_config {

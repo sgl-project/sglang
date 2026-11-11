@@ -3,8 +3,7 @@
 
 pub use crate::cache_action::{BackupKV, CacheAction, CacheActions};
 use crate::cache_action::{FreeDeviceKV, FreeDeviceKVFullOnly, UpdatePendingBackupOnNodeSplit};
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -16,6 +15,7 @@ use crate::components::{
 use crate::components::{
     BASE_COMPONENT_TYPE, ComponentType, FULL, Family, MAMBA, NUM_COMPONENT_TYPES, SWA,
 };
+use crate::evictable_device_leaves::EvictableDeviceLeaves;
 use crate::node::Node;
 use crate::node::NodeArena;
 use crate::node::NodeSet;
@@ -24,9 +24,7 @@ use crate::node::{
     NUM_VALUE_SLOTS, NodeAccessError, NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx,
 };
 use crate::unified_lru_list::UnifiedLRUList;
-use crate::unified_lru_list::{
-    EvictionStrategy, PriorityKey, TlruFloatConfig, get_eviction_strategy,
-};
+use crate::unified_lru_list::{EvictionStrategy, TlruFloatConfig, get_eviction_strategy};
 
 // A 42-bit mask keeps digest multiplication by 1_000_003 within i64.
 const COEXIST_RECLAIM_DIGEST_MULTIPLIER: i64 = 1_000_003;
@@ -624,8 +622,9 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     slot_of_family: [Option<ComponentType>; Family::COUNT],
     /// Per-component bookkeeping, indexed by `ComponentType::idx`.
     pub(crate) component_states: [ComponentState; NUM_COMPONENT_TYPES],
-    /// Nodes currently eligible for device eviction (D-leaves).
-    pub(crate) evictable_device_leaves: NodeSet,
+    /// Nodes currently eligible for device eviction (D-leaves), with the
+    /// Full walk's persistent eviction queue.
+    pub(crate) evictable_device_leaves: EvictableDeviceLeaves,
     /// Nodes currently eligible for host eviction (H-leaves).
     pub(crate) evictable_host_leaves: NodeSet,
     /// Full has no device LRU; track host/device duplicates in insertion order.
@@ -636,10 +635,11 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     tracked_unbacked_tokens: Option<usize>,
     /// Per-slot LRU lists, indexed by `ValueSlotIdx::idx`.
     pub(crate) lru_lists: [UnifiedLRUList; NUM_VALUE_SLOTS],
-    /// Device-eviction candidates; the lowest priority is popped first.
-    pub(crate) full_evict_device_heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>>,
     /// Eviction-priority strategy; lower priority evicts first.
     pub(crate) eviction_strategy: Box<dyn EvictionStrategy<K> + Send>,
+    /// Whether an access can lower a node's priority, so an accessed D-leaf
+    /// must be requeued.
+    pub(crate) requeue_device_leaf_on_access: bool,
     /// Keep path depths and branch high-water marks only for T-LRU.
     pub(crate) tlru_bookkeeping: bool,
     /// Atoms per radix page; children are keyed by their key's first page.
@@ -1005,7 +1005,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             components_by_type: Default::default(),
             slot_of_family: Default::default(),
             component_states: Default::default(),
-            evictable_device_leaves: NodeSet::new(),
+            evictable_device_leaves: EvictableDeviceLeaves::new(),
             evictable_host_leaves: NodeSet::new(),
             full_coexisting_host_nodes: NodeSet::new(),
             write_back_coexist_reclaim_digest: 0,
@@ -1013,13 +1013,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             tracked_unbacked_tokens: None,
             // Disabled components keep harmless empty lists, like component_states.
             lru_lists: Self::new_lru_lists(),
-            full_evict_device_heap: BinaryHeap::new(),
             eviction_strategy: get_eviction_strategy(
                 &params.eviction_policy,
                 params.slru_protected_threshold,
                 params.tlru_tail_budget,
                 params.tlru_float_config,
             ),
+            requeue_device_leaf_on_access: false,
             tlru_bookkeeping: params.eviction_policy.eq_ignore_ascii_case("tlru"),
             page_size: params.page_size,
             is_write_back: params.is_write_back,
@@ -1038,6 +1038,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
             ongoing_insert_walk_state: None,
         };
+        tree_core.requeue_device_leaf_on_access =
+            tree_core.eviction_strategy.access_can_lower_priority();
         for component in components {
             tree_core.register_component_(component);
         }
@@ -1049,14 +1051,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn reset(&mut self) {
         self.arena.reset();
         self.component_states = Default::default();
-        self.evictable_device_leaves = NodeSet::new();
+        self.evictable_device_leaves = EvictableDeviceLeaves::new();
         self.evictable_host_leaves = NodeSet::new();
         self.full_coexisting_host_nodes = NodeSet::new();
         self.write_back_coexist_reclaim_digest = 0;
         self.write_back_queued_count = 0;
         self.tracked_unbacked_tokens = None;
         self.lru_lists = Self::new_lru_lists();
-        self.full_evict_device_heap.clear();
         self.namespaced_event_hashes.clear();
         self.ongoing_insert_walk_state = None;
     }
@@ -1700,6 +1701,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .get_and_batch_bump_access_counter(path.len() as i64);
         for (i, id) in path.iter().enumerate() {
             self.arena.node_mut(*id).last_access_counter = newest_tick - i as i64;
+            self.requeue_accessed_device_leaf_(*id);
         }
 
         // last_host_node will be used as the starting node for the subsequent
@@ -1808,6 +1810,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(Tensor::cat(&prefix_chunks, 0))
     }
 
+    /// Requeue a D-leaf whose access tick moved, when that can lower its priority.
+    pub(crate) fn requeue_accessed_device_leaf_(&mut self, node_id: NodeIdx_) {
+        if self.requeue_device_leaf_on_access {
+            self.evictable_device_leaves.requeue(node_id);
+        }
+    }
+
     /// Refresh a node's access tick and component LRU positions.
     pub fn touch_node_(&mut self, node_id: NodeIdx_) {
         let tick = self.arena.get_and_bump_access_counter();
@@ -1816,6 +1825,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if node.is_root() {
             return;
         }
+        self.requeue_accessed_device_leaf_(node_id);
         for i in 0..self.components.len() {
             // Full uses leaf sets, not LRU.
             if self.components[i].component_type() == BASE_COMPONENT_TYPE {
@@ -2506,6 +2516,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         let tick = self.arena.get_and_bump_access_counter();
         self.arena.node_mut(child_id).last_access_counter = tick;
+        // A shorter key can move the suffix into T-LRU's evict-first group.
+        self.evictable_device_leaves.requeue(child_id);
 
         self.update_evictable_leaf_sets_(new_node_id);
         self.update_evictable_leaf_sets_(child_id);
@@ -5520,6 +5532,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             if !missing.is_empty() {
                 errors.push(format!("D-leaf missing: {missing:?}"));
             }
+        }
+        if let Some(error) = self
+            .evictable_device_leaves
+            .check_queue_invariant(|id| self.eviction_strategy.get_priority(self.arena.node(id)))
+        {
+            errors.push(error);
         }
 
         // Host leaf set must match the expected leaves.
