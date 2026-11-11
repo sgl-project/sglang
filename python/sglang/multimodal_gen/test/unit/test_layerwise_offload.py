@@ -3142,8 +3142,9 @@ def test_finish_offload_writeback_is_noop_when_idle():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
+@pytest.mark.parametrize("side_stream", [False, True])
 @torch.no_grad()
-def test_layerwise_breakable_graph_preserves_copies_and_event_lifetimes():
+def test_layerwise_breakable_graph_preserves_copies_and_event_lifetimes(side_stream):
     from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
         BaseBreakableCudaGraphRunner,
     )
@@ -3165,10 +3166,19 @@ def test_layerwise_breakable_graph_preserves_copies_and_event_lifetimes():
                 [torch.nn.Linear(256, 256) for _ in range(4)]
             )
             self.offset = torch.nn.Parameter(torch.randn(256))
+            self.compute_stream = torch.cuda.Stream() if side_stream else None
 
         def forward(self, x):
             for block in self.blocks:
-                x = boundary(block(x).relu())
+                if self.compute_stream is None:
+                    x = block(x).relu()
+                else:
+                    current_stream = torch.cuda.current_stream()
+                    self.compute_stream.wait_stream(current_stream)
+                    with torch.cuda.stream(self.compute_stream):
+                        x = block(x).relu()
+                    current_stream.wait_stream(self.compute_stream)
+                x = boundary(x)
             return x + self.offset
 
     torch.manual_seed(42)
