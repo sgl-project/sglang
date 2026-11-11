@@ -27,11 +27,12 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq, decode_queue
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue, leaving_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
@@ -53,8 +54,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def test_ensure_prefill_info_tolerates_cleared_receiver(self):
-        # A req whose kv_receiver was already cleared must not crash on .abort().
+    def test_a_request_stops_waiting_when_prefill_info_never_arrives(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._max_ensure_retries = 1
         queue._ensure_retry_interval = 0
@@ -63,15 +63,17 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.kv_manager = MagicMock()
         queue.kv_manager.try_ensure_parallel_info.return_value = False
 
-        cleared_req = SimpleNamespace(
-            req=SimpleNamespace(rid="cleared"), kv_receiver=None
+        waiting = SimpleNamespace(
+            req=SimpleNamespace(rid="waiting"),
+            kv_receiver=MagicMock(),
+            awaiting_prefill_dp_rank=True,
         )
-        addr_to_reqs = {"127.0.0.1:11500": [cleared_req]}
 
-        ready, remaining = queue._ensure_prefill_info(addr_to_reqs)
+        ready = queue._ensure_prefill_info({"127.0.0.1:11500": [waiting]})
 
         self.assertEqual(ready, {})
-        self.assertEqual(remaining, [])
+        waiting.kv_receiver.abort.assert_called_once()
+        self.assertFalse(waiting.awaiting_prefill_dp_rank)
 
     def test_an_empty_queue_reads_no_capacity(self):
         """Polling an empty preallocation queue returns before the capacity
@@ -102,28 +104,30 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         def decode_req(room):
             return SimpleNamespace(
-                req=SimpleNamespace(
+                req=FakeReq(
+                    rid=str(room),
                     bootstrap_host="127.0.0.1",
                     bootstrap_port=11500,
                     bootstrap_room=room,
                 ),
                 kv_receiver=MagicMock(),
+                awaiting_prefill_dp_rank=True,
             )
 
         first = decode_req(7)
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.pending_reqs = [first]
+        queue.queue = decode_queue(ListKind.PD_PREALLOC, [first])
         queue._prefill_dp_rank_queries = {}
         queue.kv_manager = SimpleNamespace(
             prefill_info_table={addr: object()},
             _ensure_prefill_recompute_executor=lambda: executor,
         )
         queue._resolve_prefill_dp_rank = MagicMock(return_value=None)
-        queue._ensure_prefill_info = lambda groups: (groups, [])
+        queue._ensure_prefill_info = lambda groups: groups
 
         queue.prefetch_prefill_dp_rank_queries()
         tail = decode_req(8)
-        queue.pending_reqs.append(tail)
+        move([tail], queue.queue)
         with patch(
             "sglang.srt.disaggregation.decode.CommonKVReceiver.query_prefill_dp_ranks",
             return_value={"8": 2},
@@ -135,7 +139,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         query.assert_called_once_with(addr, [8])
         first.kv_receiver.init.assert_called_once_with(1)
         tail.kv_receiver.init.assert_called_once_with(2)
-        self.assertEqual(queue.pending_reqs, [])
+        self.assertEqual(queue._reqs_awaiting_prefill_dp_rank(), [])
 
 
 class TestHeldDestinationPublication(CustomTestCase):
@@ -285,7 +289,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             queue._clean_hicache_prefetch_resources = MagicMock()
             queue._commit_transfer_to_req = MagicMock()
             queue._record_transfer_failure = MagicMock()
-            scheduler = MagicMock()
+            scheduler = MagicMock(request_retirer=leaving_retirer())
             scheduler.enable_decode_hicache = True
             scheduler.enable_hisparse = False
             scheduler.metrics_reporter.enable_metrics = False
@@ -405,7 +409,6 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue.pp_size = 1
         queue.gloo_group = object()
         queue.queue = decode_queue(ListKind.PD_PREALLOC, decode_reqs)
-        queue.pending_reqs = []
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
         queue._num_published_destinations = 0
@@ -796,7 +799,7 @@ class TestPublishedDestinationHandoff(CustomTestCase):
         self.assertFalse(prealloc._host_destinations_quiescent())
 
         # The receive completes and leaves the queue.
-        transfer.queue.leave([decode_req.req])
+        transfer.queue._leave([decode_req.req])
         self.assertTrue(prealloc._host_destinations_quiescent())
 
 
