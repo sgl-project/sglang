@@ -5559,14 +5559,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 self.kv_buffer = [
                     torch.zeros(
                         (
-                            0 if skip else self.size + self.page_size,
+                            0 if skip else self.layer_buffer_rows(i),
                             1,
                             self.kv_cache_dim,
                         ),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
-                    for skip in self.skip_kv_layers
+                    for i, skip in enumerate(self.skip_kv_layers)
                 ]
 
     def _create_index_key_cache(self) -> IndexKeyCache:

@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.device_pool_info import (
     MLABufferInfo,
     MLASplitBuffers,
 )
+from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.kv_cache_configurator import _should_elide_dsa_index_k
 from sglang.srt.mem_cache.memory_pool import (
@@ -1524,6 +1525,20 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
         self.assertLessEqual(set(consumers), owned)
         self.assertEqual(mirror.layer_num, 44)
         self.assertEqual(anchor.layer_num, 72)
+
+    def test_layer_split_kv_sharing_allocates_only_owned_provider_rows(self):
+        pool = LayerSplitDSATokenToKVPool.__new__(LayerSplitDSATokenToKVPool)
+        pool.start_layer, pool.layer_num = 0, 4
+        pool.layer_shard_rank, pool.layer_shard_size = 0, 2
+        pool.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+        pool.custom_mem_pool = None
+        pool.size, pool.page_size, pool.kv_cache_dim = 6, 2, 3
+        pool.store_dtype, pool.device = torch.float32, "cpu"
+        pool.skip_kv_layers = [False, True, False, False]
+
+        DSATokenToKVPool._create_buffers(pool)
+
+        self.assertEqual([buf.shape[0] for buf in pool.kv_buffer], [8, 0, 0, 0])
 
     def test_kv_sharing_consumers_relocate_without_latent_rows(self):
         """Consumer layers hold 0-row latent placeholders: relocation must move the
