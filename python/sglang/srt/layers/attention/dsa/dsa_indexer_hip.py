@@ -336,3 +336,63 @@ def fp4_request_rows(
         ),
     )
     return tables, starts
+
+
+def fp4_topk_paged(
+    indexer,
+    forward_batch,
+    layer_id: int,
+    query,
+    weights: torch.Tensor,
+    metadata,
+    dcp_size: int,
+    dcp_rank: int,
+) -> torch.Tensor:
+    """Decode / verify top-k over the MXFP4 index-K: this rank's local KV slots, with
+    their counts in ``metadata.attn_metadata.dcp_topk_length`` (dcp_local_topk)."""
+    from sglang.kernels.ops.attention.dsa import fp4_index_hip
+    from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import dcp_local_topk
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+    # AITER's row-group logits score each row up to its own rank-local length,
+    # the only columns the DCP top-k reads
+    assert isinstance(query, fp4_index_hip.Fp4IndexQuery), (
+        "FP4 index-K needs the FP4 prologue"
+    )
+    pool = get_token_to_kv_pool()
+    page_size = pool.index_page_size
+    block_tables = metadata.get_page_table_64()
+    mode = forward_batch.forward_mode
+    if mode.is_target_verify() or mode.is_draft_extend_v2():
+        seqlens_32 = metadata.get_seqlens_expanded()
+    else:
+        seqlens_32 = metadata.get_seqlens_int32()
+    q_offset = sum(metadata.get_dsa_extend_len_cpu())
+    B = metadata.get_seqlens_int32().shape[0]
+    next_n = max(q_offset // B if B > 0 else 1, 1)
+    local_lens = dcp_local_lens(
+        forward_batch, layer_id, seqlens_32.reshape(-1, 1), dcp_size, dcp_rank
+    ).view(-1)[:q_offset]
+    request_tables, query_starts = fp4_request_rows(
+        forward_batch, layer_id, block_tables, q_offset, next_n
+    )
+    logits = fp4_index_hip.fp4_paged_mqa_logits(
+        query[:q_offset],
+        weights[:q_offset].squeeze(-1),
+        *pool.get_index_k_fp4_buffers(layer_id),
+        request_tables,
+        query_starts,
+        local_lens,
+        block_tables.shape[1] * page_size,
+    )
+    # attention reads local KV slots and their counts
+    return dcp_local_topk(
+        logits,
+        local_lens,
+        seqlens_32.view(-1)[:q_offset],
+        block_tables,
+        indexer.index_topk,
+        page_size,
+        metadata.attn_metadata.topk_v2_plan,
+        metadata.attn_metadata.dcp_topk_length,
+    )
