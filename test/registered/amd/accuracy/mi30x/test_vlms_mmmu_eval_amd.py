@@ -7,6 +7,7 @@ Models are selected based on compatibility with AMD/ROCm platform.
 VLMs tested here:
 - Qwen VL series (Qwen2.5-VL-7B, Qwen3-VL-30B)
 - InternVL2 series (InternVL2_5-2B)
+- MiniCPM-o (MiniCPM-o-2_6)
 - DeepSeek VL series (deepseek-vl2-small, Janus-Pro-7B, DeepSeek-OCR-2)
 - Kimi VL (Kimi-VL-A3B-Instruct)
 - MiMo VL (MiMo-VL-7B-RL)
@@ -59,6 +60,12 @@ AMD_VLM_MODELS = [
         "model_path": "OpenGVLab/InternVL2_5-2B",
         "tp_size": 1,
         "accuracy_threshold": 0.29,
+        "extra_args": ["--trust-remote-code"],
+    },
+    {
+        "model_path": "openbmb/MiniCPM-o-2_6",
+        "tp_size": 1,
+        "accuracy_threshold": 0.32,
         "extra_args": ["--trust-remote-code"],
     },
     # DeepSeek VL series
