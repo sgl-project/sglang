@@ -23,7 +23,6 @@ from sglang.test.ascend.test_npu_rl_utils import (
     generation_signature,
     health,
     load_checkpoint_tensor,
-    npu_available,
     npu_device_count,
     npu_rl_env,
     npu_server,
@@ -58,10 +57,7 @@ MASTER_ADDR = os.environ.get("SGLANG_TEST_HCCL_MASTER_ADDR", "127.0.0.1")
 NORM_WEIGHT = "model.norm.weight"
 
 
-@unittest.skipUnless(
-    npu_available() and npu_device_count() >= 2, "requires at least 2 Ascend NPUs"
-)
-@unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
+@unittest.skipUnless(npu_device_count() >= 2, "requires at least 2 Ascend NPUs")
 class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
     @classmethod
     def setUpClass(cls):

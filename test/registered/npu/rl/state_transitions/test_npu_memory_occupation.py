@@ -5,7 +5,6 @@ back between RL steps. These tests assert that the memory is actually released
 and that a resumed engine still produces the same output.
 """
 
-import os
 import unittest
 
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
@@ -15,7 +14,6 @@ from sglang.test.ascend.test_npu_rl_utils import (
     generation_signature,
     get,
     health,
-    npu_available,
     npu_free_bytes,
     npu_rl_env,
     npu_server,
@@ -50,8 +48,6 @@ MEMORY_ARGS = BASE_ARGS + ("--enable-memory-saver", "--enable-weights-cpu-backup
 NO_MEMORY_ARGS = BASE_ARGS
 
 
-@unittest.skipUnless(npu_available(), "requires an Ascend NPU")
-@unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
 class TestNpuMemoryOccupation(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -103,8 +99,6 @@ class TestNpuMemoryOccupation(CustomTestCase):
         self.assertEqual(actual, golden, "staged resume changed the output")
 
 
-@unittest.skipUnless(npu_available(), "requires an Ascend NPU")
-@unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
 class TestNpuMemoryOccupationFreshServer(CustomTestCase):
     def test_release_resume_on_fresh_server(self):
         # Keep one case on a freshly-started engine: the shared-server cases
@@ -119,8 +113,6 @@ class TestNpuMemoryOccupationFreshServer(CustomTestCase):
             self.assertEqual(actual, golden, "fresh-server resume changed the output")
 
 
-@unittest.skipUnless(npu_available(), "requires an Ascend NPU")
-@unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
 class TestNpuMemoryOccupationWithoutFlag(CustomTestCase):
     @classmethod
     def setUpClass(cls):

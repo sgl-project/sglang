@@ -4,7 +4,6 @@ The scheduler must drain or freeze in-flight requests without emitting tokens
 from a half-updated model, and must resume the same requests afterwards.
 """
 
-import os
 import threading
 import time
 import unittest
@@ -20,7 +19,6 @@ from sglang.test.ascend.test_npu_rl_utils import (
     generate,
     generation_signature,
     load_checkpoint_tensor,
-    npu_available,
     npu_rl_env,
     npu_server,
     pause_generation,
@@ -57,8 +55,6 @@ SHORT_PROMPT = PROMPTS[0]
 NORM_WEIGHT = "model.norm.weight"
 
 
-@unittest.skipUnless(npu_available(), "requires an Ascend NPU")
-@unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
 class TestNpuPauseContinue(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -248,8 +244,6 @@ class TestNpuPauseContinue(CustomTestCase):
         self.assertTrue(generate(self.base_url, SHORT_PROMPT, max_new_tokens=4))
 
 
-@unittest.skipUnless(npu_available(), "requires an Ascend NPU")
-@unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
 class TestNpuPauseContinueQueued(CustomTestCase):
     """Pause behavior with one running request and one queued request."""
 
