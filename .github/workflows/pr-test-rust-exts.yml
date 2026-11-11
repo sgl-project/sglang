@@ -26,7 +26,10 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: rust-exts-${{ github.ref }}
+  # A label other than `run-ci` (`highest-priority`, ...) is skipped by the
+  # job `if` below, but it must not cancel the run in progress on its way
+  # to being skipped, so it gets a group of its own.
+  group: rust-exts-${{ github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && github.run_id || 'checks' }}
   cancel-in-progress: true
 
 jobs:

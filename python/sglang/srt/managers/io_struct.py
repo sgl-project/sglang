@@ -64,12 +64,12 @@ from sglang.srt.managers.req_types import (
     SamplingLogprobsMode,
     get_return_hidden_states_mode,
 )
-from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.multimodal.media_io import ImageData, VideoData
+from sglang.srt.multimodal.mm_utils import batch_single_media_input, has_valid_data
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import ImageData, VideoData
+from sglang.srt.sampling.sampling_params import SamplingParams, validate_n
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgpack_utils import (
     dec_hook,
@@ -82,6 +82,7 @@ from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
     msgspec_struct_pydantic_core_schema,
 )
+from sglang.srt.utils.rid_utils import expand_base_rid
 from sglang.srt.utils.weight_versions import WeightVersionSpans
 
 # Handle serialization of Image for pydantic
@@ -146,19 +147,17 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # The session identifier. Used by the scheduler to look up or create the
     # Session object that groups all requests in a multi-turn conversation.
     id: Optional[str] = None
-    # A request identifier *within* the session. In non-streaming sessions the
-    # session maintains a tree of request nodes keyed by rid; this field selects
-    # which node to continue from (append) or replace. When None the default
-    # branch point is used (latest node for streaming, all nodes cleared on
-    # replace).
+    # A request identifier *within* the session: the turn to continue from. A
+    # non-streaming session keeps every turn by rid, so a new turn may continue
+    # from any of them. When None, a streaming session continues from its
+    # latest turn and a non-streaming one starts with no history.
     rid: Optional[str] = None
     # Token-level insertion point. When set, the new request's tokens are
     # spliced into the accumulated context at this position instead of being
     # appended at the end (i.e. ``context[:offset] + new_tokens``).
     offset: Optional[int] = None
-    # When True, the request node identified by ``rid`` (or all nodes if
-    # ``rid`` is None) is aborted and its children are cleared before the new
-    # request is inserted. Not supported in streaming sessions.
+    # Unsupported: a request that sets it is rejected. The field keeps the
+    # positional (array_like) wire layout of the fields after it.
     replace: Optional[bool] = None
     # When True, the previous request's generated output tokens are excluded
     # from the accumulated context so the new turn sees only the original input.
@@ -181,6 +180,40 @@ MultimodalDataInputFormat = Union[
     List[MultimodalDataInputItem],
     MultimodalDataInputItem,
 ]
+
+# Each routing label is copied into every BlockStored span that covers its
+# item, so a long label multiplies KV event payloads.
+MAX_MM_ROUTING_LABEL_BYTES = 128
+
+
+def _mm_input_count(*media) -> int:
+    """Media inputs in one request's image, video and audio data."""
+    count = 0
+    for data in media:
+        if isinstance(data, list):
+            count += sum(item is not None for item in data)
+        elif data is not None:
+            count += 1
+    return count
+
+
+def _check_mm_routing_labels(labels, field_name: str, input_count: int) -> None:
+    """Require one string per media input, each at most MAX_MM_ROUTING_LABEL_BYTES."""
+    if not isinstance(labels, list):
+        raise ValueError(f"{field_name} must be a list of strings")
+    if len(labels) != input_count:
+        raise ValueError(
+            f"{field_name} has {len(labels)} labels for {input_count} "
+            "image, video and audio inputs"
+        )
+    for label in labels:
+        if not isinstance(label, str):
+            raise ValueError(f"{field_name} must contain only strings")
+        if len(label.encode("utf-8")) > MAX_MM_ROUTING_LABEL_BYTES:
+            raise ValueError(
+                f"{field_name} has a label longer than "
+                f"{MAX_MM_ROUTING_LABEL_BYTES} bytes"
+            )
 
 
 @dataclass
@@ -215,17 +248,25 @@ class GenerateReqInput:
     # Optional per-image hashes the caller has already computed (hex strings).
     # Single request: one hash per image. Batch request: either one hash per
     # request when each request has one image, or one list of hashes per request.
-    # When supplied, each MultimodalDataItem's
-    # `hash` is initialised from this list and `set_pad_value` skips the
-    # internal `hash_feature()` recompute, so the resulting `pad_value` is
-    # deterministic from the caller's hash. Intended for external KV routers
-    # that compute their own per-image hash for routing decisions and need
-    # sglang's prefix-cache key to align. When unset, behavior is unchanged
-    # (sglang hashes the processor feature tensor).
+    # Legacy routing hints, ignored for cache identity. The server identifies
+    # actual content, shape, dtype, and processor configuration independently;
+    # identical caller hashes cannot authorize sharing between different media.
     mm_hashes: Optional[Union[List[str], List[List[str]]]] = None
-    # Optional `sha256:<64-hex>` identities for the original media contents. Unlike
-    # mm_hashes, these identify processor inputs and never replace the
-    # processor-output feature hash used by the embedding/prefix cache.
+    # Optional caller routing labels, one opaque string per media input: the
+    # image_data labels first, then video_data, then audio_data, each in input
+    # order. The count must equal the request's media inputs. An empty string
+    # leaves an input unlabeled. Labels are matched to processed items within
+    # each media type, since each type's inputs fill its placeholders in
+    # order; a type whose processing does not yield one item per input stays
+    # unlabeled. Each label is at most
+    # MAX_MM_ROUTING_LABEL_BYTES in UTF-8. Batch request: one list per request,
+    # or one string for a request with one input. Routing metadata only: they
+    # never affect identity, caching or reuse. KV events in the "dynamo"
+    # format report them back as `mm_routing_spans` on BlockStored; other
+    # formats ignore them.
+    mm_routing_labels: Optional[Union[List[str], List[List[str]]]] = None
+    # Optional `sha256:<64-hex>` identities verified against original media
+    # contents. They do not replace the embedding/prefix-cache identity.
     mm_content_hashes: Optional[
         Union[List[Optional[str]], List[List[Optional[str]]]]
     ] = None
@@ -413,6 +454,22 @@ class GenerateReqInput:
             or has_valid_data(self.audio_data)
         )
 
+    def mm_routing_labels_by_modality(self) -> Optional[Dict[str, List[str]]]:
+        """This request's routing labels split by media type, in input order."""
+        if not self.mm_routing_labels:
+            return None
+        grouped, start = {}, 0
+        for modality, data in (
+            ("image", self.image_data),
+            ("video", self.video_data),
+            ("audio", self.audio_data),
+        ):
+            count = _mm_input_count(data)
+            if count:
+                grouped[modality] = self.mm_routing_labels[start : start + count]
+                start += count
+        return grouped
+
     def normalize_batch_and_arguments(self):
         """
         Normalize the batch size and arguments for the request.
@@ -544,12 +601,13 @@ class GenerateReqInput:
         if self.sampling_params is None:
             self.parallel_sample_num = 1
             return
+        # Validate before inputs are expanded n times; verify() runs too late.
         elif isinstance(self.sampling_params, dict):
-            self.parallel_sample_num = self.sampling_params.get("n", 1)
+            self.parallel_sample_num = validate_n(self.sampling_params.get("n", 1))
         else:  # isinstance(self.sampling_params, list):
-            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
+            self.parallel_sample_num = validate_n(self.sampling_params[0].get("n", 1))
             for sampling_params in self.sampling_params:
-                if self.parallel_sample_num != sampling_params.get("n", 1):
+                if self.parallel_sample_num != validate_n(sampling_params.get("n", 1)):
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
@@ -565,23 +623,21 @@ class GenerateReqInput:
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
-            # A single request's media list holds all of its items; batch fields hold one entry per request.
-            # A list that is already one entry per request (e.g. [["a.png", "b.png"]]) is kept as is.
-            for field_name in (
-                "image_data",
-                "video_data",
-                "audio_data",
-                "mm_hashes",
-                "mm_content_hashes",
-            ):
-                value = getattr(self, field_name)
-                if isinstance(value, list) and value and not isinstance(value[0], list):
-                    setattr(self, field_name, [value])
+            if self.mm_routing_labels is not None:
+                self.mm_routing_labels = [self.mm_routing_labels]
+            # keep each request's media and hashes together, including empty lists
+            self.image_data = batch_single_media_input(self.image_data)
+            self.video_data = batch_single_media_input(self.video_data)
+            self.audio_data = batch_single_media_input(self.audio_data)
+            self.mm_hashes = batch_single_media_input(self.mm_hashes)
+            self.mm_content_hashes = batch_single_media_input(self.mm_content_hashes)
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
         if self.sampling_params is None:
             self.sampling_params = {}
+        else:
+            self.sampling_params = self.sampling_params.copy()
         if self.rid is None:
             self.rid = uuid.uuid4().hex
         if self.return_logprob is None:
@@ -602,6 +658,12 @@ class GenerateReqInput:
                 )
             if value == "":
                 setattr(self, field_name, None)
+        if self.mm_routing_labels is not None:
+            _check_mm_routing_labels(
+                self.mm_routing_labels,
+                "mm_routing_labels",
+                _mm_input_count(self.image_data, self.video_data, self.audio_data),
+            )
         if isinstance(self.kv_hints, list):
             raise ValueError("kv_hints should be a single envelope for one request.")
         self.kv_hints = (
@@ -625,6 +687,7 @@ class GenerateReqInput:
         self._normalize_mm_hashes(num)
         self._normalize_video_data(num)
         self._normalize_audio_data(num)
+        self._normalize_mm_routing_labels(num)
         self._normalize_sampling_params(num)
         self._normalize_watermark(num)
         self._normalize_logprob_params(num)
@@ -741,9 +804,42 @@ class GenerateReqInput:
                 normalized.append(per_request)
             setattr(self, field_name, normalized * self.parallel_sample_num)
 
+    def _normalize_mm_routing_labels(self, num):
+        """Split batched routing labels per request and validate them.
+
+        Runs after image, video and audio normalization: each request's
+        labels are counted against its inputs of every modality.
+        """
+        labels = self.mm_routing_labels
+        if labels is None:
+            self.mm_routing_labels = [None] * num
+            return
+        if not isinstance(labels, list) or len(labels) != self.batch_size:
+            raise ValueError(
+                "mm_routing_labels must be a list with one entry per request"
+            )
+        normalized = []
+        for request_index, request_labels in enumerate(labels):
+            if isinstance(request_labels, str):
+                request_labels = [request_labels]
+            if request_labels is not None:
+                _check_mm_routing_labels(
+                    request_labels,
+                    f"mm_routing_labels[{request_index}]",
+                    _mm_input_count(
+                        self.image_data[request_index],
+                        self.video_data[request_index],
+                        self.audio_data[request_index],
+                    ),
+                )
+            normalized.append(request_labels)
+        self.mm_routing_labels = normalized * self.parallel_sample_num
+
     def _normalize_video_data(self, num):
         """Normalize video data for batch processing."""
-        if self.video_data is None:
+        if self.video_data is None or (
+            isinstance(self.video_data, list) and not self.video_data
+        ):
             self.video_data = [None] * num
         elif not isinstance(self.video_data, list):
             self.video_data = [self.video_data] * num
@@ -752,7 +848,9 @@ class GenerateReqInput:
 
     def _normalize_audio_data(self, num):
         """Normalize audio data for batch processing."""
-        if self.audio_data is None:
+        if self.audio_data is None or (
+            isinstance(self.audio_data, list) and not self.audio_data
+        ):
             self.audio_data = [None] * num
         elif not isinstance(self.audio_data, list):
             self.audio_data = [self.audio_data] * num
@@ -762,11 +860,15 @@ class GenerateReqInput:
     def _normalize_sampling_params(self, num):
         """Normalize sampling parameters for batch processing."""
         if self.sampling_params is None:
-            self.sampling_params = [{}] * num
+            self.sampling_params = [{} for _ in range(num)]
         elif isinstance(self.sampling_params, dict):
-            self.sampling_params = [self.sampling_params] * num
+            self.sampling_params = [self.sampling_params.copy() for _ in range(num)]
         else:  # Already a list
-            self.sampling_params = self.sampling_params * self.parallel_sample_num
+            self.sampling_params = [
+                params.copy()
+                for params in self.sampling_params * self.parallel_sample_num
+            ]
+        self.__dict__.pop("_sub_obj_cache", None)
 
     def _normalize_watermark(self, num):
         if isinstance(self.watermark, list):
@@ -783,6 +885,7 @@ class GenerateReqInput:
         if self.rid is None:
             self.rid = [uuid.uuid4().hex for _ in range(num)]
         elif isinstance(self.rid, str):
+            # Unpadded on purpose: clients and the Rust server rebuild `<rid>_<i>`.
             new_rids = [f"{self.rid}_{i}" for i in range(num)]
             self.rid = new_rids
         elif isinstance(self.rid, list):
@@ -996,6 +1099,11 @@ class GenerateReqInput:
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
             mm_hashes=self.mm_hashes[i] if self.mm_hashes is not None else None,
+            mm_routing_labels=(
+                self.mm_routing_labels[i]
+                if self.mm_routing_labels is not None
+                else None
+            ),
             mm_content_hashes=(
                 self.mm_content_hashes[i]
                 if self.mm_content_hashes is not None
@@ -1199,6 +1307,11 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+    # GenerateReqInput.mm_routing_labels split by media type ("image",
+    # "video", "audio"). Carried for multimodal inputs assembled in the
+    # scheduler (encoder disaggregation). A defaulted tail field, so older
+    # IPC senders decode as None.
+    mm_routing_labels: Optional[Dict[str, List[str]]] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
@@ -1396,22 +1509,33 @@ class EmbeddingReqInput:
                 self.rid = uuid.uuid4().hex
             if self.sampling_params is None:
                 self.sampling_params = {}
+            else:
+                self.sampling_params = self.sampling_params.copy()
             self.sampling_params["max_new_tokens"] = 0
         else:
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
+            elif isinstance(self.rid, str):
+                self.rid = expand_base_rid(self.rid, self.batch_size)
             else:
                 assert isinstance(self.rid, list), "The rid should be a list."
 
             if self.sampling_params is None:
-                self.sampling_params = [{}] * self.batch_size
+                self.sampling_params = [{} for _ in range(self.batch_size)]
             elif isinstance(self.sampling_params, dict):
-                self.sampling_params = [self.sampling_params] * self.batch_size
+                self.sampling_params = [
+                    self.sampling_params.copy() for _ in range(self.batch_size)
+                ]
+            else:
+                self.sampling_params = [
+                    params.copy() for params in self.sampling_params
+                ]
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
             self._normalize_lora_paths(self.batch_size)
 
+        self.__dict__.pop("_sub_obj_cache", None)
         self._validate_rid_uniqueness()
 
     def _validate_mm_batch_lengths(self):
@@ -2025,7 +2149,7 @@ class ContinueGenerationReqInput(BaseReq, kw_only=True):
 
 
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
-    """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
+    """Sent by each tokenizer worker on startup to register its IPC name with the router."""
 
     worker_ipc_name: str
 
@@ -2250,7 +2374,8 @@ class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    success: bool
+    message: str
 
 
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
@@ -2283,6 +2408,47 @@ class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
     message: str
 
 
+class PluginWeightUpdateReqInput(BaseReq, kw_only=True):
+    """Receive weights through a platform transport and load them, as
+    UpdateWeightsFromDistributedReqInput does over a torch.distributed group."""
+
+    # a key of SRTPlatform.get_weight_update_handlers()
+    handler: str
+    # what the transport needs to receive this bucket, e.g. names, dtypes, shapes, sources
+    payload: Dict[str, Any] = {}
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+    # which runners the op applies to
+    selector: Literal["target", "draft", "all"] = "all"
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
+
+
+class PluginWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    # how many tensors each TP rank received, in rank order; load_weights skips names the
+    # model does not know, so this is not a count of parameters written
+    received_tensor_counts: List[int] = []
+
+    @classmethod
+    def merged(cls, replies: List[PluginWeightUpdateReqOutput]):
+        """One reply per attention-DP leader; all must succeed.
+
+        Every leader gathered the same TP-wide counts, so the first reply's stand.
+        """
+        success = all(reply.success for reply in replies)
+        return cls(
+            success=success,
+            message=" | ".join(reply.message for reply in replies),
+            received_tensor_counts=replies[0].received_tensor_counts if success else [],
+        )
+
+
 class CheckWeightsReqInput(BaseReq, kw_only=True):
     action: str = "checksum"
     allow_quant_error: bool = False
@@ -2294,7 +2460,7 @@ class CheckWeightsReqInput(BaseReq, kw_only=True):
 
 
 # Wire versions of the pydantic ParallelismInfo/ChecksumInfo in
-# sglang.srt.utils.weight_checker. Not array_like: the payload is read by field
+# sglang.srt.model_executor.weight_checker. Not array_like: the payload is read by field
 # name and re-serialized to JSON, so it must stay a {field: value} map.
 class ParallelismInfo(msgspec.Struct, kw_only=True):
     # "target", or a draft role such as "draft" / "draft_step_0"
@@ -2365,6 +2531,10 @@ class AbortReq(BaseReq, kw_only=True):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
             self.rid = ""
+
+    def matches(self, rid: str) -> bool:
+        """Whether this abort targets the request `rid`."""
+        return self.abort_all or rid.startswith(self.rid)
 
 
 class EncoderDispatchErrorReq(BaseReq, kw_only=True):

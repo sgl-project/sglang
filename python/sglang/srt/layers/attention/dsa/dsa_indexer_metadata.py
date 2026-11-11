@@ -103,6 +103,9 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
     dcp_size: int = 1
+    # prefill-CP shards also take the exact v2 packed PAGED extend top-k
+    # (see DSATopKBackend); unsharded batches take it either way
+    packed_extend_topk: bool = False
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
@@ -175,4 +178,5 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             row_starts=ks,
             batch_idx_list=batch_idx_list,
             force_unfused_topk=self.force_unfused_topk,
+            packed_extend_topk=self.packed_extend_topk,
         )

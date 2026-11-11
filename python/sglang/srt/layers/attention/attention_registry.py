@@ -240,6 +240,13 @@ def create_dsv4_backend(runner):
         return backend
 
 
+@register_attention_backend("ernie55")
+def create_ernie55_backend(runner):
+    from sglang.srt.layers.attention.ernie55_backend import Ernie5_5AttnBackend
+
+    return Ernie5_5AttnBackend(runner)
+
+
 @register_attention_backend("triton")
 def create_triton_backend(runner):
     assert not runner.model_config.is_encoder_decoder, (

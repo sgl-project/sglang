@@ -293,7 +293,12 @@ class ServerArgs:
         return getattr(self, "_launch_command", None)
 
     def __repr__(self) -> str:
-        hidden = {"watermark_key", "watermark_key_b", "watermark_config"}
+        hidden = {
+            "watermark_key",
+            "watermark_key_b",
+            "watermark_config",
+            *SERVER_ARGS_SECRET_FIELD_NAMES,
+        }
         values = ", ".join(
             f"{field.name}={getattr(self, field.name)!r}"
             for field in record_fields(type(self))
@@ -438,9 +443,9 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def get_tokenizer_worker_class(self):
-        from sglang.srt.managers.multi_tokenizer_mixin import TokenizerWorker
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
-        return TokenizerWorker
+        return TokenizerManager
 
     def url(self, port: int | None = None):
         scheme = "https" if self.ssl_certfile else "http"
@@ -561,7 +566,11 @@ def resolve_encoder_transfer_backend(
 ) -> str:
     if backend != "auto":
         return backend
-    if model_arch == "KimiK3ForConditionalGeneration" and tp_size > 1:
+    if (
+        model_arch
+        in ("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
+        and tp_size > 1
+    ):
         return "zmq_to_tokenizer"
     return "zmq_to_scheduler"
 
@@ -653,6 +662,86 @@ def _declared_default(name: str):
     )
 
 
+# Credentials -- the access keys and the TLS key's password: no display, log or
+# dump of the configuration carries them.
+SERVER_ARGS_SECRET_FIELD_NAMES = frozenset(
+    {"api_key", "admin_api_key", "ssl_keyfile_password"}
+)
+_REDACTED = "<redacted>"
+
+
+def redact_server_args_secrets(values: dict[str, Any]) -> dict[str, Any]:
+    """A copy of a server-args mapping with the credentials and the watermark
+    secrets replaced. An unset credential stays None, so readers can still
+    tell whether one is configured."""
+    # lazy: watermark imports torch, outside server_args' top-level boundary.
+    from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+
+    return redact_watermark_secrets(
+        {
+            name: (
+                _REDACTED
+                if name in SERVER_ARGS_SECRET_FIELD_NAMES and value is not None
+                else value
+            )
+            for name, value in values.items()
+        }
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _default_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="sglang serve")
+    ServerArgs.add_cli_args(parser)
+    return parser
+
+
+def redact_secret_cli_args(
+    argv: list[str], parser: argparse.ArgumentParser | None = None
+) -> list[str]:
+    """``argv`` with the value of every credential flag replaced.
+
+    Options are matched as argparse matches them -- the exact spelling,
+    ``--flag=value`` and, since argparse accepts any unambiguous prefix, an
+    abbreviation -- so each occurrence is redacted whatever its value contains.
+    A prefix that also matches other options is redacted too: argparse rejects
+    it, so it cannot have reached a running server.
+    """
+    parser = parser or _default_cli_parser()
+    options = {
+        option: action.dest in SERVER_ARGS_SECRET_FIELD_NAMES
+        for action in parser._actions
+        for option in action.option_strings
+        if option.startswith("--")
+    }
+    secret_options = [option for option, secret in options.items() if secret]
+
+    def is_secret(name: str) -> bool:
+        if name in options:
+            return options[name]
+        return parser.allow_abbrev and any(
+            option.startswith(name) for option in secret_options
+        )
+
+    result: list[str] = []
+    redact_next = False
+    for index, argument in enumerate(argv):
+        if redact_next:
+            result.append(_REDACTED)
+            redact_next = False
+            continue
+        if argument == "--":
+            result.extend(argv[index:])
+            break
+        name, separator, _ = argument.partition("=")
+        if argument.startswith("--") and is_secret(name):
+            result.append(f"{name}={_REDACTED}" if separator else name)
+            redact_next = not separator
+            continue
+        result.append(argument)
+    return result
+
+
 def prepare_server_args(argv: list[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -703,7 +792,7 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     from sglang.srt.sampling.watermarking.core import redact_watermark_command_line
 
     server_args._launch_command = redact_watermark_command_line(
-        argv, raw_args.watermark_config
+        redact_secret_cli_args(argv, parser), raw_args.watermark_config
     )
     return server_args
 
@@ -735,7 +824,7 @@ class PortArgs:
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
 
-    # The ipc filename for MultiTokenizerRouter to receive inputs from TokenizerWorker processes (zmq)
+    # The ipc filename for MultiTokenizerRouter to receive inputs from tokenizer worker processes (zmq)
     tokenizer_worker_ipc_name: str | None
 
     # The ipc endpoints between verifier scheduler and drafter scheduler
