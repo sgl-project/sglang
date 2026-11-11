@@ -37,10 +37,6 @@ class UpdateWeightsFromGpuDeltaReqInput(PrepareGpuDeltaReqInput, kw_only=True):
     weight_version: str | None = None
 
 
-class GetGpuDeltaStatusReqInput(BaseReq, kw_only=True):
-    session_id: str
-
-
 class ApplyGpuDeltaReqInput(BaseReq, kw_only=True):
     session_id: str
     flush_cache: bool = True
@@ -70,7 +66,6 @@ hook_custom_types(
     ReleaseGpuDeltaCacheReqInput,
     GetGpuDeltaInfoReqInput,
     PrepareGpuDeltaReqInput,
-    GetGpuDeltaStatusReqInput,
     ApplyGpuDeltaReqInput,
     AbortGpuDeltaReqInput,
     ResumeGpuDeltaReqInput,

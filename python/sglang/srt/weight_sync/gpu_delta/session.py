@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -24,8 +24,10 @@ from sglang.srt.weight_sync.gpu_delta import profiling
 
 
 @dataclass
-class _Session:
+class _Update:
     request: dict
+    prepare_future: Future | None = None
+    release_future: Future | None = None
     cancelled: threading.Event = field(default_factory=threading.Event)
     state: str = "PREPARING"
     message: str = ""
@@ -50,10 +52,7 @@ class DeltaSession:
         self.identity = identity
         self.backend = backend
         self.version = initial_version
-        self._session: _Session | None = None
-        self._provenance = {}
-        self._cleanup_future = None
-        self._prepare_future = None
+        self._update: _Update | None = None
         self._closed_cache = None
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(
@@ -62,19 +61,31 @@ class DeltaSession:
 
     def status(self) -> dict:
         with self._lock:
-            session = self._session
+            session = self._update
             if session is None:
                 return {
                     "identity": self.identity,
                     "state": "CLEARED" if self.backend is None else "IDLE",
                     "version": self.version,
-                    **self._provenance,
                 }
             return {
                 "identity": self.identity,
-                "state": session.state,
+                "state": ("IDLE" if self.backend is not None else "CLEARED")
+                if session.state == "CLEARED"
+                else session.state,
                 "message": session.message,
-                **self._provenance,
+                **({"version": self.version} if session.state == "CLEARED" else {}),
+                **{
+                    key: session.request[key]
+                    for key in (
+                        "session_id",
+                        "manifest_sha256",
+                        "stream_id",
+                        "base_version",
+                        "target_version",
+                        "plan_digest",
+                    )
+                },
                 "result": session.result,
                 # One original process's clock, never subtract across ranks.
                 # Open/failed pauses have no qualified completed duration.
@@ -92,17 +103,16 @@ class DeltaSession:
                 },
             }
 
-    def prepare(self, request: dict) -> dict:
+    def prepare(self, request: dict) -> Future:
         with self._lock:
-            if self._session is not None and self._session.state != "RESUMED":
-                raise ValueError("unsettled delta session requires restart")
-            if (
-                self._provenance
-                and request["stream_id"] != self._provenance["stream_id"]
-            ):
-                raise ValueError("receiver incarnation belongs to another delta stream")
-            if self._prepare_future is not None and self._prepare_future.done():
-                self._prepare_future.result()
+            previous = self._update
+            if previous is not None:
+                if previous.state not in {"RESUMED", "CLEARED"}:
+                    raise ValueError("unsettled delta session requires restart")
+                if request["stream_id"] != previous.request["stream_id"]:
+                    raise ValueError(
+                        "receiver incarnation belongs to another delta stream"
+                    )
             if (
                 request["base_version"] != self.version
                 or request["target_version"] <= self.version
@@ -110,35 +120,28 @@ class DeltaSession:
                 raise ValueError(
                     "delta base version differs from committed local version"
                 )
-            self._provenance = {
-                key: request[key]
-                for key in (
-                    "session_id",
-                    "manifest_sha256",
-                    "stream_id",
-                    "base_version",
-                    "target_version",
-                    "plan_digest",
-                )
-            }
-            session = self._session = _Session(request=request)
-            self._prepare_future = self._executor.submit(self._prepare, session)
-            return self.status()
+            session = self._update = _Update(request=request)
+            session.prepare_future = self._executor.submit(
+                self._prepare, session, previous
+            )
+            return session.prepare_future
 
-    def _transaction(self, session_id: str) -> _Session:
-        session = self._session
+    def _transaction(self, session_id: str) -> _Update:
+        session = self._update
         if session is None or session.request["session_id"] != session_id:
             raise ValueError("delta operation belongs to a different session")
         return session
 
     @profiling.annotate("gpu_delta.prepare")
-    def _prepare(self, session: _Session) -> None:
+    def _prepare(self, session: _Update, previous: _Update | None) -> dict:
         prepared = None
         try:
-            # The FIFO worker has finished the previous cleanup. Propagate its
-            # failure before reusing buffers or replacing its completion future.
-            if self._cleanup_future is not None:
-                self._cleanup_future.result()
+            # The FIFO worker has finished the previous update. Propagate any
+            # failed release before reusing its persistent backend resources.
+            if previous is not None:
+                for future in (previous.prepare_future, previous.release_future):
+                    if future is not None:
+                        future.result()
             prepared = self.backend.prepare(session.request, session.cancelled)
             with self._lock:
                 if session.state != "ABORTED":
@@ -153,6 +156,7 @@ class DeltaSession:
         finally:
             if prepared is not None:
                 self.backend.discard(prepared)
+        return self.status()
 
     @profiling.annotate("gpu_delta.scheduler.apply")
     def apply(
@@ -235,12 +239,12 @@ class DeltaSession:
             prepared, session.prepared = session.prepared, None
             # Keep host release I/O off the scheduler; this FIFO executor runs
             # it before the next prepare. Resume follows the all-rank apply barrier.
-            self._cleanup_future = self._executor.submit(prepared.release_and_close)
+            session.release_future = self._executor.submit(prepared.close, True)
             return self.status()
 
     def abort(self, session_id: str) -> dict:
         with self._lock:
-            if self._session is None:
+            if self._update is None:
                 return {
                     "identity": self.identity,
                     "state": "ABORTED",
@@ -255,30 +259,35 @@ class DeltaSession:
             session.cancelled.set()
             if session.prepared is not None:
                 prepared, session.prepared = session.prepared, None
-                self._cleanup_future = self._executor.submit(
+                session.release_future = self._executor.submit(
                     self.backend.discard, prepared
                 )
             return self.status()
 
     def clear(self) -> dict:
         with self._lock:
-            if self._session is not None and self._session.state != "RESUMED":
+            if self._update is not None and self._update.state not in {
+                "RESUMED",
+                "CLEARED",
+            }:
                 raise ValueError("delta state can only be cleared when idle or resumed")
         # Do not hold the session lock while joining its background worker. The
         # queued resume release must finish before closing the arena or unlinking
         # the shared READY state that other ranks' releases still need.
         self._executor.shutdown(wait=True)
-        if self._prepare_future is not None:
-            self._prepare_future.result()
-        if self._cleanup_future is not None:
-            self._cleanup_future.result()
+        if self._update is not None:
+            for future in (self._update.prepare_future, self._update.release_future):
+                if future is not None:
+                    future.result()
         if self.backend is not None:
             self._closed_cache = self.backend.host_arena.directory
             self.backend.close()
             self.backend = None
         with self._lock:
-            self._session = None
-            self._cleanup_future = self._prepare_future = None
+            if self._update is not None:
+                self._update.state = "CLEARED"
+                self._update.result = {}
+                self._update.prepare_future = self._update.release_future = None
             return self.status()
 
     def release_cache(self, owner: bool) -> dict:
@@ -317,7 +326,6 @@ def with_gpu_delta_controls(scheduler, dispatcher):
             (delta_io.ClearGpuDeltaStateReqInput, control.handle),
             (delta_io.ReleaseGpuDeltaCacheReqInput, control.handle),
             (delta_io.PrepareGpuDeltaReqInput, control.handle),
-            (delta_io.GetGpuDeltaStatusReqInput, control.handle),
             (delta_io.ApplyGpuDeltaReqInput, control.handle),
             (delta_io.AbortGpuDeltaReqInput, control.handle),
             (delta_io.ResumeGpuDeltaReqInput, control.handle),
@@ -333,6 +341,36 @@ class GpuDeltaSchedulerControl:
         self.scheduler = scheduler
         self.reply_groups = reply_groups
         self.session: DeltaSession | None = None
+
+    def _prepare_completed(self, request, future):
+        try:
+            receipt = future.result()
+        except Exception as exc:
+            self._reply_prepare(request, self.session.status(), False, str(exc))
+        else:
+            self._reply_prepare(request, receipt, receipt["state"] == "PREPARED")
+
+    def _reply_prepare(self, request, receipt, success, message=""):
+        # Each rank replies from its preparation worker without entering any
+        # inference collective or sharing the scheduler's thread-owned socket.
+        import zmq
+
+        from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
+        from sglang.srt.utils.network import get_zmq_socket
+
+        receipt["generation_paused"] = self.scheduler._engine_paused
+        with get_zmq_socket(
+            zmq.Context.instance(), zmq.PUSH, request.http_worker_ipc, False
+        ) as socket:
+            SenderWrapper(socket).send_output(
+                delta_io.GpuDeltaReqOutput(
+                    rid=request.rid,
+                    success=success,
+                    message=message or receipt.get("message", ""),
+                    participants=[receipt],
+                ),
+                request,
+            )
 
     def _describe(self, engine_id: str) -> dict:
         from sglang.srt.runtime_context import get_exec, get_parallel
@@ -403,7 +441,6 @@ class GpuDeltaSchedulerControl:
             "identity": self.session.identity,
             "state": self.session.status()["state"],
             "version": self.session.version,
-            "plan": self.session.backend.describe(),
         }
 
     def handle(self, request):
@@ -427,7 +464,7 @@ class GpuDeltaSchedulerControl:
                     else {"identity": None, "state": "CLEARED"}
                 )
             elif isinstance(request, delta_io.PrepareGpuDeltaReqInput):
-                receipt = self.session.prepare(
+                completion = self.session.prepare(
                     {
                         "session_id": request.session_id,
                         "manifest_path": request.manifest_path,
@@ -440,10 +477,10 @@ class GpuDeltaSchedulerControl:
                         "validate_payload_hash": request.validate_payload_hash,
                     }
                 )
-            elif isinstance(request, delta_io.GetGpuDeltaStatusReqInput):
-                receipt = self.session.status()
-                if receipt.get("session_id") != request.session_id:
-                    raise ValueError("delta status belongs to a different session")
+                completion.add_done_callback(
+                    lambda future: self._prepare_completed(request, future)
+                )
+                return None
             elif isinstance(request, delta_io.ApplyGpuDeltaReqInput):
                 session = self.session._transaction(request.session_id)
                 if session.state != "PREPARED":
@@ -492,6 +529,9 @@ class GpuDeltaSchedulerControl:
                 self.scheduler._engine_paused = True
             success, message = False, str(exc)
         receipt["generation_paused"] = self.scheduler._engine_paused
+        if isinstance(request, delta_io.PrepareGpuDeltaReqInput):
+            self._reply_prepare(request, receipt, success, message)
+            return None
         replies = [(success, message, receipt)]
         for group in self.reply_groups:
             from torch.distributed import gather_object

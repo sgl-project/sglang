@@ -27,15 +27,13 @@ import re
 import select
 import threading
 import time
-from array import array
 from concurrent.futures import ThreadPoolExecutor
-from itertools import chain
 from multiprocessing.connection import Connection
-from operator import itemgetter
 from pathlib import Path
 
 import numpy as np
 import orjson
+from safetensors.numpy import load as load_columns
 
 if os.environ.get("SGLANG_ENABLE_NVTX_OPERATIONS", "").lower() in {
     "1",
@@ -240,24 +238,22 @@ def _natural_key(name):
     )
 
 
-def _gap_values(entries, counts):
-    for ordinal, entry in enumerate(entries):
-        if entry["encoding"] == "raw_bytes":
-            continue
-        cursor = 0
-        count = 0
-        for frame in entry["frames"]:
-            start = frame["decoded_offset"]
-            if cursor < start:
-                yield cursor
-                yield start - cursor
-                count += 1
-            cursor = start + frame["decoded_bytes"]
-        if cursor < entry["nbytes"]:
-            yield cursor
-            yield entry["nbytes"] - cursor
-            count += 1
-        counts[ordinal] = count
+def _read_sidecar(publication, record):
+    path = (publication.parent / record["file"]).resolve(strict=True)
+    if path.parent != publication.parent or path.stat().st_size != record["nbytes"]:
+        raise ValueError("delta metadata path or size differs")
+    with path.open("rb") as source:
+        before = os.fstat(source.fileno())
+        raw = source.read()
+        after = os.fstat(source.fileno())
+    if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ) or hashlib.sha256(raw).hexdigest() != record["sha256"]:
+        raise ValueError("delta metadata changed or SHA256 differs")
+    return raw
 
 
 def _metadata_views(mapping, counts):
@@ -284,91 +280,86 @@ _PREPARE_METRICS = (
 
 
 @annotate("gpu_delta.host.outer_zstd_worker")
-def _decode_zstd_group(jobs, destination, backing, file_spans, ordinals, tensors, pool):
+def _decode_zstd_group(jobs, destination, backing, file_spans, columns, tensors, pool):
     from zstandard import BufferWithSegments
 
     metrics = {name: 0 for name in _PREPARE_METRICS}
-    segments, sizes, offsets = array("Q"), [], []
-    prepared_offsets = tensors["prepared_offset"]
-    for entry in jobs:
-        output_offset = int(prepared_offsets[ordinals[entry["name"]]])
-        outer = entry["outer"]
-        file_start, file_size = file_spans[outer["file"]]
-        for chunk in outer["frames"]:
-            start = outer["encoded_offset"] + chunk["encoded_offset"]
-            size = chunk["encoded_bytes"]
-            if not 0 <= start <= start + size <= file_size:
-                raise ValueError("delta payload span escapes declared file")
-            segments.append(file_start + start)
-            segments.append(size)
-            sizes.append(chunk["decoded_bytes"])
-            offsets.append(output_offset + chunk["decoded_offset"])
-        metrics["host_rank_outer_zstd_encoded_bytes"] += outer["encoded_bytes"]
-        metrics["host_rank_outer_zstd_decoded_bytes"] += outer["decoded_bytes"]
-        metrics["host_rank_outer_zstd_tensors"] += 1
-        metrics["host_rank_outer_zstd_frames"] += len(outer["frames"])
+    ends = columns["tensors.outer_end"]
+    starts = np.where(jobs == 0, 0, ends[np.maximum(jobs - 1, 0)])
+    counts = ends[jobs] - starts
+    rows = np.repeat(starts - (np.cumsum(counts) - counts), counts) + np.arange(
+        int(counts.sum())
+    )
+    owners = np.repeat(jobs, counts)
+    files = file_spans[columns["tensors.payload_file"][owners]]
+    start = (
+        columns["tensors.payload_offset"][owners]
+        + columns["outer_frames.encoded_offset"][rows]
+    )
+    size = columns["outer_frames.encoded_bytes"][rows]
+    if np.any((start < 0) | (size < 0) | (start + size > files[:, 1])):
+        raise ValueError("delta payload span escapes declared file")
+    segments = np.column_stack((files[:, 0] + start, size)).astype("<u8", copy=False)
+    sizes = columns["outer_frames.decoded_bytes"][rows]
+    offsets = (
+        tensors["prepared_offset"][owners]
+        + columns["outer_frames.decoded_offset"][rows]
+    )
+    metrics["host_rank_outer_zstd_encoded_bytes"] = int(
+        columns["tensors.payload_nbytes"][jobs].sum()
+    )
+    metrics["host_rank_outer_zstd_decoded_bytes"] = int(
+        columns["tensors.inner_nbytes"][jobs].sum()
+    )
+    metrics["host_rank_outer_zstd_tensors"] = len(jobs)
+    metrics["host_rank_outer_zstd_frames"] = len(rows)
     metrics["host_rank_outer_zstd_worker_decode_sum_s"] = pool.decode_zstd(
-        BufferWithSegments(backing, segments), sizes, offsets, destination
+        BufferWithSegments(backing, segments.tobytes()), sizes, offsets, destination
     )
     return metrics
 
 
+def _copy_tensor(ordinal, destination, backing, file_spans, columns, tensors):
+    file_start, file_size = file_spans[columns["tensors.payload_file"][ordinal]]
+    start = int(columns["tensors.payload_offset"][ordinal])
+    length = int(columns["tensors.payload_nbytes"][ordinal])
+    if not 0 <= start <= start + length <= file_size:
+        raise ValueError("delta payload span escapes declared file")
+    offset = int(tensors["prepared_offset"][ordinal])
+    start += int(file_start)
+    copy_bytes(destination[offset : offset + length], backing[start : start + length])
+    return length
+
+
 @annotate("gpu_delta.host.copy_worker")
-def _copy_group(jobs, destination, backing, file_spans, ordinals, tensors, pool):
+def _copy_group(jobs, destination, backing, file_spans, columns, tensors, pool):
     metrics = {name: 0 for name in _PREPARE_METRICS}
-    prepared_offsets = tensors["prepared_offset"]
-    for entry in jobs:
-        outer = entry["outer"]
-        length = outer["encoded_bytes"]
+    for ordinal in jobs:
         started = time.perf_counter()
-        file_start, file_size = file_spans[outer["file"]]
-        start = outer["encoded_offset"]
-        if not 0 <= start <= start + length <= file_size:
-            raise ValueError("delta payload span escapes declared file")
-        start += file_start
-        offset = int(prepared_offsets[ordinals[entry["name"]]])
-        copy_bytes(
-            destination[offset : offset + length],
-            backing[start : start + length],
+        count = _copy_tensor(
+            ordinal, destination, backing, file_spans, columns, tensors
         )
         metrics["host_rank_encoded_copy_worker_sum_s"] += time.perf_counter() - started
-        metrics["host_rank_encoded_copy_bytes"] += length
-        metrics["host_rank_encoded_copy_tensors"] += 1
+        metrics["host_rank_encoded_copy_bytes"] += count
+    metrics["host_rank_encoded_copy_tensors"] = len(jobs)
     return metrics
 
 
 @annotate("gpu_delta.host.prepare_arena")
 def _prepare_arena(
-    destination, tensors, ordinals, backing, file_spans, entries, pool, metrics, codec
+    destination, tensors, raw, backing, file_spans, columns, order, pool, metrics, codec
 ):
     started = time.perf_counter()
-    jobs, futures, error = [], [], None
-    prepared_offsets = tensors["prepared_offset"]
-    prepared_sizes = tensors["prepared_nbytes"]
+    futures, error = [], None
+    active = order[tensors["prepared_nbytes"][order] != 0]
+    jobs = active[~raw[active]]
     if not codec.endswith("-zstd"):
         worker, phase = _copy_group, "host_rank_encoded_copy_s"
     else:
         worker, phase = _decode_zstd_group, "host_rank_outer_zstd_decode_s"
     try:
-        for entry in entries:
-            ordinal = ordinals[entry["name"]]
-            count = int(prepared_sizes[ordinal])
-            if not count:
-                continue
-            if entry["encoding"] == "raw_bytes":
-                raw = entry["raw"]
-                offset = int(prepared_offsets[ordinal])
-                file_start, file_size = file_spans[raw["file"]]
-                start = raw["encoded_offset"]
-                if not 0 <= start <= start + count <= file_size:
-                    raise ValueError("delta payload span escapes declared file")
-                start += file_start
-                copy_bytes(
-                    destination[offset : offset + count],
-                    backing[start : start + count],
-                )
-            else:
-                jobs.append(entry)
+        for ordinal in active[raw[active]]:
+            _copy_tensor(ordinal, destination, backing, file_spans, columns, tensors)
         count = min(4 * pool.workers, len(jobs))
         for index in range(count):
             futures.append(
@@ -378,7 +369,7 @@ def _prepare_arena(
                     destination,
                     backing,
                     file_spans,
-                    ordinals,
+                    columns,
                     tensors,
                     pool,
                 )
@@ -468,7 +459,7 @@ class HostBuilder:
     def __init__(self, directory, workers, backends):
         self.directory = Path(directory)
         self.backends = backends
-        self._ordinals = self._shared_order = None
+        self._shared_order = self._raw = None
         self._index = None
         self._metadata_mapping = self._metadata_capacity = None
         self._prepared_capacity = None
@@ -576,78 +567,61 @@ class HostBuilder:
             with (self.directory / allocation["file"]).open("r+b") as source:
                 if _identity(os.fstat(source.fileno())) != allocation["identity"]:
                     raise ValueError("metadata cache inode or extent changed")
-                self._metadata_mapping = mmap.mmap(
-                    source.fileno(), allocation["capacity"]
+                self._metadata_mapping = (
+                    mmap.mmap(source.fileno(), allocation["capacity"])
+                    if allocation["capacity"]
+                    else bytearray()
                 )
             self._metadata_capacity = allocation
 
-    def _catalog(self, manifest, previous):
+    def _catalog(self, publication, manifest, previous):
+        source = manifest["catalog"]
+        descriptor = source | {"file": "catalog.json"}
         if previous is None:
-            fields = (
-                "name",
-                "dtype",
-                "shape",
-                "nbytes",
-                "encoding",
-                "byte_order",
-                "views",
-            )
-            catalog = {
-                "plan_digest": manifest["plan_digest"],
-                "tensors": sorted(
-                    [
-                        {key: entry[key] for key in fields}
-                        for entry in manifest["tensors"]
-                    ],
-                    key=lambda entry: entry["name"],
-                ),
-            }
-            raw = orjson.dumps(catalog)
+            raw = _read_sidecar(publication, source)
+            catalog = orjson.loads(raw)
+            if catalog["plan_digest"] != manifest["plan_digest"]:
+                raise ValueError("publication catalog plan changed")
             with (self.directory / "catalog.json").open("xb") as target:
                 target.write(raw)
-            descriptor = {
-                "file": "catalog.json",
-                "sha256": hashlib.sha256(raw).hexdigest(),
-            }
         else:
-            descriptor = previous["catalog"]
+            if descriptor != previous["catalog"]:
+                raise ValueError("publication canonical catalog changed")
             catalog = None
-        if self._ordinals is None:
+        if self._raw is None:
             if catalog is None:
-                catalog = orjson.loads(
-                    (self.directory / descriptor["file"]).read_bytes()
-                )
-            tensors = catalog["tensors"]
-            self._ordinals = {entry["name"]: i for i, entry in enumerate(tensors)}
+                catalog = orjson.loads((self.directory / "catalog.json").read_bytes())
+            entries = catalog["tensors"]
+            self._raw = np.array(
+                [entry["encoding"] == "raw_bytes" for entry in entries], dtype=bool
+            )
             self._shared_order = np.array(
                 sorted(
-                    range(len(tensors)),
-                    key=lambda i: (
-                        tensors[i]["encoding"] == "raw_bytes",
-                        _natural_key(tensors[i]["name"]),
-                    ),
+                    range(len(entries)),
+                    key=lambda i: (self._raw[i], _natural_key(entries[i]["name"])),
                 ),
                 dtype=np.int64,
             )
         return descriptor
 
     @annotate("gpu_delta.host.tensor_layout")
-    def _prepare_metadata(self, manifest, previous, metrics):
-        catalog = self._catalog(manifest, previous)
-        entries = [None] * len(self._ordinals)
-        for entry in manifest["tensors"]:
-            entries[self._ordinals[entry["name"]]] = entry
-        if len(manifest["tensors"]) != len(entries) or any(
-            entry is None for entry in entries
+    def _prepare_metadata(self, publication, manifest, previous, metrics):
+        catalog = self._catalog(publication, manifest, previous)
+        columns = load_columns(_read_sidecar(publication, manifest["metadata"]))
+        count = len(self._raw)
+        if any(
+            len(value) != count
+            for key, value in columns.items()
+            if key.startswith("tensors.")
         ):
             raise ValueError("publication canonical tensor set changed")
-        frame_counts = np.fromiter((len(e["frames"]) for e in entries), dtype=np.int64)
-        gap_counts = np.zeros(len(entries), dtype=np.int64)
-        # Exhaust once: a final yield can precede the tensor's count assignment.
-        gap_values = np.fromiter(_gap_values(entries, gap_counts), dtype=np.int64)
-        counts = (len(entries), int(frame_counts.sum()), len(gap_values) // 2)
+        counts = (
+            count,
+            len(columns["frames.encoded_offset"]),
+            len(columns["gaps.offset"]),
+        )
         size = (
-            (counts[0] * TENSOR_DTYPE.itemsize + 15) // 16 * 16
+            (count * TENSOR_DTYPE.itemsize + 15) // 16 * 16
             + counts[1] * 32
             + counts[2] * 16
         )
@@ -660,17 +634,12 @@ class HostBuilder:
         )
         self._attach_metadata(allocation)
         tensors, frames, gaps = _metadata_views(self._metadata_mapping, counts)
-        tensors["changed_bytes"] = np.fromiter(
-            (e["changed_bytes"] for e in entries), dtype=np.int64
-        )
-        tensors["prepared_nbytes"] = np.fromiter(
-            (
-                (e["nbytes"] if e["changed_bytes"] else 0)
-                if e["encoding"] == "raw_bytes"
-                else (e["outer"]["decoded_bytes"] if e["frames"] else 0)
-                for e in entries
-            ),
-            dtype=np.int64,
+        tensors["changed_bytes"] = columns["tensors.changed_bytes"]
+        frame_counts = np.diff(columns["tensors.frame_end"], prepend=0)
+        tensors["prepared_nbytes"] = np.where(
+            self._raw,
+            columns["tensors.payload_nbytes"],
+            np.where(frame_counts != 0, columns["tensors.inner_nbytes"], 0),
         )
         sizes = tensors["prepared_nbytes"][self._shared_order]
         aligned = (sizes + 15) // 16 * 16
@@ -678,38 +647,26 @@ class HostBuilder:
         tensors["prepared_offset"][self._shared_order] = offsets
         tensors["prepared_offset"][tensors["prepared_nbytes"] == 0] = -1
         prepared_size = int(np.max((offsets + sizes)[sizes != 0], initial=0))
-        tensors["frame_count"], tensors["gap_count"] = frame_counts, gap_counts
-        tensors["frame_start"] = np.cumsum(frame_counts) - frame_counts
-        tensors["gap_start"] = np.cumsum(gap_counts) - gap_counts
-        frames[:] = (
-            np.fromiter(
-                chain.from_iterable(
-                    map(
-                        itemgetter(
-                            "encoded_offset",
-                            "encoded_bytes",
-                            "decoded_bytes",
-                            "decoded_offset",
-                        ),
-                        chain.from_iterable(entry["frames"] for entry in entries),
-                    )
-                ),
-                dtype=np.int64,
-                count=counts[1] * 4,
-            )
-            .reshape(-1, 4)
-            .T
-        )
-        gaps[:] = gap_values.reshape(-1, 2)
-        return catalog, allocation, counts, entries, tensors, prepared_size, size
+        for kind in ("frame", "gap"):
+            ends = columns["tensors." + kind + "_end"]
+            tensors[kind + "_count"] = np.diff(ends, prepend=0)
+            tensors[kind + "_start"] = ends - tensors[kind + "_count"]
+        for index, field in enumerate(
+            ("encoded_offset", "encoded_bytes", "decoded_bytes", "decoded_offset")
+        ):
+            frames[index] = columns["frames." + field]
+        gaps[:, 0], gaps[:, 1] = columns["gaps.offset"], columns["gaps.nbytes"]
+        return catalog, allocation, counts, columns, tensors, prepared_size, size
 
     @annotate("gpu_delta.host.prepare_shared")
     def _prepare_shared_arena(
         self, index, previous, backing, file_spans, manifest, metrics
     ):
         layout_started = time.perf_counter()
-        catalog, metadata, counts, entries, tensors, size, metadata_size = (
-            self._prepare_metadata(manifest, previous, metrics)
+        catalog, metadata, counts, columns, tensors, size, metadata_size = (
+            self._prepare_metadata(
+                Path(index["publication"]["manifest_path"]), manifest, previous, metrics
+            )
         )
         metrics["host_prepared_cache_layout_s"] = time.perf_counter() - layout_started
         prepared = _reserve_cache(
@@ -723,10 +680,11 @@ class HostBuilder:
         _prepare_arena(
             self._prepared_view,
             tensors,
-            self._ordinals,
+            self._raw,
             backing,
-            file_spans,
-            (entries[ordinal] for ordinal in self._shared_order),
+            np.asarray(list(file_spans.values()), dtype=np.int64).reshape(-1, 2),
+            columns,
+            self._shared_order,
             self.pool,
             metrics,
             index["publication"]["codec"],

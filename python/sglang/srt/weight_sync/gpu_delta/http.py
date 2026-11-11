@@ -11,7 +11,6 @@ from sglang.srt.utils.auth import AuthLevel, auth_level
 from sglang.srt.weight_sync.gpu_delta.io import (
     ClearGpuDeltaStateReqInput,
     GetGpuDeltaInfoReqInput,
-    GetGpuDeltaStatusReqInput,
     UpdateWeightsFromGpuDeltaReqInput,
 )
 
@@ -44,12 +43,5 @@ def register_gpu_delta_routes(app: FastAPI, get_global_state: Callable):
     @auth_level(AuthLevel.ADMIN_OPTIONAL)
     async def get_gpu_delta_info(
         obj: Annotated[GetGpuDeltaInfoReqInput, Body()],
-    ):
-        return await dispatch(obj)
-
-    @app.post("/get_gpu_delta_status")
-    @auth_level(AuthLevel.ADMIN_OPTIONAL)
-    async def get_gpu_delta_status(
-        obj: Annotated[GetGpuDeltaStatusReqInput, Body()],
     ):
         return await dispatch(obj)

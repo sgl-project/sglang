@@ -13,9 +13,7 @@ from itertools import chain
 
 from sglang.srt.weight_sync.gpu_delta import profiling
 from sglang.srt.weight_sync.gpu_delta.bindings import (
-    BACKEND_LAYOUTS,
     ConsumerSnapshot,
-    _digest,
     _tensor_identity,
 )
 from sglang.srt.weight_sync.gpu_delta.derived import nvfp4_derived_update, plan_updates
@@ -31,7 +29,7 @@ class GpuDeltaLayout:
 
         if not inventory:
             raise ValueError("canonical checkpoint metadata is unavailable")
-        # Normalize negotiated wire metadata without changing checkpoint inventory.
+        # Normalize canonical wire metadata without changing checkpoint inventory.
         self.inventory = {name: dict(meta) for name, meta in inventory.items()}
         mapping = model_mapping(model)
         self.bindings = []
@@ -79,13 +77,6 @@ class GpuDeltaLayout:
         ]
         self._prepare_identity_checks()
         self._reject_overlaps(mapping.aliases)
-        self.description = {
-            "layouts": dict(BACKEND_LAYOUTS),
-            "tensors": [b.describe() for b in self.bindings],
-            "excluded": self.excluded,
-        }
-        self.rank_plan_digest = _digest(self.description)
-        self.description["rank_plan_digest"] = self.rank_plan_digest
 
     def _prepare_identity_checks(self):
         # Deduplicate geometry once, not in the per-update validation loop.

@@ -32,7 +32,7 @@ def _block_scale_layer():
 
 
 @pytest.mark.parametrize("checkpoint_dtype", ["F32", "U8"])
-def test_block_scale_negotiation_is_identical_on_local_and_foreign_ranks(
+def test_block_scale_prior_is_identical_on_local_and_foreign_ranks(
     checkpoint_dtype,
 ):
     layout = FlashInferLayout("fp8-block128-ue8m0", "trtllm", True)
@@ -52,11 +52,9 @@ def test_block_scale_negotiation_is_identical_on_local_and_foreign_ranks(
     if checkpoint_dtype == "F32":
         expected["checkpoint_dtype"] = "F32"
     assert local == foreign == expected
-    description = binding.describe()
-    assert all(description[key] == value for key, value in expected.items())
-    assert len(description["views"]) == 1
-    if checkpoint_dtype == "U8":
-        assert "checkpoint_dtype" not in description
+    assert binding.dtype == "U8" and binding.shape == (17, 15)
+    assert binding.encoding == "raw_bytes" and binding.format == "fp8-block128-ue8m0"
+    assert binding.checkpoint_dtype == ("F32" if checkpoint_dtype == "F32" else None)
     with pytest.raises(ValueError, match="exact UE8M0"):
         _moe_binding(
             "scale",
@@ -120,8 +118,6 @@ def test_apply_segments_keep_one_canonical_view_and_select_original_payload():
     binding = TensorBinding(
         "weight", "U8", (3, 5), [[0, 3], [0, 5]], (target,), segments=segments
     )
-    description = binding.describe()
-    assert "format" not in description and "checkpoint_dtype" not in description
     payload = torch.arange(15, dtype=torch.uint8)
     proxies = binding.apply_bindings()
     assert binding.apply_bindings() is proxies
@@ -133,33 +129,28 @@ def test_apply_segments_keep_one_canonical_view_and_select_original_payload():
                 proxy.selected_bytes(payload).reshape(destination.shape)
             )
     assert torch.equal(target, payload.view(3, 5))
-    assert binding.describe() == description
-    assert len(description["views"]) == 1
+    assert binding.shape == (3, 5) and binding.slices == [[0, 3], [0, 5]]
 
 
-def test_nvfp4_activation_calibration_is_global_but_weight_scales_are_local():
+def test_nvfp4_activation_calibration_stays_frozen_but_weight_scales_are_local():
     layer = SimpleNamespace(
         _map_global_expert_id_to_local_expert_id=lambda expert: (
             0 if expert == 2 else -1
         ),
-        quant_config=SimpleNamespace(use_per_token_activation=False),
-        w13_input_scale=torch.arange(8, dtype=torch.float32).reshape(4, 2),
         w13_weight_scale_2=torch.ones(1, 2),
     )
     layout = FlashInferLayout("nvfp4", "trtllm", True, "w4a4")
     meta = {"dtype": "F32", "shape": []}
-    binding = _moe_binding("activation", meta, layer, 3, "up", "input_scale", layout)
-    assert binding.storage[0].data_ptr() == layer.w13_input_scale[3, 1].data_ptr()
+    for expert in (2, 3):
+        assert (
+            _moe_binding("activation", meta, layer, expert, "up", "input_scale", layout)
+            is None
+        )
     assert (
         _moe_binding("weight", meta, layer, 3, "up", "weight_scale_2", layout) is None
     )
-    changed = torch.tensor([0.5]).view(torch.uint8)
-    ((target, source),) = binding.raw_sources(changed)
-    assert target.item() == 7.0 and source.item() == 0.5
-    layer.quant_config.use_per_token_activation = True
-    assert (
-        _moe_binding("activation", meta, layer, 3, "up", "input_scale", layout) is None
-    )
+    binding = _moe_binding("weight", meta, layer, 2, "up", "weight_scale_2", layout)
+    assert binding.storage[0].data_ptr() == layer.w13_weight_scale_2[0, 1].data_ptr()
 
 
 def apply_segments(segments, mask):

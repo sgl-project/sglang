@@ -20,6 +20,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 import zstandard as zstd
+from safetensors.numpy import save as save_columns
 
 from sglang.srt.weight_sync.gpu_delta import host as host
 from sglang.srt.weight_sync.gpu_delta import host_worker as worker
@@ -31,14 +32,101 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 TENSOR_IDS = {name: i for i, name in enumerate(("dense", "expert", "foreign", "raw"))}
 
 
+def fixture_columns(entries, files):
+    """Independent small fixture encoder for the public named-column contract."""
+    fields = ("encoded_offset", "encoded_bytes", "decoded_offset", "decoded_bytes")
+    columns = {
+        "tensors." + field: []
+        for field in (
+            "changed_bytes",
+            "payload_file",
+            "payload_offset",
+            "payload_nbytes",
+            "inner_nbytes",
+            "frame_end",
+            "outer_end",
+            "gap_end",
+        )
+    }
+    columns.update(
+        {
+            group + "." + field: []
+            for group in ("frames", "outer_frames")
+            for field in fields
+        }
+    )
+    columns.update({"gaps.offset": [], "gaps.nbytes": []})
+    for entry in entries:
+        raw = entry["encoding"] == "raw_bytes"
+        payload = entry.get("raw" if raw else "outer", {})
+        for field, value in {
+            "changed_bytes": entry.get("changed_bytes", 0),
+            "payload_file": files.index(payload["file"]) if payload else -1,
+            "payload_offset": payload.get("encoded_offset", 0),
+            "payload_nbytes": payload.get("encoded_bytes", 0),
+            "inner_nbytes": 0 if raw else payload.get("decoded_bytes", 0),
+        }.items():
+            columns["tensors." + field].append(value)
+        for group, frames in (
+            ("frames", entry.get("frames", [])),
+            ("outer_frames", payload.get("frames", [])),
+        ):
+            for field in fields:
+                columns[group + "." + field].extend(frame[field] for frame in frames)
+        columns["tensors.frame_end"].append(len(columns["frames.encoded_bytes"]))
+        columns["tensors.outer_end"].append(len(columns["outer_frames.encoded_bytes"]))
+        cursor = 0
+        if not raw:
+            for frame in entry.get("frames", []):
+                if cursor < frame["decoded_offset"]:
+                    columns["gaps.offset"].append(cursor)
+                    columns["gaps.nbytes"].append(frame["decoded_offset"] - cursor)
+                cursor = frame["decoded_offset"] + frame["decoded_bytes"]
+            if cursor < entry.get("nbytes", 0):
+                columns["gaps.offset"].append(cursor)
+                columns["gaps.nbytes"].append(entry["nbytes"] - cursor)
+        columns["tensors.gap_end"].append(len(columns["gaps.offset"]))
+    return {key: np.asarray(value, dtype="<i8") for key, value in columns.items()}
+
+
 def write_manifest(path, manifest, version=1):
     manifest.update(
         base_version=version - 1, target_version=version, plan_digest="fixture-plan"
     )
     path = path.with_name(f"manifest-v{version}.json")
-    content = json.dumps(manifest).encode()
+    entries = sorted(manifest["tensors"], key=lambda entry: entry["name"])
+    fields = ("name", "dtype", "shape", "nbytes", "encoding", "byte_order")
+    catalog = {
+        "plan_digest": manifest["plan_digest"],
+        "tensors": [{key: e[key] for key in fields} for e in entries],
+    }
+    columns = fixture_columns(entries, [record["name"] for record in manifest["files"]])
+    records = {}
+    for kind, suffix, raw in (
+        ("catalog", "json", json.dumps(catalog, sort_keys=True).encode()),
+        ("metadata", "safetensors", save_columns(columns)),
+    ):
+        filename = f"{kind}-v{version}.{suffix}"
+        (path.parent / filename).write_bytes(raw)
+        records[kind] = {
+            "file": filename,
+            "nbytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    content = json.dumps(
+        {key: value for key, value in manifest.items() if key != "tensors"} | records
+    ).encode()
     path.write_bytes(content)
     return path, hashlib.sha256(content).hexdigest()
+
+
+def numeric_arena_inputs(entries, file_spans):
+    return (
+        np.array([entry["encoding"] == "raw_bytes" for entry in entries]),
+        np.asarray(list(file_spans.values()), dtype=np.int64).reshape(-1, 2),
+        fixture_columns(entries, list(file_spans)),
+        np.arange(len(entries)),
+    )
 
 
 def fixture(directory, raw_repeat=1):
@@ -155,7 +243,6 @@ def fixture(directory, raw_repeat=1):
             shape=shape,
             nbytes=size,
             byte_order="little",
-            views=[{"id": entry["name"], "slices": [[0, n] for n in shape]}],
         )
     path, digest = write_manifest(directory / "manifest.json", manifest)
     return path, digest, manifest, expected
@@ -326,10 +413,8 @@ def _shared_child(rank, publications, barrier, output):
                     )
                 )
                 barrier.wait(timeout=10)
-                if rank == 0:
-                    snapshot.mark_reusable()
+                snapshot.close(True)
                 barrier.wait(timeout=10)
-                snapshot.close()
         output.put((rank, records))
     finally:
         arena.close()
@@ -388,6 +473,43 @@ class TestHostSnapshot(unittest.TestCase):
         arena = host.HostArena(engine, 0, shared_participants(engine)[rank])
         self.addCleanup(arena.close)
         return arena
+
+    def test_empty_publication_authenticates_sidecars_without_allocating_payload(self):
+        path, digest = write_manifest(
+            self.root / "manifest.json",
+            {
+                "codec": "bitcomp-zstd",
+                "frame_bytes": 1 << 20,
+                "files": [],
+                "tensors": [],
+            },
+        )
+        wire = json.loads(path.read_bytes())
+        for kind in ("catalog", "metadata"):
+            sidecar = self.root / wire[kind]["file"]
+            original = sidecar.read_bytes()
+            sidecar.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+            with self.assertRaisesRegex(ValueError, "metadata changed or SHA256"):
+                self.arena(kind).prepare_publication(
+                    metadata(engine=kind)
+                    | dict(manifest_path=str(path), manifest_sha256=digest),
+                    {},
+                )
+            sidecar.write_bytes(original)
+        arena, timings = self.arena(), {}
+        publication = arena.prepare_publication(
+            metadata() | dict(manifest_path=str(path), manifest_sha256=digest), timings
+        )
+        snapshot = arena.prepare_local(publication, [], timings, hardware=False)
+        self.assertEqual(publication.index["metadata_counts"], (0, 0, 0))
+        self.assertEqual(timings["host_rank_arena_bytes"], 0)
+        self.assertEqual(timings["host_rank_outer_zstd_frames"], 0)
+        self.assertEqual(timings["host_prepared_cache_capacity_bytes"], 0)
+        snapshot.close(True)
+        self.assertEqual(
+            json.loads((arena.directory / "state.json").read_bytes())["state"],
+            "REUSABLE",
+        )
 
     def test_verified_cache_precedes_local_decode_and_retains_immutable_bytes(self):
         path, digest, manifest, expected = fixture(self.root)
@@ -526,8 +648,7 @@ class TestHostSnapshot(unittest.TestCase):
                     {},
                     metadata(version, "strict", not validate),
                 )
-            snapshot.mark_reusable()
-            snapshot.close()
+            snapshot.close(True)
 
         # The manifest itself still has an exact digest; only payload SHA is skipped.
         manifest["payload_checksum_format"] = "none"
@@ -681,10 +802,10 @@ class TestHostSnapshot(unittest.TestCase):
                     manifest["tensors"].reverse()
                 else:
                     manifest["codec"] = "snappy-zstd"
-                path.write_text(json.dumps(manifest))
+                path, digest = write_manifest(path, manifest, version)
                 publication = (
                     path,
-                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                    digest,
                     manifest,
                     expected,
                 )
@@ -792,8 +913,7 @@ class TestHostSnapshot(unittest.TestCase):
         prior = owner.prepare_local(
             prior_publication, [TENSOR_IDS["dense"]], prior_metrics, False
         )
-        prior.mark_reusable()
-        prior.close()
+        prior.close(True)
         manifest["tensors"][-1]["frames"] = []
         manifest["tensors"][-1]["changed_bytes"] = 0
         path, digest = write_manifest(path, manifest, 2)
@@ -807,7 +927,7 @@ class TestHostSnapshot(unittest.TestCase):
                 )
         state = json.loads((owner.directory / "state.json").read_text())
         self.assertEqual(state["state"], "BUILDING")
-        prior.mark_reusable()
+        prior.close(True)
         self.assertEqual(
             json.loads((owner.directory / "state.json").read_text()), state
         )
@@ -907,8 +1027,7 @@ class TestHostSnapshot(unittest.TestCase):
             {},
             metadata(),
         )
-        previous.mark_reusable()
-        previous.close()
+        previous.close(True)
         path, digest = write_manifest(path, manifest, 2)
         slow_pool = HostPayloadPool(2)
         self.addCleanup(slow_pool.close)
@@ -1056,8 +1175,7 @@ class TestHostSnapshot(unittest.TestCase):
             first_metrics["host_encoded_cache_capacity_bytes"],
             (sum(file["nbytes"] for file in manifest["files"]) + 1023) // 1024 * 1024,
         )
-        first.mark_reusable()
-        first.close()
+        first.close(True)
         path, digest = write_manifest(path, manifest, 2)
         warm = {}
         second = prepare_snapshot(
@@ -1073,7 +1191,7 @@ class TestHostSnapshot(unittest.TestCase):
         self.assertEqual(warm["host_rank_allocation_calls"], 0)
         self.assertEqual(warm["host_encoded_cache_allocation_calls"], 0)
         self.assertEqual(warm["host_rank_mapping_reused"], 1)
-        first.mark_reusable()
+        first.close(True)
         with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
             prepare_snapshot(
                 arena,
@@ -1084,9 +1202,7 @@ class TestHostSnapshot(unittest.TestCase):
                 {},
                 metadata(3),
             )
-        second.mark_reusable()
-        second.close()
-        manifest = json.loads(path.read_text())
+        second.close(True)
         large = hashlib.shake_256(b"growth").digest(original["capacity"] * 2 + 1)
         encoded = zstd.ZstdCompressor(write_checksum=True).compress(large)
         payload = (self.root / "owner.bin").read_bytes() + encoded
@@ -1190,7 +1306,14 @@ def decode_fixture(codec):
                 "encoding": "xor_bytes",
                 "nbytes": len(value),
                 "changed_bytes": len(value),
-                "frames": [{}],
+                "frames": [
+                    dict(
+                        encoded_offset=0,
+                        encoded_bytes=len(value),
+                        decoded_offset=0,
+                        decoded_bytes=len(value),
+                    )
+                ],
                 "outer": {
                     "file": filename,
                     "encoded_offset": start,
@@ -1256,10 +1379,9 @@ def test_bounded_jobs_decode_raw_and_compressed_bytes_exactly(codec):
             worker._prepare_arena(
                 memoryview(destination),
                 tensors,
-                ordinals,
+                numeric_arena_inputs(entries, file_spans)[0],
                 encoded,
-                file_spans,
-                entries,
+                *numeric_arena_inputs(entries, file_spans)[1:],
                 pool,
                 metrics,
                 codec,
@@ -1291,10 +1413,9 @@ def test_bounded_jobs_decode_raw_and_compressed_bytes_exactly(codec):
                 worker._prepare_arena(
                     destination,
                     tensors,
-                    ordinals,
+                    numeric_arena_inputs(entries, file_spans)[0],
                     encoded,
-                    file_spans,
-                    entries,
+                    *numeric_arena_inputs(entries, file_spans)[1:],
                     pool,
                     metrics,
                     codec,
@@ -1358,10 +1479,9 @@ def test_failed_tensor_drains_other_groups_before_releasing_views(codec):
             worker._prepare_arena(
                 memoryview(bytearray(20)),
                 tensors,
-                ordinals,
+                numeric_arena_inputs(entries, {"p": (0, 20)})[0],
                 memoryview(bytes(range(20))),
-                {"p": (0, 20)},
-                entries,
+                *numeric_arena_inputs(entries, {"p": (0, 20)})[1:],
                 pool,
                 {name: 0 for name in worker._PREPARE_METRICS},
                 codec,

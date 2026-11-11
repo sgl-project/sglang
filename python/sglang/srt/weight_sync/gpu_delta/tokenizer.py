@@ -5,12 +5,13 @@ import time
 import uuid
 from collections.abc import Callable
 
+import zmq
+
 from sglang.srt.runtime_context import get_serving
 from sglang.srt.weight_sync.gpu_delta.io import (
     AbortGpuDeltaReqInput,
     ApplyGpuDeltaReqInput,
     ClearGpuDeltaStateReqInput,
-    GetGpuDeltaStatusReqInput,
     GpuDeltaReqOutput,
     PrepareGpuDeltaReqInput,
     ReleaseGpuDeltaCacheReqInput,
@@ -27,6 +28,8 @@ class GpuDeltaCommunicator:
         self._fan_out = fan_out
         self._lock = asyncio.Lock()
         self._rid = self._event = self._results = self._expected = None
+        self._pending_ranks = None
+        self._prepare_ranks = None
 
     async def __call__(self, request):
         async with self._lock:
@@ -34,19 +37,50 @@ class GpuDeltaCommunicator:
             self._event = asyncio.Event()
             self._results = []
             self._expected = self._fan_out
+            self._pending_ranks = (
+                {rank["rank_id"] for rank in request.participants}
+                if isinstance(request, PrepareGpuDeltaReqInput)
+                else None
+            )
+            self._prepare_ranks = (
+                self._pending_ranks.copy() if self._pending_ranks is not None else None
+            )
             try:
                 self._send(request)
                 await self._event.wait()
                 return self._results
             finally:
                 self._rid = self._event = self._results = self._expected = None
+                self._pending_ranks = None
+                self._prepare_ranks = None
 
     def handle_recv(self, reply):
         # Canceled requests can still reply after the next control was sent.
         if self._event is None or reply.rid != self._rid:
             return
+        if self._pending_ranks is not None:
+            if not reply.success:
+                self._results.append(reply)
+                self._event.set()
+                return
+            ranks = {row["identity"]["rank_id"] for row in reply.participants}
+            if not ranks or not ranks.issubset(self._prepare_ranks):
+                reply.success = False
+                reply.message = (
+                    "delta prepare replied from another receiver incarnation"
+                )
+                self._results.append(reply)
+                self._event.set()
+                return
+            if not ranks.intersection(self._pending_ranks):
+                return
+            self._pending_ranks.difference_update(ranks)
         self._results.append(reply)
-        if len(self._results) == self._expected:
+        if (
+            not self._pending_ranks
+            if self._pending_ranks is not None
+            else len(self._results) == self._expected
+        ):
             self._event.set()
 
     def set_fan_out(self, fan_out: int):
@@ -58,6 +92,9 @@ class GpuDeltaTokenizerControl:
         from sglang.utils import TypeBasedDispatcher
 
         self.manager = manager
+        self.reply_endpoint = manager.recv_from_detokenizer.getsockopt_string(
+            zmq.LAST_ENDPOINT
+        )
         self.communicator = GpuDeltaCommunicator(
             manager._dispatch_to_scheduler, fan_out
         )
@@ -78,7 +115,7 @@ class GpuDeltaTokenizerControl:
                 return await self._update(obj)
             if isinstance(obj, ClearGpuDeltaStateReqInput):
                 return await self._clear()
-            # Admission/status do not gate generation or acquire its writer lock.
+            # Admission does not gate generation or acquire its writer lock.
             return await self._request(obj)
         except Exception as exc:
             return {"success": False, "message": str(exc), "participants": []}
@@ -115,6 +152,8 @@ class GpuDeltaTokenizerControl:
     async def _update(self, obj):
         started = time.monotonic()
         prepare = PrepareGpuDeltaReqInput(
+            # Reuse the existing return route, including non-leader ranks.
+            http_worker_ipc=self.reply_endpoint,
             session_id=obj.session_id,
             manifest_path=obj.manifest_path,
             manifest_sha256=obj.manifest_sha256,
@@ -129,7 +168,7 @@ class GpuDeltaTokenizerControl:
         # After apply dispatch, neither cancellation nor failure may replay XOR
         # or reopen admission: a participant may already have modified weights.
         try:
-            result = await asyncio.wait_for(self._prepare(prepare), timeout=1800)
+            result = await asyncio.wait_for(self._request(prepare), timeout=1800)
         except BaseException:
             await self._request(AbortGpuDeltaReqInput(session_id=obj.session_id))
             raise
@@ -168,17 +207,6 @@ class GpuDeltaTokenizerControl:
             cleared = await self._clear()
             if not cleared["success"]:
                 return cleared
-        return result
-
-    async def _prepare(self, request):
-        result = await self._request(request)
-        while result["success"] and any(
-            rank["state"] != "PREPARED" for rank in result["participants"]
-        ):
-            await asyncio.sleep(0.05)
-            result = await self._request(
-                GetGpuDeltaStatusReqInput(session_id=request.session_id)
-            )
         return result
 
     async def _clear(self):

@@ -27,47 +27,6 @@ def publication_view(catalog):
 
 
 class TestCanonicalPlanCache(unittest.TestCase):
-    def test_nvtx_phase_balances_failure_without_cuda_events(self):
-        events = []
-        nvtx = SimpleNamespace(
-            range_push=lambda name: events.append(("push", name)),
-            range_pop=lambda: events.append(("pop",)),
-        )
-
-        def work(fail=False):
-            if fail:
-                raise RuntimeError("worker failure")
-            return 42
-
-        for enabled in (False, True):
-            with (
-                self.subTest(enabled=enabled),
-                patch.object(receiver.profiling, "ENABLED", enabled),
-                patch.object(receiver.profiling, "nvtx", nvtx, create=True),
-                patch.object(
-                    torch.cuda, "Event", side_effect=AssertionError("new event")
-                ),
-            ):
-                events.clear()
-                wrapped = receiver.profiling.annotate("gpu_delta.worker")(work)
-                if not enabled:
-                    self.assertIs(wrapped, work)
-                self.assertEqual(wrapped(), 42)
-                with self.assertRaisesRegex(RuntimeError, "worker failure"):
-                    wrapped(True)
-                with self.assertRaisesRegex(RuntimeError, "enqueue failed"):
-                    with receiver.PreparedDelta._phase(SimpleNamespace(), "decode"):
-                        raise RuntimeError("enqueue failed")
-                self.assertEqual(
-                    events,
-                    (
-                        [("push", "gpu_delta.worker"), ("pop",)] * 2
-                        + [("push", "gpu_delta.pause.decode"), ("pop",)]
-                        if enabled
-                        else []
-                    ),
-                )
-
     def publication(self):
         entries = [
             {
@@ -77,18 +36,13 @@ class TestCanonicalPlanCache(unittest.TestCase):
                 "encoding": "xor_bytes",
                 "byte_order": "little",
                 "nbytes": 8,
-                "views": [
-                    {"id": "a", "slices": [[0, 2], [0, 2]]},
-                    {"id": "b", "slices": [[0, 2], [2, 4]]},
-                ],
                 "frames": [],
             }
             for name in ("local", "foreign")
         ]
         backend = SimpleNamespace(
             _canonical_plan_digest=None,
-            _canonical_tensors=None,
-            _canonical_tensor_ids=(),
+            binding_table=None,
             batch_plan=None,
             layers_per_batch=1,
             layout=SimpleNamespace(
@@ -98,13 +52,20 @@ class TestCanonicalPlanCache(unittest.TestCase):
                 },
                 excluded={"foreign": "expert projection owned by another EP/TP rank"},
                 bindings=[
-                    SimpleNamespace(name="local", view_id="a", slices=[[0, 2], [0, 2]])
+                    SimpleNamespace(
+                        name="local",
+                        slices=[[0, 2], [0, 2]],
+                        encoding="xor_bytes",
+                        raw_ue8m0=False,
+                        layer=None,
+                        storage_pointers=(),
+                    )
                 ],
+                derived=[],
             ),
         )
         definitions = [
             {key: entry[key] for key in ("name", "dtype", "shape", "encoding")}
-            | {"views": sorted(entry["views"], key=lambda view: view["id"])}
             for entry in sorted(entries, key=lambda entry: entry["name"])
         ]
         return backend, {
@@ -118,8 +79,8 @@ class TestCanonicalPlanCache(unittest.TestCase):
             backend, publication_view(publication)
         )
         self.assertFalse(reused)
-        self.assertEqual(admitted, {"local": (1, 8)})
-        self.assertEqual(backend._canonical_tensor_ids, (1,))
+        np.testing.assert_array_equal(admitted.ordinals, [1])
+        np.testing.assert_array_equal(admitted.nbytes, [8])
         updated = publication_view(publication)
         with (
             patch.object(receiver, "_digest", side_effect=AssertionError("cold only")),
@@ -136,7 +97,21 @@ class TestCanonicalPlanCache(unittest.TestCase):
                 backend, publication_view(publication | {"plan_digest": "changed"})
             )
 
-    def test_compact_scale_format_is_negotiated_without_duplicate_wire_fields(self):
+    def test_one_canonical_publication_binds_different_rank_local_slices(self):
+        for slices in ([[0, 2], [0, 2]], [[0, 2], [2, 4]], [[0, 2], [0, 4]]):
+            backend, publication = self.publication()
+            backend.layout.bindings[0].slices = slices
+            table, reused = receiver._qualify_canonical_plan(
+                backend, publication_view(publication)
+            )
+            self.assertFalse(reused)
+            self.assertEqual(table.bindings[0].slices, slices)
+            np.testing.assert_array_equal(table.nbytes, [8])
+            self.assertTrue(
+                all("views" not in entry for entry in publication["tensors"])
+            )
+
+    def test_compact_scale_format_matches_the_checkpoint_prior(self):
         backend, publication = self.publication()
         definitions = []
         for entry in publication["tensors"]:
@@ -148,9 +123,9 @@ class TestCanonicalPlanCache(unittest.TestCase):
                 checkpoint_dtype="F32",
             )
             definition = {
-                key: entry[key]
-                for key in ("name", "dtype", "shape", "encoding", "views")
+                key: entry[key] for key in ("name", "dtype", "shape", "encoding")
             }
+            entry.update(format="fp8-block128-ue8m0", checkpoint_dtype="F32")
             definition.update(format="fp8-block128-ue8m0", checkpoint_dtype="F32")
             definitions.append(definition)
         publication["plan_digest"] = receiver._digest(
@@ -159,29 +134,29 @@ class TestCanonicalPlanCache(unittest.TestCase):
         receiver._qualify_canonical_plan(backend, publication_view(publication))
         backend._canonical_plan_digest = None
         backend.layout.inventory["local"]["checkpoint_dtype"] = "U8"
-        with self.assertRaisesRegex(ValueError, "negotiated canonical view plan"):
+        with self.assertRaisesRegex(ValueError, "canonical tensor metadata mismatch"):
             receiver._qualify_canonical_plan(backend, publication_view(publication))
 
     def test_failed_cold_qualification_does_not_admit_a_cache(self):
         backend, publication = self.publication()
         invalid = copy.deepcopy(publication)
         invalid["plan_digest"] = "invalid"
-        with self.assertRaisesRegex(ValueError, "negotiated canonical view plan"):
+        with self.assertRaisesRegex(ValueError, "canonical tensor plan"):
             receiver._qualify_canonical_plan(backend, publication_view(invalid))
         self.assertFalse(
             receiver._qualify_canonical_plan(backend, publication_view(publication))[1]
         )
         backend, publication = self.publication()
         invalid = copy.deepcopy(publication)
-        invalid["tensors"][1]["views"][0]["slices"][0][1] = 1
-        with self.assertRaisesRegex(ValueError, "conflicting rank view"):
+        invalid["tensors"].pop(1)
+        with self.assertRaisesRegex(ValueError, "missing local tensors"):
             receiver._qualify_canonical_plan(backend, publication_view(invalid))
         self.assertIsNone(backend._canonical_plan_digest)
         self.assertFalse(
             receiver._qualify_canonical_plan(backend, publication_view(publication))[1]
         )
         backend, publication = self.publication()
-        backend.layout.excluded["local"] = "static activation calibration"
+        backend.layout.excluded["local"] = "static bundled draft"
         with self.assertRaisesRegex(ValueError, "unadmitted tensor"):
             receiver._qualify_canonical_plan(backend, publication_view(publication))
 
@@ -233,18 +208,9 @@ class TestReceiverPreparation(unittest.TestCase):
             )
         prepared = receiver.PreparedDelta.__new__(receiver.PreparedDelta)
         prepared.backend = SimpleNamespace(layout=plan)
-        description = plan.description
-        self.assertEqual(
-            description["rank_plan_digest"],
-            byte_layout._digest(
-                {key: description[key] for key in ("layouts", "tensors", "excluded")}
-            ),
-        )
-        with patch.object(
-            plan.bindings[0], "describe", side_effect=AssertionError("rebuild")
-        ):
-            backend = SimpleNamespace(layout=plan)
-            self.assertIs(receiver.GpuDeltaBackend.describe(backend), description)
+        self.assertEqual(plan.bindings[0].name, "canonical.vector")
+        self.assertEqual(plan.bindings[0].slices, [[0, 6]])
+        plan.check_identity()
         prepared.device = torch.device("cpu")
         prepared.stream = SimpleNamespace(wait_stream=lambda _: None)
         prepared.batches, prepared.status_checks = [], []
@@ -275,6 +241,9 @@ class TestReceiverPreparation(unittest.TestCase):
                     torch.float32: ([plan.bindings[0].storage[0]], [target])
                 }
                 self.assertTrue(prepared.apply()["applied"])
+                self.assertTrue(prepared._gpu_complete)
+                self.assertIsNone(prepared.error)
+                self.assertEqual(prepared.raw_copies, {})
                 torch.testing.assert_close(
                     root.cache, target.view(2, 3).t(), rtol=0, atol=0
                 )
@@ -435,9 +404,9 @@ class TestReceiverPreparation(unittest.TestCase):
             prepare_publication=lambda *args: publication, prepare_local=prepare_local
         )
         with self.assertRaisesRegex(RuntimeError, "local preparation boundary"):
-            receiver.PreparedDelta(backend, {})
+            receiver.PreparedDelta(backend).prepare({})
 
-    def test_layer_batch_cache_tracks_active_names_and_grouping(self):
+    def test_layer_batch_cache_tracks_active_rows_and_grouping(self):
         names = [
             "model.layers.0.a",
             "model.layers.0.b",
@@ -456,8 +425,12 @@ class TestReceiverPreparation(unittest.TestCase):
             )
             for name in names
         ]
-        entries = {b.name: (i, 8) for i, b in enumerate(bindings)}
-        backend = SimpleNamespace(batch_plan=None)
+        entries = {b.name: (i, {"nbytes": 8}) for i, b in enumerate(bindings)}
+        table = receiver._BindingTable(
+            SimpleNamespace(bindings=bindings, derived=[]), entries
+        )
+        rows = np.arange(len(bindings))
+        backend = SimpleNamespace(batch_plan=None, layers_per_batch=1)
         # This test checks grouping/cache ownership, not Triton launch plans.
         with patch.dict(
             sys.modules,
@@ -467,13 +440,14 @@ class TestReceiverPreparation(unittest.TestCase):
                 )
             },
         ):
-            previous = receiver._plan_layers(backend, bindings, entries)
-            self.assertIs(receiver._plan_layers(backend, bindings, entries), previous)
-            reduced = receiver._plan_layers(backend, bindings[1:], entries)
+            previous = receiver._plan_layers(backend, table, rows)
+            self.assertIs(receiver._plan_layers(backend, table, rows), previous)
+            reduced = receiver._plan_layers(backend, table, rows[1:])
             self.assertIsNot(reduced, previous)
             self.assertEqual(reduced[3][0][0, 0], 1)
             for count, expected in ((1, [[0], [1], [2], [3]]), (2, [[0, 1], [2, 3]])):
-                grouped = receiver._plan_layers(backend, bindings, entries, count)
+                backend = SimpleNamespace(batch_plan=None, layers_per_batch=count)
+                grouped = receiver._plan_layers(backend, table, rows)
                 self.assertEqual(
                     [
                         list(dict.fromkeys(bindings[i].layer for i in plan[0][0]))
@@ -481,15 +455,57 @@ class TestReceiverPreparation(unittest.TestCase):
                     ],
                     [[None], [None], [None], *expected],
                 )
-                self.assertIs(
-                    receiver._plan_layers(backend, bindings, entries, count), grouped
-                )
+                self.assertIs(receiver._plan_layers(backend, table, rows), grouped)
+            self.assertEqual(receiver._plan_layers(backend, table, rows[:0]), [])
+
+    def test_binding_table_selects_active_rows_and_derived_sources(self):
+        bindings = [
+            byte_layout._direct_binding(
+                name,
+                {"dtype": "U8", "shape": [2, 4]},
+                torch.zeros(2, 4, dtype=torch.uint8),
+            )
+            for name in ("matrix0", "matrix1")
+        ]
+        bindings += [
+            byte_layout._direct_binding(
+                "raw", {"dtype": "F32", "shape": [1]}, torch.zeros(1)
+            ),
+            byte_layout.TensorBinding(
+                "scale",
+                "U8",
+                (1,),
+                [[0, 1]],
+                (torch.zeros(1),),
+                encoding="raw_bytes",
+                format="fp8-block128-ue8m0",
+            ),
+        ]
+        image = SimpleNamespace(source_pointer=bindings[1].storage_pointers[0])
+        table = receiver._BindingTable(
+            SimpleNamespace(bindings=bindings, derived=[image]),
+            {
+                b.name: (ordinal, {"nbytes": size})
+                for b, ordinal, size in zip(bindings, [2, 0, 3, 1], [8, 8, 4, 1])
+            },
+        )
+        tensors = np.zeros(4, dtype=TENSOR_DTYPE)
+        tensors["changed_bytes"] = [8, 1, 8, 4]
+        tensors["frame_count"] = [0, 0, 1, 0]
+        matrices, raw, derived = table.select(tensors)
+        np.testing.assert_array_equal(matrices, [0])
+        np.testing.assert_array_equal(raw, [3, 2])
+        self.assertEqual(derived, [])
+        tensors["frame_count"][0] = 1
+        tensors["changed_bytes"][1] = 0
+        matrices, raw, derived = table.select(tensors)
+        np.testing.assert_array_equal(matrices, [0, 1])
+        np.testing.assert_array_equal(raw, [2])
+        self.assertEqual(derived, [image])
 
     def test_backend_reads_inventory_once_and_drains_all_streams_on_failure(self):
         fake_plan = SimpleNamespace(
             check_identity=lambda: None,
-            description={"rank_plan_digest": "digest", "tensors": []},
-            rank_plan_digest="digest",
             bindings=[],
             excluded={},
         )
@@ -513,8 +529,6 @@ class TestReceiverPreparation(unittest.TestCase):
             self.assertIsNone(backend.io_stream)
             self.assertEqual(backend.layers_per_batch, 3)
             with patch.dict(receiver.os.environ, GPU_DELTA_LAYERS_PER_BATCH="0"):
-                backend.describe()
-                backend.describe()
                 self.assertEqual(backend.layers_per_batch, 3)
                 with self.assertRaisesRegex(ValueError, "must be positive"):
                     receiver.GpuDeltaBackend(
@@ -538,11 +552,12 @@ class TestReceiverPreparation(unittest.TestCase):
             raise RuntimeError("decode stream failed")
 
         prepared = receiver.PreparedDelta.__new__(receiver.PreparedDelta)
+        prepared._gpu_complete = True
         prepared.io_stream = SimpleNamespace(synchronize=decode_failure)
         prepared.stream = SimpleNamespace(synchronize=lambda: drains.append("compute"))
         prepared._release_gpu = lambda: drains.append("release-gpu")
         prepared.host_snapshot = SimpleNamespace(
-            close=lambda: drains.append("snapshot")
+            close=lambda reuse: drains.append(("snapshot", reuse))
         )
         prepared.raw_pinned = object()
         with self.assertRaisesRegex(RuntimeError, "decode stream failed"):
@@ -555,10 +570,27 @@ class TestReceiverPreparation(unittest.TestCase):
         prepared.io_stream.synchronize = lambda: drains.append("decode")
         backend.discard(prepared)
         self.assertEqual(
-            drains, ["decode", "compute", "release-gpu", "snapshot", "backend"]
+            drains,
+            ["decode", "compute", "release-gpu", ("snapshot", False), "backend"],
         )
         self.assertIsNone(prepared.raw_pinned)
         self.assertIsNone(prepared.host_snapshot)
+
+        # Successful resume releases its host lease once. It skips the stream
+        # drains only when apply has already fenced and released GPU scratch.
+        for complete in (False, True):
+            with self.subTest(gpu_complete=complete):
+                drains.clear()
+                prepared._gpu_complete = complete
+                prepared.host_snapshot = SimpleNamespace(
+                    close=lambda reuse: drains.append(("snapshot", reuse))
+                )
+                prepared.raw_pinned = object()
+                prepared.close(True)
+                expected = [] if complete else ["decode", "compute", "release-gpu"]
+                self.assertEqual(drains, [*expected, ("snapshot", True)])
+                self.assertIsNone(prepared.raw_pinned)
+                self.assertIsNone(prepared.host_snapshot)
 
 
 if __name__ == "__main__":

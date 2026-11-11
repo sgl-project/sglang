@@ -215,19 +215,20 @@ class CpuWorker:
         )
 
     def close(self, terminate=False):
+        if self.connection is None:
+            return
         try:
             if terminate:
                 self.process.kill()
-            elif self.connection is not None:
+            else:
                 self.connection.send_bytes(b"null")
         except OSError:
             self.process.kill()
         finally:
             # Both paths reap before releasing the publication lock or mappings.
             self.process.wait()
-            if self.connection is not None:
-                self.connection.close()
-                self.connection = None
+            self.connection.close()
+            self.connection = None
 
 
 class HostArena:
@@ -336,8 +337,10 @@ class HostArena:
             with (self.directory / allocation["file"]).open("r+b") as source:
                 if _identity(os.fstat(source.fileno())) != allocation["identity"]:
                     raise ValueError("metadata cache inode or extent changed")
-                self._metadata_mapping = mmap.mmap(
-                    source.fileno(), allocation["capacity"]
+                self._metadata_mapping = (
+                    mmap.mmap(source.fileno(), allocation["capacity"])
+                    if allocation["capacity"]
+                    else bytearray()
                 )
             self._metadata_capacity = allocation
 
@@ -569,26 +572,26 @@ class HostPreparedSnapshot:
 
     def __init__(self, arena, publication, offsets):
         self.arena, self.publication, self.offsets = arena, publication, offsets
-        self.worker = arena._worker if arena.owner else None
-        index = publication.index
-        self.ready_state = {
-            "token": index["token"],
-            "state": "READY",
-            "generation": index["encoded"]["generation"],
-        }
 
     def get(self, ordinal):
         start = int(self.offsets[ordinal])
         count = int(self.publication.tensors["prepared_nbytes"][ordinal])
         return self.arena.mapping[start : start + count]
 
-    def mark_reusable(self):
-        # Resume follows all original engine ranks applying successfully. The
-        # child's exact-state check prevents stale callbacks releasing newer data.
-        if self.worker is not None:
-            self.worker.release(self.ready_state)
-
-    def close(self):
-        # Backend retains its mapping after all DE or H2D readers drain.
-        self.arena = None
-        self.publication = self.offsets = None
+    def close(self, reuse_host=False):
+        # Only successful all-rank apply/resume permits the owner to overwrite
+        # this publication. Failure cleanup drops the lease without releasing it.
+        try:
+            if reuse_host and self.arena is not None and self.arena.owner:
+                index = self.publication.index
+                self.arena._worker.release(
+                    {
+                        "token": index["token"],
+                        "state": "READY",
+                        "generation": index["encoded"]["generation"],
+                    }
+                )
+        finally:
+            # Backend retains its mapping after all DE or H2D readers drain.
+            self.arena = None
+            self.publication = self.offsets = None

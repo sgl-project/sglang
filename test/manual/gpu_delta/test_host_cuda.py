@@ -83,7 +83,14 @@ def test_bitcomp_receiver_double_buffer_exact_updates_and_stale_target(
             rank_id="bitcomp-original-rank",
         )
         backend = GpuDeltaBackend(SimpleNamespace(model=model), identity)
-        definitions = backend.describe()["tensors"]
+        definitions = [
+            dict(
+                name=name,
+                **meta,
+                encoding="raw_bytes" if len(meta["shape"]) <= 1 else "xor_bytes",
+            )
+            for name, meta in inventory.items()
+        ]
         plan_digest = _digest(sorted(definitions, key=lambda row: row["name"]))
         prepared = None
         try:
@@ -125,7 +132,6 @@ def test_bitcomp_receiver_double_buffer_exact_updates_and_stale_target(
                             *result[:4],
                             dtype=row["dtype"],
                             shape=row["shape"],
-                            views=row["views"],
                         )
                     raw = next(row for row in definitions if row["name"] == "model.raw")
                     writer.add_raw_tensor(
@@ -134,7 +140,6 @@ def test_bitcomp_receiver_double_buffer_exact_updates_and_stale_target(
                         after[raw["name"]].numpy(),
                         raw["dtype"],
                         raw["shape"],
-                        raw["views"],
                     )
                     descriptor = writer.finish()
                 finally:
@@ -179,7 +184,7 @@ def test_bitcomp_receiver_double_buffer_exact_updates_and_stale_target(
                     assert result["timings"]["de_host_input_bytes"] == 0
                     for name, value in model.named_parameters():
                         assert torch.equal(value.cpu().flatten(), after[name])
-                    prepared.release_and_close()
+                    prepared.close(True)
                 prepared = None
         finally:
             if prepared is not None:
@@ -263,7 +268,15 @@ def test_bitcomp_failed_transaction_requires_fresh_receiver_recovery(
                 name: torch.full_like(value, 16 + version).pin_memory()
                 for name, value in before.items()
             }
-            definitions = session.backend.describe()["tensors"]
+            definitions = [
+                dict(
+                    name=name,
+                    dtype="U8",
+                    shape=list(value.shape),
+                    encoding="raw_bytes" if value.ndim <= 1 else "xor_bytes",
+                )
+                for name, value in model.named_parameters()
+            ]
             matrices = [row for row in definitions if row["encoding"] == "xor_bytes"]
             encoded = encoder.finish_device(
                 encoder.encode_device(
@@ -286,7 +299,6 @@ def test_bitcomp_failed_transaction_requires_fresh_receiver_recovery(
                         *result[:4],
                         dtype=row["dtype"],
                         shape=row["shape"],
-                        views=row["views"],
                     )
                 raw = next(row for row in definitions if row["name"] == "model.raw")
                 writer.add_raw_tensor(
@@ -295,7 +307,6 @@ def test_bitcomp_failed_transaction_requires_fresh_receiver_recovery(
                     after[raw["name"]].numpy(),
                     raw["dtype"],
                     raw["shape"],
-                    raw["views"],
                 )
                 metadata = dict(
                     writer.finish(),
@@ -308,8 +319,7 @@ def test_bitcomp_failed_transaction_requires_fresh_receiver_recovery(
             return metadata, before, after
 
         def prepare(session, metadata):
-            session.prepare(metadata)
-            session._prepare_future.result(timeout=90)
+            session.prepare(metadata).result(timeout=90)
             assert session.status()["state"] == "PREPARED", session.status()
 
         def assert_weights(model, expected):
@@ -321,7 +331,7 @@ def test_bitcomp_failed_transaction_requires_fresh_receiver_recovery(
             metadata, before, after = publish(model, session, 1)
             prepare(session, metadata)
             assert_weights(model, before)
-            prepared = session._session.prepared
+            prepared = session._update.prepared
             apply_batch = prepared._apply_batch
             applications, resumed = [], []
 
@@ -376,8 +386,8 @@ def test_bitcomp_failed_transaction_requires_fresh_receiver_recovery(
                 assert_weights(model, after)
             assert resumed == ([1] if failure == "after_resume" else [])
             session._executor.shutdown(wait=True)
-            if session._session.prepared is not None:
-                session._session.prepared.close()
+            if session._update.prepared is not None:
+                session._update.prepared.close()
             session.backend.close()
             # Replacement starts from actual fresh model storage and a new rank
             # identity; only this incarnation may consume the base-zero payload.
@@ -398,11 +408,8 @@ def test_bitcomp_failed_transaction_requires_fresh_receiver_recovery(
         finally:
             for session in sessions:
                 session._executor.shutdown(wait=True)
-                if (
-                    session._session is not None
-                    and session._session.prepared is not None
-                ):
-                    session._session.prepared.close()
+                if session._update is not None and session._update.prepared is not None:
+                    session._update.prepared.close()
                 if session.backend is not None:
                     session.backend.close()
 
@@ -556,7 +563,6 @@ def _publication(directory, version, repeat, codec):
             shape=shape,
             nbytes=size,
             byte_order="little",
-            views=[{"id": entry["name"], "slices": [[0, n] for n in shape]}],
         )
     manifest = {
         "codec": codec,
@@ -573,9 +579,10 @@ def _publication(directory, version, repeat, codec):
         ],
         "tensors": entries,
     }
-    path = directory / "manifest.json"
-    path.write_text(json.dumps(manifest))
-    return path, hashlib.sha256(path.read_bytes()).hexdigest(), expected
+    from miles.utils.gpu_delta.publication import write_publication_metadata
+
+    descriptor = write_publication_metadata(directory, manifest)
+    return Path(descriptor["manifest_path"]), descriptor["manifest_sha256"], expected
 
 
 def _consumer(rank, engine, workers, publications, cache, barrier, output):
@@ -683,8 +690,7 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
             # Substitute the Miles all-original-engine-rank completion barrier with
             # an explicit two-process completion barrier in this isolated oracle.
             barrier.wait(timeout=90)
-            snapshot.mark_reusable()
-            snapshot.close()
+            snapshot.close(True)
             source = None
             assert arena.allocation is not None
             del plan, plans, decoded

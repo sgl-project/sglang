@@ -26,10 +26,18 @@ bundled-MTP files are supported; custom, secondary, encrypted or transformed
 sources are not. Packed live buffers cannot reconstruct this source inventory.
 Names and shapes do not prove that the live engine has the correct base bytes.
 
+The trainer and receiver share this checkpoint prior, not a negotiated receiver
+plan. The trainer publishes canonical names, dtypes, shapes and byte encodings.
+Each receiver independently maps that inventory to its local TP/EP slices and
+backend storage. Publications contain no rank views or backend permutations;
+encoding does not require contacting rollout. The receiver binds the static
+catalog once, checks that all its mutable tensors are present, and reuses the
+binding table on later updates.
+
 `models.py` maps the DeepSeek MLA/DSA family, including GLM's shared runtime
 implementation: canonical name mutation, unequal Q/KV-A fusion, indexer fusion
 and BF16-to-FP32 norm replacement, MLA consumer views and static draft exclusions.
-Bundled MTP layer weights stay static; its shared embedding/head buffers follow
+Bundled MTP layer weights and activation calibration stay static; its shared embedding/head buffers follow
 the target. A new model family supplies startup bindings and derived views through
 the same mapping interface. GDN/KDA and other model mappings are not implemented.
 
@@ -87,17 +95,16 @@ for a stream's lifetime. There is no server-wide ownership lock, XOR retry,
 rollback or automatic replay of an uncertain update.
 
 Routes, IPC schemas, tokenizer coordination and scheduler handlers live under
-`srt/weight_sync/gpu_delta/`; shared files only register them. The four HTTP POST
+`srt/weight_sync/gpu_delta/`; shared files only register them. The three HTTP POST
 endpoints are an internal interface to Miles:
 
 | Endpoint | Purpose |
 | --- | --- |
-| `get_gpu_delta_info` | Admit the receiver and return its canonical plan, original participants and version. |
+| `get_gpu_delta_info` | Admit the receiver and return original participant identities, state and version; no tensor plan. |
 | `update_weights_from_gpu_delta` | Prepare, apply and resume one publication, returning compact APPLIED acknowledgements, full RESUMED receipts and server timings. |
-| `get_gpu_delta_status` | Inspect the identified session without repeating its update. |
 | `clear_gpu_delta_state` | Release retained delta resources while preserving weights and committed version. |
 
-The update request carries the negotiated participants, caller-generated session
+The update request carries the admitted participants, caller-generated session
 ID and publication descriptor: manifest path/SHA256, stream, base/target versions
 and plan digest, plus `validate_payload_hash=true` by default. Rolling updates and
 HF-base recovery use the same request shape;
@@ -122,8 +129,8 @@ Preparation failure aborts that engine's preparation while old-version serving
 continues. Failed or aborted delta sessions require restart before another update.
 Internal apply/resume failures leave admission closed. A lost HTTP
 response may instead mean the server has already completed and resumed; Miles
-does not abort or replay the update on transport failure. The session ID permits
-inspection of that outcome. There is no separate global quiesce/commit round.
+does not abort or replay the update on transport failure. There is no separate
+global quiesce/commit round.
 
 Updates accept `flush_cache=true` and `abort_all_requests=false`. Miles may disable
 flushing only after invalidating KV and multimodal caches. Reader fencing and retraction still run;
@@ -144,7 +151,7 @@ Describe can recreate the backend at that version. Framework allocator/JIT cache
 are not cleared.
 
 HF-base recovery requires a fresh version-0 engine using the matching immutable
-checkpoint. Miles negotiates its new participants and submits the base-relative
+checkpoint. Miles discovers its new participants and submits the base-relative
 publication through the same update endpoint. The publication path must be visible
 to all ranks. Delta resources are retained by default (`release_state=false`);
 `release_state=true` clears them after successful activation while retaining the

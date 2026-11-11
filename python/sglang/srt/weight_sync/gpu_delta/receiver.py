@@ -38,8 +38,7 @@ class GpuDeltaBackend:
         )
 
         self._canonical_plan_digest = None
-        self._canonical_tensors = None
-        self._canonical_tensor_ids = None
+        self.binding_table = None
         self.batch_plan = None
         self.layers_per_batch = int(os.environ.get("GPU_DELTA_LAYERS_PER_BATCH", "1"))
         if self.layers_per_batch < 1:
@@ -56,18 +55,14 @@ class GpuDeltaBackend:
         self.apply_stream = None
         self.io_stream = None
 
-    def describe(self):
-        self.layout.check_identity()
-        return self.layout.description
-
     def prepare(self, request, cancelled=None):
         # Called by the background worker. Small scalar calibration may be read
         # to prepare derived values; no live writes, collectives, loader hooks
         # or generation-stream synchronization occur here.
         with torch.cuda.device(self.device):
-            prepared = PreparedDelta.__new__(PreparedDelta)
+            prepared = PreparedDelta(self)
             try:
-                prepared.__init__(self, request, cancelled)
+                prepared.prepare(request, cancelled)
                 return prepared
             except BaseException:
                 self.discard(prepared)
@@ -90,40 +85,92 @@ class _PreparedBatch:
     check_status: Callable[[], None]
 
 
+class _BindingTable:
+    """Rank-local geometry; only publication row values change between updates."""
+
+    def __init__(self, layout, entries):
+        self.bindings = tuple(layout.bindings)
+        self.ordinals = np.asarray(
+            [entries[b.name][0] for b in self.bindings], dtype=np.int64
+        )
+        self.nbytes = np.asarray(
+            [entries[b.name][1]["nbytes"] for b in self.bindings], dtype=np.int64
+        )
+        self.raw = np.asarray(
+            [b.encoding == "raw_bytes" for b in self.bindings], dtype=bool
+        )
+        self.ue8m0 = np.asarray([b.raw_ue8m0 for b in self.bindings], dtype=bool)
+        self.raw_order = np.concatenate(
+            (
+                np.flatnonzero(self.raw & self.ue8m0),
+                np.flatnonzero(self.raw & ~self.ue8m0),
+            )
+        )
+        non_layers = {"embed_tokens": [], "lm_head": [], "standalone": []}
+        layers, storage_rows = {}, {}
+        for row, binding in enumerate(self.bindings):
+            if binding.layer is None:
+                module = binding.name.rpartition(".")[0].rpartition(".")[2]
+                non_layers.get(module, non_layers["standalone"]).append(row)
+            else:
+                layers.setdefault(binding.layer, []).append(row)
+            for pointer in binding.storage_pointers:
+                storage_rows.setdefault(pointer, []).append(row)
+        self.non_layers = tuple(
+            np.asarray(rows, np.int64) for rows in non_layers.values()
+        )
+        self.layers = tuple(np.asarray(rows, np.int64) for rows in layers.values())
+        self.derived = tuple(layout.derived)
+        pairs = [
+            (row, index)
+            for index, image in enumerate(self.derived)
+            for row in storage_rows.get(image.source_pointer, ())
+        ]
+        self.derived_rows, self.derived_indices = (
+            np.asarray(pairs, np.int64).reshape(-1, 2).T
+        )
+
+    def select(self, tensors):
+        local = tensors[self.ordinals]
+        matrices = (local["frame_count"] != 0) & ~self.raw
+        raw = (local["changed_bytes"] != 0) & self.raw
+        active = matrices | raw
+        derived = np.zeros(len(self.derived), dtype=bool)
+        derived[self.derived_indices[active[self.derived_rows]]] = True
+        return (
+            np.flatnonzero(matrices),
+            self.raw_order[raw[self.raw_order]],
+            [self.derived[row] for row in np.flatnonzero(derived)],
+        )
+
+
 @profiling.annotate("gpu_delta.prepare.layer_plan")
-def _plan_layers(backend, bindings, canonical_tensors, layers_per_batch=1):
+def _plan_layers(backend, table, rows):
     """Cache membership, canonical offsets and apply geometry, never wire frames."""
-    key = layers_per_batch, tuple(binding.name for binding in bindings)
+    key = rows.tobytes()
     if backend.batch_plan is None or backend.batch_plan[0] != key:
-        if not bindings:
+        if not len(rows):
             backend.batch_plan = (key, [])
             return []
         from sglang.srt.weight_sync.gpu_delta.apply import plan_apply
 
-        layers = {}
-        non_layers = {"embed_tokens": [], "lm_head": [], "standalone": []}
-        for binding in bindings:
-            if binding.layer is None:
-                module = binding.name.rpartition(".")[0].rpartition(".")[2]
-                non_layers.get(module, non_layers["standalone"]).append(binding)
-            else:
-                layers.setdefault(binding.layer, []).append(binding)
-        groups = [group for group in non_layers.values() if group]
-        model_layers = list(layers.values())
+        active = np.zeros(len(table.bindings), dtype=bool)
+        active[rows] = True
+        groups = [group[active[group]] for group in table.non_layers]
+        groups = [group for group in groups if len(group)]
+        model_layers = [group[active[group]] for group in table.layers]
+        model_layers = [group for group in model_layers if len(group)]
+        layers_per_batch = backend.layers_per_batch
         groups.extend(
-            [
-                binding
-                for layer in model_layers[start : start + layers_per_batch]
-                for binding in layer
-            ]
+            np.concatenate(model_layers[start : start + layers_per_batch])
             for start in range(0, len(model_layers), layers_per_batch)
         )
         plans = []
         for group in groups:
             outputs, size = [], 0
-            for binding in group:
+            for row in group:
                 offset = (size + 15) // 16 * 16
-                _, nbytes = canonical_tensors[binding.name]
+                binding, nbytes = table.bindings[row], int(table.nbytes[row])
                 outputs.append((binding, offset, nbytes))
                 size = offset + nbytes
             # Segment views share one decoded canonical payload. Only the apply
@@ -133,13 +180,9 @@ def _plan_layers(backend, bindings, canonical_tensors, layers_per_batch=1):
                 for binding, offset, nbytes in outputs
                 for view in binding.apply_bindings()
             ]
-            tensor_offsets = np.asarray(
-                [
-                    (canonical_tensors[binding.name][0], offset)
-                    for binding, offset, _ in outputs
-                ],
-                dtype=np.int64,
-            ).T.copy()
+            tensor_offsets = np.stack(
+                (table.ordinals[group], [offset for _, offset, _ in outputs])
+            )
             plans.append((tensor_offsets, size, plan_apply(apply_outputs)))
         backend.batch_plan = (key, plans)
     return backend.batch_plan[1]
@@ -176,12 +219,12 @@ def _plan_decode(plans, publication, offsets):
 
 @profiling.annotate("gpu_delta.prepare.canonical_plan")
 def _qualify_canonical_plan(backend, publication):
-    """Admit the shared static catalog once; retain only local ordinals and sizes."""
+    """Bind a canonical publication to the independently prepared local layout."""
     digest = publication.header["plan_digest"]
     if backend._canonical_plan_digest is not None:
         if digest != backend._canonical_plan_digest:
-            raise ValueError("negotiated canonical delta plan changed")
-        return backend._canonical_tensors, True
+            raise ValueError("canonical delta plan changed")
+        return backend.binding_table, True
     catalog = publication.read_catalog()
     if catalog["plan_digest"] != digest:
         raise ValueError("shared canonical catalog plan changed")
@@ -189,64 +232,60 @@ def _qualify_canonical_plan(backend, publication):
         entry["name"]: (ordinal, entry)
         for ordinal, entry in enumerate(catalog["tensors"])
     }
+    if len(entries) != len(catalog["tensors"]):
+        raise ValueError("duplicate canonical tensor")
     definitions = []
     for name, (_, entry) in entries.items():
         if name not in backend.layout.inventory or backend.layout.excluded.get(
             name
-        ) not in {None, "expert projection owned by another EP/TP rank"}:
+        ) not in {
+            None,
+            "expert projection owned by another EP/TP rank",
+            "static activation calibration",
+            "loader ignores computed rotary frequencies",
+        }:
             raise ValueError(f"delta publication has an unadmitted tensor: {name}")
         canonical = backend.layout.inventory[name]
-        if (
-            entry["shape"] != canonical["shape"]
-            or entry["dtype"] != canonical["dtype"]
-            or entry["byte_order"] != "little"
-        ):
-            raise ValueError(f"canonical tensor metadata mismatch: {name}")
-        if entry["nbytes"] != math.prod(entry["shape"]) * _ITEMSIZES[
-            entry["dtype"]
-        ] or entry["encoding"] != (
-            canonical.get(
-                "encoding", "raw_bytes" if len(entry["shape"]) <= 1 else "xor_bytes"
-            )
-        ):
-            raise ValueError(f"unsupported canonical tensor size/encoding: {name}")
         definition = {
-            key: entry[key] for key in ("name", "dtype", "shape", "encoding", "views")
+            "name": name,
+            "dtype": canonical["dtype"],
+            "shape": canonical["shape"],
+            "encoding": canonical.get(
+                "encoding", "raw_bytes" if len(canonical["shape"]) <= 1 else "xor_bytes"
+            ),
         }
-        # Wire format is bound by the negotiated plan digest. Publication frames
-        # intentionally carry only byte payload geometry, not another format copy.
         for key in ("format", "checkpoint_dtype"):
             if key in canonical:
                 definition[key] = canonical[key]
+        if any(entry.get(key) != value for key, value in definition.items()) or any(
+            key in entry and key not in definition
+            for key in ("format", "checkpoint_dtype")
+        ):
+            raise ValueError(f"canonical tensor metadata mismatch: {name}")
+        if entry["byte_order"] != "little" or entry["nbytes"] != (
+            math.prod(canonical["shape"]) * _ITEMSIZES[canonical["dtype"]]
+        ):
+            raise ValueError(f"unsupported canonical tensor size/encoding: {name}")
         definitions.append(definition)
-    for binding in backend.layout.bindings:
-        views = entries[binding.name][1]["views"]
-        matching = [view for view in views if view["id"] == binding.view_id]
-        if len(matching) != 1 or matching[0]["slices"] != binding.slices:
-            raise ValueError(f"missing or conflicting rank view for {binding.name}")
+    missing = {binding.name for binding in backend.layout.bindings} - entries.keys()
+    if missing:
+        raise ValueError(f"publication is missing local tensors: {sorted(missing)}")
     if _digest(sorted(definitions, key=lambda entry: entry["name"])) != digest:
-        raise ValueError(
-            "publication does not match its negotiated canonical view plan"
-        )
-    # No catalog graph or per-publication frame objects survive cold admission.
-    local = {
-        binding.name: (entries[binding.name][0], entries[binding.name][1]["nbytes"])
-        for binding in backend.layout.bindings
-    }
-    backend._canonical_tensors = local
-    backend._canonical_tensor_ids = tuple(ordinal for ordinal, _ in local.values())
+        raise ValueError("publication does not match its canonical tensor plan")
+    # Tensor selection and physical layout are receiver-local. The publication
+    # never contains TP/EP slices, backend permutations or receiver identities.
+    table = _BindingTable(backend.layout, entries)
+    backend.binding_table = table
     backend._canonical_plan_digest = digest
-    return local, False
+    return table, False
 
 
 class PreparedDelta:
-    @profiling.annotate("gpu_delta.prepare.layout")
-    def __init__(self, backend, request, cancelled=None):
-        from sglang.srt.weight_sync.gpu_delta.host import copy_bytes
-
+    def __init__(self, backend):
         self.stream = None
         self.io_stream = None
         self.host_snapshot = None
+        self._gpu_complete = False
         self.batches, self.raw_copies = [], {}
         self.timings = {}
         self.status_checks = []
@@ -254,8 +293,13 @@ class PreparedDelta:
         self.apply_fallback_groups = set()
         self.apply_host_view = None
         self.backend, self.device = backend, backend.device
+
+    @profiling.annotate("gpu_delta.prepare.layout")
+    def prepare(self, request, cancelled=None):
+        from sglang.srt.weight_sync.gpu_delta.host import copy_bytes
+
+        backend = self.backend
         preparation_started = time.perf_counter()
-        layers_per_batch = backend.layers_per_batch
         payload_started = time.perf_counter()
         publication = backend.host_arena.prepare_publication(
             request, self.timings, cancelled
@@ -270,12 +314,12 @@ class PreparedDelta:
         self.hardware = self.decoder.backend == "hardware"
         self.target_version = publication.header["target_version"]
         plan_started = time.perf_counter()
-        canonical_tensors, reused_plan = _qualify_canonical_plan(backend, publication)
+        table, reused_plan = _qualify_canonical_plan(backend, publication)
         self.timings["host_plan_validate_s"] = time.perf_counter() - plan_started
         self.timings["host_plan_cache_reused"] = int(reused_plan)
         self.host_snapshot = backend.host_arena.prepare_local(
             publication,
-            backend._canonical_tensor_ids,
+            table.ordinals,
             self.timings,
             self.hardware,
         )
@@ -283,23 +327,11 @@ class PreparedDelta:
         self.timings["host_rank_prepare_s"] = self.timings["host_rank_prepare_body_s"]
 
         tensors_started = time.perf_counter()
-        compressed, raw_entries, ue8m0_entries = [], [], []
-        for binding in backend.layout.bindings:
-            tensor_id, nbytes = canonical_tensors[binding.name]
-            tensor = publication.tensors[tensor_id]
-            if binding.encoding == "raw_bytes":
-                if tensor["changed_bytes"]:
-                    group = ue8m0_entries if binding.raw_ue8m0 else raw_entries
-                    group.append((binding, nbytes))
-            elif tensor["frame_count"]:
-                compressed.append(binding)
+        compressed, raw_rows, self.derived = table.select(publication.tensors)
         # Compact scales form one prefix for validation and native GPU expansion.
-        raw_entries = ue8m0_entries + raw_entries
-        self.raw_ue8m0_bytes = sum(nbytes for _, nbytes in ue8m0_entries)
+        self.raw_ue8m0_bytes = int(table.nbytes[raw_rows[table.ue8m0[raw_rows]]].sum())
         previous_plan = backend.batch_plan
-        self.static_plans = _plan_layers(
-            backend, compressed, canonical_tensors, layers_per_batch
-        )
+        self.static_plans = _plan_layers(backend, table, compressed)
         self.timings["host_batch_plan_reused"] = int(
             previous_plan is not None and backend.batch_plan is previous_plan
         )
@@ -310,14 +342,15 @@ class PreparedDelta:
         )
         self.max_decoded = max((plan[1] for plan in self.static_plans), default=0)
         self.matrix_tensor_count = len(compressed)
-        self.raw_tensor_count = len(raw_entries)
+        self.raw_tensor_count = len(raw_rows)
         self.timings["host_tensor_prepare_s"] = time.perf_counter() - tensors_started
 
         # Pack the small complete-target bypass once on the host. Decoded-mask
         # storage waits for the actual serving pause; kernel warmup is below.
         raw_started = time.perf_counter()
         raw_targets, raw_h2d_bytes = [], 0
-        for binding, size in raw_entries:
+        for row in raw_rows:
+            binding, size = table.bindings[row], int(table.nbytes[row])
             position = (
                 raw_h2d_bytes if binding.raw_ue8m0 else (raw_h2d_bytes + 7) // 8 * 8
             )
@@ -327,31 +360,21 @@ class PreparedDelta:
             raw_h2d_bytes, dtype=torch.uint8, device="cpu", pin_memory=True
         )
         raw_view = memoryview(self.raw_pinned.numpy())
-        for binding, position, size in raw_targets:
+        for ordinal, (_, position, size) in zip(table.ordinals[raw_rows], raw_targets):
             copy_bytes(
                 raw_view[position : position + size],
-                self.host_snapshot.get(canonical_tensors[binding.name][0]),
+                self.host_snapshot.get(int(ordinal)),
             )
         if self.raw_ue8m0_bytes:
             validate_ue8m0_payload(self.raw_pinned[: self.raw_ue8m0_bytes])
-        changed_storages = {
-            pointer
-            for binding in compressed + [binding for binding, _ in raw_entries]
-            for pointer in binding.storage_pointers
-        }
-        self.derived = [
-            image
-            for image in backend.layout.derived
-            if image.source_pointer in changed_storages
-        ]
         self.timings.update(
             host_raw_pack_s=time.perf_counter() - raw_started,
-            raw_tensors=len(raw_entries),
-            raw_bytes=sum(nbytes for _, nbytes in raw_entries),
+            raw_tensors=len(raw_rows),
+            raw_bytes=int(table.nbytes[raw_rows].sum()),
             raw_h2d_bytes=raw_h2d_bytes,
             compressed_batches=len(self.static_plans),
             decode_stages=2,
-            layers_per_batch=layers_per_batch,
+            layers_per_batch=backend.layers_per_batch,
             compressed_tensors=self.matrix_tensor_count,
             de_host_input_bytes=int(frame_table[1].sum()) if self.hardware else 0,
             decoded_zero_ranges=sum(map(len, self.gaps)),
@@ -665,6 +688,7 @@ class PreparedDelta:
         # Release output/workspace leases before generation resumes. DE allocation
         # free/fence overhead remains included in paused host wall time.
         self._release_gpu()
+        self._gpu_complete = True
         self.timings["paused_apply_host_wall_s"] = time.perf_counter() - apply_started
         return {
             "applied": True,
@@ -745,27 +769,23 @@ class PreparedDelta:
         ) = None
 
     @profiling.annotate("gpu_delta.release_host")
-    def release_and_close(self):
-        try:
-            self.host_snapshot.mark_reusable()
-        finally:
-            self.close()
-
-    def close(self):
+    def close(self, reuse_host=False):
         # Error/cancel paths must attempt every stream before releasing any
-        # storage. Success already joined and released GPU leases in apply.
-        failure = None
-        for stream in (self.io_stream, self.stream):
-            if stream is not None:
-                try:
-                    stream.synchronize()
-                except BaseException as error:
-                    if failure is None:
-                        failure = error
-        if failure is not None:
-            raise failure
-        self._release_gpu()
+        # storage. Resume can reuse the successful apply fence and scratch
+        # release; failure cleanup always drains, even after a completed apply.
+        if not reuse_host or not self._gpu_complete:
+            failure = None
+            for stream in (self.io_stream, self.stream):
+                if stream is not None:
+                    try:
+                        stream.synchronize()
+                    except BaseException as error:
+                        if failure is None:
+                            failure = error
+            if failure is not None:
+                raise failure
+            self._release_gpu()
         if self.host_snapshot is not None:
-            self.host_snapshot.close()
+            self.host_snapshot.close(reuse_host)
             self.host_snapshot = None
         self.raw_pinned = None

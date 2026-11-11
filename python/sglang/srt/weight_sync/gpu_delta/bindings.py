@@ -26,12 +26,6 @@ from sglang.srt.weight_sync.gpu_delta.flashinfer import (
     identify_layout,
 )
 
-BACKEND_LAYOUTS = {
-    "dense": "unquantized-tp",
-    "moe": "flashinfer-native-byte-layouts",
-}
-
-
 _DTYPES = {
     torch.bfloat16: "BF16",
     torch.float16: "F16",
@@ -92,26 +86,8 @@ class TensorBinding:
     def storage_pointers(self):
         return tuple(tensor.untyped_storage().data_ptr() for tensor in self.storage)
 
-    @cached_property
-    def view_id(self):
-        return _digest({"name": self.name, "slices": self.slices})
-
-    def describe(self):
-        result = {
-            "name": self.name,
-            "dtype": self.dtype,
-            "shape": list(self.shape),
-            "encoding": self.encoding,
-            "views": [{"id": self.view_id, "slices": self.slices}],
-        }
-        if self.format is not None:
-            result["format"] = self.format
-        if self.checkpoint_dtype is not None:
-            result["checkpoint_dtype"] = self.checkpoint_dtype
-        return result
-
     def apply_bindings(self):
-        """Return byte-layout pieces without adding negotiated tensor views."""
+        """Return receiver-local byte-layout pieces of one canonical tensor."""
         return self._apply_views
 
     @cached_property
@@ -222,17 +198,9 @@ def _moe_binding(name, meta, layer, expert, projection, suffix, layout):
     stem = "w2" if projection == "down" else "w13"
     half = 0 if projection == "gate" else 1  # scalar metadata stays gate-first
     if suffix == "input_scale" and layout.format == "nvfp4":
-        if layout.quant_mode == "w4a16" or layer.quant_config.use_per_token_activation:
-            return None
-        # Calibration is global even when this expert's weights belong to a
-        # different EP rank: the ordinary consumer uses the shared maximum.
-        target = getattr(layer, f"{stem}_input_scale")
-        target = (
-            target[expert, half]
-            if projection != "down" and layout.gated
-            else target[expert]
-        )
-        return _direct_binding(name, meta, target)
+        # Activation calibration belongs to the immutable checkpoint prior.
+        # Only weight-derived scales change during training.
+        return None
     local = layer._map_global_expert_id_to_local_expert_id(expert)
     if local < 0:
         return None

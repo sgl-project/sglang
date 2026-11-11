@@ -17,7 +17,6 @@ from sglang.srt.weight_sync.gpu_delta.http import register_gpu_delta_routes
 from sglang.srt.weight_sync.gpu_delta.io import (
     ClearGpuDeltaStateReqInput,
     GetGpuDeltaInfoReqInput,
-    GetGpuDeltaStatusReqInput,
     GpuDeltaReqOutput,
     UpdateWeightsFromGpuDeltaReqInput,
 )
@@ -92,13 +91,11 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
         ),
         ("clear_gpu_delta_state", ClearGpuDeltaStateReqInput, {}),
         ("get_gpu_delta_info", GetGpuDeltaInfoReqInput, {"engine_id": "e0"}),
-        ("get_gpu_delta_status", GetGpuDeltaStatusReqInput, session),
     ]
     assert {route.path for route in app.routes if "gpu_delta" in route.path} == {
         "/update_weights_from_gpu_delta",
         "/clear_gpu_delta_state",
         "/get_gpu_delta_info",
-        "/get_gpu_delta_status",
     }
     for name, request_type, payload in cases:
         route = next(route for route in app.routes if route.path == f"/{name}")
@@ -135,7 +132,7 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
 
     # A real scheduler failure retains the same typed HTTP route and response.
     reply.update(success=False, message="delta payload checksum failed")
-    result = client.post("/get_gpu_delta_status", json={"session_id": "p"})
+    result = client.post("/update_weights_from_gpu_delta", json=publication)
     assert result.status_code == 409 and result.json() == reply
     assert len(calls) == len(cases) + 1
 
@@ -158,6 +155,7 @@ def control(monkeypatch):
         tokenizer.GpuDeltaTokenizerControl
     )
     control.manager = manager
+    control.reply_endpoint = "ipc:///gpu-delta-tokenizer-test"
     control.communicator = GpuDeltaCommunicator(manager._dispatch_to_scheduler, 1)
     return control, sent, versions
 
@@ -239,6 +237,10 @@ def test_update_waits_for_every_rank_before_apply_and_resume(
         reply(facade, prepare, "PREPARED", ranks=routes[0])
         await asyncio.sleep(0)
         assert sent.empty() and not task.done()
+        # A duplicate cannot stand in for a slower rank's completion.
+        reply(facade, prepare, "PREPARED", ranks=routes[0])
+        await asyncio.sleep(0)
+        assert sent.empty() and not task.done()
         reply(facade, prepare, "PREPARED", ranks=routes[1])
         apply = await sent.get()
         assert type(apply) is io.ApplyGpuDeltaReqInput
@@ -295,7 +297,7 @@ def test_update_preserves_receipts_options_and_failure_boundaries(
     weight_version,
     pause_at,
 ):
-    # The same negotiated input contract supports fresh-base and rolling updates.
+    # The same canonical input contract supports fresh-base and rolling updates.
     publication["validate_payload_hash"] = False
     if release_state:
         publication["base_version"] = 0
@@ -323,12 +325,12 @@ def test_update_preserves_receipts_options_and_failure_boundaries(
             if type(obj) is io.PrepareGpuDeltaReqInput:
                 assert not facade.manager.is_pause_cond.locked()
                 assert facade.manager.is_pause is (pause_at == "entry")
-                assert obj == io.PrepareGpuDeltaReqInput(**publication)
-                state, phase, duration = "PREPARING", "prepare", 2
-            elif isinstance(obj, io.GetGpuDeltaStatusReqInput):
+                assert obj == io.PrepareGpuDeltaReqInput(
+                    **publication, http_worker_ipc=facade.reply_endpoint
+                )
                 if pause_at == "prepare":
                     facade.manager.is_pause = True
-                state, phase, duration = "PREPARED", "status", 3
+                state, phase, duration = "PREPARED", "prepare", 5
             elif isinstance(obj, io.ApplyGpuDeltaReqInput):
                 assert facade.manager.is_pause
                 assert obj.flush_cache is flush_cache
@@ -393,7 +395,6 @@ def test_update_preserves_receipts_options_and_failure_boundaries(
             assert versions == [serving_version]
             expected = [
                 io.PrepareGpuDeltaReqInput,
-                io.GetGpuDeltaStatusReqInput,
                 io.ApplyGpuDeltaReqInput,
                 io.ResumeGpuDeltaReqInput,
             ]
@@ -511,6 +512,35 @@ def test_late_reply_after_cancellation_cannot_acknowledge_resume():
         assert (await resume)[0].state == "RESUMED"
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["prepare", "replacement"])
+def test_prepare_failure_does_not_wait_for_other_ranks(publication, failure):
+    async def run():
+        sent = asyncio.Queue()
+        comm = GpuDeltaCommunicator(sent.put_nowait, 1)
+        task = asyncio.create_task(comm(io.PrepareGpuDeltaReqInput(**publication)))
+        request = await sent.get()
+        row = {
+            "identity": None if failure == "prepare" else {"rank_id": "replacement"},
+            "state": "FAILED" if failure == "prepare" else "PREPARED",
+        }
+        comm.handle_recv(
+            io.GpuDeltaReqOutput(
+                rid=request.rid,
+                success=failure != "prepare",
+                message="prepare failed" if failure == "prepare" else "",
+                participants=[row],
+            )
+        )
+        results = await task
+        assert len(results) == 1 and not results[0].success
+        assert (
+            "prepare failed" in results[0].message
+            or "incarnation" in results[0].message
+        )
+
+    asyncio.run(asyncio.wait_for(run(), timeout=2))
 
 
 if __name__ == "__main__":

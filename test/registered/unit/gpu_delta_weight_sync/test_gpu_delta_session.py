@@ -42,12 +42,10 @@ class Payload:
             "timings": {"host_prepare_s": 0.25},
         }
 
-    def close(self):
+    def close(self, reuse_host=False):
+        if reuse_host:
+            self.released.set()
         self.closed.set()
-
-    def release_and_close(self):
-        self.released.set()
-        self.close()
 
 
 class Backend:
@@ -133,6 +131,32 @@ def applied(session, backend, req=None):
     return session.apply("publication-1", lambda: None, lambda: None, lambda: True)
 
 
+def test_prepare_completion_uses_request_route_without_scheduler_socket(make_session):
+    import zmq
+
+    from sglang.srt.managers.io_struct import sock_recv
+
+    session, backend = make_session()
+    control = GpuDeltaSchedulerControl(SimpleNamespace(_engine_paused=False))
+    control.session = session
+    with zmq.Context.instance().socket(zmq.PULL) as receiver:
+        endpoint = f"inproc://gpu-delta-{session.identity['rank_id']}"
+        receiver.bind(endpoint)
+        request_input = delta_io.PrepareGpuDeltaReqInput(
+            **request([session.identity]), rid="prepare", http_worker_ipc=endpoint
+        )
+        assert control.handle(request_input) is None
+        assert backend.started.wait(2)
+        assert receiver.poll(0) == 0
+        backend.ready.set()
+        assert receiver.poll(5000)
+        reply = sock_recv(receiver)
+        assert reply.rid == "prepare" and reply.http_worker_ipc == endpoint
+        assert reply.success and reply.participants[0]["state"] == "PREPARED"
+        assert reply.participants[0]["identity"] == session.identity
+        assert not reply.participants[0]["generation_paused"]
+
+
 @pytest.mark.parametrize(
     "abort_state,drain_failure",
     [("PREPARING", False), ("PREPARED", False), ("PREPARING", True)],
@@ -144,37 +168,36 @@ def test_prepare_and_status_do_not_wait_for_file_io(
     req = request([session.identity])
     control = GpuDeltaSchedulerControl(SimpleNamespace(_engine_paused=False))
     control.session = session
+    replies, replied = [], threading.Event()
+
+    def reply(request, receipt, success, message=""):
+        replies.append((receipt, success))
+        replied.set()
+
+    control._reply_prepare = reply
     accepted = control.handle(
         delta_io.PrepareGpuDeltaReqInput(**req, validate_payload_hash=False)
     )
-    assert accepted.success
-    preparing = accepted.participants[0]
-    assert session._session.request["validate_payload_hash"] is False
+    assert accepted is None and replies == []
+    assert not replied.is_set()
+    preparing = session.status()
+    assert session._update.request["validate_payload_hash"] is False
     assert preparing["state"] == "PREPARING"
     assert backend.started.wait(2)
     status = session.status()
     assert status["state"] == "PREPARING"
     assert backend.payload.applications == 0
-    matched = control.handle(
-        delta_io.GetGpuDeltaStatusReqInput(session_id="publication-1")
-    )
-    assert matched.success and matched.participants[0]["session_id"] == "publication-1"
-    mismatched = control.handle(
-        delta_io.GetGpuDeltaStatusReqInput(session_id="another-publication")
-    )
-    assert not mismatched.success and "different session" in mismatched.message
-    for receipt in (
-        preparing,
-        status,
-        matched.participants[0],
-        mismatched.participants[0],
-    ):
+    for receipt in (preparing, status):
         for key in req.keys() - {"manifest_path", "participants"}:
             assert receipt[key] == req[key]
     assert session.status()["state"] == "PREPARING"
     if abort_state == "PREPARED":
         backend.ready.set()
         wait_state(session, "PREPARED")
+        session._update.prepare_future.result(timeout=2)
+        assert replied.wait(2)
+        assert len(replies) == 1 and replies[0][1]
+        assert replies[0][0]["state"] == "PREPARED"
     cleanup = []
     close_payload, close_backend = backend.payload.close, backend.close
 
@@ -196,7 +219,7 @@ def test_prepare_and_status_do_not_wait_for_file_io(
     session._executor.submit(lambda: None).result(timeout=2)
     if drain_failure:
         with pytest.raises(RuntimeError, match="GPU drain failed"):
-            session._prepare_future.result()
+            session._update.prepare_future.result()
         assert cleanup == ["drain"]
         assert not backend.closed and not backend.payload.closed.is_set()
     else:
@@ -264,14 +287,14 @@ def test_engine_release_runs_off_scheduler_and_before_next_prepare(make_session)
     entered, release = threading.Event(), threading.Event()
     caller = threading.get_ident()
 
-    def cleanup():
+    def cleanup(reuse_host=False):
+        assert reuse_host
         assert threading.get_ident() != caller
         entered.set()
         assert release.wait(5)
-        backend.payload.released.set()
-        backend.payload.close()
+        Payload.close(backend.payload, reuse_host)
 
-    backend.payload.release_and_close = cleanup
+    backend.payload.close = cleanup
     try:
         assert session.resume("publication-1", lambda _: None)["state"] == "RESUMED"
         assert entered.wait(2)
@@ -284,7 +307,9 @@ def test_engine_release_runs_off_scheduler_and_before_next_prepare(make_session)
             base_version=1,
             target_version=2,
         )
-        receipt = session.prepare(req)
+        completion = session.prepare(req)
+        assert not completion.done()
+        receipt = session.status()
         assert receipt["state"] == "PREPARING"
         for key in req.keys() - {"manifest_path", "participants"}:
             assert receipt[key] == req[key]
@@ -293,6 +318,7 @@ def test_engine_release_runs_off_scheduler_and_before_next_prepare(make_session)
         release.set()
     assert backend.started.wait(2)
     assert backend.payload.released.is_set()
+    assert completion.result(timeout=2)["state"] == "PREPARED"
 
 
 def test_bad_publication_never_mutates(make_session):
@@ -523,7 +549,10 @@ def test_cp_tp_replies_preserve_follower_failure_and_original_identity(
     ]
     values = [(r["state"] == "APPLIED", r["message"], r) for r in receipts]
     control = GpuDeltaSchedulerControl(SimpleNamespace(_engine_paused=True), groups)
-    control.session = SimpleNamespace(status=lambda: receipts[rank].copy())
+    control.session = SimpleNamespace(
+        abort=lambda session_id: receipts[rank].copy(),
+        status=lambda: receipts[rank].copy(),
+    )
     calls = []
 
     def gather_object(local, output, dst, group):
@@ -547,12 +576,12 @@ def test_cp_tp_replies_preserve_follower_failure_and_original_identity(
 
     monkeypatch.setattr("torch.distributed.gather_object", gather_object)
     result = control.handle(
-        delta_io.GetGpuDeltaStatusReqInput(session_id="publication-1", rid="status")
+        delta_io.AbortGpuDeltaReqInput(session_id="publication-1", rid="abort")
     )
     if rank == 0:
         assert len(calls) == len(groups)
         assert result.success is (count == 1)
-        assert result.rid == "status" and result.message == receipts[-1]["message"]
+        assert result.rid == "abort" and result.message == receipts[-1]["message"]
         assert (
             sorted(result.participants, key=lambda r: r["identity"]["pid"]) == receipts
         )
@@ -636,15 +665,15 @@ def test_clear_drains_release_before_private_close_and_shared_unlink(
     applied(session, backend, req)
     entered, release = threading.Event(), threading.Event()
 
-    def cleanup():
+    def cleanup(reuse_host=False):
+        assert reuse_host
         entered.set()
         assert release.wait(5)
         assert not backend.closed
         assert (directory / "state.json").read_text() == "READY"
-        backend.payload.release_and_close_original()
+        Payload.close(backend.payload, reuse_host)
 
-    backend.payload.release_and_close_original = backend.payload.release_and_close
-    backend.payload.release_and_close = cleanup
+    backend.payload.close = cleanup
     session.resume("publication-1", lambda version: None)
     assert entered.wait(2)
     from concurrent.futures import ThreadPoolExecutor
@@ -660,7 +689,9 @@ def test_clear_drains_release_before_private_close_and_shared_unlink(
     assert receipt["state"] == "CLEARED" and receipt["version"] == 7
     assert receipt["target_version"] == 7 and receipt["identity"] == session.identity
     assert backend.closed and backend.payload.closed.is_set()
-    assert session.backend is None and session._session is None
+    assert session.backend is None and session._update.state == "CLEARED"
+    assert session._update.prepared is None and session._update.result == {}
+    assert session._update.prepare_future is session._update.release_future is None
     # Closing all rank-local resources does not itself unlink the shared cache.
     assert directory.exists()
     session.release_cache(owner=True)
@@ -670,15 +701,19 @@ def test_clear_drains_release_before_private_close_and_shared_unlink(
     scheduler = SimpleNamespace(_engine_paused=False)
     control = GpuDeltaSchedulerControl(scheduler)
     control.session = session
-    rejected = control.handle(
+    replies = []
+    control._reply_prepare = lambda req, receipt, success, message: replies.append(
+        (receipt, success, message)
+    )
+    result = control.handle(
         delta_io.PrepareGpuDeltaReqInput(**request([session.identity]))
     )
-    assert not rejected.success and "base version" in rejected.message
-    assert rejected.participants[0]["state"] == "CLEARED"
-    assert rejected.participants[0]["version"] == 7
-    assert rejected.participants[0]["identity"] == session.identity
-    assert not rejected.participants[0]["generation_paused"]
-    for receipt in (receipt, session.status(), rejected.participants[0]):
+    assert result is None
+    rejected, success, message = replies[0]
+    assert not success and "base version" in message
+    assert rejected["state"] == "CLEARED" and rejected["version"] == 7
+    assert rejected["identity"] == session.identity
+    for receipt in (receipt, session.status(), rejected):
         for key in req.keys() - {"manifest_path", "participants"}:
             assert receipt[key] == req[key]
 
@@ -689,7 +724,7 @@ def test_clear_drains_release_before_private_close_and_shared_unlink(
 def test_clear_cannot_discard_an_unsettled_update(make_session, state):
     session, backend = make_session()
     prepare_ready(session, backend)
-    session._session.state = state
+    session._update.state = state
     with pytest.raises(ValueError, match="idle or resumed"):
         session.clear()
     assert not backend.closed and session.backend is backend
@@ -701,10 +736,11 @@ def test_failed_async_release_prevents_resource_reuse(make_session, next_operati
     session, backend = make_session()
     applied(session, backend)
 
-    def fail_release():
+    def fail_release(reuse_host=False):
+        assert reuse_host
         raise OSError("state release failed")
 
-    backend.payload.release_and_close = fail_release
+    backend.payload.close = fail_release
     session.resume("publication-1", lambda _: None)
     if next_operation == "clear":
         with pytest.raises(OSError, match="state release failed"):
@@ -785,8 +821,9 @@ def test_update_owns_pause_fence_retract_and_resume_order(
         SimpleNamespace(
             prepare=lambda *args: SimpleNamespace(
                 apply=apply,
-                close=lambda: None,
-                release_and_close=lambda: events.append("release"),
+                close=lambda reuse_host=False: (
+                    events.append("release") if reuse_host else None
+                ),
             ),
             host_arena=SimpleNamespace(directory=None),
             close=lambda: events.append("close"),
@@ -917,14 +954,12 @@ def test_describe_binds_published_scheduler_ranks(
         scheduler.rust_server = None
         scheduler.tp_worker = SimpleNamespace(model_runner=runner)
 
-        plan = {"tensors": []}
         backends = []
 
         def make_backend(model_runner, identity):
             assert model_runner is runner
             backends.append(identity.copy())
             return SimpleNamespace(
-                describe=lambda: plan,
                 host_arena=SimpleNamespace(directory=None),
                 close=lambda: None,
             )
@@ -974,7 +1009,7 @@ def test_describe_binds_published_scheduler_ranks(
             "pp_rank": 0,
         }
         assert receipt["state"] == "IDLE" and receipt["version"] == 0
-        assert receipt["plan"] == plan
+        assert set(receipt) == {"identity", "state", "version"}
         assert control._describe("engine-0") == receipt
         assert len(backends) == 1
         assert cache_engines == ["engine-0"]
@@ -1045,9 +1080,9 @@ def test_nvtx_pause_ends_only_after_successful_unpause(
             session.resume("publication-1", resume, keep_pause=outcome == "retained")
     if outcome == "resumed":
         assert events[-2:] == [("resume", 1), ("end", 17)]
-        assert session._session.nvtx_pause_id is None
+        assert session._update.nvtx_pause_id is None
         assert session.status()["scheduler_timing"]["blocked_s"] is not None
     else:
         assert not any(event[0] == "end" for event in events)
-        assert session._session.nvtx_pause_id == 17
+        assert session._update.nvtx_pause_id == 17
         assert session.status()["scheduler_timing"]["blocked_s"] is None
