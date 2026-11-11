@@ -929,6 +929,8 @@ class Envs:
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
     # With the master: CTA quota of the per-layer KV load; None keeps the stock one.
     SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(None)
+    # With the master: CTA quota of the page_first Mamba state load.
+    SGLANG_HICACHE_MAMBA_LOAD_BLOCK_QUOTA = EnvInt(None)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
