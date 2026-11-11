@@ -125,6 +125,9 @@ srt_hip = [
   "sglang[monokernels_hip]",
   "sglang[runtime_common]",
   "torch",
+  # --tokenizer-backend fastokens; the DeepSeek-V4.1 recipe prompt encoder
+  # needs Tokenizer.encode_segments.
+  "fastokens==0.3.6",
   "petit_kernel==0.0.2",
   "wave-lang==3.8.2",
 ]
@@ -134,6 +137,7 @@ srt_hip_rocm724 = [
   # ROCm 7.2.4 uses torch 2.11. compressed-tensors 0.15.0 requires
   # torch<2.11, while 0.16.0 supports torch>=2.10.
   "compressed-tensors==0.16.0",
+  "fastokens==0.3.6",
   "petit_kernel==0.0.2",
   "sglang[monokernels_hip]",
   "sglang[runtime_common]",
@@ -145,6 +149,7 @@ srt_hip_rocm724 = [
 # hand. ROCm 10.1 publishes no torch 2.11 wheel, so it has to be 2.12.
 srt_hip_rocm101 = [
   "compressed-tensors==0.16.0",
+  "fastokens==0.3.6",
   "petit_kernel==0.0.2",
   "sglang[runtime_common]",
   "torch==2.12.0",
