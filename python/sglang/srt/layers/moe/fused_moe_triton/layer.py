@@ -20,7 +20,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.eplb.expert_location import (
+    TARGET_EXPERT_LOCATION_FAMILY,
+    ExpertLocationFamily,
+    get_global_expert_location_metadata,
+    resolve_layer_expert_location_family,
+)
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
@@ -410,7 +415,9 @@ class FusedMoE(torch.nn.Module):
         gate_up_interleaved: bool = True,
         enable_qwen35_fp8_deferred_finalize: bool = False,
         quant_method: Optional[FusedMoEMethodBase] = None,
-        uses_expert_location: bool = True,
+        expert_location_family: Optional[
+            ExpertLocationFamily
+        ] = TARGET_EXPERT_LOCATION_FAMILY,
         allow_fp8_blockwise_tail: bool = False,
     ):
         super().__init__()
@@ -425,7 +432,9 @@ class FusedMoE(torch.nn.Module):
         self.layer_name = prefix
         self.layer_id = layer_id
         self.is_draft = get_flags().moe.in_speculative_scope
-        self.uses_expert_location = uses_expert_location and not self.is_draft
+        self.expert_location_family = resolve_layer_expert_location_family(
+            expert_location_family, is_draft=self.is_draft
+        )
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -1263,7 +1272,9 @@ class FusedMoE(torch.nn.Module):
     def _weight_loader_expert_ids(self, param: torch.nn.Parameter, expert_id: int):
         """Resolve destinations before online loaders allocate a source tensor."""
         global_expert_location_metadata = (
-            get_global_expert_location_metadata() if self.uses_expert_location else None
+            get_global_expert_location_metadata(self.expert_location_family)
+            if self.expert_location_family is not None
+            else None
         )
         if global_expert_location_metadata is None:
             if not getattr(param, "_sglang_require_global_experts", False):

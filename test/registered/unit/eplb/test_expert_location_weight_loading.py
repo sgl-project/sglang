@@ -85,12 +85,13 @@ def _stand_in_layer(
     num_local_routed,
     num_global_routed,
     num_shared=0,
+    family="target",
 ):
     """The FusedMoE fields and methods that the expert weight loaders read."""
     layer = types.SimpleNamespace(
         quant_config=None,
         quant_method=None,
-        uses_expert_location=True,
+        expert_location_family=family,
         layer_id=layer_id,
         moe_ep_size=ep_size,
         num_local_experts=num_local_routed + num_shared,
@@ -110,13 +111,15 @@ def _stand_in_layer(
 
 
 @contextlib.contextmanager
-def _published(metadata):
-    previous = get_global_expert_location_metadata()
-    set_global_expert_location_metadata(metadata, allow_overwrite=True)
+def _published(metadata, family="target"):
+    previous = get_global_expert_location_metadata(family)
+    set_global_expert_location_metadata(metadata, allow_overwrite=True, family=family)
     try:
         yield
     finally:
-        set_global_expert_location_metadata(previous, allow_overwrite=True)
+        set_global_expert_location_metadata(
+            previous, allow_overwrite=True, family=family
+        )
 
 
 def _load_with_fused_moe(
@@ -128,6 +131,7 @@ def _load_with_fused_moe(
     num_global_routed,
     num_shared=0,
     require_global_experts=False,
+    family="target",
 ):
     """Run FusedMoE.weight_loader for every checkpoint expert on a stand-in layer and
     return {slot: checkpoint expert written there}; global slots for a global param."""
@@ -138,6 +142,7 @@ def _load_with_fused_moe(
         num_local_routed=num_local_routed,
         num_global_routed=num_global_routed,
         num_shared=num_shared,
+        family=family,
     )
     written = {}
 
@@ -152,7 +157,7 @@ def _load_with_fused_moe(
     checkpoint_experts = [
         metadata.num_logical_experts + i for i in range(num_shared)
     ] + list(range(metadata.num_logical_experts))
-    with _published(metadata):
+    with _published(metadata, family):
         for expert_id in checkpoint_experts:
             FusedMoE.weight_loader(
                 layer, param, torch.tensor(expert_id), "w13_weight", "w1", expert_id
@@ -226,6 +231,27 @@ class TestExpertLocationWeightLoading(CustomTestCase):
                         )
                         own = row[rank * per_rank : (rank + 1) * per_rank]
                         self.assertEqual(written, dict(enumerate(own)))
+
+    def test_draft_family_loads_by_the_draft_placement(self):
+        """A draft-family layer fills its slots from the draft's placement, not the
+        target's, and counts shared experts past the draft's logical experts."""
+        target = _metadata(SAME_NODE_NARROWING, ep_size=4, nnodes=2, moe_ep_rank=1)
+        draft_layout = [[2, 0, 1, 2, 0, 1]]
+        for rank in range(2):
+            with self.subTest(rank=rank), _published(target):
+                draft = _metadata(draft_layout, ep_size=2, nnodes=1, moe_ep_rank=rank)
+                written = _load_with_fused_moe(
+                    draft,
+                    layer_id=0,
+                    rank=rank,
+                    num_local_routed=3,
+                    num_global_routed=6,
+                    num_shared=1,
+                    family="draft",
+                )
+                own = dict(enumerate(draft_layout[0][rank * 3 : rank * 3 + 3]))
+                self.assertEqual(written, {**own, 3: 3})
+                self.assertIs(get_global_expert_location_metadata(), target)
 
     def test_static_dispatch_only_targets_loaded_slots(self):
         """No rank's static dispatch table sends an expert's tokens to a slot that

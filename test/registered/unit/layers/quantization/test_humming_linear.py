@@ -156,7 +156,7 @@ class TestHummingLinear(CustomTestCase):
                 layer.moe_runner_config = MoeRunnerConfig(is_gated=True)
                 layer.scheme = None
                 layer._has_fused_shared = False
-                layer.uses_expert_location = False
+                layer.expert_location_family = None
                 layer._expert_storage_rank = 0
                 layer._num_local_routed = 2
                 layer.use_flashinfer_trtllm_moe = False

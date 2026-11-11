@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import draft_expert_distribution_scope
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -32,6 +33,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_model,
     get_parallel,
+    get_resources,
 )
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -246,7 +248,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             mega_l2_weights=object(),
             should_fuse_routed_scaling_factor_in_topk=True,
             moe_runner_config=SimpleNamespace(swiglu_limit=None),
-            uses_expert_location=False,
+            expert_location_family=None,
             _mega_moe_weights_built=True,
             _mega_moe_nvfp4=False,
         )
@@ -428,6 +430,33 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     self.assertIsNone(mega_moe._local_eplb_load_row(moe))
             shared = SimpleNamespace(experts=moe.experts, num_fused_shared_experts=1)
             self.assertIsNone(mega_moe._local_eplb_load_row(shared))
+
+    def test_draft_stage_counts_received_rows_in_the_draft_row(self):
+        """Inside the draft scope the in-kernel recv stats land in the draft
+        family's row; the target's row is never handed out."""
+        target_row = torch.zeros(2, dtype=torch.int32)
+        draft_row = torch.zeros(2, dtype=torch.int32)
+        group = SimpleNamespace(size=lambda: 4, rank=lambda: 1)
+        parallel = SimpleNamespace(moe_ep_group=SimpleNamespace(device_group=group))
+        moe = SimpleNamespace(
+            experts=SimpleNamespace(num_experts=8), num_fused_shared_experts=0
+        )
+        with (
+            get_resources().override(
+                expert_distribution_recorder=SimpleNamespace(
+                    get_current_pass_local_count_buffer=lambda **_: target_row
+                ),
+                draft_expert_distribution_recorder=SimpleNamespace(
+                    get_current_pass_local_count_buffer=lambda **_: draft_row
+                ),
+            ),
+            patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
+            patch.object(mega_moe, "_device_sm", 100),
+            patch.object(mega_moe, "_mega_moe_mma_type", return_value="fp8xfp4"),
+        ):
+            with draft_expert_distribution_scope():
+                self.assertIs(mega_moe._local_eplb_load_row(moe), draft_row)
+            self.assertIs(mega_moe._local_eplb_load_row(moe), target_row)
 
     def test_v41_megamoe_selects_image_bias_on_local_rows(self):
         """Image rows must retain their router bias after attention-TP sharding.

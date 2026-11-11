@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import torch
 
 import sglang.srt.layers.quantization  # noqa: F401
+from sglang.srt.eplb.expert_location import TARGET_EXPERT_LOCATION_FAMILY
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUMXFP4W4A8LinearMethod,
 )
@@ -84,7 +85,7 @@ class TestOnlineMXFP4Loading(unittest.TestCase):
         torch.nn.Module.__init__(layer)
         layer.quant_config = Mxfp4W4A8Config()
         layer.scheme = None
-        layer.uses_expert_location = False
+        layer.expert_location_family = None
         layer.layer_id = 0
         layer._expert_storage_rank = 1
         layer._num_local_routed = layer.num_local_experts = 2
@@ -384,7 +385,7 @@ class TestOnlineMXFP4Loading(unittest.TestCase):
             # Explicitly disabled location metadata must not be consulted.
             self.assertEqual(list(layer._weight_loader_expert_ids(param, 2)), [0])
             metadata.logical_to_all_physical.assert_not_called()
-            layer.uses_expert_location = True
+            layer.expert_location_family = TARGET_EXPERT_LOCATION_FAMILY
             self.assertEqual(list(layer._weight_loader_expert_ids(param, 1)), [0, 1])
             param._sglang_require_global_experts = True
             self.assertEqual(list(layer._weight_loader_expert_ids(param, 1)), [0, 2, 3])
