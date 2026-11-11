@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed.utils import get_group_rank_size
@@ -46,9 +47,9 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
     CuteDSLFusion,
-    MoeDeferredFinalize,
     install_cutedsl_fusion,
 )
+from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -59,10 +60,7 @@ from sglang.srt.layers.linear import (
     resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-    get_moe_runner_backend,
-)
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import (
     TopK,
@@ -83,6 +81,8 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -92,11 +92,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -104,23 +100,31 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
+from sglang.srt.models.utils import is_non_idle_and_non_empty
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_forward,
     get_parallel,
 )
-from sglang.srt.utils import (
-    LazyValue,
-    add_prefix,
-    ceil_align,
-    is_non_idle_and_non_empty,
-    make_pp_layers,
-)
+from sglang.srt.utils import LazyValue, ceil_align
 
 MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
+
+# Minimum m (num_tokens) from which the HPC-Ops bf16xfp32 router GEMM is at
+# least as fast as cublas, benchmarked per router shape
+# (hidden_size, n_routed_experts) on H100; below it the dispatcher falls back.
+# Opt-in via SGLANG_OPT_BF16_FP32_GEMM_ALGO=hpc, for two reasons: the split
+# fp32 weight moves router logits by up to ~1e-4, enough to reorder near-tied
+# experts so generations are not bit-identical to the cublas path, and the
+# cached weight split rejects online weight updates.
+_MIMO_V2_ROUTER_HPC_GEMM_MIN_M = {
+    # MiMo-V2.5-Flash: 4096 hidden size, 256 routed experts.
+    (4096, 256): 8,
+}
 
 
 def load_mimo_v2_qkv_proj_weight(
@@ -384,20 +388,27 @@ class MoEGate(nn.Module):
             torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
         )
         if config.topk_method == "noaux_tc":
-            correction_bias_dtype = (
-                torch.bfloat16
-                if quant_config is not None
-                and quant_config.get_name() == "modelopt_fp4"
-                and get_moe_runner_backend().is_flashinfer_trtllm()
-                else torch.float32
-            )
             self.e_score_correction_bias = nn.Parameter(
-                torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
+                torch.empty((config.n_routed_experts), dtype=torch.float32)
             )
         else:
             self.e_score_correction_bias = None
+        self.hpc_kernel_min_m = (
+            _MIMO_V2_ROUTER_HPC_GEMM_MIN_M.get(
+                (config.hidden_size, config.n_routed_experts)
+            )
+            if self.dtype == torch.float32
+            and envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get() == "hpc"
+            else None
+        )
 
     def forward(self, hidden_states):
+        if self.hpc_kernel_min_m is not None:
+            return linear_bf16_fp32(
+                hidden_states,
+                self.weight,
+                hpc_kernel_min_m=self.hpc_kernel_min_m,
+            )
         if self.dtype != torch.float32 and hidden_states.is_cuda:
             return torch.mm(
                 hidden_states.to(self.dtype),

@@ -8,7 +8,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.utils.profile_utils import sanitize_profile_filename_component
+from sglang.srt.observability.profile_utils import sanitize_profile_filename_component
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

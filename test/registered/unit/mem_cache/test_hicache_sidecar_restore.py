@@ -13,10 +13,8 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.page_interleave import PageInterleavePlacement, PageShardSpec
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    CacheTransferPhase,
-    ComponentType,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -30,6 +28,7 @@ def test_sidecar_restores_cache_and_request_slots(active_request, sidecar_first)
     node = UnifiedTreeNode((ComponentType.FULL, ComponentType.MAMBA))
     node.component_data[ComponentType.MAMBA].host_value = torch.tensor([2])
     component = object.__new__(MambaComponent)
+    component.host_only_checkpoint = False
     transfers = component.build_hicache_transfers(
         node,
         CacheTransferPhase.LOAD_BACK,
@@ -44,6 +43,7 @@ def test_sidecar_restores_cache_and_request_slots(active_request, sidecar_first)
     controller.device = "cpu"
     controller.is_kv_sharded = False
     controller.mem_pool_device_allocator = SimpleNamespace()
+    controller.kv_storage = None
     controller.load_queue = []
     controller.mem_pool_host = SimpleNamespace(
         anchor_entry=SimpleNamespace(

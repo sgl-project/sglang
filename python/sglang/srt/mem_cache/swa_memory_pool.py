@@ -86,7 +86,10 @@ class SWAKVPool(BaseSWAKVPool):
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
         self.layer_num = self.full_layer_nums + self.swa_layer_nums
-        self.start_layer = 0
+        # Layer ids are global under pipeline parallelism; start at this stage's first.
+        self.start_layer = min(
+            [*swa_attention_layer_ids, *full_attention_layer_ids], default=0
+        )
         self.page_size = page_size
         self.layer_transfer_counter = None
 
@@ -144,10 +147,12 @@ class SWAKVPool(BaseSWAKVPool):
             if isinstance(pool, MHATokenToKVPool):
                 pool.model_layer_ids = tuple(layer_ids)
         self.dsa_kv_cache_store_fp8 = False
+        self.kv_scale_ue8m0 = False
         self.kv_cache_dim = None
         self.index_head_dim = None
         if isinstance(self.full_kv_pool, MLATokenToKVPool):
             self.dsa_kv_cache_store_fp8 = self.full_kv_pool.dsa_kv_cache_store_fp8
+            self.kv_scale_ue8m0 = self.full_kv_pool.kv_scale_ue8m0
             self.kv_cache_dim = self.full_kv_pool.kv_cache_dim
         if isinstance(self.full_kv_pool, DSATokenToKVPool):
             self.index_head_dim = self.full_kv_pool.index_head_dim
@@ -296,6 +301,13 @@ class SWAKVPool(BaseSWAKVPool):
         # -1 in kv_indices maps to -1 via the sentinel appended to the mapping.
         return self.full_to_swa_index_mapping[kv_indices]
 
+    def _window_loc(self, window_locs):
+        assert window_locs is not None and self.WINDOW_SUB_POOL in window_locs, (
+            f"a sliding-window layer's write loc carries no ids for "
+            f"{self.WINDOW_SUB_POOL!r} (it carries {sorted(window_locs or ())})"
+        )
+        return window_locs[self.WINDOW_SUB_POOL]
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -305,16 +317,16 @@ class SWAKVPool(BaseSWAKVPool):
         k_scale: float = 1.0,
         v_scale: float = 1.0,
     ):
-        # loc_info bundles the full loc and the pre-translated SWA loc.
-        loc, swa_loc, _ = unwrap_write_loc(loc_info)
+        # loc_info bundles the full loc and the pre-translated window locs.
+        loc, window_locs, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         pool = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
         if is_swa_layer:
-            # swa_loc is the full->SWA translation, computed once per forward by
-            # the attention backend; set_kv_buffer never translates internally.
-            assert swa_loc is not None
-            loc = swa_loc
+            # The window's write ids are the full->SWA translation, computed
+            # once per forward by the attention backend; set_kv_buffer never
+            # translates internally.
+            loc = self._window_loc(window_locs)
         if isinstance(pool, MLATokenToKVPool):
             pool.set_kv_buffer(
                 None,
@@ -341,12 +353,11 @@ class SWAKVPool(BaseSWAKVPool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        loc, swa_loc, _ = unwrap_write_loc(loc_info)
+        loc, window_locs, _ = unwrap_write_loc(loc_info)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer.layer_id]
         pool = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
         if is_swa_layer:
-            assert swa_loc is not None
-            loc = swa_loc
+            loc = self._window_loc(window_locs)
         if not isinstance(pool, MLATokenToKVPool):
             raise TypeError(f"Layer {layer.layer_id} is not backed by an MLA KV pool")
         pool.set_mla_kv_buffer(
