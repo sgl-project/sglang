@@ -8,6 +8,7 @@ from unittest.mock import Mock, call, patch
 
 import torch
 from msgspec.structs import replace
+from transformers import PretrainedConfig
 
 from sglang.kernels.plugin_kernels.nvidia import spec as registry
 from sglang.srt.kernel_plugins.nvidia import binding
@@ -29,6 +30,16 @@ from _fakes import (  # noqa: E402
 )
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+
+
+def _cuda_model_runner(lm):
+    """A CUDA model runner stub for warmup; its model is not a linear-attention
+    hybrid, so warmup compiles no GDN prefill kernels."""
+    return SimpleNamespace(
+        model=lm,
+        device="cuda",
+        model_config=SimpleNamespace(hf_config=PretrainedConfig()),
+    )
 
 
 class OtherBinding:
@@ -202,7 +213,7 @@ class TestMegakernelRuntime(CustomTestCase):
         lm = self._install_spec(replace(SPEC, prepare=prepare), model=model)
         built = binding.built_megakernel(lm)
         self.assertIs(lm.prepare_before_cuda_graph_capture, original)
-        mr = SimpleNamespace(model=lm, device="cuda")
+        mr = _cuda_model_runner(lm)
         expected = [
             "allreduce",
             "a2a",
@@ -277,7 +288,7 @@ class TestMegakernelRuntime(CustomTestCase):
                     ),
                     self.assertRaisesRegex(RuntimeError, f"{failed_stage} failed"),
                 ):
-                    self._warmup(SimpleNamespace(model=lm, device="cuda"), events)
+                    self._warmup(_cuda_model_runner(lm), events)
                 self.assertEqual(
                     events,
                     ["allreduce", "a2a", "dcp", "pcie"]
@@ -307,7 +318,7 @@ class TestMegakernelRuntime(CustomTestCase):
             MegakernelBinding, "preparation_view", return_value=prepared_view
         ):
             lm = self._install_spec(spec, is_draft=True)
-            self._warmup(SimpleNamespace(model=lm, device="cuda"), [])
+            self._warmup(_cuda_model_runner(lm), [])
         self.assertIs(zero.prepared, prepared_view)
         self.assertIs(binding.built_megakernel(lm), zero)
         self.assertIs(binding.megakernel_draft_sampler(lm), print)
