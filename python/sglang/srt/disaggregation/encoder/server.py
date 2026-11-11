@@ -1028,6 +1028,7 @@ class MMEncoder:
         get_feature_fn,
         *,
         observe_metrics: bool = True,
+        to_cpu: bool = False,
     ) -> torch.Tensor:
         """Normalize one model forward without copying an existing 2-D output."""
         forward_start = time.perf_counter()
@@ -1039,6 +1040,11 @@ class MMEncoder:
                 )
             elif new_embeddings.ndim != 2:
                 new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
+            if to_cpu:
+                # The blocking copy is the GPU-completion boundary for CPU-output
+                # requests, so it stays inside the measured interval. Otherwise
+                # the forward metric only reports host launch time.
+                new_embeddings = new_embeddings.cpu()
         if observe_metrics and encoder_metrics_collector is not None:
             encoder_metrics_collector.observe_model_forward(
                 time.perf_counter() - forward_start, modality=modality.name.lower()
@@ -1055,13 +1061,18 @@ class MMEncoder:
         get_feature_fn=None,
         *,
         observe_metrics: bool = True,
+        to_cpu: bool = False,
     ) -> List[torch.Tensor]:
         """Run the model on missing items and return preprocessing-owned slices."""
         mm_items = self._build_model_mm_items(
             mm_feature, preprocess_result, indices, modality
         )
         new_embeddings = self._forward_mm_items(
-            mm_items, modality, get_feature_fn, observe_metrics=observe_metrics
+            mm_items,
+            modality,
+            get_feature_fn,
+            observe_metrics=observe_metrics,
+            to_cpu=to_cpu,
         )
         return self.slice_embedding(
             new_embeddings, (preprocess_result.token_counts[i] for i in indices)
@@ -1826,9 +1837,8 @@ class MMEncoder:
                     modality,
                     ctx.get_feature_fn,
                     observe_metrics=not ctx.is_health_check,
+                    to_cpu=not keep_on_gpu,
                 )
-                if not keep_on_gpu:
-                    mm_embedding = mm_embedding.cpu()
 
             if use_mm_cache and missing_indices:
                 encoded_rows = self._encode_missing(
@@ -1838,9 +1848,8 @@ class MMEncoder:
                     modality,
                     ctx.get_feature_fn,
                     observe_metrics=not ctx.is_health_check,
+                    to_cpu=not keep_on_gpu,
                 )
-                if not keep_on_gpu:
-                    encoded_rows = [row.cpu() for row in encoded_rows]
                 for index, row in zip(missing_indices, encoded_rows):
                     cached_rows[index] = row
             if use_mm_cache:
