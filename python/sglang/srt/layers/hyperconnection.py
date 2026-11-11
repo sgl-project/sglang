@@ -305,8 +305,13 @@ class GatedResidual(HyperConnectionBase):
     def mix(
         self,
         hyper_input: torch.Tensor,
-        normalized_input: Optional[torch.Tensor] = None,
+        prepared_norm: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+        """``prepared_norm`` is whatever ``combine_and_normalize`` returned for
+        ``hyper_input``: on the fused path, the [M, HC * NP] FP32 partial sums of
+        squares from ``hc_apply_inject``; otherwise, ``hc_norm(hyper_input)``.
+        None makes ``mix`` compute whichever one its path needs.
+        """
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
             mixed_input = hyper_input.new_empty(
@@ -318,13 +323,12 @@ class GatedResidual(HyperConnectionBase):
             and not torch.compiler.is_compiling()
             and flydsl_hc_mix_supported(hyper_input, True)
         ):
-            # Fused sites get combine_and_normalize's sums of squares as normalized_input.
-            return self._fused_mix(hyper_input, sumsq=normalized_input)
+            return self._fused_mix(hyper_input, sumsq=prepared_norm)
 
-        if normalized_input is not None:
+        if prepared_norm is not None:
             assert self.config.hc_per_branch_norm
-            assert normalized_input.shape == hyper_input.shape
-            hyper_input_normed = normalized_input
+            assert prepared_norm.shape == hyper_input.shape
+            hyper_input_normed = prepared_norm
         elif self.config.hc_per_branch_norm:
             hyper_input_normed = self.hc_norm(hyper_input)
         else:
@@ -409,16 +413,17 @@ class GatedResidual(HyperConnectionBase):
         residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
         next_norm: Optional[GroupedGemmaRMSNorm],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Return the residual and its next HC normalization explicitly.
+        """Return the combined residual and the next ``mix``'s ``prepared_norm``.
 
-        The BF16 combine result is retained before calculating the next norm.
-        Callers must only pass the norm when no PLE or other update intervenes.
+        That is the [M, HC * NP] FP32 partial sums of squares on the fused path,
+        ``next_norm`` of the BF16-rounded residual on the decode combine-norm path,
+        and None otherwise or when ``next_norm`` is None.
+        Pass ``next_norm`` only when no PLE or other update touches the residual first.
         """
         hyper_input, _, partials = residuals
         if self._fused_hc_ok and partials is not None:
             from sglang.kernels.ops.gemm.hc_fused_flydsl import hc_apply_inject
 
-            # The next fused mix takes the combine's sums of squares in place of the norm.
             out, sumsq = hc_apply_inject(
                 h=hyper_input, y=block_output.contiguous(), g=partials
             )

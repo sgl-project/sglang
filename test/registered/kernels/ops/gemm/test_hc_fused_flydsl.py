@@ -48,7 +48,7 @@ def test_fused_hc_matches_unfused(rows):
         out, sumsq = fused.combine_and_normalize(y, res, fused.hc_norm)
         # Mix again on the combined residual, reusing the combine's sums of squares.
         m2_ref, _ = ref.mix(out_ref)
-        m2, _ = fused.mix(out, normalized_input=sumsq)
+        m2, _ = fused.mix(out, prepared_norm=sumsq)
     # Only the rounding points differ (normed input and (1 + w) are not rounded to
     # BF16 separately), so allow a few BF16 ulps.
     for a, b in ((m, m_ref), (out, out_ref), (m2, m2_ref)):
