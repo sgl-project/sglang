@@ -142,7 +142,13 @@ sglang serve \
 This captures text-to-video and first-frame image-conditioned timestep shapes
 for 832×480, 81-frame requests. Other resolutions or frame counts run eagerly.
 The default prompt length is fixed at 300 tokens, so no text bucket flag is
-needed for this command.
+needed for this command. Changing quality after startup drops captured graphs
+and runs eagerly until restart.
+
+Add `--quality high` to run the eight softmax anchor layers with BF16-input
+flash attention instead of the FP32 memory-efficient kernel the default path
+uses. Accumulation stays FP32 inside the kernel, but the output is no longer
+bit-identical to the default path.
 
 With two GPUs, add `--num-gpus 2` to split the video tokens across them
 (sequence parallelism). The result is not bit-identical to the single-GPU

@@ -114,19 +114,9 @@ def test_denoising_uses_request_flow_shift(
     monkeypatch.setattr(
         sana_video2, "sample_ltx_euler" if conditioned else "sample_flow_dpm", sample
     )
-    stage = object.__new__(sana_video2.SanaVideo2DenoisingStage)
-    stage.transformer = None
-    stage.begin_declared_component_use = lambda **_: None
-    stage.progress_bar = lambda **_: nullcontext()
-    batch = SimpleNamespace(
-        do_classifier_free_guidance=False,
-        prompt_embeds=[torch.zeros(1, 300, 4)],
-        prompt_attention_mask=[torch.ones(1, 300)],
-        condition_image=object() if conditioned else None,
-        latents=torch.zeros(1, 2, 3, 1, 1),
-        num_inference_steps=2,
-        is_warmup=False,
-        flow_shift=flow_shift,
+    stage = _denoising_stage()
+    batch = _denoising_batch(
+        condition_image=object() if conditioned else None, flow_shift=flow_shift
     )
     stage.forward(
         batch,
@@ -138,14 +128,10 @@ def test_denoising_uses_request_flow_shift(
     assert shifts == [expected]
 
 
-def test_denoising_stage_role():
-    stage = object.__new__(sana_video2.SanaVideo2DenoisingStage)
-    assert stage.role_affinity is RoleType.DENOISER
-
-
-def _denoising_stage(transformer):
+def _denoising_stage(transformer=None):
     stage = object.__new__(sana_video2.SanaVideo2DenoisingStage)
     stage.transformer = transformer
+    stage._mounted_quality = "exact"
     stage._bcg_runner = None
     stage._bcg_ropes = {}
     stage.begin_declared_component_use = lambda **_: None
@@ -153,7 +139,15 @@ def _denoising_stage(transformer):
     return stage
 
 
-def _denoising_batch(*, condition_image=None, is_warmup=False, cfg=True, frames=3):
+def _denoising_batch(
+    quality="exact",
+    *,
+    condition_image=None,
+    is_warmup=False,
+    cfg=True,
+    frames=3,
+    flow_shift=None,
+):
     return SimpleNamespace(
         condition_image=condition_image,
         do_classifier_free_guidance=cfg,
@@ -165,8 +159,32 @@ def _denoising_batch(*, condition_image=None, is_warmup=False, cfg=True, frames=
         guidance_scale=8.0,
         num_inference_steps=2,
         is_warmup=is_warmup,
-        flow_shift=None,
+        flow_shift=flow_shift,
+        sampling_params=SimpleNamespace(quality=quality),
     )
+
+
+def test_denoising_toggles_quality_fusions_at_quality_changes(monkeypatch):
+    toggles = []
+    monkeypatch.setattr(sana_video2, "sample_flow_dpm", lambda *args, **_: args[1])
+    monkeypatch.setattr(
+        sana_video2,
+        "toggle_quality_fusions",
+        lambda transformers, quality: toggles.append((transformers, quality)),
+    )
+    transformer = object()
+    stage = _denoising_stage(transformer)
+    server_args = SimpleNamespace(
+        pipeline_config=SanaVideo2PipelineConfig(), enable_breakable_cuda_graph=False
+    )
+    for quality in ("high", "high", "exact"):
+        stage.forward(_denoising_batch(quality), server_args)
+    assert toggles == [([transformer], "high"), ([transformer], "exact")]
+
+
+def test_denoising_stage_role():
+    stage = object.__new__(sana_video2.SanaVideo2DenoisingStage)
+    assert stage.role_affinity is RoleType.DENOISER
 
 
 @pytest.mark.parametrize("conditioned", [False, True])
@@ -265,7 +283,7 @@ class _CapturingRunner:
         self.disabled_reason = disabled_reason
 
 
-def _warmed_bcg_stage(monkeypatch):
+def _warmed_bcg_stage(monkeypatch, *, quality="exact"):
     from sglang.multimodal_gen.runtime.breakable_cuda_graph import runner as bcg_module
 
     monkeypatch.setattr(
@@ -276,8 +294,30 @@ def _warmed_bcg_stage(monkeypatch):
         enable_breakable_cuda_graph=True,
         pipeline_config=SimpleNamespace(flow_shift=12.0),
     )
-    stage.forward(_denoising_batch(is_warmup=True), args)
+    stage.forward(_denoising_batch(quality, is_warmup=True), args)
     return stage, args
+
+
+@pytest.mark.parametrize("initial, target", [("exact", "high"), ("high", "exact")])
+def test_denoising_quality_change_drops_captured_graphs(monkeypatch, initial, target):
+    toggles = []
+    monkeypatch.setattr(
+        sana_video2,
+        "toggle_quality_fusions",
+        lambda transformers, quality: toggles.append((transformers, quality)),
+    )
+    stage, args = _warmed_bcg_stage(monkeypatch, quality=initial)
+    captured = dict(stage._bcg_runner.entries)
+    assert captured
+    stage.forward(_denoising_batch(initial), args)
+    assert stage._bcg_runner.entries == captured
+
+    stage.forward(_denoising_batch(target), args)
+    assert stage._bcg_runner.entries == {}
+    assert stage._bcg_runner.disabled_reason == "quality changed"
+    assert stage._bcg_ropes == {}
+    assert stage._mounted_quality == target
+    assert toggles[-1] == ([stage.transformer], target)
 
 
 def test_denoising_bcg_keeps_captured_rope_tables_until_graphs_drop(monkeypatch):

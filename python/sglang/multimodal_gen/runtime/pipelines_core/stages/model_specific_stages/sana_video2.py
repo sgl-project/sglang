@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.pipelines.sana_video import (
     select_sana_video_prompt_window,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    toggle_quality_fusions,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
@@ -215,6 +218,7 @@ class SanaVideo2DenoisingStage(PipelineStage):
         self.transformer = transformer
         self._bcg_runner = None
         self._bcg_ropes = {}
+        self._mounted_quality = "exact"
 
     @property
     def role_affinity(self) -> RoleType:
@@ -272,8 +276,17 @@ class SanaVideo2DenoisingStage(PipelineStage):
                 dropped,
             )
 
+    def _maybe_toggle_quality_fusions(self, batch):
+        quality = batch.sampling_params.quality
+        if quality == self._mounted_quality:
+            return
+        self.drop_breakable_cuda_graphs("quality changed")
+        toggle_quality_fusions([self.transformer], quality)
+        self._mounted_quality = quality
+
     @torch.no_grad()
     def forward(self, batch, server_args):
+        self._maybe_toggle_quality_fusions(batch)
         self.begin_declared_component_use(
             component_name="transformer", module=self.transformer
         )
