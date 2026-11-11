@@ -106,11 +106,4 @@ def forward_dcp_sparse_attention(
             **kwargs,
         )
     lse = softmax_max.float() + torch.log(softmax_sum.float())
-    lse = lse.permute(1, 0, 2).reshape(lse.shape[1], -1)
-    if fp8_attention is not None:
-        # Remapping packs valid slots first. An empty local row contributes
-        # zero weight to the cross-rank softmax.
-        empty = topk_indices[..., :1] < 0
-        attn_out = attn_out.masked_fill(empty, 0)
-        lse = lse.masked_fill(empty.squeeze(-1), -torch.inf)
-    return attn_out, lse
+    return attn_out, lse.permute(1, 0, 2).reshape(lse.shape[1], -1)

@@ -346,8 +346,15 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
         rope = torch.zeros(2, 2, 64, dtype=torch.bfloat16)
         packed = torch.zeros(3, 128, 1, 656, dtype=torch.float8_e4m3fn)
         topk = torch.tensor([[[2, -1]], [[-1, -1]]], dtype=torch.int32)
+        # The packed kernel leaves zero output and max/sum for the empty row.
+        attention_out = q.clone()
+        attention_out[1].zero_()
         mock_op = MagicMock(
-            return_value=(q, torch.ones(1, 2, 2), torch.full((1, 2, 2), 2.0))
+            return_value=(
+                attention_out,
+                torch.tensor([[[1.0, 1.0], [0.0, 0.0]]]),
+                torch.tensor([[[2.0, 2.0], [0.0, 0.0]]]),
+            )
         )
         for mode in ("prefill", "decode", "verify"):
             with self.subTest(mode=mode):
