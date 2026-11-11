@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_context,
     autocast_enabled_for_device,
@@ -45,6 +46,8 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     ActiveTargetCompiledCallable,
 )
+
+logger = init_logger(__name__)
 
 
 def _required_tensor(value, path: str) -> torch.Tensor:
@@ -262,6 +265,7 @@ def _minimax_h3_decoder_task(batch: Req) -> str | None:
 
 class MiniMaxH3DecodingStage(DecodingStage):
     def __init__(self, video_vae, audio_vae) -> None:
+        """``audio_vae=None`` selects the audio-free image release output."""
         super().__init__(vae=video_vae, component_name="video_vae")
         self.video_vae = video_vae
         self.audio_vae = audio_vae
@@ -284,6 +288,8 @@ class MiniMaxH3DecodingStage(DecodingStage):
         video_vae_dtype = resolve_precision(
             server_args, "video_vae", precision_attr="vae_precision"
         )
+        if self.audio_vae is None:
+            return [ComponentUse(stage_name, "video_vae", target_dtype=video_vae_dtype)]
         audio_vae_dtype = resolve_precision(
             server_args, "audio_vae", precision_attr="audio_vae_precision"
         )
@@ -296,17 +302,21 @@ class MiniMaxH3DecodingStage(DecodingStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
         result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
-        result.add_check(
-            "audio_latents",
-            batch.audio_latents,
-            [V.is_tensor, V.with_dims(3)],
-        )
+        if self.audio_vae is not None:
+            result.add_check(
+                "audio_latents",
+                batch.audio_latents,
+                [V.is_tensor, V.with_dims(3)],
+            )
         return result
 
     def verify_output(
         self, batch: OutputBatch, server_args: ServerArgs
     ) -> VerificationResult:
         result = VerificationResult()
+        if self.audio_vae is None:
+            result.add_check("output", batch.output, [V.is_tensor, V.with_dims(4)])
+            return result
         if not batch.output_file_paths:
             result.add_check("output", batch.output, [V.is_tensor, V.with_dims(5)])
         result.add_check("audio", batch.audio, [V.is_tensor, V.with_dims(3)])
@@ -421,8 +431,58 @@ class MiniMaxH3DecodingStage(DecodingStage):
             frames = canonical_frames
         return frames
 
+    def _decode_image(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        """Image release: one FP32 T=1 latent through ``decode_image_raw``
+        (BF16 decoder weights under BF16 autocast), then the resize from the
+        generation canvas to the requested size (minimax_h3/image_canvas.py)."""
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.image_canvas import (
+            minimax_h3_resize_image_output,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
+            minimax_h3_plan_from_batch,
+        )
+
+        plan = minimax_h3_plan_from_batch(batch)
+        if plan is None:
+            raise ValueError("MiniMax H3 image decode requires a resolved request plan")
+        with self.use_declared_component(
+            component_name="video_vae", module=self.video_vae
+        ) as video_vae:
+            self.video_vae = video_vae
+            arch = server_args.pipeline_config.vae_config.arch_config
+            raw = _reverse_normalize_latents(
+                batch.latents.to(self.device),
+                mean_values=arch.latents_mean,
+                std_values=arch.latents_std,
+                name="video_vae",
+            )
+            # The ViT decoder's attention layer reads the forward context on
+            # CUDA, as in the video decode path.
+            with (
+                set_forward_context(current_timestep=0, attn_metadata=None),
+                use_vae_fast_path(video_vae, quality_allows(batch.quality, "lossless")),
+            ):
+                pixels = video_vae.decode_image_raw(raw)
+        # decode_image_raw already applies the ImageNet inverse normalization.
+        pixels = pixels.detach().float().cpu()
+        shape = plan.shape
+        if shape["output_width"] is not None:
+            width, height = int(shape["output_width"]), int(shape["output_height"])
+            logger.info(
+                "MiniMax H3 image: generated %dx%d (min_generation_area), resized "
+                "to the requested %dx%d with LANCZOS",
+                int(shape["width"]),
+                int(shape["height"]),
+                width,
+                height,
+            )
+            pixels = minimax_h3_resize_image_output(pixels, width, height)
+        return OutputBatch(output=pixels, metrics=batch.metrics)
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        if self.audio_vae is None:
+            return self._decode_image(batch, server_args)
         _minimax_h3_decoder_task(batch)
         visual_latent = _required_tensor(batch.latents, "batch.latents")
         audio_latent = _required_tensor(batch.audio_latents, "batch.audio_latents")
