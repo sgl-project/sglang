@@ -3943,12 +3943,18 @@ class AscendAttnBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
             )
             query = q.reshape(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
-            if seq_lens_cpu_int is None:
+            num_tokens = query.shape[0]
+            # Graph replay needs a stable address, not a frozen value: this
+            # device buffer is refreshed in _apply_cuda_graph_metadata before
+            # every launch. A host list here bakes the capture-time lengths
+            # into the graph, so replay either reads a fixed length or, worse,
+            # a stale one.
+            if self.forward_metadata.seq_lens is not None:
+                actual_seq_len_kv = self.forward_metadata.seq_lens[:num_tokens]
+            elif seq_lens_cpu_int is None:
                 actual_seq_len_kv = seq_lens_cpu_list
             else:
                 actual_seq_len_kv = seq_lens_cpu_int.cpu().int().tolist()
-
-            num_tokens = query.shape[0]
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 query,
                 k_cache,
