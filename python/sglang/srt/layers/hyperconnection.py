@@ -66,6 +66,7 @@ class GroupedGemmaRMSNorm(nn.Module):
             self._jit_group_size is not None
             and (x.is_cuda or x.is_xpu)
             and x.dtype in (torch.bfloat16, torch.float16)
+            and (not x.is_xpu or self.weight.dtype == x.dtype)
         ):
             from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
                 grouped_gemma_rmsnorm,

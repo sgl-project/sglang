@@ -1,9 +1,13 @@
 """Grouped Gemma RMSNorm on XPU against an fp64 reference."""
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
 from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import grouped_gemma_rmsnorm
+from sglang.srt.layers.hyperconnection import GroupedGemmaRMSNorm
+from sglang.srt.models.qwen4_exp import Qwen4ExpPLEGroupedNorm
 from sglang.test.ci.ci_register import register_xpu_ci
 
 register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
@@ -66,6 +70,24 @@ def test_out_buffer_is_written_in_place(shape):
     assert result.data_ptr() == out.data_ptr()
     expected = _reference(x, weight, 2560, 1e-6).to(x.dtype).to("xpu")
     torch.testing.assert_close(out, expected, **_TOLERANCES[x.dtype])
+
+
+@pytest.mark.parametrize("norm_type", [GroupedGemmaRMSNorm, Qwen4ExpPLEGroupedNorm])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_module_mixed_dtype_dispatch(norm_type, dtype, weight_dtype):
+    norm = norm_type(1024, group_size=512).to(device="xpu", dtype=weight_dtype)
+    with torch.no_grad():
+        norm.weight.copy_(torch.linspace(-0.2, 0.2, 1024, device="xpu"))
+    x = torch.randn(3, 1024, device="xpu", dtype=dtype)
+    with patch(
+        "sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm.grouped_gemma_rmsnorm",
+        wraps=grouped_gemma_rmsnorm,
+    ) as fast:
+        result = norm(x)
+    assert fast.call_count == (weight_dtype == dtype)
+    expected = _reference(x, norm.weight, 512, 1e-6).to(dtype).to("xpu")
+    torch.testing.assert_close(result, expected, **_TOLERANCES[dtype])
 
 
 if __name__ == "__main__":
