@@ -442,6 +442,12 @@ class Envs:
     SGLANG_OPT_SPEC_STAGED_DRAFT_LOCS = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # The post-verify graph's commit-outputs launch also writes the draft extend's layout
+    # (prefix / extend / post lengths, positions, start offsets, M-RoPE rows), which the
+    # draft extend takes instead of its own prepare_draft_extend_layout launch.
+    SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

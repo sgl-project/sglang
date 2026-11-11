@@ -338,6 +338,107 @@ class TestPostVerifyGraphs(CustomTestCase):
                 graphs._body(slot)
                 self.assertIs(commit.call_args.kwargs["bonus_dtype"], dtype)
 
+    def test_the_draft_extend_takes_the_layout_the_graph_wrote(self):
+        """SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT: the graphs' commit-outputs launch
+        also writes the draft extend's layout (M-RoPE rows for an M-RoPE target), and
+        prepare_for_draft_extend lays the batch out from it when its M-RoPE choice is
+        the batch's, instead of its own launch; otherwise it launches as before."""
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        child = envs.SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT
+        for on, mrope in ((False, True), (True, False), (True, True)):
+            target = _target_worker()
+            target.model_runner.model_config = SimpleNamespace(model_is_mrope=mrope)
+            with master.override(True), child.override(on):
+                graphs = EaglePostVerifyGraphs(
+                    target_worker=target,
+                    simulated_acc_len_rng=simulated_acc_len_generator(0),
+                )
+            commit = MagicMock(return_value=(None, None, None, None))
+            slot = SimpleNamespace(
+                staged={"seq_lens": torch.tensor([5])},
+                tokens_per_request=4,
+                track_interval=0,
+                next_draft=None,
+            )
+            with (
+                self.subTest(on=on, mrope=mrope),
+                patch.object(
+                    eagle_post_verify_graphs, "_sample", return_value=(1, 2, 3)
+                ),
+                patch(
+                    "sglang.kernels.ops.speculative.eagle."
+                    "prepare_verify_commit_outputs",
+                    commit,
+                ),
+            ):
+                graphs._body(slot)
+                kwargs = commit.call_args.kwargs
+                self.assertEqual(kwargs["extend_layout"], on)
+                self.assertEqual(kwargs["extend_mrope"], on and mrope)
+
+        def layout(with_mrope):
+            return (
+                torch.zeros(2, dtype=torch.int32),
+                torch.full((2,), 4, dtype=torch.int32),
+                torch.tensor([21, 44]),
+                (
+                    torch.arange(8),
+                    torch.tensor([0, 4], dtype=torch.int32),
+                    torch.zeros((3, 8), dtype=torch.int64) if with_mrope else None,
+                ),
+            )
+
+        for prepared, batch_mrope, taken in (
+            (None, False, False),
+            (layout(True), False, False),
+            (layout(False), False, True),
+            (layout(True), True, True),
+        ):
+            # device lengths without host ones: the GPU-only layout path
+            seq_lens = MagicMock(is_cuda=True)
+            seq_lens.__len__.return_value = 2
+            batch = SimpleNamespace(
+                seq_lens=seq_lens,
+                seq_lens_cpu=None,
+                forward_mode=ForwardMode.DECODE,
+                multimodal_inputs=[None, None],
+                model_config=SimpleNamespace(vocab_size=100),
+            )
+            launch = MagicMock(return_value=layout(batch_mrope))
+            init_new = MagicMock(
+                return_value=SimpleNamespace(
+                    seq_lens=None, mark_forward_metadata_ready=MagicMock()
+                )
+            )
+            with (
+                self.subTest(prepared=prepared is not None, taken=taken),
+                patch.object(
+                    eagle_worker_common, "prepare_draft_extend_layout", launch
+                ),
+                patch.object(eagle_worker_common.ForwardBatch, "init_new", init_new),
+            ):
+                forward_batch = eagle_worker_common.prepare_for_draft_extend(
+                    SimpleNamespace(num_front_tokens=0, positions=None),
+                    batch,
+                    torch.zeros(8, dtype=torch.int64),
+                    4,
+                    SimpleNamespace(
+                        model_config=SimpleNamespace(model_is_mrope=batch_mrope),
+                        spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
+                    ),
+                    SimpleNamespace(can_run_graph=lambda fb: True),
+                    return_hidden_states_before_norm=False,
+                    prepared_layout=prepared,
+                )
+                self.assertEqual(launch.called, not taken)
+                used = prepared if taken else launch.return_value
+                self.assertIs(batch.prefix_lens, used[0])
+                self.assertIs(batch.extend_lens, used[1])
+                self.assertIs(forward_batch.seq_lens, used[2])
+                self.assertIs(
+                    init_new.call_args.kwargs["extend_position_info"], used[3]
+                )
+
     def test_a_kv_pool_that_clears_c128_draft_states_keeps_the_eager_verify(self):
         """The post-verify graphs skip the eager verify's cleanup of rejected c128
         draft states (DeepSeek-V4), so a KV pool that has one never reaches them;
@@ -953,7 +1054,7 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
         publish(ServerArgs(model_path="dummy"), role="test")
         self.addCleanup(reset_context)
 
-    def _check(self, *, sim_acc_len, fused=False, stage=False):
+    def _check(self, *, sim_acc_len, fused=False, stage=False, extend_layout=False):
         # the worker's forced lengths, drawn by its graphs and its eager rounds alike;
         # the all-eager reference draws the same stream from its own generator
         worker_rng = simulated_acc_len_generator(0)
@@ -964,6 +1065,8 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
             ),
             simulated_acc_len_rng=worker_rng,
         )
+        # SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT, with M-RoPE rows
+        graphs._extend_layout = graphs._extend_mrope = extend_layout
         generator = torch.Generator(device="cuda").manual_seed(0)
         if stage:
             # SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT into a draft runner's static inputs
@@ -1063,6 +1166,8 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                             self.assertTrue(torch.equal(g, w), name)
                         if stage:
                             self._check_staging(graphs, batch, want[3], req_to_token)
+                        if extend_layout and graphed:
+                            self._check_extend_layout(got[5], batch.seq_lens)
                         # the host may still read a round's outputs in the next round
                         if previous is not None:
                             for kept, snapshot in zip(*previous):
@@ -1109,6 +1214,20 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
 
     def test_greedy(self):
         self._check(sim_acc_len=-1.0)
+
+    def _check_extend_layout(self, draft_extend_inputs, seq_lens):
+        """The layout the commit-outputs launch wrote equals the draft extend's own."""
+        from sglang.kernels.ops.speculative.eagle import prepare_draft_extend_layout
+
+        got = draft_extend_inputs[3]
+        want = prepare_draft_extend_layout(seq_lens, TOKENS, True)
+        for name, g, w in zip(("prefix", "extend", "post"), got[:3], want[:3]):
+            self.assertTrue(g.dtype == w.dtype and torch.equal(g, w), name)
+        for name, g, w in zip(("positions", "starts", "mrope"), got[3], want[3]):
+            self.assertTrue(g.dtype == w.dtype and torch.equal(g, w), name)
+
+    def test_greedy_with_the_extend_layout(self):
+        self._check(sim_acc_len=-1.0, extend_layout=True)
 
     def test_greedy_with_the_staged_next_draft(self):
         self._check(sim_acc_len=-1.0, stage=True)

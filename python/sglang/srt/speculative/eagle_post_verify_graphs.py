@@ -75,6 +75,13 @@ class EaglePostVerifyGraphs:
         self._speculative_runtime_hooks = speculative_runtime_hooks
         # Whether the commit writes recurrent state slots; resolved at first use.
         self._stages_state_slots: Optional[bool] = None
+        # SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT: the draft extend's layout in the
+        # commit-outputs launch
+        self._extend_layout = envs.SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT.get()
+        self._extend_mrope = (
+            self._extend_layout
+            and target_worker.model_runner.model_config.model_is_mrope
+        )
         self._graphs = _PostVerifyGraphs(
             body=self._body,
             commit=self._commit,
@@ -279,6 +286,8 @@ class EaglePostVerifyGraphs:
                 num_draft_tokens=slot.tokens_per_request,
                 mamba_track_interval=slot.track_interval,
                 bonus_dtype=_BONUS_DTYPE,
+                extend_layout=self._extend_layout,
+                extend_mrope=self._extend_mrope,
             )
         )
         if slot.next_draft is not None:
