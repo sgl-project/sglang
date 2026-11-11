@@ -29,9 +29,12 @@ def runner_module(monkeypatch):
 def make_runner(module):
     runner = object.__new__(module.HummingRunnerCore)
     runner.num_experts = 3
+    runner.global_num_experts = 3
     runner.activation = "silu"
     runner.swiglu_limit = None
-    runner.config = SimpleNamespace(params_dtype=torch.bfloat16)
+    runner.config = SimpleNamespace(
+        params_dtype=torch.bfloat16, num_fused_shared_experts=0
+    )
     runner.layer = SimpleNamespace(
         hidden_size=256,
         intermediate_size_per_partition=128,
@@ -48,6 +51,124 @@ def make_runner(module):
             check_device=Mock(),
         )
     return runner
+
+
+@pytest.mark.parametrize(
+    "rows,top_k,global_experts,local_experts,shared,standard,expected_m,expected",
+    [
+        (384, 6, 384, 48, 0, True, None, 288),
+        (320, 3, 128, 16, 0, True, None, 120),
+        (3, 2, 8, 1, 0, True, None, 1),
+        (384, 7, 385, 49, 1, True, None, 672),
+        (3, 3, 9, 3, 1, True, None, 5),
+        (384, 6, 384, 384, 0, True, None, 2304),
+        (3, 2, 2, 2, 2, True, None, 6),
+        (384, 6, 384, 48, 0, False, None, 2304),
+        (384, 6, 384, 48, 0, False, 7, 336),
+    ],
+)
+def test_local_work_estimate(
+    runner_module,
+    rows,
+    top_k,
+    global_experts,
+    local_experts,
+    shared,
+    standard,
+    expected_m,
+    expected,
+):
+    runner = make_runner(runner_module)
+    runner.num_experts = local_experts
+    runner.global_num_experts = global_experts
+    runner.config.num_fused_shared_experts = shared
+    # Meta tensors reject data-dependent counting / host synchronization.
+    ids = torch.empty((rows, top_k), dtype=torch.int32, device="meta")
+    assert (
+        runner.estimate_local_valid_shape_m(
+            ids, expected_m, is_standard_dispatch=standard
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("gemm_type", ["indexed", "grouped_contiguous"])
+def test_standard_dispatch_passes_local_work_to_gemm(
+    runner_module, monkeypatch, fused, gemm_type
+):
+    # Exercise the Python custom-op body without its CUDA-only dispatcher.
+    monkeypatch.setattr(
+        runner_module,
+        "humming_moe_runner_core_run",
+        runner_module.humming_moe_runner_core_run.__wrapped__,
+    )
+    runner = make_runner(runner_module)
+    runner.global_num_experts = 24
+    runner_module.HummingRunnerCore.runner_cores[id(runner)] = runner
+    runner.layer._humming_standard_runner_core = runner
+    inputs = torch.ones(3, 256)
+    output = SimpleNamespace(
+        hidden_states=inputs,
+        topk_output=SimpleNamespace(
+            topk_ids=torch.zeros(3, 2, dtype=torch.int32),
+            topk_weights=torch.ones(3, 2),
+        ),
+    )
+    configs = {"compute_config_str": json.dumps({"gemm_type": gemm_type})}
+    for name in ("w13", "w2"):
+        tuning = [
+            [0, 1, {"block_shape": [16, 128, 128]}],
+            [1, 100, {"block_shape": [64, 128, 128]}],
+        ]
+        configs[f"{name}_tuning_config"] = tuning
+        configs[f"{name}_tuning_config_str"] = json.dumps(tuning)
+    runner.get_humming_gemm_configs = Mock(return_value=configs)
+    monkeypatch.setattr(
+        runner_module,
+        "get_standard_humming_moe_gemm_type",
+        lambda: runner_module.HummingGemmType(gemm_type),
+    )
+    indices = (torch.zeros(1, dtype=torch.int32),) * 3
+    monkeypatch.setattr(
+        fused_moe_triton, "moe_align_block_size", Mock(return_value=indices)
+    )
+    monkeypatch.setattr(
+        runner_module, "moe_permute", Mock(return_value=(inputs, *indices[:2]))
+    )
+    runner_module.HummingMethod.may_process_input.return_value = inputs, None, None
+
+    class ReachedGemm(Exception):
+        pass
+
+    forward = Mock(side_effect=ReachedGemm)
+    monkeypatch.setattr(runner_module.HummingMethod, "forward_layer", forward)
+    quant_info = runner_module.HummingMoeQuantInfo(runner.layer)
+    with pytest.raises(ReachedGemm):
+        if fused:
+            runner_module.fused_experts_none_to_humming(
+                output, quant_info, runner.config
+            )
+        else:
+            runner_input = runner_module.pre_permute_standard_to_humming(
+                output, quant_info, runner.config, {}
+            )
+            runner.run(runner_input, quant_info, {})
+    assert forward.call_args.kwargs["valid_shape_m"] == 1
+
+
+def test_standard_dispatch_custom_op_fake(runner_module):
+    inputs = torch.empty((3, 256), dtype=torch.bfloat16, device="meta")
+    output = runner_module.humming_moe_runner_core_run(
+        moe_runner_id=0,
+        gemm_type="indexed",
+        hidden_states=inputs,
+        topk_weights=torch.empty((3, 2), device="meta"),
+        topk_ids=torch.empty((3, 2), dtype=torch.int32, device="meta"),
+        output_dtype=torch.bfloat16,
+        is_standard_dispatch=True,
+    )
+    assert output.shape == inputs.shape and output.dtype == torch.bfloat16
 
 
 @pytest.mark.parametrize("down_block_m", [40, 16])

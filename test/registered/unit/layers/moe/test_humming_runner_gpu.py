@@ -39,13 +39,36 @@ class TestHummingRunnerGPU(CustomTestCase):
             self.skipTest("Secondary-scale UMMA regression requires SM100/SM110 family")
         self._check_indexed_two_gemms(static_scales=False, secondary_scales=True)
 
-    def _check_indexed_two_gemms(self, static_scales, secondary_scales=False):
+    def test_standard_ep_with_default_tuning(self):
+        if get_device_sm() != 90:
+            self.skipTest("MXFP4 per-token AFP8 regression targets SM90")
+        for gemm_type in ("indexed", "grouped_contiguous"):
+            for shared in (0, 1):
+                with self.subTest(gemm_type=gemm_type, shared=shared):
+                    self._check_indexed_two_gemms(
+                        static_scales=False,
+                        gemm_type=gemm_type,
+                        ep_size=8,
+                        shared_experts=shared,
+                    )
+
+    def _check_indexed_two_gemms(
+        self,
+        static_scales,
+        secondary_scales=False,
+        gemm_type="indexed",
+        ep_size=1,
+        shared_experts=0,
+    ):
         from humming.schema import HummingInputSchema, HummingWeightSchema
         from humming.utils.weight import dequantize_weight
 
         torch.manual_seed(42)
         num_experts, hidden_size, intermediate_size = 4, 512, 256
         num_tokens, top_k = 128, 2
+        local_routed_experts = num_experts - shared_experts
+        global_routed_experts = local_routed_experts * ep_size
+        global_experts = global_routed_experts + shared_experts
         layer = torch.nn.Module()
         layer.hidden_size = hidden_size
         layer.intermediate_size_per_partition = intermediate_size
@@ -58,7 +81,7 @@ class TestHummingRunnerGPU(CustomTestCase):
         )
         input_schema = HummingInputSchema(
             a_dtype="float8e4m3",
-            input_scale_group_size=128,
+            input_scale_group_size=0 if ep_size > 1 else 128,
             input_scale_dtype="float32",
         )
         reference_weights = {}
@@ -123,8 +146,9 @@ class TestHummingRunnerGPU(CustomTestCase):
 
         runner = humming_runner.HummingRunnerCore(
             MoeRunnerConfig(
-                num_experts=num_experts,
+                num_experts=global_experts,
                 num_local_experts=num_experts,
+                num_fused_shared_experts=shared_experts,
                 hidden_size=hidden_size,
                 intermediate_size_per_partition=intermediate_size,
                 top_k=top_k,
@@ -134,20 +158,27 @@ class TestHummingRunnerGPU(CustomTestCase):
             )
         )
         runner.layer = layer
-        compute_config = {"gemm_type": "indexed", "use_f16_accum": False}
+        compute_config = {"gemm_type": gemm_type, "use_f16_accum": False}
         configs = {
             "compute_config": compute_config,
             "compute_config_str": json.dumps(compute_config),
         }
-        if secondary_scales:
+        if secondary_scales or ep_size > 1:
             for sublayer in ("w13", "w2"):
                 meta = layer.humming_metas[sublayer]
-                self.assertTrue(meta.use_block_scaled_mma)
-                self.assertTrue(meta.has_input_scale_2)
+                if secondary_scales:
+                    self.assertTrue(meta.use_block_scaled_mma)
+                    self.assertTrue(meta.has_input_scale_2)
                 tuning = [
-                    [lo, hi, {**selected, "use_stream_k": False}]
+                    [
+                        lo,
+                        hi,
+                        {**selected, "use_stream_k": False}
+                        if secondary_scales
+                        else selected,
+                    ]
                     for lo, hi, selected in humming_runner.HummingMethod.get_default_tuning_configs(
-                        layer, gemm_type="indexed", sublayer_name=sublayer
+                        layer, gemm_type=gemm_type, sublayer_name=sublayer
                     )
                 ]
                 configs[f"{sublayer}_tuning_config"] = tuning
@@ -172,13 +203,22 @@ class TestHummingRunnerGPU(CustomTestCase):
                 tuning = [[0, 1 << 30, selected]]
                 configs[f"{sublayer}_tuning_config"] = tuning
                 configs[f"{sublayer}_tuning_config_str"] = json.dumps(tuning)
-        runner.humming_gemm_configs["indexed"] = configs
+        runner.humming_gemm_configs[gemm_type] = configs
         inputs = torch.randn(
             num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
         )
         topk_ids = torch.randint(
-            num_experts, (num_tokens, top_k), device="cuda", dtype=torch.int32
+            global_routed_experts,
+            (num_tokens, top_k - shared_experts),
+            device="cuda",
+            dtype=torch.int32,
         )
+        topk_ids = torch.where(topk_ids < local_routed_experts, topk_ids, -1)
+        if shared_experts:
+            shared_ids = torch.arange(
+                local_routed_experts, num_experts, device="cuda", dtype=torch.int32
+            )
+            topk_ids = torch.cat((topk_ids, shared_ids.expand(num_tokens, -1)), dim=1)
         topk_weights = torch.softmax(
             torch.randn(num_tokens, top_k, device="cuda"), dim=-1
         )
@@ -203,7 +243,8 @@ class TestHummingRunnerGPU(CustomTestCase):
                 return (
                     (grouped / scale).to(torch.float8_e4m3fn).float() * scale
                 ).reshape_as(values)
-            grouped = values.float().reshape(*values.shape[:-1], -1, 128)
+            width = values.shape[-1] if ep_size > 1 else 128
+            grouped = values.float().reshape(*values.shape[:-1], -1, width)
             scales = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10) / 448.0
             return (
                 (grouped / scales).to(torch.float8_e4m3fn).float() * scales
@@ -250,7 +291,19 @@ class TestHummingRunnerGPU(CustomTestCase):
             )
         reference = reference.to(torch.bfloat16)
 
-        actual = runner._run_indexed_gemm(inputs, topk_weights, topk_ids)
+        def run():
+            runner_input = humming_runner.HummingRunnerInput(
+                hidden_states=inputs,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                gemm_type=humming_runner.HummingGemmType(gemm_type),
+                is_standard_dispatch=True,
+            )
+            return runner.run(
+                runner_input, humming_runner.HummingMoeQuantInfo(layer), {}
+            ).hidden_states
+
+        actual = run()
         self.assertTrue(torch.isfinite(actual).all().item())
         relative_error = (
             actual.float() - reference.float()
@@ -260,9 +313,16 @@ class TestHummingRunnerGPU(CustomTestCase):
         graph = torch.cuda.CUDAGraph()
         torch.cuda.synchronize()
         with torch.cuda.graph(graph):
-            captured = runner._run_indexed_gemm(inputs, topk_weights, topk_ids)
+            captured = run()
         graph.replay()
-        torch.testing.assert_close(captured, actual, rtol=0, atol=0)
+        if ep_size > 1:
+            self.assertTrue(torch.isfinite(captured).all().item())
+            graph_error = (
+                captured.float() - reference.float()
+            ).norm() / reference.float().norm()
+            self.assertLess(graph_error.item(), 0.035)
+        else:
+            torch.testing.assert_close(captured, actual, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
