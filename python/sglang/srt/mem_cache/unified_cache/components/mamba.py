@@ -225,7 +225,9 @@ class MambaComponent(TreeComponent):
             return result
         req = params.req
         assert req is not None
-        if not req.kv.holds_mamba:
+        # A deferred slot is bound with the row (`StateStorage.acquire`); the
+        # staged copy still runs, as it does into a slot taken here.
+        if not req.kv.holds_mamba and not params.defer_cow_slot:
             storage, sub_pool = self._state()
             dst_index = storage.take_state_slots(sub_pool, 1)
             if dst_index is None:
