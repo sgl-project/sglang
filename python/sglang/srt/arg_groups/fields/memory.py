@@ -15,7 +15,6 @@ from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
 )
-from sglang.srt.arg_groups.argparse_actions import RadixEvictionPolicyAction
 from sglang.srt.arg_groups.choices import RADIX_EVICTION_POLICY_CHOICES
 
 
@@ -24,7 +23,7 @@ class Memory(msgspec.Struct):
 
     _NS_PATH = "memory"
     radix_eviction_policy: A[
-        str,
+        Optional[str],
         Arg(
             help=(
                 "The eviction policy of radix trees. 'lru' stands for Least "
@@ -38,21 +37,19 @@ class Memory(msgspec.Struct):
                 "--enable-unified-memory, and acts as 'lru' elsewhere. 'gds' evicts "
                 "cached recurrent-state checkpoints on hybrid models by GreedyDual-Size "
                 "over the prefill each one saves, and acts as 'lru' on other models. "
-                "Hybrid models on the Mamba radix cache list (e.g. Qwen3-Next, "
-                "GLM-5.3-Flash) default to 'gds' when this flag is not given, "
-                "unless --enable-session-radix-cache is on. See "
+                "Unset means 'lru', or 'gds' on hybrid models on the Mamba radix "
+                "cache list (e.g. Qwen3-Next, GLM-5.3-Flash) unless "
+                "--enable-session-radix-cache is on. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy "
                 "for what each policy optimizes for."
             ),
             choices=RADIX_EVICTION_POLICY_CHOICES,
-            action=RadixEvictionPolicyAction,
-            action_kwargs={"choices": RADIX_EVICTION_POLICY_CHOICES},
             resolvable=True,
         ),
-    ] = "lru"
-    # The value alone cannot distinguish the default from an explicit LRU
-    # choice, which model-specific defaults must preserve.
-    _radix_eviction_policy_explicitly_set: A[bool, Arg(no_cli=True)] = False
+    ] = None
+    # Whether the caller chose the policy, which model-specific defaults must keep.
+    # Resolution fills it from whether radix_eviction_policy was left None.
+    _radix_eviction_policy_explicitly_set: A[Optional[bool], Arg(no_cli=True)] = None
     radix_eviction_policy_config: A[
         Optional[Dict[str, Any]],
         Arg(

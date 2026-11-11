@@ -63,10 +63,7 @@ class HttpServerEngineAdapter(EngineBase):
     """
 
     def __init__(self, **kwargs):
-        self.server_args = ServerArgs(
-            **kwargs,
-            _radix_eviction_policy_explicitly_set="radix_eviction_policy" in kwargs,
-        )
+        self.server_args = ServerArgs(**kwargs)
         # This process launches the server as a child and never publishes, so
         # every read here is of the record it just built -- a bag read would
         # either fail closed or answer for an unrelated engine in the process.

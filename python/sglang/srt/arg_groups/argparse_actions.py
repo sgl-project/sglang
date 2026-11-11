@@ -25,15 +25,6 @@ class LoRAPathAction(argparse.Action):
         setattr(namespace, self.dest, lora_paths)
 
 
-class RadixEvictionPolicyAction(argparse.Action):
-    """Store --radix-eviction-policy and record that it was given."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        setattr(namespace, self.dest, values)
-        # Read by ServerArgs.from_cli_args: a model default replaces only an unchosen policy.
-        namespace._radix_eviction_policy_explicitly_set = True
-
-
 def print_deprecated_warning(message: str):
     logger.warning(f"\033[1;33m{message}\033[0m")
 
