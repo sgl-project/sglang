@@ -9,10 +9,12 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache import memory_pool_host
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
+from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host import common as host_common
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -28,6 +30,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     AsymmetricMHATokenToKVPoolHost,
     MHATokenToKOnlyPoolHost,
 )
+from sglang.srt.mem_cache.storage.mmap import mmap_allocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
@@ -208,12 +211,8 @@ class TestHiCacheHostRegister(unittest.TestCase):
         for layout in ("page_first", "page_first_direct"):
             with self.subTest(layout=layout):
                 host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
-                host.device_pool = SimpleNamespace(
-                    device="cpu", index_k_with_scale_buffer=target_buffers
-                )
-                host.mtp_draft_device_pools = [
-                    SimpleNamespace(index_k_with_scale_buffer=[draft_buffer])
-                ]
+                host._buffer_device = torch.device("cpu")
+                host.packed_device_index_buffers = [*target_buffers, draft_buffer]
                 host.layout = layout
                 host._live_target_layers = [0, 1, 2]
                 host.layer_num = 4
@@ -229,8 +228,6 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 with mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}):
                     host.init_kv_buffer()
 
-                self.assertEqual(len(host.packed_device_index_buffers), 4)
-                self.assertIs(host.packed_device_index_buffers[-1], draft_buffer)
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
                     host.indexer_layout_dim,
@@ -280,12 +277,12 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 with (
                     mock.patch.object(
                         memory_pool_host,
-                        "host_memory_budget_bytes",
-                        return_value=1024**3,
-                    ),
+                        "host_memory_preflight",
+                        return_value=(0, 1024**3),
+                    ) as budget,
                     mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
                 ):
-                    DeepSeekV4PagedHostPool(
+                    pool = DeepSeekV4PagedHostPool(
                         pool_name="test",
                         device_buffers=device_buffers,
                         item_bytes=11,
@@ -294,6 +291,10 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         layout=layout,
                     )
 
+                # 4 pages x 11 B x 3 layers in one mapping, booked once.
+                budget.assert_called_once_with(
+                    [132], allocator=pool.allocator, device=torch.device("cpu")
+                )
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
                     3 * 11,
@@ -301,35 +302,72 @@ class TestHiCacheHostRegister(unittest.TestCase):
 
             with self.subTest(pool="state", layout=layout):
                 alloc = mock.Mock(return_value=torch.empty(1, dtype=torch.uint8))
-                state_pools = [
-                    SimpleNamespace(
+                state_infos = [
+                    DSV4StateBufferInfo(
+                        pages=torch.empty((2, 6), dtype=torch.uint8),
                         ring_size=2,
-                        kv_score_buffer=SimpleNamespace(
-                            kv_score=torch.empty((4, 3), dtype=torch.uint8)
-                        ),
+                        dtype=torch.uint8,
                     )
                     for _ in range(2)
                 ]
                 with (
                     mock.patch.object(
                         memory_pool_host,
-                        "host_memory_budget_bytes",
-                        return_value=1024**3,
-                    ),
+                        "host_memory_preflight",
+                        return_value=(0, 1024**3),
+                    ) as budget,
                     mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
                 ):
-                    DeepSeekV4StateHostPool(
+                    pool = DeepSeekV4StateHostPool(
                         pool_name="test",
-                        state_pools=state_pools,
+                        state_infos=state_infos,
                         num_host_pages=4,
                         swa_page_size=2,
                         layout=layout,
                     )
 
+                # 4 pages x (ring 2 x 3 B slots) x 2 layers, one mapping.
+                budget.assert_called_once_with(
+                    [48], allocator=pool.allocator, device=torch.device("cpu")
+                )
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
                     2 * 2 * 3,
                 )
+
+    def test_layer_first_v4_pool_checks_per_mapping_hugetlb_rounding(self):
+        alloc = mock.Mock(return_value=torch.empty(1, dtype=torch.uint8))
+        device_buffers = [torch.empty(1, dtype=torch.uint8) for _ in range(3)]
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("1GB"),
+            mock.patch.object(
+                base, "host_memory_budget_plain_hugetlb", return_value=(0, 2 * 1024**3)
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.common.hugetlb_pool_free_bytes",
+                return_value=2 * 1024**3,
+            ),
+            mock.patch.object(base, "device_uses_allocator", return_value=True),
+            mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
+        ):
+            with self.assertRaises(ValueError):
+                DeepSeekV4PagedHostPool(
+                    pool_name="test",
+                    device_buffers=device_buffers,
+                    item_bytes=11,
+                    num_host_pages=4,
+                    slot_page_size=2,
+                    layout="layer_first",
+                )
+            DeepSeekV4PagedHostPool(
+                pool_name="test",
+                device_buffers=device_buffers,
+                item_bytes=11,
+                num_host_pages=4,
+                slot_page_size=2,
+                layout="page_first",
+            )
 
     def test_k_only_mha_page_layouts_use_page_registration_granularity(self):
         for layout in ("page_first", "page_first_direct"):
@@ -346,7 +384,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 pool.layout_dim = (
                     pool.layer_num * pool.head_num * pool.head_dim * pool.dtype.itemsize
                 )
-                pool.device_pool = SimpleNamespace(device="cuda")
+                pool._transfer_device = torch.device("cuda")
                 pool.device = "cpu"
                 pool.pin_memory = True
                 pool.allocator = object()
@@ -494,6 +532,70 @@ class TestHiCacheHostRegister(unittest.TestCase):
         )
         for ptr, _, _ in cudart.registrations:
             self.assertEqual((ptr - base) % page_copy_bytes, 0)
+
+    def test_hugepage_buffer_registers_the_rounded_mapping(self):
+        mib = 1024**2
+        cudart = _FakeCudart()
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("required"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+            mock.patch.object(
+                mmap_allocator,
+                "_alloc_hugepage",
+                return_value=(ctypes.c_uint8 * 16)(),
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            buffer = mmap_allocator.alloc_mmap((4,), torch.float32)
+            _cuda_host_register(buffer)
+            _cuda_host_unregister(buffer)
+
+        # 16 tensor bytes round up to one 2 MiB hugepage; the whole page must
+        # be registered, not the unaligned tensor size.
+        self.assertEqual(cudart.registrations, [(buffer.data_ptr(), 2 * mib, 0)])
+        self.assertEqual(cudart.unregistrations, [buffer.data_ptr()])
+
+    def test_hugepage_registration_chunks_align_to_the_page_size(self):
+        mib = 1024**2
+        two_mib = 2 * mib
+        base = 0x10000000
+        total = 3076 * mib  # 1538 whole 2 MiB hugepages
+        cudart = _FakeCudart()
+
+        def register(granularity_mib):
+            cudart.registrations.clear()
+            _cuda_host_register(
+                _FakeBuffer(base, total),
+                registration_granularity_bytes=granularity_mib * mib,
+            )
+            return cudart.registrations[:]
+
+        with (
+            mock.patch.object(host_common, "tensor_uses_hugepage", return_value=True),
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
+                "get",
+                return_value=1,
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            # lcm(2 MiB, 513 MiB) = 1026 MiB exceeds the 1 GiB chunk limit.
+            with self.assertRaises(ValueError):
+                register(513)
+            # lcm(2 MiB, 301 MiB) = 602 MiB fits: chunks keep both grids.
+            lcm_aligned = register(301)
+            # A page-multiple granularity keeps the same grid.
+            page_multiple = register(300)
+
+        self.assertEqual([s for _, s, _ in lcm_aligned], [602 * mib] * 5 + [66 * mib])
+        self.assertEqual(
+            [s for _, s, _ in page_multiple], [900 * mib] * 3 + [376 * mib]
+        )
+        for registrations in (lcm_aligned, page_multiple):
+            for ptr, size, _ in registrations:
+                self.assertEqual((ptr - base) % two_mib, 0)
+                self.assertEqual(size % two_mib, 0)
 
     def test_null_pinned_allocation_raises(self):
         """On XPU a null pinned buffer must fail at allocation, not at first transfer."""

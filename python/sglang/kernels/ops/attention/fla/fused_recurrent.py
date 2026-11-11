@@ -641,9 +641,15 @@ def fused_recurrent_kda_packed_decode(
     # row-streaming state update reaches the in-place R+W bandwidth of the
     # part (~9.6 TB/s) where this triton kernel tops out at ~5 TB/s holding a
     # [BV, K] register tile per warp. ULP-level output differences only
-    # (reduction order); small batches keep triton (launch-bound anyway). Since it
-    # only engages from a batch size up, batch-invariant mode keeps triton.
-    if use_qk_l2norm_in_kernel and not is_batch_invariant_mode_enabled():
+    # (reduction order); small batches keep triton (launch-bound anyway).
+    # Safe-gate layers stay on triton: at GLM-5.3-Flash's 8-32 heads per rank it
+    # is faster than the row-streaming kernel at every batch on H200 and B200.
+    # It only engages from a batch size up, so batch-invariant mode keeps triton.
+    if (
+        use_qk_l2norm_in_kernel
+        and lower_bound is None
+        and not is_batch_invariant_mode_enabled()
+    ):
         from sglang.kernels.ops.attention import kda_packed_decode as kda_decode_cuda
 
         if kda_decode_cuda.covered(

@@ -15,6 +15,7 @@
 
 import logging
 import signal
+import traceback
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -30,6 +31,10 @@ from sglang.srt.beam_search.output import (
 )
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import get_tokenizer
+from sglang.srt.kv_canary.perturb.detokenizer import (
+    maybe_perturb_batch_token_id_out,
+)
 from sglang.srt.managers.incremental_detokenize import (
     DETOKENIZER_MAX_STATES,
     DetokenizeHeader,
@@ -43,6 +48,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     DetokenizeReleaseReq,
     FreezeGCReq,
+    row_output_ids,
     sock_recv,
     sock_send,
 )
@@ -59,11 +65,10 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
 from sglang.srt.utils.watchdog import Watchdog
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +98,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
-        # In multi-tokenizer mode, results are pushed back to each TokenizerWorker
+        # In multi-tokenizer mode, results are pushed back to each tokenizer worker
         # directly via SocketMapping inside multi_http_worker_event_loop, so the
         # single send_to_tokenizer socket is unused.
         if get_serving().tokenizer_worker_num == 1:
@@ -287,7 +292,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if s is not None:
                 s.append_row(
                     rid=rid,
-                    output_ids=recv_obj.output_ids[i],
+                    output_ids=row_output_ids(recv_obj, i),
                     completion_tokens=recv_obj.completion_tokens[i],
                     is_beam=beam_outputs is not None and beam_outputs[i] is not None,
                     vocab_size=vocab_size,
@@ -394,6 +399,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return ipcs
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
+        maybe_perturb_batch_token_id_out(recv_obj)
         states = self._update_detokenize_states(recv_obj)
         headers = [None if s is None else s.header for s in states]
         # Beam decoding is additive: a batch may mix beam leaders with normal
@@ -419,7 +425,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             http_worker_ipcs=self._route_rows(recv_obj, headers),
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
-            output_ids=recv_obj.output_ids,
+            output_ids_flat=recv_obj.output_ids_flat,
+            output_ids_offsets=recv_obj.output_ids_offsets,
             reasoning_tokens=recv_obj.reasoning_tokens,
             completion_tokens=recv_obj.completion_tokens,
             request_stats=recv_obj.request_stats,
@@ -453,6 +460,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             weight_versions=recv_obj.weight_versions,
+            prefill_weight_versions=recv_obj.prefill_weight_versions,
             token_steps=recv_obj.token_steps,
             beam_search_output=recv_obj.beam_search_output,
             dp_ranks=recv_obj.dp_ranks,
@@ -494,8 +502,7 @@ def run_detokenizer_process(
         else:
             manager.multi_http_worker_event_loop()
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"DetokenizerManager hit an exception: {traceback}")
+        logger.error(f"DetokenizerManager hit an exception: {traceback.format_exc()}")
         if manager is not None:
             manager.maybe_clear_socket_mapping()
         parent_process.send_signal(signal.SIGQUIT)

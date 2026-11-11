@@ -11,7 +11,9 @@ from sglang.srt.dllm.algorithm.joint_threshold import JointThreshold
 from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
+from sglang.srt.managers.scheduler_components.request_list import move
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -91,7 +93,6 @@ def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
         tree_prefix=torch.tensor(prefix, dtype=torch.int32),
         prefix_len=len(prefix),
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
-        inflight_middle_chunks=1 if req_pool_idx is not None else 0,
         kv=ReqKvInfo(
             req_pool_idx=req_pool_idx,
             kv_committed_len=len(prefix) if req_pool_idx is not None else 0,
@@ -230,21 +231,34 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "full block"):
             alloc_for_extend(batch)
 
-    def test_dllm_manager_pop_aborted_reqs_removes_waiting_and_staging(self):
-        manager = DllmManager(SimpleNamespace(max_running_requests=4))
-        waiting = _make_req("abort-waiting", [1], self.block_size)
-        staging = _make_req("abort-staging", [2], self.block_size)
-        keep = _make_req("keep", [3], self.block_size)
-        manager.waiting_queue = [waiting, keep]
-        manager.staging_queue = [staging, waiting]
-
-        aborted = manager.pop_aborted_reqs(False, "abort")
-
-        self.assertEqual(
-            [req.rid for req in aborted], ["abort-waiting", "abort-staging"]
+    def test_dllm_abort_removes_waiting(self):
+        released = []
+        manager = DllmManager(
+            SimpleNamespace(max_running_requests=4), abort=released.append
         )
-        self.assertEqual(manager.waiting_queue, [keep])
-        self.assertEqual(manager.staging_queue, [])
+        first, second, keep = (
+            Mock(rid=rid, owner_list=None) for rid in ("abort-1", "abort-2", "keep")
+        )
+        move([first, second, keep], manager.waiting_queue)
+
+        manager.waiting_queue.abort(AbortReq(rid="abort"))
+
+        self.assertEqual(released, [first, second])
+        self.assertEqual(list(manager.waiting_queue), [keep])
+
+    def test_staged_are_the_last_rounds_requests_still_waiting(self):
+        manager = DllmManager(SimpleNamespace(max_running_requests=4), abort=None)
+        first, second, aborted, unrun = (
+            Mock(rid=rid, owner_list=None)
+            for rid in ("first", "second", "aborted", "unrun")
+        )
+        move([first, second, aborted, unrun], manager.waiting_queue)
+        manager.take(lambda req: req is aborted)
+
+        # In the round's order, not the queue's.
+        last_batch = SimpleNamespace(reqs=[aborted, second, first])
+        self.assertEqual(manager.staged_reqs(last_batch), [second, first])
+        self.assertEqual(manager.staged_reqs(None), [])
 
 
 class TestDllmFdfoResolvedBlockKeepsRow(unittest.TestCase):
