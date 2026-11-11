@@ -584,6 +584,27 @@ def _anthropic_error_response(*, status_code: int, error_type: str, message: str
     )
 
 
+def _chat_route_error_response(
+    request: Request, message: str, err_type: str, status_code: int
+) -> Optional[ORJSONResponse]:
+    """A chat error raised before the handler runs, in its wire's envelope;
+    None when the wire keeps the stock body."""
+    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
+    if route_path != "/v1/chat/completions":
+        return None
+    error = ErrorResponse(
+        object="error",
+        message=message,
+        type=err_type,
+        param=None,
+        code=status_code,
+    )
+    body = request.app.state.openai_serving_chat.chat_wire.error_body(error)
+    if body is None:
+        return None
+    return ORJSONResponse(content=body, status_code=status_code)
+
+
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):
     """Enrich HTTP exception with status code and other details.
@@ -630,6 +651,12 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
         return ORJSONResponse(
             content={"error": nested_error}, status_code=exc.status_code
         )
+
+    chat_error = _chat_route_error_response(
+        request, str(exc.detail), str(exc.status_code), exc.status_code
+    )
+    if chat_error is not None:
+        return chat_error
 
     error = ErrorResponse(
         object="error",
@@ -688,6 +715,12 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "code": HTTPStatus.BAD_REQUEST.value,
         }
         return ORJSONResponse(status_code=400, content={"error": nested_error})
+
+    chat_error = _chat_route_error_response(
+        request, message, "BadRequest", HTTPStatus.BAD_REQUEST.value
+    )
+    if chat_error is not None:
+        return chat_error
 
     err = ErrorResponse(
         message=message,

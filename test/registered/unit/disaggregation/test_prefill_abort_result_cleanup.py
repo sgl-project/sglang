@@ -246,7 +246,7 @@ class TestPrefillCompleteResult(CustomTestCase):
         req = _Req()
         req.to_finish = None
         retried = []
-        scheduler.optimistic_release_and_requeue = lambda r, src: retried.append(r)
+        scheduler.optimistic_release_and_requeue = lambda r: retried.append(r)
         scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
         self.assertEqual(retried, [req])
         self.assertEqual(req.output_ids, [])

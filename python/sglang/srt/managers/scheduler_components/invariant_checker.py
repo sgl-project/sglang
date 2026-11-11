@@ -633,7 +633,7 @@ class SchedulerInvariantChecker:
 
     def _check_request_lists(self, batch: ScheduleBatch) -> None:
         """At the launch of `batch`: each live request is in exactly one list,
-        one that matches its state."""
+        the one its `owner_list` names, and that list matches its state."""
         lists = self.get_request_lists()
         owners: Dict[Req, ListKind] = {}
         for kind, reqs in lists.items():
@@ -642,6 +642,13 @@ class SchedulerInvariantChecker:
                     self.reporter.report(
                         Severity.CORRUPTION,
                         f"Request {req.rid} is in both {owners[req].name} and {kind.name}",
+                    )
+                if req.owner_list is not reqs:
+                    owner = req.owner_list
+                    self.reporter.report(
+                        Severity.CORRUPTION,
+                        f"Request {req.rid} is in {kind.name} but owned by "
+                        f"{None if owner is None else owner.kind.name}",
                     )
                 owners[req] = kind
 
