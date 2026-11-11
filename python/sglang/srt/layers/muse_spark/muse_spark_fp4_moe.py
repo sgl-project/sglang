@@ -35,7 +35,7 @@ from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
     MuseSparkNvFp4FusedMoEMethod,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils.common import get_device_capability, is_cuda
+from sglang.srt.utils.device import get_device_capability, is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.communication.muse_spark_finalize_workspace import (

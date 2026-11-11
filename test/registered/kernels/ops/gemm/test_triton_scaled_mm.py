@@ -5,7 +5,7 @@ import torch
 import torch.testing
 
 from sglang.kernels.ops.gemm.fp8_kernel import triton_scaled_mm
-from sglang.srt.utils.common import get_device
+from sglang.srt.utils.device import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 

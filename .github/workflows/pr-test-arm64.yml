@@ -96,7 +96,7 @@ jobs:
         timeout-minutes: 5
         run: |
           docker exec -w /sglang-checkout/ ci_sglang_arm64 \
-            bash -c "source /opt/.venv/bin/activate && python3 -c 'import platform; import torch; import sgl_kernel; from sglang.srt.utils.common import is_host_cpu_arm64; assert platform.machine() in (\"aarch64\", \"arm64\"); assert is_host_cpu_arm64(); assert hasattr(torch.ops.sgl_kernel, \"decode_attention_cpu\"); assert hasattr(torch.ops.sgl_kernel, \"initialize\");'"
+            bash -c "source /opt/.venv/bin/activate && python3 -c 'import platform; import torch; import sgl_kernel; from sglang.srt.utils.device import is_host_cpu_arm64; assert platform.machine() in (\"aarch64\", \"arm64\"); assert is_host_cpu_arm64(); assert hasattr(torch.ops.sgl_kernel, \"decode_attention_cpu\"); assert hasattr(torch.ops.sgl_kernel, \"initialize\");'"
 
       - name: Run unit tests
         timeout-minutes: 36
