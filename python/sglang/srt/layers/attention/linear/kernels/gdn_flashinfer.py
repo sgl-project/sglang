@@ -208,6 +208,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     """
 
     uses_state_checkpoints = True
+    # extend() gathers each request's state by pool index and scatters the
+    # final state back the same way, so any slot pitch works.
+    extend_honors_slot_pitch = True
 
     def __init__(self):
         (

@@ -1,12 +1,13 @@
 """GDN prefill on a state pool laid out like unified memory's: each slot of a
 layer is a slice of a wide arena entry holding every layer's conv and SSM state.
 
-`GDNAttnBackend.forward_extend` on the Triton prefill kernels must give the same
-outputs and states, bit for bit, whether it runs in place on that pool, on packed
-copies of its rows, or on a packed pool holding the same values: for fresh
-requests, cached prefixes and a follow-up chunk of several mixed-length requests.
-In place it must also leave every other byte of the arena alone. The highest slots
-start past 2**31 elements of the arena, where a 32-bit slot offset wraps.
+`GDNAttnBackend.forward_extend` on the Triton or the FlashInfer prefill kernel
+must give the same outputs and states, bit for bit, whether it runs in place on
+that pool, on packed copies of its rows, or on a packed pool holding the same
+values: for fresh requests, cached prefixes and a follow-up chunk of several
+mixed-length requests. In place it must also leave every other byte of the arena
+alone. The highest slots start past 2**31 elements of the arena, where a 32-bit
+slot offset wraps.
 """
 
 import math
@@ -20,6 +21,10 @@ from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
+)
+from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+    FlashInferGDNKernel,
+    is_flashinfer_gdn_prefill_available,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
@@ -36,6 +41,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="4-gpu-b200")
 
 HEADS, V_HEADS, HEAD_DIM, CONV = 2, 4, 128, 4
 DIM = (2 * HEADS + V_HEADS) * HEAD_DIM
@@ -45,6 +51,13 @@ LAYERS = (0, 1)
 PITCH_BYTES = (64 << 20) + 4096
 NUM_SLOTS = 136
 SENTINEL = 0x5A
+_SM_MAJOR = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+_CUDA_MAJOR = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+# The SSM state dtype FlashInfer prefill runs on by default: fp32 on SM90, bf16
+# on SM100 (CUDA 13 or newer); None where it is not the default.
+_FLASHINFER_SSM_DTYPE = {9: torch.float32, 10: torch.bfloat16}.get(_SM_MAJOR)
+if _SM_MAJOR == 10 and _CUDA_MAJOR < 13:
+    _FLASHINFER_SSM_DTYPE = None
 # Two mixed-length chunks of six requests: fresh requests, cached prefixes, and
 # lengths around the 64-token chunk of the delta rule.
 FIRST_CHUNK = ([1, 37, 64, 129, 300, 7], [0, 0, 48, 0, 1000, 5])
@@ -80,7 +93,7 @@ class _Arena:
     """Per-layer conv and SSM views over one strided arena, built by the layout
     the unified state pool uses; ``slots`` are the slots requests use."""
 
-    def __init__(self, slots):
+    def __init__(self, slots, ssm_dtype):
         self.slots = slots
         parts = [
             TensorPartDecl(
@@ -92,7 +105,7 @@ class _Arena:
             TensorPartDecl(
                 name="temporal",
                 shape=(V_HEADS, HEAD_DIM, HEAD_DIM),
-                dtype=torch.float32,
+                dtype=ssm_dtype,
                 layer_ids=LAYERS,
             ),
         ]
@@ -123,7 +136,7 @@ class _Arena:
         return bool((self.raw == SENTINEL).all())
 
 
-def _backend(caches, slot_of_request):
+def _backend(caches, slot_of_request, prefill_backend):
     backend = GDNAttnBackend.__new__(GDNAttnBackend)
     backend.state_pool = None
     backend.req_to_token_pool = SimpleNamespace(
@@ -146,7 +159,7 @@ def _backend(caches, slot_of_request):
     backend.prefill_graph_metadata = None
     backend.kernel_dispatcher = GDNKernelDispatcher(
         LinearAttnKernelBackend.TRITON,
-        LinearAttnKernelBackend.TRITON,
+        prefill_backend,
         LinearAttnKernelBackend.TRITON,
     )
     return backend
@@ -223,9 +236,8 @@ class TestGDNPrefillStridedPool(CustomTestCase):
                     for width in (DIM, V_HEADS, V_HEADS)
                 )
             )
-        self.arena = _Arena(self.slots.long())
 
-    def _prefill(self, conv, ssm):
+    def _prefill(self, conv, ssm, prefill_backend):
         """Both chunks through both layers; the outputs of every forward."""
         caches = [
             SimpleNamespace(conv=[conv[layer]], temporal=ssm[layer]) for layer in LAYERS
@@ -235,7 +247,7 @@ class TestGDNPrefillStridedPool(CustomTestCase):
         for (lens, prefixes), (mixed_qkv, a, b) in zip(
             (FIRST_CHUNK, SECOND_CHUNK), self.inputs
         ):
-            backend = _backend(caches, slot_of_request)
+            backend = _backend(caches, slot_of_request, prefill_backend)
             batch = _batch(lens, prefixes)
             backend.init_forward_metadata(batch)
             for layer in self.layers:
@@ -247,47 +259,45 @@ class TestGDNPrefillStridedPool(CustomTestCase):
         return outputs
 
     def _assert_same(self, outputs, conv, ssm, ref_outputs, ref_conv, ref_ssm):
+        slots = self.slots.long()
         for output, ref_output in zip(outputs, ref_outputs, strict=True):
             self.assertTrue(torch.equal(output, ref_output), "outputs differ")
         for layer in LAYERS:
             self.assertTrue(
-                torch.equal(
-                    conv[layer][self.arena.slots], ref_conv[layer][self.arena.slots]
-                ),
+                torch.equal(conv[layer][slots], ref_conv[layer][slots]),
                 "conv states differ",
             )
             self.assertTrue(
-                torch.equal(
-                    ssm[layer][self.arena.slots], ref_ssm[layer][self.arena.slots]
-                ),
+                torch.equal(ssm[layer][slots], ref_ssm[layer][slots]),
                 "ssm states differ",
             )
 
-    def test_in_place_and_staged_prefill_match_the_packed_pool(self):
-        arena = self.arena
+    def _check_in_place_and_staged(self, prefill_backend, kernel_cls, ssm_dtype):
+        arena = _Arena(self.slots.long(), ssm_dtype)
         self.assertFalse(arena.ssm[0].is_contiguous())
         self.assertGreater(
             int(self.slots.max()) * arena.ssm[0].stride(0), torch.iinfo(torch.int32).max
         )
-        ref_conv, ref_ssm = self.conv.clone(), self.ssm.clone()
-        ref_outputs = self._prefill(ref_conv, ref_ssm)
+        start_ssm = self.ssm.to(ssm_dtype)
+        ref_conv, ref_ssm = self.conv.clone(), start_ssm.clone()
+        ref_outputs = self._prefill(ref_conv, ref_ssm, prefill_backend)
 
-        arena.fill(self.conv, self.ssm)
+        arena.fill(self.conv, start_ssm)
         with patch.object(
             gdn_backend,
             "stage_pool_states",
             side_effect=AssertionError("staged a pool the kernels can address"),
         ):
-            outputs = self._prefill(arena.conv, arena.ssm)
+            outputs = self._prefill(arena.conv, arena.ssm, prefill_backend)
         self._assert_same(
             outputs, arena.conv, arena.ssm, ref_outputs, ref_conv, ref_ssm
         )
         self.assertTrue(arena.bytes_outside_slots_untouched())
 
         # A prefill kernel that cannot follow the pitch runs on packed copies.
-        arena.fill(self.conv, self.ssm)
+        arena.fill(self.conv, start_ssm)
         with (
-            patch.object(TritonGDNKernel, "extend_honors_slot_pitch", False),
+            patch.object(kernel_cls, "extend_honors_slot_pitch", False),
             patch.object(
                 gdn_backend, "stage_pool_states", wraps=stage_pool_states
             ) as stage,
@@ -295,7 +305,7 @@ class TestGDNPrefillStridedPool(CustomTestCase):
                 PoolStaging, "from_indices", wraps=PoolStaging.from_indices
             ) as plan,
         ):
-            outputs = self._prefill(arena.conv, arena.ssm)
+            outputs = self._prefill(arena.conv, arena.ssm, prefill_backend)
         # Two forwards of two layers each; one set of rows per forward.
         self.assertEqual(stage.call_count, 4)
         self.assertEqual(plan.call_count, 2)
@@ -303,6 +313,24 @@ class TestGDNPrefillStridedPool(CustomTestCase):
             outputs, arena.conv, arena.ssm, ref_outputs, ref_conv, ref_ssm
         )
         self.assertTrue(arena.bytes_outside_slots_untouched())
+
+    def test_triton_prefill_in_place_and_staged_match_the_packed_pool(self):
+        self._check_in_place_and_staged(
+            LinearAttnKernelBackend.TRITON, TritonGDNKernel, torch.float32
+        )
+
+    @unittest.skipUnless(
+        _FLASHINFER_SSM_DTYPE is not None and is_flashinfer_gdn_prefill_available(),
+        "FlashInfer GDN prefill needs SM90, or SM100 with CUDA 13",
+    )
+    def test_flashinfer_prefill_in_place_and_staged_match_the_packed_pool(self):
+        """FlashInfer prefill gathers and scatters states by pool index, so it
+        runs on the strided pool without packed copies."""
+        self._check_in_place_and_staged(
+            LinearAttnKernelBackend.FLASHINFER,
+            FlashInferGDNKernel,
+            _FLASHINFER_SSM_DTYPE,
+        )
 
 
 if __name__ == "__main__":

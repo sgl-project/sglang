@@ -327,9 +327,9 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                 )
 
     def test_selects_flashinfer_for_a_page_major_pool(self):
-        """The unified pool runs page-major. Its strided state reaches every
-        prefill kernel as contiguous per-sequence copies, so FlashInfer prefill
-        qualifies there exactly as on the contiguous pool."""
+        """The unified pool runs page-major. FlashInfer prefill gathers and
+        scatters each request's state by pool index, whatever the pool's slot
+        pitch, so it qualifies there exactly as on the contiguous pool."""
         cases = (
             ("sm100", {}, {}),
             (
