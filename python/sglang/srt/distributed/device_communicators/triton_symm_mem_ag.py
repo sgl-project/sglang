@@ -18,6 +18,7 @@ import triton.language as tl
 
 from sglang.srt.runtime_context import (
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
 )
@@ -466,7 +467,12 @@ class MultimemAllGatherer:
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
         # None => always NCCL; _UNINIT => build on first eager call.
-        self._state = self._UNINIT if enabled else None
+        if not get_platform().is_cuda:
+            # Multimem symmetric-memory all-gather is an NVLink/CUDA feature;
+            # other platforms (e.g. NPU) always take the standard gather path.
+            self._state = None
+        else:
+            self._state = self._UNINIT if enabled else None
         if self._state is self._UNINIT:
             # Lazy import avoids a module-load dependency on the distributed facade.
             from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
