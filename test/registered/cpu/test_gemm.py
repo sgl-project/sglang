@@ -269,7 +269,7 @@ class TestGemm(CustomTestCase):
 
         packed_weight, packed_zero, packed_scales = (
             torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                awq_weight, awq_zero, awq_scales, 0
+                awq_weight, awq_zero, awq_scales, 0, is_symmetric=False
             )
         )
         target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
@@ -282,6 +282,15 @@ class TestGemm(CustomTestCase):
 
         atol = rtol = precision[ref_res.dtype]
         torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)
+
+    def test_int4_awq_symmetric_mode_is_rejected(self):
+        weight = torch.zeros((128, 4), dtype=torch.int32)
+        zeros = torch.zeros((1, 4), dtype=torch.int32)
+        scales = torch.ones((1, 32), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(RuntimeError, "CPU AWQ symmetric quantization"):
+            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                weight, zeros, scales, 0, is_symmetric=True
+            )
 
     @parametrize(
         M=[1, 32], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]
@@ -358,7 +367,7 @@ class TestGemm(CustomTestCase):
 
         packed_weight, packed_zero_points, packed_scales = (
             torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                gptq_weight, gptq_zero, scales, 1, gptq_is_symmetric=True
+                gptq_weight, gptq_zero, scales, 1, is_symmetric=True
             )
         )
         torch.testing.assert_close(
