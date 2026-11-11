@@ -164,10 +164,12 @@ def check_quantized_moe_compatibility(
                 f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({tp_size}) divided by moe_ep_size ({moe_ep_size})."
             )
 
+        # weight_block_size is the FP8 block; MXFP4 routed experts use 32-wide groups.
         if (
             not envs.SGLANG_SHARED_EXPERT_TP1.get()
             and (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0
             and not _use_aiter
+            and not model_config.is_fp4_experts
         ):
             raise ValueError(
                 f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
