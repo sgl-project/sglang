@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.kernels.ops.moe import smallm_moe_gfx950
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import MoeRunnerConfig
@@ -674,6 +675,10 @@ class TestQuarkMxfp4MoEFlydslPadding(CustomTestCase):
         serialized=True,
         gfx95=True,
         flydsl=True,
+        hidden_size=64,
+        intermediate_size=320,
+        moe_ep_size=1,
+        smallm=False,
     ):
         scheme = object.__new__(QuarkW4A4MXFp4MoE)
         scheme.dequantization_config = None
@@ -683,6 +688,7 @@ class TestQuarkMxfp4MoEFlydslPadding(CustomTestCase):
         layer.moe_runner_config = MoeRunnerConfig(**(runner or {}))
         layer.use_presharded_weights = False
         layer.moe_tp_size = 2
+        layer.moe_ep_size = moe_ep_size
         kernel = SimpleNamespace(enable_amd_monokernel=monokernel)
         with (
             patch.dict(os.environ, env or {}),
@@ -699,12 +705,13 @@ class TestQuarkMxfp4MoEFlydslPadding(CustomTestCase):
                 "_aiter_refuses_unaligned_cktile_mxfp4",
                 return_value=aiter_guard,
             ),
+            patch.object(smallm_moe_gfx950, "smallm_moe_enabled", return_value=smallm),
         ):
             scheme.create_weights(
                 layer,
                 num_experts=2,
-                hidden_size=64,
-                intermediate_size_per_partition=320,
+                hidden_size=hidden_size,
+                intermediate_size_per_partition=intermediate_size,
                 params_dtype=torch.bfloat16,
             )
         return layer
@@ -736,6 +743,37 @@ class TestQuarkMxfp4MoEFlydslPadding(CustomTestCase):
                 layer = self._create_weights(**kwargs)
                 self.assertEqual(layer.intermediate_pad, 192)
                 self.assertEqual(tuple(layer.w2_weight_scale.shape), (2, 64, 16))
+
+    # Qwen3.5-397B-A17B at TP8: hidden 4096, 128 columns per rank, top-10 routed
+    # experts (top-11 with the shared expert fused). The widths the small-M kernel
+    # dispatches are pinned, so the result does not depend on its current table.
+    _TP8 = {"hidden_size": 4096, "intermediate_size": 128, "smallm": True}
+
+    def _tp8(self, top_k=10, smallm_widths=(256,), **kwargs):
+        runner = {"top_k": top_k, "params_dtype": torch.bfloat16}
+        caps = dict.fromkeys(smallm_widths, 40)
+        with patch.dict(smallm_moe_gfx950.MAX_TOK_DISPATCH, caps, clear=True):
+            return self._create_weights(runner=runner, **{**self._TP8, **kwargs})
+
+    def test_keeps_the_generic_width_the_small_m_kernel_serves(self):
+        # gfx950's small-M MoE kernel serves this shard's small batches only at
+        # AITER's generic 256-column alignment.
+        for top_k in (10, 11):
+            with self.subTest(top_k=top_k):
+                layer = self._tp8(top_k)
+                self.assertEqual(layer.intermediate_pad, 128)
+                self.assertEqual(tuple(layer.w2_weight.shape), (2, 4096, 128))
+
+    def test_flydsl_width_where_the_small_m_kernel_does_not_decide(self):
+        cases = {
+            "small_m_kernel_off": {"smallm": False},
+            "expert_parallel": {"moe_ep_size": 2},
+            "top_8": {"top_k": 8},
+            "small_m_kernel_at_128_columns": {"smallm_widths": (256, 128)},
+        }
+        for case, kwargs in cases.items():
+            with self.subTest(case=case):
+                self.assertEqual(self._tp8(**kwargs).intermediate_pad, 0)
 
 
 _MXFP4_MOE_SPEC = {

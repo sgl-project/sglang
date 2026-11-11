@@ -170,6 +170,48 @@ def _pads_for_flydsl_mxfp4(layer: torch.nn.Module) -> bool:
     )
 
 
+def _smallm_takes_only_the_generic_width(
+    layer: torch.nn.Module, hidden_size: int, intermediate_size: int
+) -> bool:
+    """Whether SGLang's gfx950 small-M MXFP4 MoE kernel serves this layer's
+    small batches at AITER's generic alignment but not at the FlyDSL one.
+
+    The FlyDSL alignment would move those batches to AITER, which runs them up
+    to 2x slower (Qwen3.5-397B-A17B at TP8, 128 columns, <= 8 rows). Asks the
+    kernel's own support check about a one-row call at each width.
+    """
+    cfg = layer.moe_runner_config
+    # Under EP the dispatcher hands AITER an expert mask, which the kernel
+    # refuses; a FusedMoE built without top_k leaves the routing width unknown.
+    if layer.moe_ep_size > 1 or cfg.top_k is None:
+        return False
+    from sglang.kernels.ops.moe.smallm_moe_gfx950 import smallm_moe_supported
+
+    meta = functools.partial(torch.empty, device="meta")
+
+    def takes(aiter_padding_size):
+        w13_up_dim, w2_down_dim, _ = get_moe_weight_sizes(
+            intermediate_size,
+            is_concat=True,
+            is_packed=True,
+            is_aiter_moe=True,
+            aiter_padding_size=aiter_padding_size,
+        )
+        return smallm_moe_supported(
+            hidden_states=meta(1, hidden_size, dtype=cfg.params_dtype),
+            w13=meta(1, w13_up_dim, hidden_size // 2, dtype=torch.uint8),
+            w2=meta(1, hidden_size, w2_down_dim, dtype=torch.uint8),
+            topk_ids=meta(1, cfg.top_k, dtype=torch.int32),
+            expert_mask=None,
+            doweight_stage1=False,
+            activation_is_silu=cfg.activation == "silu",
+            has_bias=False,
+            a1_scale=None,
+        )
+
+    return takes(None) and not takes(FLYDSL_MXFP4_PADDING_SIZE)
+
+
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """Convert packed MXFP4 weights and their scales to the triton_kernels matmul
     layouts. triton_kernels comes from the ROCm image, not the sglang-kernel wheel."""
@@ -338,6 +380,9 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 if pad_for_aiter
                 and self.is_checkpoint_mxfp4_serialized
                 and _pads_for_flydsl_mxfp4(layer)
+                and not _smallm_takes_only_the_generic_width(
+                    layer, hidden_size, intermediate_size_per_partition
+                )
                 else None
             ),
         )
