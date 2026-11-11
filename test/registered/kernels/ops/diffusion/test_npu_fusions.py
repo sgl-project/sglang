@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Ascend kernels that back Qwen-Image 2.1's `exact` tier.
+"""Ascend fusions that back Qwen-Image 2.1's `exact` tier.
 
-Each case pins one kernel against the eager chain the model runs when the
-fusion gate declines: elementwise ops must reproduce every eager bf16 rounding
+The kernels ship in sgl-kernel-npu; these cases check that the installed wheel
+carries them and that each one matches the eager chain the model runs when the
+fusion gate declines. Elementwise ops must reproduce every eager bf16 rounding
 boundary, and RMSNorm must reproduce aten's row reduction, not an equivalent
 one.
 """
@@ -12,15 +13,10 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.diffusion.activation.silu_mul_npu_triton import (
-    silu_mul_npu,
-)
-from sglang.kernels.ops.diffusion.modulate.residual_gate_add_npu_triton import (
+from sglang.kernels.ops.diffusion import (
     residual_gate_add_npu,
-)
-from sglang.kernels.ops.diffusion.norm.rmsnorm_npu_triton import (
     rmsnorm_npu_onepass,
-    rmsnorm_npu_preserve,
+    silu_mul_npu,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.test.ci.ci_register import register_npu_ci
@@ -71,20 +67,18 @@ def _reference_norm(shape, scale, eps):
 
 @pytest.mark.parametrize("shape", [(16, 128), (1, 32, 128), (1, 4096, 32, 128)])
 @pytest.mark.parametrize("scale,eps", [(1e-4, 1e-6), (100.0, 1e-5)])
-@pytest.mark.parametrize("kernel", [rmsnorm_npu_onepass, rmsnorm_npu_preserve])
-def test_rmsnorm_matches_native(shape, scale, eps, kernel):
+def test_rmsnorm_matches_native(shape, scale, eps):
     x, weight, expected = _reference_norm(shape, scale, eps)
-    assert torch.equal(kernel(x, weight, eps), expected)
+    assert torch.equal(rmsnorm_npu_onepass(x, weight, eps), expected)
 
 
-@pytest.mark.parametrize("kernel", [rmsnorm_npu_onepass, rmsnorm_npu_preserve])
-def test_rmsnorm_refuses_tiles_under_16_rows(kernel):
+def test_rmsnorm_refuses_tiles_under_16_rows():
     # triton_ascend 3.2.2 computed these tiles incorrectly; the kernel must
     # decline so the caller keeps the eager result instead of publishing one.
     x = torch.randn(8, 128, device=DEVICE, dtype=torch.bfloat16)
     weight = torch.ones(128, device=DEVICE, dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError):
-        kernel(x, weight, 1e-6)
+    with pytest.raises(ValueError):
+        rmsnorm_npu_onepass(x, weight, 1e-6)
 
 
 if __name__ == "__main__":

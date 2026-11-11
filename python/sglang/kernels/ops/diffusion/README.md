@@ -339,6 +339,20 @@ in `sites/` or `ext/` belongs in an operator domain, and `sites/` is the one
 place allowed to reference `multimodal_gen` types (lazily, inside functions) —
 inspecting model modules is its whole job.
 
+### Ascend fusions (sgl-kernel-npu)
+
+Qwen-Image 2.1's three NPU sites resolve their kernels from the installed
+`sgl-kernel-npu` wheel at first use; this package only adapts the calls, and a
+wheel that predates them logs one warning and leaves the model on the eager
+chain.
+
+| Entry point | Backend | Contract | Applies to |
+|---|---|---|---|
+| `silu_mul_npu` | sgl-kernel-npu Triton | bit-exact `silu(a) * b` | Qwen-Image 2.1 feed-forward |
+| `residual_gate_add_npu` | sgl-kernel-npu Triton | bit-exact `residual + update * gate`, elementwise or one broadcast row | Qwen-Image 2.1 block residual |
+| `rmsnorm_npu_onepass` | sgl-kernel-npu Triton | FP32 row reduction, BF16 round before the learned scale | Qwen-Image 2.1 Q/K norm |
+| `npu_fusions_available` | -- | whether the installed wheel carries the three operators | -- |
+
 ## Adding a kernel
 
 1. Put ordinary implementations in their operator domain. Put a kernel

@@ -699,6 +699,11 @@ _EXPORTS: dict[str, str] = {
     "can_use_flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
+    # Ascend fusions resolved from sgl-kernel-npu at first use
+    "npu_fusions_available": "common.npu_fusions",
+    "rmsnorm_npu_onepass": "common.npu_fusions",
+    "residual_gate_add_npu": "common.npu_fusions",
+    "silu_mul_npu": "common.npu_fusions",
     "can_use_channel_rmsnorm_finish_silu": "norm.channel_rmsnorm_finish_silu_jit",
     "channel_rmsnorm_finish_silu": "norm.channel_rmsnorm_finish_silu_jit",
     "can_use_channel_rmsnorm_silu_nhwc": "norm.channel_rmsnorm_silu_nhwc_jit",
