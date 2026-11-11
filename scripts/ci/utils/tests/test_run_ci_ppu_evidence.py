@@ -71,13 +71,22 @@ class StrictRunnerTest(unittest.TestCase):
 
     def test_explicit_deselect_preserves_other_tests(self):
         result, report = self.run_fixture(
-            "def test_legacy(missing_fixture): pass\ndef test_ok(): pass\n",
+            "def test_legacy(missing_fixture): pass\n"
+            "def test_legacy_extra(): pass\n"
+            "def test_ok(): pass\n",
             deselect=("test_fixture.py::test_legacy",),
         )
         self.assertEqual(result, 0)
         self.assertTrue(report["success"])
-        self.assertEqual(report["files"][0]["executed"], 1)
+        self.assertEqual(report["files"][0]["executed"], 2)
         self.assertEqual(report["deselect"], ["test_fixture.py::test_legacy"])
+
+    def test_radix_environment_is_file_scoped(self):
+        path = "/workspace/source/test/registered/radix_cache/test_radix_attention.py"
+        env = RUNNER.environment_for_file(path, {})
+        self.assertEqual(env["SGLANG_TEST_RETRACT"], "true")
+        self.assertEqual(env["SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY"], "1")
+        self.assertEqual(RUNNER.environment_for_file("/tmp/test_other.py", {}), {})
 
     def test_failure_retains_counts(self):
         result, report = self.run_fixture("def test_bad():\n    assert False\n")
@@ -314,6 +323,15 @@ class StrictRunnerTest(unittest.TestCase):
         (self.root / suite / dropped["junit"]).unlink()
         summary.write_text(json.dumps(report))
         with self.assertRaisesRegex(ValueError, "registration"):
+            REPORT.verify(self.root, "cpu")
+
+    def test_deselected_case_cannot_verify(self):
+        suite, _ = self.build_cpu_evidence()
+        summary = self.root / suite / "summary.json"
+        report = json.loads(summary.read_text())
+        report["deselect"] = ["test_required_failure"]
+        summary.write_text(json.dumps(report))
+        with self.assertRaisesRegex(ValueError, "Deselection"):
             REPORT.verify(self.root, "cpu")
 
 

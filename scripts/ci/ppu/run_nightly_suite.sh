@@ -10,6 +10,7 @@ suite_timeout="${4:?suite timeout in seconds required}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$ROOT"
 mkdir -p "$evidence_dir"
+git rev-parse HEAD > "$evidence_dir/checkout_sha.txt"
 python3 scripts/ci/ppu/nightly_skip_policy.py --json > "$evidence_dir/allowed_skips.json"
 mapfile -t skip_args < <(python3 scripts/ci/ppu/nightly_skip_policy.py)
 mapfile -t deselect_args < <(python3 scripts/ci/ppu/nightly_skip_policy.py --deselect)

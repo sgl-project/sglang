@@ -631,6 +631,7 @@ class PpuPathSelectionTest(unittest.TestCase):
             ),
             (["python/sglang/srt/new_module.py", "README.md"], single),
             (["python/sglang/srt/layers/attention/new.py"], kernel),
+            (["test/registered/kernels/ops/activation/test_activation.py"], kernel),
             (["python/sglang/srt/mem_cache/radix_cache.py"], kernel),
             (["sgl-kernel/csrc/attention.cu"], kernel),
             (["python/sglang/srt/hardware_backend/ppu/moe/ppu_deepep_hooks.py"], multi),

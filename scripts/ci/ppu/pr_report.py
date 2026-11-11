@@ -206,6 +206,8 @@ def verify(directory, lane, kernel=False):
             raise ValueError(f"Selection/registration mismatch: {suite}")
         if [r["file"] for r in report["files"]] != report["selected"]:
             raise ValueError(f"Missing selected file: {suite}")
+        if report.get("deselect"):
+            raise ValueError(f"Deselection is not approved for PR suites: {suite}")
         allowed_skips = report.get("allowed_skips", [])
         if len(set(report["selected"])) != len(report["selected"]) or set(
             allowed_skips

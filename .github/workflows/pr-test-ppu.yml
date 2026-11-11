@@ -167,7 +167,7 @@ jobs:
               - '!**/*.[rR][sS][tT]'
               - '!**/{README*,CHANGELOG*,LICENSE*,NOTICE*}'
             ppu_kernel:
-              - '{sgl-kernel/**,python/sglang/{kernels/**,srt/{layers/{attention,rotary_embedding}/**,mem_cache/**,hardware_backend/ppu/**,platforms/ppu.py}},test/{ppu/unit/test_topk_prefill_bf16_alignment.py,registered/ppu/pr/test_kernels.py}}'
+              - '{sgl-kernel/**,python/sglang/{kernels/**,srt/{layers/{attention,rotary_embedding}/**,mem_cache/**,hardware_backend/ppu/**,platforms/ppu.py}},test/{ppu/unit/test_topk_prefill_bf16_alignment.py,registered/ppu/pr/test_kernels.py,registered/kernels/ops/**}}'
               - '!python/sglang/kernels/ops/diffusion/**'
               - '!**/*.[mM][dD]'
               - '!**/*.[mM][dD][xX]'
