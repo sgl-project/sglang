@@ -173,6 +173,12 @@ def apply_qk_norm(x, norm):
 
 
 def apply_residual_gate(residual, update, gate):
+    """Mount the Ascend kernel over ``residual_gate_add`` behind a first-call check.
+
+    ``residual_gate_add`` already picks its own fast path or eager fallback, so
+    off NPU this is exactly the call main makes. On NPU that fallback is the
+    eager chain, which is what the gate compares the new kernel against.
+    """
     fused = None
     if (
         _is_npu
