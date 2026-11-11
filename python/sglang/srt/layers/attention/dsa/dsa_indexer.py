@@ -8,16 +8,6 @@ import torch
 from einops import rearrange
 
 from sglang.kernels.fused_op import BaseFusedOp
-from sglang.kernels.ops.attention.dsa.fp4_index_hip import (
-    Fp4IndexKeys,
-    Fp4IndexQuery,
-    fp4_paged_mqa_logits,
-    fp4_ragged_mqa_logits,
-    gather_fp4_index_k_rows,
-    indexer_q_fp4_head_gate,
-    stage_fp4_index_k_rows,
-    store_fp4_index_k,
-)
 from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     aiter_fused_fp8_qk_write,
     aiter_fused_fp8_writer_available,
@@ -173,6 +163,7 @@ if _is_xpu:
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
+    from sglang.kernels.ops.attention.dsa import fp4_index_hip
     from sglang.srt.layers.attention.dsa import dsa_indexer_hip
     from sglang.srt.layers.attention.dsa.indexer_prologue_hip import (
         make_rocm_nope_prologue,
@@ -1799,13 +1790,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self,
         forward_batch: ForwardBatch,
         layer_id: int,
-        query: Fp4IndexQuery,
+        query: fp4_index_hip.Fp4IndexQuery,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
         # AITER's row-group logits score each row up to its own rank-local length,
         # the only columns the DCP top-k reads
-        assert isinstance(query, Fp4IndexQuery), "FP4 index-K needs the FP4 prologue"
+        assert isinstance(query, fp4_index_hip.Fp4IndexQuery), (
+            "FP4 index-K needs the FP4 prologue"
+        )
         pool = get_token_to_kv_pool()
         page_size = pool.index_page_size
         block_tables = metadata.get_page_table_64()
@@ -1824,7 +1817,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         request_tables, query_starts = dsa_indexer_hip.fp4_request_rows(
             forward_batch, layer_id, block_tables, q_offset, next_n
         )
-        logits = fp4_paged_mqa_logits(
+        logits = fp4_index_hip.fp4_paged_mqa_logits(
             query[:q_offset],
             weights[:q_offset].squeeze(-1),
             *pool.get_index_k_fp4_buffers(layer_id),
@@ -1846,8 +1839,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
 
     def _hip_mqa_logits(self, q, index_k, weights, ks, ke, plans=None) -> torch.Tensor:
-        if isinstance(index_k, Fp4IndexKeys):
-            return fp4_ragged_mqa_logits(
+        if self.fp4_index_k:
+            return fp4_index_hip.fp4_ragged_mqa_logits(
                 q, weights, self.softmax_scale, index_k, ks, ke, plans
             )
         from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -1961,7 +1954,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 seq_len_sum,
                 max_seq_len,
             )
-        if isinstance(index_k, Fp4IndexKeys):
+        if self.fp4_index_k:
             k_offset = index_k.num_keys
         else:
             k_fp8, k_scale = index_k
@@ -2068,7 +2061,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         fp4_plans = None
         if (
             _is_hip
-            and isinstance(index_k, Fp4IndexKeys)
+            and self.fp4_index_k
             and not torch.cuda.is_current_stream_capturing()
             and not is_in_breakable_cuda_graph()
         ):
@@ -2151,7 +2144,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         metadata: BaseIndexerMetadata,
         block_tables: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Fp4IndexKeys]:
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], fp4_index_hip.Fp4IndexKeys]:
         # Prefill under DCP: every request's index-K from all ranks, in DCP1's
         # get_index_k_scale_buffer layout, so the ragged indexer runs unchanged.
         parallel = get_parallel()
@@ -2159,14 +2152,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         local_lens_cpu = get_dcp_lens(seq_lens_cpu, dcp_size, dcp_rank)
         if get_exec().kernel.enable_dsa_fp4_indexer:
             # FP4 keys gather as 68-byte rows and are staged back into pages
-            rows = gather_fp4_index_k_rows(
+            rows = fp4_index_hip.gather_fp4_index_k_rows(
                 *get_token_to_kv_pool().get_index_k_fp4_buffers(layer_id),
                 block_tables.contiguous(),
                 get_dcp_lens(metadata.get_indexer_seq_len(), dcp_size, dcp_rank),
                 int(local_lens_cpu.sum()),
                 max(int(local_lens_cpu.max()), 1),
             )
-            return stage_fp4_index_k_rows(dcp_gather_request_rows(rows, seq_lens_cpu))
+            return fp4_index_hip.stage_fp4_index_k_rows(
+                dcp_gather_request_rows(rows, seq_lens_cpu)
+            )
         # block_tables holds this rank's page ids of each request
         k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
             layer_id,
@@ -2445,7 +2440,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if not out_loc.is_contiguous():
                 out_loc = out_loc.contiguous()
             if self.fp4_index_k:
-                store_fp4_index_k(key, *pool.get_index_k_fp4_buffers(layer_id), out_loc)
+                fp4_index_hip.store_fp4_index_k(
+                    key, *pool.get_index_k_fp4_buffers(layer_id), out_loc
+                )
                 return
             page_size = pool.index_page_size
             buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
@@ -2696,7 +2693,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 key=key,
                 act_quant=act_quant,
             )
-            q_fp8, weights = indexer_q_fp4_head_gate(
+            q_fp8, weights = fp4_index_hip.indexer_q_fp4_head_gate(
                 query, self._project_head_gates(x), 1.0, torch.bfloat16
             )
         elif enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
