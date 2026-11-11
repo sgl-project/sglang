@@ -309,6 +309,10 @@ class Envs:
     )
     # With the master: post-verify graph sets kept before eager (64 without it).
     SGLANG_POST_VERIFY_MAX_GRAPH_KEYS = EnvInt(64)
+    # A text-only extend batch's mrope rows built on the device.
+    SGLANG_OPT_MROPE_TEXT_DEVICE_POSITIONS = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Presize the post-verify graph pool with the largest batch's scratch.
     SGLANG_OPT_POST_VERIFY_POOL_PRESIZE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
