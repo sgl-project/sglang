@@ -1426,4 +1426,52 @@ mod tests {
         assert_eq!(task.await.unwrap().unwrap(), Bytes::from_static(b"payload"));
         assert!(harness.abort_rx.try_recv().is_err());
     }
+
+    /// A relayed weight update holds this listener while its scheduler runs
+    /// it: generates park, and resume once the reply is in, with the facts
+    /// marked stale.
+    #[tokio::test]
+    async fn a_relayed_weight_update_holds_the_peer_listener() {
+        use crate::message::io_struct::EndWeightUpdateReqInput;
+        let harness = Harness::unbounded(8);
+        let header = ControlRequest::EndWeightUpdateReqInput(EndWeightUpdateReqInput::new(
+            "peer-rid".into(),
+        ))
+        .encode()
+        .unwrap();
+        let handle = harness.handle.clone();
+        let relayed = tokio::spawn(async move { handle.forward_control_req(header).await });
+        let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        assert!(
+            harness.handle.inner.frontend.is_paused(),
+            "held while it runs"
+        );
+        let gen_handle = harness.handle.clone();
+        let parked = tokio::spawn(async move {
+            gen_handle
+                .generate(
+                    GenerateRequest {
+                        input_ids: Some(vec![1]),
+                        ..Default::default()
+                    },
+                    ReceivedAs::without_headers(),
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(!parked.is_finished() && harness.intake_rx.try_recv().is_err());
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({"success": true, "message": "ok"}))
+                    .unwrap(),
+            )))
+            .unwrap();
+        relayed.await.unwrap().unwrap();
+        assert!(!harness.handle.inner.frontend.is_paused());
+        assert!(harness.handle.inner.frontend.is_stale());
+        let released = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        assert!(matches!(released.kind, RequestKind::Generate(_)));
+        drop(parked);
+    }
 }

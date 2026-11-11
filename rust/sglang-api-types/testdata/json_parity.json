@@ -693,6 +693,36 @@
       "canonical": "{\"tags\":[\"weights\"]}"
     },
     {
+      "type": "GetWeightsByNameRequest",
+      "name": "truncate_size defaults to 100 when absent",
+      "input": {
+        "name": "model.embed_tokens.weight"
+      },
+      "canonical": "{\"name\":\"model.embed_tokens.weight\",\"truncate_size\":100}"
+    },
+    {
+      "type": "InitWeightsUpdateGroupRequest",
+      "name": "group name and backend take Python's defaults, null included",
+      "input": {
+        "master_address": "10.0.0.1",
+        "master_port": 29500,
+        "rank_offset": 1,
+        "world_size": 9,
+        "backend": null
+      },
+      "canonical": "{\"master_address\":\"10.0.0.1\",\"master_port\":29500,\"rank_offset\":1,\"world_size\":9,\"group_name\":\"weight_update_group\",\"backend\":\"nccl\"}"
+    },
+    {
+      "type": "SendWeightsToRemoteInstanceRequest",
+      "name": "an explicit group name is kept",
+      "input": {
+        "master_address": "10.0.0.2",
+        "ports": "9000,9001",
+        "group_name": "g"
+      },
+      "canonical": "{\"master_address\":\"10.0.0.2\",\"ports\":\"9000,9001\",\"group_name\":\"g\"}"
+    },
+    {
       "type": "PauseGenerationRequest",
       "name": "mode defaults to abort as in Python",
       "input": {},
@@ -717,6 +747,29 @@
         "new_version": "v2"
       },
       "canonical": "{\"new_version\":\"v2\",\"abort_all_requests\":true}"
+    },
+    {
+      "type": "UpdateWeightsFromDiskRequest",
+      "name": "flush_cache defaults on and null resets it; unread fields keep Python's defaults",
+      "input": {
+        "model_path": "/m",
+        "flush_cache": null,
+        "manifest": {
+          "a": 1
+        }
+      },
+      "canonical": "{\"model_path\":\"/m\",\"abort_all_requests\":false,\"is_async\":false,\"torch_empty_cache\":false,\"keep_pause\":false,\"recapture_cuda_graph\":false,\"token_step\":0,\"flush_cache\":true,\"manifest\":{\"a\":1}}"
+    },
+    {
+      "type": "UpdateWeightsFromTensorRequest",
+      "name": "selector defaults to all and payloads stay base64 text",
+      "input": {
+        "serialized_named_tensors": [
+          "gAU="
+        ],
+        "selector": null
+      },
+      "canonical": "{\"serialized_named_tensors\":[\"gAU=\"],\"flush_cache\":true,\"abort_all_requests\":false,\"selector\":\"all\",\"torch_empty_cache\":false}"
     }
   ]
 }

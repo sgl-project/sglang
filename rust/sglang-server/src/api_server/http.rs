@@ -11,3 +11,4 @@ mod openai;
 pub(crate) mod pre_generate;
 mod request_decompression;
 mod request_headers;
+pub(crate) mod weights;
