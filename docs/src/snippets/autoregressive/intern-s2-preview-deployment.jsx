@@ -79,17 +79,11 @@ export const InternS2PreviewDeployment = () => {
 
   const generateCommand = () => {
     if (values.hardware === 'xeon') {
-      return `SGLANG_USE_CPU_ENGINE=1 sglang serve \\
+      return `sglang serve \\
   --model internLM/Intern-S2-Preview \\
   --device cpu \\
-  --disable-overlap-schedule \\
-  --revision 4f57cab513689b089019fce4ad24e26520df183c \\
-  --trust-remote-code \\
   --tp 4 \\
-  --dtype bfloat16 \\
-  --max-total-tokens 8192 \\
-  --host 0.0.0.0 \\
-  --port 30000`;
+  --host 0.0.0.0`;
     }
     const { reasoning, toolcall, mtp } = values;
     const tpValue = 8;
@@ -164,6 +158,9 @@ export const InternS2PreviewDeployment = () => {
 
   return (
     <div style={containerStyle} className="not-prose">
+      {values.hardware === 'xeon' && (
+        <p>Before serving on CPU, export <code>SGLANG_USE_CPU_ENGINE=1</code> in your shell.</p>
+      )}
       {Object.entries(options).map(([key, option]) => (
         <div key={key} style={cardStyle}>
           <div style={titleStyle}>{option.title}</div>

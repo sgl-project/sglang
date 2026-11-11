@@ -15,10 +15,10 @@ const load = async (name, vendor = "IFM") => {
   return (await import("data:text/javascript," + encodeURIComponent(text))).config;
 };
 
-for (const [vendor, name, checkpoint, revision, cap, gpu] of [
-  ["IFM", "k2-horizon", "K2-Horizon-0.9B", "d50881f4f8dc6923fb8f301e1c2313fe3a2b6c1d", 4096, "h200"],
-  ["IFM", "jais-3", "Jais-3-0.9B", "ef8b0e93cae13e7fdb6c711770ab00e03616baac", 8192, "h100"],
-  ["ibm-granite", "granite-4.2", "granite-4.2-3b", "4e9c275e232f10211ec88644d106a1f6a1b60e06", 8192, "h200"],
+for (const [vendor, name, checkpoint, gpu] of [
+  ["IFM", "k2-horizon", "K2-Horizon-0.9B", "h200"],
+  ["IFM", "jais-3", "Jais-3-0.9B", "h100"],
+  ["ibm-granite", "granite-4.2", "granite-4.2-3b", "h200"],
 ]) {
 const config = await load(name, vendor);
 const firstVariant = vendor === "IFM" ? "0.9b" : "3b";
@@ -41,12 +41,18 @@ test(`${name} exposes only validated Python-only Xeon recipes`, () => {
     HOST_IP: "127.0.0.1", PORT: "31000",
   });
   for (const flag of [
-    `--model ${vendor}/${checkpoint}`, "--device cpu", "--disable-overlap-schedule",
-    "--tp 6", "--dtype bfloat16", `--max-total-tokens ${cap}`, "--port 31000",
-    `--revision ${revision}`,
+    `--model ${vendor}/${checkpoint}`, "--device cpu", "--tp 6", "--port 31000",
   ]) assert.ok(command.includes(flag), flag);
-  assert.doesNotMatch(command, /docker|--gpus|fa3|--ep |--nnodes|--reasoning-parser|--speculative/);
-  assert.match(cell.warn, /Quick generation.*full context.*unverified/);
+  assert.match(command, /^sglang serve/);
+  assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--disable-overlap-schedule|docker|--gpus|fa3|--ep |--nnodes|--reasoning-parser|--speculative/);
+  assert.match(cell.warn, /Only basic text generation.*full context.*unverified/);
+  const defaults = api.renderCommand(cell, cell.match, { HOST_IP: "127.0.0.1", PORT: "30000" });
+  assert.doesNotMatch(defaults, /--host|--port/);
+  const custom = api.renderCommand(cell, cell.match, { HOST_IP: "0.0.0.0", PORT: "31001" });
+  assert.match(custom, /--host 0\.0\.0\.0/);
+  assert.match(custom, /--port 31001/);
+  const gpuCell = config.cells.find((candidate) => candidate.match.hw === gpu);
+  assert.match(api.renderCommand(gpuCell, gpuCell.match, { HOST_IP: "127.0.0.1", PORT: "30000" }), /--port 30000/);
 });
 
 test(`${name} hardware switches and stale URLs snap to a validated Xeon cell`, () => {
@@ -76,17 +82,17 @@ test(`${name} hides unvalidated Playground axes and discards stale GPU overrides
 });
 }
 
-for (const [vendor, name, variant, checkpoint, revision] of [
-  ["IFM", "k2-horizon", "3.7b", "K2-Horizon-3.7B", "4525090a8f0fce1026d861701b9bde2fb726b7a0"],
-  ["IFM", "k2-horizon", "7b", "K2-Horizon-7B", "92f61d9123d12e223196ca484edf34a56df7803e"],
-  ["IFM", "k2-horizon", "32b", "K2-Horizon-32B", "4b05c13ad1972e8f470ab93ff90c3e90010ce592"],
-  ["IFM", "jais-3", "3.7b", "Jais-3-3.7B", "78d52c03900ef18ee3ebae631426556df6bd925a"],
-  ["IFM", "jais-3", "7b", "Jais-3-7B", "c7daf3c43355921602398a0d97bbeba05bfbe81b"],
-  ["IFM", "jais-3", "32b", "Jais-3-32B", "2d4da325cfa0d28b9f2eb4ddac2baa1ae0ed6063"],
-  ["ibm-granite", "granite-4.2", "8b", "granite-4.2-8b", "a7042144125ce5ae64f89610e8289647fc000b9a"],
-  ["ibm-granite", "granite-4.2", "30b", "granite-4.2-30b", "9e668ce1c538387ef24d3644e9b0606647762636"],
+for (const [vendor, name, variant, checkpoint] of [
+  ["IFM", "k2-horizon", "3.7b", "K2-Horizon-3.7B"],
+  ["IFM", "k2-horizon", "7b", "K2-Horizon-7B"],
+  ["IFM", "k2-horizon", "32b", "K2-Horizon-32B"],
+  ["IFM", "jais-3", "3.7b", "Jais-3-3.7B"],
+  ["IFM", "jais-3", "7b", "Jais-3-7B"],
+  ["IFM", "jais-3", "32b", "Jais-3-32B"],
+  ["ibm-granite", "granite-4.2", "8b", "granite-4.2-8b"],
+  ["ibm-granite", "granite-4.2", "30b", "granite-4.2-30b"],
 ]) {
-test(`${checkpoint} emits its independently validated checkpoint and cache limit`, async () => {
+test(`${checkpoint} emits its model and CPU topology without redundant flags`, async () => {
   const config = await load(name, vendor);
   const cell = config.cells.find((cell) => cell.match.hw === "xeon" && cell.match.variant === variant);
   const command = engine(config).renderCommand(cell, cell.match, {
@@ -94,9 +100,9 @@ test(`${checkpoint} emits its independently validated checkpoint and cache limit
   });
   for (const flag of [
     `--model ${vendor}/${checkpoint}`,
-    `--revision ${revision}`,
-    "--tp 6", "--max-total-tokens 8192", "OPENBLAS_NUM_THREADS=1",
+    "--device cpu", "--tp 6",
   ]) assert.ok(command.includes(flag), flag);
-  assert.doesNotMatch(command, /docker|--gpus|fa3|--ep |--nnodes|--reasoning-parser|--speculative/);
+  assert.match(command, /^sglang serve/);
+  assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--disable-overlap-schedule|docker|--gpus|fa3|--ep |--nnodes|--reasoning-parser|--speculative/);
 });
 }

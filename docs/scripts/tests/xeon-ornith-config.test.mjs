@@ -11,9 +11,9 @@ const engine = (config) => new Function("config", `${setup}
 return { findCell, snapToValidCell, validateSelection, isOptionAvailable, renderCommand };
 `)(config);
 
-for (const [vendor, name, model, revision] of [
-  ["deepreinforce-ai", "ornith-1.0", "Ornith-1.0-9B", "83dc1f5e24ef8527af019a6b3bf66ac0f1c2c999"],
-  ["ornith-ai", "ornith-1.5", "Ornith-1.5-9B", "489cb97981b8654bcfcf30ce1f94ed1b62e07b53"],
+for (const [vendor, name, model] of [
+  ["deepreinforce-ai", "ornith-1.0", "Ornith-1.0-9B"],
+  ["ornith-ai", "ornith-1.5", "Ornith-1.5-9B"],
 ]) {
   const text = readFileSync(new URL(`../../src/snippets/configs/${vendor}/${name}.jsx`, import.meta.url), "utf8");
   const { config } = await import("data:text/javascript," + encodeURIComponent(text));
@@ -33,13 +33,11 @@ for (const [vendor, name, model, revision] of [
       HOST_IP: "127.0.0.1", PORT: "31001",
     });
     for (const flag of [
-      `--model ${vendor}/${model}`, `--revision ${revision}`,
-      `--served-model-name ${model}`, "--device cpu", "--disable-overlap-schedule",
-      "--tp 6", "--dtype bfloat16", "--max-total-tokens 8192", "--port 31001",
-      "SGLANG_USE_CPU_ENGINE=1", "OPENBLAS_NUM_THREADS=1",
+      `--model ${vendor}/${model}`, "--device cpu", "--tp 6", "--port 31001",
     ]) assert.ok(command.includes(flag), flag);
-    assert.doesNotMatch(command, /docker|--gpus|--context-length|--reasoning-parser|--tool-call-parser/);
-    assert.match(cell.warn, /Quick generation.*full context.*unverified/);
+    assert.match(command, /^sglang serve/);
+    assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--served-model-name|--disable-overlap-schedule|docker|--gpus|--context-length|--reasoning-parser|--tool-call-parser/);
+    assert.match(cell.warn, /Only basic text generation.*full context.*unverified/);
   });
 
   test(`${name} resets stale GPU variants, precision and topology on CPU`, () => {
@@ -76,11 +74,9 @@ test("Ornith 1.0 35B uses its independent BF16 TP6 record, not its FP8 sibling",
   const cell = config.cells.find((candidate) => candidate.match.hw === "xeon" && candidate.match.variant === "35b");
   const command = engine(config).renderCommand(cell, cell.match, {});
   for (const flag of [
-    "--model deepreinforce-ai/Ornith-1.0-35B", "--served-model-name Ornith-1.0-35B",
-    "--revision 5df2ed3f675c7beaa490328cc70bb573b65fb660",
-    "--device cpu", "--tp 6", "--dtype bfloat16", "--max-total-tokens 8192",
+    "--model deepreinforce-ai/Ornith-1.0-35B", "--device cpu", "--tp 6",
   ]) assert.ok(command.includes(flag), flag);
-  assert.doesNotMatch(command, /-FP8|--reasoning-parser|--tool-call-parser|--speculative/);
+  assert.doesNotMatch(command, /-FP8|--revision|--served-model-name|--reasoning-parser|--tool-call-parser|--speculative/);
 });
 
 test("Ornith 1.5 35B-A3B uses its independent BF16 TP6 record, not its FP8 sibling", async () => {
@@ -89,9 +85,7 @@ test("Ornith 1.5 35B-A3B uses its independent BF16 TP6 record, not its FP8 sibli
   const cell = config.cells.find((candidate) => candidate.match.hw === "xeon" && candidate.match.variant === "35b");
   const command = engine(config).renderCommand(cell, cell.match, {});
   for (const flag of [
-    "--model ornith-ai/Ornith-1.5-35B-A3B", "--served-model-name Ornith-1.5-35B-A3B",
-    "--revision 10fbf86fed7ecee4a061f8b499a618f46001cac1",
-    "--device cpu", "--tp 6", "--dtype bfloat16", "--max-total-tokens 8192",
+    "--model ornith-ai/Ornith-1.5-35B-A3B", "--device cpu", "--tp 6",
   ]) assert.ok(command.includes(flag), flag);
-  assert.doesNotMatch(command, /-FP8|--reasoning-parser|--tool-call-parser|--speculative/);
+  assert.doesNotMatch(command, /-FP8|--revision|--served-model-name|--reasoning-parser|--tool-call-parser|--speculative/);
 });

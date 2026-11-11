@@ -1,10 +1,9 @@
 // Single `export const config` literal — Mintlify re-evaluates this module at
 // hydration time, so keep the cookbook data self-contained.
 //
-// The serving settings in the six H200 recipes below were benchmarked with the
+// The serving settings in the six base recipes below were benchmarked with the
 // K2 Horizon runtime support in sgl-project/sglang#37654. The commands pin the
 // current model revisions; benchmark provenance is documented on the page.
-// Xeon recipes are quick-generation checks, not benchmark measurements.
 // Playground overrides remain separate from the verified commands.
 
 export const config = {
@@ -221,20 +220,13 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "xeon", variant: "0.9b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
-      warn: "Quick generation verified on Intel Xeon 6972P at TP6. The 4,096-token cache does not cover the full context. Playground overrides, dataset accuracy, and performance are unverified.",
-      env: [
-        "SGLANG_USE_CPU_ENGINE=1",
-        "RAYON_NUM_THREADS=1",
-        "TOKENIZERS_PARALLELISM=false",
-      ],
+      warn: "Before serving on CPU, export SGLANG_USE_CPU_ENGINE=1 in your shell. Only basic text generation has been checked; full context, Playground overrides, dataset accuracy, and performance are unverified.",
+      env: [],
+      omitDefaultServerAddress: true,
       flags: [
         "--model {{MODEL_NAME}}",
         "--device cpu",
-        "--disable-overlap-schedule",
-        "--revision d50881f4f8dc6923fb8f301e1c2313fe3a2b6c1d",
         "--tp 6",
-        "--dtype bfloat16",
-        "--max-total-tokens 4096",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -242,21 +234,13 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "xeon", variant: "3.7b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
-      warn: "Quick generation verified on Intel Xeon 6972P at TP6. The 8,192-token cache does not cover the full context. Playground overrides, dataset accuracy, and performance are unverified.",
-      env: [
-        "SGLANG_USE_CPU_ENGINE=1",
-        "RAYON_NUM_THREADS=1",
-        "TOKENIZERS_PARALLELISM=false",
-        "OPENBLAS_NUM_THREADS=1",
-      ],
+      warn: "Before serving on CPU, export SGLANG_USE_CPU_ENGINE=1 in your shell. Only basic text generation has been checked; full context, Playground overrides, dataset accuracy, and performance are unverified.",
+      env: [],
+      omitDefaultServerAddress: true,
       flags: [
         "--model {{MODEL_NAME}}",
         "--device cpu",
-        "--disable-overlap-schedule",
-        "--revision 4525090a8f0fce1026d861701b9bde2fb726b7a0",
         "--tp 6",
-        "--dtype bfloat16",
-        "--max-total-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -264,21 +248,13 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "xeon", variant: "7b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
-      warn: "Quick generation verified on Intel Xeon 6972P at TP6. The 8,192-token cache does not cover the full context. Playground overrides, dataset accuracy, and performance are unverified.",
-      env: [
-        "SGLANG_USE_CPU_ENGINE=1",
-        "RAYON_NUM_THREADS=1",
-        "TOKENIZERS_PARALLELISM=false",
-        "OPENBLAS_NUM_THREADS=1",
-      ],
+      warn: "Before serving on CPU, export SGLANG_USE_CPU_ENGINE=1 in your shell. Only basic text generation has been checked; full context, Playground overrides, dataset accuracy, and performance are unverified.",
+      env: [],
+      omitDefaultServerAddress: true,
       flags: [
         "--model {{MODEL_NAME}}",
         "--device cpu",
-        "--disable-overlap-schedule",
-        "--revision 92f61d9123d12e223196ca484edf34a56df7803e",
         "--tp 6",
-        "--dtype bfloat16",
-        "--max-total-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -286,21 +262,13 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "xeon", variant: "32b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
-      warn: "Quick generation verified on Intel Xeon 6972P at TP6. The 8,192-token cache does not cover the full context. Playground overrides, dataset accuracy, and performance are unverified.",
-      env: [
-        "SGLANG_USE_CPU_ENGINE=1",
-        "RAYON_NUM_THREADS=1",
-        "TOKENIZERS_PARALLELISM=false",
-        "OPENBLAS_NUM_THREADS=1",
-      ],
+      warn: "Before serving on CPU, export SGLANG_USE_CPU_ENGINE=1 in your shell. Only basic text generation has been checked; full context, Playground overrides, dataset accuracy, and performance are unverified.",
+      env: [],
+      omitDefaultServerAddress: true,
       flags: [
         "--model {{MODEL_NAME}}",
-        "--revision 4b05c13ad1972e8f470ab93ff90c3e90010ce592",
         "--device cpu",
-        "--disable-overlap-schedule",
         "--tp 6",
-        "--dtype bfloat16",
-        "--max-total-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

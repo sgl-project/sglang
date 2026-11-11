@@ -13,11 +13,10 @@ const base = { hardware: "xeon", quantization: "bf16", reasoning: "enabled", too
 test("Laguna XS.2 emits only the independently validated TP4 BF16 CPU recipe", () => {
   const command = load(base).generateCommand();
   for (const flag of [
-    "--model-path poolside/Laguna-XS.2", "--revision a397bde04501591d0ac3d74a5d9d0a4ec298ffb8",
-    "--device cpu", "--disable-overlap-schedule", "--trust-remote-code",
-    "--tp 4", "--dtype bfloat16", "--max-total-tokens 8192", "--port 30000",
+    "--model poolside/Laguna-XS.2", "--device cpu", "--tp 4", "--host 0.0.0.0",
   ]) assert.ok(command.includes(flag), flag);
-  assert.doesNotMatch(command, /--reasoning-parser|--tool-call-parser|--attn-dp-size|docker/);
+  assert.match(command, /^sglang serve/);
+  assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--port|--trust-remote-code|--disable-overlap-schedule|--reasoning-parser|--tool-call-parser|--attn-dp-size|docker/);
   for (const quantization of ["fp8", "nvfp4"]) {
     assert.match(load({ ...base, quantization }).generateCommand(), /^# Error: No validated Xeon/);
   }

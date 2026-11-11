@@ -14,19 +14,18 @@ const base = {
   reasoning: "enabled", toolcall: "enabled", speculative: "enabled",
 };
 
-for (const [modelSize, checkpoint, revision] of [
-  ["e2b", "E2B", "6befbaca7398925921802abd1f277b495b78b738"],
-  ["e4b", "E4B", "476025a01dbf99361c062bbeca3d6a76bb4c4566"],
+for (const [modelSize, checkpoint] of [
+  ["e2b", "E2B"],
+  ["e4b", "E4B"],
 ]) {
   test(`Gemma 4 QAT ${checkpoint} emits only the independently verified CPU command`, () => {
     const command = load().generateCommand({ ...base, modelSize });
     for (const flag of [
-      `--model-path google/gemma-4-${checkpoint}-it-qat-q4_0-unquantized`,
-      `--revision ${revision}`, "--device cpu", "--tp 4",
-      "--dtype bfloat16", "--max-total-tokens 8192",
-      "--host 0.0.0.0 --port 30000", "SGLANG_USE_CPU_ENGINE=1",
+      `--model google/gemma-4-${checkpoint}-it-qat-q4_0-unquantized`,
+      "--device cpu", "--tp 4", "--mem-fraction-static 0.9", "--host 0.0.0.0",
     ]) assert.ok(command.includes(flag), flag);
-    assert.doesNotMatch(command, /--reasoning-parser|--tool-call-parser|--speculative|--mem-fraction|docker|--gpus/);
+    assert.match(command, /^sglang serve/);
+    assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--port|--disable-overlap-schedule|--reasoning-parser|--tool-call-parser|--speculative|docker|--gpus/);
   });
 }
 
@@ -63,12 +62,10 @@ test("Gemma 4 standard 12B is selectable and emits its independently validated C
   assert.equal(options.hardware.getDynamicItems(values).find((item) => item.id === "xeon").disabled, false);
   const command = generateCommand(values);
   for (const flag of [
-    "--model-path google/gemma-4-12B-it",
-    "--revision 43c9d014b231474fa7212dbb48a762566c2b255d",
-    "--device cpu", "--disable-overlap-schedule", "--tp 6",
-    "--dtype bfloat16", "--max-total-tokens 8192", "--host 0.0.0.0 --port 30000",
+    "--model google/gemma-4-12B-it",
+    "--device cpu", "--tp 6", "--mem-fraction-static 0.9", "--host 0.0.0.0",
   ]) assert.ok(command.includes(flag), flag);
-  assert.doesNotMatch(command, /qat|--reasoning-parser|--tool-call-parser|--speculative|--mem-fraction/);
+  assert.doesNotMatch(command, /qat|--revision|--dtype|--max-total-tokens|--port|--disable-overlap-schedule|--reasoning-parser|--tool-call-parser|--speculative/);
   for (const axis of ["reasoning", "toolcall", "speculative"]) {
     assert.equal(options[axis].condition(values), false);
     assert.equal(options[axis].condition({ ...values, hardware: "h200" }), true);

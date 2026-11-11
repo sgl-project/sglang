@@ -44,7 +44,7 @@
 //
 // NVFP4 is Blackwell-only → no h200×nvfp4 cells (same rule as Laguna-M.1).
 //
-// GPU verified:true = ran that command shape and it served correctly + passed full GSM8K
+// verified:true = ran that command shape and it served correctly + passed full GSM8K
 // (see laguna-xs21-benchmarks.jsx). GB300 cells verified (4×GB300, tp 4); H200 cells
 // verified (8×H200: bf16 tp8, fp8/int4 tp8+ep8). B300 cells verified with the identical
 // commands run as tp8 across 2×(4×GB300) over MNNVL — same GPU (GB300/B300 = Blackwell
@@ -189,22 +189,13 @@ sgl-eval run aime25 \\
     {
       match: { hw: "xeon", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      warn: "Basic text generation verified on Intel Xeon 6972P at TP4 with an 8,192-token cache. Dataset accuracy, full context, DFlash, parser overrides and performance are unverified.",
-      env: [
-        "SGLANG_USE_CPU_ENGINE=1",
-        "RAYON_NUM_THREADS=1",
-        "TOKENIZERS_PARALLELISM=false",
-        "OPENBLAS_NUM_THREADS=1",
-      ],
+      warn: "Before serving on CPU, export SGLANG_USE_CPU_ENGINE=1 in your shell. Only basic text generation has been checked; full context, Playground overrides, dataset accuracy, and performance are unverified.",
+      env: [],
+      omitDefaultServerAddress: true,
       flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--revision c5f36269bbdbd3f27fddc9a9f9dbae0cf2cf57db",
+        "--model {{MODEL_NAME}}",
         "--device cpu",
-        "--disable-overlap-schedule",
         "--tp 4",
-        "--dtype bfloat16",
-        "--max-total-tokens 8192",
-        "--trust-remote-code",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

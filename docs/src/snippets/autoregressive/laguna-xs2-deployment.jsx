@@ -127,17 +127,11 @@ export const LagunaXS2Deployment = () => {
     if (hardware === 'xeon') {
       if (quantization !== 'bf16') return '# Error: No validated Xeon recipe for this checkpoint format.';
       return [
-        'SGLANG_USE_CPU_ENGINE=1 RAYON_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false OPENBLAS_NUM_THREADS=1 sglang serve \\',
-        '  --model-path poolside/Laguna-XS.2 \\',
-        '  --revision a397bde04501591d0ac3d74a5d9d0a4ec298ffb8 \\',
+        'sglang serve \\',
+        '  --model poolside/Laguna-XS.2 \\',
         '  --device cpu \\',
-        '  --disable-overlap-schedule \\',
-        '  --trust-remote-code \\',
         '  --tp 4 \\',
-        '  --dtype bfloat16 \\',
-        '  --max-total-tokens 8192 \\',
-        '  --host 0.0.0.0 \\',
-        '  --port 30000'
+        '  --host 0.0.0.0'
       ].join('\n');
     }
 
@@ -190,6 +184,9 @@ export const LagunaXS2Deployment = () => {
 
   return (
     <div style={containerStyle} className="not-prose">
+      {values.hardware === 'xeon' && (
+        <p>Before serving on CPU, export <code>SGLANG_USE_CPU_ENGINE=1</code> in your shell.</p>
+      )}
       {Object.entries(options).map(([key, option]) => {
         if (option.condition && !option.condition(values)) return null;
         const items = resolveItems(option, values);
