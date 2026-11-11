@@ -11,7 +11,6 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -39,7 +38,8 @@ def _ratio_after_kv_full_retract(survivors, current: float) -> float:
     scheduler.tree_cache.req_to_token_pool.mamba_allocator = None
     scheduler.metrics_reporter = MagicMock(enable_metrics=False)
     scheduler._add_request_to_queue = MagicMock()
-    scheduler.running_reqs = RunningReqs()
+    scheduler.request_retirer = MagicMock()
+    scheduler.uocr_runtime = None
     scheduler.new_token_ratio_tracker = NewTokenRatioTracker(
         init=0.7, min=FLOOR, decay=0.001, current=current
     )
