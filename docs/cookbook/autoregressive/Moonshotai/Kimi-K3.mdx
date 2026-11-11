@@ -488,8 +488,27 @@ Clients then send requests to the router (`:8000`) instead of an individual role
 
 ### 3.5 VLM Serving Profiles
 
-The open-source K3 serving contract currently supports **image input only** — its
-processor rejects video and audio input.
+The open-source K3 serving contract supports **image and video input**; its
+processor rejects audio input.
+
+#### Video input
+
+Send video as a `video_url` content part, as an `http(s)` URL or a
+`data:video/...;base64,` URL; the audio track is ignored. Sampling and prompt layout
+follow Moonshot's hosted K3 API and the checkpoint's `preprocessor_config.json`:
+
+- Frames are sampled at `sample_fps` (8 fps, or the source rate if lower) and each
+  keeps up to `in_patch_limit_each_frame` ViT patches.
+- Every `temporal_merge_kernel_size` (4) frames form one chunk that the vision tower
+  pools into a single frame's tokens, preceded by the chunk's `hh:mm:ss.fff` start
+  time.
+- A video over `in_patch_limit_video` patches keeps its frame size and samples fewer
+  frames over its full length, so one video costs at most about 41K image tokens.
+  `max_num_frames_each_video` caps frames further when set.
+
+Sampling options on the `video_url` object are ignored. Video requests skip the
+preprocessing cache, reject `mm_content_hashes`, and are not yet validated with EPD
+encoder roles; their tokens are reported as `image_tokens` in usage.
 
 #### VLM feature transport
 
