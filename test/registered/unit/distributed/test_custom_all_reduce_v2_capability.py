@@ -5,6 +5,7 @@ import pytest
 from sglang.srt.distributed.device_communicators import (
     custom_all_reduce_utils,
     custom_all_reduce_v2,
+    dpx_hier_all_reduce,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -181,14 +182,20 @@ def test_hier_sizing(max_size, sizes_own_push, hier_max, two_shot):
     )
 
     config = cfg._rocm_gfx1250_configs.__wrapped__(96)[16]
-    got = custom_all_reduce_v2._hier_max_bytes(
+    got = dpx_hier_all_reduce._hier_max_bytes(
         config, max_size, sizes_own_push=sizes_own_push
     )
     assert got == hier_max
-    fitted = custom_all_reduce_v2._fit_hier(config, got)
+    fitted = dpx_hier_all_reduce._fit_hier(config, got)
     for heuristic in (fitted.graph, fitted.eager):
         assert heuristic.hier_2shot_push.max_bytes == hier_max
         assert heuristic.two_shot_push_threshold == two_shot
+
+
+def _choice_name(choice):
+    if choice is None:
+        return None
+    return "HIER_2SHOT_PUSH" if choice.use_hier else choice.algo.name
 
 
 @pytest.mark.parametrize(
@@ -207,14 +214,13 @@ def test_pick_config_hier_at_default_cap(nbytes, expected):
     )
 
     config = cfg._rocm_gfx1250_configs.__wrapped__(96)[16]
-    hier_max = custom_all_reduce_v2._hier_max_bytes(
+    hier_max = dpx_hier_all_reduce._hier_max_bytes(
         config, 16 * _MB, sizes_own_push=False
     )
     comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
     comm.disabled = True
-    comm.config = custom_all_reduce_v2._fit_hier(config, hier_max)
-    picked = comm._pick_config(nbytes, False)
-    assert (None if picked is None else picked.algo.name) == expected
+    comm.config = dpx_hier_all_reduce._fit_hier(config, hier_max)
+    assert _choice_name(comm._pick_config(nbytes, False)) == expected
 
 
 @pytest.mark.parametrize(
@@ -253,9 +259,7 @@ def test_pick_config_hier_2shot_push(nbytes, expected):
         num_mc_blocks=None,
     )
     for use_graph in (False, True):
-        picked = comm._pick_config(nbytes, use_graph)
-        algo = None if picked is None else picked.algo.name
-        assert algo == expected
+        assert _choice_name(comm._pick_config(nbytes, use_graph)) == expected
 
 
 @pytest.mark.parametrize(
