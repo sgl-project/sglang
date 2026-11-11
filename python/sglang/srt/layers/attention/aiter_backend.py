@@ -1095,13 +1095,19 @@ class AiterAttnBackend(AttentionBackend):
             # Batches on SGLANG_AITER_MLA_DECODE_BACKEND=triton do not read
             # SGLANG_AITER_MLA_GLUON or SGLANG_AITER_MLA_PERSIST.
             if is_gfx1250_supported():
-                self.use_aiter_triton_mla_decode = self.mla_decode_backend == "triton"
+                self.use_aiter_triton_mla_decode = (
+                    self.mla_decode_backend == "triton"
+                    and not self.gfx1250_mla_asm_decode
+                )
                 logger.info(
                     "aiter gfx1250 Triton MLA decode is %s",
                     (
                         f"enabled (page size {self.page_size}, kernel block "
                         f"size {triton_mla_block_size(self.page_size)})"
                         if self.use_aiter_triton_mla_decode
+                        else "disabled (SGLANG_AITER_MLA_GFX1250_ASM=1 selects "
+                        "the ASM MLA decode)"
+                        if self.gfx1250_mla_asm_decode
                         else "disabled (SGLANG_AITER_MLA_DECODE_BACKEND resolved "
                         f"to {self.mla_decode_backend!r}; auto picks triton "
                         "with bf16 activations, no DCP, qk_rope_head_dim > 0)"
@@ -1270,7 +1276,10 @@ class AiterAttnBackend(AttentionBackend):
 
         Matches main's ``_use_mla_ps_kernel and dcp_world_size <= 1`` when ASM
         is off. DCP ASM needs the same buffers with fast_mode scheduling.
+        The gfx1250 ASM decode builds its own page table and needs neither.
         """
+        if self.gfx1250_mla_asm_decode:
+            return False
         return (_use_mla_ps_kernel and self.dcp_world_size <= 1) or (
             self.use_mla_dcp_asm and self.dcp_world_size > 1
         )
