@@ -62,6 +62,7 @@ def process_model_weights_after_loading(
     process_device: torch.device | None = None,
     *,
     quantized_only: bool = False,
+    keep_on_device: bool = False,
 ) -> int:
     """Process native and SRT layers once, optionally staging one layer at a time."""
     processed_layers = 0
@@ -93,6 +94,9 @@ def process_model_weights_after_loading(
         if is_npu() and not unquantized:
             torch.npu.config.allow_internal_format = True
         if process_device is None:
+            method.process_weights_after_loading(module)
+        elif keep_on_device:
+            module._apply(lambda t: t if t.is_meta else t.to(process_device))
             method.process_weights_after_loading(module)
         else:
             with stage_module_for_post_load(module, process_device):

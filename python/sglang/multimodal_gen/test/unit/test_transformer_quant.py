@@ -93,6 +93,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
     TransformerLoader,
     _default_quantized_attention_backend,
     _resolve_checkpoint_load_device,
+    _resolve_layerwise_postprocess_device,
     _warn_if_expected_param_dtype_missing,
 )
 from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
@@ -1441,6 +1442,60 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         )
 
         self.assertEqual(device, runtime_device)
+
+    def test_resident_online_fp8_stages_if_the_checkpoint_exceeds_free_memory(self):
+        device = torch.device("cuda:0")
+        platform = transformer_loader.current_platform
+        with (
+            tempfile.NamedTemporaryFile() as checkpoint,
+            patch.object(platform, "is_cuda", return_value=True),
+            patch.object(platform, "is_mps", return_value=False),
+            patch.object(platform, "device_shares_host_memory", return_value=False),
+            patch.object(platform, "get_available_gpu_memory") as free_memory,
+        ):
+            checkpoint.truncate(16)
+            for config in (Fp8Config(), MXFP8Config()):
+                for free_bytes, expected in ((8, device), (16, None)):
+                    with self.subTest(quantization=config.get_name(), free=free_bytes):
+                        free_memory.return_value = free_bytes / (1 << 30)
+                        self.assertEqual(
+                            _resolve_layerwise_postprocess_device(
+                                device,
+                                config,
+                                component_starts_on_cpu=False,
+                                use_fsdp=False,
+                                num_gpus=1,
+                                weight_files=[checkpoint.name],
+                            ),
+                            expected,
+                        )
+
+    def test_resident_online_fp8_staging_skips_sharded_or_shared_memory_loads(self):
+        device = torch.device("cuda:0")
+        platform = transformer_loader.current_platform
+        with (
+            patch.object(platform, "is_cuda", return_value=True),
+            patch.object(platform, "device_shares_host_memory") as shares_host_memory,
+            patch.object(platform, "get_available_gpu_memory") as free_memory,
+        ):
+            for use_fsdp, num_gpus, shared in (
+                (True, 1, False),
+                (False, 2, False),
+                (False, 1, True),
+            ):
+                with self.subTest(fsdp=use_fsdp, num_gpus=num_gpus, shared=shared):
+                    shares_host_memory.return_value = shared
+                    self.assertIsNone(
+                        _resolve_layerwise_postprocess_device(
+                            device,
+                            Fp8Config(),
+                            component_starts_on_cpu=False,
+                            use_fsdp=use_fsdp,
+                            num_gpus=num_gpus,
+                            weight_files=["checkpoint.safetensors"],
+                        )
+                    )
+            free_memory.assert_not_called()
 
     def test_mixed_model_with_expected_dtype_does_not_warn(self):
         model = torch.nn.Module()

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Online quantization must not materialize a CPU-offloaded DiT on CUDA."""
+"""Bound temporary CUDA allocations when quantizing a DiT layerwise."""
 
 import unittest
 from unittest.mock import patch
@@ -34,6 +34,7 @@ class _TwoLayerModel(nn.Module):
             ReplicatedLinear(128, 128, bias=False, quant_config=quant_config)
             for _ in range(2)
         )
+        self.final_bias = nn.Parameter(torch.empty(1))
         self.register_buffer("inv_freq", torch.empty(4), persistent=False)
 
     def post_load_weights(self):
@@ -53,6 +54,7 @@ class TestOnlineFp8LayerwiseLoad(unittest.TestCase):
             )
             for i in range(2)
         }
+        checkpoint["final_bias"] = torch.ones(1, dtype=torch.bfloat16)
         device = torch.device("cuda:0")
         for config_cls in (Fp8Config, MXFP8Config):
             with self.subTest(quantization=config_cls.__name__):
@@ -80,7 +82,7 @@ class TestOnlineFp8LayerwiseLoad(unittest.TestCase):
                 del reference
                 visited = []
 
-                def bounded_postprocess(model, process_device):
+                def bounded_postprocess(model, process_device, *, keep_on_device=False):
                     self.assertEqual(process_device, device)
                     for layer in model.layers:
                         original = layer.quant_method.process_weights_after_loading
@@ -89,35 +91,51 @@ class TestOnlineFp8LayerwiseLoad(unittest.TestCase):
                             self.assertEqual(current.weight.device, device)
                             for other in model.layers:
                                 if other is not current:
-                                    self.assertEqual(other.weight.device.type, "cpu")
+                                    expected_device = (
+                                        device
+                                        if keep_on_device and other in visited
+                                        else torch.device("cpu")
+                                    )
+                                    self.assertEqual(
+                                        other.weight.device, expected_device
+                                    )
                             visited.append(current)
                             original(current)
 
                         layer.quant_method.process_weights_after_loading = check
-                    return process_model_weights_after_loading(model, process_device)
-
-                plan = WeightLoadPlan.for_component(
-                    checkpoint_load_device=torch.device("cpu"),
-                    needs_device_weight_postprocess=True,
-                    component_starts_on_cpu=True,
-                    layerwise_postprocess_device=device,
-                )
-                with patch.object(
-                    fsdp_load,
-                    "process_model_weights_after_loading",
-                    bounded_postprocess,
-                ):
-                    model = load(plan, True)
-                self.assertEqual(len(visited), 2)
-                for tensor in (*model.parameters(), *model.buffers()):
-                    self.assertEqual(tensor.device.type, "cpu")
-                for name, value in model.state_dict().items():
-                    torch.testing.assert_close(
-                        value.detach().contiguous().view(torch.uint8),
-                        expected[name],
-                        rtol=0,
-                        atol=0,
+                    return process_model_weights_after_loading(
+                        model, process_device, keep_on_device=keep_on_device
                     )
+
+                for starts_on_cpu in (True, False):
+                    with self.subTest(starts_on_cpu=starts_on_cpu):
+                        visited.clear()
+                        plan = WeightLoadPlan.for_component(
+                            checkpoint_load_device=torch.device("cpu"),
+                            needs_device_weight_postprocess=True,
+                            component_starts_on_cpu=starts_on_cpu,
+                            layerwise_postprocess_device=device,
+                        )
+                        with patch.object(
+                            fsdp_load,
+                            "process_model_weights_after_loading",
+                            bounded_postprocess,
+                        ):
+                            model = load(plan, starts_on_cpu)
+                        self.assertEqual(len(visited), 2)
+                        expected_device = (
+                            torch.device("cpu") if starts_on_cpu else device
+                        )
+                        for tensor in (*model.parameters(), *model.buffers()):
+                            self.assertEqual(tensor.device, expected_device)
+                        for name, value in model.state_dict().items():
+                            torch.testing.assert_close(
+                                value.detach().cpu().contiguous().view(torch.uint8),
+                                expected[name],
+                                rtol=0,
+                                atol=0,
+                            )
+                        del model
 
 
 if __name__ == "__main__":

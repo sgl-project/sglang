@@ -1,5 +1,6 @@
 import copy
 import logging
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from typing import Any
@@ -14,6 +15,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
 )
+from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
     ConvRotInt8Config,
 )
@@ -66,6 +68,42 @@ def _resolve_checkpoint_load_device(
     ):
         return torch.device("cpu")
     return runtime_device
+
+
+def _resolve_layerwise_postprocess_device(
+    runtime_device: torch.device,
+    quant_config: QuantizationConfig | None,
+    *,
+    component_starts_on_cpu: bool,
+    use_fsdp: bool,
+    num_gpus: int,
+    weight_files: list[str],
+) -> torch.device | None:
+    if (
+        use_fsdp
+        or runtime_device.type != "cuda"
+        or quant_config is None
+        or quant_config.get_name() not in ("fp8", "mxfp8")
+        or quant_config.is_checkpoint_fp8_serialized
+    ):
+        return None
+    if component_starts_on_cpu:
+        return runtime_device
+
+    # Checkpoint size is an estimate of this device's load only for an
+    # unsharded model. Staging also needs a separate host memory pool.
+    if (
+        num_gpus != 1
+        or not weight_files
+        or not current_platform.is_cuda()
+        or current_platform.device_shares_host_memory()
+    ):
+        return None
+    checkpoint_bytes = sum(os.path.getsize(path) for path in weight_files)
+    free_gib = current_platform.get_available_gpu_memory(
+        device_id=runtime_device.index, empty_cache=False
+    )
+    return runtime_device if checkpoint_bytes > free_gib * (1 << 30) else None
 
 
 def _minimax_h3_adaln_cache_key_filter(name: str) -> bool:
@@ -511,19 +549,23 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             )
 
         local_torch_device = get_local_torch_device()
-        layerwise_postprocess_device = None
-        if (
-            component_starts_on_cpu
-            and not use_fsdp
-            and local_torch_device.type == "cuda"
-            and runtime_quant_config is not None
-            and runtime_quant_config.get_name() in ("fp8", "mxfp8")
-            and not runtime_quant_config.is_checkpoint_fp8_serialized
-        ):
-            layerwise_postprocess_device = local_torch_device
+        layerwise_postprocess_device = _resolve_layerwise_postprocess_device(
+            local_torch_device,
+            quant_spec.quant_config,
+            component_starts_on_cpu=component_starts_on_cpu,
+            use_fsdp=use_fsdp,
+            num_gpus=component_server_args.num_gpus,
+            weight_files=safetensors_list,
+        )
+        if layerwise_postprocess_device is not None and not component_starts_on_cpu:
+            logger.info(
+                "Staging online %s conversion for resident %s one layer at a time",
+                runtime_quant_config.get_name(),
+                component_name,
+            )
         checkpoint_load_device = (
             torch.device("cpu")
-            if cpu_offload_flag
+            if cpu_offload_flag or layerwise_postprocess_device is not None
             else _resolve_checkpoint_load_device(
                 local_torch_device,
                 component_starts_on_cpu=component_starts_on_cpu,
@@ -535,7 +577,6 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                     )
                     or quant_spec.is_convrot_int8
                     or quant_spec.is_serialized_kitchen_w4a8
-                    or layerwise_postprocess_device is not None
                 ),
             )
         )
