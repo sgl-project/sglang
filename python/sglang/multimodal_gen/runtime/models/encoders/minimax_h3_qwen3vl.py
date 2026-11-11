@@ -277,10 +277,6 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             use_tensor_parallel=True,
             prefix="model",
         )
-        # CPU initialization computes pow differently from CUDA. Rebuild the
-        # small vision frequency table after offload transfers so conditioning
-        # matches the GPU-resident encoder, as in the native Qwen-Image path.
-        self.model.visual.rotary_pos_emb.recompute_on_device_change = True
         # H3 and ClipProj consume an unnormalized intermediate residual stream.
         self.model.language_model.norm = nn.Identity()
         self.image_token_id = int(arch.image_token_id)
