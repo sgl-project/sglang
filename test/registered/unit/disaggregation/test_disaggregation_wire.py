@@ -965,17 +965,17 @@ class TestDisaggregationWire(unittest.TestCase):
                             manager.validate_aux_buffers(dst_ptrs, peer_lens)
 
     def test_aux_buffer_validation_checks_top_logprobs_width(self):
-        legacy = MetadataBuffers.LEGACY_TOP_LOGPROBS_NUM
+        default = MetadataBuffers.DEFAULT_TOP_LOGPROBS_NUM
         with (
             get_context().override_server_args(disaggregation_enable_kv_checksum=False),
             envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(0),
         ):
             for prefill_width, decode_width, accepted in (
-                (legacy, legacy, True),
-                (legacy, 2 * legacy, True),
-                (2 * legacy, 2 * legacy, True),
-                (2 * legacy, legacy, False),
-                (4 * legacy, 2 * legacy, False),
+                (default, default, True),
+                (default, 2 * default, True),
+                (2 * default, 2 * default, True),
+                (2 * default, default, False),
+                (4 * default, 2 * default, False),
             ):
                 with self.subTest(prefill=prefill_width, decode=decode_width):
                     src_ptrs, _, src_lens = MetadataBuffers(
@@ -986,11 +986,11 @@ class TestDisaggregationWire(unittest.TestCase):
                     ).get_buf_infos()
                     manager = object.__new__(CommonKVManager)
                     manager.customized_info_enabled = False
-                    manager.exchange_aux_item_lens = prefill_width != legacy
+                    manager.exchange_aux_item_lens = prefill_width != default
                     manager.kv_args = SimpleNamespace(
                         aux_data_ptrs=src_ptrs, aux_item_lens=src_lens
                     )
-                    peer_lens = dst_lens if decode_width != legacy else None
+                    peer_lens = dst_lens if decode_width != default else None
                     if accepted:
                         manager.validate_aux_buffers(dst_ptrs, peer_lens)
                     else:

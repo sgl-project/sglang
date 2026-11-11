@@ -355,7 +355,7 @@ class CommonKVManager(BaseKVManager):
         )
         self.exchange_aux_item_lens = self.customized_info_enabled or (
             get_disagg().disaggregation_max_top_logprobs_num
-            != MetadataBuffers.LEGACY_TOP_LOGPROBS_NUM
+            != MetadataBuffers.DEFAULT_TOP_LOGPROBS_NUM
         )
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout

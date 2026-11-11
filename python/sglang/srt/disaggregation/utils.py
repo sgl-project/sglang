@@ -622,7 +622,7 @@ class CustomizedInfoError(ValueError):
 
 class MetadataBuffers:
     CUSTOMIZED_INFO_SLOTS = slice(6, 8)
-    LEGACY_TOP_LOGPROBS_NUM = 128
+    DEFAULT_TOP_LOGPROBS_NUM = 128
 
     def __init__(
         self,
@@ -630,7 +630,7 @@ class MetadataBuffers:
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
         max_sampling_mask_tokens: int,
-        max_top_logprobs_num: int = LEGACY_TOP_LOGPROBS_NUM,
+        max_top_logprobs_num: int = DEFAULT_TOP_LOGPROBS_NUM,
         custom_mem_pool: torch.cuda.MemPool = None,
         output_dsa_topk_indices_dim: int = 0,
         *,
