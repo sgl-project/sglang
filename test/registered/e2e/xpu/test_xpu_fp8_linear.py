@@ -7,15 +7,26 @@ Usage:
 """
 
 import unittest
+from contextlib import contextmanager
 from typing import List
+from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.quantization.fp8_utils import (
-    dispatch_w8a8_block_fp8_linear,
+from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
+    scaled_fp8_quant,
+)
+from sglang.srt.layers.quantization import fp8_utils
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import (
+    apply_fp8_linear,
+    dispatch_w8a8_block_fp8_linear,
+    get_fp8_gemm_runner_backend,
     torch_w8a8_block_fp8_linear,
 )
+from sglang.srt.runtime_context import SpawnRanks, publish, reset_context
+from sglang.srt.server_args import prepare_server_args
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -56,6 +67,22 @@ def reference_block_fp8_matmul(
     return output
 
 
+@contextmanager
+def fp8_gemm_backend_from_cli(backend: str):
+    """Parse --fp8-gemm-backend through the CLI, publish it, and initialize from it."""
+    server_args = prepare_server_args(
+        ["--model-path", "dummy", "--fp8-gemm-backend", backend]
+    )
+    reset_context()
+    publish(server_args, role="test", ranks=SpawnRanks(world_rank=0, dp_rank=None))
+    try:
+        with patch.object(fp8_utils, "FP8_GEMM_RUNNER_BACKEND", None):
+            fp8_utils.initialize_fp8_gemm_config()
+            yield
+    finally:
+        reset_context()
+
+
 class TestXPUFP8Linear(CustomTestCase):
     def setUp(self):
         if not torch.xpu.is_available():
@@ -66,6 +93,39 @@ class TestXPUFP8Linear(CustomTestCase):
         """Verify that dispatch_w8a8_block_fp8_linear cleanly routes to torch_w8a8_block_fp8_linear on XPU."""
         dispatched_fn = dispatch_w8a8_block_fp8_linear()
         self.assertIs(dispatched_fn, torch_w8a8_block_fp8_linear)
+
+    def test_default_auto_backend_resolves_to_xpu_scaled_mm(self):
+        """The default --fp8-gemm-backend=auto is pinned to xpu_scaled_mm on XPU."""
+        with fp8_gemm_backend_from_cli("auto"):
+            self.assertTrue(get_fp8_gemm_runner_backend().is_xpu_scaled_mm())
+
+    def test_explicit_xpu_scaled_mm_backend_serves_block_fp8(self):
+        """--fp8-gemm-backend=xpu_scaled_mm parses, initializes, and runs block FP8."""
+        with fp8_gemm_backend_from_cli("xpu_scaled_mm"):
+            self.assertTrue(get_fp8_gemm_runner_backend().is_xpu_scaled_mm())
+            method = Fp8LinearMethod(
+                Fp8Config(
+                    is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128]
+                )
+            )
+        self.assertIs(method.w8a8_block_fp8_linear, torch_w8a8_block_fp8_linear)
+
+        M, K, N = 16, 256, 384
+        block_size = [128, 128]
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+        weight = torch.randn(N, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight_scale = (
+            torch.rand(N // 128, K // 128, dtype=torch.float32, device=self.device)
+            + 0.1
+        )
+        out = method.w8a8_block_fp8_linear(x, weight, block_size, weight_scale)
+        q_input, input_scale = per_token_group_quant_fp8(x, block_size[1])
+        ref = reference_block_fp8_matmul(
+            q_input, input_scale, weight, block_size, weight_scale
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref, rtol=0.05, atol=0.1)
 
     def test_torch_w8a8_block_fp8_linear_shapes_and_dims(self):
         """Test small sizes with varied M, 2D/3D shapes, and bias to keep memory minimal."""
@@ -330,6 +390,140 @@ class TestXPUFP8Linear(CustomTestCase):
             q_input, input_scale, weight, block_size, weight_scale, bias
         ).to(torch.bfloat16)
         torch.testing.assert_close(out, ref, rtol=0.05, atol=0.1)
+
+    def test_channelwise_xpu_rowwise_scaled_mm_gate(self):
+        """Use fused rowwise scaled_mm without changing accuracy."""
+        method = Fp8LinearMethod(
+            Fp8Config(is_checkpoint_fp8_serialized=False, weight_block_size=None)
+        )
+        K, N = 256, 384
+        weight_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) / 3
+
+        layer = torch.nn.Module()
+        layer.logical_widths = [N]
+        layer.weight = torch.nn.Parameter(weight_bf16, requires_grad=False)
+        layer.orig_dtype = torch.bfloat16
+        layer.input_scale = None
+        self.assertFalse(method.cutlass_fp8_supported)
+        method.process_weights_after_loading(layer)
+        self.assertTrue(method.use_per_token_if_dynamic)
+        weight = layer.weight
+        weight_scale = layer.weight_scale
+        self.assertEqual(tuple(weight_scale.shape), (N, 1))
+        self.assertTrue(weight_scale.t().is_contiguous())
+        original_scaled_mm = torch._scaled_mm
+
+        for m in (1, 8):
+            with self.subTest(m=m):
+                x = torch.randn(m, K, dtype=torch.bfloat16, device=self.device) / 3
+                q_input, input_scale = scaled_fp8_quant(
+                    x, use_per_token_if_dynamic=True
+                )
+                reference = (q_input.float() * input_scale.float()) @ (
+                    weight.float() * weight_scale.t()
+                )
+                calls = []
+
+                def traced_scaled_mm(*args, **kwargs):
+                    calls.append(
+                        (
+                            tuple(kwargs["scale_a"].shape),
+                            tuple(kwargs["scale_b"].shape),
+                        )
+                    )
+                    return original_scaled_mm(*args, **kwargs)
+
+                with patch.object(torch, "_scaled_mm", side_effect=traced_scaled_mm):
+                    output = apply_fp8_linear(
+                        input=x,
+                        weight=weight,
+                        weight_scale=weight_scale,
+                        use_per_token_if_dynamic=method.use_per_token_if_dynamic,
+                        compressed_tensor_quant=True,
+                    )
+
+                torch.testing.assert_close(
+                    output, reference.to(torch.bfloat16), rtol=0.01, atol=0.1
+                )
+                expected_scale_shapes = ((m, 1), (1, N))
+                self.assertEqual(calls, [expected_scale_shapes])
+
+    def test_static_input_scale_with_channelwise_weight_scale(self):
+        """Static activation_scheme + per-channel weight_scale must not crash.
+
+        process_weights_after_loading forces XPU through the channelwise
+        weight_scale branch unconditionally, but a static checkpoint gives a
+        0-dim per-tensor input_scale (not a per-token one). That combination
+        used to hit `_apply_fallback_scaled_mm`'s `torch.narrow` on a 0-dim
+        tensor.
+        """
+        method = Fp8LinearMethod(
+            Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=None)
+        )
+        method.quant_config.activation_scheme = "static"
+        N, K = 384, 256
+        weight_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) / 3
+        weight_scale = (
+            weight_bf16.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+            / torch.finfo(torch.float8_e4m3fn).max
+        )
+
+        layer = torch.nn.Module()
+        layer.logical_widths = [N]
+        layer.weight = torch.nn.Parameter(
+            weight_bf16.to(torch.float8_e4m3fn), requires_grad=False
+        )
+        layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
+        layer.orig_dtype = torch.bfloat16
+        layer.input_scale = torch.nn.Parameter(
+            torch.tensor(0.05, device=self.device), requires_grad=False
+        )
+        method.process_weights_after_loading(layer)
+        self.assertEqual(layer.input_scale.shape, torch.Size([]))
+
+        x = torch.randn(4, K, dtype=torch.bfloat16, device=self.device) / 3
+        output = method.apply(layer, x)
+
+        q_input = (
+            (x.float() / layer.input_scale.float())
+            .clamp(-448, 448)
+            .to(torch.float8_e4m3fn)
+        )
+        # layer.weight is stored transposed as (K, N) after loading.
+        reference = (q_input.float() * layer.input_scale.float()) @ (
+            layer.weight.float() * layer.weight_scale.float().t()
+        )
+        torch.testing.assert_close(
+            output, reference.to(torch.bfloat16), rtol=0.05, atol=0.2
+        )
+
+    def test_prequantized_vector_scale_with_channelwise_weight_scale(self):
+        """A one-element pre-quantized input scale is treated as scalar."""
+        M, K, N = 4, 256, 384
+        q_input = torch.randn(M, K, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight = torch.randn(K, N, dtype=torch.bfloat16, device=self.device).to(
+            torch.float8_e4m3fn
+        )
+        weight_scale = torch.full((N, 1), 0.5, device=self.device)
+        input_scale = torch.tensor([0.25], device=self.device)
+
+        output = apply_fp8_linear(
+            input=q_input,
+            weight=weight,
+            weight_scale=weight_scale,
+            input_scale=input_scale,
+            use_per_token_if_dynamic=True,
+            compressed_tensor_quant=True,
+            pre_quant_output_dtype=torch.bfloat16,
+        )
+        reference = (q_input.float() * input_scale.float()) @ (
+            weight.float() * weight_scale.t()
+        )
+        torch.testing.assert_close(
+            output, reference.to(torch.bfloat16), rtol=0.01, atol=0.1
+        )
 
 
 if __name__ == "__main__":

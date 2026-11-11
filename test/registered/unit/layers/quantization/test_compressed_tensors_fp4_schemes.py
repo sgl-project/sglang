@@ -16,6 +16,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE as _FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.quantization.compressed_tensors import compressed_tensors
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -25,6 +26,8 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
     CompressedTensorsW4A16Fp4,
+    CompressedTensorsW4A16Mxfp4,
+    CompressedTensorsW4A16Mxfp4MoE,
     CompressedTensorsW4A16Nvfp4MoE,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsWNA16,
@@ -121,6 +124,15 @@ SELECTION_CASES = [
     ("moe", "nvfp4a16", SM90, CompressedTensorsW4A16Nvfp4MoE, {"has_input_global_scale": False, "group_size": 16}),
     ("moe", "nvfp4", SM90, CompressedTensorsW4A16Nvfp4MoE, {"has_input_global_scale": True}),
     ("moe", "nvfp4", SM100, CompressedTensorsW4A4Nvfp4MoE, {}),
+    # No native MXFP4 linear kernel exists, so both variants are weight-only on
+    # every capability.
+    ("linear", "mxfp4a16", SM90, CompressedTensorsW4A16Mxfp4, {"has_input_activations": False}),
+    ("linear", "mxfp4", SM90, CompressedTensorsW4A16Mxfp4, {"has_input_activations": True}),
+    ("linear", "mxfp4", SM100, CompressedTensorsW4A16Mxfp4, {"has_input_activations": True}),
+    # Likewise for MXFP4 MoE.
+    ("moe", "mxfp4a16", SM90, CompressedTensorsW4A16Mxfp4MoE, {"has_input_global_scale": False, "group_size": 32}),
+    ("moe", "mxfp4", SM90, CompressedTensorsW4A16Mxfp4MoE, {"has_input_global_scale": True}),
+    ("moe", "mxfp4", SM100, CompressedTensorsW4A16Mxfp4MoE, {"has_input_global_scale": True}),
     # Neighbours of the fp4 predicates. The int4 type check keeps fp4 out of
     # WNA16; a weight-only MoE config has no input_activations, which the w8a8
     # predicates used to dereference.
@@ -149,7 +161,7 @@ class TestFp4SchemeSelection(CustomTestCase):
         """warning_once is lru_cache-wrapped; clear it to stay order-independent."""
         logging.Logger.warning_once.cache_clear()
         self.addCleanup(logging.Logger.warning_once.cache_clear)
-        for w4a4, a16 in (("nvfp4", "nvfp4a16"),):
+        for w4a4, a16 in (("nvfp4", "nvfp4a16"), ("mxfp4", "mxfp4a16")):
             with self.subTest(variant=w4a4):
                 with self.assertLogs(SCHEME_LOGGER, level="WARNING") as captured:
                     _get_scheme("linear", _make_config(w4a4), SM90)
@@ -157,6 +169,29 @@ class TestFp4SchemeSelection(CustomTestCase):
                 with mock.patch.object(SCHEME_LOGGER, "warning_once") as warn:
                     _get_scheme("linear", _make_config(a16), SM90)
                 warn.assert_not_called()
+
+    def test_marlin_backend_serves_w4a4_weight_only_on_blackwell(self):
+        """FlashInfer mm_fp4 has no marlin backend, so --fp4-gemm-backend marlin
+        must not select the native w4a4 linear on SM100. The MoE follows
+        --moe-runner-backend instead, which the warning has to say."""
+        from sglang.srt.layers.quantization import fp4_utils
+
+        logging.Logger.warning_once.cache_clear()
+        self.addCleanup(logging.Logger.warning_once.cache_clear)
+        with (
+            mock.patch.object(
+                fp4_utils, "FP4_GEMM_RUNNER_BACKEND", Fp4GemmRunnerBackend.MARLIN
+            ),
+            self.assertLogs(SCHEME_LOGGER, level="WARNING") as captured,
+        ):
+            linear = _get_scheme("linear", _make_config("nvfp4"), SM100)
+            moe = _get_scheme("moe", _make_config("nvfp4"), SM100)
+        self.assertIsInstance(linear, CompressedTensorsW4A16Fp4)
+        self.assertTrue(linear.has_input_global_scale)
+        self.assertIsInstance(moe, CompressedTensorsW4A4Nvfp4MoE)
+        output = "\n".join(captured.output)
+        self.assertIn("marlin is weight-only", output)
+        self.assertIn("MoE layers follow --moe-runner-backend", output)
 
     def test_fp4_weights_with_non_nvfp4_activations_raise(self):
         """Mismatched activation quantization must not be served weight-only."""
@@ -166,13 +201,42 @@ class TestFp4SchemeSelection(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "NVFP4"):
             _get_scheme("linear", config, SM90)
 
-    def test_mxfp4_linear_reports_no_compatible_scheme(self):
-        """No MXFP4 linear kernel yet; the error must not name Sparse24."""
+    def test_fused_layout_model_still_bypasses_to_mxfp4_moe_method(self):
+        """The split-expert MXFP4 scheme is reached only through FusedMoE's
+        serves_fused_mxfp4 opt-out: GraniteMoe and Kimi-K3 ship indistinguishable
+        configs, so a model keeping the default must still get Mxfp4MoEMethod."""
+
+        class RealFusedMoE(_FusedMoE):
+            # get_quant_method checks isinstance(layer, FusedMoE); skip the
+            # distributed __init__ and set only the field the gate reads.
+            def __init__(self, serves_fused_mxfp4):
+                torch.nn.Module.__init__(self)
+                self.serves_fused_mxfp4 = serves_fused_mxfp4
+
         for variant in ("mxfp4a16", "mxfp4"):
-            with self.subTest(variant=variant):
-                with self.assertRaises(NotImplementedError) as ctx:
-                    _get_scheme("linear", _make_config(variant), SM90)
-                self.assertNotIn("Sparse24", str(ctx.exception))
+            for serves_fused in (True, False):
+                with self.subTest(variant=variant, serves_fused=serves_fused):
+                    layer = RealFusedMoE(serves_fused)
+                    quant_config = CompressedTensorsConfig.from_config(
+                        _make_config(variant)
+                    )
+                    with (
+                        mock.patch(
+                            "torch.cuda.get_device_capability", return_value=SM90
+                        ),
+                        mock.patch("torch.cuda.is_available", return_value=True),
+                        mock.patch(
+                            "sglang.srt.layers.quantization.mxfp4.Mxfp4MoEMethod"
+                        ) as fused_method,
+                    ):
+                        fused_method.return_value = "fused"
+                        method = quant_config.get_quant_method(layer, prefix=MOE_LAYER)
+                    if serves_fused:
+                        self.assertEqual(method, "fused")
+                    else:
+                        self.assertIsInstance(
+                            layer.scheme, CompressedTensorsW4A16Mxfp4MoE
+                        )
 
 
 def _noop_loader(*args, **kwargs):
@@ -210,9 +274,12 @@ def _moe_layer(scheme, is_gated=True):
 # (name, scheme class, group size, scale dtype, has a weight global scale)
 LINEAR_FORMATS = [
     ("nvfp4", CompressedTensorsW4A16Fp4, 16, torch.float8_e4m3fn, True),
+    # E8M0 scales arrive as raw uint8 exponent bytes; no outer global scale.
+    ("mxfp4", CompressedTensorsW4A16Mxfp4, 32, torch.uint8, False),
 ]
 MOE_FORMATS = [
     ("nvfp4", CompressedTensorsW4A16Nvfp4MoE, 16, torch.float8_e4m3fn, True),
+    ("mxfp4", CompressedTensorsW4A16Mxfp4MoE, 32, torch.uint8, False),
 ]
 
 
@@ -241,6 +308,9 @@ class TestWeightOnlyFp4WeightCreation(CustomTestCase):
         )
         layer = _linear_layer(CompressedTensorsW4A16Fp4(has_input_global_scale=True))
         self.assertEqual(layer.input_global_scale.shape, (1,))
+        # MXFP4 folds its outer scale into the E8M0 group scales.
+        layer = _linear_layer(CompressedTensorsW4A16Mxfp4(has_input_activations=True))
+        self.assertFalse(hasattr(layer, "input_global_scale"))
 
     def test_mismatched_fused_global_scales_are_rejected(self):
         """Both kernels take one global scale per layer, so fused projections

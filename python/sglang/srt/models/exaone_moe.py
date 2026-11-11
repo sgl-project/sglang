@@ -26,7 +26,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -54,6 +53,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -62,7 +63,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_pp_layers
+from sglang.srt.utils import LazyValue, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +183,10 @@ class ExaoneMoESparseMoEBlock(nn.Module):
             apply_routed_scaling_factor_on_output=True,
             scoring_func="sigmoid",
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         if config.num_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.num_shared_experts
@@ -224,10 +229,6 @@ class ExaoneMoESparseMoEBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -694,46 +695,6 @@ class ExaoneMoEForCausalLM(nn.Module):
             )
         else:
             return hidden_states
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-        input_embeds: torch.Tensor = None,
-    ):
-        start, end = split_interval
-        # embed
-        if start == 0:
-            residual_batch.start(forward_batch)
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-        # decoder layer
-        for i in range(start, end):
-            layer = self.model.layers[i]
-            forward_batch.hidden_states = layer(
-                positions,
-                forward_batch.hidden_states,
-                forward_batch,
-            )
-
-        if end == self.model.config.num_hidden_layers:
-            # norm
-            forward_batch.hidden_states = residual_batch.final_norm(
-                forward_batch.hidden_states, forward_batch, self.model.norm
-            )
-            # logits process
-            result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            result = None
-
-        return result
 
     @property
     def start_layer(self):
