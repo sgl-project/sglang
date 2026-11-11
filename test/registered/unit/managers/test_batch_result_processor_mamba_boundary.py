@@ -15,6 +15,10 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocation import alloc_tracking_slots
 from sglang.srt.mem_cache.kv.advance import advance_tracking
@@ -97,6 +101,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         output_streamer=MagicMock(),
         abort_request=lambda *args, **kwargs: None,
         still_in_batch=lambda req: True,
+        prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
     )
 
 
@@ -290,7 +295,7 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
         batch.token_to_kv_pool_allocator = SimpleNamespace(
             storage=storage,
             state=SimpleNamespace(
-                slots=SimpleNamespace(schedulable_available_size=lambda: int(took))
+                slots=SimpleNamespace(slots_fit=lambda count: count <= int(took))
             ),
         )
         return req, batch
@@ -347,9 +352,7 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
                 allocator.storage.take_tracking_slot = lambda req, position: bool(
                     free_slots and free_slots.pop()
                 )
-                allocator.state.slots.schedulable_available_size = lambda: len(
-                    free_slots
-                )
+                allocator.state.slots.slots_fit = lambda count: count <= len(free_slots)
                 batch.tree_cache = SimpleNamespace(
                     page_size=TRACK_INTERVAL,
                     supports_mamba=lambda: True,
@@ -417,7 +420,7 @@ class TestTrackingSlotsAskTheWholeDemand(unittest.TestCase):
             take_tracking_slot=lambda req, pos: bool(free_slots and free_slots.pop())
         )
         state = SimpleNamespace(
-            slots=SimpleNamespace(schedulable_available_size=lambda: len(free_slots))
+            slots=SimpleNamespace(slots_fit=lambda count: count <= len(free_slots))
         )
         candidates = [(object(), i) for i in range(4)]
         taken = alloc_tracking_slots(storage, state, candidates, cache)
