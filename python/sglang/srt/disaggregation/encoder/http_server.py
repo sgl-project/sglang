@@ -40,6 +40,7 @@ from sglang.srt.disaggregation.encoder.server import (
     MMEncoder,
     MMError,
 )
+from sglang.srt.entrypoints.server_utils import add_prometheus_middleware
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -56,10 +57,7 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    add_prometheus_middleware,
-    configure_logger,
-)
+from sglang.srt.utils import configure_logger
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)

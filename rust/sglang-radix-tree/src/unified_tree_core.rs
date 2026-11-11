@@ -393,33 +393,15 @@ impl PoolHitPolicy {
     }
 }
 
-/// Well-known pool names used as PoolTransfer identifiers.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
+/// Pool names used as PoolTransfer identifiers. The tree core reads only the
+/// named variants; any other python PoolName passes through as `Other`.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub enum PoolName {
     #[default]
     Kv,
     Mamba,
     Swa,
-    AuxiliarySwa,
-    Indexer,
-    DeepseekV4C4,
-    DeepseekV4C4Indexer,
-    DeepseekV4C4IndexerScale,
-    DeepseekV4C128,
-    DeepseekV4C1,
-    DeepseekV4C1Indexer,
-    DeepseekV4C1IndexerScale,
-    DeepseekV4C2,
-    DeepseekV4C2Indexer,
-    DeepseekV4C2IndexerScale,
-    DeepseekV4C4Rope,
-    DeepseekV4C128Rope,
-    DeepseekV4C4State,
-    DeepseekV4C4IndexerState,
-    DeepseekV4C128State,
-    Draft,
-    DraftIndexer,
-    DraftSwa,
+    Other(Box<str>),
 }
 
 /// Result of a HiCache pool transfer.
