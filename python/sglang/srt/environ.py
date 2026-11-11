@@ -307,6 +307,8 @@ class Envs:
     SGLANG_OPT_CUDA_GRAPH_FIELD_COPY_PLAN = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # With the master: post-verify graph sets kept before eager (64 without it).
+    SGLANG_POST_VERIFY_MAX_GRAPH_KEYS = EnvInt(64)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

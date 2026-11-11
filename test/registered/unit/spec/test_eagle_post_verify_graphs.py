@@ -276,6 +276,23 @@ class TestPostVerifyGraphs(CustomTestCase):
                 self.assertIsNone(worker._post_verify_graphs)
                 self.assertIsNone(worker._simulated_acc_len_rng)
 
+    def test_graph_key_bound_is_raised_only_under_the_runtime_master(self):
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        keys = envs.SGLANG_POST_VERIFY_MAX_GRAPH_KEYS
+        for master_on, value, expected in (
+            (False, "512", 64),
+            (True, None, 64),
+            (True, "512", 512),
+        ):
+            with (
+                self.subTest(master=master_on, value=value),
+                master.override(master_on),
+            ):
+                with keys.override(value) if value else nullcontext():
+                    self.assertEqual(
+                        eagle_post_verify_graphs._max_graph_keys(), expected
+                    )
+
     def test_a_kv_pool_that_clears_c128_draft_states_keeps_the_eager_verify(self):
         """The post-verify graphs skip the eager verify's cleanup of rejected c128
         draft states (DeepSeek-V4), so a KV pool that has one never reaches them;
