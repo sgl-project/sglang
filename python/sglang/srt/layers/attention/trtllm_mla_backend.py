@@ -50,6 +50,7 @@ from sglang.kernels.ops.attention.utils import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_dcp import dcp_trtllm_sparse_attention
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
@@ -1475,9 +1476,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Row p attends [p - sliding_window_size, p] via trtllm-gen sparse MLA;
         under DCP returns the rank-local (out, lse) for the caller's merge."""
-        from sglang.srt.layers.attention.dsa.dsa_dcp import (
-            dcp_trtllm_sparse_attention,
-        )
+        # Import cycle: forward_mla -> dsa_backend -> trtllm_mla_backend.
         from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
             is_mla_dcp_lse_base_on_e,
         )

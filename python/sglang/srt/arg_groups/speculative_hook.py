@@ -5,7 +5,10 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
+from sglang.srt.arg_groups.choices import (
+    DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+    DRAFT_ATTENTION_BACKEND_CHOICES,
+)
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     dspark_dp_a2a_backends,
@@ -911,6 +914,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
 
 
 def _load_draft_hf_config(cfg):
+    # Deferred: hf_transformers adds ~0.8 s to the server_args import.
     from sglang.srt.hf_transformers import get_config
 
     return get_config(
@@ -956,10 +960,8 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     Consumed by ModelRunner's `is_draft_worker` override (one backend for all
     draft modes).
     """
+    # Deferred: dflash_utils adds ~1.6 s to the server_args import.
     from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
-    from sglang.srt.speculative.draft_worker_common import (
-        DFLASH_MLA_ONLY_DRAFT_BACKENDS,
-    )
 
     cfg = resolving_view(server_args)
 
@@ -1078,12 +1080,10 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
 
 
 def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
+    # Deferred: dflash_utils adds ~1.6 s to the server_args import.
     from sglang.srt.speculative.dflash_utils import (
         get_dflash_layer_types,
         is_dflash_mla_draft_config,
-    )
-    from sglang.srt.speculative.draft_worker_common import (
-        DFLASH_MLA_ONLY_DRAFT_BACKENDS,
     )
 
     cfg = resolving_view(server_args)
