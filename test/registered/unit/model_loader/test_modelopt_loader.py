@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4A16LinearMethod,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     ModelOptModelLoader,
@@ -512,6 +513,46 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
                     "packed_modules_mapping": {},
                 }
             )
+
+    def test_unsupported_layer_algo_is_rejected(self):
+        # A layer whose quant_algo has no SGLang method must not be built
+        # unquantized: its stored FP8 codes would be read as plain values.
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.self_attn.o_proj": {
+                        "quant_algo": "FP8_PER_CHANNEL_PER_TOKEN"
+                    },
+                    "model.layers.1.mlp.experts": {
+                        "quant_algo": "FP8_PER_CHANNEL_PER_TOKEN"
+                    },
+                    "model.layers.0.mlp.down_proj": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    },
+                },
+                "packed_modules_mapping": {},
+            }
+        )
+        # Type dispatch only needs layer instances; skip GPU weight setup.
+        linear = ReplicatedLinear.__new__(ReplicatedLinear)
+        moe = FusedMoE.__new__(FusedMoE)
+        with self.assertRaisesRegex(ValueError, "FP8_PER_CHANNEL_PER_TOKEN"):
+            quant_config.get_quant_method(linear, "model.layers.0.self_attn.o_proj")
+        with self.assertRaisesRegex(ValueError, "FP8_PER_CHANNEL_PER_TOKEN"):
+            quant_config.get_quant_method(moe, "model.layers.1.mlp.experts")
+
+        # Supported layers, and layers the checkpoint does not list, are built
+        # as before.
+        self.assertIsInstance(
+            quant_config.get_quant_method(linear, "model.layers.0.mlp.down_proj"),
+            ModelOptFp4LinearMethod,
+        )
+        self.assertIsInstance(
+            quant_config.get_quant_method(linear, "model.layers.0.self_attn.q_proj"),
+            UnquantizedLinearMethod,
+        )
 
     def test_incomplete_inline_config_falls_back_to_hf_quant_config_file(self):
         packed_modules_mapping = {

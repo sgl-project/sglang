@@ -803,6 +803,15 @@ class ModelOptNvFp4EmbeddingMethod(QuantizeMethodBase):
 _BLOCK_FP8_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
 
 
+def _unsupported_layer_algo(prefix: str, quant_algo: str) -> ValueError:
+    # Building such a layer unquantized would load its quantized weights as
+    # plain values and skip their scales.
+    return ValueError(
+        f"MIXED_PRECISION layer {prefix!r} uses quant_algo {quant_algo!r}, "
+        "which SGLang does not support for this layer type."
+    )
+
+
 class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     """Configuration for ModelOpt MIXED_PRECISION checkpoints."""
 
@@ -1070,6 +1079,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4A16LinearMethod(self.nvfp4a16_config)
+            if quant_algo is not None:
+                raise _unsupported_layer_algo(prefix, quant_algo)
             return UnquantizedLinearMethod()
 
         # Must stay after the ParallelLMHead branch: ParallelLMHead subclasses
@@ -1099,6 +1110,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4a16_config)
+            if quant_algo is not None:
+                raise _unsupported_layer_algo(prefix, quant_algo)
             return None
 
         return None
