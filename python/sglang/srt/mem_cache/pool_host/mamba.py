@@ -40,6 +40,7 @@ if _is_cuda or _is_hip:
     from sglang.kernels.ops.mamba.transfer_mamba import (
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
+        warm_up_mamba_split_kernels,
     )
 elif _is_xpu:
     from sglang.srt.mem_cache.pool_host._kvcacheio import (
@@ -240,8 +241,21 @@ class MambaPoolHost(HostKVCache):
         self.kv_buffer = self.init_kv_buffer()
         self._configure_npu_mamba_io()
         self._init_write_back_staging_buffers()
+        self._warm_up_split_copies()
         self.lock = threading.RLock()
         self.clear()
+
+    def _warm_up_split_copies(self) -> None:
+        if not _is_cuda or self.layout != "page_first":
+            return
+        load_quota, backup_quota = warm_up_mamba_split_kernels()
+        if load_quota is not None or backup_quota is not None:
+            logger.info(
+                "HiCache Mamba split kernels built: load quota=%s, backup quota=%s "
+                "(None: stock kernel)",
+                load_quota,
+                backup_quota,
+            )
 
     def _configure_npu_mamba_io(self) -> None:
         mode = _npu_hicache_mamba_io_mode()

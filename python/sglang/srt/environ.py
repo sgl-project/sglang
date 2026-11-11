@@ -1098,6 +1098,11 @@ class Envs:
     # With SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION: CTA quota of the HiCache per-layer
     # KV load (layer_first / page_first JIT kernel); None keeps the stock quota.
     SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(None)
+    # With the master: CTA quotas of the HiCache Mamba state copies of a page_first host
+    # pool (load / backup). Set, each state item is split over up to that many CTAs
+    # (transfer_mamba_split.cuh, same bytes); None keeps the stock kernel.
+    SGLANG_HICACHE_MAMBA_LOAD_BLOCK_QUOTA = EnvInt(None)
+    SGLANG_HICACHE_MAMBA_BACKUP_BLOCK_QUOTA = EnvInt(None)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
