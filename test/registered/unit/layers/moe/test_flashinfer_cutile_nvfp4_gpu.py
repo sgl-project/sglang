@@ -262,6 +262,27 @@ class TestFlashInferCutileNvfp4GPU(CustomTestCase):
         output_bytes = (bound + 1) * HIDDEN * 2
         self.assertLess(peaks[bound + 1], peaks[bound] + 3 * output_bytes)
 
+    def test_padded_rows_contribute_nothing(self):
+        """CUDA-graph padding rows carry expert id -1: they must not read out of
+        range or change the real rows."""
+        x, ids, w = self._inputs(64)
+        real = self._run(x[:48].contiguous(), ids[:48], w[:48]).clone()
+        padded_ids = ids.clone()
+        padded_ids[48:] = -1
+        out = self._run(x, padded_ids, w)
+        self.assertTrue(bool(torch.isfinite(out[:48]).all()))
+        # A different batch can pick another tactic, so compare within tolerance.
+        self.assertLess(_rel(out[:48], real.float()), 1e-2)
+        self.assertTrue(bool((out[48:] == 0).all()))
+        # One unrouted slot in a real row drops only that expert's term.
+        partial_ids, partial_w = ids.clone(), w.clone()
+        partial_ids[:, -1] = -1
+        partial_w[:, -1] = 0.0
+        ref_ids = ids.clone()
+        ref_ids[:, -1] = 0
+        expected = self._run(x, ref_ids, partial_w)
+        self.assertTrue(_same_bits(self._run(x, partial_ids, w), expected))
+
     def test_routed_scaling_factor_is_applied_once(self):
         x, ids, w = self._inputs(64)
         base = self._run(x, ids, w).float()

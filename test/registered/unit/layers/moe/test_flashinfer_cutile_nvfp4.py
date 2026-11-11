@@ -312,6 +312,24 @@ class TestForwardContract(CustomTestCase):
         scaled = self._run(dispatch, routed_scaling_factor=2.0)
         self.assertTrue(torch.equal(scaled, (expected.float() * 2.0).bfloat16()))
 
+    def test_padded_slots_reach_the_kernel_as_no_ops(self):
+        """CUDA-graph padding rows arrive with expert id -1; the kernel must see an
+        in-range id with zero weight, never the -1."""
+        dispatch = self._dispatch(num_tokens=4)
+        ids = dispatch.topk_output.topk_ids.clone()
+        ids[2:] = -1  # padded rows
+        ids[0, 1] = -1  # one unrouted slot in a real row
+        dispatch = dispatch._replace(
+            topk_output=dispatch.topk_output._replace(topk_ids=ids)
+        )
+        topk = dispatch.topk_output
+        valid = topk.topk_ids >= 0
+        scale = torch.where(valid, topk.topk_ids.float() * topk.topk_weights, 0.0)
+        expected = (dispatch.hidden_states.float() * scale.sum(1, keepdim=True)).to(
+            torch.bfloat16
+        )
+        self.assertTrue(torch.equal(self._run(dispatch), expected))
+
     def test_zero_tokens_skip_the_kernel(self):
         output = self._run(self._dispatch(num_tokens=0))
         self.assertEqual(tuple(output.shape), (0, 16))

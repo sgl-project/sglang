@@ -344,6 +344,18 @@ def _run_cutile_nvfp4(
     )
 
 
+def _drop_unrouted_slots(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # TopK writes expert id -1 into CUDA-graph padding rows (num_token_non_padded),
+    # and the cuTile kernel defines no behaviour for negative ids. Route those
+    # slots to expert 0 with weight 0, on device, so capture needs no host sync.
+    valid = topk_ids >= 0
+    ids = torch.where(valid, topk_ids, 0).to(torch.int32).contiguous()
+    weights = torch.where(valid, topk_weights, 0).to(torch.float32).contiguous()
+    return ids, weights
+
+
 @register_fused_func("none", "flashinfer_cutile")
 def fused_experts_none_to_flashinfer_cutile(
     dispatch_output: StandardDispatchOutput,
@@ -370,11 +382,14 @@ def fused_experts_none_to_flashinfer_cutile(
     if hidden_states.shape[0] == 0:
         return StandardCombineInput(hidden_states=hidden_states.clone())
 
+    topk_ids, topk_weights = _drop_unrouted_slots(
+        topk_output.topk_ids, topk_output.topk_weights
+    )
     output = _run_cutile_nvfp4(
         quant_info=quant_info,
         hidden_states=hidden_states.contiguous(),
-        topk_ids=topk_output.topk_ids.to(torch.int32).contiguous(),
-        topk_weights=topk_output.topk_weights.to(torch.float32).contiguous(),
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
     )
     # The kernel applies the router weights but no routed scaling factor.
     scaling = runner_config.routed_scaling_factor
