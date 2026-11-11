@@ -15,6 +15,7 @@ from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_list import (  # noqa: E402
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -162,7 +163,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s = self._scheduler(DisaggregationMode.DECODE)
         # is_fully_idle skips held requests, so it still reports idle.
         held = IndexedReqList(ListKind.PD_HELD)
-        held.join([MagicMock()])
+        move([MagicMock(owner_list=None)], held)
         s.request_lists.return_value = {ListKind.PD_HELD: held}
         out = Scheduler.handle_pd_role_switch(
             s, PdRoleSwitchReqInput(new_role="prefill")
@@ -643,6 +644,7 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
 
 def _radix_scheduler(disable_radix_cache):
     s = MagicMock()
+    s.request_lists.return_value = {}
     s.disable_radix_cache = disable_radix_cache
     tree = MagicMock()
     del tree.clear_storage_backend  # plain RadixCache has none
