@@ -4006,10 +4006,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             outcome = "drained" if drained else "timeout"
             try:
                 self._do_release(decode_req, idx)
-            except Exception:
+            except Exception as error:
                 # Isolate a failed release so the rest still run.
-                logger.exception(f"Deferred KV release failed for room {room}")
-                self.scheduler.request_retirer.abandon(decode_req.req)
+                self.scheduler.request_retirer.abandon(decode_req.req, error)
                 outcome = "error"
             self._observe_deferred_kv_release(
                 duration_seconds=max(0.0, now - start_time),

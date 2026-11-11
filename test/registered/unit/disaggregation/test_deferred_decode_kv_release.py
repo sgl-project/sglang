@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreResult
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_components import request_retirer as retirer_mod
 from sglang.srt.managers.scheduler_components.request_list import (
@@ -714,6 +715,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             release(req, checkpoint=checkpoint)
 
         with (
+            envs.SGLANG_IS_IN_CI.override(False),
             patch.object(decode_mod.time, "monotonic", return_value=40.0),
             patch.object(
                 q.scheduler.request_retirer, "release", side_effect=fake_release

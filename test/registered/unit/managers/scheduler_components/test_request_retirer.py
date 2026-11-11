@@ -144,28 +144,40 @@ class TestTakeOutWithoutRelease(CustomTestCase):
     def setUp(self):
         super().setUp()
         enter_scope(self, envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True))
+        enter_scope(self, envs.SGLANG_IS_IN_CI.override(False))
         self.retirer = release_only_retirer()
 
     def test_abandon_takes_a_listed_request_out_as_its_exit(self):
-        req = FakeReq(rid="r")
+        req = FakeReq(rid="r", bootstrap_room=7)
         queue = IndexedReqList(ListKind.PD_RELEASING)
         move([req], queue)
 
-        self.retirer.abandon(req)
+        self.retirer.abandon(req, RuntimeError("release failed"))
 
         self.assertEqual(list(queue), [])
         self.assertIsNone(req.owner_list)
         self.assertEqual(req.exit_via, "abandon")
 
     def test_abandon_after_the_release_took_it_out_does_nothing(self):
-        req = FakeReq(rid="r", exit_via="release")
+        req = FakeReq(rid="r", bootstrap_room=7, exit_via="release")
 
-        self.retirer.abandon(req)
+        self.retirer.abandon(req, RuntimeError("release failed"))
 
         self.assertEqual(req.exit_via, "release")
 
+    def test_abandon_raises_in_ci(self):
+        req = FakeReq(rid="r", bootstrap_room=7)
+        queue = IndexedReqList(ListKind.PD_RELEASING)
+        move([req], queue)
+
+        with (
+            envs.SGLANG_IS_IN_CI.override(True),
+            self.assertRaisesRegex(RuntimeError, "release failed"),
+        ):
+            self.retirer.abandon(req, RuntimeError("release failed"))
+
     def test_settle_output_takes_a_released_request_out_without_an_exit(self):
-        req = FakeReq(rid="r", exit_via="release")
+        req = FakeReq(rid="r", bootstrap_room=7, exit_via="release")
         deferred = IndexedReqList(ListKind.DEFERRED)
         move([req], deferred)
 
