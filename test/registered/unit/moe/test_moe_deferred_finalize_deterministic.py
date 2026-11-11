@@ -101,6 +101,7 @@ class TestMoeDeferredFinalizeDeterministic(CustomTestCase):
             enable_deterministic_inference=True,
             debug_cuda_graph=False,
             enable_deepseek_v4_fp4_indexer=False,
+            enable_fp4_indexer=False,
         )
         with (
             envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.override(True),
