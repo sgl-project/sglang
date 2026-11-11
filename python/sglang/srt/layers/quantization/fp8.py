@@ -3125,11 +3125,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         elif (
             _is_xpu
             and moe_runner_backend.is_intel_xpu()
-            and not self.is_fp4_expert
+            and not getattr(self, "is_fp4_expert", False)
             and not can_use_xpu_fp8_moe(
                 moe_runner_config,
-                self.weight_block_size,
-                use_mxfp8=self.use_mxfp8,
+                getattr(self, "weight_block_size", None),
+                use_mxfp8=getattr(self, "use_mxfp8", False),
             )
         ):
             moe_runner_backend = MoeRunnerBackend.TRITON
@@ -3265,11 +3265,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             _is_xpu
             and not get_moe_runner_backend().is_triton()
             and (
-                self.is_fp4_expert
+                getattr(self, "is_fp4_expert", False)
                 or can_use_xpu_fp8_moe(
                     moe_runner_config,
-                    self.weight_block_size,
-                    use_mxfp8=self.use_mxfp8,
+                    getattr(self, "weight_block_size", None),
+                    use_mxfp8=getattr(self, "use_mxfp8", False),
                 )
             )
         ):
@@ -3283,7 +3283,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert layer.w13_weight.dtype == layer.w2_weight.dtype
             use_fp8_w8a8 = layer.w13_weight.dtype == torch.float8_e4m3fn
             use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8
-            assert self.is_fp4_expert == use_mxfp4_w4a16
+            assert getattr(self, "is_fp4_expert", False) == use_mxfp4_w4a16
             output = fused_experts(
                 x,
                 layer.w13_weight,
@@ -3296,17 +3296,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8_w8a8=use_fp8_w8a8,
                 w1_scale=(
                     layer.w13_weight_scale_inv
-                    if self.block_quant
+                    if getattr(self, "block_quant", False)
                     else layer.w13_weight_scale
                 ),
                 w2_scale=(
                     layer.w2_weight_scale_inv
-                    if self.block_quant
+                    if getattr(self, "block_quant", False)
                     else layer.w2_weight_scale
                 ),
                 block_shape=(
-                    self.weight_block_size
-                    if self.block_quant and use_fp8_w8a8 and not self.use_mxfp8
+                    getattr(self, "weight_block_size", None)
+                    if getattr(self, "block_quant", False)
+                    and use_fp8_w8a8
+                    and not getattr(self, "use_mxfp8", False)
                     else None
                 ),
                 # XPU "gelu" uses the tanh approximation.
