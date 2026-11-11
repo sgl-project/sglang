@@ -5,7 +5,10 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
+from sglang.srt.arg_groups.choices import (
+    DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+    DRAFT_ATTENTION_BACKEND_CHOICES,
+)
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     dspark_dp_a2a_backends,
@@ -441,7 +444,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
 
     _resolve_dflash_draft_attention_backend(server_args)
-    _resolve_dflash_mla_draft_window(server_args)
+    _reject_dflash_sliding_mla_draft_window(server_args)
     _resolve_dflash_draft_kv_ring(server_args)
 
     if cfg.max_running_requests is None:
@@ -912,6 +915,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
 
 
 def _load_draft_hf_config(cfg):
+    # Deferred: hf_transformers adds ~0.8 s to the server_args import.
     from sglang.srt.hf_transformers import get_config
 
     return get_config(
@@ -957,10 +961,8 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     Consumed by ModelRunner's `is_draft_worker` override (one backend for all
     draft modes).
     """
+    # Deferred: dflash_utils adds ~1.6 s to the server_args import.
     from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
-    from sglang.srt.speculative.draft_worker_common import (
-        DFLASH_MLA_ONLY_DRAFT_BACKENDS,
-    )
 
     cfg = resolving_view(server_args)
 
@@ -1078,43 +1080,29 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     )
 
 
-def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
-    """Drop or reject ``--speculative-draft-window-size`` on the MLA-only draft
-    backends. Runs after the draft backend is final."""
+def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
+    # Deferred: dflash_utils adds ~1.6 s to the server_args import.
     from sglang.srt.speculative.dflash_utils import (
+        get_dflash_layer_types,
         is_dflash_mla_draft_config,
-        resolve_mla_draft_compact_window,
-    )
-    from sglang.srt.speculative.draft_worker_common import (
-        DFLASH_MLA_ONLY_DRAFT_BACKENDS,
     )
 
     cfg = resolving_view(server_args)
-    window_size = cfg.speculative_draft_window_size
-    if window_size is None:
-        return
-    if cfg.speculative_draft_attention_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+    draft_backend = cfg.speculative_draft_attention_backend
+    if (
+        cfg.speculative_draft_window_size is None
+        or draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS
+    ):
         return
     draft_hf_config = _load_draft_hf_config(cfg)
     if not is_dflash_mla_draft_config(draft_hf_config):
         return
-    kept = resolve_mla_draft_compact_window(
-        draft_hf_config,
-        window_size=int(window_size),
-        dcp_size=cfg.dcp_size,
-    )
-    if kept is None:
-        logger.warning(
-            "DFLASH: --speculative-draft-window-size %d is dropped on %s: every "
-            "draft layer is sliding_attention and the backend applies that window "
-            "itself over the full request table.",
-            int(window_size),
-            cfg.speculative_draft_attention_backend,
-        )
-        declare_resolution(
-            server_args,
-            "_resolve_dflash_mla_draft_window",
-            speculative_draft_window_size=None,
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    if layer_types and all(t == "sliding_attention" for t in layer_types):
+        raise ValueError(
+            "--speculative-draft-window-size is not supported for a sliding-window "
+            f"MLA draft on {draft_backend}: the backend applies the draft's own "
+            "window."
         )
 
 

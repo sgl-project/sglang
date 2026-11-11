@@ -50,6 +50,7 @@ from sglang.kernels.ops.attention.utils import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_dcp import dcp_trtllm_sparse_attention
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
@@ -306,11 +307,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self._window_index_cache = None
         self._window_counter_buffer = None
         self._window_row_indptr = None
-
-        # Without DCP the window path drops the LSE and every row owns a key.
-        self._swa_need_lse = get_parallel().dcp_enabled or not (
-            envs.SGLANG_OPT_DFLASH_SWA_SKIP_LSE.get()
-        )
         if model_runner.sliding_window_size is not None and (
             model_runner.sliding_window_size >= 0
         ):
@@ -1491,9 +1487,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Row p attends [p - sliding_window_size, p] via trtllm-gen sparse MLA;
         under DCP returns the rank-local (out, lse) for the caller's merge."""
-        from sglang.srt.layers.attention.dsa.dsa_dcp import (
-            dcp_trtllm_sparse_attention,
-        )
+        # Import cycle: forward_mla -> dsa_backend -> trtllm_mla_backend.
         from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
             is_mla_dcp_lse_base_on_e,
         )
@@ -1530,7 +1524,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             multi_ctas_kv_counter_buffer=self._window_counter_buffer,
-            need_lse=self._swa_need_lse,
         )
         out = out.view(rows, kernel_heads, -1)[:, :heads]
         if not get_parallel().dcp_enabled:

@@ -1772,8 +1772,6 @@ class Envs:
     # window + verify-block rows instead of one row per target slot. On by default;
     # resolved at startup to off for drafts or backends it does not fit.
     SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(True)
-    # Skip the SWA draft's LSE and zero-KV fixup when DCP is off.
-    SGLANG_OPT_DFLASH_SWA_SKIP_LSE = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
