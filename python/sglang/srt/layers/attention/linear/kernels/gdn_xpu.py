@@ -88,7 +88,7 @@ class XpuGDNKernel(TritonGDNKernel):
             dt_bias,
             ssm_states,
             query_start_loc,
-            cache_indices,
+            cache_indices.clamp(min=0),
             num_prefills=0,
             num_decodes=cache_indices.numel(),
         )

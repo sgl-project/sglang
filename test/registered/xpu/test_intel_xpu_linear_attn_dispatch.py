@@ -262,6 +262,32 @@ class TestIntelXpuGDNDispatch(CustomTestCase):
         sycl.assert_called_once()
         triton.assert_not_called()
 
+    def test_decode_clamps_padded_state_indices(self):
+        kernel = XpuGDNKernel()
+        x = torch.zeros(1, 3, 1, 2)
+        indices = torch.tensor([2, -1, -1], dtype=torch.int32)
+        states = torch.arange(5, dtype=torch.float32)
+
+        def update(*args, **kwargs):
+            for index in args[10]:
+                states[index] += 10
+
+        with patch.object(gdn_xpu, "gated_delta_rule", side_effect=update):
+            kernel.decode(
+                x,
+                x,
+                x,
+                x,
+                x,
+                A_log=sentinel.A_log,
+                dt_bias=sentinel.dt_bias,
+                ssm_states=states,
+                cache_indices=indices,
+                query_start_loc=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+            )
+        self.assertEqual(indices.tolist(), [2, -1, -1])
+        self.assertEqual(states.tolist(), [20, 1, 12, 3, 4])
+
     def test_target_verify_clamps_padded_seed_indices(self):
         kernel = XpuGDNKernel()
         x = torch.zeros(1, 3, 1, 2)
