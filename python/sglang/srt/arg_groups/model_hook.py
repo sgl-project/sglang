@@ -560,11 +560,6 @@ def handle_model_specific_adjustments(server_args: Any):
                 f"- Decode: {decode_attn_backend}\n"
             )
 
-        if resolved_view(server_args).moe_runner_backend == "triton_kernel":
-            assert resolved_view(server_args).ep_size == 1, (
-                "Triton kernel MoE is only supported when ep_size == 1"
-            )
-
     elif model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
         if model_arch == "MiMoV2ForCausalLM" and not cfg.encoder_only:
             expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(hf_config)

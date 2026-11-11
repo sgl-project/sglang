@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import fields, replace
+from dataclasses import replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional
 
@@ -227,70 +227,6 @@ if _is_hip:
         dynamic_mxfp4_quant = e8m0_shuffle = err
 
 
-def _pad_hopper_mxfp4_scale(scale, k_size):
-    # triton_kernels' HOPPER_SCALE branch (matmul_details/_matmul.py) loads the w
-    # scales unmasked over cdiv(k_size, 128) tiles; drop when that load is masked.
-    mxfp4_block = 32
-    want = round_up(k_size, 128) // mxfp4_block
-    if scale.shape[-1] >= want:
-        return scale
-    return torch.nn.functional.pad(scale, (0, want - scale.shape[-1]), value=_UE8M0_ONE)
-
-
-@lru_cache(maxsize=1)
-def _mx_block_kwargs():
-    # triton_kernels 3.8 rejects an mx scale without its block size; the field is
-    # absent in 3.7, which ROCm still ships, so probe before importing the value.
-    from triton_kernels.matmul import PrecisionConfig
-
-    if "b_microblock_size" not in {f.name for f in fields(PrecisionConfig)}:
-        return {}
-
-    from triton_kernels.numerics_details.mxfp import MXFP_BLOCK_SIZE
-
-    return {"b_microblock_size": int(MXFP_BLOCK_SIZE)}
-
-
-def _swizzle_mxfp4(quant_tensor, scale, num_warps):
-    """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
-    import triton_kernels.matmul_details.opt_flags as opt_flags
-    from triton_kernels.numerics import InFlexData
-    from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
-    from triton_kernels.tensor_details import layout
-
-    value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
-    value_layout_opts = {}
-    scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
-        mx_axis=-2, num_warps=num_warps
-    )
-    scale_layout_opts = {}
-    if get_platform().is_sm100:
-        constraints = {
-            "is_persistent": True,
-            "epilogue_subtile": 1,
-        }
-        opt_flags.update_opt_flags_constraints(constraints)
-    elif get_platform().is_sm90:
-        constraints = {
-            "split_k": 1,
-        }
-        opt_flags.update_opt_flags_constraints(constraints)
-        k_size = quant_tensor.shape[-1] * 2  # packed e2m1: 2 fp4 values per byte
-        scale = _pad_hopper_mxfp4_scale(scale=scale, k_size=k_size)
-    elif get_platform().is_cuda and get_platform().device_capability < (9, 0):
-        # No scale layout carries the warp count below Hopper, and the tile
-        # formula gives the batch-1 decode tile a single warp.
-        opt_flags.update_opt_flags_constraints({"num_warps": num_warps})
-    # transpose the tensor so that the quantization axis is on dim1
-    quant_tensor = quant_tensor.transpose(-2, -1)
-    scale = scale.transpose(-2, -1)
-    quant_tensor = convert_layout(
-        wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout, **value_layout_opts
-    )
-    scale = convert_layout(wrap_torch_tensor(scale), scale_layout, **scale_layout_opts)
-    return quant_tensor, InFlexData(), scale
-
-
 def _dequant_mxfp4_fake(
     x: torch.Tensor, scale: torch.Tensor, float_dtype: torch.dtype
 ) -> torch.Tensor:
@@ -403,7 +339,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.prefix = prefix
         self.topk_indices_dtype = None
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
@@ -448,7 +383,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         "moe_runner_backend=flashinfer_mxfp4 on SM90 requires the "
                         "interleave_moe_{weights,scales}_for_sm90_mixed_gemm helpers "
                         "from FlashInfer PR #3084 (>= 0.6.11). Upgrade flashinfer-python "
-                        "or pick a different backend (e.g. marlin / triton_kernel)."
+                        "or pick a different backend (e.g. marlin)."
                     )
                 self._use_sm90_humming = self.flashinfer_mxfp4_moe_precision == "fp8"
                 self._fi_kernel = "cutlass_sm90"
@@ -1072,37 +1007,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             return
 
-        if self.use_triton_kernels:
-            from triton_kernels.matmul import FlexCtx, PrecisionConfig
-
-            w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
-            w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
-
-            layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
-            layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
-
-            num_warps = 8
-
-            w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
-                layer.w13_weight, layer.w13_weight_scale, num_warps
-            )
-            w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
-                layer.w2_weight, layer.w2_weight_scale, num_warps
-            )
-
-            mx_block = _mx_block_kwargs()
-            self.w13_precision_config = PrecisionConfig(
-                b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex), **mx_block
-            )
-            self.w2_precision_config = PrecisionConfig(
-                b_mx_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex), **mx_block
-            )
-
-            self.w13_weight_triton_tensor = w13_weight
-            self.w2_weight_triton_tensor = w2_weight
-            del layer.w13_weight
-            del layer.w2_weight
-        elif _is_cpu and _is_cpu_amx_available:
+        if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             if use_intel_amx_backend(layer):
                 packed_w13_weight_scale = torch.ops.sgl_kernel.convert_scale_packed(
@@ -1470,11 +1375,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if moe_runner_backend.is_auto():
-            # Must match apply() priority: aiter before use_triton_kernels.
+            # Must match apply() priority: aiter first.
             if self.use_aiter_moe:
                 moe_runner_backend = MoeRunnerBackend.AITER
-            elif self.use_triton_kernels:
-                moe_runner_backend = MoeRunnerBackend.TRITON_KERNELS
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
@@ -1487,8 +1390,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 aiter_config = replace(aiter_config, activation="swiglu")
             self.runner = MoeRunner(moe_runner_backend, aiter_config)
         elif (
-            moe_runner_backend.is_triton_kernels()
-            or moe_runner_backend.is_triton()
+            moe_runner_backend.is_triton()
             or moe_runner_backend.is_marlin()
             or moe_runner_backend.is_deep_gemm()
         ):
@@ -1741,38 +1643,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.use_aiter_moe:
             return self._apply_aiter(layer, dispatch_output)
 
-        backend = self.runner.runner_backend
-        if backend.is_triton_kernels():
-            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
-                TritonKernelsQuantInfo,
-            )
-
-            assert layer.moe_ep_size == 1, (
-                "Expert parallel is not supported when using triton kernels"
-            )
-            quant_info = TritonKernelsQuantInfo(
-                w13_weight=(
-                    self.w13_weight_triton_tensor
-                    if self.w13_weight_triton_tensor is not None
-                    else layer.w13_weight
-                ),
-                w2_weight=(
-                    self.w2_weight_triton_tensor
-                    if self.w2_weight_triton_tensor is not None
-                    else layer.w2_weight
-                ),
-                w13_bias=getattr(layer, "w13_weight_bias", None),
-                w2_bias=getattr(layer, "w2_weight_bias", None),
-                w13_precision_config=getattr(self, "w13_precision_config", None),
-                w2_precision_config=getattr(self, "w2_precision_config", None),
-            )
-        else:
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                b13=getattr(layer, "w13_weight_bias", None),
-                b2=getattr(layer, "w2_weight_bias", None),
-            )
+        quant_info = TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            b13=getattr(layer, "w13_weight_bias", None),
+            b2=getattr(layer, "w2_weight_bias", None),
+        )
         return self.runner.run(dispatch_output, quant_info)
 
     def _apply_aiter(self, layer, dispatch_output) -> CombineInput:
