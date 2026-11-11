@@ -17,6 +17,7 @@ from sglang.kernels.ops.speculative.dflash import (
     selector_walk_triton,
 )
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
+from sglang.srt.arg_groups.choices import DFLASH_MLA_ONLY_DRAFT_BACKENDS
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
@@ -539,7 +540,6 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         )
         if sliding_window_size > -1:
             from sglang.srt.speculative.draft_worker_common import (
-                DFLASH_MLA_ONLY_DRAFT_BACKENDS,
                 resolve_draft_worker_attention_backend,
             )
 

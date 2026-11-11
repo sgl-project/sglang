@@ -29,6 +29,7 @@ import numpy as np
 import torch
 
 from sglang.kernels.ops.speculative.dflash_ring_locs import dflash_ring_block_locs
+from sglang.srt.arg_groups.choices import DFLASH_MLA_ONLY_DRAFT_BACKENDS
 
 
 def draft_kv_ring_unsupported_reason(
@@ -53,10 +54,6 @@ def draft_kv_ring_unsupported_reason(
         )
     if enable_unified_memory:
         return "--enable-unified-memory places the draft KV in the target's pool"
-    from sglang.srt.speculative.draft_worker_common import (
-        DFLASH_MLA_ONLY_DRAFT_BACKENDS,
-    )
-
     if draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
         return f"draft backend {draft_backend!r} has no window index path"
     if draft_window_size is not None:

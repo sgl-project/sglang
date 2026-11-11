@@ -602,47 +602,6 @@ def validate_dflash_mla_draft_config(draft_hf_config: Any) -> None:
         )
 
 
-def resolve_mla_draft_compact_window(
-    draft_hf_config: Any,
-    *,
-    window_size: Optional[int],
-    dcp_size: int,
-) -> Optional[int]:
-    """The ``--speculative-draft-window-size`` an MLA draft keeps on trtllm_mla
-    or cutedsl_mla, or None to drop it. These backends read ``req_to_token`` by
-    absolute position, so the compact draft table is kept only where it reads
-    the same keys; otherwise this raises."""
-    if window_size is None:
-        return None
-    layer_types = get_dflash_layer_types(draft_hf_config)
-    if layer_types is not None and "sliding_attention" in layer_types:
-        if any(layer_type != "sliding_attention" for layer_type in layer_types):
-            raise ValueError(
-                "--speculative-draft-window-size with an MLA draft that mixes "
-                "full and sliding_attention layers is not supported on trtllm_mla "
-                "or cutedsl_mla: the compact draft table would narrow the full "
-                f"layers, and the native window cannot read it (layer_types="
-                f"{list(layer_types)})."
-            )
-        window_left = get_dflash_attention_sliding_window_size(draft_hf_config)
-        if window_left > window_size:
-            raise ValueError(
-                f"--speculative-draft-window-size {window_size} is narrower than "
-                f"the draft's own sliding window (window_left={window_left}); "
-                "trtllm_mla and cutedsl_mla apply the draft's window and cannot "
-                "narrow it. Use a window size >= window_left or drop the flag."
-            )
-        return None
-    if dcp_size > 1:
-        raise ValueError(
-            "--speculative-draft-window-size with a full-attention MLA draft is "
-            "not supported under --dcp-size > 1: the compact draft table starts "
-            "on a page boundary, but the DCP page table walks pages of "
-            f"page_size * dcp_size positions (dcp_size={dcp_size})."
-        )
-    return window_size
-
-
 @dataclass(frozen=True)
 class DFlashDraftConfig:
     num_hidden_layers: Optional[int]
