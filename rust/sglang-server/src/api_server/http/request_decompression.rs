@@ -8,7 +8,7 @@ use std::io::Read;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, HttpBody as _};
 use axum::extract::Request;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
@@ -85,17 +85,22 @@ async fn decompress_request_body(
     next.run(Request::from_parts(parts, Body::from(body))).await
 }
 
+/// The body is read only once a permit is held, so a request waiting for one
+/// holds its headers, not its compressed body.
 async fn decompress_zstd(body: Body, decompressions: Arc<Semaphore>) -> Result<Vec<u8>, String> {
-    let compressed = axum::body::to_bytes(body, usize::MAX)
-        .await
-        .map_err(|error| format!("reading the body: {error}"))?;
-    if compressed.is_empty() {
+    if body.size_hint().exact() == Some(0) {
         return Ok(Vec::new());
     }
     let permit = decompressions
         .acquire_owned()
         .await
         .map_err(|error| error.to_string())?;
+    let compressed = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .map_err(|error| format!("reading the body: {error}"))?;
+    if compressed.is_empty() {
+        return Ok(Vec::new());
+    }
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         decode_zstd(&compressed)
@@ -137,9 +142,13 @@ fn bad_request(message: String) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use axum::routing::post;
+    use bytes::Bytes;
+    use futures::StreamExt;
     use tower::ServiceExt;
 
     use super::*;
@@ -271,7 +280,8 @@ mod tests {
     }
 
     /// A decompression past the limit waits for a permit instead of failing,
-    /// and a body declaring its content size decodes without spare capacity.
+    /// without reading its body until it has one, and a body declaring its
+    /// content size decodes without spare capacity.
     #[tokio::test]
     async fn decompressions_past_the_limit_wait() {
         assert!((5..=32).contains(&python_executor_workers()));
@@ -289,9 +299,19 @@ mod tests {
             decompressions.clone(),
         );
         let held = decompressions.clone().acquire_owned().await.unwrap();
+        // Read lazily, like a socket, counting the bytes the server pulls.
+        let read = Arc::new(AtomicUsize::new(0));
+        let chunks: Vec<_> = compressed.chunks(4).map(Bytes::copy_from_slice).collect();
+        let body = Body::from_stream(futures::stream::iter(chunks).map({
+            let read = read.clone();
+            move |chunk| {
+                read.fetch_add(chunk.len(), Ordering::Relaxed);
+                Ok::<_, Infallible>(chunk)
+            }
+        }));
         let request = Request::post("/echo")
             .header(COMPRESSION_HEADER, "zstd")
-            .body(Body::from(compressed))
+            .body(body)
             .unwrap();
         let mut response = tokio::spawn(app.oneshot(request));
         assert!(
@@ -300,6 +320,11 @@ mod tests {
                 .is_err(),
             "decompressed without a permit"
         );
+        assert_eq!(
+            read.load(Ordering::Relaxed),
+            0,
+            "read the body while queued"
+        );
         drop(held);
         let response = response.await.unwrap().unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -307,5 +332,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], payload);
+        assert_eq!(read.load(Ordering::Relaxed), compressed.len());
     }
 }
