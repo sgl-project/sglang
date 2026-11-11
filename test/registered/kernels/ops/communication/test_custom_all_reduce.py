@@ -72,7 +72,6 @@ TEST_ALGOS = [
     AllReduceAlgo.ONE_SHOT_PUSH,
     AllReduceAlgo.TWO_SHOT_PUSH,
     AllReduceAlgo.TWO_SHOT_PULL,
-    AllReduceAlgo.RING_SIMPLE,  # skipped where the ring plane is not enabled
 ]
 # 2 KB slices per ring channel: every size streams through many FIFO loops
 RING_SMALL_FIFO_BYTES = 4 * 1024
@@ -226,23 +225,36 @@ def test_two_shot_push_single_block(
 @pytest.mark.parametrize("dtype", TEST_DTYPES)
 @pytest.mark.parametrize("size", TEST_SIZES)
 @torch.inference_mode()
+def test_ring_simple(size: int, dtype: torch.dtype, use_graph: bool) -> None:
+    _check_custom_all_reduce(size, dtype, None, use_graph, _init_comm_once())
+
+
+@pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
+@pytest.mark.parametrize("dtype", TEST_DTYPES)
+@pytest.mark.parametrize("size", TEST_SIZES)
+@torch.inference_mode()
 def test_ring_small_fifo(size: int, dtype: torch.dtype, use_graph: bool) -> None:
     comm = _init_comm_once(ring_simple_buffer_size=RING_SMALL_FIFO_BYTES)
-    _check_custom_all_reduce(size, dtype, AllReduceAlgo.RING_SIMPLE, use_graph, comm)
+    _check_custom_all_reduce(size, dtype, None, use_graph, comm)
 
 
 def _check_custom_all_reduce(
     size: int,
     dtype: torch.dtype,
-    algo: AllReduceAlgo,
+    algo: AllReduceAlgo | None,
     use_graph: bool,
     comm: CustomAllReduceV2,
 ) -> None:
-    if algo == AllReduceAlgo.RING_SIMPLE and not comm.ring_simple_enabled:
-        pytest.skip("the ring all-reduce is only enabled on ROCm gfx1250")
+    """``algo`` None runs the ring all-reduce, which is not a forced-algo choice."""
+    if algo is None:
+        if comm._ring is None:
+            pytest.skip("the ring all-reduce is only enabled on ROCm gfx1250")
+        reduce = comm._ring.all_reduce
+    else:
+        comm.override_algo = algo
+        reduce = comm.custom_all_reduce
     nccl_group = _init_nccl_group_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-    comm.override_algo = algo
 
     if use_graph:
         graph = torch.cuda.CUDAGraph()
@@ -252,7 +264,7 @@ def _check_custom_all_reduce(
             # the reference NCCL group's watchdog thread queries events meanwhile
             with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 for i in range(TEST_LAYERS):
-                    outs.append(comm.custom_all_reduce(graph_inp[i]))
+                    outs.append(reduce(graph_inp[i]))
                 out_jit_stack = torch.stack(outs)
         torch.cuda.synchronize()
 
@@ -267,14 +279,14 @@ def _check_custom_all_reduce(
             eager_inp = x.clone()
             outs = []
             for i in range(TEST_LAYERS):
-                outs.append(comm.custom_all_reduce(eager_inp[i]))
+                outs.append(reduce(eager_inp[i]))
                 torch.cuda.synchronize()
             return torch.stack(outs)
 
     for _ in range(TEST_LOOP):
         # NOTE: 15 * 8 < 128, which is the precision limit for bf16
         inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
-        assert comm.should_custom_ar(inp[0])
+        assert algo is None or comm.should_custom_ar(inp[0])
         out_ref = inp.clone()
         dist.all_reduce(out_ref, group=nccl_group)
         out_jit = run(inp)
@@ -323,7 +335,7 @@ def test_custom_all_reduce_tuned_ring() -> None:
     comm.override_algo = None
     nbytes = 64 * 1024 * 1024
     config = comm._pick_config(nbytes, False)
-    if config is None or config.algo != AllReduceAlgo.RING_SIMPLE:
+    if config is None or not config.use_ring:
         pytest.skip("the tuned table does not pick ring_simple on this system")
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
 
