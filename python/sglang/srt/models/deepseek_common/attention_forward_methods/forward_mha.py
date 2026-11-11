@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -32,6 +33,8 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.utils import BumpAllocator, next_power_of_2
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -487,6 +490,15 @@ class DeepseekMHAForwardMixin:
     ) -> torch.Tensor:
         # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
         from sglang.srt.layers.attention.merge_state import merge_state
+
+        if getattr(self.kv_b_proj, "set_lora", False):
+            # Validation-only trace: a kv_b_proj adapter is about to run on
+            # cached-prefix rows with the batch's extend-token segments.
+            logger.info(
+                "kv_b_proj LoRA on cached prefix: chunk rows %s, batch tokens %s",
+                forward_batch.prefix_chunk_num_tokens,
+                sum(forward_batch.extend_seq_lens_cpu),
+            )
 
         backend = resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
