@@ -473,11 +473,13 @@ class ExecKernel(msgspec.Struct):
     enable_dsa_fused_indexer: A[
         Optional[bool],
         Arg(
-            help="Use the four-kernel fused DSA indexer decode path in place of "
-            "the 12-launch aiter/torch chain. By default this is enabled "
-            "wherever it is supported -- gfx950 (MI355X) with aiter preshuffle "
-            "and an fp8 e4m3fn index cache -- and the runtime declines with a "
-            "logged reason wherever any of that is missing. Pass "
+            help="Use a fused DSA indexer: on gfx950 (MI355X) with aiter "
+            "preshuffle and an fp8 e4m3fn index cache, the four-kernel decode "
+            "path in place of the 12-launch aiter/torch chain; on SM12x, "
+            "FlashInfer's SM120 indexer, which scores and selects the top-k in "
+            "one pass, for decode and extend. By default this is enabled "
+            "wherever it is supported, and the runtime declines with a logged "
+            "reason wherever any of that is missing. Pass "
             "--no-enable-dsa-fused-indexer to force the standard path.",
             action=argparse.BooleanOptionalAction,
             resolvable=True,
