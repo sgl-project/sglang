@@ -752,8 +752,8 @@ def parse_args() -> argparse.Namespace:
     # manifests (per-tensor metadata for hundreds of buckets) run to tens of
     # MB, and an undersized buffer surfaces as "manifest not found".
     default_segment_size = int(os.getenv("MOONCAKE_SEGMENT_SIZE", "0"))
-    env_buffer_size = int(os.getenv("MOONCAKE_BUFFER_SIZE", str(256 * 1024 * 1024)))
-    default_buffer_size = env_buffer_size if env_buffer_size > 0 else 256 * 1024 * 1024  # Ensure non-zero
+    env_buffer_size = int(os.getenv("MOONCAKE_BUFFER_SIZE", str(2 * 1024 * 1024 * 1024)))
+    default_buffer_size = env_buffer_size if env_buffer_size > 0 else 2 * 1024 * 1024 * 1024  # Ensure non-zero
     default_update_timeout = float(os.getenv("SGLANG_IPC_UPDATE_TIMEOUT", "1800"))
 
     parser = argparse.ArgumentParser(
