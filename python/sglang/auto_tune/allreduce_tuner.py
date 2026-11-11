@@ -247,6 +247,26 @@ def _time_backend(
 # ---------------------------------------------------------------------------
 
 
+def _reason_from(exc: Exception, what: str) -> str:
+    """One line naming the exception, for the skipped column."""
+    text = str(exc).splitlines()[0] if str(exc) else ""
+    detail = f": {text}" if text else ""
+    return f"{what} raised {type(exc).__name__}{detail}"
+
+
+def _check_backend(backend: _Backend, tensor) -> Optional[str]:
+    """Why the tensor cannot run, or None. A raising check counts as a reason.
+
+    A rank that raised here while the others went on into the collectives would
+    leave them waiting, so the exception becomes a reason like any other and is
+    then agreed across the ranks.
+    """
+    try:
+        return backend.check(tensor)
+    except Exception as e:
+        return _reason_from(e, "check")
+
+
 def _agree(ok: bool, cpu_group) -> bool:
     """True only when every rank passes ``ok``.
 
@@ -703,7 +723,7 @@ def tune_allreduce(
             row_times: Dict[str, Optional[float]] = {}
             for name, backend in backends.items():
                 barrier()
-                reason = backend.check(tensor)
+                reason = _check_backend(backend, tensor)
                 # Every rank must agree before any rank enters the collectives.
                 if not _agree(reason is None, cpu_group):
                     reason = reason or "another rank declined the tensor"
@@ -720,9 +740,12 @@ def tune_allreduce(
                             barrier,
                             sync_every,
                         )
+                    except _Rejected as e:
+                        t = None
+                        reason = str(e)
                     except Exception as e:
                         t = None
-                        reason = str(e).splitlines()[0] if str(e) else type(e).__name__
+                        reason = _reason_from(e, "timing")
                 barrier()
                 if verbose:
                     shown = f"{t:.2f} us" if t is not None else f"skipped: {reason}"
@@ -750,8 +773,11 @@ def tune_allreduce(
         # Close together: a rank that frees its IPC buffers early can leave a
         # peer still using them.
         barrier()
-        for backend in backends.values():
-            backend.close()
+        for name, backend in backends.items():
+            try:
+                backend.close()
+            except Exception as e:
+                logger.warning("closing %s raised %s: %s", name, type(e).__name__, e)
 
     if verbose:
         print(
