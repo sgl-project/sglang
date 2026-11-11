@@ -668,8 +668,6 @@ class MetadataBuffers:
             if self.custom_mem_pool
             else nullcontext()
         ):
-            # TODO: abort top_logprobs_num > 128 in PD
-
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
             self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
