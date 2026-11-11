@@ -269,7 +269,7 @@ class DocPrefetch:
         }
 
     def _abort(self, windows: ReqList, recv_req: AbortReq) -> None:
-        aborted = windows.take(lambda r: recv_req.matches(r.rid))
+        aborted = [r for r in windows if recv_req.matches(r.rid)]
         for r in aborted:
             self.release_early(r.rid)
         self._abort_windows(aborted, finished_reason=recv_req.finished_reason)
@@ -289,10 +289,9 @@ class DocPrefetch:
             self._early.release(rid)
 
     def reset(self) -> List[Req]:
-        """Forget everything; returns the held follow-ups for the caller to abort."""
+        """Forget everything; returns the held follow-ups for the caller to
+        abort, which takes them out of their lists."""
         held = [*self._parked, *self._released]
-        self._parked.clear()
-        self._released.clear()
         self._finished.clear()
         if self._early is not None:
             self._early.clear()
