@@ -13,7 +13,7 @@ from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_weights_supported,
     weight_cache_key,
 )
-from sglang.srt.utils.common import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported
 
 
 @lru_cache(None)
