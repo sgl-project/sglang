@@ -192,7 +192,12 @@ class TestOOTSpecGraphRunnerSelection(CustomTestCase):
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
             topk=1,
-            target_worker=SimpleNamespace(device="custom"),
+            target_worker=SimpleNamespace(
+                device="custom",
+                model_runner=SimpleNamespace(
+                    sampler=SimpleNamespace(synthid_watermark=None)
+                ),
+            ),
             draft_runner=None,
             device="custom",
             gpu_id=0,

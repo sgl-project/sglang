@@ -28,6 +28,7 @@ def _verify_tree():
     return SimpleNamespace(
         draft_token=torch.tensor([4, 0, 1, 4, 2, 3]),
         draft_probs=None,
+        draft_prob_token_ids=None,
         retrieve_index=torch.arange(6).view(2, 3),
         retrieve_next_token=torch.tensor([[1, 2, -1], [1, 2, -1]]),
         retrieve_next_sibling=torch.full((2, 3), -1),

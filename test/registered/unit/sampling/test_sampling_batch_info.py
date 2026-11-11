@@ -6,12 +6,12 @@ register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
+from sglang.srt.runtime_context import get_context, get_exec
 from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     DisallowedTokensLogitsProcessor,
@@ -700,19 +700,12 @@ class TestCopyForForward(CustomTestCase):
 class TestFromScheduleBatch(CustomTestCase):
     def setUp(self):
         super().setUp()
-        # from_schedule_batch reads these two flags from the exec bag; give
-        # each test a mutable stand-in so it does not depend on a published
-        # (or leaked) process context.
-        self._exec_ns = SimpleNamespace(
-            deterministic=SimpleNamespace(enable_deterministic_inference=False),
-            features=SimpleNamespace(enable_custom_logit_processor=False),
+        self.enterContext(
+            get_context().override_server_args(
+                enable_deterministic_inference=False,
+                enable_custom_logit_processor=False,
+            )
         )
-        exec_patch = patch(
-            "sglang.srt.sampling.sampling_batch_info.get_exec",
-            return_value=self._exec_ns,
-        )
-        exec_patch.start()
-        self.addCleanup(exec_patch.stop)
 
     def _make_req(
         self,
@@ -758,6 +751,7 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertAlmostEqual(info.temperatures[0, 0].item(), 0.8, places=5)
         self.assertAlmostEqual(info.top_ps[0].item(), 0.9, places=5)
         self.assertEqual(info.top_ks[0].item(), 50)
+        self.assertIsNone(info.synthid_state)
 
     def test_greedy_detection(self):
         """Test that top_k=1 sets is_all_greedy=True."""
@@ -784,7 +778,9 @@ class TestFromScheduleBatch(CustomTestCase):
 
     def test_deterministic_seed(self):
         """Test that explicit seed=123 is kept and missing seed defaults to 42."""
-        self._exec_ns.deterministic.enable_deterministic_inference = True
+        get_context().override(
+            "test_sampling_batch_info", enable_deterministic_inference=True
+        )
 
         reqs = [self._make_req(seed=123), self._make_req(seed=None)]
         batch = MagicMock()
@@ -851,7 +847,9 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertIsNone(info.logit_bias)
 
     def test_merge_preserves_processor_cache_after_batch_without_processors(self):
-        self._exec_ns.features.enable_custom_logit_processor = True
+        get_context().override(
+            "test_sampling_batch_info", enable_custom_logit_processor=True
+        )
         left_batch = MagicMock()
         left_batch.reqs = [self._make_req(), self._make_req()]
         left_batch.device = DEVICE
@@ -895,7 +893,7 @@ class TestFromScheduleBatch(CustomTestCase):
         logits = torch.zeros(1, VOCAB_SIZE)
         apply_custom_logit_processor(logits, info)
         self.assertEqual(torch.isfinite(logits[0]).nonzero().flatten().tolist(), [1])
-        self.assertFalse(self._exec_ns.features.enable_custom_logit_processor)
+        self.assertFalse(get_exec().features.enable_custom_logit_processor)
 
     def test_external_processor_still_requires_the_enable_flag(self):
         req = self._make_req()
@@ -907,7 +905,9 @@ class TestFromScheduleBatch(CustomTestCase):
 
     def test_custom_logit_processor_merging(self):
         """Test deserialization and merging of custom logit processors."""
-        self._exec_ns.features.enable_custom_logit_processor = True
+        get_context().override(
+            "test_sampling_batch_info", enable_custom_logit_processor=True
+        )
 
         proc_str = DisallowedTokensLogitsProcessor.to_str()
         req1 = self._make_req()

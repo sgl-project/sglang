@@ -201,9 +201,7 @@ from sglang.srt.sampling.custom_logit_processor import (
     supports_sampling_mask,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.watermarking.core import (
-    resolve_watermark_request,
-)
+from sglang.srt.sampling.watermarking.server import validate_watermark_request
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -242,16 +240,8 @@ logger = logging.getLogger(__name__)
 
 
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
-    watermark = sampling_params.watermark
     features = get_exec().features
-    _, _, enabled = resolve_watermark_request(
-        watermark,
-        server_enabled=features.enable_watermark,
-        default_key=features.watermark_key,
-        default_context_window=features.watermark_context_window,
-        default_enabled=features.watermark_default_enabled,
-        enforce_all=features.watermark_enforce_all,
-    )
+    enabled = validate_watermark_request(sampling_params, features)
     if enabled and (sampling_params.beam_width or 1) > 1:
         raise ValueError("beam search is not supported with watermarking")
 

@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import mamba_track_grid
+from sglang.srt.sampling.watermarking.synthid.request import is_enabled
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
@@ -590,6 +591,7 @@ def build_eagle_verify_input(
     top_scores_index: torch.Tensor,
     draft_tokens: torch.Tensor,
     draft_probs: Optional[torch.Tensor],
+    draft_prob_token_ids: Optional[torch.Tensor] = None,
     *,
     target_worker: TpModelWorker,
     topk: int,
@@ -695,6 +697,7 @@ def build_eagle_verify_input(
         draft_probs=draft_probs,
         prepared_out_cache_loc=prepared_out_cache_loc,
         prepared_mrope_positions=prepared_mrope_positions,
+        draft_prob_token_ids=draft_prob_token_ids,
     )
 
 
@@ -871,6 +874,7 @@ def run_eagle_verify(
         pp_proxy_tensors=pp_proxy_tensors,
     )
     logits_output = forward_batch_output.logits_output
+    synthid_enabled = is_enabled(batch.sampling_info.synthid_state)
 
     kvcache = token_to_kv_pool_allocator.get_kvcache()
     clears_c128 = isinstance(kvcache, DeepSeekV4TokenToKVPool)
@@ -878,7 +882,7 @@ def run_eagle_verify(
     # they skip the c128 cleanup below, so not for a KV pool that needs it.
     post = (
         None
-        if post_verify_graphs is None or clears_c128
+        if post_verify_graphs is None or clears_c128 or synthid_enabled
         else post_verify_graphs.run(
             batch=batch,
             verify_input=verify_input,
@@ -931,7 +935,7 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+    if envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get() and not synthid_enabled:
         watermark_full_mask = (
             target_worker.model_runner.attn_backend.verify_mask is None
             or target_worker.model_runner.attn_backend.verify_mask.mode
@@ -977,6 +981,11 @@ def run_eagle_verify(
             logits_output,
             grammar_mask,
             uno_target_max_top_k=uno_target_max_top_k,
+            synthid_processor=(
+                target_worker.model_runner.sampler.synthid_watermark
+                if synthid_enabled
+                else None
+            ),
             watermark_state=target_worker.model_runner.watermark_state,
             watermark_full_mask=(
                 target_worker.model_runner.attn_backend.verify_mask is None

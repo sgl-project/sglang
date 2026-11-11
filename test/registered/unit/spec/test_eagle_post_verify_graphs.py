@@ -215,7 +215,7 @@ def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
         has_grammar=False,
         device="cpu",
         forward_mode=ForwardMode.IDLE if idle else ForwardMode.TARGET_VERIFY,
-        sampling_info=None,
+        sampling_info=SimpleNamespace(synthid_state=None),
         return_logprob=False,
     )
     target_worker = SimpleNamespace(

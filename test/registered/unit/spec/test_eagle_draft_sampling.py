@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -33,6 +34,7 @@ class TestEagleDraftSamplingPosition(CustomTestCase):
             forward=lambda _: SimpleNamespace(logits_output=logits_output),
         )
         sampling_info = SimpleNamespace(
+            synthid_state=None,
             temperatures=torch.ones(2, 1),
             top_ks=torch.ones(2, dtype=torch.int32),
             sampling_seed=torch.tensor([11, 22], dtype=torch.int64),
@@ -55,7 +57,6 @@ class TestEagleDraftSamplingPosition(CustomTestCase):
             torch.ones(2, 1),
             torch.zeros(2, 1, dtype=torch.int64),
         )
-        resolved_spec = SimpleNamespace(speculative_use_rejection_sampling=True)
 
         with (
             patch(
@@ -66,10 +67,7 @@ class TestEagleDraftSamplingPosition(CustomTestCase):
                 "sglang.srt.speculative.eagle_worker_v2.sample_draft_proposal",
                 return_value=sample_result,
             ) as sample,
-            patch(
-                "sglang.srt.speculative.eagle_worker_v2.get_spec",
-                return_value=resolved_spec,
-            ),
+            get_context().override_server_args(speculative_use_rejection_sampling=True),
         ):
             worker._draft_extend_for_decode(batch, batch_result)
 

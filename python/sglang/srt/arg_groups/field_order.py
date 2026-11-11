@@ -566,5 +566,11 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_dspark_lm_head_dtype",
     "media_url_timeout",
     "allow_local_media_files",
+    "synthid_watermark_key_file",
+    "synthid_watermark_ngram_len",
+    "synthid_watermark_top_k",
+    "synthid_watermark_context_history_size",
+    "synthid_watermark_skip_first_ngram_calls",
+    "watermark_algorithm",
 )
 # fmt: on
