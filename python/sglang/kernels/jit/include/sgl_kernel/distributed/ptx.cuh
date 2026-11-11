@@ -274,14 +274,6 @@ SGL_DEVICE uint64_t load_relaxed_sys(const uint64_t* ptr) {
   return val;
 }
 
-/// A 64-bit sequence flag: payload the writer stored before the flag is
-/// visible once this load sees it.
-SGL_DEVICE uint64_t load_acquire_sys(const uint64_t* ptr) {
-  uint64_t val;
-  asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(val) : "l"(ptr) : "memory");
-  return val;
-}
-
 SGL_DEVICE void store_relaxed_sys(uint64_t* ptr, uint64_t val) {
   asm volatile("st.relaxed.sys.global.u64 [%0], %1;" : : "l"(ptr), "l"(val) : "memory");
 }
@@ -508,18 +500,6 @@ SGL_DEVICE void fence_release_sys() {
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
 }
 
-/// Publishes this wave's system-scope stores (`st_relaxed_16B`) before a later
-/// flag store, without the cache writeback `fence_release_sys` adds for plain
-/// stores: those stores bypass the cache, so completing them is enough. Only
-/// gfx12 counts stores apart from loads; elsewhere this is the full fence.
-SGL_DEVICE void wait_stores_sys() {
-#if defined(__gfx1250__)
-  asm volatile("s_wait_storecnt 0x0" ::: "memory");
-#else
-  fence_release_sys();
-#endif
-}
-
 SGL_DEVICE uint32_t atomic_add_acq_rel_gpu(uint32_t* ptr, uint32_t val) {
   return __hip_atomic_fetch_add(ptr, val, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
 }
@@ -538,10 +518,6 @@ SGL_DEVICE void multimem_red_add_release(uint32_t*, uint32_t) {
 
 SGL_DEVICE uint64_t load_relaxed_sys(const uint64_t* ptr) {
   return __hip_atomic_load(const_cast<uint64_t*>(ptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-}
-
-SGL_DEVICE uint64_t load_acquire_sys(const uint64_t* ptr) {
-  return __hip_atomic_load(const_cast<uint64_t*>(ptr), __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 SGL_DEVICE void store_relaxed_sys(uint64_t* ptr, uint64_t val) {
