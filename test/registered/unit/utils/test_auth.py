@@ -339,6 +339,10 @@ class TestApiKeyMiddleware(CustomTestCase):
         async def force_by_name(name: str):
             return {}
 
+        @app.post("/force/shadowed")
+        async def shadowed():
+            return {}
+
         @app.websocket("/ws")
         async def ws(websocket: WebSocket):
             await websocket.accept()
@@ -350,6 +354,7 @@ class TestApiKeyMiddleware(CustomTestCase):
     def test_keys_are_read_per_request(self):
         self.assertEqual(self.client.get("/normal").status_code, 200)
         self.assertEqual(self.client.post("/force").status_code, 403)
+        self.assertEqual(self.client.post("/force/shadowed").status_code, 403)
         self.keys = ("user", "admin")
         admin = {"Authorization": "Bearer admin"}
         user = {"Authorization": "Bearer user"}
