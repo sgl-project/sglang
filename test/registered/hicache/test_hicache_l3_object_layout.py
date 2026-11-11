@@ -45,7 +45,12 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
 )
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_context,
+    get_memory,
+    get_parallel,
+    get_server_args,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -311,10 +316,20 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
             scheduler.get_init_info()["hicache_object_layout"], reply.layout
         )
 
+        backend = get_memory().unified_cache_external_linker_backend
+        scheduler.tree_cache.linker = SimpleNamespace(
+            cache_linker=SimpleNamespace(storage=object())
+        )
+        reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
+        self.assertFalse(reply.layout["enabled"])
+        self.assertEqual(reply.layout["backend"], backend)
+        self.assertIn("not Mooncake", reply.layout["reason"])
+
         scheduler.tree_cache.linker = None
         reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
         self.assertFalse(reply.layout["enabled"])
-        self.assertIn("linker", reply.layout["reason"])
+        self.assertEqual(reply.layout["backend"], backend)
+        self.assertIn("not attached", reply.layout["reason"])
 
     def test_sidecar_window_uses_its_source_and_preserves_its_policy(self):
         store = self._store(

@@ -6161,7 +6161,13 @@ class Scheduler(
         storage = getattr(getattr(wrapper, "cache_linker", None), "storage", None)
         if not isinstance(storage, MooncakeStore):
             return disabled_l3_layout(
-                "Mooncake external linker is not attached", page_size=self.page_size
+                (
+                    "External linker storage is not Mooncake"
+                    if wrapper is not None
+                    else "Mooncake external linker is not attached"
+                ),
+                backend=get_memory().unified_cache_external_linker_backend,
+                page_size=self.page_size,
             )
         window_trailing_pages = {
             str(window.pool_name): window.full_window_pages
