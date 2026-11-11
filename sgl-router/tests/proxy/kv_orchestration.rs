@@ -43,6 +43,8 @@ struct EngineState {
     pin_missing: bool,
     epoch: String,
     fail_residency: bool,
+    fail_capabilities: bool,
+    validate_context: bool,
     lose_submit_once: bool,
     feedback: bool,
     hide_feedback: bool,
@@ -91,6 +93,9 @@ async fn capabilities(State(state): State<Arc<Mutex<EngineState>>>) -> Json<Valu
         delayed.release.notified().await;
     }
     let s = state.lock().unwrap();
+    if s.fail_capabilities {
+        return Json(json!({"success":false,"error":{"code":"unavailable"}}));
+    }
     let mut reply = json!({"success":true,"data":{"engine_id":"mock-engine","engine_epoch":s.epoch,"namespace":"weights-v1",
         "cache_salt_encoding":"owner_assertion","executor":{"cache_generation":1},"public_protocol":{"actions":{"sglang.prefetch":["1.0"],"sglang.demote":["1.0"],"sglang.pin":["1.0"]},
         "paths":{"sglang.prefetch":[["storage","host"],["host","gpu"]],"sglang.demote":[["host","storage"]]},
@@ -125,6 +130,17 @@ fn command_now(
 ) -> (axum::http::StatusCode, Json<Value>) {
     use axum::http::StatusCode;
     let mut s = state.lock().unwrap();
+    let context = if body["kind"] == "cancel" {
+        &body["ref"]["context"]
+    } else {
+        &body["context"]
+    };
+    if s.validate_context && context["engine_epoch"] != s.epoch {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"success":false,"error":{"code":"stale_epoch"}})),
+        );
+    }
     s.commands.push(body.clone());
     if body["kind"] == "events" {
         if s.fail_feedback {
@@ -815,7 +831,11 @@ async fn request_prefetch_uses_the_selected_worker_without_waiting_for_control()
             .is_success());
 
         let hold = Arc::new(DelayedQuery::default());
-        b.state.lock().unwrap().delayed_submit = Some(hold.clone());
+        {
+            let mut state = b.state.lock().unwrap();
+            state.running = true;
+            state.delayed_submit = Some(hold.clone());
+        }
         let response = tokio::time::timeout(
             Duration::from_secs(2),
             client
@@ -846,8 +866,16 @@ async fn request_prefetch_uses_the_selected_worker_without_waiting_for_control()
             assert_eq!(action["action_type"], "sglang.prefetch");
             assert_eq!(action["payload"]["target"]["token_ids"], json!([1, 2, 3]));
         }
+        {
+            let mut state = b.state.lock().unwrap();
+            state.fail_capabilities = true;
+            for result in state.operations.values_mut() {
+                result["sequence"] = json!(2);
+                result["update"] = json!({"status":"completed","quiescent":true});
+            }
+        }
         hold.release.notify_one();
-        // The internal intent must retire without an application ACK.
+        // Retirement uses owner-scoped commands without new discovery or an application ACK.
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let response = client.post(format!("{}/v1/kv/control", router.url))
@@ -1293,6 +1321,63 @@ async fn released_prefetch_drains_when_residency_feedback_is_unavailable() {
         .await["acknowledged"],
         true
     );
+}
+
+#[tokio::test]
+async fn prefetch_cleanup_uses_owner_scoped_commands_when_discovery_fails() {
+    for restarted in [false, true] {
+        let engine = Engine::start().await;
+        engine.state.lock().unwrap().running = true;
+        let mut cfg = orchestration();
+        cfg.poll_ms = cfg.operation_ttl_ms;
+        let router = router_with(&[&engine], false, Some(cfg)).await;
+        start(&router, "task").await;
+        api(
+            &router,
+            json!({"kind":"submit","task":task("task"),"message_id":"read","action":"sglang.prefetch",
+            "target":prefix(vec![1,2,3,4]),"source":{"tier":"storage"},"destination":{"tier":"host"}}),
+        )
+        .await;
+        let running = query(&router, "task", "read").await;
+        assert_eq!(
+            running["operations"][0]["result"]["update"]["status"],
+            "running"
+        );
+        {
+            let mut state = engine.state.lock().unwrap();
+            state.fail_capabilities = true;
+            state.validate_context = true;
+            if restarted {
+                state.epoch = "epoch-2".into();
+            }
+        }
+        event(&router, "task", "task_finished", 1, "finish").await;
+        let view = query(&router, "task", "read").await;
+        assert!(view["operations"][0]["ready_scope"].is_null());
+        if restarted {
+            assert_eq!(view["quiescent"], false);
+            assert!(!engine.state.lock().unwrap().cancelled);
+            assert!(view["operations"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("stale_epoch"));
+        } else {
+            assert_eq!(
+                view["operations"][0]["result"]["update"]["status"],
+                "cancelled"
+            );
+            assert_eq!(view["quiescent"], true);
+            assert!(engine.state.lock().unwrap().cancelled);
+            assert_eq!(
+                api(
+                    &router,
+                    json!({"kind":"ack","task":task("task"),"message_id":"read"})
+                )
+                .await["acknowledged"],
+                true
+            );
+        }
+    }
 }
 
 #[tokio::test]

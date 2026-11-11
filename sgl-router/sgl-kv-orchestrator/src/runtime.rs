@@ -1729,13 +1729,21 @@ impl WorkerPoll {
             job.releasing_pin = true;
             job.result = Arc::new(Value::Null);
         }
-        let live = self.refresh().await?;
-        if live.epoch != job.caps.epoch || live.compatibility != job.caps.compatibility {
-            return Err(
-                "owner epoch/compatibility changed; reconcile old operation separately".into(),
-            );
-        }
-        job.caps.generation = live.generation;
+        let observe_residency = job.action == "sglang.prefetch" && !cancel && !request_only;
+        let live = if job.action == "sglang.pin" || observe_residency {
+            let live = self.refresh().await?;
+            if live.epoch != job.caps.epoch || live.compatibility != job.caps.compatibility {
+                return Err(
+                    "owner epoch/compatibility changed; reconcile old operation separately".into(),
+                );
+            }
+            job.caps.generation = live.generation;
+            live
+        } else {
+            // Owner-scoped operation commands validate epoch at the Engine.
+            // Discovery is needed for live location/claim evidence only.
+            job.caps.clone()
+        };
         if !job.submitted {
             if !job.attempted && !job.releasing_pin && Instant::now() >= job.deadline {
                 job.quiescent = true;
@@ -1772,7 +1780,6 @@ impl WorkerPoll {
         }
         job.ready_end = 0;
         job.ready_at = None;
-        let observe_residency = job.action == "sglang.prefetch" && !cancel && !request_only;
         // Cancellation and operation receipts do not depend on residency feedback.
         if job.action == "sglang.pin" || observe_residency {
             self.poll_feedback(&job.url, &live).await?;
