@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional, Type, Union
 import torch
 from huggingface_hub import snapshot_download
 
-from sglang.srt.configs import (
+from sglang.srt.configs.all_configs import (
     AfmoeConfig,
     BailingHybridConfig,
     BailingMM2Config,
@@ -95,6 +95,7 @@ from sglang.srt.configs import (
     Step3p5Config,
     Step3p7Config,
     Step3VLConfig,
+    Xing4_0Config,
     XllmConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
@@ -189,6 +190,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         InklingVisionConfig,
         InklingMMConfig,
         MiniMaxM3VLConfig,
+        Xing4_0Config,
         XllmConfig,
     ]
 }

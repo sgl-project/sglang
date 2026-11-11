@@ -865,7 +865,7 @@ struct K3A8W4MoE {
     auto I_ = SymbolicSize{"inter"};
     auto IG_ = SymbolicSize{"inter / 32"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
     TensorMatcher({T_, K_}).with_dtype<uint8_t>().with_device(device_).verify(a);
     TensorMatcher({T_, KG_}).with_dtype<uint8_t>().with_device(device_).verify(a_scale);
     TensorMatcher({E_, N2_, KP_}).with_dtype<uint8_t>().with_device(device_).verify(w);
@@ -950,7 +950,7 @@ struct K3A8W4MoE {
     auto T_ = SymbolicSize{"num_tokens"};
     auto K_ = SymbolicSize{"topk"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
     TensorMatcher({S_, I_}).with_dtype<uint8_t>().with_device(device_).verify(inter);
     TensorMatcher({S_, IG_}).with_dtype<uint8_t>().with_device(device_).verify(inter_scale);
     TensorMatcher({E_, N_, IP_}).with_dtype<uint8_t>().with_device(device_).verify(w);
@@ -1038,7 +1038,7 @@ struct K3A8W4MoE {
     auto R_ = SymbolicSize{"y rows"};
     auto N_ = SymbolicSize{"hidden"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
     TensorMatcher({R_, N_}).with_dtype<bf16_t>().with_device(device_).verify(y);
     TensorMatcher({T_, K_}).with_dtype<float>().with_device(device_).verify(topk_weights);
     TensorMatcher({T_, N_}).with_strides({-1, 1}).with_dtype<bf16_t>().with_device(device_).verify(out);

@@ -53,5 +53,9 @@ def apply_kimi_k31_rocm_env_defaults() -> None:
     # AITER's opus MoE stage 2 otherwise stores per-slot down outputs in fp8 before the
     # top-k sum: 11x the error of the bf16 partials the reference keeps.
     os.environ.setdefault("AITER_OPUS_STAGE2_FP8", "0")
+    # the same experts as AITER's biased top-k, in under half its time
+    os.environ.setdefault("SGLANG_K3_RADIX4_TOPK", "1")
+    # AgentX target verify (up to 64 requests x 6 rows) takes the column-split tail
+    os.environ.setdefault("SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS", "384")
     if "AITER_CONFIG_GEMM_BF16" not in os.environ:
         os.environ["AITER_CONFIG_GEMM_BF16"] = write_k31_bf16_gemm_table()

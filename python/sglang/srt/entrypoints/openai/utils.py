@@ -252,8 +252,8 @@ def should_include_usage(
 ) -> tuple[bool, bool]:
     # When stream_options are specified in the request
     if stream_options:
-        # An explicit include_usage wins in BOTH directions; only an unset
-        # (None) value defers to the server default.
+        # An explicit include_usage wins either way; only an unset value falls
+        # back to the server default.
         include_usage = (
             stream_response_default_include_usage
             if stream_options.include_usage is None

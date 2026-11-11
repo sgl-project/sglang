@@ -285,7 +285,7 @@ def test_reduce_d_chunk_is_bitwise_identical(active_splits):
 def _pow2_scaled_kv():
     torch.manual_seed(0)
     k = (torch.randn(_N, 1, _DV + _DR, device=_DEVICE) * 2).bfloat16()
-    kv = quantize_k_cache(k.unsqueeze(1), pow2_scale=True).view(_N, 1, -1)
+    kv = quantize_k_cache(k.unsqueeze(1), scale_ue8m0=True).view(_N, 1, -1)
     raw = kv.view(torch.uint8).view(_N, 656)
     nope = raw[:, :512].view(torch.float8_e4m3fn).float().view(_N, 4, 128)
     scale = raw[:, 512:528].contiguous().view(torch.float32).view(_N, 4, 1)

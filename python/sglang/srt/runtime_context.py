@@ -508,6 +508,18 @@ def draft_attn_tp_size() -> int:
     return getattr(get_parallel(), f"{draft_attn_parallel_group()}_size")
 
 
+def is_scheduler_io_rank() -> bool:
+    """Whether this scheduler rank receives requests from the tokenizer and
+    sends outputs to the detokenizer: pipeline, attention-TP and attention-CP
+    rank 0, one per attention-DP group."""
+    parallel = get_parallel()
+    return (
+        parallel.pp_rank == 0
+        and parallel.attn_tp_rank == 0
+        and parallel.attn_cp_rank == 0
+    )
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
@@ -921,7 +933,7 @@ def _install_derived_leaves(tops: dict, server_args: Any) -> None:
     import importlib
 
     from sglang.srt.arg_groups.arg_utils import _NO_DEFAULT, Derived
-    from sglang.srt.arg_groups.overrides import resolved_view
+    from sglang.srt.arg_groups.model_override_base import resolved_view
 
     namespaces = getattr(type(server_args), "_NAMESPACES", None)
     if not namespaces:
@@ -1834,6 +1846,7 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_xpu": "is_xpu",
     "is_musa": "is_musa",
     "is_mps": "is_mps",
+    "is_sail": "is_sail",
     "is_sm90": "is_sm90_supported",
     "is_sm100": "is_sm100_supported",
     "is_sm100_or_sm110": "is_sm100_or_sm110_supported",
@@ -2008,7 +2021,7 @@ def max_speculative_num_draft_tokens() -> int | None:
 
 def uses_mla_backend() -> bool:
     """Whether this process's model runs the MLA attention path."""
-    from sglang.srt.arg_groups.overrides import use_mla_backend
+    from sglang.srt.arg_groups.model_override_base import use_mla_backend
 
     return use_mla_backend(get_server_args())
 
@@ -2023,14 +2036,14 @@ def attention_backends() -> tuple:
     stamps its own resolved pair (``ModelRunner.prefill_attention_backend_str``);
     read that when there is a runner in hand.
     """
-    from sglang.srt.arg_groups.overrides import attention_backends_of
+    from sglang.srt.arg_groups.model_override_base import attention_backends_of
 
     return attention_backends_of(get_exec().kernel)
 
 
 def process_model_config():
     """The process's ``ModelConfig`` (built once from the published config)."""
-    from sglang.srt.arg_groups.overrides import model_config_of
+    from sglang.srt.arg_groups.model_override_base import model_config_of
 
     return model_config_of(get_server_args())
 
@@ -2149,7 +2162,8 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     helpers the scheduler binds through — so the advertisement cannot
     drift from the sockets.
     """
-    from sglang.srt.arg_groups.overrides import kv_event_block_size_of, resolving_view
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+    from sglang.srt.arg_groups.overrides import kv_event_block_size_of
 
     # Lazy import so loading server_args doesn't pull in
     # disaggregation / msgspec / zmq at module top level.

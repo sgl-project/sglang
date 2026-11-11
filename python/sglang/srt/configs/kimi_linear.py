@@ -169,7 +169,9 @@ class KimiLinearConfig(PretrainedConfig):
         self.index_rope_dim = index_rope_dim
         self.index_k_norm_type = index_k_norm_type
         self.index_k_norm_eps = self.rms_norm_eps
+        self.index_k_norm_fp32 = True
         self.index_apply_hadamard = False
+        self.index_bf16_head_gate = True
 
     def is_dsa_layer(self, layer_idx: int) -> bool:
         return self.dsa_config is not None and (layer_idx + 1) in self.dsa_layers

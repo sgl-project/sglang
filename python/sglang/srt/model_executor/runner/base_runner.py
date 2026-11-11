@@ -33,15 +33,14 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     NgramEmbeddingInfo,
     PPProxyTensors,
     enable_num_token_non_padded,
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
@@ -205,6 +204,7 @@ def _allocate_decode_buffers(
     return SimpleNamespace(
         input_ids=input_ids,
         input_embeds=input_embeds,
+        ragged_verify_layout=None,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
         seq_lens_cpu=seq_lens_cpu,
@@ -234,7 +234,6 @@ class BaseRunner(ABC):
         # elastic-EP scale-up widens num_dp_ranks on the published config
         self.num_dp_ranks = get_parallel().num_dp_ranks
         self.pp_size = get_parallel().pp_size
-        self.enable_pdmux = get_disagg().enable_pdmux
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker
@@ -719,7 +718,7 @@ class BaseRunner(ABC):
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
-        mr.kv_index_translator.bind_runner_slots(forward_batch)
+        mr.runner_ids.bind_runner_slots(forward_batch)
 
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(

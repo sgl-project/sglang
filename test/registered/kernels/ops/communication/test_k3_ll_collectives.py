@@ -44,8 +44,8 @@ def _check_gather_tail_read(comm, rank, failures):
     cw = torch.randn(H, generator=g, device="cuda") * 0.05
     ow = (torch.rand(H, generator=g, device="cuda") + 0.5).bfloat16().float()
     cols = slice(rank * H // WORLD, (rank + 1) * H // WORLD)
-    # Preserve every prefix/(bank-size, write) mode. Three max-row calls reuse
-    # both scratch epochs with new payloads, including all 64 row flags.
+    # Preserve every prefix/(bank-size, write) mode. Three 64-row calls reuse
+    # both scratch epochs with new payloads.
     cases = (
         (1, False, 1, False),
         (4, True, 1, False),
@@ -54,13 +54,31 @@ def _check_gather_tail_read(comm, rank, failures):
         (64, False, 8, True),
         (64, True, 8, True),
     )
+    # Above 64 rows the slice is the bf16 GEMM of the RMSNorm'd latent (projected);
+    # three max-row calls reuse both epochs of every row flag.
+    cases += (
+        (65, True, 4, True),
+        (96, False, 8, False),
+        (288, True, 8, True),
+        (384, True, 8, True),
+        (384, False, 2, True),
+        (384, True, 4, False),
+    )
     for rows, with_prefix, nvb, write in cases:
         latent = (torch.randn(rows, L, generator=g, device="cuda") * 3).bfloat16()
         shared = torch.randn(rows, H, generator=g, device="cuda").bfloat16()
         prefix = (torch.randn(rows, H, generator=g, device="cuda") * 4).bfloat16()
         bank = (torch.randn(rows, NB, H, generator=g, device="cuda") * 4).bfloat16()
-        part, sq = k3_latent_tail_partials(latent, norm_w, up[cols])
-        proj = (part.sum(0) * torch.rsqrt(sq.sum(0) / L + EPS)[:, None]).bfloat16()
+        if rows <= 64:
+            part, sq = k3_latent_tail_partials(latent, norm_w, up[cols])
+            proj = (part.sum(0) * torch.rsqrt(sq.sum(0) / L + EPS)[:, None]).bfloat16()
+        else:
+            normed = latent.float() * torch.rsqrt(
+                latent.float().pow(2).mean(-1, keepdim=True) + EPS
+            )
+            normed = (normed * norm_w.float()).bfloat16()
+            part, sq = normed @ up[cols].T, None
+            proj = part
         pre = prefix if with_prefix else None
         mine = proj.float() + shared[:, cols].float()
         if with_prefix:

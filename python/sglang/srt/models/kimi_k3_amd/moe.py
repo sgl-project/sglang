@@ -41,9 +41,9 @@ if _is_gfx95:
     from sglang.kernels.ops.attention import k3_attn_res_read_hip
     from sglang.kernels.ops.gemm import kimi_k3_latent_tail_hip
     from sglang.srt.layers import attn_residual_hip
-# The all-gather read's row limit; up to it the column tail's split-K partial GEMM
-# beats the replicated tail on MI350X.
-_COLUMN_TAIL_MAX_TOKENS = 64
+# Up to this many rows the column tail's slice comes from split-K partials (faster than the
+# replicated tail on MI350X); above it, from a GEMM of the RMSNorm'd latent.
+_COLUMN_TAIL_PARTIALS_MAX_TOKENS = 64
 # From this many tokens each rank computes its 1/TP routed up_proj columns into the
 # shared-expert all-reduce.
 _UP_PROJ_COLUMN_SPLIT_MIN_TOKENS = 2048
@@ -552,7 +552,7 @@ class KimiK3MoEHipMixin:
         bank = read.bank.require()
         if not (
             self._fused_latent_tail_eligible
-            and num_tokens <= _COLUMN_TAIL_MAX_TOKENS
+            and num_tokens <= envs.SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS.get()
             and latent.shape[1] == k3_attn_res_read_hip.TAIL_LATENT
             and latent.stride(-1) == 1
             and k3_attn_res_read_hip.tail_covered(shared_output, prefix_sum)
@@ -565,11 +565,17 @@ class KimiK3MoEHipMixin:
         up_weight = self.routed_expert_up_proj.weight[
             rank * slice_width : (rank + 1) * slice_width
         ]
-        part, sq = kimi_k3_latent_tail_hip.k3_latent_tail_partials(
-            latent,
-            self.routed_expert_norm.weight,
-            up_weight,
-        )
+        if num_tokens <= _COLUMN_TAIL_PARTIALS_MAX_TOKENS:
+            part, sq = kimi_k3_latent_tail_hip.k3_latent_tail_partials(
+                latent,
+                self.routed_expert_norm.weight,
+                up_weight,
+            )
+        else:
+            # the replicated tail's up_proj GEMM on this rank's columns
+            from sglang.srt.models.kimi_k3 import _k3_bf16_gemm
+
+            part, sq = _k3_bf16_gemm(self._latent_norm(latent), up_weight), None
         return attn_residual_hip.gather_tail_read(
             bank,
             part,

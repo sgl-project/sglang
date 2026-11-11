@@ -6,14 +6,16 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
-from sglang.srt.arg_groups.overrides import (
-    _speculative_moe_runner_default,
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
     model_config_of,
-    record_foreign_defaults,
     resolved_view,
     resolving_view,
+)
+from sglang.srt.arg_groups.overrides import (
+    _speculative_moe_runner_default,
+    declare_resolution,
+    record_foreign_defaults,
     run_post_process_pass,
 )
 from sglang.srt.environ import envs
@@ -88,7 +90,7 @@ def _resolve_speculative_algorithm_alias(
 
     is_gemma4_draft = False
     if speculative_draft_model_path:
-        from sglang.srt.utils.hf_transformers_utils import get_config
+        from sglang.srt.utils.hf_transformers import get_config
 
         cfg = get_config(
             speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
@@ -398,7 +400,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         model_override_args = json.loads(cfg.json_model_override_args)
         inferred_block_size = None
         try:
-            from sglang.srt.utils.hf_transformers_utils import get_config
+            from sglang.srt.utils.hf_transformers import get_config
 
             draft_hf_config = get_config(
                 cfg.speculative_draft_model_path,
@@ -551,8 +553,6 @@ def _handle_uno(server_args: ServerArgs) -> None:
                 f"F={draft_width}, K={candidate_top_k}."
             )
 
-        if cfg.enable_pdmux:
-            raise ValueError("UNO tree mode does not yet support PDMux.")
         if cfg.enable_two_batch_overlap:
             raise ValueError("UNO tree mode does not yet support two-batch overlap.")
         if (
@@ -892,7 +892,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
 
 
 def _load_draft_hf_config(cfg):
-    from sglang.srt.utils.hf_transformers_utils import get_config
+    from sglang.srt.utils.hf_transformers import get_config
 
     return get_config(
         cfg.speculative_draft_model_path,
@@ -1147,7 +1147,7 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
 
 def _handle_iquest_q1_mtp_draft(server_args: ServerArgs) -> bool:
     from sglang.srt.configs.iquest_q1 import IQuestQ1MTPConfig
-    from sglang.srt.utils.hf_transformers_utils import get_config
+    from sglang.srt.utils.hf_transformers import get_config
 
     target = model_config_of(server_args).hf_config
     if target.architectures[0] != "IQuestQ1ForCausalLM":
@@ -1265,6 +1265,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",
+        "Xing4_0ForCausalLM",
         "HYV4ForCausalLM",
         # Qwen4-Exp ships its NEXTN draft layer inside the target checkpoint.
         "Qwen4ExpForConditionalGeneration",

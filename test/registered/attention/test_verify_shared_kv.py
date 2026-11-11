@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.triton_backend import (
 )
 from sglang.srt.layers.attention.triton_draft_hip import init_draft_backend
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_hip_version, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -97,9 +97,11 @@ class TestVerifySharedKV(CustomTestCase):
         l_ext=4,
         atol=BF16_ATOL,
         rtol=BF16_RTOL,
+        prefix_lens=(512, 2048),
+        sliding_window_size=-1,
     ):
         inputs = _build_inputs(
-            prefix_lens=[512, 2048],
+            prefix_lens=list(prefix_lens),
             l_ext=l_ext,
             h_q=h_q,
             h_kv=h_kv,
@@ -117,6 +119,7 @@ class TestVerifySharedKV(CustomTestCase):
             mla=False,
             k_scale=k_scale,
             v_scale=v_scale,
+            window=sliding_window_size,
         )
         reference = _extend(case, inputs, bf16_dot=False)
         actual = _extend(case, inputs, bf16_dot=False, kernel=verify_shared_kv_fwd)
@@ -163,6 +166,96 @@ class TestVerifySharedKV(CustomTestCase):
             h_kv=2,
             is_causal=False,
             l_ext=7,
+        )
+
+    def test_windowed_verify_matches_the_extend_kernel(self):
+        """Windowed verify must match the extend kernel at the M3.1 draft's window;
+        prefix lists are pre-windowed by the backend, at most one window long."""
+        for prefix_lens, window in (
+            ((300, 4095), 4095),
+            # The short window hides 0-6 of 16 keys per query, so an off-by-one shows.
+            ((16, 13), 16),
+            # Past 16 requests the combine merges several draft rows per program.
+            ((300, 4095) * 9, 4095),
+        ):
+            with self.subTest(window=window):
+                self._run_parity(
+                    head_dim=128,
+                    v_head_dim=128,
+                    h_q=16,
+                    is_causal=False,
+                    l_ext=7,
+                    prefix_lens=prefix_lens,
+                    sliding_window_size=window,
+                )
+
+    def test_strided_draft_rows_match_contiguous_rows(self):
+        """K/V rows split out of a packed qkv projection (the attention hands them
+        over uncopied) give the bits contiguous rows give."""
+        q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = _build_inputs(
+            prefix_lens=[300, 4095], l_ext=7, h_q=16, head_dim=128, v_head_dim=128
+        )
+        tokens = q.shape[0]
+        qkv = torch.cat([q.reshape(tokens, -1), k[:, 0], v[:, 0]], dim=-1)
+        k_rows = qkv[:, 16 * 128 : 17 * 128].view(tokens, 1, 128)
+        v_rows = qkv[:, 17 * 128 :].view(tokens, 1, 128)
+        self.assertFalse(v_rows.is_contiguous())
+        outs = []
+        for k_ext, v_ext in (
+            (k_rows, v_rows),
+            (k_rows.contiguous(), v_rows.contiguous()),
+        ):
+            out = torch.empty_like(q)
+            self.assertTrue(
+                verify_shared_kv_fwd(
+                    q,
+                    k_ext,
+                    v_ext,
+                    out,
+                    k_buffer,
+                    v_buffer,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    None,
+                    False,
+                    None,
+                    7,
+                    1.0,
+                    1.0,
+                    sm_scale=128**-0.5,
+                    sliding_window_size=4095,
+                    max_bs=2,
+                    allow_sliding_window=True,
+                )
+            )
+            outs.append(out)
+        self.assertTrue(torch.equal(outs[0], outs[1]))
+
+    def test_sliding_window_is_declined_unless_the_caller_opts_in(self):
+        """Only the M3.1 draft opts in; every other windowed caller keeps the extend kernel."""
+        q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = _build_inputs(
+            prefix_lens=[16], l_ext=7, h_q=16, head_dim=128, v_head_dim=128
+        )
+        self.assertFalse(
+            verify_shared_kv_fwd(
+                q,
+                k,
+                v,
+                torch.empty_like(q),
+                k_buffer,
+                v_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                None,
+                False,
+                None,
+                7,
+                1.0,
+                1.0,
+                sliding_window_size=16,
+            )
         )
 
     def test_rejects_non_power_of_two_kv_group(self):
@@ -328,6 +421,11 @@ def _extend(case, inputs, bf16_dot, kernel=extend_attention_fwd):
         **(
             {"max_bs": len(kv_indptr) - 1} if kernel is not extend_attention_fwd else {}
         ),
+        **(
+            {"allow_sliding_window": case.get("window", -1) > 0}
+            if kernel is verify_shared_kv_fwd
+            else {}
+        ),
     )
     if kernel is not extend_attention_fwd:
         assert ran is True
@@ -353,8 +451,17 @@ def _backend_extend(case, inputs, bf16_dot):
     backend.enable_deterministic = False
     backend.dllm_attention = None
     backend.page_size = 1
+    read = SimpleNamespace(
+        kv=lambda: (k_buffer, v_buffer), key=lambda: k_buffer, value=lambda: v_buffer
+    )
     backend.token_to_kv_pool = SimpleNamespace(
-        get_key_buffer=lambda _: k_buffer, get_value_buffer=lambda _: v_buffer
+        get_key_buffer=lambda _: k_buffer,
+        get_value_buffer=lambda _: v_buffer,
+        layer_router=SimpleNamespace(
+            read=lambda _: read,
+            route=lambda _: SimpleNamespace(sub_pool=None),
+            sub_pool=lambda _: None,
+        ),
     )
     backend.forward_metadata = SimpleNamespace(
         kv_indptr=kv_indptr,

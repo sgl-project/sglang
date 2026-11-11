@@ -6,7 +6,7 @@ Graph row capacity is fixed while live token counts and prefix state can change.
 
 import torch
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolved_view,
     resolving_view,
@@ -77,6 +77,14 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
     def allows_replay(self, batch_size, num_tokens, prefix_lens, contains_mm_inputs):
         return batch_size > 0 and not contains_mm_inputs and prefix_lens is not None
 
+    # GLM-5.3 Flash (KDA hybrid), the dense-DSA GLM MoE family (GLM-5.2 /
+    # GLM-5.3 and their fine-tunes) and Kimi-K3.1 share the interleave BCG path.
+    _SUPPORTED_ARCHITECTURES = (
+        "Glm5NextForConditionalGeneration",
+        "GlmMoeDsaForCausalLM",
+        "KimiK31ForConditionalGeneration",
+    )
+
     @staticmethod
     def supports(server_args):
         cfg = resolving_view(server_args)
@@ -86,21 +94,18 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
         # MegaMoE EP over the CP group: each rank owns its CP shard's rows.
         # Pipeline stages exchange CP-local rows (see execute_prefill_cp_bcg).
         kimi_ep = (
-            is_kimi_k31
-            and view.ep_size == cfg.tp_size == view.attn_cp_size
+            view.ep_size == cfg.tp_size == view.attn_cp_size
             and view.moe_a2a_backend == "megamoe"
             and cfg.moe_dp_size == 1
         )
         return (
             cfg.dp_size == 1
             and (cfg.pp_size == 1 or is_kimi_k31)
-            and (view.ep_size == 1 or kimi_ep)
+            and (not is_kimi_k31 or view.ep_size == 1 or kimi_ep)
             and view.attn_cp_size > 1
-            and bool(
-                {
-                    "Glm5NextForConditionalGeneration",
-                    "KimiK31ForConditionalGeneration",
-                }.intersection(architectures)
+            and any(
+                arch in architectures
+                for arch in InterleaveCPBCGInput._SUPPORTED_ARCHITECTURES
             )
         )
 

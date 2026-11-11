@@ -21,7 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.tree_slots import slot_of, tree_slots_of
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -54,7 +55,7 @@ def pipeline(selective):
     cache.sidecar_pool_specs = []
     cache.storage_existence_cache = StorageExistenceCache()
     cache.token_to_kv_pool_allocator.get_kvcache.return_value = SimpleNamespace(
-        size=128
+        size=128, layer_router=SimpleNamespace(sub_pool=lambda kind: None)
     )
     cache.tree_core.snapshot_buffer_backup.return_value = snapshot()
     cache.tree_core.buffer_backup_pool_keys.return_value = {
@@ -73,14 +74,21 @@ def real_tree_core(backend):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
         page_size=1,
-        tree_components=(ComponentType.FULL,),
+        tree_slots=tree_slots_of((ComponentType.FULL,)),
     )
     if backend == "rust":
         from sglang.srt.mem_cache.rust_tree_core.adapter import RustUnifiedTreeCore
 
         return RustUnifiedTreeCore(params)
     cache = SimpleNamespace(enable_session_radix_cache=False)
-    return UnifiedTreeCore(params, {ComponentType.FULL: FullComponent(cache, params)})
+    return UnifiedTreeCore(
+        params,
+        {
+            ComponentType.FULL: FullComponent(
+                cache, params, slot_of(params, ComponentType.FULL)
+            )
+        },
+    )
 
 
 def pump_insert(core, key):
@@ -233,6 +241,8 @@ class TestMambaSelectiveBackup(unittest.TestCase):
                 cache.disable = False
                 cache.tree_core = SimpleNamespace(is_eagle=False, page_size=2)
                 cache._components_tuple = ()
+                cache.components = {}
+                cache.linker = None
                 cache.req_to_token_pool = SimpleNamespace(
                     req_to_token=torch.arange(4).reshape(1, 4)
                 )

@@ -24,7 +24,9 @@ from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
     CALL_OPEN,
+    MESSAGE_CLOSE,
     RESPONSE_CLOSE,
+    RESPONSE_OPEN,
     THINK_CLOSE,
     THINK_OPEN,
     TOOLS_CLOSE,
@@ -211,9 +213,8 @@ def _with_root_definitions(
 
 
 def _is_root_structure_ref(ref: Any) -> bool:
-    # Refs into the definition pools resolve in every argument schema, which
-    # carries the root's pools; any other local ref points into the root's own
-    # structure, which an argument schema no longer has.
+    # Every argument schema carries the root's definition pools; other local
+    # refs point into the root's own structure, which an argument schema lacks.
     return (
         isinstance(ref, str)
         and (ref == "#" or ref.startswith("#/"))
@@ -224,14 +225,8 @@ def _is_root_structure_ref(ref: Any) -> bool:
 def _localize_root_refs(
     schema: Union[bool, Dict[str, Any]], root_schema: Dict[str, Any]
 ) -> Union[bool, Dict[str, Any]]:
-    """Make the root-structure refs of an argument schema resolvable inside it.
-
-    Each argument value compiles as its own JSON schema, so a ref such as
-    ``#/properties/value/properties/a`` would be looked up in the argument
-    schema and fail. Every such target (and, transitively, the root-structure
-    refs inside it) is copied under ``$defs`` and the ref is rewritten to it.
-    Unresolvable refs are left for the compiler to report.
-    """
+    # Each argument value compiles as its own schema, so every root-structure ref
+    # target is copied under its $defs and the ref rewritten to point there.
     if not isinstance(schema, dict):
         return schema
     pools = [schema.get(key) for key in ("$defs", "definitions")]
@@ -624,16 +619,47 @@ def _tool_calls_tag(call_tags: List[TagFormat], parallel_tool_calls: bool) -> Ta
     return TagFormat(begin=TOOLS_OPEN, content=content, end=TOOLS_CLOSE)
 
 
-def _auto_suffix(
-    tools_tag: TagFormat, parallel_tool_calls: bool
-) -> TriggeredTagsFormat:
+# Response text admits no control token: an exclude list of known markers would
+# miss the near-misses the model emits (<|close|>Message, a stray TOOLS_CLOSE).
+_RESPONSE_TEXT = AnyTextFormat(excludes=["<|open|>", _CLOSE_TOKEN])
+
+
+def _response(content: Format) -> OrFormat:
+    # Without thinking the prompt already opens the response channel, so the
+    # output starts inside it; after reasoning the model opens it itself.
+    return OrFormat(
+        elements=[
+            TagFormat(begin=RESPONSE_OPEN, content=content, end=RESPONSE_CLOSE),
+            TagFormat(begin="", content=content, end=RESPONSE_CLOSE),
+        ]
+    )
+
+
+_RESPONSE = _response(_RESPONSE_TEXT)
+# A model that wanted a tool otherwise closes an empty response block when no
+# tool may be called, and the client gets no content.
+_NONEMPTY_RESPONSE = _response(
+    SequenceFormat(
+        elements=[RegexFormat(pattern=r"[^ \t\r\n<]|<[^|<]"), _RESPONSE_TEXT]
+    )
+)
+
+# K3 emits MESSAGE_CLOSE before EOS, and EOS is masked until the grammar
+# completes, so a grammar ending at the tools close must still admit it.
+_OPTIONAL_MESSAGE_CLOSE = OptionalFormat(content=ConstStringFormat(value=MESSAGE_CLOSE))
+
+
+def _auto_suffix(tools_tag: TagFormat, parallel_tool_calls: bool) -> Format:
     # A retriggered second tools section would evade the single-call limit.
-    return TriggeredTagsFormat(
+    triggered = TriggeredTagsFormat(
         triggers=[TOOLS_OPEN],
         tags=[tools_tag],
         excludes=[THINK_OPEN, THINK_CLOSE, CALL_OPEN],
         stop_after_first=not parallel_tool_calls,
     )
+    if parallel_tool_calls:
+        return triggered
+    return SequenceFormat(elements=[triggered, _OPTIONAL_MESSAGE_CLOSE])
 
 
 def _with_reasoning(suffix: Format, thinking_mode: bool) -> Format:
@@ -747,7 +773,7 @@ def _select_tools(
 
 def get_kimik3_structural_tag(
     tools: List[Tool],
-    tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+    tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = "auto",
     thinking_mode: bool = False,
     parallel_tool_calls: bool = True,
     response_channel_open: bool = False,
@@ -760,6 +786,12 @@ def get_kimik3_structural_tag(
     response channel the model must close it first, otherwise the tools section
     comes immediately.
     """
+    if tool_choice == "none":
+        # The K3 prompt still lists the tools, so forbid the tools section
+        # instead of letting raw call markup reach the content.
+        suffix = SequenceFormat(elements=[_NONEMPTY_RESPONSE, _OPTIONAL_MESSAGE_CLOSE])
+        return StructuralTag(format=_with_reasoning(suffix, thinking_mode))
+
     selected_tools, at_least_one = _select_tools(tools, tool_choice)
     if not selected_tools:
         raise ValueError("Kimi K3 structural tags require at least one tool")
@@ -779,11 +811,13 @@ def get_kimik3_structural_tag(
                 (
                     ConstStringFormat(value=RESPONSE_CLOSE)
                     if response_channel_open
-                    else AnyTextFormat(
-                        excludes=[TOOLS_OPEN, THINK_OPEN, THINK_CLOSE, CALL_OPEN]
-                    )
+                    # Only a response may precede the tools section, so a model
+                    # that decides no tool is needed cannot close the message or
+                    # end the turn without making the call.
+                    else OptionalFormat(content=_RESPONSE)
                 ),
                 tools_tag,
+                _OPTIONAL_MESSAGE_CLOSE,
             ]
         )
     else:

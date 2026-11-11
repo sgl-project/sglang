@@ -23,8 +23,8 @@ from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.dcp import layout as dcp_layout
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase, published_topology

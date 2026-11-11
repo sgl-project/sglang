@@ -1,7 +1,7 @@
 """Numerical tests for the HPC-Ops bf16xfp32 router GEMM path.
 
 Validates sglang.kernels.ops.attention.dsv4.linear_bf16_fp32's HPC-Ops branch against
-the fp32 reference on the LongCat-Flash router shapes. Skipped when HPC-Ops
+the fp32 reference on the LongCat-Flash and MiMo-V2 router shapes. Skipped when HPC-Ops
 (https://github.com/Tencent/hpc-ops) is not installed or the GPU is not
 Hopper (the kernels ship sm90a only).
 """
@@ -27,8 +27,9 @@ register_cuda_ci(
     disabled="HPC-Ops is only built in docker/Dockerfile; not installed in CI",
 )
 
-# (hidden_size, n_routed_experts + zero experts) for LongCat-Flash Chat / Lite.
-_ROUTER_SHAPES = ((6144, 768), (3072, 384))
+# (hidden_size, n_routed_experts + zero experts) for LongCat-Flash Chat / Lite,
+# and (hidden_size, n_routed_experts) for MiMo-V2.5-Flash.
+_ROUTER_SHAPES = ((6144, 768), (3072, 384), (4096, 256))
 
 
 @unittest.skipUnless(

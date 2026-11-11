@@ -10,15 +10,17 @@ from typing import Any
 from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
     resolve_cp_tp_group_sharing,
 )
+from sglang.srt.arg_groups.model_override_base import (
+    model_config_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
     _dcp_comm_backend_default,
     _dp_lm_head_validation,
     _tp_lm_head_all_to_all_default,
     declare_resolution,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
     should_report_expert_balancedness,
 )
@@ -192,13 +194,20 @@ def handle_context_parallelism(server_args: Any):
             "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
         )
 
-    from sglang.srt.layers.cp.base import init_cp_strategy
+    from sglang.srt.layers.cp.base import init_cp_strategy, is_cp_sharded_padded
 
     init_cp_strategy(
         enable_prefill_cp=bool(cfg.enable_prefill_cp),
         cp_size=cfg.attn_cp_size,
         cp_strategy=cfg.cp_strategy,
+        cp_kv_layout=cfg.cp_kv_layout,
     )
+    if cfg.enable_unified_memory and is_cp_sharded_padded():
+        raise ValueError(
+            f"--cp-kv-layout {cfg.cp_kv_layout} keeps each rank's KV sharded "
+            "and padded, which --enable-unified-memory does not support; "
+            "drop one of them."
+        )
 
 
 def handle_shared_experts_tp(server_args: Any):
@@ -213,22 +222,14 @@ def handle_shared_experts_tp(server_args: Any):
         attn_cp_size=view.attn_cp_size,
         attn_dp_size=cfg.attn_dp_size,
     )
-    # Interleave PCP gives the FFN equal padded token-row shards after its
-    # residual/norm readout. Shared experts can gather those rows across CP
-    # as well as attention TP, then reduce-scatter to the original shards.
-    # A subgroup must still fit inside one attention-DP replica / PP stage.
+    # Shared experts can gather token rows across CP as well as attention TP,
+    # then reduce-scatter to the original shards. A subgroup must still fit
+    # inside one attention-DP replica / PP stage.
     replica_size = attn_tp_size * view.attn_cp_size
     if size < 1 or replica_size % size != 0:
         raise ValueError(
             f"--shared-experts-tp-size ({size}) must be a positive divisor "
             f"of attention replica size ({replica_size}, attention TP x CP)."
-        )
-    if attn_tp_size % size != 0 and not (
-        cfg.enable_prefill_cp and cfg.cp_strategy == "interleave"
-    ):
-        raise ValueError(
-            "Shared-expert TP across CP ranks requires --enable-prefill-cp "
-            "with --cp-strategy interleave (equal padded token-row shards)."
         )
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         raise ValueError(
@@ -731,9 +732,6 @@ def handle_elastic_ep(server_args: Any):
             )
             assert not cfg.forward_hooks, (
                 "Elastic EP CUDA graph recapture does not support forward hooks."
-            )
-            assert not cfg.enable_pdmux, (
-                "Elastic EP CUDA graph recapture does not support PDMux."
             )
         assert attn_dp_enabled_of(resolved), (
             "Elastic EP scale-up requires attention DP (--attn-dp-size); "

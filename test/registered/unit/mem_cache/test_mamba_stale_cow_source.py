@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import match_kv_cache
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.unified_radix_cache.config import CacheConfig
 from sglang.test.kits.unified_radix_cache.fixtures import (

@@ -47,7 +47,7 @@ def gather_covers(
 def gather_tail_read(
     bank: AttnResidual,
     part: torch.Tensor,
-    sq: torch.Tensor,
+    sq: Optional[torch.Tensor],
     shared: torch.Tensor,
     prefix: Optional[torch.Tensor],
     tail_eps: float,

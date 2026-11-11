@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.layers.cp.interleave import is_interleave_extend
+from sglang.srt.layers.cp.utils import cp_live_store_rows
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -75,39 +76,16 @@ def pcg_dsa_indexer_prefill_split(
     metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
     extend_num_tokens = forward_batch.extend_num_tokens
-    cp = is_interleave_extend(forward_batch)
-    query_tokens = extend_num_tokens
-    logical_tokens = extend_num_tokens
-    if cp:
-        from sglang.srt.layers.cp.bcg.interleave_bcg import cp_interleave_indexer_rows
-
-        query_tokens, logical_tokens = cp_interleave_indexer_rows(forward_batch)
-        parts = x if isinstance(x, tuple) else (x,)
-        if not 0 <= logical_tokens <= query_tokens or any(
-            query_tokens > part.shape[0] for part in parts
-        ):
-            raise ValueError("Invalid CP indexer live rows")
-        if query_tokens > q_lora.shape[0] or query_tokens > positions.shape[0]:
-            raise ValueError("CP indexer input rows do not cover the live shard")
-        x = (
-            tuple(part[:query_tokens] for part in parts)
-            if isinstance(x, tuple)
-            else x[:query_tokens]
-        )
-        q_lora, positions = q_lora[:query_tokens], positions[:query_tokens]
-        extend_num_tokens = forward_batch.attn_cp_metadata.total_seq_lens
-        if extend_num_tokens > forward_batch.out_cache_loc.shape[0]:
-            raise ValueError(
-                "CP indexer cache locations do not cover live global tokens"
-            )
-        topk_result.fill_(-1)
+    in_cp = forward_batch.attn_cp_metadata is not None
     # Empty buffer encodes return_indices=False for graph dispatch.
     return_indices = topk_result.numel() != 0
     k_only = not return_indices or (
         indexer._should_skip_logits_computation(forward_batch)
         and not indexer.dsa_enable_prefill_cp
     )
-    if k_only and not cp:
+    # The K-only path stores the local K without the CP all-gather, so a
+    # top-k-reuse layer under CP takes the gathered store below instead.
+    if k_only and not in_cp:
         indexer._forward_cuda_k_only(
             x,
             positions,
@@ -122,7 +100,7 @@ def pcg_dsa_indexer_prefill_split(
         return
 
     # Same fused Q/K writer as the eager ROCm path, sliced to the unpadded count.
-    if not cp and indexer._aiter_fused_fp8_active(forward_batch):
+    if indexer._aiter_fused_fp8_active(forward_batch):
         q_fp8, weights = indexer._aiter_fused_fp8_prepare_and_store(
             x,
             q_lora,
@@ -145,7 +123,7 @@ def pcg_dsa_indexer_prefill_split(
     # Fused path stores K (no-Hadamard) and computes q_fp8 + head gate in the
     # fused kernels, sliced to the unpadded count. Single stream: the split op is
     # captured, so the dual-stream overlap is disabled.
-    if not cp and indexer.use_dsa_indexer_fusion:
+    if indexer.use_dsa_indexer_fusion and not in_cp:
         q_fp8, weights = indexer._fused_q_prepare_and_store(
             x,
             q_lora,
@@ -182,7 +160,7 @@ def pcg_dsa_indexer_prefill_split(
     ):
         from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
 
-        gate = indexer._weights_proj_bf16_in_fp32_out(x)
+        gate = indexer._project_head_gates(x)
         q_fp8, weights = indexer_q_quant_head_gate(
             query, gate, indexer.softmax_scale, indexer.scale_fmt
         )
@@ -196,12 +174,19 @@ def pcg_dsa_indexer_prefill_split(
     # Store K cache + ragged top-k, sliced to the unpadded count and writing into
     # the static padded topk_result buffer (the graph contract). Mirrors the eager
     # path's store + _get_topk_ragged.
+    # Under CP the key comes back gathered in global order, so it is sliced
+    # like the non-CP path. BCG replay hands over the bucket-sized static
+    # out_cache_loc and a gathered key whose padding sits at the tail; only
+    # the live rows are stored.
+    n_store = extend_num_tokens
+    if in_cp:
+        n_store = cp_live_store_rows(forward_batch, key.shape[0], "indexer K")
     indexer._store_index_k_cache(
         forward_batch=forward_batch,
         layer_id=layer_id,
-        key=key[:extend_num_tokens],
+        key=key[:n_store],
         act_quant=act_quant,
-        out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
+        out_cache_loc=forward_batch.out_cache_loc[:n_store],
     )
     if not return_indices:
         return
@@ -209,12 +194,17 @@ def pcg_dsa_indexer_prefill_split(
         False,
         forward_batch,
         layer_id,
-        q_fp8[:query_tokens],
+        q_fp8 if in_cp else q_fp8[:extend_num_tokens],
         weights,
         metadata,
         topk_result,
     )
-    if cp:
+    if is_interleave_extend(forward_batch):
+        # Interleave BCG replays a bucket-sized local shard: the top-k rows
+        # past this rank's logical tokens stay -1.
+        from sglang.srt.layers.cp.bcg.interleave_bcg import cp_interleave_indexer_rows
+
+        _, logical_tokens = cp_interleave_indexer_rows(forward_batch)
         topk_result[logical_tokens:].fill_(-1)
 
 

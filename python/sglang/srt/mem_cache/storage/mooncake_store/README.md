@@ -52,15 +52,14 @@ to 16 MiB. Size it for concurrent reads and writes, including large recurrent
 state objects. This is per-client transient memory, separate from the shared
 `global_segment_size`; include both in the host memory budget.
 
-### Direct Linker with PCP and RDMA
+### Direct Linker with RDMA
 
 The direct Linker requires `--pp-size 1`; pipeline parallelism is not supported.
-For K31's hybrid DSA/KDA pools, interleave PCP keeps complete DSA KV and
-indexer pages on each GPU. The direct Linker shares these objects across
-replicated PCP and attention-TP ranks, with one writer per shared pool.
-Every rank reads the shared objects into its own GPU buffers. KDA state keeps
-rank-specific objects; replicated MLA draft pools also share across attention-TP
-ranks. This deduplicates L3 storage, not GPU allocations.
+For K31's hybrid DSA/KDA pools, every attention-TP rank holds identical DSA KV,
+indexer and MLA draft pages. The direct Linker shares these objects across
+attention-TP ranks, with one writer per shared pool. Every rank reads the shared
+objects into its own GPU buffers. KDA state keeps rank-specific objects. This
+deduplicates L3 storage, not GPU allocations.
 Use a distinct `extra_backend_tag` for each model/draft revision, dtype, page
 layout and parallel topology; the shared keys do not enable cross-topology reuse.
 
@@ -134,10 +133,12 @@ When integrated with **SGLang**, the system conceptually consists of four key co
 **Launch Mooncake `metadata service` (Optional):**
 
 ```bash
-python -m mooncake.http_metadata_server
+python -m mooncake.http_metadata_server --host 127.0.0.1
 ```
 
 This service is responsible for centralized metadata management including internal connection status and related metadata.
+
+Since Mooncake 0.3.14, the metadata server refuses to bind a non-loopback address (such as the default `0.0.0.0`) without an authentication token. Bind `127.0.0.1` for a single-server setup. For a multi-server setup, set the same `MC_METADATA_HTTP_TOKEN` on the metadata server and on every SGLang server and store service.
 
 Deployment of the `metadata service` can be skipped in the following cases:
 * Mooncake supports non-centralized metadata management via a P2P handshake mechanism to exchange metadata. When using this mode, deployment of the `metadata service` can be skipped.

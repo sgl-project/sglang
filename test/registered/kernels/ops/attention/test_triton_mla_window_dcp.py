@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.triton_draft_hip import (
     MlaDcpWindowVerify,
     init_draft_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     is_mla_dcp_lse_base_on_e,
 )

@@ -155,6 +155,23 @@ def _aiter_situ_uses_gu_interleaved_weights() -> bool:
     return a8w4 or not a4w4
 
 
+def _situ_gate_mode_kwargs(layer) -> Optional[dict]:
+    """fused_moe kwargs naming the gate/up layout of a K3 SiTU layer's w13.
+
+    The preshuffled A8W4 / A16W4 w13 is GU-interleaved; AITER's mxmoe stage1
+    kernels read it by ``gate_mode`` (the older "gui" kernels ignore it).
+    gfx95 only: on other archs (gfx1250) INTERLEAVE selects AITER kernels that
+    read a different interleaved layout, so the runner keeps its default there.
+    """
+    if not getattr(layer, "situ_gate_up_interleaved", False):
+        return None
+    if not is_gfx95_supported():
+        return None
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    return {"gate_mode": GateMode.INTERLEAVE.value}
+
+
 def _aiter_situ_uses_a8w4() -> bool:
     """Match AITER's SiTU activation-mode precedence: A8W4 wins over A4W4, and
     gfx1250 overrides it with fp4 activations."""
@@ -1104,6 +1121,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # fused_moe selects the preshuffle_on kernel family.
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
+            # K3 SiTU: tell the AITER runner which gate/up layout w13 holds.
+            layer.situ_gate_up_interleaved = k3_situ and use_aiter_gu_interleave
 
             layer.w13_weight_scale = torch.nn.Parameter(
                 shuffled_w13_scale, requires_grad=False
@@ -1860,6 +1879,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
             hidden_pad=self.hidden_pad,
             intermediate_pad=self.intermediate_pad,
+            fused_moe_kwargs=_situ_gate_mode_kwargs(layer),
             # Applies swiglu clamp for GPT-OSS-style activations. K3 SiTU
             # uses gemm1_clamp_limit as linear_beta, which is forwarded by
             # the AITER runner and must not be treated as swiglu_limit.

@@ -40,7 +40,6 @@ from sglang.kernels.ops.attention.dsa.dcp_topk_merge import (
     dcp_topk_merge_buffer_numel,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
-    candidates_cluster_size,
     topk_transform_candidates_v2,
     topk_transform_packed_v2,
     topk_transform_paged_v2,
@@ -183,38 +182,51 @@ _DCP_MERGE_CAND_K = 384
 
 class DcpTopKMerge:
     """Exact global top-k merge of decode rows in one kernel; see
-    jit/csrc/dsa/dcp_topk_merge.cuh. Needs 8 or 16 ranks (one warp each), top-k
-    2048 and multicast; ``usable`` is False otherwise. ``split``: candidates come
-    from the context-split verify indexer."""
+    jit/csrc/dsa/dcp_topk_merge.cuh. Built by ``create``. Calls go on one
+    stream, never concurrently, with the same rows in the same order on every
+    rank."""
 
-    def __init__(self, group, max_rows: int, topk: int, split: bool = False):
+    def __init__(self, group, max_rows: int, topk: int, buffer: torch.Tensor, handle):
+        device = group.device
+        self.dcp_rank = group.rank_in_group
+        self.max_rows = max_rows
+        self.buffer = buffer
+        self.multicast_ptr = handle.multicast_ptr
+        self.peer_ptrs = torch.tensor(
+            handle.buffer_ptrs, dtype=torch.int64, device=device
+        )
+        self.counters = torch.zeros(max_rows, dtype=torch.int64, device=device)
+        # 1 where a row's candidates could not certify the result (for tests)
+        self.fallback = torch.zeros(max_rows, dtype=torch.int32, device=device)
+        self.union_scratch = torch.empty(
+            (max_rows, group.world_size * topk), dtype=torch.int64, device=device
+        )
+
+    @classmethod
+    def create(
+        cls, group, max_rows: int, topk: int, dcp_rank: int
+    ) -> Optional["DcpTopKMerge"]:
+        """Collective over ``group``. None unless it has 8 ranks (16 with the
+        megakernel), top-k is 2048, and its GPUs share NVLink multicast."""
         import torch.distributed._symmetric_memory as symm_mem
 
-        self.rank = group.rank_in_group
-        self.max_rows = max_rows
-        self.split = split
-        self.buffer: Optional[torch.Tensor] = None
-        self.multicast_ptr = 0
-        self.peer_ptrs: Optional[torch.Tensor] = None
-        self.counters: Optional[torch.Tensor] = None
-        # 1 where a row's candidates could not certify the result (for tests)
-        self.fallback: Optional[torch.Tensor] = None
-        self.union_scratch: Optional[torch.Tensor] = None
+        # the certificate counts rank q's keys as positions p % world == q
+        assert group.rank_in_group == dcp_rank, (group.rank_in_group, dcp_rank)
 
         world = group.world_size
-        # 16 ranks only on megakernel paths; stock DCP16 keeps the all-gather.
-        worlds = (8, 16) if split or megakernel_enabled() else (8,)
+        worlds = (8, 16) if megakernel_enabled() else (8,)
         if world not in worlds or topk != 2048:
             print_info_once(
                 "DSA DCP top-k merge off: it needs 8 or 16 ranks and top-k 2048"
                 if 16 in worlds
                 else "DSA DCP top-k merge off: it needs 8 ranks and top-k 2048"
             )
-            return
+            return None
         if not all(in_the_same_node_as(group.cpu_group)) and not is_one_nvlink_clique(
             group.cpu_group, group.device
         ):
-            return
+            print_info_once("DSA DCP top-k merge off: ranks span NVLink domains")
+            return None
         buffer = symm_mem.empty(
             dcp_topk_merge_buffer_numel(world, max_rows, topk, _DCP_MERGE_CAND_K),
             dtype=torch.int64,
@@ -227,27 +239,18 @@ class DcpTopKMerge:
         handle = symm_mem.rendezvous(buffer, group.device_group.group_name)
         if handle.multicast_ptr == 0:
             print_info_once("DSA DCP top-k merge off: no multicast")
-            return
-        self.buffer = buffer
-        self.multicast_ptr = handle.multicast_ptr
-        self.peer_ptrs = torch.tensor(
-            handle.buffer_ptrs, dtype=torch.int64, device=group.device
-        )
-        self.counters = torch.zeros(max_rows, dtype=torch.int64, device=group.device)
-        self.fallback = torch.zeros(max_rows, dtype=torch.int32, device=group.device)
-        self.union_scratch = torch.empty(
-            (max_rows, world * topk), dtype=torch.int64, device=group.device
-        )
+            return None
+        return cls(group, max_rows, topk, buffer, handle)
 
     def usable(self, rows: int) -> bool:
-        return self.buffer is not None and rows <= self.max_rows
+        return rows <= self.max_rows
 
     def __call__(
         self,
         candidates: torch.Tensor,
         global_lens: torch.Tensor,
         page_table: torch.Tensor,
-        out: torch.Tensor,
+        out_slots: torch.Tensor,
         span: int,
     ) -> None:
         dcp_topk_merge(
@@ -259,32 +262,30 @@ class DcpTopKMerge:
             peer_ptrs=self.peer_ptrs,
             counters=self.counters,
             union_scratch=self.union_scratch,
-            out_slots=out,
-            out_fallback=self.fallback[: out.shape[0]],
-            rank=self.rank,
+            out_slots=out_slots,
+            out_fallback=self.fallback[: out_slots.shape[0]],
+            dcp_rank=self.dcp_rank,
             span=span,
             cand_k=_DCP_MERGE_CAND_K,
-            split=self.split,
         )
 
 
 _TOPK_MERGE: Optional[DcpTopKMerge] = None
+_TOPK_MERGE_INITIALIZED = False
 
 
 def init_dcp_topk_merge(max_rows: int, topk: int) -> None:
     """Collective over the DCP group; call on every rank before CUDA graph
     capture."""
-    global _TOPK_MERGE
-    if _TOPK_MERGE is not None:  # one buffer per process
+    global _TOPK_MERGE, _TOPK_MERGE_INITIALIZED
+    if _TOPK_MERGE_INITIALIZED:  # one buffer per process
         return
+    _TOPK_MERGE_INITIALIZED = True
     parallel = get_parallel()
     group = parallel.dcp_group
     # the kernel's rank must be the one the local candidates encode positions with
-    assert (group.world_size, group.rank_in_group) == (
-        parallel.attn_dcp_size,
-        parallel.attn_dcp_rank,
-    )
-    _TOPK_MERGE = DcpTopKMerge(group, max_rows, topk)
+    assert group.world_size == parallel.attn_dcp_size
+    _TOPK_MERGE = DcpTopKMerge.create(group, max_rows, topk, parallel.attn_dcp_rank)
 
 
 def _zeros_i32(n: int, device: torch.device) -> torch.Tensor:
@@ -416,10 +417,9 @@ def _local_candidates(
         logits,
         local_lens,
         out_candidates=out,
-        world=parallel.attn_dcp_size,
-        rank=parallel.attn_dcp_rank,
-        stable_ties=True,
-        cluster_size=candidates_cluster_size(rows),
+        dcp_size=parallel.attn_dcp_size,
+        dcp_rank=parallel.attn_dcp_rank,
+        deterministic=True,
         cluster_floor=_CANDIDATE_CLUSTER_FLOOR,
     )
     return out
@@ -515,7 +515,7 @@ def dcp_global_topk(
         BLOCK=block,
     )
     topk_transform_paged_v2(
-        dense, global_lens, page_table, out, span, plan, stable_ties=True
+        dense, global_lens, page_table, out, span, plan, deterministic=True
     )
     return out
 
@@ -545,7 +545,7 @@ def dcp_all_visible(
         out,
         span,
         row_starts=_zeros_i32(rows, global_lens.device),
-        stable_ties=True,
+        deterministic=True,
     )
     return out
 

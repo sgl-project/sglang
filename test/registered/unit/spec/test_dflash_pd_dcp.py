@@ -11,7 +11,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.speculative import draft_worker_common
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci

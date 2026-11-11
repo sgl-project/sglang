@@ -1,7 +1,9 @@
+#include <sgl_kernel/once.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/math.cuh>
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
@@ -43,13 +45,21 @@ struct MegaMoEPreDispatchParams {
   uint32_t hidden;
   uint32_t num_groups;  // hidden / group_size
   uint32_t top_k;
+  float topk_weight_scale;
 };
 
 // kGroupSize must match the consuming MoE's activation scale group (quant_group_size).
 // kMultiChunk covers rows too wide for one chunk per thread. It is a template
 // parameter rather than a runtime check because this kernel is issue-bound: the
 // loop bookkeeping alone costs ~10% on the rows that fit a single chunk.
-template <uint32_t kGroupSize, bool kUsePDL, bool kMultiChunk, bool kWriteSharedSF, bool kCopyTopk, bool kMaskPadding>
+template <
+    uint32_t kGroupSize,
+    bool kUsePDL,
+    bool kMultiChunk,
+    uint32_t kChunksPerThread,
+    bool kWriteSharedSF,
+    bool kCopyTopk,
+    bool kMaskPadding>
 __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     mega_moe_pre_dispatch_kernel(const MegaMoEPreDispatchParams __grid_constant__ params) {
   using namespace device;
@@ -82,8 +92,7 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
                    m % 32u * 4u + m % 128u / 32u;
     }
 
-    const auto quantize_chunk = [&](uint32_t chunk) {
-      InputVec in_vec;
+    const auto load_chunk = [&](InputVec& in_vec, uint32_t chunk) {
       if (valid) {
         in_vec.load(token_in, chunk);
       } else {
@@ -92,7 +101,9 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
         for (uint32_t i = 0; i < kVecElems / 2; ++i)
           in_vec[i] = bf16x2_t{};
       }
+    };
 
+    const auto quantize_chunk = [&](uint32_t chunk, const InputVec& in_vec) {
       float local_max = 0.0f;
       float vals[kVecElems];
 #pragma unroll
@@ -141,28 +152,40 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
       // consecutive lanes.
       const uint32_t num_chunks = params.hidden / kVecElems;
       for (uint32_t chunk = tid; chunk < num_chunks; chunk += blockDim.x) {
-        quantize_chunk(chunk);
+        InputVec in_vec;
+        load_chunk(in_vec, chunk);
+        quantize_chunk(chunk, in_vec);
       }
     } else {
-      quantize_chunk(tid);
+      InputVec in_vecs[kChunksPerThread];
+#pragma unroll
+      for (uint32_t c = 0; c < kChunksPerThread; ++c) {
+        load_chunk(in_vecs[c], tid + c * blockDim.x);
+      }
+#pragma unroll
+      for (uint32_t c = 0; c < kChunksPerThread; ++c) {
+        quantize_chunk(tid + c * blockDim.x, in_vecs[c]);
+      }
     }
 
     // Copy this token's topk row (no alignment assumptions; top_k is small).
     if (kCopyTopk && tid < params.top_k) {
       const uint32_t off = token_id * params.top_k + tid;
       params.buf_topk_idx[off] = valid ? params.topk_idx[off] : -1;
-      params.buf_topk_weights[off] = valid ? params.topk_weights[off] : 0.0f;
+      params.buf_topk_weights[off] = valid ? __fmul_rn(params.topk_weights[off], params.topk_weight_scale) : 0.0f;
     }
   } else {
     // ---- Pad path: trailing blocks fill [num_tokens, padded_max) with (-1, 0) ----
     const uint32_t copy_bid = bid - params.num_tokens;
     const uint32_t pad_base = params.num_tokens * params.top_k;
-    const uint32_t slot = pad_base + copy_bid * blockDim.x + tid;
     const uint32_t total_slots = params.padded_max * params.top_k;
-
-    if (slot < total_slots) {
-      params.buf_topk_idx[slot] = -1;
-      params.buf_topk_weights[slot] = 0.0f;
+#pragma unroll
+    for (uint32_t c = 0; c < kChunksPerThread; ++c) {
+      const uint32_t slot = pad_base + (copy_bid * kChunksPerThread + c) * blockDim.x + tid;
+      if (slot < total_slots) {
+        params.buf_topk_idx[slot] = -1;
+        params.buf_topk_weights[slot] = 0.0f;
+      }
     }
   }
   PDLTriggerSecondary<kUsePDL>();
@@ -178,6 +201,23 @@ struct MegaMoEPreDispatchKernel {
       static_cast<uint32_t>(kGroupSize),
       kUsePDL,
       false,
+      1,
+      kWriteSharedSF,
+      kCopyTopk,
+      kMaskPadding>;
+  static constexpr auto kernel_two_chunks = mega_moe_pre_dispatch_kernel<
+      static_cast<uint32_t>(kGroupSize),
+      kUsePDL,
+      false,
+      2,
+      kWriteSharedSF,
+      kCopyTopk,
+      kMaskPadding>;
+  static constexpr auto kernel_four_chunks = mega_moe_pre_dispatch_kernel<
+      static_cast<uint32_t>(kGroupSize),
+      kUsePDL,
+      false,
+      4,
       kWriteSharedSF,
       kCopyTopk,
       kMaskPadding>;
@@ -185,9 +225,18 @@ struct MegaMoEPreDispatchKernel {
       static_cast<uint32_t>(kGroupSize),
       kUsePDL,
       true,
+      1,
       kWriteSharedSF,
       kCopyTopk,
       kMaskPadding>;
+
+  static int max_threads_per_sm(int device_id) {
+    return host::init_once(device_id, [device_id] {
+      int threads = 0;
+      host::RuntimeDeviceCheck(cudaDeviceGetAttribute(&threads, cudaDevAttrMaxThreadsPerMultiProcessor, device_id));
+      return threads;
+    });
+  }
 
   static void
   run(const tvm::ffi::TensorView x,
@@ -199,6 +248,7 @@ struct MegaMoEPreDispatchKernel {
       const tvm::ffi::TensorView buf_topk_weights,
       const tvm::ffi::Optional<tvm::ffi::TensorView> shared_x_sf,
       const int64_t shared_block_m,
+      const double topk_weight_scale,
       const tvm::ffi::Optional<tvm::ffi::TensorView> num_token_non_padded) {
     using namespace host;
 
@@ -208,7 +258,7 @@ struct MegaMoEPreDispatchKernel {
     auto H = SymbolicSize{"hidden"};
     auto K = SymbolicSize{"top_k"};
     auto G4 = SymbolicSize{"num_groups_div_4"};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({M, H})  // input x
         .with_dtype<bf16_t>()
@@ -265,8 +315,20 @@ struct MegaMoEPreDispatchKernel {
         reinterpret_cast<uintptr_t>(buf_x_sf.data_ptr()) % 16u == 0, "buf_x_sf base address must be 16B-aligned");
     RuntimeCheck(hidden % 8u == 0, "hidden must be a multiple of 8 (16B bf16 loads)");
     const auto num_chunks = hidden / 8u;
-    const auto block_size = std::min(num_chunks, kMaxBlockThreads);
     const bool one_chunk_per_thread = num_chunks <= kMaxBlockThreads;
+    const auto device_id = device.unwrap().device_id;
+    const auto fits = [&](uint32_t n) {
+      return num_chunks % (n * device::kWarpThreads) == 0 && top_k <= num_chunks / n;
+    };
+    uint32_t chunks_per_thread = 1;
+    if (one_chunk_per_thread && 2u * num_chunks > static_cast<uint32_t>(max_threads_per_sm(device_id))) {
+      if (fits(4u) && num_tokens >= 6u * runtime::get_sm_count(device_id)) {
+        chunks_per_thread = 4;
+      } else if (fits(2u)) {
+        chunks_per_thread = 2;
+      }
+    }
+    const auto block_size = std::min(num_chunks, kMaxBlockThreads) / chunks_per_thread;
     // The quant group absmax is a full-warp-mask shuffle, so either the row fits
     // one iteration or its tail iteration is entered by whole warps.
     RuntimeCheck(
@@ -290,7 +352,8 @@ struct MegaMoEPreDispatchKernel {
     }
 
     const auto pad_slots = kCopyTopk ? (padded_max - num_tokens) * top_k : 0u;
-    const uint32_t num_pad_blocks = pad_slots == 0 ? 0u : ((pad_slots + block_size - 1u) / block_size);
+    const uint32_t pad_slots_per_block = block_size * chunks_per_thread;
+    const uint32_t num_pad_blocks = div_ceil(pad_slots, pad_slots_per_block);
     const auto num_total_blocks = num_tokens + num_pad_blocks;
 
     const int32_t* live_count = nullptr;
@@ -322,16 +385,15 @@ struct MegaMoEPreDispatchKernel {
         .hidden = hidden,
         .num_groups = num_groups,
         .top_k = top_k,
+        .topk_weight_scale = static_cast<float>(topk_weight_scale),
     };
 
     if (num_total_blocks == 0) return;
-    if (one_chunk_per_thread) {
-      LaunchKernel(num_total_blocks, block_size, device.unwrap())  //
-          .enable_pdl(kUsePDL)(kernel_one_chunk, params);
-    } else {
-      LaunchKernel(num_total_blocks, block_size, device.unwrap())  //
-          .enable_pdl(kUsePDL)(kernel_multi_chunk, params);
-    }
+    const auto kernel = !one_chunk_per_thread    ? kernel_multi_chunk
+                        : chunks_per_thread == 4 ? kernel_four_chunks
+                        : chunks_per_thread == 2 ? kernel_two_chunks
+                                                 : kernel_one_chunk;
+    LaunchKernel(num_total_blocks, block_size, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 

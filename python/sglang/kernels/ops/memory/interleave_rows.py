@@ -20,7 +20,8 @@ def _interleave_rows_kernel(
     TO_RANK_MAJOR: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    # 64-bit offsets: rows x width overflows int32 at long contexts.
+    row = tl.program_id(0).to(tl.int64)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     if TO_RANK_MAJOR:
         source = row % rank_rows * CP_SIZE + row // rank_rows
@@ -45,7 +46,7 @@ def interleave_rows(
     ``output_rows`` trims rank padding when restoring sequence order. This is a
     local copy and performs no communication.
     """
-    assert x.is_cuda and x.is_contiguous() and x.ndim >= 2
+    assert x.device.type != "cpu" and x.is_contiguous() and x.ndim >= 2
     assert cp_size > 0 and output_rows >= 0
     rank_total = output_rows if to_rank_major else x.shape[0]
     sequence_total = x.shape[0] if to_rank_major else output_rows

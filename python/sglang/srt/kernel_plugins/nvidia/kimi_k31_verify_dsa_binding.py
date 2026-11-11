@@ -125,8 +125,10 @@ class K31SparseVerifyHostBinding(K31VerifyHostBinding):
         b, r = int(forward_batch.batch_size), int(input_ids.shape[0])
         if not b or r % b or not built.supports(b, r // b, r):
             return None
-        spec = forward_batch.spec_info
-        if spec is None or getattr(spec, "ragged_verify_layout", None) is not None:
+        if (
+            forward_batch.spec_info is None
+            or forward_batch.ragged_verify_layout is not None
+        ):
             return None
         return Step(mode="target_verify", rows=r)
 

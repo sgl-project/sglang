@@ -17,7 +17,7 @@ register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 # backend-specific: a ROCm host validates the pairing as ROCm, not as CUDA.
 register_amd_ci(est_time=12, stage="stage-b", runner_config="1-gpu-small-amd")
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.speculative import dflash_info
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput

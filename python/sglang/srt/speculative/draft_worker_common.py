@@ -6,12 +6,13 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
+from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import attention_backends, get_platform, get_spec
-from sglang.srt.server_args import DRAFT_ATTENTION_BACKEND_CHOICES, ServerArgs
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 

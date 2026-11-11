@@ -27,6 +27,44 @@ _SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
 
+for _name in ("npu_w8a8_block_fp8_linear", "npu_w8a8_block_fp8_grouped_matmul"):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.{_name}",
+            backend=KernelBackend.TORCH_NPU,
+            target=f"sglang.kernels.ops.gemm.npu_block_fp8:{_name}",
+            capabilities=frozenset({CapabilityRequirement.NPU}),
+        )
+    )
+del _name
+
+
+def npu_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Ascend arch35 BF16/FP16 Linear with 128x128 FP8 weights and FP32 scales."""
+    return get_kernel("gemm.npu_w8a8_block_fp8_linear", KernelBackend.TORCH_NPU)(
+        input, weight, weight_scale, bias
+    )
+
+
+def npu_w8a8_block_fp8_grouped_matmul(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_list: torch.Tensor,
+    group_list_type: int,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Ascend arch35 grouped BF16/FP16 input and checkpoint-layout FP8 weights."""
+    return get_kernel(
+        "gemm.npu_w8a8_block_fp8_grouped_matmul", KernelBackend.TORCH_NPU
+    )(input, weight, weight_scale, group_list, group_list_type, output_dtype)
+
+
 def _prefer_torch_rowwise_fp8(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
@@ -208,22 +246,6 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
-        op="gemm.n128k512",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.small_gemm_bf16:n128k512_gemm_bf16",
-        capabilities=CUDA_ONLY,
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="gemm.n32k5120",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.small_gemm_bf16:n32k5120_gemm_bf16",
-        capabilities=CUDA_ONLY,
-    )
-)
-register_kernel(
-    KernelSpec(
         op="gemm.qwen3x_nvfp4",
         backend=KernelBackend.KDA,
         target=f"{_KDA_PACKAGE}.qwen3x_nvfp4_gemm:try_qwen3x_nvfp4_gemm",
@@ -345,6 +367,8 @@ __all__ = [
     "dual_gemm_swiglu_fp8",
     "fp8_scaled_mm",
     "kimi_k3_tiny_gemm",
+    "npu_w8a8_block_fp8_grouped_matmul",
+    "npu_w8a8_block_fp8_linear",
     "try_qwen3x_nvfp4_gemm",
     "try_sm120_fp8_linear",
 ]
@@ -547,5 +571,29 @@ register_kernel(
         backend=KernelBackend.TORCH,
         target="sglang.kernels.ops.gemm.router_gemv:router_gemm_bf16x3_cublas",
         capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.hopper_fp8_block_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.hopper_fp8_block_gemv:hopper_fp8_block_gemv",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.hopper_bf16_tiny_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.hopper_bf16_tiny_gemv:hopper_bf16_tiny_gemv",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.router_gate_matvec_cuda",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.router_gate_matvec_cuda:router_gate_matvec_cuda",
+        capabilities=_SM90,
     )
 )
