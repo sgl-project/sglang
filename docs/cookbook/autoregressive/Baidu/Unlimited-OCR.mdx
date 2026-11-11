@@ -43,9 +43,13 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-For Ascend NPU, start an A3 container with the [Ascend installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation), map the davinci devices, and run the generated Python command inside it. Ascend support is added by [SGLang PR #49522](https://github.com/sgl-project/sglang/pull/49522); use a build that contains it.
+<Accordion title="Install and prepare Ascend NPUs">
 
-Pick your hardware to generate the launch command. On H100 the recipe uses FlashAttention-3 with `--page-size 1`, which is required by the current prefill-aware sliding-window attention path. On Ascend A3 the recipe uses `--attention-backend ascend --page-size 128`; the Ascend adapter rejects speculative decoding, and the recipe passes `--disable-radix-cache`. Both recipes disable radix cache by default, which is the better fit for batch OCR workloads where each request usually contains a different image.
+Follow the [Ascend installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) to start an A3 container with the NPU devices and driver mounts. The SGLang build must contain [PR #49522](https://github.com/sgl-project/sglang/pull/49522); build from source if the image predates it. Mount the checkpoint directory and replace the model path in the generated command with that mounted path.
+
+</Accordion>
+
+Pick your hardware to generate the launch command. On H100 the recipe uses FlashAttention-3 with `--page-size 1`, which is required by the current prefill-aware sliding-window attention path. On Ascend A3 the recipe uses `--attention-backend ascend --page-size 128` and `--disable-radix-cache`. Both recipes disable radix cache by default, which is the better fit for batch OCR workloads where each request usually contains a different image.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/baidu/unlimited-ocr.jsx";
@@ -73,9 +77,9 @@ The SGLang integration loads the standalone Unlimited-OCR architecture with SAM 
 - **Attention backend**: on H100 use `--attention-backend fa3 --page-size 1`. The prefill-aware SWA page table is built with token-level locations, so page size 1 is required. On Ascend A3 use `--attention-backend ascend --device npu --page-size 128`.
 - **Radix cache**: keep `--disable-radix-cache` for batch OCR over different documents. If your workload repeatedly asks about the same image and prompt, remove this flag to allow prefix reuse through `PureSWARadixCache`.
 - **Long OCR generations**: keep the default prefill-aware SWA path enabled. It retains prompt and image KV while still applying a sliding window to generated text.
-- **Ascend NPU**: keep overlap scheduling enabled; the adapter fixes custom logit processor sampling order under overlap. The adapter rejects speculative decoding, so do not add `--speculative-algorithm`; graph capture and chunked prefill keep their defaults. The validated configuration is TP1 on one A3 die, base image mode, context length 32768, mem fraction 0.8, and default chunked prefill; TP, DP, and non-base image modes were not validated.
+- **Ascend NPU**: keep overlap scheduling enabled. The validated configuration is TP1 on one A3 die, context length 32768, mem fraction 0.8, and the default graph capture and chunked-prefill settings; TP, DP, and image modes other than the ones listed below were not validated.
 - **Custom logit processor**: keep `--enable-custom-logit-processor` in the launch command.
-- **Image modes**: pass `images_config.image_mode` per request. Supported modes are `tiny`, `small`, `base`, `large`, and `gundam`. Multiple images are supported only for `tiny`, `small`, and `base`. On Ascend, only `base` has been validated.
+- **Image modes**: pass `images_config.image_mode` per request. Supported modes are `tiny`, `small`, `base`, `large`, and `gundam`. Multiple images are supported only for `tiny`, `small`, and `base`. The 1651-page accuracy run used `gundam` on single-page requests; `base` was validated on 2-3 page requests. Other modes and `gundam` multi-page requests were not validated.
 - **Default image mode**: when `images_config.image_mode` is omitted, SGLang uses `gundam`.
 
 ## 3. Advanced Usage

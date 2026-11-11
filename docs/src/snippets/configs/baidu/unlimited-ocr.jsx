@@ -10,7 +10,7 @@ export const config = {
   strategies: [{ id: "balanced", label: "Balanced" }],
   nodesOptions: [{ id: "single", label: "Single Node" }],
 
-  runModes: (s) => (["a3", "a5"].includes(s.hw) ? ["python"] : ["python", "docker"]),
+  runModes: (s) => (s.hw === "a3" ? ["python"] : ["python", "docker"]),
 
   modelNames: {
     "default|default": "baidu/Unlimited-OCR",
