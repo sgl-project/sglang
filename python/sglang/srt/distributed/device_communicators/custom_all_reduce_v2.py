@@ -3,7 +3,7 @@
 The CUDA side is split into independent pieces:
 
 - ``PushPlane``: the zero-filled symmetric push buffers plus a rank-local
-  phase counter.
+  phase word shared by every push kernel.
 - ``PullPlane``: the symmetric pull buffers plus the per-block semaphores
   guarding them. The buffers exist only because this class hands the
   all-reduce tensors that are not symmetric memory, so it stages them
@@ -82,7 +82,7 @@ _is_hip = is_hip()
 MB = 1024 * 1024
 
 _ALIGN_BYTES = 1024
-_SEMAPHORE_BYTES = 128
+_SEMAPHORE_BYTES = 128  # sizeof(Semaphore)
 _MAX_GRAPH_INPUTS = 131072
 # resolved once at import time; explicit constructor sizes take precedence
 _DEFAULT_MAX_SIZE = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.get() * 1024
@@ -194,8 +194,9 @@ class CustomAllReduceV2:
                               push-only instance.
         :param max_push_size: explicit per-slot push workspace size;
                               overrides both the tuned size and ``max_size``.
-        :param max_pull_blocks: cap on the barrier plane's block count; ``0``
-                                builds a push-only instance.
+        :param max_pull_blocks: cap on the pull kernels' default launch width;
+                                ``0`` builds a push-only instance.
+        :param max_push_blocks: the push kernels' default launch width.
 
         ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB`` /
         ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB`` take the highest
@@ -313,16 +314,13 @@ class CustomAllReduceV2:
         self.disabled = False
 
     def supports_push(self, *, nbytes: int, num_blocks: int) -> bool:
-        """Whether the push plane can hold a payload and its synchronization blocks.
+        """Whether the push plane can hold a payload launched over ``num_blocks``.
 
         This checks allocated capacity, not algorithm-selection thresholds or
-        tensor eligibility. Disabled communicators have no usable capacity.
+        tensor eligibility. Any grid size is legal: the phase word is shared.
+        Disabled communicators have no usable capacity.
         """
-        return (
-            not self.disabled
-            and 0 < nbytes <= self.max_push_size
-            and 0 < num_blocks <= self._push_counter.numel()
-        )
+        return not self.disabled and 0 < nbytes <= self.max_push_size and num_blocks > 0
 
     def reserve_push_capacity(self, nbytes: int) -> None:
         """Grow shared storage without changing AR dispatch or counter capacity.
@@ -365,7 +363,13 @@ class CustomAllReduceV2:
         push_num_slots = 2 * self.world_size  # 2 phases x world_size peers
         push_bytes = push_num_slots * self.max_push_size
         pull_bytes = self.max_pull_size  # 0 when the pull half is disabled
-        sem_bytes = _SEMAPHORE_BYTES * cfg.num_pull_blocks if self.pull_enabled else 0
+        # Semaphores are indexed by block, so capacity only bounds a grid; at
+        # least one per SM, the persistent width every pull kernel stays within.
+        num_sm = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.num_semaphores = (
+            max(num_sm, cfg.num_pull_blocks) if self.pull_enabled else 0
+        )
+        sem_bytes = _SEMAPHORE_BYTES * self.num_semaphores
         # hier_2shot_push: a pair reduce-scatter / all-gather of N bytes moves
         # one N/2 chunk per slot; the cross 2shot_push all-reduces N/2
         cross_world = self.world_size // 2
@@ -408,16 +412,16 @@ class CustomAllReduceV2:
         def mc_at(offset: int) -> Optional[int]:
             return multicast_ptr + offset if self.has_multicast else None
 
-        self._push_counter = torch.zeros(
-            (cfg.num_push_blocks,), dtype=torch.uint32, device=self.device
-        )
+        # one u64 phase word shared by every push kernel (EpochCounter)
+        self._push_counter = torch.zeros((1,), dtype=torch.int64, device=self.device)
         self._push_workspaces = slice_all([push_num_slots, self.max_push_size], 0)
         self._push_multicast_ptr = mc_at(0)
         push_plane = PushPlane(
             self.rank,
             self.world_size,
             workspaces=self._push_workspaces,
-            counter=self._push_counter.view(-1, 1).view(torch.uint8),
+            counter=self._push_counter,
+            default_blocks=cfg.num_push_blocks,
             mc_workspace=mc_at(0),
         )
         pull_plane = None
@@ -427,10 +431,11 @@ class CustomAllReduceV2:
                 self.world_size,
                 workspaces=slice_all([pull_bytes], pull_offset),
                 semaphores=slice_all(
-                    [cfg.num_pull_blocks, _SEMAPHORE_BYTES], sem_offset
+                    [self.num_semaphores, _SEMAPHORE_BYTES], sem_offset
                 ),
                 mc_workspace=mc_at(pull_offset),
                 mc_semaphore=mc_at(sem_offset),
+                default_blocks=cfg.num_pull_blocks,
             )
         if not self.has_multicast or not self.pull_enabled:
             self.config = self.config._replace(num_mc_blocks=None)
@@ -442,8 +447,9 @@ class CustomAllReduceV2:
             pair = next(ranks for ranks in self._dpx_pairs if self.rank in ranks)
             p = pair.index(self.rank)
             cross = [ranks[p] for ranks in self._dpx_pairs]
+            # one EpochCounter per sub-plane: pair, cross
             self._hier_counters = torch.zeros(
-                (2, cfg.num_push_blocks), dtype=torch.uint32, device=self.device
+                (2,), dtype=torch.int64, device=self.device
             )
 
             def sub_communicator(ranks, offset, slot_bytes, counter):
@@ -459,15 +465,16 @@ class CustomAllReduceV2:
                         ranks.index(self.rank),
                         len(ranks),
                         workspaces=workspaces,
-                        counter=counter.view(-1, 1).view(torch.uint8),
+                        counter=counter,
+                        default_blocks=cfg.num_push_blocks,
                     )
                 )
 
             self._pair_obj = sub_communicator(
-                pair, pair_offset, pair_slot, self._hier_counters[0]
+                pair, pair_offset, pair_slot, self._hier_counters[0:1]
             )
             self._cross_obj = sub_communicator(
-                cross, cross_offset, cross_slot, self._hier_counters[1]
+                cross, cross_offset, cross_slot, self._hier_counters[1:2]
             )
 
         self.obj = Communicator(push=push_plane, pull=pull_plane)

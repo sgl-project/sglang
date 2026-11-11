@@ -563,6 +563,9 @@ POSITIONAL_FIELD_ORDER = (
     "paged_experts_enable_disk",
     "disable_normalize_embedding",
     "log_schedule_decisions",
+    "speculative_dspark_lm_head_dtype",
+    "media_url_timeout",
+    "allow_local_media_files",
     "speculative_dflash_draft_kv_on_swa",
     "speculative_dflash_draft_window_transfer",
 )
