@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Backend interface for CUDA graph capture/replay."""
+"""Backend interface for device graph capture/replay."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
-class BaseCudaGraphBackend(ABC):
+class BaseGraphBackend(ABC):
     """Device lifecycle and optional hooks with portable defaults.
 
     Each implementation owns its per-backend state and binds handles from the
@@ -88,7 +88,7 @@ class BaseCudaGraphBackend(ABC):
         finish_cuda_capture_profile(options, profile_context)
 
     @abstractmethod
-    def capture_session(self, stream: torch.cuda.Stream) -> Iterator[None]: ...
+    def capture_session(self, stream: torch.Stream) -> Iterator[None]: ...
 
     @abstractmethod
     def capture_one(
