@@ -54,6 +54,27 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestDSparkPPContext(CustomTestCase):
+    def test_prefill_swa_reset_updates_newly_placed_rows(self):
+        draft_pool = SimpleNamespace(
+            swa_valid_from=torch.empty(1),
+            set_swa_valid_from=Mock(),
+        )
+        worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
+        worker._kv_injector = SimpleNamespace(
+            draft_model_runner=SimpleNamespace(token_to_kv_pool=draft_pool)
+        )
+        batch = SimpleNamespace(
+            encoder_swa_reset=[False, True, True],
+            prefix_lens=[4, 8, 12],
+            req_pool_indices=torch.tensor([2, 5, 9]),
+        )
+
+        DSparkWorkerV2._reset_prefill_swa_valid_from(worker, batch, torch.device("cpu"))
+
+        rows, valid_from = draft_pool.set_swa_valid_from.call_args.args
+        self.assertTrue(torch.equal(rows, torch.tensor([5, 9])))
+        self.assertTrue(torch.equal(valid_from, torch.tensor([8, 12])))
+
     def test_iteration_ids_take_rows_preserves_selected_verify_window(self):
         translations = {"full": 0, "swa": 0}
 
