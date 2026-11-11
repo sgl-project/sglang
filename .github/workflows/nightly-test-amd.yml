@@ -799,6 +799,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 60
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -807,6 +808,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-grok1-int4 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   nightly-8-gpu-mi35x-grok1-int4:
     name: ${{ format('nightly-8-gpu-mi35x-grok1-int4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
@@ -853,6 +860,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 60
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -861,6 +869,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-grok1-int4 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   # ==============================================================================
   # 8-GPU Grok2 (MI30x + MI35x)
@@ -908,6 +922,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 60
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -916,6 +931,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-grok2 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   nightly-8-gpu-mi35x-grok2:
     name: ${{ format('nightly-8-gpu-mi35x-grok2 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
@@ -962,6 +983,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 60
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -970,6 +992,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-grok2 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   # ==============================================================================
   # 8-GPU DeepSeek-R1 (MI35x only)
@@ -1021,6 +1049,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 300
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -1029,6 +1058,12 @@ jobs:
             python3 registered/amd/perf/mi35x/test_deepseek_r1_mxfp4_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
@@ -1129,6 +1164,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 300
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -1137,6 +1173,12 @@ jobs:
             python3 registered/amd/perf/mi35x/test_deepseek_r1_mxfp4_kv_fp8_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
@@ -1184,6 +1226,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 300
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -1192,6 +1235,12 @@ jobs:
             python3 registered/amd/perf/mi35x/test_deepseek_r1_mxfp4_ar_fusion_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   nightly-8-gpu-mi35x-deepseek-r1-hicache:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-hicache ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
@@ -1688,6 +1737,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 300
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -1696,6 +1746,12 @@ jobs:
             python3 registered/amd/perf/mi35x/test_kimi_k31_pro_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   # ==============================================================================
   # 8-GPU Muse Spark Open MXFP4 (MI35x only - native MXFP4 needs gfx95x)
@@ -1792,6 +1848,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 120
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -1801,6 +1858,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-qwen35-fp8 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   nightly-8-gpu-mi35x-qwen35:
     name: ${{ format('nightly-8-gpu-mi35x-qwen35 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
@@ -1847,6 +1910,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 120
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -1856,6 +1920,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-qwen35-fp8 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   nightly-8-gpu-mi35x-qwen35-triton-dcp:
     name: ${{ format('nightly-8-gpu-mi35x-qwen35-triton-dcp ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
@@ -2137,6 +2207,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 120
         continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
+        id: performance
         run: |
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -2146,6 +2217,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-4-gpu-mi35x-minimax-m3 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   # ==============================================================================
   # 4-GPU MiniMax-M3.1-Flash MXFP4 + DSpark (MI35x)
@@ -2238,6 +2315,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 120
         continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -2247,6 +2325,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-minimax-m27 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   # ==============================================================================
   # Diffusion (MI30x)

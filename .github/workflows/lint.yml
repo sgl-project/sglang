@@ -82,6 +82,9 @@ jobs:
       - name: Test PR health action
         run: node --test .github/actions/check-pr-test-health/action.test.cjs
 
+      - name: Test AMD performance outcome reporting
+        run: node --test .github/actions/report-amd-perf-outcome/action.test.cjs
+
       # docs/ (Mintlify) internal-link check. Runs only in CI — contributors
       # are NOT required to install `mint` for local pre-commit. External links
       # are covered separately by the nightly lychee job (no --check-external here).
