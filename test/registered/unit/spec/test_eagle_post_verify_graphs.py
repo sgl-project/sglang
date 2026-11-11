@@ -13,7 +13,9 @@ the fused chain a replay takes and accept the forced lengths. With the NVIDIA
 megakernel's fused chain acceptance, eagle_sample's tail (greedy check, injected
 acceptance, accept lengths) must leave every output bitwise as the unfused tail does,
 greedy, compact top-k and dense sampled, at batch sizes up to 64, and the graphs must
-still match eager sampling."""
+still match eager sampling. On CPU too: the pool presize (its own switch) is sized for
+the largest decode-graph batch and taken once, inside the first capture before its
+body."""
 
 import unittest
 from contextlib import contextmanager, nullcontext
@@ -293,6 +295,99 @@ class TestPostVerifyGraphs(CustomTestCase):
                     self.assertEqual(
                         eagle_post_verify_graphs._max_graph_keys(), expected
                     )
+
+    def test_pool_presize_is_on_under_its_switch(self):
+        """SGLANG_OPT_POST_VERIFY_POOL_PRESIZE (follows the runtime master) hands the
+        graphs a presize for the pool's first capture; off, the pool grows per key."""
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        child = envs.SGLANG_OPT_POST_VERIFY_POOL_PRESIZE
+        for master_on, value, expected in (
+            (False, None, False),
+            (True, None, True),
+            (True, "0", False),
+            (False, "1", False),
+        ):
+            with (
+                self.subTest(master=master_on, value=value),
+                master.override(master_on),
+                # the fake target worker has no model config for the extend layout
+                envs.SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT.override("0"),
+                child.override(value) if value else nullcontext(),
+            ):
+                graphs = _worker(switch=True)._post_verify_graphs._graphs
+                self.assertIs(graphs.presize is not None, expected)
+
+    def test_pool_presize_is_the_largest_graph_batchs_sampling_scratch(self):
+        """Two fp32 [requests * tokens, vocab] buffers at the largest decode-graph batch
+        plus a 64 MiB margin; nothing when the device lacks that plus 1 GiB."""
+        nbytes = 2 * 128 * 4 * 248320 * 4 + (64 << 20)
+        size = eagle_post_verify_graphs.pool_presize_bytes
+        kwargs = dict(max_requests=128, tokens_per_request=4, vocab=248320)
+        self.assertEqual(size(free_bytes=nbytes + (1 << 30), **kwargs), nbytes)
+        self.assertEqual(size(free_bytes=nbytes + (1 << 30) - 1, **kwargs), 0)
+        owner = EaglePostVerifyGraphs.__new__(EaglePostVerifyGraphs)
+        owner._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(decode_cuda_graph_capture_bs=[1, 8, 96])
+        )
+        slot = SimpleNamespace(
+            num_requests=3, tokens_per_request=4, logits=torch.empty(12, 1000)
+        )
+        with (
+            patch.object(torch.cuda, "empty_cache") as empty_cache,
+            patch.object(torch.cuda, "mem_get_info", return_value=(1 << 40, 1 << 40)),
+        ):
+            got = owner._pool_presize_bytes(slot)
+        empty_cache.assert_called_once()
+        self.assertEqual(got, 2 * 96 * 4 * 1000 * 4 + (64 << 20))
+
+    def test_pool_presize_runs_once_inside_the_first_capture_before_the_body(self):
+        events = []
+        graphs = eagle_post_verify_graphs._PostVerifyGraphs(
+            body=lambda slot: events.append(("body", slot.num_requests)) or ("out",),
+            commit=lambda slot, outputs: None,
+            sim_rng=torch.Generator(),
+        )
+        graphs.presize = lambda slot: events.append(("size", slot.num_requests)) or 4096
+        native_empty = torch.empty
+
+        def empty(*args, **kwargs):
+            if kwargs.get("dtype") is torch.uint8:
+                events.append(("presize", args[0]))
+            return native_empty(*args, **kwargs)
+
+        @contextmanager
+        def graph(*args, **kwargs):
+            events.append(("capture",))
+            yield
+
+        cuda = torch.cuda
+        with (
+            patch.object(cuda, "graph_pool_handle", return_value="pool"),
+            patch.object(cuda, "Stream", MagicMock),
+            patch.object(cuda, "Event", MagicMock),
+            patch.object(cuda, "CUDAGraph", MagicMock),
+            patch.object(cuda, "current_stream", MagicMock()),
+            patch.object(cuda, "graph", graph),
+            patch.object(torch, "empty", empty),
+            patch(
+                "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+            ),
+        ):
+            for bs in (4, 9):
+                graphs._capture(SimpleNamespace(num_requests=bs, device="cpu"))
+        self.assertEqual(
+            events,
+            [
+                ("size", 4),
+                ("capture",),
+                ("presize", 4096),
+                ("body", 4),
+                ("capture",),
+                ("capture",),
+                ("body", 9),
+                ("capture",),
+            ],
+        )
 
     def test_bonus_tokens_take_the_relay_dtype_only_under_their_switch(self):
         """SGLANG_OPT_SPEC_POST_VERIFY_BONUS_I64: the graphs' commit-outputs launch

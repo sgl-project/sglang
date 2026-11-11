@@ -463,6 +463,12 @@ class Envs:
     SGLANG_OPT_SCHEDULER_GC_FREEZE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # The EAGLE post-verify graph pool's first capture takes the sampling scratch of the
+    # largest decode-graph batch and frees it, so later batch sizes split that segment
+    # instead of each adding one the private pool keeps.
+    SGLANG_OPT_POST_VERIFY_POOL_PRESIZE = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

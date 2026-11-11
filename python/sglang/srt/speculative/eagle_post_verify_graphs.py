@@ -58,6 +58,33 @@ def _bonus_dtype() -> torch.dtype:
 _BONUS_DTYPE = _bonus_dtype()
 # SGLANG_OPT_SPEC_STAGED_SEQ_LENS: a batch's lengths may be a slot's new_seq_lens output
 _STAGED_SEQ_LENS = envs.SGLANG_OPT_SPEC_STAGED_SEQ_LENS.get()
+# Arbitrary headroom for the body's large temporaries besides its two sampling buffers.
+_PRESIZE_MARGIN = 64 << 20
+
+
+def pool_presize_bytes(
+    *, max_requests: int, tokens_per_request: int, vocab: int, free_bytes: int
+) -> int:
+    """The post-verify body's peak scratch at the largest key: two fp32
+    [requests * tokens, vocab] sampling buffers live at once, plus a margin. 0 when the
+    device has less than that plus 1 GiB free: the pool then grows per key."""
+    nbytes = 2 * max_requests * tokens_per_request * vocab * 4 + _PRESIZE_MARGIN
+    if free_bytes < nbytes + (1 << 30):
+        logger.warning(
+            "The post-verify graph pool is not presized: %.2f GiB free for %.2f GiB",
+            free_bytes / 2**30,
+            nbytes / 2**30,
+        )
+        return 0
+    logger.info(
+        "The post-verify graph pool is presized to %.2f GiB (%d requests x %d tokens, "
+        "vocab %d)",
+        nbytes / 2**30,
+        max_requests,
+        tokens_per_request,
+        vocab,
+    )
+    return nbytes
 
 
 class EaglePostVerifyGraphs:
@@ -174,6 +201,25 @@ class EaglePostVerifyGraphs:
         """Order the current stream after the last side-stream mamba state commit; the
         worker calls it once the draft extend is enqueued."""
         self._graphs.join()
+
+    def enable_pool_presize(self) -> None:
+        """SGLANG_OPT_POST_VERIFY_POOL_PRESIZE: the pool's first capture takes the
+        scratch of the largest batch a verify graph replays and frees it at once, so
+        every later key splits that segment instead of adding segments the private pool
+        never returns."""
+        self._graphs.presize = self._pool_presize_bytes
+
+    def _pool_presize_bytes(self, slot: SimpleNamespace) -> int:
+        # Return the allocator's unused cached blocks first, so the free reading counts
+        # them; this runs once, before the pool's first capture.
+        torch.cuda.empty_cache()
+        graph_sizes = self._target_worker.model_runner.decode_cuda_graph_capture_bs
+        return pool_presize_bytes(
+            max_requests=max([slot.num_requests, *graph_sizes]),
+            tokens_per_request=slot.tokens_per_request,
+            vocab=slot.logits.shape[-1],
+            free_bytes=torch.cuda.mem_get_info()[0],
+        )
 
     def _key(
         self,
@@ -419,6 +465,8 @@ class _PostVerifyGraphs:
         self._sim_rng = sim_rng
         self._states: dict[tuple, SimpleNamespace] = {}
         self._pool = None
+        # slot -> bytes the pool's first capture takes and frees (enable_pool_presize)
+        self.presize: Optional[Callable] = None
         self._side_stream = self._main_done = self._commit_done = None
         self._commit_pending = False
         # The host runs up to ~2 rounds ahead; a pinned slot is rewritten only after
@@ -547,10 +595,13 @@ class _PostVerifyGraphs:
     def _capture(self, slot: SimpleNamespace) -> None:
         from sglang.srt.distributed.parallel_state import graph_capture
 
+        presize = 0
         if self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
             self._side_stream = torch.cuda.Stream()
             self._main_done, self._commit_done = torch.cuda.Event(), torch.cuda.Event()
+            if self.presize is not None:
+                presize = self.presize(slot)
         graph = torch.cuda.CUDAGraph()
         with graph_capture(stream=torch.cuda.current_stream()) as ctx:
             with torch.cuda.graph(
@@ -559,6 +610,13 @@ class _PostVerifyGraphs:
                 stream=ctx.stream,
                 capture_error_mode="thread_local",
             ):
+                if presize:
+                    # A private pool never frees a segment: size its first one for the
+                    # largest key.
+                    scratch = torch.empty(
+                        presize, dtype=torch.uint8, device=slot.device
+                    )
+                    del scratch
                 outputs = self._body(slot)
         # Captured after the main graph in the same pool and replayed after it.
         commit_graph = torch.cuda.CUDAGraph()

@@ -1469,6 +1469,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             simulated_acc_len_rng=self._simulated_acc_len_rng,
             speculative_runtime_hooks=self._speculative_runtime_hooks,
         )
+        if envs.SGLANG_OPT_POST_VERIFY_POOL_PRESIZE.get():
+            self._post_verify_graphs.enable_pool_presize()
 
     def _init_staged_next_draft(self) -> None:
         """SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT: the post-verify graphs stage the next
