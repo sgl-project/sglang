@@ -42,7 +42,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     ASCEND_OPS = "ascend_ops"
-    FLASHINFER = "flashinfer"
+    FLASHINFER = "flashinfer_nvlink_one_sided"
     MEGAMOE = "megamoe"
     DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
@@ -53,6 +53,8 @@ class MoeA2ABackend(Enum):
     def _missing_(cls, value):
         if value is None:
             return cls.NONE
+        if value == "flashinfer":  # Deprecated alias for FLASHINFER.
+            return cls.FLASHINFER
         for member in cls:
             if value == member.value:
                 return member

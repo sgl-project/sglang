@@ -26,12 +26,14 @@ NUM_ROWS = 4
 
 
 class _Req:
+    owner_list = None
+
     def __init__(self, holds_row):
         self.kv = SimpleNamespace(holds_kv=holds_row)
         self.beam_group = None
         self.token_indices_to_pool = None
 
-    def init_next_round_input(self, tree_cache=None):
+    def init_next_round_input(self, tree_cache=None, **_):
         pass
 
 
@@ -69,7 +71,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.waiting_queue = IndexedReqList(ListKind.WAITING)
         s.waiting_queue.join(waiting)
         s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
-        s.chunked_req = final_chunk
+        s.chunked_reqs.join([final_chunk])
         s.min_free_slots_delayer = None
         s.invariant_checker = Mock()
         s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
@@ -86,7 +88,9 @@ class TestHeldRowAdmission(CustomTestCase):
         s.tree_cache = SimpleNamespace(
             buffer_pipeline=None, storage_prefetch_retries=None
         )
-        s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
+        s.token_to_kv_pool_allocator = SimpleNamespace(
+            state_slots=None, pools_share_memory=False
+        )
         s.new_token_ratio_tracker = SimpleNamespace(current=0.0)
         s.max_prefill_tokens = 1 << 20
         s.is_mixed_chunk = False
@@ -111,6 +115,7 @@ class TestHeldRowAdmission(CustomTestCase):
         )
         s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
         s.running_reqs = KeyedReqList(ListKind.DECODING)
+        s.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         return s
 
     def _admitted(self, disaggregation_mode):

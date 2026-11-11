@@ -14,12 +14,13 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.srt.arg_groups import model_override_base as base_module
 from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
 from sglang.srt.arg_groups.model_override_base import register_model_override
+from sglang.srt.arg_groups.model_overrides import gemma4 as gemma4_module
 from sglang.srt.arg_groups.model_overrides import minicpm as minicpm_module
 from sglang.srt.arg_groups.model_overrides import qwen3_5 as qwen3_5_module
 from sglang.srt.arg_groups.model_overrides import qwen3_vl as qwen3_vl_module
@@ -31,6 +32,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
+from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,
@@ -234,6 +236,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_draft_attention_backend",
                     "speculative_draft_kv_cache_dtype",
                     "speculative_draft_model_quantization",
+                    "speculative_dspark_lm_head_dtype",
                     "aux_hidden_state_capture",
                     "watermark_context_window",
                     "watermark_default_enabled",
@@ -628,6 +631,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         disaggregation_mode="null",
         attn_dp_size=1,
         enable_hierarchical_cache=False,
+        enable_unified_memory=False,
     ):
         args = SimpleNamespace(
             attention_backend=attention_backend,
@@ -637,6 +641,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             attn_dp_size=attn_dp_size,
             ep_join_mode=None,
             enable_hierarchical_cache=enable_hierarchical_cache,
+            enable_unified_memory=enable_unified_memory,
         )
         mixer_types = []
         if sparse_attention:
@@ -726,6 +731,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             attn_dp_size=1,
             ep_join_mode=None,
             enable_hierarchical_cache=False,
+            enable_unified_memory=False,
         )
         config = SimpleNamespace(
             has_minicpm_sparse_attention=True,
@@ -1456,7 +1462,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
         }
         accepted = {
-            "cutedsl_with_a2a": (args("flashinfer_cutedsl", "flashinfer"), *dense),
+            "cutedsl_with_a2a": (
+                args("flashinfer_cutedsl", "flashinfer_nvlink_one_sided"),
+                *dense,
+            ),
             "puzzle_equal_expert_counts": (
                 args("flashinfer_trtllm_routed"),
                 "NemotronHPuzzleForCausalLM",
@@ -1705,7 +1714,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ("flashinfer_trtllm", "none", True, None, "moe-runner-backend=marlin"),
             ("flashinfer_cutlass", "none", True, None, "moe-runner-backend=marlin"),
             ("flashinfer_cutedsl", "deepep", True, None, "moe-a2a-backend=none"),
-            ("flashinfer_cutedsl", "flashinfer", True, None, "moe-a2a-backend=none"),
+            (
+                "flashinfer_cutedsl",
+                "flashinfer_nvlink_one_sided",
+                True,
+                None,
+                "moe-a2a-backend=none",
+            ),
         ]
         for runner, a2a, w4a16_enabled, expected, error in cases:
             with (
@@ -3947,6 +3962,88 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 },
             )
 
+    def test_gemma4_uses_oot_platform_attention_backend(self):
+        from sglang.srt.arg_groups.model_overrides.gemma4 import (
+            _gemma4_overrides,
+            gemma4_attention_backends,
+        )
+
+        def _args(**kw):
+            defaults = dict(
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                moe_runner_backend="triton",
+                quantization=None,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        platform = Mock(spec=SRTPlatform)
+        platform.is_out_of_tree.return_value = True
+        platform.get_default_attention_backend.return_value = "custom_attention"
+
+        with patch.object(gemma4_module, "current_platform", platform):
+            self.assertEqual(
+                _gemma4_overrides(_args(), None),
+                {"attention_backend": "custom_attention"},
+            )
+            self.assertEqual(
+                _gemma4_overrides(_args(attention_backend="triton"), None), {}
+            )
+            self.assertEqual(
+                _gemma4_overrides(
+                    _args(prefill_attention_backend="custom_attention"), None
+                ),
+                {"attention_backend": "custom_attention"},
+            )
+            self.assertEqual(
+                _gemma4_overrides(
+                    _args(decode_attention_backend="custom_attention"), None
+                ),
+                {"attention_backend": "custom_attention"},
+            )
+            self.assertEqual(
+                _gemma4_overrides(
+                    _args(),
+                    SimpleNamespace(architectures=["DiffusionGemmaForBlockDiffusion"]),
+                ),
+                {"attention_backend": "triton"},
+            )
+            self.assertIn("custom_attention", gemma4_attention_backends())
+            self.assertIn("fa4", gemma4_attention_backends())
+
+    def test_gemma4_explicit_builtin_backend_does_not_require_oot_default(self):
+        from sglang.srt.arg_groups.model_overrides.gemma4 import (
+            _gemma4_overrides,
+            gemma4_attention_backends,
+        )
+
+        args = SimpleNamespace(
+            attention_backend="triton",
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            moe_runner_backend="triton",
+            quantization=None,
+        )
+        split_args = SimpleNamespace(
+            attention_backend=None,
+            prefill_attention_backend="triton",
+            decode_attention_backend="triton",
+            moe_runner_backend="triton",
+            quantization=None,
+        )
+        platform = Mock(spec=SRTPlatform)
+        platform.is_out_of_tree.return_value = True
+        platform.get_default_attention_backend.side_effect = NotImplementedError
+
+        with patch.object(gemma4_module, "current_platform", platform):
+            self.assertEqual(_gemma4_overrides(args, None), {})
+            self.assertEqual(_gemma4_overrides(split_args, None), {})
+            platform.get_default_attention_backend.assert_not_called()
+            self.assertIn("triton", gemma4_attention_backends())
+            platform.get_default_attention_backend.assert_called_once()
+
     def test_deepseek_moe_quant_slot_pass(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import _deepseek_moe_quant_resolution
@@ -4269,9 +4366,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ("marlin", "none", False, {}),
             ("marlin", "none", True, {}),
             ("flashinfer_cutedsl", "none", True, {}),
-            ("flashinfer_cutedsl", "flashinfer", True, {}),
+            ("flashinfer_cutedsl", "flashinfer_nvlink_one_sided", True, {}),
             ("flashinfer_cutedsl", "none", False, None),
-            ("flashinfer_cutedsl", "flashinfer", False, None),
+            ("flashinfer_cutedsl", "flashinfer_nvlink_one_sided", False, None),
             ("flashinfer_cutedsl", "deepep", True, None),
             ("flashinfer_cutlass", "none", True, None),
             ("flashinfer_trtllm", "none", True, None),

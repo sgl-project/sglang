@@ -62,6 +62,7 @@ _is_xpu = is_xpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -722,22 +723,35 @@ def traverse_tree(
         if is_accepted:
             if curr != 0:
                 # Accept the current token
-                grammar.accept_token(int(draft_tokens[curr]))
-            if not grammar.is_terminated():
-                # Generate the bitmask for the current token
-                grammar.fill_vocab_mask(allocate_token_bitmask, curr)
-                if retrieve_next_token[curr] != -1:
-                    # Visit the child node
-                    dfs(
-                        int(retrieve_next_token[curr]),
-                        retrieve_next_token,
-                        retrieve_next_sibling,
-                        curr,
+                try:
+                    grammar.accept_token(int(draft_tokens[curr]))
+                except ValueError:
+                    # The matcher can reject a draft token that passed the parent
+                    # mask row (mask/matcher desync, e.g. a disagg retracted-request
+                    # double-accept). Clear it in the parent row so verify won't
+                    # accept it, and prune this branch rather than raising to -- and
+                    # killing -- the scheduler. The accept failed, so the grammar is
+                    # still at the parent state; no rollback is owed for this node.
+                    parent_bitmask[int(current_token) // 32] &= ~(
+                        1 << (int(current_token) % 32)
                     )
+                    is_accepted = False
+            if is_accepted:
+                if not grammar.is_terminated():
+                    # Generate the bitmask for the current token
+                    grammar.fill_vocab_mask(allocate_token_bitmask, curr)
+                    if retrieve_next_token[curr] != -1:
+                        # Visit the child node
+                        dfs(
+                            int(retrieve_next_token[curr]),
+                            retrieve_next_token,
+                            retrieve_next_sibling,
+                            curr,
+                        )
 
-            if curr != 0:
-                # Rollback the current token
-                grammar.rollback(1)
+                if curr != 0:
+                    # Rollback the current token
+                    grammar.rollback(1)
 
         if retrieve_next_sibling[curr] != -1:
             # Visit the sibling node
@@ -1167,6 +1181,7 @@ def commit_mamba_states_after_verify(
     accept_index: torch.Tensor,
     draft_token_num: int,
     prepared_step_indices: Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]] = None,
+    state_slots: Optional[ForwardStateSlots] = None,
 ) -> None:
     """Commit accepted per-step mamba states into the persistent caches.
 
@@ -1176,6 +1191,9 @@ def commit_mamba_states_after_verify(
     accepted step is committed back, plus the interval-crossing state used
     for prefix-cache tracking (mamba extra_buffer mode).
 
+    Writes ``state_slots``, the verify forward's resolved slots by default, and
+    looks up no table: it may run after the scheduler reused a finished row.
+
     No-op for models without mamba-style state or backends without the
     commit hook.
     """
@@ -1183,15 +1201,6 @@ def commit_mamba_states_after_verify(
     if mambaish_config(model_runner.model_config) is None:
         return
 
-    # FIXME: when the target runner is the forward's last shared reader, this
-    # ReplaySSM branch reads the request pool's Mamba indices and the state map
-    # after the declared shared-read end. The schedule stream may then reuse and
-    # rewrite a finished request's row or state slot while this commit still
-    # reads it. Declare a later read end for this path, or gather the indices
-    # during metadata preparation. The same holds for EAGLE v2's post-verify
-    # graphs: they replay this commit on a side stream joined only after draft
-    # extend, while draft extend's declared read end (pre-, in- or post-replay)
-    # is recorded before that join; only its whole-forward fallback covers it.
     # ReplaySSM spec-verify path (Part B of #28511): the accepted drafts already
     # live in the per-slot circular ring (written during verify). Instead of
     # scattering an intermediate full SSM state into `temporal`, advance the
@@ -1200,7 +1209,6 @@ def commit_mamba_states_after_verify(
     # still needs its usual accept-rollback, so we keep the conv-window scatter and
     # skip only the SSM scatter. GDN-only + linear-chain (topk<=1) -- the runtime
     # ring is allocated only then; KDA never allocates the cursors.
-    req_pool = model_runner.req_to_token_pool
     mamba_pool = model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
     bs = accept_lens.shape[0]
     src_indices_raw = (
@@ -1213,14 +1221,15 @@ def commit_mamba_states_after_verify(
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
-        # Persistent destinations follow state relocation; replay/scratch rows
-        # still index requests, and the scheduler keeps owning virtual state IDs.
-        state_ids = model_runner.runner_ids.state_ids(req_pool.state_sub_pool)
-        replay_state_indices = state_ids.ids(
-            req_pool.get_mamba_indices(batch.req_pool_indices)
-        )
+        # Persistent destinations are state slots; replay/scratch rows still
+        # index requests.
+        if state_slots is None:
+            state_slots = model_runner.attn_backend.forward_state_slots(
+                bs, batch.mamba_track_indices
+            )
+        replay_state_indices = state_slots.working[:bs]
         if batch.mamba_track_indices is not None:
-            replay_track_indices = state_ids.ids(batch.mamba_track_indices)
+            replay_track_indices = state_slots.track[:bs]
 
     # Fold-every-commit: replay the accepted prefix from the ring into
     # `temporal`; the same fold stores the interval-crossing state to the
@@ -1429,7 +1438,29 @@ def commit_mamba_states_after_verify(
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=model_runner.model,
                 req_pool_indices=batch.req_pool_indices[:bs],
+                state_slots=state_slots,
             )
+
+
+def relayed_commit_state_slots(
+    target_worker: TpModelWorker, batch: ScheduleBatch
+) -> Optional[ForwardStateSlots]:
+    """The slots a PP stage's relayed verify commit writes, resolved when it runs:
+    the rows still belong to the batch, but a compaction may have moved the slots."""
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+        ForwardStateSlots,
+    )
+
+    model_runner = target_worker.model_runner
+    if mambaish_config(model_runner.model_config) is None:
+        return None
+    req_pool = model_runner.req_to_token_pool
+    state_ids = model_runner.runner_ids.state_ids(req_pool.state_sub_pool)
+    track = batch.mamba_track_indices
+    return ForwardStateSlots(
+        state_ids.ids(req_pool.get_mamba_indices(batch.req_pool_indices)),
+        None if track is None else state_ids.ids(track),
+    )
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:

@@ -108,10 +108,12 @@ def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None
     # SGLang's pre-dispatch requires 16-byte input SF rows (hidden % 512).
     # The pinned DeepGEMM FP8/FP4 path copies intermediate scales separately
     # from token TMA loads, so intermediate % 128 suffices, including V4.1
-    # Flash's 2304-wide intermediate dimension.
+    # Flash's 2304-wide intermediate dimension. The MXFP4 path writes and loads
+    # the intermediate SFs MN-major (token-contiguous) as well, so it needs the
+    # same 128 only.
     # Keep the existing restrictions on the other MMA paths.
     scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 128 if mma_type in ("fp8xfp4", "fp8xfp8") else 16 * scale_group
+    align = 128 if mma_type in ("fp8xfp4", "fp8xfp8", "mxf4xmxf4") else 16 * scale_group
     hidden_align = 16 * scale_group
     if hidden % hidden_align != 0 or intermediate % align != 0:
         raise ValueError(
