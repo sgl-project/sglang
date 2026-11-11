@@ -62,7 +62,6 @@ from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
     draft_kv_ring_rows_per_req,
-    draft_kv_ring_window_left,
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -72,6 +71,7 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    get_dflash_attention_sliding_window_size,
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
@@ -717,10 +717,10 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _init_draft_kv_ring(self) -> None:
         dcp_size = get_parallel().attn_dcp_size
         pool = self.draft_model_runner.token_to_kv_pool
-        window_left = draft_kv_ring_window_left(
+        window_left = get_dflash_attention_sliding_window_size(
             self.draft_model_runner.model_config.hf_config
         )
-        req_pool_rows = self.model_runner.req_to_token_pool.req_to_token.shape[0]
+        req_to_token_rows = self.model_runner.req_to_token_pool.req_to_token.shape[0]
         self.draft_kv_ring = DFlashDraftKVRing(
             rows_per_req=draft_kv_ring_rows_per_req(
                 window_left=window_left,
@@ -728,22 +728,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                 dcp_size=dcp_size,
             ),
             dcp_size=dcp_size,
-            req_pool_rows=req_pool_rows,
+            req_to_token_rows=req_to_token_rows,
             device=self.device,
         )
         if get_parallel().tp_rank == 0:
             logger.info(
                 "DFLASH draft KV ring: %d rows per request per rank (%d positions), "
-                "%d req pool rows, draft pool %d rows.",
+                "%d req_to_token rows, draft pool %d rows.",
                 self.draft_kv_ring.rows_per_req,
                 self.draft_kv_ring.span,
-                req_pool_rows,
+                req_to_token_rows,
                 pool.size,
             )
 
     def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
         # A ring holds no prefix: a cached prefix brings no draft KV back.
-        if get_spec().speculative_dflash_draft_kv_ring:
+        if self.draft_kv_ring is not None:
             return HiCacheDraftPlan()
         return super()._build_hicache_draft_plan()
 

@@ -104,19 +104,19 @@ def test_window_indices(dcp, window_left, with_v2p):
 
 @pytest.mark.parametrize("dcp", [1, 8])
 def test_ring_window_reads_the_rows_the_ring_writes(dcp):
-    """Ring mode: each rank's window rows are exactly the rows of
-    DFlashDraftKVRing.locs it owns, floored at the ring's min_pos."""
-    window_left, q_len, req_pool_rows = 1023, 8, 9
+    window_left, q_len, req_to_token_rows = 1023, 8, 9
     ring = DFlashDraftKVRing(
         rows_per_req=draft_kv_ring_rows_per_req(
             window_left=window_left, block_size=q_len, dcp_size=dcp
         ),
         dcp_size=dcp,
-        req_pool_rows=req_pool_rows,
+        req_to_token_rows=req_to_token_rows,
         device="cuda",
     )
     pool_rows = draft_kv_ring_pool_rows(
-        req_pool_rows=req_pool_rows, rows_per_req=ring.rows_per_req, page_size=PAGE
+        req_to_token_rows=req_to_token_rows,
+        rows_per_req=ring.rows_per_req,
+        page_size=PAGE,
     )
     req_pool_indices = torch.tensor([3, 7, 1], dtype=torch.int32, device="cuda")
     prefix = torch.tensor([5000, 700, 3], dtype=torch.int64, device="cuda")

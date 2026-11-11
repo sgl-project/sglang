@@ -1486,8 +1486,6 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 )
 
     def test_draft_kv_ring_drops_the_per_token_draft_charge(self):
-        """A resolved DFLASH draft KV ring is a fixed pool, so the target's
-        per-token budget carries no draft row."""
         mr = _make_model_runner(self)
         mr.spec_algorithm.is_dflash.return_value = True
         mr.spec_algorithm.is_dflash_family.return_value = True
@@ -1509,8 +1507,6 @@ class TestDflashDraftKvBudget(CustomTestCase):
         self.assertEqual(cfg._cell_size, 4 * (64 + 64) * 32 * KV_SIZE)
 
     def _ring_target_configurator(self, *, page_size, **publish):
-        """A DFLASH target KVCacheConfigurator whose draft is a 5-layer
-        all-sliding MLA draft (window 1024)."""
         import torch
 
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -1569,25 +1565,14 @@ class TestDflashDraftKvBudget(CustomTestCase):
         )
 
     def test_draft_kv_ring_charge_matches_the_ring_pool(self):
-        """The ring charged to the target's budget is the pool the draft
-        allocates: a ring for every row of the req_to_token table the target
-        builds (PD pre-alloc rows included) and the pool's padding page."""
-        for dcp_size, page_size, publish in (
-            (8, 1, {}),
-            (1, 64, {}),
-            (
-                8,
-                64,
-                dict(disaggregation_mode="decode", disaggregation_decode_extra_slots=6),
-            ),
-        ):
+        for dcp_size, page_size in ((8, 1), (1, 64)):
             with (
-                self.subTest(dcp=dcp_size, page=page_size, **publish),
+                self.subTest(dcp=dcp_size, page=page_size),
                 mock_cpu_env(tp_size=8),
                 get_parallel().override(attn_dcp_size=dcp_size),
             ):
                 config = self._ring_target_configurator(
-                    page_size=page_size, max_running_requests=48, **publish
+                    page_size=page_size, max_running_requests=48
                 )
                 with get_spec().override(speculative_dflash_draft_kv_ring=True):
                     charged = config._dflash_draft_kv_ring_bytes()
@@ -1596,7 +1581,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 )
                 self.assertEqual(
                     req_pool.req_to_token.shape[0],
-                    48 + publish.get("disaggregation_decode_extra_slots", 0) + 1,
+                    48 + 1,
                 )
                 rows = config._dflash_draft_kv_ring_rows(
                     draft_hf_config=config.spec_aux_config.draft_model_config.hf_config,

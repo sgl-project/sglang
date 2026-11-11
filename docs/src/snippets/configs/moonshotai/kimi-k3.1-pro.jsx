@@ -126,9 +126,9 @@ export const config = {
             "--speculative-draft-model-path RadixArk/Kimi-K3.1-Dflash2-Preview",
             `--speculative-dflash-block-size ${config.dflashBlock(s)}`,
             "--speculative-draft-kv-cache-dtype fp8_e4m3",
-            // The draft KV ring (default on) needs an MLA draft backend; DCP forces this one
-            // anyway, so pinning it keeps DCP and non-DCP recipes on the same path. ROCm runs the
-            // same ring on the Triton draft backend.
+            // The draft KV ring (default on, colocated only) needs an MLA draft backend; DCP
+            // forces this one anyway, so pinning it keeps DCP and non-DCP recipes on the same
+            // path. ROCm's Triton draft backend keeps the per-token draft pool.
             `--speculative-draft-attention-backend ${config.isAmd(s) ? "triton" : "cutedsl_mla"}`,
             // Without ReplaySSM, DFLASH keeps one intermediate KDA state per draft token and the
             // KV pool collapses (5.13M -> 0.77M tokens measured on decode). The PD prefill role
