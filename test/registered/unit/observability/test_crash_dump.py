@@ -85,6 +85,7 @@ _SECRETS = {
     "api_key": "api-secret",
     "admin_api_key": "admin-secret",
     "ssl_keyfile_password": "ssl-secret",
+    "hicache_storage_backend_extra_config": '{"secret_key": "s3-secret"}',
     "watermark_key": "abcdef0123456789",
     "watermark_key_b": "0123456789abcdef",
 }
