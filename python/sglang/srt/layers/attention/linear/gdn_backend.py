@@ -502,6 +502,10 @@ class GDNKernelDispatcher:
     def extend_uses_state_checkpoints(self) -> bool:
         return self.extend_kernel.uses_state_checkpoints
 
+    @property
+    def extend_honors_slot_pitch(self) -> bool:
+        return self.extend_kernel.extend_honors_slot_pitch
+
     def packed_decode(
         self,
         mixed_qkv: torch.Tensor,
@@ -1238,6 +1242,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         return (core_attn_out, z) if return_z else core_attn_out
 
+    def _prefill_kernels_follow_slot_pitch(self, ssm_states: torch.Tensor) -> bool:
+        # The Triton conv takes any conv-state strides; the extend kernel declares
+        # whether it steps slots by the pool's stride, given packed slot contents.
+        return (
+            (is_cuda() or _is_hip)
+            and self.kernel_dispatcher.extend_honors_slot_pitch
+            and ssm_states[0].is_contiguous()
+        )
+
     def _prefill_state_staging(self) -> PoolStaging:
         metadata = self.forward_metadata
         if metadata.prefill_state_staging is None:
@@ -1256,7 +1269,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ) -> torch.Tensor:
         block_table = self.forward_metadata.conv_block_table
         conv_kwargs = {"block_table": block_table} if block_table is not None else {}
-        return causal_conv1d_fn(
+        # The compiled CUDA conv assumes packed slots; Triton follows the strides.
+        conv_fn = (
+            causal_conv1d_fn_triton
+            if not conv_states.is_contiguous() and not is_cpu()
+            else causal_conv1d_fn
+        )
+        return conv_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
             layer.bias,
@@ -1429,22 +1448,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 and not mamba_pool.replayssm_is_kda
             )
 
-        # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
-        # chunk_gated_delta_rule) write state back in place assuming a contiguous
-        # slot layout, so they silently drop the write to the strided envelope
-        # pool. Run them on contiguous per-sequence copies and scatter the result
-        # back. No-op for the default contiguous pool.
-        # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use
-        # proper indexed writes and handle non-contiguous pools directly via
-        # cache_indices, so the gather/scatter round-trip is unnecessary on CPU.
-        # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
-        # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
-        # int64 indexing, like packed_decode / causal_conv1d_update already do.
+        # A strided state pool (unified memory) is read and written in place when
+        # the prefill kernels address slots by its stride, else through packed
+        # copies; CPU kernels index any pool directly.
         needs_state_gather = (
             self.requires_contiguous_prefill_state
             and (not is_target_verify)
             and (not is_cpu())
             and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
+            and not self._prefill_kernels_follow_slot_pitch(ssm_states)
         )
         if needs_state_gather:
             staging = self._prefill_state_staging()
