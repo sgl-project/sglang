@@ -16,6 +16,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.bailing_mrope import BailingMRotaryEmbedding
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.rope_variant import (
@@ -91,6 +92,10 @@ class TestFusedAbsorbGate(CustomTestCase):
 
 class TestAbsorbBmmConfig(CustomTestCase):
     def setUp(self):
+        self.enterContext(envs.SGLANG_ROCM_ABSORB_BMM_MAX_WAVES_PER_EU.override(2))
+        self.enterContext(
+            envs.SGLANG_ROCM_ABSORB_BMM_DISABLE_HAND_CONFIG.override(False)
+        )
         self._saved = forward_mla_rocm._absorb_bmm_num_cu
         forward_mla_rocm._absorb_bmm_num_cu = 256
         self.addCleanup(
@@ -121,6 +126,56 @@ class TestAbsorbBmmConfig(CustomTestCase):
     def test_large_row_count_falls_back(self):
         self.assertIsNone(_ABSORB_CONFIG(16, 0, 512))
         self.assertIsNone(_ABSORB_CONFIG(16, 257, 512))
+
+    def test_waves_per_eu_stays_within_the_compilable_budget(self):
+        """The original gfx950 M=256 reproducer requests four waves per EU.
+
+        ``waves_per_eu`` becomes the AMDGPU ``amdgpu-waves-per-eu`` function
+        attribute, so it constrains the register budget at compile time. The
+        M=256 shape of issue 46829 is the first one that asks for four.
+        """
+        config = _ABSORB_CONFIG(64, 256, 512)
+        self.assertEqual(config["BLOCK_SIZE_M"], 64)
+        self.assertEqual(config["BLOCK_SIZE_N"], 128)
+        self.assertEqual(config["waves_per_eu"], 2)
+
+    def test_capped_shape_matches_the_known_good_tile_config(self):
+        """M=256 must select the same tile settings as the known-good M=128 case."""
+        self.assertEqual(
+            _ABSORB_CONFIG(64, 256, 512),
+            _ABSORB_CONFIG(64, 128, 512),
+        )
+
+    def test_no_row_count_exceeds_the_wave_cap(self):
+        for m in range(1, 257):
+            with self.subTest(m=m):
+                self.assertLessEqual(_ABSORB_CONFIG(64, m, 512)["waves_per_eu"], 2)
+
+    def test_wave_cap_is_configurable(self):
+        with envs.SGLANG_ROCM_ABSORB_BMM_MAX_WAVES_PER_EU.override(4):
+            self.assertEqual(_ABSORB_CONFIG(64, 256, 512)["waves_per_eu"], 4)
+        with envs.SGLANG_ROCM_ABSORB_BMM_MAX_WAVES_PER_EU.override(1):
+            self.assertEqual(_ABSORB_CONFIG(64, 256, 512)["waves_per_eu"], 1)
+        # 0 lifts the cap entirely, which is what the gfx950 team needs to
+        # sweep the trigger value.
+        with envs.SGLANG_ROCM_ABSORB_BMM_MAX_WAVES_PER_EU.override(0):
+            self.assertEqual(_ABSORB_CONFIG(64, 256, 512)["waves_per_eu"], 4)
+
+    def test_no_compute_units_falls_back(self):
+        forward_mla_rocm._absorb_bmm_num_cu = 0
+        with mock.patch.object(
+            forward_mla_rocm, "get_device_core_count", return_value=0
+        ):
+            self.assertIsNone(_ABSORB_CONFIG(64, 256, 512))
+
+    def test_negative_compute_units_falls_back(self):
+        forward_mla_rocm._absorb_bmm_num_cu = -1
+        self.assertIsNone(_ABSORB_CONFIG(64, 256, 512))
+
+    def test_hand_config_can_be_disabled(self):
+        with envs.SGLANG_ROCM_ABSORB_BMM_DISABLE_HAND_CONFIG.override(True):
+            self.assertIsNone(_ABSORB_CONFIG(64, 256, 512))
+            self.assertIsNone(_ABSORB_CONFIG(16, 48, 512))
 
 
 _ROPE_HEAD_DIM = 64
