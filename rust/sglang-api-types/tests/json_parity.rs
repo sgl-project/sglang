@@ -119,6 +119,20 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "OpenAiChatCompletionStreamResponse" => {
                 check::<api::OpenAiChatCompletionStreamResponse>(&name, input, canonical)
             }
+            "OpenAiEmbeddingRequest" => {
+                check::<api::OpenAiEmbeddingRequest>(&name, input, canonical)
+            }
+            "OpenAiEmbeddingResponse" => {
+                check::<api::OpenAiEmbeddingResponse>(&name, input, canonical)
+            }
+            "OpenAiScoreRequest" => check::<api::OpenAiScoreRequest>(&name, input, canonical),
+            "OpenAiScoreResponse" => check::<api::OpenAiScoreResponse>(&name, input, canonical),
+            "OpenAiRerankRequest" => check::<api::OpenAiRerankRequest>(&name, input, canonical),
+            "OpenAiRerankResponse" => check::<api::OpenAiRerankResponse>(&name, input, canonical),
+            "OpenAiTokenizeRequest" => check::<api::OpenAiTokenizeRequest>(&name, input, canonical),
+            "OpenAiTokenizeResponse" => {
+                check::<api::OpenAiTokenizeResponse>(&name, input, canonical)
+            }
             "OpenAiErrorResponse" => check::<api::OpenAiErrorResponse>(&name, input, canonical),
             "OllamaChatRequest" => check::<api::OllamaChatRequest>(&name, input, canonical),
             "OllamaChatResponse" => check::<api::OllamaChatResponse>(&name, input, canonical),

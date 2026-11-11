@@ -20,6 +20,7 @@ mod completions;
 mod lowered;
 mod models;
 pub(crate) mod pd_routing;
+pub(crate) mod score;
 mod template;
 mod tokenize;
 pub(crate) mod tools;
@@ -45,6 +46,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .merge(models::routes())
         .merge(completions::routes())
         .merge(chat::routes())
+        .merge(score::routes())
         .merge(tokenize::routes())
 }
 

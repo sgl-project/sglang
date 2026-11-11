@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::http::StatusCode;
 use futures::{Stream, StreamExt};
 use sglang_api_types::api::v1 as api;
 use sglang_api_types::api::v1::sglang_service_server::SglangService;
@@ -1193,6 +1194,67 @@ impl SglangService for GrpcService {
         &self,
         _request: Request<api::OpenAiChatCompletionRequest>,
     ) -> Result<Response<api::OpenAiChatCompletionResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_embeddings(
+        &self,
+        _request: Request<api::OpenAiEmbeddingRequest>,
+    ) -> Result<Response<api::OpenAiEmbeddingResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_classify(
+        &self,
+        _request: Request<api::OpenAiClassifyRequest>,
+    ) -> Result<Response<api::OpenAiClassifyResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_score(
+        &self,
+        request: Request<api::OpenAiScoreRequest>,
+    ) -> Result<Response<api::OpenAiScoreResponse>, Status> {
+        let request = request.into_inner();
+        let scored = crate::api_server::http::openai::score::score_request(
+            &self.core,
+            &self.server_args,
+            ReceivedAs::without_headers,
+            &request,
+        )
+        .await
+        .map_err(|(status, message)| {
+            let code = match status {
+                StatusCode::BAD_REQUEST => tonic::Code::InvalidArgument,
+                StatusCode::SERVICE_UNAVAILABLE => tonic::Code::Unavailable,
+                status if status.is_server_error() => tonic::Code::Internal,
+                _ => tonic::Code::Unknown,
+            };
+            Status::new(code, message)
+        })?;
+        Ok(Response::new(scored.into_response(
+            request.model.clone().unwrap_or_else(|| "default".into()),
+        )))
+    }
+
+    async fn open_ai_rerank(
+        &self,
+        _request: Request<api::OpenAiRerankRequest>,
+    ) -> Result<Response<api::OpenAiRerankResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_tokenize(
+        &self,
+        _request: Request<api::OpenAiTokenizeRequest>,
+    ) -> Result<Response<api::OpenAiTokenizeResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_detokenize(
+        &self,
+        _request: Request<api::OpenAiDetokenizeRequest>,
+    ) -> Result<Response<api::OpenAiDetokenizeResponse>, Status> {
         Err(openai_unimplemented())
     }
 

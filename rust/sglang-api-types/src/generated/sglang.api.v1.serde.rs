@@ -17258,63 +17258,58 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiChatCompletionStreamResponse {
     }
 }
 
-impl OpenAiResponseReasoning {
-    /// The schema default when unset (protobuf arrival).
-    pub fn effort_or_default(&self) -> ::prost::alloc::string::String {
-        self.effort.clone().unwrap_or_else(|| "medium".to_string())
-    }
-    /// Protobuf arrival: unset defaulted fields become their schema
-    /// defaults (JSON arrival already baked them at deserialization).
-    pub fn apply_absent_defaults(&mut self) {
-        if self.effort.is_none() {
-            self.effort = Some("medium".to_string());
-        }
-    }
-}
-
-impl ::serde::Serialize for OpenAiResponseReasoning {
+impl ::serde::Serialize for OpenAiMultimodalEmbeddingInput {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
-        if let Some(v) = &self.effort {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "effort", v)?;
+        if let Some(v) = &self.text {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "text", v)?;
         }
-        if let Some(v) = &self.summary {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "summary", v)?;
+        if let Some(v) = &self.image {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "image", v)?;
+        }
+        if let Some(v) = &self.video {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "video", v)?;
         }
         ::serde::ser::SerializeMap::end(map)
     }
 }
 
-impl<'de> ::serde::Deserialize<'de> for OpenAiResponseReasoning {
+impl<'de> ::serde::Deserialize<'de> for OpenAiMultimodalEmbeddingInput {
     fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = OpenAiResponseReasoning;
+            type Value = OpenAiMultimodalEmbeddingInput;
             fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("struct OpenAiResponseReasoning")
+                f.write_str("struct OpenAiMultimodalEmbeddingInput")
             }
             fn visit_map<A: ::serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
-                let mut f_effort = None;
-                let mut f_summary = None;
+                let mut f_text = None;
+                let mut f_image = None;
+                let mut f_video = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
-                        "effort" => {
-                            if f_effort.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("effort"));
+                        "text" => {
+                            if f_text.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("text"));
                             }
-                            f_effort = Some(Some(
-                                map.next_value::<Option<::prost::alloc::string::String>>()?
-                                    .unwrap_or_else(|| "medium".to_string()),
-                            ));
+                            f_text =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
                         }
-                        "summary" => {
-                            if f_summary.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("summary"));
+                        "image" => {
+                            if f_image.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("image"));
                             }
-                            f_summary =
+                            f_image =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "video" => {
+                            if f_video.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("video"));
+                            }
+                            f_video =
                                 Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
                         }
                         _ => {
@@ -17322,9 +17317,10 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiResponseReasoning {
                         }
                     }
                 }
-                Ok(OpenAiResponseReasoning {
-                    effort: f_effort.unwrap_or_else(|| Some("medium".to_string())),
-                    summary: f_summary.flatten(),
+                Ok(OpenAiMultimodalEmbeddingInput {
+                    text: f_text.flatten(),
+                    image: f_image.flatten(),
+                    video: f_video.flatten(),
                 })
             }
         }
@@ -17332,590 +17328,233 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiResponseReasoning {
     }
 }
 
-impl ::serde::Serialize for OpenAiResponseTool {
+impl ::serde::Serialize for OpenAiMultimodalEmbeddingInputList {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(None)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", &self.r#type)?;
-        if let Some(v) = &self.name {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "name", v)?;
-        }
-        if let Some(v) = &self.description {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "description", v)?;
-        }
-        if let Some(v) = &self.parameters {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "parameters",
-                &::serde_json::from_str::<::serde_json::Value>(v)
-                    .unwrap_or(::serde_json::Value::Null),
-            )?;
-        }
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "strict", &self.strict)?;
-        if !self.tools.is_empty() {
-            let rows: Vec<::serde_json::Value> = self
-                .tools
-                .iter()
-                .map(|s| ::serde_json::from_str(s).unwrap_or(::serde_json::Value::Null))
-                .collect();
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tools", &rows)?;
-        }
-        if let Some(v) = &self.defer_loading {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "defer_loading", v)?;
-        }
-        if let Some(v) = &self.format {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "format",
-                &::serde_json::from_str::<::serde_json::Value>(v)
-                    .unwrap_or(::serde_json::Value::Null),
-            )?;
-        }
-        ::serde::ser::SerializeMap::end(map)
+        serializer.collect_seq(self.items.iter())
     }
 }
 
-impl<'de> ::serde::Deserialize<'de> for OpenAiResponseTool {
+impl<'de> ::serde::Deserialize<'de> for OpenAiMultimodalEmbeddingInputList {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(OpenAiMultimodalEmbeddingInputList {
+            items: <::prost::alloc::vec::Vec<OpenAiMultimodalEmbeddingInput> as ::serde::Deserialize>::deserialize(deserializer)?,
+        })
+    }
+}
+
+impl ::serde::Serialize for OpenAiEmbeddingInput {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(open_ai_embedding_input::Value::Text(v)) => v.serialize(serializer),
+            Some(open_ai_embedding_input::Value::Texts(v)) => v.serialize(serializer),
+            Some(open_ai_embedding_input::Value::Ids(v)) => v.serialize(serializer),
+            Some(open_ai_embedding_input::Value::IdsList(v)) => v.serialize(serializer),
+            Some(open_ai_embedding_input::Value::Multimodal(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiEmbeddingInput {
     fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = OpenAiResponseTool;
+            type Value = OpenAiEmbeddingInput;
             fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("struct OpenAiResponseTool")
+                f.write_str("one of the OpenAiEmbeddingInput shapes")
             }
-            fn visit_map<A: ::serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut f_type = None;
-                let mut f_name = None;
-                let mut f_description = None;
-                let mut f_parameters = None;
-                let mut f_strict = None;
-                let mut f_tools = None;
-                let mut f_defer_loading = None;
-                let mut f_format = None;
-                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
-                    match key.as_ref() {
-                        "type" => {
-                            if f_type.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("type"));
-                            }
-                            f_type = Some(map.next_value::<::prost::alloc::string::String>()?);
-                        }
-                        "name" => {
-                            if f_name.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("name"));
-                            }
-                            f_name =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
-                        }
-                        "description" => {
-                            if f_description.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("description"));
-                            }
-                            f_description =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
-                        }
-                        "parameters" => {
-                            if f_parameters.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("parameters"));
-                            }
-                            f_parameters = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
-                        }
-                        "strict" => {
-                            if f_strict.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("strict"));
-                            }
-                            f_strict = Some(map.next_value::<bool>()?);
-                        }
-                        "tools" => {
-                            if f_tools.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("tools"));
-                            }
-                            f_tools = Some(
-                                map.next_value::<Option<Vec<::serde_json::Value>>>()?
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .map(|v| v.to_string())
-                                    .collect(),
-                            );
-                        }
-                        "defer_loading" => {
-                            if f_defer_loading.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("defer_loading"));
-                            }
-                            f_defer_loading = Some(map.next_value::<Option<bool>>()?);
-                        }
-                        "format" => {
-                            if f_format.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("format"));
-                            }
-                            f_format = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
-                        }
-                        _ => {
-                            map.next_value::<::serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(OpenAiResponseTool {
-                    r#type: f_type.unwrap_or_default(),
-                    name: f_name.flatten(),
-                    description: f_description.flatten(),
-                    parameters: f_parameters.flatten(),
-                    strict: f_strict.unwrap_or_default(),
-                    tools: f_tools.unwrap_or_default(),
-                    defer_loading: f_defer_loading.flatten(),
-                    format: f_format.flatten(),
+            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(OpenAiEmbeddingInput {
+                    value: Some(open_ai_embedding_input::Value::Text(v.to_owned())),
                 })
             }
+            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(OpenAiEmbeddingInput {
+                    value: Some(open_ai_embedding_input::Value::Text(v)),
+                })
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items: Vec<::serde_json::Value> = Vec::new();
+                while let Some(v) = seq.next_element::<::serde_json::Value>()? {
+                    items.push(v);
+                }
+                let shape = match items.first() {
+                    None => "empty",
+                    Some(::serde_json::Value::Array(inner))
+                        if inner.first().is_some_and(|x| x.is_array()) =>
+                    {
+                        "seq2"
+                    }
+                    Some(::serde_json::Value::Array(_)) => "seq",
+                    Some(::serde_json::Value::String(_)) => "str",
+                    Some(::serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => "int",
+                    Some(::serde_json::Value::Number(_)) => "float",
+                    Some(::serde_json::Value::Object(_)) => "map",
+                    Some(::serde_json::Value::Bool(_)) => "bool",
+                    Some(::serde_json::Value::Null) => "null",
+                };
+                let reparse = ::serde_json::Value::Array(items);
+                match shape {
+                    "str" | "empty" => {
+                        let v: StringList = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(OpenAiEmbeddingInput {
+                            value: Some(open_ai_embedding_input::Value::Texts(v)),
+                        })
+                    }
+                    "int" => {
+                        let v: TokenIds = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(OpenAiEmbeddingInput {
+                            value: Some(open_ai_embedding_input::Value::Ids(v)),
+                        })
+                    }
+                    "seq" => {
+                        let v: TokenIdsList = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(OpenAiEmbeddingInput {
+                            value: Some(open_ai_embedding_input::Value::IdsList(v)),
+                        })
+                    }
+                    "map" => {
+                        let v: OpenAiMultimodalEmbeddingInputList =
+                            ::serde_json::from_value(reparse)
+                                .map_err(::serde::de::Error::custom)?;
+                        Ok(OpenAiEmbeddingInput {
+                            value: Some(open_ai_embedding_input::Value::Multimodal(v)),
+                        })
+                    }
+                    other => Err(::serde::de::Error::custom(format!(
+                        "no OpenAiEmbeddingInput array form takes {other} elements"
+                    ))),
+                }
+            }
         }
-        deserializer.deserialize_map(V)
+        deserializer.deserialize_any(V)
     }
 }
 
-impl OpenAiResponsesRequest {
+impl OpenAiEmbeddingRequest {
     /// The schema default when unset (protobuf arrival).
-    pub fn background_or_default(&self) -> bool {
-        self.background.clone().unwrap_or_else(|| false)
+    pub fn model_or_default(&self) -> ::prost::alloc::string::String {
+        self.model.clone().unwrap_or_else(|| "default".to_string())
     }
     /// The schema default when unset (protobuf arrival).
-    pub fn parallel_tool_calls_or_default(&self) -> bool {
-        self.parallel_tool_calls.clone().unwrap_or_else(|| true)
-    }
-    /// The schema default when unset (protobuf arrival).
-    pub fn service_tier_or_default(&self) -> ::prost::alloc::string::String {
-        self.service_tier
+    pub fn encoding_format_or_default(&self) -> ::prost::alloc::string::String {
+        self.encoding_format
             .clone()
-            .unwrap_or_else(|| "auto".to_string())
-    }
-    /// The schema default when unset (protobuf arrival).
-    pub fn store_or_default(&self) -> bool {
-        self.store.clone().unwrap_or_else(|| true)
-    }
-    /// The schema default when unset (protobuf arrival).
-    pub fn stream_or_default(&self) -> bool {
-        self.stream.clone().unwrap_or_else(|| false)
-    }
-    /// The schema default when unset (protobuf arrival).
-    pub fn top_logprobs_or_default(&self) -> i64 {
-        self.top_logprobs.clone().unwrap_or_else(|| 0i64)
-    }
-    /// The schema default when unset (protobuf arrival).
-    pub fn truncation_or_default(&self) -> ::prost::alloc::string::String {
-        self.truncation
-            .clone()
-            .unwrap_or_else(|| "disabled".to_string())
+            .unwrap_or_else(|| "float".to_string())
     }
     /// Protobuf arrival: unset defaulted fields become their schema
     /// defaults (JSON arrival already baked them at deserialization).
     pub fn apply_absent_defaults(&mut self) {
-        if self.background.is_none() {
-            self.background = Some(false);
+        if self.model.is_none() {
+            self.model = Some("default".to_string());
         }
-        if self.parallel_tool_calls.is_none() {
-            self.parallel_tool_calls = Some(true);
-        }
-        if self.service_tier.is_none() {
-            self.service_tier = Some("auto".to_string());
-        }
-        if self.store.is_none() {
-            self.store = Some(true);
-        }
-        if self.stream.is_none() {
-            self.stream = Some(false);
-        }
-        if self.top_logprobs.is_none() {
-            self.top_logprobs = Some(0i64);
-        }
-        if self.truncation.is_none() {
-            self.truncation = Some("disabled".to_string());
+        if self.encoding_format.is_none() {
+            self.encoding_format = Some("float".to_string());
         }
     }
 }
 
-impl ::serde::Serialize for OpenAiResponsesRequest {
+impl ::serde::Serialize for OpenAiEmbeddingRequest {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
-        if let Some(v) = &self.background {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "background", v)?;
-        }
-        if !self.include.is_empty() {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "include", &self.include)?;
-        }
         if let Some(v) = &self.input {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "input",
-                &::serde_json::from_str::<::serde_json::Value>(v)
-                    .unwrap_or(::serde_json::Value::Null),
-            )?;
-        }
-        if let Some(v) = &self.instructions {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "instructions", v)?;
-        }
-        if let Some(v) = &self.max_output_tokens {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_output_tokens", v)?;
-        }
-        if let Some(v) = &self.max_tool_calls {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_tool_calls", v)?;
-        }
-        if let Some(v) = &self.metadata {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "metadata",
-                &::serde_json::from_str::<::serde_json::Value>(v)
-                    .unwrap_or(::serde_json::Value::Null),
-            )?;
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "input", v)?;
         }
         if let Some(v) = &self.model {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", v)?;
         }
-        if let Some(v) = &self.parallel_tool_calls {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "parallel_tool_calls", v)?;
+        if let Some(v) = &self.encoding_format {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "encoding_format", v)?;
         }
-        if let Some(v) = &self.previous_response_id {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "previous_response_id", v)?;
-        }
-        if let Some(v) = &self.reasoning {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "reasoning", v)?;
-        }
-        if let Some(v) = &self.service_tier {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "service_tier", v)?;
-        }
-        if let Some(v) = &self.store {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "store", v)?;
-        }
-        if let Some(v) = &self.stream {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "stream", v)?;
-        }
-        if let Some(v) = &self.temperature {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "temperature", v)?;
-        }
-        if let Some(v) = &self.text {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "text",
-                &::serde_json::from_str::<::serde_json::Value>(v)
-                    .unwrap_or(::serde_json::Value::Null),
-            )?;
-        }
-        if let Some(v) = &self.tool_choice {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "tool_choice",
-                &::serde_json::from_str::<::serde_json::Value>(v)
-                    .unwrap_or(::serde_json::Value::Null),
-            )?;
-        }
-        if !self.tools.is_empty() {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tools", &self.tools)?;
-        }
-        if let Some(v) = &self.top_logprobs {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "top_logprobs", v)?;
-        }
-        if let Some(v) = &self.top_p {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "top_p", v)?;
-        }
-        if let Some(v) = &self.truncation {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "truncation", v)?;
+        if let Some(v) = &self.dimensions {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "dimensions", v)?;
         }
         if let Some(v) = &self.user {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "user", v)?;
         }
-        if let Some(v) = &self.chat_template_kwargs {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "chat_template_kwargs",
-                &::serde_json::from_str::<::serde_json::Value>(v)
-                    .unwrap_or(::serde_json::Value::Null),
-            )?;
+        if let Some(v) = &self.rid {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "rid", v)?;
         }
-        if let Some(v) = &self.request_id {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "request_id", v)?;
+        if let Some(v) = &self.priority {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "priority", v)?;
         }
-        if let Some(v) = &self.session_id {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "session_id", v)?;
+        if let Some(v) = &self.lora_path {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "lora_path", v)?;
         }
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "priority", &self.priority)?;
-        if let Some(v) = &self.extra_key {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "extra_key", v)?;
+        if let Some(v) = &self.embed_override_token_id {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "embed_override_token_id", v)?;
         }
-        if let Some(v) = &self.cache_salt {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "cache_salt", v)?;
-        }
-        if let Some(v) = &self.data_parallel_rank {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "data_parallel_rank", v)?;
-        }
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "frequency_penalty",
-            &self.frequency_penalty,
-        )?;
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "presence_penalty",
-            &self.presence_penalty,
-        )?;
-        if let Some(v) = &self.stop {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "stop", v)?;
-        }
-        if let Some(v) = &self.top_k {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "top_k", v)?;
-        }
-        if let Some(v) = &self.min_p {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "min_p", v)?;
-        }
-        if let Some(v) = &self.repetition_penalty {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "repetition_penalty", v)?;
-        }
-        if let Some(v) = &self.bootstrap_host {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "bootstrap_host", v)?;
-        }
-        if let Some(v) = &self.bootstrap_port {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "bootstrap_port", v)?;
-        }
-        if let Some(v) = &self.bootstrap_room {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "bootstrap_room", v)?;
-        }
-        if let Some(v) = &self.routed_dp_rank {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "routed_dp_rank", v)?;
-        }
-        if let Some(v) = &self.disagg_prefill_dp_rank {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "disagg_prefill_dp_rank", v)?;
+        if !self.embed_overrides.is_empty() {
+            let rows: Vec<::serde_json::Value> = self
+                .embed_overrides
+                .iter()
+                .map(|s| ::serde_json::from_str(s).unwrap_or(::serde_json::Value::Null))
+                .collect();
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "embed_overrides", &rows)?;
         }
         ::serde::ser::SerializeMap::end(map)
     }
 }
 
-impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesRequest {
+impl<'de> ::serde::Deserialize<'de> for OpenAiEmbeddingRequest {
     fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = OpenAiResponsesRequest;
+            type Value = OpenAiEmbeddingRequest;
             fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("struct OpenAiResponsesRequest")
+                f.write_str("struct OpenAiEmbeddingRequest")
             }
             fn visit_map<A: ::serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
-                let mut f_background = None;
-                let mut f_include = None;
                 let mut f_input = None;
-                let mut f_instructions = None;
-                let mut f_max_output_tokens = None;
-                let mut f_max_tool_calls = None;
-                let mut f_metadata = None;
                 let mut f_model = None;
-                let mut f_parallel_tool_calls = None;
-                let mut f_previous_response_id = None;
-                let mut f_reasoning = None;
-                let mut f_service_tier = None;
-                let mut f_store = None;
-                let mut f_stream = None;
-                let mut f_temperature = None;
-                let mut f_text = None;
-                let mut f_tool_choice = None;
-                let mut f_tools = None;
-                let mut f_top_logprobs = None;
-                let mut f_top_p = None;
-                let mut f_truncation = None;
+                let mut f_encoding_format = None;
+                let mut f_dimensions = None;
                 let mut f_user = None;
-                let mut f_chat_template_kwargs = None;
-                let mut f_request_id = None;
-                let mut f_session_id = None;
+                let mut f_rid = None;
                 let mut f_priority = None;
-                let mut f_extra_key = None;
-                let mut f_cache_salt = None;
-                let mut f_data_parallel_rank = None;
-                let mut f_frequency_penalty = None;
-                let mut f_presence_penalty = None;
-                let mut f_stop = None;
-                let mut f_top_k = None;
-                let mut f_min_p = None;
-                let mut f_repetition_penalty = None;
-                let mut f_bootstrap_host = None;
-                let mut f_bootstrap_port = None;
-                let mut f_bootstrap_room = None;
-                let mut f_routed_dp_rank = None;
-                let mut f_disagg_prefill_dp_rank = None;
+                let mut f_lora_path = None;
+                let mut f_embed_override_token_id = None;
+                let mut f_embed_overrides = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
-                        "background" => {
-                            if f_background.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("background"));
-                            }
-                            f_background = Some(Some(
-                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| false),
-                            ));
-                        }
-                        "include" => {
-                            if f_include.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("include"));
-                            }
-                            f_include = Some(
-                                map.next_value::<Option<Vec<::prost::alloc::string::String>>>()?
-                                    .unwrap_or_default(),
-                            );
-                        }
                         "input" => {
                             if f_input.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("input"));
                             }
-                            f_input = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
-                        }
-                        "instructions" => {
-                            if f_instructions.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("instructions"));
-                            }
-                            f_instructions =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
-                        }
-                        "max_output_tokens" => {
-                            if f_max_output_tokens.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "max_output_tokens",
-                                ));
-                            }
-                            f_max_output_tokens = Some(map.next_value::<Option<i64>>()?);
-                        }
-                        "max_tool_calls" => {
-                            if f_max_tool_calls.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("max_tool_calls"));
-                            }
-                            f_max_tool_calls = Some(map.next_value::<Option<i64>>()?);
-                        }
-                        "metadata" => {
-                            if f_metadata.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("metadata"));
-                            }
-                            f_metadata = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
+                            f_input = Some(map.next_value::<Option<OpenAiEmbeddingInput>>()?);
                         }
                         "model" => {
                             if f_model.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("model"));
                             }
-                            f_model =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
-                        }
-                        "parallel_tool_calls" => {
-                            if f_parallel_tool_calls.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "parallel_tool_calls",
-                                ));
-                            }
-                            f_parallel_tool_calls = Some(Some(
-                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| true),
-                            ));
-                        }
-                        "previous_response_id" => {
-                            if f_previous_response_id.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "previous_response_id",
-                                ));
-                            }
-                            f_previous_response_id =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
-                        }
-                        "reasoning" => {
-                            if f_reasoning.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("reasoning"));
-                            }
-                            f_reasoning =
-                                Some(map.next_value::<Option<OpenAiResponseReasoning>>()?);
-                        }
-                        "service_tier" => {
-                            if f_service_tier.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("service_tier"));
-                            }
-                            f_service_tier = Some(Some(
+                            f_model = Some(Some(
                                 map.next_value::<Option<::prost::alloc::string::String>>()?
-                                    .unwrap_or_else(|| "auto".to_string()),
+                                    .unwrap_or_else(|| "default".to_string()),
                             ));
                         }
-                        "store" => {
-                            if f_store.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("store"));
+                        "encoding_format" => {
+                            if f_encoding_format.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("encoding_format"));
                             }
-                            f_store = Some(Some(
-                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| true),
-                            ));
-                        }
-                        "stream" => {
-                            if f_stream.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("stream"));
-                            }
-                            f_stream = Some(Some(
-                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| false),
-                            ));
-                        }
-                        "temperature" => {
-                            if f_temperature.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("temperature"));
-                            }
-                            f_temperature = Some(map.next_value::<Option<f64>>()?);
-                        }
-                        "text" => {
-                            if f_text.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("text"));
-                            }
-                            f_text = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
-                        }
-                        "tool_choice" => {
-                            if f_tool_choice.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("tool_choice"));
-                            }
-                            f_tool_choice = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
-                        }
-                        "tools" => {
-                            if f_tools.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("tools"));
-                            }
-                            f_tools = Some(
-                                map.next_value::<Option<Vec<OpenAiResponseTool>>>()?
-                                    .unwrap_or_default(),
-                            );
-                        }
-                        "top_logprobs" => {
-                            if f_top_logprobs.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("top_logprobs"));
-                            }
-                            f_top_logprobs = Some(Some(
-                                map.next_value::<Option<i64>>()?.unwrap_or_else(|| 0i64),
-                            ));
-                        }
-                        "top_p" => {
-                            if f_top_p.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("top_p"));
-                            }
-                            f_top_p = Some(map.next_value::<Option<f64>>()?);
-                        }
-                        "truncation" => {
-                            if f_truncation.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("truncation"));
-                            }
-                            f_truncation = Some(Some(
+                            f_encoding_format = Some(Some(
                                 map.next_value::<Option<::prost::alloc::string::String>>()?
-                                    .unwrap_or_else(|| "disabled".to_string()),
+                                    .unwrap_or_else(|| "float".to_string()),
                             ));
+                        }
+                        "dimensions" => {
+                            if f_dimensions.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("dimensions"));
+                            }
+                            f_dimensions = Some(map.next_value::<Option<i64>>()?);
                         }
                         "user" => {
                             if f_user.is_some() {
@@ -17924,180 +17563,60 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesRequest {
                             f_user =
                                 Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
                         }
-                        "chat_template_kwargs" => {
-                            if f_chat_template_kwargs.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "chat_template_kwargs",
-                                ));
+                        "rid" => {
+                            if f_rid.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("rid"));
                             }
-                            f_chat_template_kwargs = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
-                        }
-                        "request_id" => {
-                            if f_request_id.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("request_id"));
-                            }
-                            f_request_id =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
-                        }
-                        "session_id" => {
-                            if f_session_id.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("session_id"));
-                            }
-                            f_session_id =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                            f_rid = Some(map.next_value::<Option<StringOrList>>()?);
                         }
                         "priority" => {
                             if f_priority.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("priority"));
                             }
-                            f_priority = Some(map.next_value::<i64>()?);
+                            f_priority = Some(map.next_value::<Option<i64>>()?);
                         }
-                        "extra_key" => {
-                            if f_extra_key.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("extra_key"));
+                        "lora_path" => {
+                            if f_lora_path.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("lora_path"));
                             }
-                            f_extra_key =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                            f_lora_path = Some(map.next_value::<Option<OptionalStringOrList>>()?);
                         }
-                        "cache_salt" => {
-                            if f_cache_salt.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("cache_salt"));
-                            }
-                            f_cache_salt =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
-                        }
-                        "data_parallel_rank" => {
-                            if f_data_parallel_rank.is_some() {
+                        "embed_override_token_id" => {
+                            if f_embed_override_token_id.is_some() {
                                 return Err(::serde::de::Error::duplicate_field(
-                                    "data_parallel_rank",
+                                    "embed_override_token_id",
                                 ));
                             }
-                            f_data_parallel_rank = Some(map.next_value::<Option<i64>>()?);
+                            f_embed_override_token_id = Some(map.next_value::<Option<i64>>()?);
                         }
-                        "frequency_penalty" => {
-                            if f_frequency_penalty.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "frequency_penalty",
-                                ));
+                        "embed_overrides" => {
+                            if f_embed_overrides.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("embed_overrides"));
                             }
-                            f_frequency_penalty = Some(map.next_value::<f64>()?);
-                        }
-                        "presence_penalty" => {
-                            if f_presence_penalty.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "presence_penalty",
-                                ));
-                            }
-                            f_presence_penalty = Some(map.next_value::<f64>()?);
-                        }
-                        "stop" => {
-                            if f_stop.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("stop"));
-                            }
-                            f_stop = Some(map.next_value::<Option<StringOrList>>()?);
-                        }
-                        "top_k" => {
-                            if f_top_k.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("top_k"));
-                            }
-                            f_top_k = Some(map.next_value::<Option<i64>>()?);
-                        }
-                        "min_p" => {
-                            if f_min_p.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("min_p"));
-                            }
-                            f_min_p = Some(map.next_value::<Option<f64>>()?);
-                        }
-                        "repetition_penalty" => {
-                            if f_repetition_penalty.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "repetition_penalty",
-                                ));
-                            }
-                            f_repetition_penalty = Some(map.next_value::<Option<f64>>()?);
-                        }
-                        "bootstrap_host" => {
-                            if f_bootstrap_host.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("bootstrap_host"));
-                            }
-                            f_bootstrap_host = Some(map.next_value::<Option<StringOrList>>()?);
-                        }
-                        "bootstrap_port" => {
-                            if f_bootstrap_port.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("bootstrap_port"));
-                            }
-                            f_bootstrap_port =
-                                Some(map.next_value::<Option<OptionalInt64OrList>>()?);
-                        }
-                        "bootstrap_room" => {
-                            if f_bootstrap_room.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("bootstrap_room"));
-                            }
-                            f_bootstrap_room = Some(map.next_value::<Option<Int64OrList>>()?);
-                        }
-                        "routed_dp_rank" => {
-                            if f_routed_dp_rank.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("routed_dp_rank"));
-                            }
-                            f_routed_dp_rank = Some(map.next_value::<Option<i64>>()?);
-                        }
-                        "disagg_prefill_dp_rank" => {
-                            if f_disagg_prefill_dp_rank.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "disagg_prefill_dp_rank",
-                                ));
-                            }
-                            f_disagg_prefill_dp_rank = Some(map.next_value::<Option<i64>>()?);
+                            f_embed_overrides = Some(
+                                map.next_value::<Option<Vec<::serde_json::Value>>>()?
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(|v| v.to_string())
+                                    .collect(),
+                            );
                         }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
                     }
                 }
-                Ok(OpenAiResponsesRequest {
-                    background: f_background.unwrap_or_else(|| Some(false)),
-                    include: f_include.unwrap_or_default(),
+                Ok(OpenAiEmbeddingRequest {
                     input: f_input.flatten(),
-                    instructions: f_instructions.flatten(),
-                    max_output_tokens: f_max_output_tokens.flatten(),
-                    max_tool_calls: f_max_tool_calls.flatten(),
-                    metadata: f_metadata.flatten(),
-                    model: f_model.flatten(),
-                    parallel_tool_calls: f_parallel_tool_calls.unwrap_or_else(|| Some(true)),
-                    previous_response_id: f_previous_response_id.flatten(),
-                    reasoning: f_reasoning.flatten(),
-                    service_tier: f_service_tier.unwrap_or_else(|| Some("auto".to_string())),
-                    store: f_store.unwrap_or_else(|| Some(true)),
-                    stream: f_stream.unwrap_or_else(|| Some(false)),
-                    temperature: f_temperature.flatten(),
-                    text: f_text.flatten(),
-                    tool_choice: f_tool_choice.flatten(),
-                    tools: f_tools.unwrap_or_default(),
-                    top_logprobs: f_top_logprobs.unwrap_or_else(|| Some(0i64)),
-                    top_p: f_top_p.flatten(),
-                    truncation: f_truncation.unwrap_or_else(|| Some("disabled".to_string())),
+                    model: f_model.unwrap_or_else(|| Some("default".to_string())),
+                    encoding_format: f_encoding_format.unwrap_or_else(|| Some("float".to_string())),
+                    dimensions: f_dimensions.flatten(),
                     user: f_user.flatten(),
-                    chat_template_kwargs: f_chat_template_kwargs.flatten(),
-                    request_id: f_request_id.flatten(),
-                    session_id: f_session_id.flatten(),
-                    priority: f_priority.unwrap_or_default(),
-                    extra_key: f_extra_key.flatten(),
-                    cache_salt: f_cache_salt.flatten(),
-                    data_parallel_rank: f_data_parallel_rank.flatten(),
-                    frequency_penalty: f_frequency_penalty.unwrap_or_default(),
-                    presence_penalty: f_presence_penalty.unwrap_or_default(),
-                    stop: f_stop.flatten(),
-                    top_k: f_top_k.flatten(),
-                    min_p: f_min_p.flatten(),
-                    repetition_penalty: f_repetition_penalty.flatten(),
-                    bootstrap_host: f_bootstrap_host.flatten(),
-                    bootstrap_port: f_bootstrap_port.flatten(),
-                    bootstrap_room: f_bootstrap_room.flatten(),
-                    routed_dp_rank: f_routed_dp_rank.flatten(),
-                    disagg_prefill_dp_rank: f_disagg_prefill_dp_rank.flatten(),
+                    rid: f_rid.flatten(),
+                    priority: f_priority.flatten(),
+                    lora_path: f_lora_path.flatten(),
+                    embed_override_token_id: f_embed_override_token_id.flatten(),
+                    embed_overrides: f_embed_overrides.unwrap_or_default(),
                 })
             }
         }
@@ -18105,392 +17624,90 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesRequest {
     }
 }
 
-impl ::serde::Serialize for OpenAiResponsesInputTokensDetails {
+impl ::serde::Serialize for OpenAiEmbeddingVector {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(None)?;
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "cached_tokens",
-            &self.cached_tokens,
-        )?;
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "cache_write_tokens",
-            &self.cache_write_tokens,
-        )?;
-        ::serde::ser::SerializeMap::end(map)
+        match &self.value {
+            Some(open_ai_embedding_vector::Value::Floats(v)) => v.serialize(serializer),
+            Some(open_ai_embedding_vector::Value::Base64(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
     }
 }
 
-impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesInputTokensDetails {
+impl<'de> ::serde::Deserialize<'de> for OpenAiEmbeddingVector {
     fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = OpenAiResponsesInputTokensDetails;
+            type Value = OpenAiEmbeddingVector;
             fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("struct OpenAiResponsesInputTokensDetails")
+                f.write_str("one of the OpenAiEmbeddingVector shapes")
             }
-            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
                 self,
-                mut map: A,
+                seq: A,
             ) -> Result<Self::Value, A::Error> {
-                let mut f_cached_tokens = None;
-                let mut f_cache_write_tokens = None;
-                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
-                    match key.as_ref() {
-                        "cached_tokens" => {
-                            if f_cached_tokens.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("cached_tokens"));
-                            }
-                            f_cached_tokens = Some(map.next_value::<i64>()?);
-                        }
-                        "cache_write_tokens" => {
-                            if f_cache_write_tokens.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "cache_write_tokens",
-                                ));
-                            }
-                            f_cache_write_tokens = Some(map.next_value::<i64>()?);
-                        }
-                        _ => {
-                            map.next_value::<::serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(OpenAiResponsesInputTokensDetails {
-                    cached_tokens: f_cached_tokens.unwrap_or_default(),
-                    cache_write_tokens: f_cache_write_tokens.unwrap_or_default(),
+                let v = <DoubleList as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::SeqAccessDeserializer::new(seq),
+                )?;
+                Ok(OpenAiEmbeddingVector {
+                    value: Some(open_ai_embedding_vector::Value::Floats(v)),
+                })
+            }
+            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(OpenAiEmbeddingVector {
+                    value: Some(open_ai_embedding_vector::Value::Base64(v.to_owned())),
+                })
+            }
+            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(OpenAiEmbeddingVector {
+                    value: Some(open_ai_embedding_vector::Value::Base64(v)),
                 })
             }
         }
-        deserializer.deserialize_map(V)
+        deserializer.deserialize_any(V)
     }
 }
 
-impl ::serde::Serialize for OpenAiResponsesOutputTokensDetails {
+impl ::serde::Serialize for OpenAiEmbeddingObject {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "reasoning_tokens",
-            &self.reasoning_tokens,
-        )?;
-        ::serde::ser::SerializeMap::end(map)
-    }
-}
-
-impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesOutputTokensDetails {
-    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = OpenAiResponsesOutputTokensDetails;
-            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("struct OpenAiResponsesOutputTokensDetails")
-            }
-            fn visit_map<A: ::serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut f_reasoning_tokens = None;
-                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
-                    match key.as_ref() {
-                        "reasoning_tokens" => {
-                            if f_reasoning_tokens.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "reasoning_tokens",
-                                ));
-                            }
-                            f_reasoning_tokens = Some(map.next_value::<i64>()?);
-                        }
-                        _ => {
-                            map.next_value::<::serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(OpenAiResponsesOutputTokensDetails {
-                    reasoning_tokens: f_reasoning_tokens.unwrap_or_default(),
-                })
-            }
+        if let Some(v) = &self.embedding {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "embedding", v)?;
         }
-        deserializer.deserialize_map(V)
-    }
-}
-
-impl ::serde::Serialize for OpenAiResponsesUsage {
-    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(None)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "input_tokens", &self.input_tokens)?;
-        if let Some(v) = &self.input_tokens_details {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "input_tokens_details", v)?;
-        }
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "output_tokens",
-            &self.output_tokens,
-        )?;
-        if let Some(v) = &self.output_tokens_details {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "output_tokens_details", v)?;
-        }
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "total_tokens", &self.total_tokens)?;
-        ::serde::ser::SerializeMap::end(map)
-    }
-}
-
-impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesUsage {
-    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = OpenAiResponsesUsage;
-            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("struct OpenAiResponsesUsage")
-            }
-            fn visit_map<A: ::serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut f_input_tokens = None;
-                let mut f_input_tokens_details = None;
-                let mut f_output_tokens = None;
-                let mut f_output_tokens_details = None;
-                let mut f_total_tokens = None;
-                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
-                    match key.as_ref() {
-                        "input_tokens" => {
-                            if f_input_tokens.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("input_tokens"));
-                            }
-                            f_input_tokens = Some(map.next_value::<i64>()?);
-                        }
-                        "input_tokens_details" => {
-                            if f_input_tokens_details.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "input_tokens_details",
-                                ));
-                            }
-                            f_input_tokens_details = Some(
-                                map.next_value::<Option<OpenAiResponsesInputTokensDetails>>()?,
-                            );
-                        }
-                        "output_tokens" => {
-                            if f_output_tokens.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("output_tokens"));
-                            }
-                            f_output_tokens = Some(map.next_value::<i64>()?);
-                        }
-                        "output_tokens_details" => {
-                            if f_output_tokens_details.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "output_tokens_details",
-                                ));
-                            }
-                            f_output_tokens_details = Some(
-                                map.next_value::<Option<OpenAiResponsesOutputTokensDetails>>()?,
-                            );
-                        }
-                        "total_tokens" => {
-                            if f_total_tokens.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("total_tokens"));
-                            }
-                            f_total_tokens = Some(map.next_value::<i64>()?);
-                        }
-                        _ => {
-                            map.next_value::<::serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(OpenAiResponsesUsage {
-                    input_tokens: f_input_tokens.unwrap_or_default(),
-                    input_tokens_details: f_input_tokens_details.flatten(),
-                    output_tokens: f_output_tokens.unwrap_or_default(),
-                    output_tokens_details: f_output_tokens_details.flatten(),
-                    total_tokens: f_total_tokens.unwrap_or_default(),
-                })
-            }
-        }
-        deserializer.deserialize_map(V)
-    }
-}
-
-impl ::serde::Serialize for OpenAiResponsesResponse {
-    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(None)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "id", &self.id)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "index", &self.index)?;
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "object", &self.object)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "created_at", &self.created_at)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", &self.model)?;
-        if !self.output.is_empty() {
-            let rows: Vec<::serde_json::Value> = self
-                .output
-                .iter()
-                .map(|s| ::serde_json::from_str(s).unwrap_or(::serde_json::Value::Null))
-                .collect();
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "output", &rows)?;
-        }
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "status", &self.status)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "usage", &self.usage)?;
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "parallel_tool_calls",
-            &self.parallel_tool_calls,
-        )?;
-        if let Some(v) = &self.tool_choice {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "tool_choice",
-                &::serde_json::from_str::<::serde_json::Value>(v)
-                    .unwrap_or(::serde_json::Value::Null),
-            )?;
-        }
-        if !self.tools.is_empty() {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tools", &self.tools)?;
-        }
-        match &self.error {
-            Some(v) => {
-                ::serde::ser::SerializeMap::serialize_entry(
-                    &mut map,
-                    "error",
-                    &::serde_json::from_str::<::serde_json::Value>(v)
-                        .unwrap_or(::serde_json::Value::Null),
-                )?;
-            }
-            None => {
-                ::serde::ser::SerializeMap::serialize_entry(
-                    &mut map,
-                    "error",
-                    &::serde_json::Value::Null,
-                )?;
-            }
-        }
-        match &self.incomplete_details {
-            Some(v) => {
-                ::serde::ser::SerializeMap::serialize_entry(
-                    &mut map,
-                    "incomplete_details",
-                    &::serde_json::from_str::<::serde_json::Value>(v)
-                        .unwrap_or(::serde_json::Value::Null),
-                )?;
-            }
-            None => {
-                ::serde::ser::SerializeMap::serialize_entry(
-                    &mut map,
-                    "incomplete_details",
-                    &::serde_json::Value::Null,
-                )?;
-            }
-        }
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "instructions", &self.instructions)?;
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "max_output_tokens",
-            &self.max_output_tokens,
-        )?;
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "previous_response_id",
-            &self.previous_response_id,
-        )?;
-        match &self.reasoning {
-            Some(v) => {
-                ::serde::ser::SerializeMap::serialize_entry(
-                    &mut map,
-                    "reasoning",
-                    &::serde_json::from_str::<::serde_json::Value>(v)
-                        .unwrap_or(::serde_json::Value::Null),
-                )?;
-            }
-            None => {
-                ::serde::ser::SerializeMap::serialize_entry(
-                    &mut map,
-                    "reasoning",
-                    &::serde_json::Value::Null,
-                )?;
-            }
-        }
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "store", &self.store)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "temperature", &self.temperature)?;
-        match &self.text {
-            Some(v) => {
-                ::serde::ser::SerializeMap::serialize_entry(
-                    &mut map,
-                    "text",
-                    &::serde_json::from_str::<::serde_json::Value>(v)
-                        .unwrap_or(::serde_json::Value::Null),
-                )?;
-            }
-            None => {
-                ::serde::ser::SerializeMap::serialize_entry(
-                    &mut map,
-                    "text",
-                    &::serde_json::Value::Null,
-                )?;
-            }
-        }
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "top_p", &self.top_p)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "truncation", &self.truncation)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "user", &self.user)?;
-        match &self.metadata {
-            Some(v) => {
-                ::serde::ser::SerializeMap::serialize_entry(
-                    &mut map,
-                    "metadata",
-                    &::serde_json::from_str::<::serde_json::Value>(v)
-                        .unwrap_or(::serde_json::Value::Null),
-                )?;
-            }
-            None => {
-                ::serde::ser::SerializeMap::serialize_entry(
-                    &mut map,
-                    "metadata",
-                    &::serde_json::Value::Null,
-                )?;
-            }
-        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
 
-impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesResponse {
+impl<'de> ::serde::Deserialize<'de> for OpenAiEmbeddingObject {
     fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = OpenAiResponsesResponse;
+            type Value = OpenAiEmbeddingObject;
             fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("struct OpenAiResponsesResponse")
+                f.write_str("struct OpenAiEmbeddingObject")
             }
             fn visit_map<A: ::serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
-                let mut f_id = None;
+                let mut f_embedding = None;
+                let mut f_index = None;
                 let mut f_object = None;
-                let mut f_created_at = None;
-                let mut f_model = None;
-                let mut f_output = None;
-                let mut f_status = None;
-                let mut f_usage = None;
-                let mut f_parallel_tool_calls = None;
-                let mut f_tool_choice = None;
-                let mut f_tools = None;
-                let mut f_error = None;
-                let mut f_incomplete_details = None;
-                let mut f_instructions = None;
-                let mut f_max_output_tokens = None;
-                let mut f_previous_response_id = None;
-                let mut f_reasoning = None;
-                let mut f_store = None;
-                let mut f_temperature = None;
-                let mut f_text = None;
-                let mut f_top_p = None;
-                let mut f_truncation = None;
-                let mut f_user = None;
-                let mut f_metadata = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
-                        "id" => {
-                            if f_id.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("id"));
+                        "embedding" => {
+                            if f_embedding.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("embedding"));
                             }
-                            f_id = Some(map.next_value::<::prost::alloc::string::String>()?);
+                            f_embedding = Some(map.next_value::<Option<OpenAiEmbeddingVector>>()?);
+                        }
+                        "index" => {
+                            if f_index.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("index"));
+                            }
+                            f_index = Some(map.next_value::<i64>()?);
                         }
                         "object" => {
                             if f_object.is_some() {
@@ -18498,11 +17715,61 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesResponse {
                             }
                             f_object = Some(map.next_value::<::prost::alloc::string::String>()?);
                         }
-                        "created_at" => {
-                            if f_created_at.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("created_at"));
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OpenAiEmbeddingObject {
+                    embedding: f_embedding.flatten(),
+                    index: f_index.unwrap_or_default(),
+                    object: f_object.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OpenAiEmbeddingResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if !self.data.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "data", &self.data)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", &self.model)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "object", &self.object)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "usage", &self.usage)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiEmbeddingResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiEmbeddingResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiEmbeddingResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_data = None;
+                let mut f_model = None;
+                let mut f_object = None;
+                let mut f_usage = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "data" => {
+                            if f_data.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("data"));
                             }
-                            f_created_at = Some(map.next_value::<i64>()?);
+                            f_data = Some(
+                                map.next_value::<Option<Vec<OpenAiEmbeddingObject>>>()?
+                                    .unwrap_or_default(),
+                            );
                         }
                         "model" => {
                             if f_model.is_some() {
@@ -18510,142 +17777,182 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesResponse {
                             }
                             f_model = Some(map.next_value::<::prost::alloc::string::String>()?);
                         }
-                        "output" => {
-                            if f_output.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("output"));
+                        "object" => {
+                            if f_object.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("object"));
                             }
-                            f_output = Some(
-                                map.next_value::<Option<Vec<::serde_json::Value>>>()?
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .map(|v| v.to_string())
-                                    .collect(),
-                            );
-                        }
-                        "status" => {
-                            if f_status.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("status"));
-                            }
-                            f_status = Some(map.next_value::<::prost::alloc::string::String>()?);
+                            f_object = Some(map.next_value::<::prost::alloc::string::String>()?);
                         }
                         "usage" => {
                             if f_usage.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("usage"));
                             }
-                            f_usage = Some(map.next_value::<Option<OpenAiResponsesUsage>>()?);
+                            f_usage = Some(map.next_value::<Option<OpenAiUsage>>()?);
                         }
-                        "parallel_tool_calls" => {
-                            if f_parallel_tool_calls.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "parallel_tool_calls",
-                                ));
-                            }
-                            f_parallel_tool_calls = Some(map.next_value::<bool>()?);
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
                         }
-                        "tool_choice" => {
-                            if f_tool_choice.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("tool_choice"));
+                    }
+                }
+                Ok(OpenAiEmbeddingResponse {
+                    data: f_data.unwrap_or_default(),
+                    model: f_model.unwrap_or_default(),
+                    object: f_object.unwrap_or_default(),
+                    usage: f_usage.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OpenAiClassifyInput {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(open_ai_classify_input::Value::Text(v)) => v.serialize(serializer),
+            Some(open_ai_classify_input::Value::Texts(v)) => v.serialize(serializer),
+            Some(open_ai_classify_input::Value::Ids(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiClassifyInput {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiClassifyInput;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the OpenAiClassifyInput shapes")
+            }
+            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(OpenAiClassifyInput {
+                    value: Some(open_ai_classify_input::Value::Text(v.to_owned())),
+                })
+            }
+            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(OpenAiClassifyInput {
+                    value: Some(open_ai_classify_input::Value::Text(v)),
+                })
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items: Vec<::serde_json::Value> = Vec::new();
+                while let Some(v) = seq.next_element::<::serde_json::Value>()? {
+                    items.push(v);
+                }
+                let shape = match items.first() {
+                    None => "empty",
+                    Some(::serde_json::Value::Array(inner))
+                        if inner.first().is_some_and(|x| x.is_array()) =>
+                    {
+                        "seq2"
+                    }
+                    Some(::serde_json::Value::Array(_)) => "seq",
+                    Some(::serde_json::Value::String(_)) => "str",
+                    Some(::serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => "int",
+                    Some(::serde_json::Value::Number(_)) => "float",
+                    Some(::serde_json::Value::Object(_)) => "map",
+                    Some(::serde_json::Value::Bool(_)) => "bool",
+                    Some(::serde_json::Value::Null) => "null",
+                };
+                let reparse = ::serde_json::Value::Array(items);
+                match shape {
+                    "str" | "empty" => {
+                        let v: StringList = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(OpenAiClassifyInput {
+                            value: Some(open_ai_classify_input::Value::Texts(v)),
+                        })
+                    }
+                    "int" => {
+                        let v: TokenIds = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(OpenAiClassifyInput {
+                            value: Some(open_ai_classify_input::Value::Ids(v)),
+                        })
+                    }
+                    other => Err(::serde::de::Error::custom(format!(
+                        "no OpenAiClassifyInput array form takes {other} elements"
+                    ))),
+                }
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl OpenAiClassifyRequest {
+    /// The schema default when unset (protobuf arrival).
+    pub fn model_or_default(&self) -> ::prost::alloc::string::String {
+        self.model.clone().unwrap_or_else(|| "default".to_string())
+    }
+    /// Protobuf arrival: unset defaulted fields become their schema
+    /// defaults (JSON arrival already baked them at deserialization).
+    pub fn apply_absent_defaults(&mut self) {
+        if self.model.is_none() {
+            self.model = Some("default".to_string());
+        }
+    }
+}
+
+impl ::serde::Serialize for OpenAiClassifyRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.model {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", v)?;
+        }
+        if let Some(v) = &self.input {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "input", v)?;
+        }
+        if let Some(v) = &self.user {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "user", v)?;
+        }
+        if let Some(v) = &self.rid {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "rid", v)?;
+        }
+        if let Some(v) = &self.priority {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "priority", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiClassifyRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiClassifyRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiClassifyRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_model = None;
+                let mut f_input = None;
+                let mut f_user = None;
+                let mut f_rid = None;
+                let mut f_priority = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
                             }
-                            f_tool_choice = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
+                            f_model = Some(Some(
+                                map.next_value::<Option<::prost::alloc::string::String>>()?
+                                    .unwrap_or_else(|| "default".to_string()),
+                            ));
                         }
-                        "tools" => {
-                            if f_tools.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("tools"));
+                        "input" => {
+                            if f_input.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("input"));
                             }
-                            f_tools = Some(
-                                map.next_value::<Option<Vec<OpenAiResponseTool>>>()?
-                                    .unwrap_or_default(),
-                            );
-                        }
-                        "error" => {
-                            if f_error.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("error"));
-                            }
-                            f_error = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
-                        }
-                        "incomplete_details" => {
-                            if f_incomplete_details.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "incomplete_details",
-                                ));
-                            }
-                            f_incomplete_details = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
-                        }
-                        "instructions" => {
-                            if f_instructions.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("instructions"));
-                            }
-                            f_instructions =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
-                        }
-                        "max_output_tokens" => {
-                            if f_max_output_tokens.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "max_output_tokens",
-                                ));
-                            }
-                            f_max_output_tokens = Some(map.next_value::<Option<i64>>()?);
-                        }
-                        "previous_response_id" => {
-                            if f_previous_response_id.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "previous_response_id",
-                                ));
-                            }
-                            f_previous_response_id =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
-                        }
-                        "reasoning" => {
-                            if f_reasoning.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("reasoning"));
-                            }
-                            f_reasoning = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
-                        }
-                        "store" => {
-                            if f_store.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("store"));
-                            }
-                            f_store = Some(map.next_value::<Option<bool>>()?);
-                        }
-                        "temperature" => {
-                            if f_temperature.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("temperature"));
-                            }
-                            f_temperature = Some(map.next_value::<Option<f64>>()?);
-                        }
-                        "text" => {
-                            if f_text.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("text"));
-                            }
-                            f_text = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
-                        }
-                        "top_p" => {
-                            if f_top_p.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("top_p"));
-                            }
-                            f_top_p = Some(map.next_value::<Option<f64>>()?);
-                        }
-                        "truncation" => {
-                            if f_truncation.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("truncation"));
-                            }
-                            f_truncation =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                            f_input = Some(map.next_value::<Option<OpenAiClassifyInput>>()?);
                         }
                         "user" => {
                             if f_user.is_some() {
@@ -18654,44 +17961,29 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesResponse {
                             f_user =
                                 Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
                         }
-                        "metadata" => {
-                            if f_metadata.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("metadata"));
+                        "rid" => {
+                            if f_rid.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("rid"));
                             }
-                            f_metadata = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
+                            f_rid = Some(map.next_value::<Option<StringOrList>>()?);
+                        }
+                        "priority" => {
+                            if f_priority.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("priority"));
+                            }
+                            f_priority = Some(map.next_value::<Option<i64>>()?);
                         }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
                     }
                 }
-                Ok(OpenAiResponsesResponse {
-                    id: f_id.unwrap_or_default(),
-                    object: f_object.unwrap_or_default(),
-                    created_at: f_created_at.unwrap_or_default(),
-                    model: f_model.unwrap_or_default(),
-                    output: f_output.unwrap_or_default(),
-                    status: f_status.unwrap_or_default(),
-                    usage: f_usage.flatten(),
-                    parallel_tool_calls: f_parallel_tool_calls.unwrap_or_default(),
-                    tool_choice: f_tool_choice.flatten(),
-                    tools: f_tools.unwrap_or_default(),
-                    error: f_error.flatten(),
-                    incomplete_details: f_incomplete_details.flatten(),
-                    instructions: f_instructions.flatten(),
-                    max_output_tokens: f_max_output_tokens.flatten(),
-                    previous_response_id: f_previous_response_id.flatten(),
-                    reasoning: f_reasoning.flatten(),
-                    store: f_store.flatten(),
-                    temperature: f_temperature.flatten(),
-                    text: f_text.flatten(),
-                    top_p: f_top_p.flatten(),
-                    truncation: f_truncation.flatten(),
+                Ok(OpenAiClassifyRequest {
+                    model: f_model.unwrap_or_else(|| Some("default".to_string())),
+                    input: f_input.flatten(),
                     user: f_user.flatten(),
-                    metadata: f_metadata.flatten(),
+                    rid: f_rid.flatten(),
+                    priority: f_priority.flatten(),
                 })
             }
         }
@@ -18699,31 +17991,103 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesResponse {
     }
 }
 
-impl ::serde::Serialize for OpenAiModelCard {
+impl ::serde::Serialize for OpenAiClassifyData {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "index", &self.index)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "label", &self.label)?;
+        if !self.probs.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "probs", &self.probs)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "num_classes", &self.num_classes)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiClassifyData {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiClassifyData;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiClassifyData")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_index = None;
+                let mut f_label = None;
+                let mut f_probs = None;
+                let mut f_num_classes = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "index" => {
+                            if f_index.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("index"));
+                            }
+                            f_index = Some(map.next_value::<i64>()?);
+                        }
+                        "label" => {
+                            if f_label.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("label"));
+                            }
+                            f_label = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "probs" => {
+                            if f_probs.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("probs"));
+                            }
+                            f_probs =
+                                Some(map.next_value::<Option<Vec<f64>>>()?.unwrap_or_default());
+                        }
+                        "num_classes" => {
+                            if f_num_classes.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("num_classes"));
+                            }
+                            f_num_classes = Some(map.next_value::<i64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OpenAiClassifyData {
+                    index: f_index.unwrap_or_default(),
+                    label: f_label.unwrap_or_default(),
+                    probs: f_probs.unwrap_or_default(),
+                    num_classes: f_num_classes.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OpenAiClassifyResponse {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "id", &self.id)?;
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "object", &self.object)?;
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "created", &self.created)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "owned_by", &self.owned_by)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "root", &self.root)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "parent", &self.parent)?;
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "max_model_len",
-            &self.max_model_len,
-        )?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", &self.model)?;
+        if !self.data.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "data", &self.data)?;
+        }
+        if let Some(v) = &self.usage {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "usage", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
 
-impl<'de> ::serde::Deserialize<'de> for OpenAiModelCard {
+impl<'de> ::serde::Deserialize<'de> for OpenAiClassifyResponse {
     fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = OpenAiModelCard;
+            type Value = OpenAiClassifyResponse;
             fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("struct OpenAiModelCard")
+                f.write_str("struct OpenAiClassifyResponse")
             }
             fn visit_map<A: ::serde::de::MapAccess<'de>>(
                 self,
@@ -18732,10 +18096,9 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiModelCard {
                 let mut f_id = None;
                 let mut f_object = None;
                 let mut f_created = None;
-                let mut f_owned_by = None;
-                let mut f_root = None;
-                let mut f_parent = None;
-                let mut f_max_model_len = None;
+                let mut f_model = None;
+                let mut f_data = None;
+                let mut f_usage = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "id" => {
@@ -18756,45 +18119,39 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiModelCard {
                             }
                             f_created = Some(map.next_value::<i64>()?);
                         }
-                        "owned_by" => {
-                            if f_owned_by.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("owned_by"));
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
                             }
-                            f_owned_by = Some(map.next_value::<::prost::alloc::string::String>()?);
+                            f_model = Some(map.next_value::<::prost::alloc::string::String>()?);
                         }
-                        "root" => {
-                            if f_root.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("root"));
+                        "data" => {
+                            if f_data.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("data"));
                             }
-                            f_root =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                            f_data = Some(
+                                map.next_value::<Option<Vec<OpenAiClassifyData>>>()?
+                                    .unwrap_or_default(),
+                            );
                         }
-                        "parent" => {
-                            if f_parent.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("parent"));
+                        "usage" => {
+                            if f_usage.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("usage"));
                             }
-                            f_parent =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
-                        }
-                        "max_model_len" => {
-                            if f_max_model_len.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("max_model_len"));
-                            }
-                            f_max_model_len = Some(map.next_value::<Option<i64>>()?);
+                            f_usage = Some(map.next_value::<Option<OpenAiUsage>>()?);
                         }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
                     }
                 }
-                Ok(OpenAiModelCard {
+                Ok(OpenAiClassifyResponse {
                     id: f_id.unwrap_or_default(),
                     object: f_object.unwrap_or_default(),
                     created: f_created.unwrap_or_default(),
-                    owned_by: f_owned_by.unwrap_or_default(),
-                    root: f_root.flatten(),
-                    parent: f_parent.flatten(),
-                    max_model_len: f_max_model_len.flatten(),
+                    model: f_model.unwrap_or_default(),
+                    data: f_data.unwrap_or_default(),
+                    usage: f_usage.flatten(),
                 })
             }
         }
@@ -18802,46 +18159,782 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiModelCard {
     }
 }
 
-impl ::serde::Serialize for OpenAiModelList {
+impl ::serde::Serialize for OpenAiScoreQuery {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(open_ai_score_query::Value::Text(v)) => v.serialize(serializer),
+            Some(open_ai_score_query::Value::Ids(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiScoreQuery {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiScoreQuery;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the OpenAiScoreQuery shapes")
+            }
+            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(OpenAiScoreQuery {
+                    value: Some(open_ai_score_query::Value::Text(v.to_owned())),
+                })
+            }
+            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(OpenAiScoreQuery {
+                    value: Some(open_ai_score_query::Value::Text(v)),
+                })
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let v = <TokenIds as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::SeqAccessDeserializer::new(seq),
+                )?;
+                Ok(OpenAiScoreQuery {
+                    value: Some(open_ai_score_query::Value::Ids(v)),
+                })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl ::serde::Serialize for OpenAiScoreItems {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(open_ai_score_items::Value::Text(v)) => v.serialize(serializer),
+            Some(open_ai_score_items::Value::Texts(v)) => v.serialize(serializer),
+            Some(open_ai_score_items::Value::IdsList(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiScoreItems {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiScoreItems;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the OpenAiScoreItems shapes")
+            }
+            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(OpenAiScoreItems {
+                    value: Some(open_ai_score_items::Value::Text(v.to_owned())),
+                })
+            }
+            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(OpenAiScoreItems {
+                    value: Some(open_ai_score_items::Value::Text(v)),
+                })
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items: Vec<::serde_json::Value> = Vec::new();
+                while let Some(v) = seq.next_element::<::serde_json::Value>()? {
+                    items.push(v);
+                }
+                let shape = match items.first() {
+                    None => "empty",
+                    Some(::serde_json::Value::Array(inner))
+                        if inner.first().is_some_and(|x| x.is_array()) =>
+                    {
+                        "seq2"
+                    }
+                    Some(::serde_json::Value::Array(_)) => "seq",
+                    Some(::serde_json::Value::String(_)) => "str",
+                    Some(::serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => "int",
+                    Some(::serde_json::Value::Number(_)) => "float",
+                    Some(::serde_json::Value::Object(_)) => "map",
+                    Some(::serde_json::Value::Bool(_)) => "bool",
+                    Some(::serde_json::Value::Null) => "null",
+                };
+                let reparse = ::serde_json::Value::Array(items);
+                match shape {
+                    "str" | "empty" => {
+                        let v: StringList = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(OpenAiScoreItems {
+                            value: Some(open_ai_score_items::Value::Texts(v)),
+                        })
+                    }
+                    "seq" => {
+                        let v: TokenIdsList = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(OpenAiScoreItems {
+                            value: Some(open_ai_score_items::Value::IdsList(v)),
+                        })
+                    }
+                    other => Err(::serde::de::Error::custom(format!(
+                        "no OpenAiScoreItems array form takes {other} elements"
+                    ))),
+                }
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl OpenAiScoreRequest {
+    /// The schema default when unset (protobuf arrival).
+    pub fn temperature_or_default(&self) -> f64 {
+        self.temperature.clone().unwrap_or_else(|| 1.0f64)
+    }
+    /// The schema default when unset (protobuf arrival).
+    pub fn model_or_default(&self) -> ::prost::alloc::string::String {
+        self.model.clone().unwrap_or_else(|| "default".to_string())
+    }
+    /// Protobuf arrival: unset defaulted fields become their schema
+    /// defaults (JSON arrival already baked them at deserialization).
+    pub fn apply_absent_defaults(&mut self) {
+        if self.temperature.is_none() {
+            self.temperature = Some(1.0f64);
+        }
+        if self.model.is_none() {
+            self.model = Some("default".to_string());
+        }
+    }
+}
+
+impl ::serde::Serialize for OpenAiScoreRequest {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "object", &self.object)?;
-        if !self.data.is_empty() {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "data", &self.data)?;
+        if let Some(v) = &self.query {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "query", v)?;
+        }
+        if let Some(v) = &self.items {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "items", v)?;
+        }
+        if let Some(v) = &self.embed_override_token_id {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "embed_override_token_id", v)?;
+        }
+        if !self.query_embed_overrides.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "query_embed_overrides",
+                &self.query_embed_overrides,
+            )?;
+        }
+        if !self.item_embed_overrides.is_empty() {
+            let rows: Vec<::serde_json::Value> = self
+                .item_embed_overrides
+                .iter()
+                .map(|s| ::serde_json::from_str(s).unwrap_or(::serde_json::Value::Null))
+                .collect();
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "item_embed_overrides", &rows)?;
+        }
+        if let Some(v) = &self.label_token_ids {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "label_token_ids", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "apply_softmax",
+            &self.apply_softmax,
+        )?;
+        if let Some(v) = &self.temperature {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "temperature", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "return_token_logprobs",
+            &self.return_token_logprobs,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "item_first", &self.item_first)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "return_pooled_hidden_states",
+            &self.return_pooled_hidden_states,
+        )?;
+        if let Some(v) = &self.score_extraction_token {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "score_extraction_token", v)?;
+        }
+        if let Some(v) = &self.model {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", v)?;
+        }
+        if let Some(v) = &self.rid {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "rid", v)?;
         }
         ::serde::ser::SerializeMap::end(map)
     }
 }
 
-impl<'de> ::serde::Deserialize<'de> for OpenAiModelList {
+impl<'de> ::serde::Deserialize<'de> for OpenAiScoreRequest {
     fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = OpenAiModelList;
+            type Value = OpenAiScoreRequest;
             fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("struct OpenAiModelList")
+                f.write_str("struct OpenAiScoreRequest")
             }
             fn visit_map<A: ::serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
-                let mut f_object = None;
-                let mut f_data = None;
+                let mut f_query = None;
+                let mut f_items = None;
+                let mut f_embed_override_token_id = None;
+                let mut f_query_embed_overrides = None;
+                let mut f_item_embed_overrides = None;
+                let mut f_label_token_ids = None;
+                let mut f_apply_softmax = None;
+                let mut f_temperature = None;
+                let mut f_return_token_logprobs = None;
+                let mut f_item_first = None;
+                let mut f_return_pooled_hidden_states = None;
+                let mut f_score_extraction_token = None;
+                let mut f_model = None;
+                let mut f_rid = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
+                        "query" => {
+                            if f_query.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("query"));
+                            }
+                            f_query = Some(map.next_value::<Option<OpenAiScoreQuery>>()?);
+                        }
+                        "items" => {
+                            if f_items.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("items"));
+                            }
+                            f_items = Some(map.next_value::<Option<OpenAiScoreItems>>()?);
+                        }
+                        "embed_override_token_id" => {
+                            if f_embed_override_token_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "embed_override_token_id",
+                                ));
+                            }
+                            f_embed_override_token_id = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "query_embed_overrides" => {
+                            if f_query_embed_overrides.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "query_embed_overrides",
+                                ));
+                            }
+                            f_query_embed_overrides = Some(
+                                map.next_value::<Option<Vec<DoubleList>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "item_embed_overrides" => {
+                            if f_item_embed_overrides.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "item_embed_overrides",
+                                ));
+                            }
+                            f_item_embed_overrides = Some(
+                                map.next_value::<Option<Vec<::serde_json::Value>>>()?
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(|v| v.to_string())
+                                    .collect(),
+                            );
+                        }
+                        "label_token_ids" => {
+                            if f_label_token_ids.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("label_token_ids"));
+                            }
+                            f_label_token_ids = Some(map.next_value::<Option<TokenIdsOrList>>()?);
+                        }
+                        "apply_softmax" => {
+                            if f_apply_softmax.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("apply_softmax"));
+                            }
+                            f_apply_softmax = Some(map.next_value::<bool>()?);
+                        }
+                        "temperature" => {
+                            if f_temperature.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("temperature"));
+                            }
+                            f_temperature = Some(Some(
+                                map.next_value::<Option<f64>>()?.unwrap_or_else(|| 1.0f64),
+                            ));
+                        }
+                        "return_token_logprobs" => {
+                            if f_return_token_logprobs.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "return_token_logprobs",
+                                ));
+                            }
+                            f_return_token_logprobs = Some(map.next_value::<bool>()?);
+                        }
+                        "item_first" => {
+                            if f_item_first.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("item_first"));
+                            }
+                            f_item_first = Some(map.next_value::<bool>()?);
+                        }
+                        "return_pooled_hidden_states" => {
+                            if f_return_pooled_hidden_states.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "return_pooled_hidden_states",
+                                ));
+                            }
+                            f_return_pooled_hidden_states = Some(map.next_value::<bool>()?);
+                        }
+                        "score_extraction_token" => {
+                            if f_score_extraction_token.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "score_extraction_token",
+                                ));
+                            }
+                            f_score_extraction_token =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
+                            }
+                            f_model = Some(Some(
+                                map.next_value::<Option<::prost::alloc::string::String>>()?
+                                    .unwrap_or_else(|| "default".to_string()),
+                            ));
+                        }
+                        "rid" => {
+                            if f_rid.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("rid"));
+                            }
+                            f_rid =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OpenAiScoreRequest {
+                    query: f_query.flatten(),
+                    items: f_items.flatten(),
+                    embed_override_token_id: f_embed_override_token_id.flatten(),
+                    query_embed_overrides: f_query_embed_overrides.unwrap_or_default(),
+                    item_embed_overrides: f_item_embed_overrides.unwrap_or_default(),
+                    label_token_ids: f_label_token_ids.flatten(),
+                    apply_softmax: f_apply_softmax.unwrap_or_default(),
+                    temperature: f_temperature.unwrap_or_else(|| Some(1.0f64)),
+                    return_token_logprobs: f_return_token_logprobs.unwrap_or_default(),
+                    item_first: f_item_first.unwrap_or_default(),
+                    return_pooled_hidden_states: f_return_pooled_hidden_states.unwrap_or_default(),
+                    score_extraction_token: f_score_extraction_token.flatten(),
+                    model: f_model.unwrap_or_else(|| Some("default".to_string())),
+                    rid: f_rid.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OpenAiScoreMatrix {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.rows.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiScoreMatrix {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(OpenAiScoreMatrix {
+            rows: <::prost::alloc::vec::Vec<DoubleList> as ::serde::Deserialize>::deserialize(
+                deserializer,
+            )?,
+        })
+    }
+}
+
+impl ::serde::Serialize for OpenAiScoreMatrixList {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.items.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiScoreMatrixList {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(OpenAiScoreMatrixList {
+            items:
+                <::prost::alloc::vec::Vec<OpenAiScoreMatrix> as ::serde::Deserialize>::deserialize(
+                    deserializer,
+                )?,
+        })
+    }
+}
+
+impl ::serde::Serialize for OpenAiScores {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(open_ai_scores::Value::Pointwise(v)) => v.serialize(serializer),
+            Some(open_ai_scores::Value::Setwise(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiScores {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiScores;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the OpenAiScores shapes")
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items: Vec<::serde_json::Value> = Vec::new();
+                while let Some(v) = seq.next_element::<::serde_json::Value>()? {
+                    items.push(v);
+                }
+                let shape = match items.first() {
+                    None => "empty",
+                    Some(::serde_json::Value::Array(inner))
+                        if inner.first().is_some_and(|x| x.is_array()) =>
+                    {
+                        "seq2"
+                    }
+                    Some(::serde_json::Value::Array(_)) => "seq",
+                    Some(::serde_json::Value::String(_)) => "str",
+                    Some(::serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => "int",
+                    Some(::serde_json::Value::Number(_)) => "float",
+                    Some(::serde_json::Value::Object(_)) => "map",
+                    Some(::serde_json::Value::Bool(_)) => "bool",
+                    Some(::serde_json::Value::Null) => "null",
+                };
+                let reparse = ::serde_json::Value::Array(items);
+                match shape {
+                    "seq" | "empty" => {
+                        let v: OpenAiScoreMatrix = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(OpenAiScores {
+                            value: Some(open_ai_scores::Value::Pointwise(v)),
+                        })
+                    }
+                    "seq2" => {
+                        let v: OpenAiScoreMatrixList = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(OpenAiScores {
+                            value: Some(open_ai_scores::Value::Setwise(v)),
+                        })
+                    }
+                    other => Err(::serde::de::Error::custom(format!(
+                        "no OpenAiScores array form takes {other} elements"
+                    ))),
+                }
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl ::serde::Serialize for OpenAiScoreResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.scores {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "scores", v)?;
+        }
+        match &self.pooled_hidden_states {
+            Some(v) => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "pooled_hidden_states",
+                    &::serde_json::from_str::<::serde_json::Value>(v)
+                        .unwrap_or(::serde_json::Value::Null),
+                )?;
+            }
+            None => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "pooled_hidden_states",
+                    &::serde_json::Value::Null,
+                )?;
+            }
+        }
+        if !self.token_logprobs.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "token_logprobs",
+                &self.token_logprobs,
+            )?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", &self.model)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "usage", &self.usage)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "object", &self.object)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiScoreResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiScoreResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiScoreResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_scores = None;
+                let mut f_pooled_hidden_states = None;
+                let mut f_token_logprobs = None;
+                let mut f_model = None;
+                let mut f_usage = None;
+                let mut f_object = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "scores" => {
+                            if f_scores.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("scores"));
+                            }
+                            f_scores = Some(map.next_value::<Option<OpenAiScores>>()?);
+                        }
+                        "pooled_hidden_states" => {
+                            if f_pooled_hidden_states.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "pooled_hidden_states",
+                                ));
+                            }
+                            f_pooled_hidden_states = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "token_logprobs" => {
+                            if f_token_logprobs.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("token_logprobs"));
+                            }
+                            f_token_logprobs = Some(
+                                map.next_value::<Option<Vec<DoubleList>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
+                            }
+                            f_model = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "usage" => {
+                            if f_usage.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("usage"));
+                            }
+                            f_usage = Some(map.next_value::<Option<OpenAiUsage>>()?);
+                        }
                         "object" => {
                             if f_object.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("object"));
                             }
                             f_object = Some(map.next_value::<::prost::alloc::string::String>()?);
                         }
-                        "data" => {
-                            if f_data.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("data"));
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OpenAiScoreResponse {
+                    scores: f_scores.flatten(),
+                    pooled_hidden_states: f_pooled_hidden_states.flatten(),
+                    token_logprobs: f_token_logprobs.unwrap_or_default(),
+                    model: f_model.unwrap_or_default(),
+                    usage: f_usage.flatten(),
+                    object: f_object.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl OpenAiRerankRequest {
+    /// The schema default when unset (protobuf arrival).
+    pub fn return_documents_or_default(&self) -> bool {
+        self.return_documents.clone().unwrap_or_else(|| true)
+    }
+    /// Protobuf arrival: unset defaulted fields become their schema
+    /// defaults (JSON arrival already baked them at deserialization).
+    pub fn apply_absent_defaults(&mut self) {
+        if self.return_documents.is_none() {
+            self.return_documents = Some(true);
+        }
+    }
+}
+
+impl ::serde::Serialize for OpenAiRerankRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.query {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "query", v)?;
+        }
+        if !self.documents.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "documents", &self.documents)?;
+        }
+        if let Some(v) = &self.instruct {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "instruct", v)?;
+        }
+        if let Some(v) = &self.top_n {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "top_n", v)?;
+        }
+        if let Some(v) = &self.return_documents {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "return_documents", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiRerankRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiRerankRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiRerankRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_query = None;
+                let mut f_documents = None;
+                let mut f_instruct = None;
+                let mut f_top_n = None;
+                let mut f_return_documents = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "query" => {
+                            if f_query.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("query"));
                             }
-                            f_data = Some(
-                                map.next_value::<Option<Vec<OpenAiModelCard>>>()?
+                            f_query = Some(map.next_value::<Option<OpenAiChatContent>>()?);
+                        }
+                        "documents" => {
+                            if f_documents.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("documents"));
+                            }
+                            f_documents = Some(
+                                map.next_value::<Option<Vec<OpenAiChatContent>>>()?
                                     .unwrap_or_default(),
+                            );
+                        }
+                        "instruct" => {
+                            if f_instruct.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("instruct"));
+                            }
+                            f_instruct =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "top_n" => {
+                            if f_top_n.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("top_n"));
+                            }
+                            f_top_n = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "return_documents" => {
+                            if f_return_documents.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "return_documents",
+                                ));
+                            }
+                            f_return_documents = Some(Some(
+                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| true),
+                            ));
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OpenAiRerankRequest {
+                    query: f_query.flatten(),
+                    documents: f_documents.unwrap_or_default(),
+                    instruct: f_instruct.flatten(),
+                    top_n: f_top_n.flatten(),
+                    return_documents: f_return_documents.unwrap_or_else(|| Some(true)),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OpenAiRerankResult {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "score", &self.score)?;
+        if let Some(v) = &self.document {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "document", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "index", &self.index)?;
+        match &self.meta_info {
+            Some(v) => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "meta_info",
+                    &::serde_json::from_str::<::serde_json::Value>(v)
+                        .unwrap_or(::serde_json::Value::Null),
+                )?;
+            }
+            None => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "meta_info",
+                    &::serde_json::Value::Null,
+                )?;
+            }
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiRerankResult {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiRerankResult;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiRerankResult")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_score = None;
+                let mut f_document = None;
+                let mut f_index = None;
+                let mut f_meta_info = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "score" => {
+                            if f_score.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("score"));
+                            }
+                            f_score = Some(map.next_value::<f64>()?);
+                        }
+                        "document" => {
+                            if f_document.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("document"));
+                            }
+                            f_document =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "index" => {
+                            if f_index.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("index"));
+                            }
+                            f_index = Some(map.next_value::<i64>()?);
+                        }
+                        "meta_info" => {
+                            if f_meta_info.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("meta_info"));
+                            }
+                            f_meta_info = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
                             );
                         }
                         _ => {
@@ -18849,9 +18942,11 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiModelList {
                         }
                     }
                 }
-                Ok(OpenAiModelList {
-                    object: f_object.unwrap_or_default(),
-                    data: f_data.unwrap_or_default(),
+                Ok(OpenAiRerankResult {
+                    score: f_score.unwrap_or_default(),
+                    document: f_document.flatten(),
+                    index: f_index.unwrap_or_default(),
+                    meta_info: f_meta_info.flatten(),
                 })
             }
         }
@@ -18859,75 +18954,409 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiModelList {
     }
 }
 
-impl ::serde::Serialize for OpenAiListModelsRequest {
+impl ::serde::Serialize for OpenAiRerankResponse {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let map = serializer.serialize_map(None)?;
-        ::serde::ser::SerializeMap::end(map)
+        serializer.collect_seq(self.items.iter())
     }
 }
 
-impl<'de> ::serde::Deserialize<'de> for OpenAiListModelsRequest {
+impl<'de> ::serde::Deserialize<'de> for OpenAiRerankResponse {
     fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = OpenAiListModelsRequest;
-            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("struct OpenAiListModelsRequest")
-            }
-            fn visit_map<A: ::serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
-                    match key.as_ref() {
-                        _ => {
-                            map.next_value::<::serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(OpenAiListModelsRequest {})
-            }
-        }
-        deserializer.deserialize_map(V)
+        Ok(OpenAiRerankResponse {
+            items:
+                <::prost::alloc::vec::Vec<OpenAiRerankResult> as ::serde::Deserialize>::deserialize(
+                    deserializer,
+                )?,
+        })
     }
 }
 
-impl ::serde::Serialize for OpenAiRetrieveModelRequest {
+impl OpenAiTokenizeRequest {
+    /// The schema default when unset (protobuf arrival).
+    pub fn model_or_default(&self) -> ::prost::alloc::string::String {
+        self.model.clone().unwrap_or_else(|| "default".to_string())
+    }
+    /// The schema default when unset (protobuf arrival).
+    pub fn add_special_tokens_or_default(&self) -> bool {
+        self.add_special_tokens.clone().unwrap_or_else(|| true)
+    }
+    /// Protobuf arrival: unset defaulted fields become their schema
+    /// defaults (JSON arrival already baked them at deserialization).
+    pub fn apply_absent_defaults(&mut self) {
+        if self.model.is_none() {
+            self.model = Some("default".to_string());
+        }
+        if self.add_special_tokens.is_none() {
+            self.add_special_tokens = Some(true);
+        }
+    }
+}
+
+impl ::serde::Serialize for OpenAiTokenizeRequest {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", &self.model)?;
+        if let Some(v) = &self.model {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", v)?;
+        }
+        if let Some(v) = &self.prompt {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "prompt", v)?;
+        }
+        if !self.messages.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "messages", &self.messages)?;
+        }
+        if !self.tools.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tools", &self.tools)?;
+        }
+        if let Some(v) = &self.tool_choice {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tool_choice", v)?;
+        }
+        if let Some(v) = &self.reasoning_effort {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "reasoning_effort", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "continue_final_message",
+            &self.continue_final_message,
+        )?;
+        if let Some(v) = &self.chat_template_kwargs {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "chat_template_kwargs",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if let Some(v) = &self.add_special_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "add_special_tokens", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
 
-impl<'de> ::serde::Deserialize<'de> for OpenAiRetrieveModelRequest {
+impl<'de> ::serde::Deserialize<'de> for OpenAiTokenizeRequest {
     fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
-            type Value = OpenAiRetrieveModelRequest;
+            type Value = OpenAiTokenizeRequest;
             fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                f.write_str("struct OpenAiRetrieveModelRequest")
+                f.write_str("struct OpenAiTokenizeRequest")
             }
             fn visit_map<A: ::serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut f_model = None;
+                let mut f_prompt = None;
+                let mut f_messages = None;
+                let mut f_tools = None;
+                let mut f_tool_choice = None;
+                let mut f_reasoning_effort = None;
+                let mut f_continue_final_message = None;
+                let mut f_chat_template_kwargs = None;
+                let mut f_add_special_tokens = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "model" => {
                             if f_model.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("model"));
                             }
-                            f_model = Some(map.next_value::<::prost::alloc::string::String>()?);
+                            f_model = Some(Some(
+                                map.next_value::<Option<::prost::alloc::string::String>>()?
+                                    .unwrap_or_else(|| "default".to_string()),
+                            ));
+                        }
+                        "prompt" => {
+                            if f_prompt.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("prompt"));
+                            }
+                            f_prompt = Some(map.next_value::<Option<StringOrList>>()?);
+                        }
+                        "messages" => {
+                            if f_messages.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("messages"));
+                            }
+                            f_messages = Some(
+                                map.next_value::<Option<Vec<OpenAiChatMessage>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "tools" => {
+                            if f_tools.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tools"));
+                            }
+                            f_tools = Some(
+                                map.next_value::<Option<Vec<OpenAiTool>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "tool_choice" => {
+                            if f_tool_choice.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tool_choice"));
+                            }
+                            f_tool_choice = Some(map.next_value::<Option<OpenAiToolChoice>>()?);
+                        }
+                        "reasoning_effort" => {
+                            if f_reasoning_effort.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "reasoning_effort",
+                                ));
+                            }
+                            f_reasoning_effort =
+                                Some(map.next_value::<Option<OpenAiReasoningEffort>>()?);
+                        }
+                        "continue_final_message" => {
+                            if f_continue_final_message.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "continue_final_message",
+                                ));
+                            }
+                            f_continue_final_message = Some(map.next_value::<bool>()?);
+                        }
+                        "chat_template_kwargs" => {
+                            if f_chat_template_kwargs.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "chat_template_kwargs",
+                                ));
+                            }
+                            f_chat_template_kwargs = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "add_special_tokens" => {
+                            if f_add_special_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "add_special_tokens",
+                                ));
+                            }
+                            f_add_special_tokens = Some(Some(
+                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| true),
+                            ));
                         }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
                     }
                 }
-                Ok(OpenAiRetrieveModelRequest {
-                    model: f_model.unwrap_or_default(),
+                Ok(OpenAiTokenizeRequest {
+                    model: f_model.unwrap_or_else(|| Some("default".to_string())),
+                    prompt: f_prompt.flatten(),
+                    messages: f_messages.unwrap_or_default(),
+                    tools: f_tools.unwrap_or_default(),
+                    tool_choice: f_tool_choice.flatten(),
+                    reasoning_effort: f_reasoning_effort.flatten(),
+                    continue_final_message: f_continue_final_message.unwrap_or_default(),
+                    chat_template_kwargs: f_chat_template_kwargs.flatten(),
+                    add_special_tokens: f_add_special_tokens.unwrap_or_else(|| Some(true)),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OpenAiTokenizeResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tokens", v)?;
+        }
+        if let Some(v) = &self.count {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "count", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "max_model_len",
+            &self.max_model_len,
+        )?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiTokenizeResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiTokenizeResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiTokenizeResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_tokens = None;
+                let mut f_count = None;
+                let mut f_max_model_len = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "tokens" => {
+                            if f_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tokens"));
+                            }
+                            f_tokens = Some(map.next_value::<Option<TokenIdsOrList>>()?);
+                        }
+                        "count" => {
+                            if f_count.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("count"));
+                            }
+                            f_count = Some(map.next_value::<Option<Int64OrList>>()?);
+                        }
+                        "max_model_len" => {
+                            if f_max_model_len.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("max_model_len"));
+                            }
+                            f_max_model_len = Some(map.next_value::<i64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OpenAiTokenizeResponse {
+                    tokens: f_tokens.flatten(),
+                    count: f_count.flatten(),
+                    max_model_len: f_max_model_len.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl OpenAiDetokenizeRequest {
+    /// The schema default when unset (protobuf arrival).
+    pub fn model_or_default(&self) -> ::prost::alloc::string::String {
+        self.model.clone().unwrap_or_else(|| "default".to_string())
+    }
+    /// The schema default when unset (protobuf arrival).
+    pub fn skip_special_tokens_or_default(&self) -> bool {
+        self.skip_special_tokens.clone().unwrap_or_else(|| true)
+    }
+    /// Protobuf arrival: unset defaulted fields become their schema
+    /// defaults (JSON arrival already baked them at deserialization).
+    pub fn apply_absent_defaults(&mut self) {
+        if self.model.is_none() {
+            self.model = Some("default".to_string());
+        }
+        if self.skip_special_tokens.is_none() {
+            self.skip_special_tokens = Some(true);
+        }
+    }
+}
+
+impl ::serde::Serialize for OpenAiDetokenizeRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.model {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", v)?;
+        }
+        if let Some(v) = &self.tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tokens", v)?;
+        }
+        if let Some(v) = &self.skip_special_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "skip_special_tokens", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiDetokenizeRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiDetokenizeRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiDetokenizeRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_model = None;
+                let mut f_tokens = None;
+                let mut f_skip_special_tokens = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
+                            }
+                            f_model = Some(Some(
+                                map.next_value::<Option<::prost::alloc::string::String>>()?
+                                    .unwrap_or_else(|| "default".to_string()),
+                            ));
+                        }
+                        "tokens" => {
+                            if f_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tokens"));
+                            }
+                            f_tokens = Some(map.next_value::<Option<TokenIdsOrList>>()?);
+                        }
+                        "skip_special_tokens" => {
+                            if f_skip_special_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "skip_special_tokens",
+                                ));
+                            }
+                            f_skip_special_tokens = Some(Some(
+                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| true),
+                            ));
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OpenAiDetokenizeRequest {
+                    model: f_model.unwrap_or_else(|| Some("default".to_string())),
+                    tokens: f_tokens.flatten(),
+                    skip_special_tokens: f_skip_special_tokens.unwrap_or_else(|| Some(true)),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OpenAiDetokenizeResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.text {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "text", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiDetokenizeResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiDetokenizeResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiDetokenizeResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_text = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "text" => {
+                            if f_text.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("text"));
+                            }
+                            f_text = Some(map.next_value::<Option<StringOrList>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OpenAiDetokenizeResponse {
+                    text: f_text.flatten(),
                 })
             }
         }
