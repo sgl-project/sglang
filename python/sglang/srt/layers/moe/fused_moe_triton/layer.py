@@ -250,6 +250,7 @@ def create_moe_dispatcher(
             deepep_mode=get_deepep_mode(),
             async_finish=True,
             return_recv_hook=True,
+            num_fused_shared_experts=moe_runner_config.num_fused_shared_experts,
         )
     elif a2a_backend.is_deepep_v2():
         output_dtype = get_deepep_v2_dispatcher_output_dtype(

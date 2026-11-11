@@ -1096,7 +1096,9 @@ class TopK(BaseFusedOp):
                         device=device,
                     )
                 )
-        topk = self.topk_config.top_k - self.topk_config.num_shared_topk_slots
+        # The MoE layer always expects K + S columns, for both the global
+        # (none) and per-rank (DeepEP/ascend_*) shared-slot layouts.
+        topk = self.topk_config.top_k
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
@@ -1105,16 +1107,6 @@ class TopK(BaseFusedOp):
         # FIXME: router_logits should be of size (0, num_experts)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
-        if has_per_rank_fused_shared_slots(self.topk_config.num_shared_topk_slots):
-            n = self.topk_config.num_shared_topk_slots
-            topk_output = topk_output._replace(
-                topk_ids=topk_output.topk_ids.new_empty(
-                    (0, topk_output.topk_ids.shape[-1] + n)
-                ),
-                topk_weights=topk_output.topk_weights.new_empty(
-                    (0, topk_output.topk_weights.shape[-1] + n)
-                ),
-            )
         return self._apply_waterfill(topk_output, 0)
 
     def forward_xpu(
@@ -1504,16 +1496,21 @@ def grouped_topk_gpu(
         sorted=(True if num_fused_shared_experts > 0 else False),
     )
     if num_fused_shared_experts:
-        topk_ids[:, -1] = torch.randint(
-            low=num_experts,
-            high=num_experts + num_fused_shared_experts,
-            size=(topk_ids.size(0),),
+        # Global-slot layout: the last S columns are the fused shared experts
+        # (ids num_experts .. num_experts + S - 1). The gate selected the top
+        # `topk` routed scores, so overwriting the S lowest keeps `topk - S`
+        # routed experts plus all S shared slots.
+        topk_ids[:, -num_fused_shared_experts:] = torch.arange(
+            num_experts,
+            num_experts + num_fused_shared_experts,
             dtype=topk_ids.dtype,
             device=topk_ids.device,
         )
         if routed_scaling_factor is not None:
-            topk_weights[:, -1] = (
-                topk_weights[:, :-1].sum(dim=-1) if renormalize else 1.0
+            topk_weights[:, -num_fused_shared_experts:] = (
+                topk_weights[:, :-num_fused_shared_experts].sum(dim=-1)
+                if renormalize
+                else 1.0
             ) / routed_scaling_factor
 
     if renormalize:
@@ -1694,16 +1691,18 @@ def biased_topk_impl(
     topk_weights = scores.gather(1, topk_ids)
 
     if num_fused_shared_experts:
-        topk_ids[:, -1] = torch.randint(
-            low=num_experts,
-            high=num_experts + num_fused_shared_experts,
-            size=(topk_ids.size(0),),
+        # Global-slot layout: see grouped_topk_gpu for the convention.
+        topk_ids[:, -num_fused_shared_experts:] = torch.arange(
+            num_experts,
+            num_experts + num_fused_shared_experts,
             dtype=topk_ids.dtype,
             device=topk_ids.device,
         )
         if routed_scaling_factor is not None:
-            topk_weights[:, -1] = (
-                topk_weights[:, :-1].sum(dim=-1) if renormalize else 1.0
+            topk_weights[:, -num_fused_shared_experts:] = (
+                topk_weights[:, :-num_fused_shared_experts].sum(dim=-1)
+                if renormalize
+                else 1.0
             ) / routed_scaling_factor
 
     if renormalize:
@@ -1713,7 +1712,9 @@ def biased_topk_impl(
         topk_weights_sum = (
             topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
             if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
+            else topk_weights[:, :-num_fused_shared_experts].sum(
+                dim=-1, keepdim=True, dtype=torch.float32
+            )
         )
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
     if apply_routed_scaling_factor_on_output:
@@ -1918,7 +1919,9 @@ def biased_grouped_topk_impl(
         topk_weights_sum = (
             topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
             if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
+            else topk_weights[:, :-num_fused_shared_experts].sum(
+                dim=-1, keepdim=True, dtype=torch.float32
+            )
         )
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
     if apply_routed_scaling_factor_on_output:
@@ -2184,9 +2187,15 @@ def biased_grouped_topk_gpu(
         )
 
         if num_fused_shared_experts > 0:
-            # Append the global shared columns: ID = num_experts (first shared slot).
+            # Append the global shared columns: ids num_experts .. + S - 1.
             # On CUDA the routed weights carry the factor exactly when asked to.
-            topk_ids = F.pad(topk_ids, (0, num_fused_shared_experts), value=num_experts)
+            shared_ids = torch.arange(
+                num_experts,
+                num_experts + num_fused_shared_experts,
+                dtype=topk_ids.dtype,
+                device=topk_ids.device,
+            ).expand(num_tokens, -1)
+            topk_ids = torch.cat([topk_ids, shared_ids], dim=-1)
             topk_weights = F.pad(
                 topk_weights,
                 (0, num_fused_shared_experts),
@@ -2804,7 +2813,7 @@ def _post_process_topk_ids(
         # second zeroing here would be redundant (zeroing is idempotent).
 
     else:
-        if num_shared_topk_slots > 0:
+        if num_shared_topk_slots > 0 and router_wrote_shared_cols:
             shared_cols = topk_ids[:, -num_shared_topk_slots:]
             routed_cols = topk_ids_logical_to_physical(
                 topk_ids[:, :-num_shared_topk_slots], expert_location_dispatch_info
@@ -2816,7 +2825,7 @@ def _post_process_topk_ids(
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info
             )
-        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
 
     if recorder_topk_ids is None and not recorder_was_fused:
         recorder_topk_ids = (

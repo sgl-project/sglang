@@ -67,6 +67,7 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.layers.moe.utils import (
     filter_moe_weight_param_global_expert,
     get_num_fused_shared_experts,
+    has_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
@@ -82,7 +83,11 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
-from sglang.srt.models.deepseek_common.utils import _is_cuda, _use_aiter
+from sglang.srt.models.deepseek_common.utils import (
+    _is_cuda,
+    _use_aiter,
+    quant_blocks_shared_experts_fusion,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import BumpAllocator, LazyValue, is_npu
@@ -202,10 +207,24 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
         )
 
+        # DeepEP-family and ascend_* A2A backends give every EP rank its own
+        # shared slots, so a token's shared expert runs on its home rank only
+        # (no 1/ep scaling). Other backends keep one global shared slot.
+        uses_per_rank_shared_slots = has_per_rank_fused_shared_slots(
+            self.num_fused_shared_experts
+        )
+        if uses_per_rank_shared_slots:
+            num_experts_for_moe = (
+                config.n_routed_experts
+                + get_parallel().moe_ep_size * self.num_fused_shared_experts
+            )
+        else:
+            num_experts_for_moe = (
+                config.n_routed_experts + self.num_fused_shared_experts
+            )
+
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.n_routed_experts
-            + self.num_fused_shared_experts
-            + get_exec().moe.ep_num_redundant_experts,
+            num_experts=num_experts_for_moe + get_exec().moe.ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
@@ -251,6 +270,10 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 parallel_group="replicated"
                 if get_moe_a2a_backend().is_deepep()
                 or get_moe_a2a_backend().is_mooncake()
+                or get_moe_a2a_backend().is_nixl()
+                or get_moe_a2a_backend().is_mori()
+                or get_moe_a2a_backend().is_ascend_fuseep()
+                or get_moe_a2a_backend().is_ascend_ops()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 else "tp",
             )
@@ -268,7 +291,14 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
 
         self.top_k = config.num_experts_per_tok
 
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_nixl()
+            or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_ascend_ops()
+        ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
@@ -284,17 +314,27 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             )
 
         self._enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_nixl()
+            or get_moe_a2a_backend().is_mori()
+            or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_ascend_ops()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
     def get_moe_weights(self):
+        # EPLB only rebalances physical routed experts. Fused shared expert
+        # slots live at the tail of each rank's block and must stay stable.
+        num_local_experts_for_eplb = (
+            self.experts.num_local_experts - self.num_fused_shared_experts
+        )
         return [
             x.data
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
             and filter_moe_weight_param_global_expert(
-                name, x, self.experts.num_local_experts
+                name, x, num_local_experts_for_eplb
             )
         ]
 
@@ -728,11 +768,26 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
         """Why this checkpoint cannot fuse its shared expert, or None. Asked by
         the loader before any layer is built."""
+        # A precision mismatch between the shared and routed experts crashes the
+        # fused weight load, so --enforce-shared-experts-fusion cannot override
+        # it. (Same ordering as DeepseekV2ForCausalLM.)
+        if quant_blocks_shared_experts_fusion(quant_config):
+            return (
+                "Quantization keeps shared experts at a higher precision than the "
+                "routed experts, so they cannot be fused into the quantized "
+                "routed-expert path."
+            )
+        # ``load_weights`` fuses exactly one shared expert into one slot; S > 1
+        # must be refused here instead of tripping its assert at load time.
+        if hf_config.n_shared_experts != 1:
+            return "GLM shared-experts fusion requires exactly one shared expert."
+        # Opt-in escape hatch (NPU / EP are not in the default allow-list yet).
+        if get_exec().moe.enforce_shared_experts_fusion:
+            return None
         if (
             not _is_cuda
             or torch.cuda.get_device_capability("cuda") < (8, 0)
             or hf_config.architectures[0] != cls.fused_shared_experts_architecture
-            or hf_config.n_shared_experts != 1
         ):
             return "Only GLM-4.5 or GLM-4.6 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         if get_parallel().moe_ep_size > 1:

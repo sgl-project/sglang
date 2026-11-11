@@ -698,9 +698,13 @@ class DeepseekV2MoE(nn.Module):
         )
 
         if _uses_per_rank_shared_slots:
-            # 256 routed + EP_size shared slots = 272 experts total (for EP=16)
-            num_experts_for_moe = config.n_routed_experts + self.moe_ep_size
-            top_k_for_moe = config.num_experts_per_tok + 1  # 8 routed + 1 shared
+            # R routed + EP_size * S shared slots, one shared block per rank
+            # (e.g. 256 + 16 * 2 = 288 for EP=16, S=2)
+            num_experts_for_moe = (
+                config.n_routed_experts
+                + self.moe_ep_size * self.num_fused_shared_experts
+            )
+            top_k_for_moe = config.num_experts_per_tok + self.num_fused_shared_experts
             # Interleaving for DeepEP/MegaMOE dispatch is handled by TopK internally.
         else:
             num_experts_for_moe = (

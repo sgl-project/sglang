@@ -1156,12 +1156,18 @@ def _model_forward_tbo_merge_key(output_a, output_b, name, original_len):
 
 
 class MaybeTboDeepEPDispatcher(BaseDispatcher):
-    def __init__(self, runner_backend=None, **kwargs):
+    def __init__(
+        self, runner_backend=None, num_fused_shared_experts: int = 0, **kwargs
+    ):
         super().__init__()
         num_inner_dispatchers = 2 if is_tbo_enabled() else 1
         if get_moe_a2a_backend().is_deepep():
             self._inners = [
-                DeepEPDispatcher(runner_backend=runner_backend, **kwargs)
+                DeepEPDispatcher(
+                    runner_backend=runner_backend,
+                    num_fused_shared_experts=num_fused_shared_experts,
+                    **kwargs,
+                )
                 for _ in range(num_inner_dispatchers)
             ]
         elif get_moe_a2a_backend().is_mooncake():
