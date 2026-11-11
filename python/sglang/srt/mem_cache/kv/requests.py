@@ -47,6 +47,41 @@ class StateTracking(msgspec.Struct, frozen=True, kw_only=True):
     initial_slots: int
 
 
+class RowResets:
+    """Rows handed out whose request-scoped device state is not reset yet.
+
+    Handing out a reused row only marks it; the next `ModelRunner.forward`
+    resets it on the forward stream, outside every CUDA graph."""
+
+    def __init__(self, reset: Optional[Callable[[List[int]], None]]) -> None:
+        self._reset = reset
+        self._rows: set[int] = set()
+
+    def mark(self, rows: List[int]) -> None:
+        """``rows`` were handed out: reset them before their first forward."""
+        if self._reset is not None:
+            self._rows.update(rows)
+
+    def apply_row(self, row: int) -> None:
+        """Reset ``row`` now, on the current stream, if it is marked; the caller
+        has ordered this after the row's previous forward."""
+        if row in self._rows:
+            self._rows.discard(row)
+            self._reset([row])
+
+    def restored(self, row: int) -> None:
+        """``row``'s state was written whole (a restored backup): keep it."""
+        self._rows.discard(row)
+
+    def apply(self) -> None:
+        """Reset the marked rows, on the current stream."""
+        if not self._rows:
+            return
+        rows = sorted(self._rows)
+        self._rows.clear()
+        self._reset(rows)
+
+
 class RowState(enum.IntEnum):
     """Who holds a request row.
 

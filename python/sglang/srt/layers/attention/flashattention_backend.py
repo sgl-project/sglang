@@ -320,11 +320,33 @@ class FlashAttentionBackend(AttentionBackend):
                 "which requires SM90 or newer for paged KV cache. "
                 "Use --attention-backend triton on SM8x."
             )
-        if self.fa3_upgrades_to_fa4 and self.kv_cache_dtype != torch.bfloat16:
+        # FA4 on SM90 reads an fp8 e4m3 cache with unquantized Q, casting K/V in-kernel.
+        # MHA only: absorbed MLA passes qv, which that kernel path does not take.
+        self.fa4_casts_fp8_kv = (
+            device_capability[0] == 9
+            and self.kv_cache_dtype == torch.float8_e4m3fn
+            and not self.kv_cache_is_mxfp8
+            and not self.use_mla
+        )
+        if (
+            self.fa_impl_ver == 4
+            and self.fa4_casts_fp8_kv
+            and model_head_dim not in (256, 512)
+        ):
+            raise ValueError(
+                "FA4 on SM90 reads an fp8_e4m3 KV cache only at head_dim 256 or "
+                f"512, and this model has head_dim {model_head_dim}. Use a BF16 "
+                "KV cache or the fa3 backend."
+            )
+        if (
+            self.fa3_upgrades_to_fa4
+            and self.kv_cache_dtype != torch.bfloat16
+            and not self.fa4_casts_fp8_kv
+        ):
             raise ValueError(
                 f"FA4 has no {self.kv_cache_dtype_str} KV cache path on SM90, and "
                 f"the fa3 backend runs head_dim {model_head_dim} layers on FA4. "
-                "Use a BF16 KV cache."
+                "Use a BF16 or fp8_e4m3 KV cache."
             )
         self._init_flash_attention_functions(device_capability)
 
@@ -426,6 +448,18 @@ class FlashAttentionBackend(AttentionBackend):
         return self._fa_kernels[ver][0](*args, **kwargs)
 
     def flash_attn_with_kvcache(self, *args, ver: int, **kwargs):
+        # The FP8 k/v descales are one per-layer scalar expanded over the request
+        # batch (prepare_paged_mha_query), but the kernel takes one row per
+        # sequence of its own call. Calls on another batch layout (the expanded
+        # suffix of a topk > 1 target verify, SWA speculative metadata, local
+        # attention) get the same scalar at their own row count.
+        k_descale = kwargs.get("k_descale")
+        cu_seqlens_q = kwargs.get("cu_seqlens_q")
+        if k_descale is not None and cu_seqlens_q is not None:
+            batch = cu_seqlens_q.shape[0] - 1
+            if k_descale.shape[0] != batch:
+                kwargs["k_descale"] = k_descale[:1].expand(batch, -1)
+                kwargs["v_descale"] = kwargs["v_descale"][:1].expand(batch, -1)
         return self._fa_kernels[ver][1](*args, **kwargs)
 
     def _ver_for(self, layer: RadixAttention, *, needs_fa4: bool = False) -> int:
@@ -1491,16 +1525,17 @@ class FlashAttentionBackend(AttentionBackend):
         Optional[torch.Tensor],
     ]:
         k_descale = v_descale = None
-        if (
-            self.kv_cache_dtype_str != "auto"
-            and layer.head_dim <= 256
-            and not self.kv_cache_is_mxfp8
-            and (not is_prefill or ver != 4)
-        ):
-            if layer.k_scale is not None:
-                descale_shape = (logical_batch_size, kv_head_num)
-                k_descale = layer.k_scale.expand(descale_shape)
-                v_descale = layer.v_scale.expand(descale_shape)
+        if self.kv_cache_dtype_str == "auto" or self.kv_cache_is_mxfp8:
+            return q, q_rope, k_rope, k_descale, v_descale
+        fa4_casts_kv = ver == 4 and self.fa4_casts_fp8_kv
+        quantize_q = (
+            not fa4_casts_kv and layer.head_dim <= 256 and (not is_prefill or ver != 4)
+        )
+        if (fa4_casts_kv or quantize_q) and layer.k_scale is not None:
+            descale_shape = (logical_batch_size, kv_head_num)
+            k_descale = layer.k_scale.expand(descale_shape)
+            v_descale = layer.v_scale.expand(descale_shape)
+        if quantize_q:
             q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
