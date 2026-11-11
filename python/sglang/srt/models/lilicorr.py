@@ -15,13 +15,13 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
     ModelOptNvFp4A16LinearMethod,
 )
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.lilicorr_utils import (
     LiLiCorrConfig,
     parse_lilicorr_draft_config,
 )
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 

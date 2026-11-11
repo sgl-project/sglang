@@ -175,21 +175,20 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         tokens -- those collapse into the consumer's ghost slot. Real tokens
         map identically under both variants."""
         from sglang.kernels.ops.speculative.ragged_verify_kernels import (
-            PaddedToBucket,
+            PadVerifyLayout,
         )
 
-        padded = PaddedToBucket.execute(
+        padded = PadVerifyLayout.execute(
             verify_lens=self.verify_lens,
             graph_num_tokens=self.graph_num_tokens,
-            bs=self.bs,
             padded_bs=padded_bs,
+            cap=cap,
         )
-        if cap is not None:
-            padded = torch.clamp(padded, max=cap)
-
-        return RaggedVerifyLayout._assemble_device(
-            verify_lens=padded,
+        return RaggedVerifyLayout(
+            verify_lens=padded.verify_lens,
             graph_num_tokens=self.graph_num_tokens,
+            extend_start_loc=padded.extend_start_loc,
+            qo_indptr_device=padded.qo_indptr,
             total_verify_tokens=None if cap is not None else self.graph_num_tokens,
             cap=cap,
         )
@@ -214,6 +213,19 @@ def build_capture_verify_lens(
     base = num_tokens // num_slots
     rem = num_tokens - base * num_slots
     return [base + 1] * rem + [base] * (num_slots - rem)
+
+
+def ragged_verify_token_rows(
+    layout: RaggedVerifyLayout, num_tokens: int
+) -> torch.Tensor:
+    """Request row of each of ``num_tokens`` packed verify tokens.
+
+    Fixed-size, so it is CUDA-graph safe. Empty rows own no tokens, and graph
+    padding past ``qo_indptr[-1]`` maps to row ``bs``.
+    """
+    qo_indptr = layout.qo_indptr_device
+    tokens = torch.arange(num_tokens, dtype=qo_indptr.dtype, device=qo_indptr.device)
+    return torch.searchsorted(qo_indptr[1:], tokens, right=True)
 
 
 class RaggedTargetVerifyGeometry(msgspec.Struct):

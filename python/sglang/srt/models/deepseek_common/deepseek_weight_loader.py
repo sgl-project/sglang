@@ -23,6 +23,7 @@ import torch.nn as nn
 import tqdm
 from transformers import PretrainedConfig
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
@@ -64,7 +65,8 @@ from sglang.srt.models.deepseek_common.utils import (
     enable_nextn_moe_bf16_cast_to_fp8,
     is_wint4afp8_or_wint4a16_config,
 )
-from sglang.srt.utils import bind_or_assign, log_info_on_rank0
+from sglang.srt.models.utils import bind_or_assign
+from sglang.srt.utils import log_info_on_rank0
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
@@ -750,7 +752,7 @@ class DeepseekV2WeightLoaderMixin:
                     ):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                            and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                            and (_is_musa or current_arch().is_sm(9))
                             and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                         ):
                             block_scale = weight_scale

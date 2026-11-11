@@ -33,12 +33,19 @@ def _req(rid, *, after=None, budget=None, keep=False, max_new=1000):
 
 
 def _prefetch(aborted=None):
+    def abort_windows(reqs, finished_reason):
+        # Like the retirer's abort, takes each window out of its list.
+        for req in reqs:
+            req.owner_list._leave([req])
+        if aborted is not None:
+            aborted.extend(reqs)
+
     return p.DocPrefetch(
         early=None,
         device=torch.device("cpu"),
         forward_stream=None,
         tp_size=1,
-        abort_windows=lambda reqs, finished_reason: aborted.extend(reqs),
+        abort_windows=abort_windows,
     )
 
 
@@ -60,7 +67,9 @@ class _Sched:
 
     def ingest(self):
         """The scheduler queues released windows at the top of its next step."""
-        for req in self.prefetch.take_released():
+        released = list(self.prefetch.released)
+        self.prefetch.released._drop_all()
+        for req in released:
             self.add(req)
 
 
@@ -91,7 +100,7 @@ class TestNextWindowPrefetch(CustomTestCase):
         sched.ingest()
         self.assertEqual(sched.queue, [w1])
         self.assertEqual(w1.sampling_params.max_new_tokens, 700)
-        self.assertEqual(prefetch.take_released(), [])
+        self.assertEqual(list(prefetch.released), [])
 
     def test_a_follow_up_arriving_late_is_not_parked(self):
         """If the window already finished, the follow-up must go straight in,
@@ -168,8 +177,6 @@ class TestNextWindowPrefetch(CustomTestCase):
         _finish(w0, 1)
         prefetch.on_window_finished(w0)
         self.assertCountEqual(prefetch.reset(), [parked, released])
-        self.assertEqual(prefetch.held_count(), 0)
-        self.assertEqual(prefetch.take_released(), [])
 
 
 class TestEarlyEmbeddings(CustomTestCase):

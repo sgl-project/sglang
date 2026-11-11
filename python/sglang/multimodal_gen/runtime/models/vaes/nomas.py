@@ -26,6 +26,14 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_world_size,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.kvcache.nomas_segment_cache import (
+    _block_mask_builder,
+    _flex_kernel,
+)
+from sglang.multimodal_gen.runtime.models.dits.nomas_layers import (
+    _compile_exact,
+    _fused_ok,
+)
 
 TUBELET = (4, 16, 16)
 TUBE_DIM = TUBELET[0] * TUBELET[1] * TUBELET[2] * 3
@@ -129,21 +137,7 @@ def apply_mrope(
     return x * cos + rotated * sin
 
 
-def _fused_ok(x: torch.Tensor) -> bool:
-    return (
-        x.is_cuda and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
-    )
-
-
-def _compile_exact(fn):
-    # emulate_precision_casts keeps every intermediate rounding, so the fused
-    # elementwise kernels are bit-identical to the eager sequences they replace.
-    # Mean-square reductions stay in ATen to keep their summation order.
-    return torch.compile(
-        fn, dynamic=True, fullgraph=True, options={"emulate_precision_casts": True}
-    )
-
-
+# Mean-square reductions stay in ATen to keep their summation order.
 def _square(x):
     return x.float().pow(2)
 
@@ -190,13 +184,6 @@ def _compiled_silu_mul():
 
 def _mean_square(x):
     return _compiled_square()(x).mean(-1, keepdim=True)
-
-
-@lru_cache(maxsize=1)
-def _block_mask_builder():
-    from torch.nn.attention.flex_attention import create_block_mask
-
-    return torch.compile(create_block_mask, dynamic=True, fullgraph=True)
 
 
 def local_attention_layout(grid: tuple[int, int, int], tile: int, device):
@@ -253,15 +240,7 @@ def _flex_attention(
 
     if q.device.type != "cuda" or torch.compiler.is_compiling():
         return flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
-    return _compiled_flex()(q, k, v, block_mask=block_mask, enable_gqa=True)
-
-
-@lru_cache(maxsize=1)
-def _compiled_flex():
-    from torch.nn.attention.flex_attention import flex_attention
-
-    # Never allow an eager quadratic-memory fallback after graph specialization.
-    return torch.compile(flex_attention, dynamic=True, fullgraph=True)
+    return _flex_kernel()(q, k, v, block_mask=block_mask, enable_gqa=True)
 
 
 class RMSNorm(nn.Module):
@@ -649,6 +628,43 @@ class NomasStreamingDecoder:
 
 
 class NomasPixelUMMDecoder(nn.Module):
+    @staticmethod
+    def prepare_checkpoint_load(weight_files, dtype):
+        """Return a meta-model configurator when loading serialized FP8 weights."""
+        from sglang.multimodal_gen.runtime.loader.nomas_weights import (
+            resolve_nomas_vae_checkpoint_configurator,
+        )
+
+        return resolve_nomas_vae_checkpoint_configurator(weight_files, dtype)
+
+    def fp8_quantized_layer_names(self) -> tuple[str, ...]:
+        """Decoder projections serialized as FP8 by the official checkpoint."""
+        projections = (
+            "attn.q_proj",
+            "attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        )
+        return tuple(
+            f"decoder.layers.{i}.{projection}"
+            for i in range(len(self.decoder.layers))
+            for projection in projections
+        )
+
+    @staticmethod
+    def checkpoint_key_filter(name: str) -> bool:
+        """Official VAE checkpoints also contain a DCAE encoder unused by decode."""
+        return not name.startswith("encoder.")
+
+    @staticmethod
+    def checkpoint_key_mapper(name: str) -> str:
+        from sglang.multimodal_gen.runtime.loader.nomas_weights import (
+            map_nomas_vae_checkpoint_key,
+        )
+
+        return map_nomas_vae_checkpoint_key(name)
+
     def __init__(self, config: NomasVAEConfig):
         super().__init__()
         self.config = config

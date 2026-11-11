@@ -16,8 +16,8 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     swizzle_blockscale,
 )
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
 

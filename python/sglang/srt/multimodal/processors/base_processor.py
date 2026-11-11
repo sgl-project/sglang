@@ -31,6 +31,15 @@ from sglang.srt.multimodal.cache import (
     PreprocessFingerprintProvider,
     build_processor_fingerprint,
 )
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    configure_media_url_security,
+    load_audio,
+    load_image,
+    load_video,
+    media_url_security_config,
+    smart_to_rgb,
+)
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
@@ -47,19 +56,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_serving,
 )
-from sglang.srt.utils import (
-    CLIENT_MEDIA_EXCEPTIONS,
-    configure_media_url_security,
-    envs,
-    is_cpu,
-    is_npu,
-    is_xpu,
-    load_audio,
-    load_image,
-    load_video,
-    logger,
-    smart_to_rgb,
-)
+from sglang.srt.utils import envs, is_cpu, is_npu, is_xpu, logger
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -234,6 +231,12 @@ def _forget_parent_executor_wakeups():
     concurrent.futures.process._threads_wakeups.clear()
 
 
+def _init_cpu_worker(media_url_policy: tuple) -> None:
+    _forget_parent_executor_wakeups()
+    # A spawned worker starts from the default media policy, not the server's.
+    configure_media_url_security(*media_url_policy)
+
+
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
@@ -278,6 +281,8 @@ class BaseMultimodalProcessor(ABC):
         configure_media_url_security(
             get_mm().allowed_media_domains,
             get_mm().media_url_max_file_size_mb,
+            get_mm().media_url_timeout,
+            get_mm().allow_local_media_files,
         )
         configured_mm_feature_transport = get_mm().mm_feature_transport
         self.mm_feature_transport = (
@@ -535,7 +540,8 @@ class BaseMultimodalProcessor(ABC):
         return concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context(start_method),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
-            initializer=_forget_parent_executor_wakeups,
+            initializer=_init_cpu_worker,
+            initargs=(media_url_security_config(),),
         )
 
     def _replace_broken_cpu_executor(
