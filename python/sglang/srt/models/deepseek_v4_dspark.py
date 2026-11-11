@@ -70,12 +70,9 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    builds_confidence_head,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
-)
-from sglang.srt.speculative.ragged_verify import (
-    RaggedVerifyMode,
-    read_ragged_verify_mode,
 )
 from sglang.srt.utils import is_npu
 
@@ -531,13 +528,8 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
 def build_dspark_v4_confidence_head(
     *, config: DeepSeekV4Config, markov_rank: int
 ) -> Optional[DSparkConfidenceHead]:
-    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+    if not builds_confidence_head(config):
         return None
-    if not hasattr(config, "enable_confidence_head"):
-        logger.warning(
-            "DSpark draft config has no enable_confidence_head field; treating the "
-            "confidence head as enabled."
-        )
     with_markov_cfg = getattr(config, "confidence_head_with_markov", None)
     with_markov = (
         (markov_rank > 0) if with_markov_cfg is None else bool(with_markov_cfg)
@@ -1121,7 +1113,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             raise ValueError(
                 f"DSpark V4 confidence head is enabled but the checkpoint is missing "
                 f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
-                f"or disable the confidence head (enable_confidence_head=False)."
+                f"or set SGLANG_DSPARK_USE_ONLINE_ESTIMATOR=1."
             )
 
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:

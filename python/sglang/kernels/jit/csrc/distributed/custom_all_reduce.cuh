@@ -153,7 +153,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
   const auto num_vecs = params.num_vecs;
   const auto num_threads = blockDim.x * gridDim.x;
   // Round-robin warps to blocks rather than giving each block a contiguous run.
-  // The grid is pinned to the counter array, so once `num_vecs` stops filling
+  // The grid is the plane's fixed default width, so once `num_vecs` stops filling
   // `gridDim * blockDim` a block-major index leaves the tail CTAs with nothing
   // to do; that happens over a whole 2x band of sizes, between the point where
   // `choose_block_size` gives up on 512 and the point where 1024 threads fill
@@ -215,7 +215,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
 
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  epoch.flip();
+  epoch.commit();
 }
 
 /// Chunk c of the flat tensor is owned by rank c. A slot (dst, src) holds two
@@ -324,7 +324,7 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllR
 
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  epoch.flip();
+  epoch.commit();
 }
 
 #ifdef USE_ROCM
@@ -381,8 +381,8 @@ ALL_REDUCE_KERNEL void pair_push_kernel(const __grid_constant__ AllReducePushPar
   }
 
   PDLTriggerSecondary<kUsePDL>();
-  __syncthreads();
-  epoch.flip();
+  __syncthreads();  // every thread has read the phase before this block commits
+  epoch.commit();
 }
 #endif
 
@@ -394,12 +394,8 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_pull_kernel(const __grid_constant__ AllR
   const auto num_vecs = params.num_vecs;
   const auto impl = Impl{params};
   PDLWaitPrimary<kUsePDL>();
-  const auto barrier = distributed::Barrier<kWorldSize>{
-      params.ws.semaphores.data(),
-      params.rank,
-      /*num_arrives=*/2,
-  };
-  barrier.arrive_relaxed(/*n=*/0);
+  const auto barrier = distributed::Barrier<kWorldSize>{params.ws.semaphores.data(), params.rank};
+  barrier.arrive_relaxed();
   __syncthreads();
 
   const auto num_threads = blockDim.x * gridDim.x;
@@ -412,7 +408,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_pull_kernel(const __grid_constant__ AllR
 
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  barrier.arrive_relaxed(/*n=*/1);
+  barrier.arrive_relaxed();
 }
 
 template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
@@ -427,12 +423,8 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
   const auto vec_offset = params.rank * avg_vecs + min(params.rank, rem_vecs);
   const auto impl = Impl{params, vec_offset};
   PDLWaitPrimary<kUsePDL>();
-  const auto barrier = distributed::Barrier<kWorldSize>{
-      params.ws.semaphores.data(),
-      params.rank,
-      /*num_arrives=*/2,
-  };
-  barrier.arrive_relaxed(/*n=*/0);
+  const auto barrier = distributed::Barrier<kWorldSize>{params.ws.semaphores.data(), params.rank};
+  barrier.arrive_relaxed();
   __syncthreads();
 
   const auto num_threads = blockDim.x * gridDim.x;
@@ -450,7 +442,7 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
   ptx::fence_release_sys();
 #endif
   __syncthreads();
-  barrier.arrive_rel_acq(/*n=*/1);
+  barrier.arrive_rel_acq();
 }
 
 template <uint32_t N>
@@ -544,7 +536,7 @@ struct AllReduceKernel {
             .ws = push.get_workspace<kWorldSize>(int64_t{full_vecs / 2} * 16),
         };
         const auto kernel = all_gather ? pair_push_kernel<T, true, kUsePDL> : pair_push_kernel<T, false, kUsePDL>;
-        LaunchKernel(push.num_blocks, choose_block_size(full_vecs / 2), stream)  //
+        LaunchKernel(push.default_blocks, choose_block_size(full_vecs / 2), stream)  //
             .enable_pdl(kUsePDL)(kernel, params);
         return out;
       }
@@ -567,7 +559,6 @@ struct AllReduceKernel {
       };
       const auto kernel = two_shot ? all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL>
                                    : all_reduce_1shot_push_kernel<T, kWorldSize, kUsePDL>;
-      // the grid is bound to the counter array and must stay constant
       auto block_size = choose_block_size(num_vecs);
 #ifdef USE_ROCM
       // MI350X: from 128 KB a full block per CU beats the narrower pick for
@@ -580,9 +571,9 @@ struct AllReduceKernel {
 #endif
       if (two_shot) {
         // at least `kWorldSize - 1` warps in all, 1 for each peer
-        block_size = std::max(block_size, 32u * div_ceil(kWorldSize - 1, push.num_blocks));
+        block_size = std::max(block_size, 32u * div_ceil(kWorldSize - 1, push.default_blocks));
       }
-      LaunchKernel(push.num_blocks, block_size, stream)  //
+      LaunchKernel(push.default_blocks, block_size, stream)  //
           .enable_pdl(kUsePDL)(kernel, params);
       return out;
     }
