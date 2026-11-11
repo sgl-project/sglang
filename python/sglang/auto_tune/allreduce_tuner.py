@@ -48,12 +48,6 @@ _QR_QUANT_ENVS = (
 
 MODES = ("eager", "graph")
 
-# Reduction width of the GEMM that fills the all-reduce input. Its output
-# covers every byte the all-reduce reads, so the collective waits for those
-# writes. The width stays modest so the GEMM does not dominate the run; the
-# GEMM-only time is subtracted before a winner is chosen.
-_PRECEDING_GEMM_K = 256
-
 _NUM_WARMUP = 20
 
 
@@ -93,64 +87,16 @@ class _Backend:
     note: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Sizes and the preceding GEMM
-# ---------------------------------------------------------------------------
-
-
-def _get_tensor_sizes(model_config: Dict[str, Any]) -> List[int]:
-    """Message sizes in bytes for a few token counts of ``[tokens, hidden]``."""
-    import torch
-
-    hidden_size = model_config["hidden_size"]
-    intermediate_size = model_config.get("shard_intermediate_size", 4 * hidden_size)
-    dtype = model_config.get("dtype", torch.bfloat16)
-    elem_size = 4 if dtype == torch.float32 else 2
-    sizes = [
-        hidden_size * elem_size,
-        3 * hidden_size * elem_size,
-        intermediate_size * elem_size,
-        4 * hidden_size * elem_size,
-        8 * hidden_size * elem_size,
-        16 * hidden_size * elem_size,
-    ]
-    return sorted(set(sizes))
-
-
-def _gemm_cols(numel: int, limit: int) -> int:
-    """Largest power-of-two column count that divides ``numel`` and fits."""
-    cols = 1
-    limit = max(1, min(int(limit), int(numel)))
-    while cols * 2 <= limit and numel % (cols * 2) == 0:
-        cols *= 2
-    return cols
-
-
-def _preceding_gemm(tensor, hidden_size: Optional[int]):
-    """Return a callable that writes ``tensor`` with one GEMM, plus its shape.
-
-    The GEMM is queued on the current stream, and the all-reduce after it is
-    queued on the same stream with no sync, so it reads the tensor only after
-    the GEMM's writes land. In graph mode both are captured.
-    """
-    import torch
-
-    numel = tensor.numel()
-    hidden = int(hidden_size) if hidden_size else 0
-    if hidden > 1 and numel % hidden == 0:
-        rows, cols = numel // hidden, hidden
-    else:
-        cols = _gemm_cols(numel, hidden or _PRECEDING_GEMM_K)
-        rows = numel // cols
-    k = min(_PRECEDING_GEMM_K, max(cols, 1))
-    out = tensor.view(rows, cols)
-    lhs = torch.randn(rows, k, device=tensor.device, dtype=tensor.dtype)
-    rhs = torch.randn(k, cols, device=tensor.device, dtype=tensor.dtype)
-
-    def before():
-        torch.mm(lhs, rhs, out=out)
-
-    return before, {"rows": rows, "k": k, "cols": cols}
+def _normalize_sizes(sizes: List[int]) -> List[int]:
+    """The message sizes to time, in bytes. Each one is a bf16 tensor."""
+    cleaned = sorted({int(size) for size in sizes})
+    bad = [size for size in cleaned if size <= 0 or size % 2]
+    if not cleaned or bad:
+        raise ValueError(
+            "sizes must be positive multiples of 2 bytes, one bf16 tensor "
+            f"each. Rejected: {bad or 'none given'}"
+        )
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -165,16 +111,6 @@ def _time_eager(step, num_iters: int, use_median: bool) -> float:
     for _ in range(_NUM_WARMUP):
         step()
     torch.cuda.synchronize()
-    if not use_median:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(num_iters):
-            step()
-        end.record()
-        torch.cuda.synchronize()
-        return start.elapsed_time(end) * 1000 / num_iters
-
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
     for i in range(num_iters):
@@ -182,19 +118,24 @@ def _time_eager(step, num_iters: int, use_median: bool) -> float:
         step()
         ends[i].record()
     torch.cuda.synchronize()
-    return statistics.median(
-        starts[i].elapsed_time(ends[i]) * 1000 for i in range(num_iters)
-    )
+    if use_median:
+        return statistics.median(
+            starts[i].elapsed_time(ends[i]) * 1000 for i in range(num_iters)
+        )
+    else:
+        return statistics.mean(
+            starts[i].elapsed_time(ends[i]) * 1000 for i in range(num_iters)
+        )
 
 
 def _time_graph(
     step,
     capture: Callable[[], ContextManager],
     num_iters: int,
-    graph_calls: int,
+    ingraph_calls: int,
     use_median: bool,
 ) -> float:
-    """Microseconds per call, from replays of a graph that holds ``graph_calls`` calls.
+    """Microseconds per call, from replays of a graph that holds ``ingraph_calls`` calls.
 
     The calls are recorded back to back, as consecutive layers' all-reduces
     are in a decode graph. ``num_iters`` is the number of timed replays.
@@ -204,7 +145,7 @@ def _time_graph(
     # Eager warm-up first: it builds kernels and workspaces outside the graph.
     # Inside a capture context a non-captured call is a warm-up that returns
     # zeros, so it would not exercise the kernel.
-    for _ in range(3):
+    for _ in range(_NUM_WARMUP):
         step()
     torch.cuda.synchronize()
 
@@ -215,34 +156,24 @@ def _time_graph(
     # is a collective, so it runs after the capture ends, on every rank.
     with capture():
         with torch.cuda.graph(graph, stream=stream):
-            for _ in range(graph_calls):
+            for _ in range(ingraph_calls):
                 step()
     torch.cuda.synchronize()
 
-    for _ in range(3):
+    for _ in range(_NUM_WARMUP):
         graph.replay()
     torch.cuda.synchronize()
-    if not use_median:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(num_iters):
-            graph.replay()
-        end.record()
-        torch.cuda.synchronize()
-        elapsed = start.elapsed_time(end) * 1000 / (num_iters * graph_calls)
-    else:
-        starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-        ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
-        for i in range(num_iters):
-            starts[i].record()
-            graph.replay()
-            ends[i].record()
-        torch.cuda.synchronize()
-        elapsed = statistics.median(
-            starts[i].elapsed_time(ends[i]) * 1000 / graph_calls
-            for i in range(num_iters)
-        )
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
+    for i in range(num_iters):
+        starts[i].record()
+        graph.replay()
+        ends[i].record()
+    torch.cuda.synchronize()
+    samples = (
+        starts[i].elapsed_time(ends[i]) * 1000 / ingraph_calls for i in range(num_iters)
+    )
+    elapsed = statistics.median(samples) if use_median else statistics.mean(samples)
     del graph
     return elapsed
 
@@ -252,34 +183,17 @@ def _time_backend(
     tensor,
     mode: str,
     num_iters: int,
-    graph_calls: int,
+    ingraph_calls: int,
     use_median: bool,
-    before=None,
 ) -> float:
     def step():
-        if before is not None:
-            before()
         out = backend.call(tensor)
         if out is None:
             raise _Rejected("the kernel declined the tensor")
         return out
 
     if mode == "graph":
-        return _time_graph(step, backend.capture, num_iters, graph_calls, use_median)
-    return _time_eager(step, num_iters, use_median)
-
-
-def _time_gemm_only(
-    before, mode: str, num_iters: int, graph_calls: int, use_median: bool
-) -> float:
-    def step():
-        before()
-        return True
-
-    if mode == "graph":
-        return _time_graph(
-            step, contextlib.nullcontext, num_iters, graph_calls, use_median
-        )
+        return _time_graph(step, backend.capture, num_iters, ingraph_calls, use_median)
     return _time_eager(step, num_iters, use_median)
 
 
@@ -656,20 +570,18 @@ def _open_backends(
 
 
 def tune_allreduce(
-    model_config: Dict[str, Any],
+    sizes: List[int],
     tp_size: int,
     mode: str = "eager",
     group=None,
     num_iters: int = 100,
-    graph_calls: int = 10,
+    ingraph_calls: int = 10,
     verbose: bool = True,
     qr_quants: Optional[List[str]] = None,
-    sizes: Optional[List[int]] = None,
     ignore_acr_max_size: bool = False,
     ignore_scr_max_size: bool = False,
     qr_cast_bf16_to_fp16: bool = True,
     use_median: bool = False,
-    preceding_gemm: bool = False,
 ) -> Tuple[List[AllreduceConfig], List[Dict[str, Any]]]:
     """Time each backend at each size in ``mode`` and return the fastest per size."""
     import torch
@@ -694,11 +606,7 @@ def tune_allreduce(
     qr_quants = _normalize_qr_quants(qr_quants)
     cpu_group = _cpu_group(group)
     device = torch.device("cuda", torch.cuda.current_device())
-    sizes = (
-        _get_tensor_sizes(model_config)
-        if sizes is None
-        else sorted({int(size) for size in sizes})
-    )
+    sizes = _normalize_sizes(sizes)
     backends = _open_backends(
         qr_quants,
         cpu_group,
@@ -708,7 +616,7 @@ def tune_allreduce(
         ignore_scr_max_size=ignore_scr_max_size,
         qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
     )
-    dtype = model_config.get("dtype", torch.bfloat16)
+    dtype = torch.bfloat16
     if verbose:
         print(f"  Backends: {', '.join(backends)}", flush=True)
         print(f"  Mode: {mode}", flush=True)
@@ -716,7 +624,7 @@ def tune_allreduce(
         if mode == "graph":
             print(
                 f"  Timing: {stat} of {num_iters} replays of a graph with "
-                f"{graph_calls} captured calls, per call.",
+                f"{ingraph_calls} captured calls, per call.",
                 flush=True,
             )
         else:
@@ -729,13 +637,6 @@ def tune_allreduce(
             f"  ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16={int(qr_cast_bf16_to_fp16)}",
             flush=True,
         )
-        if preceding_gemm:
-            print(
-                "  Each call is a GEMM that writes the all-reduce input, then "
-                "the all-reduce, on one stream with no sync. The GEMM-only "
-                "time is subtracted.",
-                flush=True,
-            )
         print(f"  Sizes: {sizes}", flush=True)
 
     results: List[AllreduceConfig] = []
@@ -749,23 +650,7 @@ def tune_allreduce(
     try:
         for idx, size_bytes in enumerate(sizes):
             tag = f"  [{idx + 1}/{len(sizes)}] {size_bytes}B"
-            elem_size = 4 if dtype == torch.float32 else 2
-            tensor = torch.randn(size_bytes // elem_size, dtype=dtype, device="cuda")
-            before = None
-            gemm_us = None
-            shape = None
-            if preceding_gemm:
-                before, shape = _preceding_gemm(tensor, model_config.get("hidden_size"))
-                barrier()
-                gemm_us = _time_gemm_only(before, mode, num_iters, graph_calls, use_median)
-                barrier()
-                if verbose:
-                    print(
-                        f"{tag}: GEMM [{shape['rows']}, {shape['cols']}] = "
-                        f"[{shape['rows']}, {shape['k']}] @ [{shape['k']}, "
-                        f"{shape['cols']}] only -> {gemm_us:.2f} us",
-                        flush=True,
-                    )
+            tensor = torch.randn(size_bytes // 2, dtype=dtype, device="cuda")
 
             best_backend = None
             best_time = float("inf")
@@ -784,16 +669,13 @@ def tune_allreduce(
                             tensor,
                             mode,
                             num_iters,
-                            graph_calls,
+                            ingraph_calls,
                             use_median,
-                            before=before,
                         )
                     except Exception as e:
                         t = None
                         reason = str(e).splitlines()[0] if str(e) else type(e).__name__
                 barrier()
-                if t is not None and gemm_us is not None:
-                    t -= gemm_us
                 if verbose:
                     shown = f"{t:.2f} us" if t is not None else f"skipped: {reason}"
                     print(f"{tag}: {name} -> {shown}", flush=True)
@@ -801,11 +683,7 @@ def tune_allreduce(
                 if t is not None and t < best_time:
                     best_time, best_backend = t, name
 
-            row: Dict[str, Any] = {"size_bytes": size_bytes, "times_us": row_times}
-            if gemm_us is not None:
-                row["gemm_us"] = gemm_us
-                row["gemm"] = shape
-            measurements.append(row)
+            measurements.append({"size_bytes": size_bytes, "times_us": row_times})
             if best_backend is not None:
                 results.append(
                     AllreduceConfig(
@@ -818,7 +696,7 @@ def tune_allreduce(
                 )
                 if verbose:
                     print(f"{tag}: best {best_backend:24s} {best_time:8.2f} us", flush=True)
-            del tensor, before
+            del tensor
             torch.cuda.empty_cache()
     finally:
         # Close together: a rank that frees its IPC buffers early can leave a
@@ -838,44 +716,39 @@ def tune_allreduce(
 
 
 def run_allreduce_tuning(
-    model_config: Dict[str, Any],
+    sizes: List[int],
     tp_size: int,
-    ep_size: int = 1,
     mode: str = "eager",
     group=None,
     output_dir: Optional[str] = None,
     verbose: bool = True,
     qr_quants: Optional[List[str]] = None,
     num_iters: int = 100,
-    graph_calls: int = 10,
-    sizes: Optional[List[int]] = None,
+    ingraph_calls: int = 10,
     ignore_acr_max_size: bool = False,
     ignore_scr_max_size: bool = False,
     qr_cast_bf16_to_fp16: bool = True,
     use_median: bool = False,
-    preceding_gemm: bool = False,
 ) -> Dict[str, Any]:
     """Tune, then write ``allreduce_configs_<mode>.json`` into ``output_dir``."""
     if verbose:
         print(f"\n{'=' * 60}\nAll-reduce tuning, {mode} mode\n{'=' * 60}")
-        print(f"  TP: {tp_size}, EP: {ep_size}")
+        print(f"  TP: {tp_size}")
 
     qr_quants = _normalize_qr_quants(qr_quants)
     results, measurements = tune_allreduce(
-        model_config,
+        sizes,
         tp_size,
         mode=mode,
         group=group,
         num_iters=num_iters,
-        graph_calls=graph_calls,
+        ingraph_calls=ingraph_calls,
         verbose=verbose,
         qr_quants=qr_quants,
-        sizes=sizes,
         ignore_acr_max_size=ignore_acr_max_size,
         ignore_scr_max_size=ignore_scr_max_size,
         qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
         use_median=use_median,
-        preceding_gemm=preceding_gemm,
     )
     if not results:
         if verbose:
@@ -886,16 +759,13 @@ def run_allreduce_tuning(
         "mode": mode,
         "env": "SGLANG_TUNED_GRAPH_CONFIG" if mode == "graph" else "SGLANG_TUNED_EAGER_CONFIG",
         "tp_size": tp_size,
-        "ep_size": ep_size,
         "qr_quants": qr_quants,
         "qr_cast_bf16_to_fp16": int(qr_cast_bf16_to_fp16),
         "ignore_acr_max_size": bool(ignore_acr_max_size),
         "ignore_scr_max_size": bool(ignore_scr_max_size),
         "num_iters": int(num_iters),
-        "graph_calls": int(graph_calls) if mode == "graph" else None,
-        "timing": ("median" if use_median else "mean")
-        + ("_after_gemm" if preceding_gemm else ""),
-        "preceding_gemm": bool(preceding_gemm),
+        "ingraph_calls": int(ingraph_calls) if mode == "graph" else None,
+        "timing": "median" if use_median else "mean",
         "configs": [r.to_dict() for r in results],
         "measurements": measurements,
     }
@@ -920,15 +790,11 @@ def _print_comparison(measurements: List[Dict[str, Any]], timing: str) -> None:
     if not names:
         return
     width = max(12, *(len(name) for name in names))
-    show_gemm = any(row.get("gemm_us") is not None for row in measurements)
     print(
         f"\nAll-reduce comparison, microseconds per call ({timing}). "
         "skip means the kernel declined the tensor."
-        + (" GEMM-only time already subtracted." if show_gemm else "")
     )
     header = f"{'size':>10}  " + "  ".join(f"{name:<{width}}" for name in names)
-    if show_gemm:
-        header += f"  {'gemm':<{width}}"
     print(header)
     print("-" * len(header))
     for row in measurements:
@@ -943,10 +809,7 @@ def _print_comparison(measurements: List[Dict[str, Any]], timing: str) -> None:
                 continue
             text = f"{value:.2f}" + ("*" if value == best else "")
             cells.append(f"{text:<{width}}")
-        line = f"{row['size_bytes']:>10}  " + "  ".join(cells)
-        if show_gemm:
-            line += f"  {row.get('gemm_us', 0.0):<{width}.2f}"
-        print(line)
+        print(f"{row['size_bytes']:>10}  " + "  ".join(cells))
 
 
 def print_allreduce_summary(results: Dict[str, Any]) -> None:

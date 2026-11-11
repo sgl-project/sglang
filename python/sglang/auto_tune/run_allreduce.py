@@ -1,11 +1,10 @@
-"""All-reduce tuner. It does not start a server and does not load weights.
+"""All-reduce tuner. It does not start a server and does not load a model.
 
 One process cannot all-reduce with itself, so torchrun starts one process per
-GPU. The model's config.json gives the hidden size; the tensors are random.
+GPU. ``--sizes`` is the message sizes in bytes. Each is timed as a bf16 tensor.
 
     torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce \
-        --model-path amd/Qwen3.8-2.4T-A95B-Quark-MXFP4 --tp 8 \
-        --graph 0 --output-dir /tmp/ar-tune
+        --tp 8 --sizes 16384 32768 --graph 0 --output-dir /tmp/ar-tune
 
 ``--graph 0`` (default) times eager calls and writes
 ``allreduce_configs_eager.json`` for ``SGLANG_TUNED_EAGER_CONFIG``.
@@ -24,7 +23,6 @@ from sglang.auto_tune.allreduce_tuner import (
     print_allreduce_summary,
     run_allreduce_tuning,
 )
-from sglang.auto_tune.utils import get_model_config
 
 
 def _bool01(value: str) -> bool:
@@ -41,13 +39,7 @@ def create_parser() -> argparse.ArgumentParser:
         description="Time every all-reduce kernel per message size, eagerly "
         "or inside a CUDA graph, and write the fastest per size."
     )
-    parser.add_argument(
-        "--model-path",
-        required=True,
-        help="Hugging Face id or a local directory with config.json.",
-    )
     parser.add_argument("--tp", "--tp-size", dest="tp_size", type=int, required=True)
-    parser.add_argument("--ep", "--ep-size", dest="ep_size", type=int, default=1)
     parser.add_argument(
         "--graph",
         type=_bool01,
@@ -59,7 +51,7 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--graph-calls",
+        "--ingraph-calls",
         type=int,
         default=10,
         help=(
@@ -88,23 +80,11 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--preceding-gemm",
-        type=_bool01,
-        default=False,
-        help=(
-            "1: before each all-reduce, a GEMM writes its input on the same "
-            "stream with no sync, and the GEMM-only time is subtracted."
-        ),
-    )
-    parser.add_argument(
         "--sizes",
         nargs="+",
         type=int,
-        default=None,
-        help=(
-            "Message sizes in bytes, replacing the ones derived from the "
-            "model. bf16 [tokens, hidden] is tokens * hidden * 2 bytes."
-        ),
+        required=True,
+        help="Message sizes in bytes. Each is timed as a bf16 tensor.",
     )
     parser.add_argument(
         "--qr-quant",
@@ -199,7 +179,7 @@ def _init_distributed() -> None:
         sys.exit(
             "All-reduce tuning needs one process per GPU:\n"
             "torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce "
-            "--model-path <model> --tp 8"
+            "--tp 8 --sizes <bytes>..."
         )
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     _enable_stack_dumps(int(os.environ.get("RANK", os.environ["LOCAL_RANK"])))
@@ -211,8 +191,10 @@ def main(argv: list[str] | None = None) -> None:
     args = create_parser().parse_args(argv)
     if args.num_iters < 1:
         sys.exit("-n must be at least 1")
-    if args.graph_calls < 1:
-        sys.exit("--graph-calls must be at least 1")
+    if args.ingraph_calls < 1:
+        sys.exit("--ingraph-calls must be at least 1")
+    if any(size <= 0 or size % 2 for size in args.sizes):
+        sys.exit("--sizes must be positive multiples of 2 bytes (bf16 tensors)")
     _init_distributed()
 
     import torch.distributed as dist
@@ -229,23 +211,20 @@ def main(argv: list[str] | None = None) -> None:
                 )
             sys.exit(1)
 
-        model_config = get_model_config(args.model_path, args.tp_size, args.ep_size)
         results = run_allreduce_tuning(
-            model_config,
+            args.sizes,
             tp_size=args.tp_size,
-            ep_size=args.ep_size,
             mode="graph" if args.graph else "eager",
             output_dir=args.output_dir if rank == 0 else None,
             verbose=(rank == 0),
             qr_quants=args.qr_quant,
             num_iters=args.num_iters,
-            graph_calls=args.graph_calls,
+            ingraph_calls=args.ingraph_calls,
             sizes=args.sizes,
             ignore_acr_max_size=args.ignore_acr_max_size,
             ignore_scr_max_size=args.ignore_scr_max_size,
             qr_cast_bf16_to_fp16=bool(args.qr_cast_bf16_to_fp16),
             use_median=args.median,
-            preceding_gemm=args.preceding_gemm,
         )
         if rank == 0:
             print_allreduce_summary(results)
