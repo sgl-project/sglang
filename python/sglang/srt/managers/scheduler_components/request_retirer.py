@@ -28,7 +28,9 @@ class RequestRetirer:
     """Ends requests and releases what they hold: `abort` for one no launched
     step reports (sends the abort output), `retire_unadmitted` for one rejected
     before it was queued (streams its output), `release` for one its caller
-    ended and sends."""
+    ended and sends. `abort`, `retire_unadmitted` and `abort_retracted` take
+    the request out of the list it is still in: a request ended on its way
+    between lists leaves for none."""
 
     def __init__(
         self,
@@ -59,6 +61,7 @@ class RequestRetirer:
         the chunked slot, or refused at the waiting-queue door. ``reason`` is the
         request's own finish reason and ``finished_reason`` what the tokenizer
         receives."""
+        _leave_owner_list(req)
         # Finished in place, so a later abort in the same intake skips it.
         if req.finished_reason is None:
             req.finish_outside_step(reason or FINISH_ABORT())
@@ -71,6 +74,7 @@ class RequestRetirer:
         """Finish a request rejected before it was queued. It holds no device KV,
         but the release still frees its streaming session, its cache prefetch
         retry and a retracted request's host KV backup."""
+        _leave_owner_list(req)
         # An already set `finished_reason` is what the client receives.
         reason = req.finished_reason or req.to_finish
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
@@ -96,14 +100,14 @@ class RequestRetirer:
         discard_kv_cache_backup(req, self.tree_cache)
         # HiSparse clears its mapping of the row before the row is freed.
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.request_finished(req)
+            self.hisparse_coordinator.release_request(req)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
     def retract(self, req: Req, *, offload_kv: bool) -> bool:
         """Release a retracted request's memory uncheckpointed; return whether it can resume."""
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.retract_req(req)
+            self.hisparse_coordinator.release_request(req)
 
         # PD decode backs the KV up to host to restore it without recompute; a caller
         # that will rebootstrap passes offload_kv=False to skip the copy.
@@ -127,6 +131,7 @@ class RequestRetirer:
     def abort_retracted(self, req: Req, *, reason: FINISH_ABORT) -> None:
         """Abort a retracted request that will not be requeued. Not finished in place:
         a step launched before the retraction may still carry it and report it again."""
+        _leave_owner_list(req)
         record_exit(req, "abort_retracted")
         self._detach(req)
         # retract released the KV without a checkpoint.
@@ -147,3 +152,8 @@ class RequestRetirer:
             req.session.abort_req()
         if self.uocr_runtime is not None:
             self.uocr_runtime.on_req_dropped(req)
+
+
+def _leave_owner_list(req: Req) -> None:
+    if req.owner_list is not None:
+        req.owner_list.leave([req])
