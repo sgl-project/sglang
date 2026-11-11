@@ -179,7 +179,6 @@ def _cuda_host_register(
         while offset < total:
             size = min(chunk_bytes, total - offset)
             ptr = base + offset
-            # Keep the cudaError value: cudaGetErrorString does not take an int.
             err = cudart.cudaHostRegister(ptr, size, 0)
             rc = int(err)
             if rc != 0:
