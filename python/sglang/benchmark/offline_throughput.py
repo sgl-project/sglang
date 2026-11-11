@@ -239,7 +239,7 @@ def throughput_test_once(
         "backend": backend_name,
         "successful_requests": len(reqs),
         "total_latency": -1,
-        "total_input_tokens": sum(r.prompt_len for r in reqs),
+        "total_input_tokens": -1,
         "total_output_tokens": -1,
         "request_throughput": -1,
         "input_throughput": -1,
@@ -302,6 +302,19 @@ def throughput_test_once(
     server_info = backend.get_server_info()
 
     measurement_results["total_latency"] = latency
+    # The backend tokenizes the final prompt text (e.g. re-adding special
+    # tokens the sampler subtracted), so count the tokens it actually received
+    # instead of the dataset's nominal sampling length. With parallel sampling
+    # (n > 1) each request fans out into n consecutive outputs that all report
+    # the same prompt_tokens; count the prompt once per original request.
+    # Beam search collapses the fan-out to one output per request, so fall
+    # back to per-output counting when the expanded size does not match.
+    num_samples = sampling_params[0].get("n", 1) if sampling_params else 1
+    if len(gen_out) != len(reqs) * num_samples:
+        num_samples = 1
+    measurement_results["total_input_tokens"] = sum(
+        o["meta_info"]["prompt_tokens"] for o in gen_out[::num_samples]
+    )
     measurement_results["total_output_tokens"] = sum(
         o["meta_info"]["completion_tokens"] for o in gen_out
     )
