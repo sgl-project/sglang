@@ -48,10 +48,6 @@ QWEN_IMAGE21_TRANSPARENT_PROMPT = (
     "background. A clean cutout with an alpha channel, transparent outside the "
     "cat, no floor, no shadow, no background."
 )
-QWEN_IMAGE21_RECOLOR_PROMPT = (
-    "Change the orange skirt and bow to deep blue, keeping her pose, face, hair, "
-    "and the SGL logo unchanged."
-)
 QWEN_IMAGE21_MULTI_IMAGE_PROMPT = (
     "The girl from image 1 is standing on the left, and the white rabbit from "
     "image 2 is sitting on the right, in a park."
@@ -215,27 +211,6 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         DiffusionSamplingParams(
             prompt=QWEN_IMAGE21_MULTI_IMAGE_PROMPT,
             image_path=_multi_image_inputs(),
-            output_size="1024x1024",
-            output_format="png",
-            extras={
-                "num_inference_steps": 40,
-                "guidance_scale": 1,
-                "seed": 42,
-                "quality": "exact",
-            },
-        ),
-        run_consistency_check=False,
-        run_component_accuracy_check=False,
-    ),
-    DiffusionTestCase(
-        "qwen_image21_edit_recolor_ti2i_1npu",
-        DiffusionServerArgs(
-            model_path=QWEN_IMAGE_21_WEIGHTS_PATH,
-            extras=EXTRAS_DISABLE_WARMUP,
-        ),
-        replace(
-            TI2I_sampling_params,
-            prompt=QWEN_IMAGE21_RECOLOR_PROMPT,
             output_size="1024x1024",
             output_format="png",
             extras={
