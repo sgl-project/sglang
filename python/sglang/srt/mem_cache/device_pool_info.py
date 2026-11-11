@@ -174,7 +174,7 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                 )
 
     def page_views(self) -> tuple[torch.Tensor, ...]:
-        if self.key_layout is not IndexKeyLayout.KEY_ROWS:
+        if self.key_layout is IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES:
             return self.buffers
         return tuple(
             buffer.view(torch.uint8).reshape(-1, self.page_bytes)
