@@ -63,6 +63,8 @@ class _Demand:
     # Already resident at join time is L2, not this request's storage hit.
     storage_start: int
     joined_at: float = field(default_factory=time.monotonic)
+    resume_tokens: tuple[int, ...] | None = None
+    tail_started: bool = False
 
 
 @dataclass
@@ -99,6 +101,7 @@ class StorageCacheReads:
         self._host_reclaim_retry_at = 0.0
         self.stats = dict(
             demand_coalesced=0,
+            demand_prefix_coalesced=0,
             demand_consumed=0,
             demand_aborted=0,
             demand_limit_declined=0,
@@ -200,21 +203,44 @@ class StorageCacheReads:
 
     def join_demand(self, request, prefix, suffix, extra_key, cache_salt):
         if request in self.demands:
-            return True
+            return not self.demands[request].tail_started
         # Other stop policies retain their existing deadline/early-compute behavior.
         if self.cache.prefetch_stop_policy != "wait_complete":
             return False
         if len(self.demands) >= self.executor.config.max_prepared_prefixes:
             self.stats["demand_limit_declined"] += 1
             return False
+        prefix_length = len(prefix or ())
         if (
-            len(prefix or ()) + len(suffix)
+            prefix_length + len(suffix)
             > self.cache.kv_control_service.config.limits.max_scope_tokens
         ):
             return False
         tokens = tuple(prefix or ()) + tuple(suffix.token_ids)
         key = self._demand_key(tokens, extra_key, cache_salt)
         job = self._joinable.get(key)
+        resume_tokens = None
+        if job is None:
+            # Join only submitted reads. A speculative ancestor still waiting
+            # for admission must not block an ordinary request.
+            job = max(
+                (
+                    candidate
+                    for candidate in self._joinable.values()
+                    if candidate.operation is not None
+                    and not candidate.cancel_requested
+                    and not candidate.failure
+                    and not candidate.retired
+                    and candidate.compatibility.extra_key == extra_key
+                    and candidate.compatibility.cache_salt == cache_salt
+                    and prefix_length < len(candidate.tokens) < len(tokens)
+                    and tokens[: len(candidate.tokens)] == candidate.tokens
+                ),
+                key=lambda candidate: len(candidate.tokens),
+                default=None,
+            )
+            if job is not None:
+                resume_tokens = tokens
         if (
             job is None
             and len(self.demands) + 1 < self.executor.config.max_prepared_prefixes
@@ -242,16 +268,53 @@ class StorageCacheReads:
                 self._retire(job, status=Status.DEFERRED, code="ordinary_restore")
                 return False
         self.demands[request] = _Demand(
-            job, max(len(prefix or ()), self._host_length(job))
+            job, max(prefix_length, self._host_length(job)), resume_tokens=resume_tokens
         )
         job.demands.add(request)
         self.stats["demand_coalesced"] += 1
+        if resume_tokens is not None:
+            self.stats["demand_prefix_coalesced"] += 1
         return True
 
     def demand_ready(self, request):
         """Admission may proceed after drain, including partial/missing results."""
         demand = self.demands.get(request)
         return None if demand is None else demand.job.retired
+
+    def check_demand_progress(self, request):
+        demand = self.demands.get(request)
+        if demand is None:
+            return None
+        if not demand.job.retired:
+            return False
+        if demand.resume_tokens is None:
+            return True
+        if not demand.tail_started:
+            demand.tail_started = True
+            tokens, compatibility = demand.resume_tokens, demand.job.compatibility
+            anchor, length = self.cache.tree_core.root_node, 0
+            for node, _, end, matched in self.executor._walk(tokens, compatibility):
+                if not self._host_ready(node):
+                    break
+                if matched == len(tokens):
+                    return None
+                if matched != end:
+                    break
+                anchor, length = node, end
+            self.cache.prefetch_from_storage(
+                request,
+                anchor.id,
+                array("q", tokens[length:]),
+                last_hash=self.cache.get_last_hash_value(anchor.id),
+                prefix_keys=self.cache.get_prefix_hash_values(anchor.id)
+                if self.cache.hicache_storage_pass_prefix_keys
+                else None,
+                matched_prefix_tokens=list(tokens[:length]),
+                extra_key=compatibility.extra_key,
+                cache_salt=compatibility.cache_salt,
+            )
+        # The ordinary progress path owns the suffix operation, if any.
+        return None
 
     def release_demand(self, request, *, aborted=False):
         demand = self.demands.pop(request, None)
@@ -328,13 +391,17 @@ class StorageCacheReads:
     def _host_length(self, job, rows=None):
         length = 0
         for node, _, end in self._rows(job) if rows is None else rows:
-            if (
-                node.component_data[FULL].host_value is None
-                or node.write_through_pending_id is not None
-            ):
+            if not self._host_ready(node):
                 break
             length = end
         return length
+
+    @staticmethod
+    def _host_ready(node):
+        return (
+            node.component_data[FULL].host_value is not None
+            and node.write_through_pending_id is None
+        )
 
     def _borrow_ordinary(self, tokens, compatibility, *, exact=False):
         end = len(tokens)

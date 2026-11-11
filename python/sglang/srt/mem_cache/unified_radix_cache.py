@@ -2570,7 +2570,10 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         reads = self._native_storage_reads()
-        if reads is not None and (ready := reads.demand_ready(request)) is not None:
+        if (
+            reads is not None
+            and (ready := reads.check_demand_progress(request)) is not None
+        ):
             return ready
         if (
             self.cache_controller is not None
@@ -2961,13 +2964,18 @@ class UnifiedRadixCache(BasePrefixCache):
         self, request: CacheRequestHandle
     ) -> tuple[int, Optional[int]]:
         """Pop the loaded L3 token count and its absolute prefix start."""
+        count = self.prefetch_loaded_tokens_by_reqid.pop(request, 0)
+        start = self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
         reads = self._native_storage_reads()
         if reads is not None and reads.demand_ready(request):
-            return reads.release_demand(request)
-        return (
-            self.prefetch_loaded_tokens_by_reqid.pop(request, 0),
-            self.prefetch_loaded_storage_start_by_reqid.pop(request, None),
-        )
+            shared_count, shared_start = reads.release_demand(request)
+            if shared_count:
+                if shared_start + shared_count == start:
+                    return shared_count + count, shared_start
+                # An unrelated L2 hit can separate the two L3 ranges. Keep a
+                # contiguous span without attributing that gap to storage.
+                return shared_count, shared_start
+        return count, start
 
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:

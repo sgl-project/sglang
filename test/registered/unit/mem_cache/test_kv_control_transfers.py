@@ -807,7 +807,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
         with hicache(self, namespace_keys=True) as owner:
             _, cache, service, _ = owner
             scopes = [
-                cache_fixtures.target((5, 6, 7, 8), cache_salt="abort"),
+                cache_fixtures.target((1, 6, 7, 8), cache_salt="abort"),
                 cache_fixtures.target(cache_salt="abort"),
             ]
             self._cold_scopes(owner, scopes)
@@ -839,6 +839,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     self._ordinary_prefetch(cache, service, scopes[1], demand)
                     reads = service.control.executor.storage_reads
                     self.assertIn(demand, reads.demands)
+                    self.assertIsNone(reads.demands[demand].job.operation)
                     self.assertEqual(
                         service.control.cancel(queued.ref).status, Status.CANCELLING
                     )
@@ -2105,6 +2106,57 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         )
                         self.assertEqual(reads.stats["ordinary_reads_reused"], 1)
                         self.assertEqual(reads.stats["jobs_started"], 0)
+                finally:
+                    release.set()
+                    cache.release_aborted_request(demand)
+                assert_retired(cache, service)
+                cache.sanity_check()
+
+    def test_tool_resume_shares_issued_prefix_and_fetches_only_its_tail(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        for tail_stored in (False, True):
+            with (
+                self.subTest(tail_stored=tail_stored),
+                hicache(self, namespace_keys=True) as owner,
+            ):
+                _, cache, service, _ = owner
+                ancestor = cache_fixtures.target()
+                resume = cache_fixtures.target((1, 2, 3, 4, 5, 6))
+                self._cold_scopes(owner, [resume if tail_stored else ancestor])
+                cc = cache.cache_controller
+                entered, release = threading.Event(), threading.Event()
+                batches = []
+                get = cc.page_get_func
+                demand = CacheRequestHandle("tool-resume", 0)
+
+                def blocked_get(operation, hashes, *args, **kwargs):
+                    batches.append((operation.storage_start, len(hashes)))
+                    if not entered.is_set():
+                        entered.set()
+                        assert release.wait(5)
+                    return get(operation, hashes, *args, **kwargs)
+
+                try:
+                    with (
+                        patch.object(cc, "page_get_func", blocked_get),
+                        patch.object(cache, "prefetch_threshold", 1),
+                        patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                    ):
+                        hint = self._restore(service, ancestor, "ancestor")
+                        wait_for(service, entered.is_set)
+                        self._ordinary_prefetch(cache, service, resume, demand)
+                        self.assertNotIn(demand, cache.ongoing_prefetch)
+                        self.assertFalse(cache.check_prefetch_progress(demand))
+                        release.set()
+                        self.assertEqual(wait(service, hint).status, Status.COMPLETED)
+                        self.assertEqual(
+                            self._consume_ordinary_prefetch(cache, service, demand),
+                            (6 if tail_stored else 4, 0),
+                        )
+                        self.assertEqual(
+                            batches, [(0, 4), (4, 2)] if tail_stored else [(0, 4)]
+                        )
                 finally:
                     release.set()
                     cache.release_aborted_request(demand)
