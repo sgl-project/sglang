@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, runtime_checkable
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import torch
@@ -133,8 +134,21 @@ def _read_media_bytes(media: str | bytes) -> bytes:
     if isinstance(media, bytes):
         return bytes(media)
 
-    from sglang.srt.multimodal.media_io import get_image_bytes
+    from sglang.srt.multimodal.media_io import (
+        get_image_bytes,
+        image_extension_names,
+        read_local_media_file,
+    )
 
+    if media.startswith("file://"):
+        return read_local_media_file(unquote(urlparse(media).path))
+    if media.startswith(("http://", "https://", "data:")):
+        return get_image_bytes(media)
+    # ``load_image`` accepts relative local paths only by image extension.
+    # Match that contract instead of probing arbitrary base64 as a filename;
+    # base64 has no ".", so it never takes this branch.
+    if media.lower().endswith(image_extension_names):
+        return read_local_media_file(media)
     return get_image_bytes(media)
 
 
@@ -155,7 +169,17 @@ def snapshot_media(media: Any) -> MediaSnapshot:
             media = media["image"]
 
     if isinstance(media, (str, bytes)):
-        payload = _read_media_bytes(media)
+        from sglang.srt.multimodal.media_io import (
+            CLIENT_MEDIA_EXCEPTIONS,
+            shorten_media_source,
+        )
+
+        try:
+            payload = _read_media_bytes(media)
+        except CLIENT_MEDIA_EXCEPTIONS as e:
+            raise ValueError(
+                f"Could not load media {shorten_media_source(str(media))}: {e}"
+            ) from e
         return MediaSnapshot(payload, _digest_bytes(payload), len(payload), "bytes")
     if isinstance(media, Image.Image):
         return _snapshot_pil(media)

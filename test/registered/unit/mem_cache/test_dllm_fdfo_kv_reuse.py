@@ -236,7 +236,8 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
             SimpleNamespace(max_running_requests=4), abort=released.append
         )
         staged, waiting, keep = (
-            Mock(rid=rid) for rid in ("abort-staged", "abort-waiting", "keep")
+            Mock(rid=rid, owner_list=None)
+            for rid in ("abort-staged", "abort-waiting", "keep")
         )
         manager.waiting_queue.join([staged, waiting, keep])
         manager.staging_queue = [staged, keep]

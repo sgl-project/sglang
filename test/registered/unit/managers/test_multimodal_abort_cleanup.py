@@ -92,7 +92,8 @@ def _rank(rank):
 def _queued_scheduler(req):
     scheduler = object.__new__(Scheduler)
     empty_request_lists(scheduler)
-    scheduler.waiting_queue.join([req])
+    if req is not None:
+        scheduler.waiting_queue.join([req])
     scheduler.mm_receiver = None
     scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.tree_cache = MagicMock()

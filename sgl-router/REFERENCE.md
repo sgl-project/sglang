@@ -11,7 +11,7 @@ design, policies and bucket configuration are in [ARCHITECTURE.md](ARCHITECTURE.
 - [OpenAI over /generate](#openai-over-generate)
 - [Embeddings](#embeddings), [Classify](#classify), [Completions](#completions), [Rerank](#rerank)
 - [Anthropic Messages](#anthropic-messages)
-- Per-model rendering: [DeepSeek V4 and V4.1](#deepseek-v4-and-v41), [GLM-5.3](#glm-53), [Qwen3.8](#qwen38), [Kimi-K3](#kimi-k3), [MiniMax-M3](#minimax-m3)
+- Per-model rendering: [DeepSeek V4 and V4.1](#deepseek-v4-and-v41), [GLM-5.3](#glm-53), [Qwen3.8](#qwen38), [Kimi-K3](#kimi-k3), [MiniMax-M3](#minimax-m3), [StepFun](#stepfun)
 - [HTTP/2](#http2)
 - [Native gRPC](#native-grpc)
 - [Upgrading from `cache_aware_zmq`](#upgrading-from-cache_aware_zmq)
@@ -399,15 +399,17 @@ text, as does any model whose template fails to load or render.
 Some chats additionally forward the rendered tokens to the engine as
 `input_ids`, retaining the original messages, so the engine skips
 re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's, V4.1's
-and Kimi-K3's native encoders and GLM-5.3's, MiniMax-M3's and Qwen3.8's templates are
-fixture-verified against SGLang's request normalization, so they forward every
+and Kimi-K3's native encoders and GLM-5.3's, MiniMax-M3's, Qwen3.8's and StepFun's
+templates are fixture-verified against SGLang's request normalization, so they forward every
 chat except multimodal ones and those with caller-provided `input_ids`. Renderers
 without that verification (HF Jinja templates)
 forward only plain text chat requests (string `content`, no tools, no template
 kwargs or reasoning controls or historical `reasoning_content`, no assistant
 continuation, no consecutive users or non-leading system turns) and warn
 `UNVERIFIED` at startup; every other request shape is rendered for routing
-only.
+only. A `continue_final_message` prefix is tokenized on its own with the special
+tokens the tokenizer adds around a text, less one leading BOS, as SGLang's
+`_append_assistant_prefix_to_prompt_ids` does.
 
 Use matching model files on the router and workers, and set
 the same `--default-chat-template-kwargs`, `SGLANG_DEFAULT_THINKING`,
@@ -500,7 +502,7 @@ own route as sent: workers that disagree on those args or never
 reported them, `--completion-template`, `return_hidden_states` and other
 `sglext` outputs, `echo` or `logprobs` without a router tokenizer, and bodies
 SGLang would reject. Chat also needs a renderer verified against SGLang (the
-`AllText` scope: DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3 and Qwen3.8 today), router `--default-chat-template-kwargs`
+`AllText` scope: DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3, Qwen3.8 and StepFun today), router `--default-chat-template-kwargs`
 equal to the workers', a reasoning parser the processor reproduces
 (`deepseek-v4`, `deepseek-v41`, `glm45`, `kimi_k3`, `qwen3`) or none, and no media yet. Tools are served with `tool_choice`
 `auto` or `none`, non-strict, with standard JSON-schema types, and a tool
@@ -630,6 +632,17 @@ adaptively, and the router enforces that at ingress: `thinking: {"type":
 "disabled"}`, `chat_template_kwargs.thinking_mode: "disabled"` and a
 `reasoning_effort` of `none` are rejected with 400, and `minimal` is sent as `low`.
 MiniMax-M3 can disable thinking, so its requests pass through unchanged.
+
+## StepFun
+
+Step-3.5-Flash, Step-3.7-Flash and Step-5-Preview render with the checkpoint's
+`chat_template.jinja` through `rust/sglang-processor`, which picks them by the template
+(its `tool_response` turn, `<im_patch>` and Qwen3-Coder tool-call tags) and hands it the
+messages, tools and kwargs SGLang's Jinja path builds. Every text chat forwards
+`input_ids`. Media, `-0` in tool arguments or schemas, and a `chat_template`,
+`bos_token`, `eos_token` or `unk_token` key in `chat_template_kwargs` render on the
+worker. With the cookbook's `step3p5` parsers, which the processor does not reproduce
+yet, chats keep the engine's route.
 
 ## HTTP/2
 

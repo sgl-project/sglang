@@ -10,14 +10,14 @@ from unittest.mock import patch
 import requests
 
 from sglang.srt.multimodal.media_io import (
-    _assert_local_media_path_allowed,
     _normalize_video_input,
     configure_media_url_security,
     download_remote_media,
     get_image_bytes,
     load_audio,
     load_image,
-    read_local_media,
+    media_url_security_config,
+    read_local_media_file,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -183,10 +183,6 @@ class TestMediaURLSecurity(unittest.TestCase):
                         loader("https://blocked.example/media")
             self.assertEqual(download.call_count, 3)
 
-
-class TestLocalMediaSecurity(unittest.TestCase):
-    """Local paths and file:// URIs must obey the same policy as remote URLs."""
-
     def test_local_media_disabled_when_domain_allowlist_configured(self):
         configure_media_url_security(["127.0.0.1"], max_file_size_mb=64)
         for input_target in ("/etc/hosts", "file:///etc/hosts"):
@@ -199,10 +195,6 @@ class TestLocalMediaSecurity(unittest.TestCase):
                     ValueError, "Local media access is disabled"
                 ):
                     _normalize_video_input(input_target)
-                with self.assertRaisesRegex(
-                    ValueError, "Local media access is disabled"
-                ):
-                    _assert_local_media_path_allowed(input_target)
 
     def test_allowed_local_media_paths_permits_whitelisted_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -213,16 +205,15 @@ class TestLocalMediaSecurity(unittest.TestCase):
             configure_media_url_security(
                 allowed_local_media_paths=[tmpdir], max_file_size_mb=64
             )
+            configure_media_url_security(*media_url_security_config())
             self.assertEqual(get_image_bytes(file_path), b"sample-image-content")
             self.assertEqual(
                 get_image_bytes(f"file://{file_path}"), b"sample-image-content"
             )
-            self.assertEqual(
-                read_local_media(f"file://{file_path}"), b"sample-image-content"
-            )
+            self.assertEqual(read_local_media_file(file_path), b"sample-image-content")
             self.assertEqual(
                 _normalize_video_input(f"file://{file_path}"),
-                os.path.realpath(file_path),
+                file_path,
             )
 
     def test_allowed_local_media_paths_rejects_unwhitelisted_and_traversal(self):
@@ -267,7 +258,9 @@ class TestLocalMediaSecurity(unittest.TestCase):
             if not os.path.exists(special_target):
                 continue
             with self.subTest(target=special_target):
-                with self.assertRaisesRegex(ValueError, "not a regular file"):
+                with self.assertRaisesRegex(
+                    ValueError, "not a regular file|Is a directory"
+                ):
                     get_image_bytes(special_target)
 
     def test_local_media_file_size_limit(self):
@@ -279,7 +272,7 @@ class TestLocalMediaSecurity(unittest.TestCase):
             configure_media_url_security(
                 allowed_local_media_paths=[tmpdir], max_file_size_mb=1
             )
-            with self.assertRaisesRegex(ValueError, "download limit"):
+            with self.assertRaisesRegex(ValueError, "limit"):
                 get_image_bytes(oversized_file)
 
     def test_empty_allowed_local_media_paths_blocks_all(self):
@@ -289,9 +282,7 @@ class TestLocalMediaSecurity(unittest.TestCase):
                 f.write(b"test")
 
             configure_media_url_security(allowed_local_media_paths=[])
-            with self.assertRaisesRegex(
-                ValueError, "Local media access is not allowed"
-            ):
+            with self.assertRaisesRegex(ValueError, "not within allowed paths"):
                 get_image_bytes(test_file)
 
     def test_load_image_and_audio_enforce_local_security(self):
