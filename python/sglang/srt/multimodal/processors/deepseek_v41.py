@@ -73,14 +73,22 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self, image_data, input_text, request_obj, *args, **kwargs
     ):
-        base = await self.load_mm_data(
-            input_text, image_data=image_data, multimodal_tokens=self.mm_tokens
-        )
-        ids = (
-            input_text
-            if isinstance(input_text, list)
-            else self._processor.encode(input_text)
-        )
+        if isinstance(input_text, list):
+            # Decoded text spells image-token text like a placeholder; the IDs
+            # tell them apart, so the count below is the alignment check.
+            ids = input_text
+            self.validate_mm_data(image_data)
+            base = await self.fast_load_mm_data(
+                input_text,
+                image_data=image_data,
+                multimodal_tokens=self.mm_tokens,
+                input_ids=ids,
+            )
+        else:
+            ids = self._processor.encode(input_text)
+            base = await self.load_mm_data(
+                input_text, image_data=image_data, multimodal_tokens=self.mm_tokens
+            )
         if ids.count(self.image_token_id) != len(base.images):
             raise ValueError("Image placeholders and images must match")
         images = iter(base.images)

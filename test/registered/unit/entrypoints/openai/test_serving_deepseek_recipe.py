@@ -360,6 +360,76 @@ class TestHandlerRequestSemantics(CustomTestCase):
                     prompt([], tool_choice=choice),
                 )
 
+    def test_message_tools_keep_image_placeholders(self):
+        """A declaring message keeps its images and its text that spells the image
+        token where the same message without tools renders them."""
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+        from sglang.srt.parser.deepseek_recipe_renderer import IMAGE_TOKEN
+
+        chat = _serving(self, self.tokenizer, is_multimodal=True)
+        image_id = self._token(IMAGE_TOKEN)
+        user = "<｜User｜>"
+        tool = {"function": {"name": "f", "parameters": {"type": "object"}}}
+
+        def image(name):
+            url = f"https://example.com/{name}.png"
+            return {"type": "image_url", "image_url": {"url": url}}
+
+        def text(value):
+            return {"type": "text", "text": value}
+
+        def render(content, tools):
+            request = ChatCompletionRequest(
+                messages=[
+                    {"role": "system", "content": content, "tools": tools},
+                    {"role": "user", "content": [image("u"), text("hi")]},
+                ],
+            )
+            processed = chat._process_messages(request, True)
+            between_images, ids = [], []
+            for token_id in [*processed.prompt_ids, image_id]:
+                if token_id == image_id:
+                    between_images.append(self.tokenizer.decode(ids))
+                    ids = []
+                else:
+                    ids.append(token_id)
+            return between_images, [item.url for item in processed.image_data]
+
+        literal = f"literal {IMAGE_TOKEN}"
+        for name, content, images in (
+            ("after", [text("see"), image("a"), text(literal)], "a"),
+            (
+                "interleaved",
+                [image("a"), text("one"), image("b"), text(f"{literal} {literal}")],
+                "ab",
+            ),
+            ("no image", literal, ""),
+        ):
+            with self.subTest(name):
+                declared, declared_images = render(content, [tool])
+                plain, plain_images = render(content, None)
+                self.assertEqual(
+                    declared_images,
+                    [image(name)["image_url"]["url"] for name in images + "u"],
+                )
+                self.assertEqual(declared_images, plain_images)
+                self.assertEqual(len(declared), len(plain))
+                for declared_text, plain_text in zip(declared, plain):
+                    system, _, rest = declared_text.partition(user)
+                    plain_system, _, plain_rest = plain_text.partition(user)
+                    self.assertTrue(system.startswith(plain_system), declared_text)
+                    self.assertEqual(rest, plain_rest)
+                self.assertIn("### Updated Tool Schemas", declared[len(images)])
+        # Recipe's message constructor cannot place text that spells the token
+        # ahead of an image, so the request fails instead of moving the image.
+        for name, content in (
+            ("before", [text(literal), image("a")]),
+            ("between", [image("a"), text(literal), image("b")]),
+        ):
+            with self.subTest(name):
+                with self.assertRaisesRegex(ValueError, "before one of its images"):
+                    render(content, [tool])
+
     def test_request_reaches_the_engine_with_sglang_semantics(self):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
