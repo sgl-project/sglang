@@ -556,6 +556,92 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 k3_count * 8,
             )
 
+    def test_minimax_m3_pp_stages_relay_dspark_captures_to_the_draft(self):
+        """Under PP every MiniMax-M3 stage must capture its DSpark layers and relay
+        them, so the last stage hands the draft all captures in layer order."""
+        from torch import nn
+
+        from sglang.srt.models import minimax_m3
+        from sglang.srt.models.minimax_m3_vl import (
+            MiniMaxM3SparseForConditionalGeneration,
+        )
+
+        class _Layer:
+            attn_boundary = SimpleNamespace(
+                from_pp=lambda proxy, forward_batch: proxy["hidden_states"]
+            )
+
+            def __call__(self, *, hidden_states, captured_last_layer_outputs, **_):
+                if captured_last_layer_outputs is not None:
+                    captured_last_layer_outputs.capture(hidden_states)
+                return hidden_states + 1
+
+        def _final_norm(hidden_states, forward_batch, norm, *, capture, **_):
+            if capture is not None:
+                capture(hidden_states)
+            return hidden_states
+
+        residual = SimpleNamespace(
+            start=lambda forward_batch: None,
+            to_pp=lambda hidden_states, forward_batch: PPProxyTensors(
+                {"hidden_states": hidden_states}
+            ),
+            final_norm=_final_norm,
+        )
+        # M3.1-Flash's DSpark target layers; layer i outputs i + 1 here.
+        target_layers, num_layers, hidden = [3, 17, 31, 45, 59], 60, 2
+        forward_batch = SimpleNamespace(can_run_tbo=False)
+        proxy = None
+        with (
+            patch.object(minimax_m3, "residual_batch", residual),
+            patch.object(minimax_m3, "check_cuda_graph_backend", return_value=True),
+        ):
+            for pp_rank, start in enumerate(range(0, num_layers, 15)):
+                pp_group = SimpleNamespace(
+                    is_first_rank=pp_rank == 0, is_last_rank=pp_rank == 3
+                )
+                stage = MiniMaxM3SparseForConditionalGeneration.__new__(
+                    MiniMaxM3SparseForConditionalGeneration
+                )
+                nn.Module.__init__(stage)
+                stage.config = SimpleNamespace(
+                    text_config=SimpleNamespace(hidden_size=hidden)
+                )
+                stage.pp_group = pp_group
+                stage.model = SimpleNamespace(
+                    layers=[_Layer() for _ in range(num_layers)],
+                    start_layer=start,
+                    end_layer=start + 15,
+                    layers_to_capture=[],
+                    pp_group=pp_group,
+                    norm=None,
+                    finalize_norm=None,
+                )
+                stage.set_dspark_layers_to_capture(target_layers)
+                relayed = (
+                    None if proxy is None else proxy.tensors.get("dspark_hidden_states")
+                )
+                # The PP proxy buffers are sized from this width.
+                self.assertEqual(
+                    resolve_pp_proxy_dspark_hidden_size(
+                        model=stage, pp_size=4, pp_rank=pp_rank
+                    ),
+                    0 if relayed is None else relayed.shape[-1],
+                )
+                proxy = minimax_m3.MiniMaxM3Model.forward(
+                    stage.model,
+                    input_ids=None,
+                    positions=None,
+                    forward_batch=forward_batch,
+                    input_embeds=torch.zeros(3, hidden) if pp_rank == 0 else None,
+                    pp_proxy_tensors=proxy,
+                )
+        _, aux_hidden_states = proxy
+        self.assertEqual(
+            torch.cat(aux_hidden_states, dim=-1)[0].tolist(),
+            [layer_id + 1.0 for layer_id in target_layers for _ in range(hidden)],
+        )
+
     def test_body_replay_uses_plural_embeds_and_skips_embedding_on_later_pp_stage(self):
         for first_rank in (True, False):
             for positional in (True, False):
