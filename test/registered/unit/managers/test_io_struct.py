@@ -434,6 +434,67 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             rid=["id1", "id2"],
         )
 
+    def test_mixed_beam_parallel_sampling_rejected_before_expansion(self):
+        """Mixed n>1 batches must not drop samples or duplicate beam requests."""
+        for ordinary in ({}, {"beam_width": None}, {"beam_width": 1}):
+            for beam_positions in ((0,), (1,), (0, 2)):
+                for stream in (False, True):
+                    with self.subTest(
+                        ordinary=ordinary, beam_positions=beam_positions, stream=stream
+                    ):
+                        size = 3 if beam_positions == (0, 2) else 2
+                        params = [
+                            {
+                                "n": 2,
+                                **(
+                                    {"beam_width": 2}
+                                    if i in beam_positions
+                                    else ordinary
+                                ),
+                            }
+                            for i in range(size)
+                        ]
+                        inputs = dict(
+                            text=[f"Prompt {i}" for i in range(size)],
+                            rid=[f"request-{i}" for i in range(size)],
+                            sampling_params=params,
+                        )
+                        original = copy.deepcopy(inputs)
+                        req = GenerateReqInput(**inputs, stream=stream)
+                        with self.assertRaisesRegex(ValueError, "separate batches"):
+                            req.normalize_batch_and_arguments()
+                        self.assertEqual(inputs, original)
+                        for name, value in original.items():
+                            self.assertEqual(getattr(req, name), value)
+
+    def test_beam_sampling_compatible_batches_preserve_fanout(self):
+        """Rejecting mixed n>1 must preserve n=1 mixing and homogeneous fan-out."""
+        cases = (
+            ([{"n": 1, "beam_width": 2}, {}], 1),
+            ([{}, {"n": 1, "beam_width": 2}], 1),
+            ([{"n": 2}, {"n": 2, "beam_width": 1}], 2),
+            ([{"n": 2, "beam_width": 2}, {"n": 2, "beam_width": 2}], 1),
+            ([{"n": 2, "beam_width": 2}, {"n": 2, "beam_width": 3}], 1),
+        )
+        for params, copies in cases:
+            with self.subTest(params=params):
+                req = GenerateReqInput(text=["Hello", "World"], sampling_params=params)
+                req.normalize_batch_and_arguments()
+                self.assertEqual(req.parallel_sample_num, copies)
+                self.assertEqual(req.text, ["Hello", "World"] * copies)
+                self.assertEqual(req.sampling_params, params * copies)
+                self.assertEqual(len(set(req.rid)), 2 * copies)
+
+    def test_scalar_beam_sampling_preserves_fanout(self):
+        """Scalar beam n counts returned sequences, not independent requests."""
+        for params, copies in (({"n": 2}, 2), ({"n": 2, "beam_width": 2}, 1)):
+            with self.subTest(params=params):
+                req = GenerateReqInput(text="Hello", sampling_params=params)
+                req.normalize_batch_and_arguments()
+                self.assertEqual(req.parallel_sample_num, copies)
+                self.assertEqual(req.is_single, copies == 1)
+                self.assertEqual(req.text, "Hello" if copies == 1 else ["Hello"] * 2)
+
     def test_sampling_params_are_owned_by_each_request(self):
         """Adjusting one request's token budget must preserve peers and caller defaults."""
         for n in (1, 2):

@@ -121,6 +121,8 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
 
 The object is defined at `sampling_params.py::SamplingParams`. You can also read the source code to find more arguments and docs.
 
+When you pass a list of `sampling_params` to `/generate`, all items must use the same `n`. For beam search (`beam_width > 1`), `n` is the number of returned sequences; for ordinary sampling, it is the number of independent samples. If `n > 1`, send beam search and ordinary sampling in separate batches. Mixing them in one batch is supported only when `n = 1`.
+
 ### Note on defaults
 
 By default, SGLang initializes several sampling parameters from the model's `generation_config.json` (when the server is launched with `--sampling-defaults model`, which is the default). To use SGLang/OpenAI constant defaults instead, start the server with `--sampling-defaults openai`. You can always override any parameter per request via `sampling_params`.
