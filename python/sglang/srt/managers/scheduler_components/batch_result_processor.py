@@ -518,7 +518,6 @@ class SchedulerBatchResultProcessor:
                                 partial(
                                     self.hisparse_coordinator.admit_request_into_staging,
                                     req,
-                                    src=self.prefill_launched_reqs,
                                 )
                             )
 

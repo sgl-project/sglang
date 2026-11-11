@@ -235,17 +235,14 @@ class UocrSchedulerRuntime:
         req: Req,
         *,
         is_retracted: bool,
-        src: Optional[ReqList] = None,
     ) -> bool:
-        """queue a follow-up in reuse order, or keep it parked until its source
-        finishes; one `src` holds moves out of it"""
+        """queue a follow-up in reuse order, or keep it parked until its source finishes"""
         if is_retracted:
             self._reuse.on_retracted(req)
-        if not is_retracted and self._prefetch.park(req, src=src):
+        if not is_retracted and self._prefetch.park(req):
             return False
         move(
             [req],
-            src,
             waiting_queue,
             at=self._reuse.queue_position(waiting_queue, req),
         )
