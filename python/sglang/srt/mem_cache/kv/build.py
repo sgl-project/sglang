@@ -15,7 +15,9 @@ from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.decl import (
     KV_PART,
+    IndexKeyGeometry,
     KVLayerDecl,
+    MLAGeometry,
     RequestLifetime,
     StateLifetime,
     WindowLifetime,
@@ -24,8 +26,13 @@ from sglang.srt.mem_cache.kv.layout.composite import (
     CompositeSubPoolSpec,
     UnitPartGeometry,
 )
+from sglang.srt.mem_cache.kv.layout.index_key import IndexKeyView
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
-from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
+from sglang.srt.mem_cache.kv.layout.mla import (
+    LayerMajorMLAView,
+    MLASubPoolSpec,
+    MLAView,
+)
 from sglang.srt.mem_cache.kv.layout.state import NGramView, ShortConvView, StateView
 from sglang.srt.mem_cache.kv.memory.arena import GB, KVArena, plan_bands
 from sglang.srt.mem_cache.kv.memory.fixed import FixedMemory
@@ -213,6 +220,22 @@ def _unit_view(
     if isinstance(geometry, UnitPartGeometry):
         return geometry.unit_view(
             arena=arena, spec=sub_pool.spec, part=part, page_size=plan.page_size
+        )
+    if isinstance(geometry, MLAGeometry) and geometry.layer_major:
+        return LayerMajorMLAView(
+            arena=arena,
+            spec=sub_pool.spec,
+            geometry=geometry,
+            page_size=plan.page_size,
+            model_layer_ids=part.layer_ids,
+        )
+    if isinstance(geometry, IndexKeyGeometry):
+        return IndexKeyView(
+            arena=arena,
+            spec=sub_pool.spec,
+            geometry=geometry,
+            page_size=plan.page_size,
+            model_layer_ids=part.layer_ids,
         )
     raise NotImplementedError(
         f"sub-pool {sub_pool.name!r}: no view reads {type(geometry).__name__} "

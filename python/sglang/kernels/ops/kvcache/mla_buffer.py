@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.kvcache.paged_rows import paged_layout, paged_row_offset
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -26,6 +27,9 @@ def set_mla_kv_buffer_kernel(
     DCP_RANK: tl.constexpr,
     DCP_WORLD_SIZE: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    # A paged buffer (`paged_layout`): buffer_stride is then its row stride.
+    PAGE_SIZE: tl.constexpr = 1,
+    PAGE_STRIDE: tl.constexpr = 0,
 ):
     pid_loc = tl.program_id(0)
     pid_blk = tl.program_id(1)
@@ -42,7 +46,11 @@ def set_mla_kv_buffer_kernel(
     is_valid = (loc != reserved_skip_index) & (loc % DCP_WORLD_SIZE == DCP_RANK)
     safe_loc = tl.where(is_valid, loc, 0)
     safe_loc = safe_loc // DCP_WORLD_SIZE
-    dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
+    dst_ptr = (
+        kv_buffer_ptr
+        + paged_row_offset(safe_loc, PAGE_STRIDE, buffer_stride, PAGE_SIZE)
+        + offs
+    )
 
     # Three-way branch to handle boundary correctly while preserving fast path
     if base + BLOCK <= nope_dim:
@@ -93,6 +101,8 @@ def set_mla_kv_buffer_kernel_norope(
     nope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    PAGE_SIZE: tl.constexpr = 1,
+    PAGE_STRIDE: tl.constexpr = 0,
 ):
     pid_loc = tl.program_id(0)
     pid_blk = tl.program_id(1)
@@ -105,7 +115,11 @@ def set_mla_kv_buffer_kernel_norope(
         tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+    dst_ptr = (
+        kv_buffer_ptr
+        + paged_row_offset(loc, PAGE_STRIDE, buffer_stride, PAGE_SIZE)
+        + offs
+    )
 
     src = tl.load(
         cache_k_nope_ptr + pid_loc * nope_stride + offs,
@@ -137,7 +151,13 @@ def set_mla_kv_buffer_naive(
     # view, not reshape: the destination must alias kv_buffer, and a layout
     # reshape would have to copy is one this write cannot serve. The sources
     # are read-only, so a copy there is harmless.
-    rows = kv_buffer.view(kv_buffer.shape[0], -1)
+    paged = paged_layout(kv_buffer)
+    page_size = 1 if paged is None else paged[0]
+    if paged is None:
+        rows = kv_buffer.view(kv_buffer.shape[0], -1)
+    else:
+        assert dcp_world_size == 1, "a paged buffer holds rank-local rows"
+        rows = kv_buffer[:, :, 0, :]
     nope = cache_k_nope.reshape(cache_k_nope.shape[0], -1)
     nope_dim = nope.shape[-1]
     has_rope = cache_k_rope is not None and cache_k_rope.numel() > 0
@@ -152,11 +172,21 @@ def set_mla_kv_buffer_naive(
     if dcp_world_size > 1:
         is_valid &= loc % dcp_world_size == dcp_rank
     dst = loc[is_valid] // dcp_world_size
+    # A paged buffer's row of token t is [t // page_size, t % page_size].
+    at = dst if page_size == 1 else (dst // page_size, dst % page_size)
 
-    rows[dst, :nope_dim] = nope[is_valid]
+    nope_rows = nope[is_valid]
+    if page_size == 1:
+        rows[dst, :nope_dim] = nope_rows
+    else:
+        rows[at[0], at[1], :nope_dim] = nope_rows
     if has_rope:
-        rope = cache_k_rope.reshape(cache_k_rope.shape[0], -1)
-        rows[dst, nope_dim : nope_dim + rope.shape[-1]] = rope[is_valid]
+        rope = cache_k_rope.reshape(cache_k_rope.shape[0], -1)[is_valid]
+        span = slice(nope_dim, nope_dim + rope.shape[-1])
+        if page_size == 1:
+            rows[dst, span] = rope
+        else:
+            rows[at[0], at[1], span] = rope
 
 
 def _set_mla_kv_buffer_impl(
@@ -217,6 +247,15 @@ def _set_mla_kv_buffer_impl(
     has_rope = cache_k_rope is not None and cache_k_rope.numel() > 0
     n_loc = loc.numel()
     nope_dim = cache_k_nope.shape[-1]
+    # A paged buffer addresses token t's row through its page and row strides;
+    # a flat run of rows keeps its row stride and its kernels as they were.
+    paged = paged_layout(kv_buffer)
+    if paged is None:
+        page_size, page_stride, row_stride = 1, 0, kv_buffer.stride(0)
+    else:
+        assert dcp_world_size == 1, "a paged buffer holds rank-local rows"
+        page_size, page_stride, row_stride = paged
+    page_kwargs = {"PAGE_SIZE": page_size, "PAGE_STRIDE": page_stride}
 
     if not has_rope:
         BLOCK = triton.next_power_of_2(nope_dim)
@@ -228,10 +267,11 @@ def _set_mla_kv_buffer_impl(
             kv_buffer,
             cache_k_nope,
             loc,
-            kv_buffer.stride(0),
+            row_stride,
             cache_k_nope.stride(0),
             nope_dim,
             BLOCK=BLOCK,
+            **page_kwargs,
             **pdl_kwargs,
         )
         return
@@ -275,7 +315,7 @@ def _set_mla_kv_buffer_impl(
         cache_k_rope,
         loc,
         reserved_skip_index,
-        kv_buffer.stride(0),
+        row_stride,
         cache_k_nope.stride(0),
         cache_k_rope.stride(0),
         nope_dim,
@@ -283,6 +323,7 @@ def _set_mla_kv_buffer_impl(
         BLOCK=BLOCK,
         DCP_RANK=dcp_rank,
         DCP_WORLD_SIZE=dcp_world_size,
+        **page_kwargs,
         **pdl_kwargs,
     )
 

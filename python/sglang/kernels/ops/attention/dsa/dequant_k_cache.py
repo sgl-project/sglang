@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.kvcache.paged_rows import paged_layout, paged_row_offset
+
 
 def _infer_dsa_dims(dim_quant: int, tile_size: int = 128) -> tuple[int, int]:
     """Recover the NoPE and RoPE widths from a packed DSA cache row."""
@@ -15,6 +17,25 @@ def _infer_dsa_dims(dim_quant: int, tile_size: int = 128) -> tuple[int, int]:
         if dim_nope > 0 and dim_nope % tile_size == 0:
             return dim_nope, dim_rope
     raise ValueError(f"Unsupported packed DSA KV row width: {dim_quant}")
+
+
+def _split_packed_rows(quant_k_cache: torch.Tensor, dim_nope: int, num_tiles: int):
+    """The NoPE bytes, per-group FP32 scales and BF16 RoPE of each packed row,
+    and how to address token ``t``'s row in each: ``(PAGE_SIZE, [(page_stride,
+    row_stride)] * 3)``. A flat run of rows is viewed as ``(-1, dim_quant)``
+    and addressed by its row stride, as it always was; a paged buffer
+    (`paged_layout`) keeps its pages."""
+    dim_quant = quant_k_cache.shape[-1]
+    paged = paged_layout(quant_k_cache)
+    rows = quant_k_cache if paged is not None else quant_k_cache.view((-1, dim_quant))
+    parts = (
+        rows[..., :dim_nope],
+        rows[..., dim_nope : dim_nope + num_tiles * 4].view(torch.float32),
+        rows[..., dim_nope + num_tiles * 4 :].view(torch.bfloat16),
+    )
+    if paged is None:
+        return parts, 1, [(0, part.stride(0)) for part in parts]
+    return parts, paged[0], [(part.stride(0), part.stride(1)) for part in parts]
 
 
 def dequantize_k_cache(quant_k_cache, dv: int | None = None):
@@ -149,14 +170,13 @@ def dequantize_k_cache_paged_dsa(
     """
     De-quantize the k-cache with paged layout
     Args:
-        quant_k_cache: [total_num_tokens, 1, dim_quant] or [num_blocks, block_size, 1, dim_quant], the quantized k-cache in paged layout
+        quant_k_cache: [total_num_tokens, 1, dim_quant] or [num_blocks, block_size, 1, dim_quant], the quantized k-cache in paged layout; the blocks may lie further apart than block_size rows (`paged_layout`)
         page_table_1_flattened: [num_tokens], the flattened page_table_1 with the page indices in each requests concatenated together
     Returns:
         output: [num_tokens, 1, dim_nope + dim_rope], the de-quantized k-cache
     """
     dim_quant = quant_k_cache.shape[-1]
     dim_nope, dim_rope = _infer_dsa_dims(dim_quant)
-    quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     # num_tokens can exceed kv_cache_size due to prefix sharing (multiple seqs share same KV slots)
     # Index bounds validated in dsa_backend.init_forward_metadata
@@ -174,13 +194,11 @@ def dequantize_k_cache_paged_dsa(
 
     assert dim_nope % group_size == 0
 
-    input_nope_q = quant_k_cache[:, :dim_nope]
-    # [:, 512:512+4*4] = [:, 512:528]
-    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
-        torch.float32
+    # NoPE [:, :512], scales [:, 512:528], RoPE [:, 528:].
+    (input_nope_q, input_nope_s, input_rope), page_size, strides = _split_packed_rows(
+        quant_k_cache, dim_nope, num_tiles
     )
-    # [:, 528:]
-    input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
+    (q_page, q_row), (s_page, s_row), (r_page, r_row) = strides
 
     _dequantize_k_cache_paged_kernel[(num_tokens, num_blocks_per_token)](
         output,
@@ -189,13 +207,17 @@ def dequantize_k_cache_paged_dsa(
         input_rope,
         page_table_1_flattened,
         output.stride(0),
-        input_nope_q.stride(0),
-        input_nope_s.stride(0),
-        input_rope.stride(0),
+        q_row,
+        s_row,
+        r_row,
+        q_page,
+        s_page,
+        r_page,
         NUM_NOPE_BLOCKS=num_tiles,
         GROUP_SIZE=group_size,
         DIM_NOPE=dim_nope,
         DIM_ROPE=dim_rope,
+        PAGE_SIZE=page_size,
     )
 
     return output
@@ -212,10 +234,14 @@ def _dequantize_k_cache_paged_kernel(
     input_nope_q_stride_0: int,
     input_nope_s_stride_0: int,
     input_rope_stride_0: int,
+    input_nope_q_page_stride: int,
+    input_nope_s_page_stride: int,
+    input_rope_page_stride: int,
     NUM_NOPE_BLOCKS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     DIM_NOPE: tl.constexpr,
     DIM_ROPE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
 ):
     token_id = tl.program_id(0).to(tl.int64)
     token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int64)
@@ -227,10 +253,24 @@ def _dequantize_k_cache_paged_kernel(
 
         offs_q = effective_block_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
         mask = offs_q < DIM_NOPE
-        ptr_q = input_nope_q_ptr + token_id_paged * input_nope_q_stride_0 + offs_q
+        ptr_q = (
+            input_nope_q_ptr
+            + paged_row_offset(
+                token_id_paged,
+                input_nope_q_page_stride,
+                input_nope_q_stride_0,
+                PAGE_SIZE,
+            )
+            + offs_q
+        )
         ptr_s = (
             input_nope_s_ptr
-            + token_id_paged * input_nope_s_stride_0
+            + paged_row_offset(
+                token_id_paged,
+                input_nope_s_page_stride,
+                input_nope_s_stride_0,
+                PAGE_SIZE,
+            )
             + effective_block_id
         )
 
@@ -248,7 +288,13 @@ def _dequantize_k_cache_paged_kernel(
         offs = effective_block_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
         mask = offs < DIM_ROPE
 
-        src_ptr = input_rope_ptr + token_id_paged * input_rope_stride_0 + offs
+        src_ptr = (
+            input_rope_ptr
+            + paged_row_offset(
+                token_id_paged, input_rope_page_stride, input_rope_stride_0, PAGE_SIZE
+            )
+            + offs
+        )
         dst_ptr = output_ptr + token_id * output_stride_0 + DIM_NOPE + offs
 
         data = tl.load(src_ptr, mask=mask).to(tl.bfloat16)
@@ -303,7 +349,6 @@ def gather_dequant_requant_fp8_paged_dsa(
     """
     dim_quant = quant_k_cache.shape[-1]
     dim_nope, dim_rope = _infer_dsa_dims(dim_quant)
-    quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
@@ -333,11 +378,10 @@ def gather_dequant_requant_fp8_paged_dsa(
     if total_rows == 0:
         return output
 
-    input_nope_q = quant_k_cache[:, :dim_nope]
-    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
-        torch.float32
+    (input_nope_q, input_nope_s, input_rope), page_size, strides = _split_packed_rows(
+        quant_k_cache, dim_nope, num_tiles
     )
-    input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
+    (q_page, q_row), (s_page, s_row), (r_page, r_row) = strides
 
     grid = (triton.cdiv(total_rows, _GATHER_TOKENS_PER_PROG),)
     _gather_dequant_requant_fp8_paged_vec_kernel[grid](
@@ -349,14 +393,18 @@ def gather_dequant_requant_fp8_paged_dsa(
         num_tokens,
         total_rows,
         output.stride(0),
-        input_nope_q.stride(0),
-        input_nope_s.stride(0),
-        input_rope.stride(0),
+        q_row,
+        s_row,
+        r_row,
+        q_page,
+        s_page,
+        r_page,
         NUM_NOPE_BLOCKS=num_tiles,
         GROUP_SIZE=group_size,
         DIM_NOPE=dim_nope,
         DIM_ROPE=dim_rope,
         TOKENS_PER_PROG=_GATHER_TOKENS_PER_PROG,
+        PAGE_SIZE=page_size,
         num_warps=4,
     )
 
@@ -376,11 +424,15 @@ def _gather_dequant_requant_fp8_paged_vec_kernel(
     input_nope_q_stride_0: int,
     input_nope_s_stride_0: int,
     input_rope_stride_0: int,
+    input_nope_q_page_stride: int,
+    input_nope_s_page_stride: int,
+    input_rope_page_stride: int,
     NUM_NOPE_BLOCKS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     DIM_NOPE: tl.constexpr,
     DIM_ROPE: tl.constexpr,
     TOKENS_PER_PROG: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
 ):
     """Vectorized fused gather + dequant(per-group) + requant(per-tensor).
 
@@ -408,14 +460,20 @@ def _gather_dequant_requant_fp8_paged_vec_kernel(
 
     # a. nope: [T, G, I] fp8 block; the (G, I) plane spans the contiguous
     #    DIM_NOPE bytes of one cache row.
+    row_q = paged_row_offset(
+        paged, input_nope_q_page_stride, input_nope_q_stride_0, PAGE_SIZE
+    )
     ptr_q = (
         input_nope_q_ptr
-        + paged[:, None, None] * input_nope_q_stride_0
+        + row_q[:, None, None]
         + offs_g[None, :, None] * GROUP_SIZE
         + offs_i[None, None, :]
     )
     y_q = tl.load(ptr_q, mask=is_real[:, None, None], other=0.0).to(tl.float32)
-    ptr_s = input_nope_s_ptr + paged[:, None] * input_nope_s_stride_0 + offs_g[None, :]
+    row_s = paged_row_offset(
+        paged, input_nope_s_page_stride, input_nope_s_stride_0, PAGE_SIZE
+    )
+    ptr_s = input_nope_s_ptr + row_s[:, None] + offs_g[None, :]
     y_s = tl.load(ptr_s, mask=is_real[:, None], other=0.0)
     # dequant -> f32 -> requant to fp8; pad rows: (0 * 0) -> +0 -> byte 0x00
     y = (y_q * y_s[:, :, None]).to(tl.float8e4nv)
@@ -430,7 +488,10 @@ def _gather_dequant_requant_fp8_paged_vec_kernel(
     # b. rope: [T, R] bf16 -> fp8; pad rows: 0.0 -> byte 0x00
     if DIM_ROPE > 0:
         offs_r = tl.arange(0, DIM_ROPE)
-        src_r = input_rope_ptr + paged[:, None] * input_rope_stride_0 + offs_r[None, :]
+        row_r = paged_row_offset(
+            paged, input_rope_page_stride, input_rope_stride_0, PAGE_SIZE
+        )
+        src_r = input_rope_ptr + row_r[:, None] + offs_r[None, :]
         data = tl.load(src_r, mask=is_real[:, None], other=0.0).to(tl.float8e4nv)
         dst_r = (
             output_ptr
@@ -562,6 +623,9 @@ def gather_cast_kv_fp8_pad_paged(
     # so only stride(0) is passed; a non-unit last-dim stride would silently read
     # the wrong elements. concat_cast_kv_fp8_pad asserts the same invariant.
     assert kv_cache.stride(-1) == 1
+    assert paged_layout(kv_cache) is None, (
+        "gather_cast_kv_fp8_pad_paged reads a flat run of bf16 rows"
+    )
     if head_dim == nope_dim and head_dim & (head_dim - 1) == 0:
         # NoPE: source and destination rows are both one contiguous HEAD_DIM run,
         # so gather, cast and pad-zeroing fit in one kernel.  The shared get
