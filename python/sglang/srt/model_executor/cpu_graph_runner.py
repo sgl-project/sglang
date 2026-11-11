@@ -1550,6 +1550,16 @@ class CPUGraphRunner:
         forward_batch: ForwardBatch,
         include_extend_metadata: bool,
     ) -> None:
+        dynamic_forward_batch.return_logprob = forward_batch.return_logprob
+        dynamic_forward_batch.is_prefill_only = forward_batch.is_prefill_only
+        dynamic_forward_batch.return_pooled_hidden_states = (
+            forward_batch.return_pooled_hidden_states
+        )
+        dynamic_forward_batch.sampling_info = forward_batch.sampling_info
+        dynamic_forward_batch.spec_algorithm = forward_batch.spec_algorithm
+        dynamic_forward_batch.spec_info = forward_batch.spec_info
+        dynamic_forward_batch.rids = copy.copy(forward_batch.rids)
+        dynamic_forward_batch.lora_ids = copy.copy(forward_batch.lora_ids)
         dynamic_forward_batch.encoder_lens_cpu = copy.copy(
             forward_batch.encoder_lens_cpu
         )
@@ -1583,6 +1593,25 @@ class CPUGraphRunner:
             dynamic_forward_batch.mamba_track_seqlens_cpu = copy.copy(
                 forward_batch.mamba_track_seqlens_cpu
             )
+            dynamic_forward_batch.decision_layouts = copy.copy(
+                forward_batch.decision_layouts
+            )
+            dynamic_forward_batch.extend_is_final_cpu = copy.copy(
+                forward_batch.extend_is_final_cpu
+            )
+
+    @staticmethod
+    def _clear_dynamic_batch_template_references(
+        dynamic_forward_batch: ForwardBatch,
+    ) -> None:
+        dynamic_forward_batch.sampling_info = None
+        dynamic_forward_batch.spec_info = None
+        dynamic_forward_batch.rids = None
+        dynamic_forward_batch.lora_ids = None
+        dynamic_forward_batch.token_indices_to_pool = None
+        dynamic_forward_batch.multi_item_delimiter_indices = None
+        dynamic_forward_batch.token_ids_logprobs = None
+        dynamic_forward_batch.mm_inputs = None
 
     def _compile_decode_dynamic_graph(self, skip_cross_attention: bool) -> Callable:
         with patch_model(
@@ -1829,11 +1858,16 @@ class CPUGraphRunner:
                             ForwardContext(attn_backend=self.model_runner.attn_backend),
                             forward_batch=dynamic_forward_batch,
                         ):
-                            return dynamic_graph(
-                                dynamic_forward_batch.input_ids,
-                                dynamic_forward_batch.positions,
-                                dynamic_forward_batch,
-                            )
+                            try:
+                                return dynamic_graph(
+                                    dynamic_forward_batch.input_ids,
+                                    dynamic_forward_batch.positions,
+                                    dynamic_forward_batch,
+                                )
+                            finally:
+                                self._clear_dynamic_batch_template_references(
+                                    dynamic_forward_batch
+                                )
                     prepared_forward_batch = self.prepare_replay(
                         forward_batch, skip=skip
                     )
@@ -2070,6 +2104,10 @@ class CPUGraphRunner:
                 forward_batch.global_num_token_non_padded_cpu = (
                     original_num_token_non_padded_cpu
                 )
+                if forward_batch is getattr(
+                    self, "prefill_dynamic_batch_template", None
+                ):
+                    self._clear_dynamic_batch_template_references(forward_batch)
 
     def _warmup_prefill_callable(
         self,
@@ -2176,7 +2214,13 @@ class CPUGraphRunner:
         dynamic_forward_batch.return_hidden_states_before_norm = (
             forward_batch.return_hidden_states_before_norm
         )
-        dynamic_forward_batch.mm_inputs = None
+        if (
+            forward_batch.mm_inputs is not None
+            and not forward_batch.contains_mm_inputs()
+        ):
+            dynamic_forward_batch.mm_inputs = None
+        else:
+            dynamic_forward_batch.mm_inputs = forward_batch.mm_inputs
         self._refresh_dynamic_forward_batch_metadata(
             dynamic_forward_batch,
             forward_batch,
@@ -2410,6 +2454,10 @@ class CPUGraphRunner:
                 if forward_batch.out_cache_loc is not None:
                     padded_fb.out_cache_loc = F.pad(
                         forward_batch.out_cache_loc, (0, pad_len), value=0
+                    )
+                if forward_batch.token_type_ids is not None:
+                    padded_fb.token_type_ids = F.pad(
+                        forward_batch.token_type_ids, (0, pad_len), value=0
                     )
                 forward_batch = padded_fb
             else:
