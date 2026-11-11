@@ -11,6 +11,7 @@ package sglang.api.v1;
 import "sglang/api/v1/control.proto";
 import "sglang/api/v1/generate.proto";
 import "sglang/api/v1/hicache.proto";
+import "sglang/api/v1/parsers.proto";
 import "sglang/api/v1/weights.proto";
 import "sglang/json/v1/options.proto";
 
@@ -101,6 +102,10 @@ service SglangService {
   // `/remote_instance_transfer_engine_info`: proxied from the engine-info
   // bootstrap server.
   rpc GetRemoteInstanceTransferEngineInfo(RemoteInstanceTransferEngineInfoRequest) returns (RemoteInstanceTransferEngineInfoResponse);
+
+  // `/parse_function_call`, `/separate_reasoning`: frontend-only parsing.
+  rpc ParseFunctionCall(ParseFunctionCallRequest) returns (ParseFunctionCallResponse);
+  rpc SeparateReasoning(SeparateReasoningRequest) returns (SeparateReasoningResponse);
 
   // `/freeze_gc`, `/pause_generation`, `/continue_generation`,
   // `/pd_role_switch`, `/update_weight_version`.

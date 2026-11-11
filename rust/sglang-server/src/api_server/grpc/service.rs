@@ -13,8 +13,8 @@ use tonic::{Request, Response, Status};
 use super::{info, native_api};
 use crate::api_server::core::{HealthStatus, ReceivedAs};
 use crate::api_server::handlers::{
-    AbortEnding, CoreHandle, HiCacheError, HiCacheManager, LORA_DISABLED, WeightGroupOutcome,
-    WeightUpdateOutcome,
+    AbortEnding, CoreHandle, HiCacheError, HiCacheManager, LORA_DISABLED, ToolSpec,
+    WeightGroupOutcome, WeightUpdateOutcome, parse_function_call, separate_reasoning,
 };
 use crate::api_server::http::weights::{decode_payloads, json_object};
 use crate::message::config::{
@@ -445,6 +445,63 @@ impl SglangService for GrpcService {
                 )
                 .await,
         )
+    }
+
+    async fn parse_function_call(
+        &self,
+        request: Request<api::ParseFunctionCallRequest>,
+    ) -> Result<Response<api::ParseFunctionCallResponse>, Status> {
+        let request = request.into_inner();
+        let tools: Vec<ToolSpec> = request
+            .tools
+            .into_iter()
+            .map(|tool| {
+                let function = tool.function.unwrap_or_default();
+                ToolSpec {
+                    name: function.name,
+                    parameters: function.parameters,
+                }
+            })
+            .collect();
+        let (normal_text, calls) =
+            parse_function_call(&request.text, &tools, request.tool_call_parser.as_deref())
+                .await
+                .map_err(native_api::status)?;
+        Ok(Response::new(api::ParseFunctionCallResponse {
+            normal_text,
+            calls: calls
+                .into_iter()
+                .map(|call| api::ParsedToolCall {
+                    tool_index: call.tool_index,
+                    name: call.name,
+                    parameters: call.parameters,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn separate_reasoning(
+        &self,
+        request: Request<api::SeparateReasoningRequest>,
+    ) -> Result<Response<api::SeparateReasoningResponse>, Status> {
+        let request = request.into_inner();
+        let (reasoning_text, text) = separate_reasoning(&request.text, &request.reasoning_parser)
+            .map_err(native_api::status)?;
+        let blocks = request.return_blocks;
+        Ok(Response::new(api::SeparateReasoningResponse {
+            reasoning_blocks: blocks.then(|| api::StringList {
+                items: if reasoning_text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![reasoning_text.clone()]
+                },
+            }),
+            text_blocks: blocks.then(|| api::StringList {
+                items: vec![text.clone()],
+            }),
+            reasoning_text,
+            text,
+        }))
     }
 
     async fn freeze_gc(

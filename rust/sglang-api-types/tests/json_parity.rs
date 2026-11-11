@@ -88,6 +88,12 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "SendWeightsToRemoteInstanceRequest" => {
                 check::<api::SendWeightsToRemoteInstanceRequest>(&name, input, canonical)
             }
+            "ParseFunctionCallRequest" => {
+                check::<api::ParseFunctionCallRequest>(&name, input, canonical)
+            }
+            "ParseFunctionCallResponse" => {
+                check::<api::ParseFunctionCallResponse>(&name, input, canonical)
+            }
             "PauseGenerationRequest" => {
                 check::<api::PauseGenerationRequest>(&name, input, canonical)
             }
