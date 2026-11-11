@@ -2123,15 +2123,19 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 _, cache, service, _ = owner
                 ancestor = cache_fixtures.target()
                 resume = cache_fixtures.target((1, 2, 3, 4, 5, 6))
-                self._cold_scopes(owner, [resume if tail_stored else ancestor])
+                sibling = cache_fixtures.target((1, 2, 3, 4, 7, 8))
+                self._cold_scopes(
+                    owner, [resume, sibling] if tail_stored else [ancestor]
+                )
                 cc = cache.cache_controller
                 entered, release = threading.Event(), threading.Event()
                 batches = []
                 get = cc.page_get_func
                 demand = CacheRequestHandle("tool-resume", 0)
+                sibling_demand = CacheRequestHandle("sibling-resume", 0)
 
                 def blocked_get(operation, hashes, *args, **kwargs):
-                    batches.append((operation.storage_start, len(hashes)))
+                    batches.append((operation.storage_start, tuple(hashes)))
                     if not entered.is_set():
                         entered.set()
                         assert release.wait(5)
@@ -2150,6 +2154,13 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         self.assertFalse(cache.check_prefetch_progress(demand))
                         reads = service.control.executor.storage_reads
                         prefix_read = reads.demands[demand].job
+                        if tail_stored:
+                            self._ordinary_prefetch(
+                                cache, service, sibling, sibling_demand
+                            )
+                            self.assertIs(
+                                reads.demands[sibling_demand].job, prefix_read
+                            )
                         release.set()
                         self.assertEqual(wait(service, hint).status, Status.COMPLETED)
                         if tail_stored:
@@ -2158,18 +2169,32 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                             late = self._restore(service, resume, "late-during-tail")
                             self.assertIs(reads.demands[demand].job, prefix_read)
                             self.assertEqual(late.status, Status.DEFERRED)
+                            self.assertFalse(
+                                cache.check_prefetch_progress(sibling_demand)
+                            )
                         self.assertEqual(
                             self._consume_ordinary_prefetch(cache, service, demand),
                             (6 if tail_stored else 4, 0),
                         )
+                        if tail_stored:
+                            self.assertEqual(
+                                self._consume_ordinary_prefetch(
+                                    cache, service, sibling_demand
+                                ),
+                                (6, 0),
+                            )
                         self.assertEqual(
-                            batches, [(0, 4), (4, 2)] if tail_stored else [(0, 4)]
+                            [(start, len(keys)) for start, keys in batches],
+                            [(0, 4), (4, 2), (4, 2)] if tail_stored else [(0, 4)],
                         )
+                        if tail_stored:
+                            self.assertNotEqual(batches[1][1], batches[2][1])
                         self.assertFalse(prefix_read.demands)
                         self.assertFalse(prefix_read.host_locks)
                 finally:
                     release.set()
                     cache.release_aborted_request(demand)
+                    cache.release_aborted_request(sibling_demand)
                 assert_retired(cache, service)
                 cache.sanity_check()
 
