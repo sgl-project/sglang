@@ -404,6 +404,9 @@ class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
         self.init_pp_loop_state()
+        self.output_streamer.defer_decode_collection = (
+            get_parallel().pp_async_batch_depth == 0
+        )
 
         # PD additional state initialization
         rmbs = [None] * self.pp_loop_size
@@ -497,6 +500,11 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+
+                # Drain even with no forward (idle, paused or prebuilt), before
+                # output exchange can block. The builder owns the previous
+                # iteration's token deltas, not live request objects.
+                self.output_streamer.send_to_detokenizer.flush_output()
 
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (

@@ -13,6 +13,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Sequence,
 )
 
 import torch
@@ -36,6 +37,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.req_types import BaseFinishReason
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.exit_ledger import record_send
+from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.runtime_context import (
     get_observability,
@@ -103,6 +105,8 @@ class SchedulerOutputStreamer:
     rust_server: Optional[RustServer] = None
     # Set when the scheduler first defers a response; see deferred_output.
     defer_outputs: bool = False
+    # The PP decode loop drains this sender after the next forward submission.
+    defer_decode_collection: bool = field(default=False, init=False)
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
     _test_stream_output_count: int = 0
     output_sink: OutputSink = field(init=False)
@@ -302,6 +306,8 @@ class SchedulerOutputStreamer:
                 self.get_request_stats if self.rust_server is not None else None
             ),
         )
+        if self._try_defer_decode_collection(reqs, acc, skip_req, is_idle_batch):
+            return
         for req in reqs:
             if req is skip_req:
                 continue
@@ -350,6 +356,79 @@ class SchedulerOutputStreamer:
                 )
             else:
                 self.send_to_detokenizer.send_output(payload)
+
+    def _try_defer_decode_collection(
+        self,
+        reqs: List[Req],
+        acc: _GenerationStreamAccumulator,
+        skip_req: Optional[Req],
+        is_idle_batch: bool,
+    ) -> bool:
+        if not (
+            self.defer_decode_collection
+            and isinstance(self.send_to_detokenizer, SenderWrapper)
+            and self.output_sink is OutputSink.DETOKENIZER
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.spec_algorithm.is_none()
+            and not self.has_additional_customized_info
+            and self.uocr_runtime is None
+            and skip_req is None
+            and not is_idle_batch
+            and not acc.return_logprob
+            and not acc.return_hidden_states
+            and not acc.return_routed_experts
+            and not acc.return_indexer_topk
+            and not acc.return_sampling_mask
+        ):
+            return False
+
+        # Check the whole batch before advancing any cursor. First outputs,
+        # finishes, retractions and auxiliary outputs keep the full path.
+        for req in reqs:
+            if (
+                req.finished()
+                or req.to_finish is not None
+                or req.finished_output
+                or req.finished_len is not None
+                or req.is_retracted
+                or req.grammar is not None
+                or req.beam_group is not None
+                or req.customized_info is not None
+                or not req.detokenize_header_sent
+                or req.request_stats_retraction_count != req.retraction_count
+            ):
+                return False
+
+        rows = []
+        for req in reqs:
+            if not acc.should_output(req):
+                continue
+            count = len(req.output_ids)
+            rows.append(
+                (
+                    req.rid,
+                    req.output_ids[req.send_token_offset :],
+                    count,
+                    min(req.reasoning_tokens, count),
+                )
+            )
+            req.send_token_offset = count
+
+        if rows:
+            dp_rank = get_parallel().dp_rank
+
+            def build_output() -> BatchTokenIDOutput:
+                # Only owned token slices and scalars survive until flush. In
+                # particular, no mutable Req or clock-calibration state is read
+                # after the next batch has been prepared.
+                for rid, tokens, completion_tokens, reasoning_tokens in rows:
+                    acc.append_token_delta(rid, tokens, reasoning_tokens)
+                    acc.completion_tokens.append(completion_tokens)
+                    acc.finished_reasons.append(None)
+                return acc.to_payload(dp_rank=dp_rank, is_idle_batch=False)
+
+            self.send_to_detokenizer.defer_output(build_output)
+        return True
 
     def build_additional_customized_info(self, reqs: List[Req]) -> dict[str, list]:
         """Return fields aligned with the emitted requests in ``reqs``.
@@ -573,6 +652,29 @@ class _GenerationStreamAccumulator:
         # Only the leader is ever streamed, and only at group finish.
         return req.is_beam_leader and req.finished()
 
+    def should_output(self, req: Req) -> bool:
+        if not req.stream:
+            return len(req.output_ids) % self.default_force_stream_interval == 0
+        stream_interval = (
+            req.sampling_params.stream_interval or self.default_stream_interval
+        )
+        # A speculative block can pass an interval without landing on it. Send
+        # the first token immediately, then count unsent tokens.
+        num_unsent = len(req.output_ids) - req.send_token_offset
+        return (
+            stream_interval == 1
+            or num_unsent >= stream_interval
+            or (req.send_token_offset == 0 and num_unsent > 0)
+        ) and not req.check_match_stop_str_prefix()
+
+    def append_token_delta(
+        self, rid: str, tokens: Sequence[int], reasoning_tokens: int
+    ) -> None:
+        self.rids.append(rid)
+        self.output_ids_flat.extend(tokens)
+        self.output_ids_offsets.append(len(self.output_ids_flat))
+        self.reasoning_tokens.append(reasoning_tokens)
+
     def accept(self, *, req: Req) -> None:
         if req.beam_group is not None and not self._beam_admits(req=req):
             return
@@ -584,49 +686,27 @@ class _GenerationStreamAccumulator:
                 req.finished_len = len(req.output_ids)
             should_output = True
         else:
-            if req.stream:
-                stream_interval = (
-                    req.sampling_params.stream_interval or self.default_stream_interval
-                )
-
-                # Send every step at the default interval of 1. Otherwise send
-                # the first token at once, then whenever at least
-                # stream_interval tokens are unsent: a step can append several
-                # tokens (speculative decoding, dLLM), so it can pass a multiple
-                # of the interval without landing on it.
-                num_unsent = len(req.output_ids) - req.send_token_offset
-                should_output = (
-                    stream_interval == 1
-                    or num_unsent >= stream_interval
-                    or (req.send_token_offset == 0 and num_unsent > 0)
-                )
-
-                if should_output:
-                    # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
-                    should_output &= not req.check_match_stop_str_prefix()
-            else:
-                should_output = (
-                    len(req.output_ids) % self.default_force_stream_interval == 0
-                )
+            should_output = self.should_output(req)
 
         if not should_output:
             return
 
         send_token_offset = req.send_token_offset
         send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
-        self.rids.append(req.rid)
         self.output_reqs.append(req)
         self.finished_reasons.append(
             req.finished_reason.to_json() if req.finished_reason else None
         )
         # Exclude the tokens after stop condition
         output_ids_ = req.output_ids_through_stop
-        self.output_ids_flat.extend(output_ids_[send_token_offset:])
-        self.output_ids_offsets.append(len(self.output_ids_flat))
         req.send_token_offset = len(output_ids_)
         # A verified token block can extend past the stop position. Report
         # reasoning usage only within the same prefix as completion usage.
-        self.reasoning_tokens.append(min(req.reasoning_tokens, len(output_ids_)))
+        self.append_token_delta(
+            req.rid,
+            output_ids_[send_token_offset:],
+            min(req.reasoning_tokens, len(output_ids_)),
+        )
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (

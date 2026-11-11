@@ -20,6 +20,10 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
+from sglang.srt.managers.scheduler_components.output_streamer import (
+    SchedulerOutputStreamer,
+)
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -218,6 +222,90 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                             scheduler.on_idle.call_count,
                             0 if pending_transfer else 1 + (pattern == "idle_cycle"),
                         )
+
+    def test_pp_decode_drains_snapshot_after_launch_or_without_a_next_batch(self):
+        for next_step in ("decode", "idle", "pause", "prebuilt"):
+            with self.subTest(next_step=next_step):
+                batches = self.make_batches(ForwardMode.DECODE)[:3]
+                if next_step == "prebuilt":
+                    batches[2].forward_mode = ForwardMode.PREBUILT
+                schedule = batches[:2] + [
+                    batches[2] if next_step in ("decode", "prebuilt") else None,
+                    None,
+                ]
+                scheduler = self.make_scheduler(schedule)
+                self.prepare_pp_scheduler(scheduler)
+                log = []
+                params = SamplingParams()
+                params.normalize(None)
+                req = Req("streaming", "", [1], params, stream=True)
+                # The first output already delivered the header and stats.
+                req.detokenize_header_sent = True
+                req.request_stats_retraction_count = req.retraction_count
+                req.output_ids.append(10)
+                req.send_token_offset = 1
+                scheduler.output_streamer = SchedulerOutputStreamer(
+                    send_to_detokenizer=SenderWrapper(Mock()),
+                    tree_cache=None,
+                    server_args=SimpleNamespace(enable_lmcache=False),
+                    is_generation=True,
+                    spec_algorithm=SpeculativeAlgorithm.NONE,
+                    disaggregation_mode=DisaggregationMode.DECODE,
+                    skip_tokenizer_init=False,
+                    enable_hicache_storage=lambda: False,
+                )
+
+                def run_batch(batch, pp_proxy_tensors):
+                    log.append(("launch", batch.launch_ts))
+                    return GenerationBatchResult()
+
+                def process_batch_result(batch, result):
+                    if batch is batches[0]:
+                        req.output_ids.append(11)
+                        scheduler.output_streamer.stream_output([req], False)
+                        if next_step == "pause":
+                            scheduler.pause_state.pause()
+
+                def exchange(*args):
+                    log.append(("exchange", None))
+                    return None, GenerationBatchResult(), Mock()
+
+                scheduler.run_batch = run_batch
+                scheduler.process_batch_result = process_batch_result
+                scheduler._on_step_processed = Mock()
+                scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = (
+                    exchange
+                )
+                with (
+                    get_parallel().override(pp_size=2, pp_async_batch_depth=0),
+                    patch(
+                        f"{PP_MODULE}.get_disagg",
+                        return_value=SimpleNamespace(
+                            disaggregation_decode_enable_offload_kvcache=False
+                        ),
+                    ),
+                    patch(f"{PP_MODULE}.set_time_batch"),
+                    patch(
+                        "sglang.srt.managers.scheduler_components.output_sender.sock_send",
+                        side_effect=lambda socket, output: log.append(
+                            ("output", output)
+                        ),
+                    ),
+                    self.assertRaises(StopIteration),
+                ):
+                    Scheduler.event_loop_pp_disagg_decode(scheduler)
+                sent = [i for i, entry in enumerate(log) if entry[0] == "output"]
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(list(log[sent[0]][1].output_ids_flat), [11])
+                # The pending delta leaves after the next submission, or in the
+                # empty/paused slot; it never waits behind output exchange.
+                previous = (
+                    ("launch", batches[2].launch_ts)
+                    if next_step in ("decode", "prebuilt")
+                    else ("exchange", None)
+                )
+                self.assertEqual(log[sent[0] - 1], previous)
+                self.assertEqual(log[sent[0] + 1], ("exchange", None))
 
     @parameterized.expand([("fresh", False), ("chained", True)])
     def test_mlx_idle_gap(self, name, chained):
@@ -633,6 +721,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def prepare_pp_scheduler(self, scheduler):
         enter_scope(self, get_parallel().override(pp_size=2, pp_rank=0))
+        scheduler.output_streamer = SimpleNamespace(
+            defer_decode_collection=False, send_to_detokenizer=SenderWrapper(None)
+        )
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
         scheduler.token_to_kv_pool_allocator = None
         scheduler.forward_stream_ctx = nullcontext()
