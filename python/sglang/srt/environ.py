@@ -1090,6 +1090,11 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # Pages must be at least this many bytes for the staged write-back to issue one
+    # cudaMemcpyBatchAsync instead of per-page cudaMemcpyAsync. None keeps the kernel's
+    # 128 KiB default; the JIT kernel reads it from the environment once, at first use
+    # (sgl-project/sglang#40910).
+    SGLANG_HICACHE_BATCH_COPY_THRESHOLD = EnvInt(None)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
