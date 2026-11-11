@@ -35,26 +35,41 @@ def auth_level(level: AuthLevel):
     return decorator
 
 
+def _iter_leaf_routes(routes, prefix: str = ""):
+    """Yield `(prefix, route)`, descending into the routers FastAPI keeps nested on include."""
+    for route in routes:
+        included = getattr(route, "original_router", None)
+        if included is None:
+            yield prefix, route
+            continue
+        context = getattr(route, "include_context", None)
+        yield from _iter_leaf_routes(
+            included.routes, prefix + (getattr(context, "prefix", "") or "")
+        )
+
+
+def _route_auth_level(route) -> AuthLevel:
+    level = getattr(getattr(route, "endpoint", None), "_auth_level", None)
+    return level if isinstance(level, AuthLevel) else AuthLevel.NORMAL
+
+
 def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
     """Best-effort resolve auth level by matching the request to a route."""
     # Import lazily to keep this module unit-test friendly (FastAPI/Starlette are not
     # required unless you actually use the middleware / route matching).
     from starlette.routing import Match
 
-    # Prefer app.router.routes when available; fall back to app.routes.
-    routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
-        app, "routes", []
-    )
-
-    for route in routes:
+    for prefix, route in _iter_leaf_routes(app.router.routes):
+        if not scope["path"].startswith(prefix):
+            continue
         try:
-            match, child_scope = route.matches(scope)
+            match, _ = route.matches(
+                {**scope, "path": scope["path"][len(prefix) :]} if prefix else scope
+            )
         except Exception:
             continue
         if match == Match.FULL:
-            endpoint = child_scope.get("endpoint") or getattr(route, "endpoint", None)
-            level = getattr(endpoint, "_auth_level", None)
-            return level if isinstance(level, AuthLevel) else AuthLevel.NORMAL
+            return _route_auth_level(route)
 
     return AuthLevel.NORMAL
 
@@ -62,14 +77,14 @@ def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
 def _build_static_auth_levels(app: Any) -> dict:
     order = [AuthLevel.NORMAL, AuthLevel.ADMIN_OPTIONAL, AuthLevel.ADMIN_FORCE]
     levels = {}
-    for route in app.router.routes:
+    for prefix, route in _iter_leaf_routes(app.router.routes):
         path = getattr(route, "path", None)
         if path is None or getattr(route, "param_convertors", None):
             continue
-        level = getattr(getattr(route, "endpoint", None), "_auth_level", None)
-        if not isinstance(level, AuthLevel):
-            level = AuthLevel.NORMAL
-        levels[path] = max(levels.get(path, level), level, key=order.index)
+        level = _route_auth_level(route)
+        levels[prefix + path] = max(
+            levels.get(prefix + path, level), level, key=order.index
+        )
     return levels
 
 
