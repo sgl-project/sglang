@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -225,6 +226,15 @@ def uses_ssm_state(model_config) -> bool:
         or glm5_next_config(model_config) is not None
         or hybrid_lightning_config(model_config) is not None
     )
+
+
+def agree_on_stage_request_capacity(*, tp_worker: BaseTpWorker) -> None:
+    """Once the pool is final, and before its request limits are read and the HiCache
+    host pools are sized: pipeline stages serve the same requests, so every stage
+    keeps the smallest share."""
+    allocator = tp_worker.model_runner.token_to_kv_pool_allocator
+    if get_parallel().pp_size > 1 and isinstance(allocator, ChainAllocator):
+        allocator.agree_on_stage_shares(get_parallel().pp_group.cpu_group)
 
 
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:

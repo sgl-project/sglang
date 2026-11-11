@@ -321,6 +321,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     KeyedReqList,
     ListKind,
     ReqList,
+    move,
 )
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
@@ -343,6 +344,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+from sglang.srt.mem_cache.capacity import shares_memory
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv.alloc.demand import window_retirement
@@ -438,6 +440,9 @@ else:
 
 logger = logging.getLogger(__name__)
 
+# Cap on rids printed per --log-schedule-decisions line.
+_MAX_LOGGED_RIDS = 16
+
 
 def _prewarm_hccl_group(device, group, device_module):
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
@@ -515,6 +520,9 @@ class Scheduler(
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
     resolve_forward_inputs = staticmethod(resolve_forward_inputs)
+    # Class-level defaults so stub schedulers built via __new__ skip the log.
+    log_schedule_decisions: bool = False
+    _last_empty_schedule_decision: Optional[Tuple[int, ...]] = None
 
     def __init__(
         self,
@@ -1239,6 +1247,7 @@ class Scheduler(
                 )
             )
             self.kv_cache_allocation_time += time.perf_counter() - tic
+        kv_cache_builder.agree_on_stage_request_capacity(tp_worker=self.tp_worker)
 
         if get_model().is_startup_weight_load_overlap:
             self.tp_worker.finalize_startup_weight_load()
@@ -1385,14 +1394,16 @@ class Scheduler(
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue = IndexedReqList(ListKind.WAITING, abort=self._abort_waiting)
+        # Read on every prefill pass, so cache it.
+        self.log_schedule_decisions = get_observability().log_schedule_decisions
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # Requests merged into a running batch, until they finish or a retract,
         # preemption or pause takes them out.
         self.running_reqs = KeyedReqList(ListKind.DECODING)
-        # Prefill requests out of the chunked slot whose launched steps their next
-        # holder has not taken yet: the running batch at the merge, the PD
-        # transfer queue, HiSparse staging, or a requeue.
+        # Prefill requests whose last chunk is in a built batch, until their next
+        # holder takes them: the running batch at the merge, the PD transfer
+        # queue, HiSparse staging, or a requeue.
         self.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
@@ -1541,9 +1552,13 @@ class Scheduler(
                 )
 
         # NOTE: preemption is enabled by default for priority scheduling.
+        # TODO(ch-wan): a unified pool admits by pricing demands, and preemption
+        # does not yet ask admission itself whether its victims make room; it
+        # stays off there until it does.
         self.enable_priority_preemption = (
             self.enable_priority_scheduling
             and not get_schedule().disable_priority_preemption
+            and not get_memory().enable_unified_memory
         )
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
@@ -2265,7 +2280,8 @@ class Scheduler(
         """
         if self.uocr_runtime is not None:
             # Document windows released while their predecessor's KV was freed.
-            for req in self.uocr_runtime.take_released():
+            released = self.uocr_runtime.released
+            for req in list(released):
                 self._add_request_to_queue(req)
         local_reqs = []
         # Avoid re-enqueuing timeout aborts while dispatch is stopped at a pause.
@@ -2744,6 +2760,11 @@ class Scheduler(
                 *(self.running_mbs if get_parallel().pp_size > 1 else ()),
             ),
             get_pp_mbs=lambda: self.mbs if get_parallel().pp_size > 1 else (),
+            get_offloading_reqs=lambda: (
+                self.decode_offload_manager.offload_inflight
+                if self.decode_offload_manager is not None
+                else ()
+            ),
             # Hisparse pool counters diverge during host backup (see the
             # _get_swa_token_info clamp), and pending deferred KV releases hold
             # pages out of the allocator by design.
@@ -2936,7 +2957,7 @@ class Scheduler(
             request_retirer=self.request_retirer,
             abort_request=self.abort_request,
             uocr_runtime=self.uocr_runtime,
-            leave_prefill_launched=self.prefill_launched_reqs.leave,
+            prefill_launched_reqs=self.prefill_launched_reqs,
             still_in_batch=self.still_in_batch,
         )
 
@@ -2947,6 +2968,18 @@ class Scheduler(
         )
 
     def init_req_max_new_tokens(self, req):
+        # PD prefill never decodes: budget the single handoff token and return
+        # before the clamps, which could only lower it to a dummy prefill-only
+        # 0. Constant output: every PP rank must derive the same
+        # sampling_params (rank consensus hashes them).
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            req.sampling_params.max_new_tokens = 1
+            # min <= max invariant; EOS stays legal as the handoff token
+            # unless the user set min_new_tokens.
+            req.sampling_params.min_new_tokens = min(
+                req.sampling_params.min_new_tokens, 1
+            )
+            return
         input_len = len(req.origin_input_ids)
         max_new_tokens = (
             req.sampling_params.max_new_tokens
@@ -3755,7 +3788,14 @@ class Scheduler(
         self._retry_storage_prefetch(req)
         return True
 
-    def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+    def _add_request_to_queue(
+        self,
+        req: Req,
+        is_retracted: bool = False,
+    ):
+        """Queue a request, moving it out of the list it is in, if any. One
+        refused at the door (an abort, the queue limit, the KV capacity) is
+        finished and leaves for no list."""
         # Every request the scheduler keeps owes its output from here; one rejected
         # at intake without being queued sends it in the call that built it.
         self.invariant_checker.expect_output(req)
@@ -3770,7 +3810,7 @@ class Scheduler(
                 return
             self._prefetch_kvcache(req)
             if self.uocr_runtime is None:
-                self.waiting_queue.join([req])
+                move([req], self.waiting_queue)
             elif not self.uocr_runtime.enqueue(
                 self.waiting_queue, req, is_retracted=is_retracted
             ):
@@ -3789,7 +3829,7 @@ class Scheduler(
                 req.time_stats.set_decode_prealloc_queue_entry_time()
             else:
                 # Restart the queue wait here;
-                # resume_retracted_reqs() re-queues the request without stamping it.
+                # move_resumed() re-queues the request without stamping it.
                 req.time_stats.set_wait_queue_entry_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
@@ -3801,7 +3841,8 @@ class Scheduler(
         self.request_retirer.retire_unadmitted(req)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
-        """Set the default priority value, or abort the request based on the priority scheduling mode."""
+        """Set the default priority value, or abort the request based on the
+        priority scheduling mode."""
         if self.enable_priority_scheduling and req.priority is None:
             if self.schedule_low_priority_values_first:
                 req.priority = sys.maxsize
@@ -3842,7 +3883,8 @@ class Scheduler(
             self.request_retirer.abort(req, finished_reason=finished_reason)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
-        """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
+        """Abort an incoming or existing request if the waiting queue is full.
+        Returns True if the incoming request is aborted."""
         if (
             self.max_queued_requests is None
             or len(self.waiting_queue) + 1 <= self.max_queued_requests
@@ -3864,7 +3906,6 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                self.waiting_queue.leave([candidate_req])
                 self._abort_unavailable(
                     candidate_req,
                     message="The request is aborted by a higher priority request.",
@@ -4057,12 +4098,6 @@ class Scheduler(
         """The request between two chunks of its prefill, or None."""
         return next(iter(self.chunked_reqs), None)
 
-    @chunked_req.setter
-    def chunked_req(self, req: Optional[Req]) -> None:
-        self.chunked_reqs.clear()
-        if req is not None:
-            self.chunked_reqs.join([req])
-
     def stash_chunked_request(self, req: Req):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.checkpoint_disagg_prefill(req)
@@ -4110,7 +4145,6 @@ class Scheduler(
             req, finished_reason=req.discard_output_reason and reason.to_json()
         )
 
-        self.chunked_req = None
         self._pending_chunked_abort_req = None
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
@@ -4185,16 +4219,16 @@ class Scheduler(
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
+        staged = []
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
+            # Read before the merge below empties last_batch.
+            staged = self.dllm_manager.staged_reqs(last_batch)
 
         # Merge the prefill batch into the running batch
-        reqs_to_exclude = set()
-
-        if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
-            reqs_to_exclude.update(self.dllm_manager.staging_queue)
-            for req in self.dllm_manager.staging_queue:
-                self.finish_dllm_forward(req)
+        reqs_to_exclude = set(staged)
+        for req in staged:
+            self.finish_dllm_forward(req)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
@@ -4208,10 +4242,9 @@ class Scheduler(
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
-            ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
+            ready_reqs = self.hisparse_coordinator.move_ready_reqs(self.running_reqs)
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
-                self.running_reqs.join(new_batch.reqs)
                 if running_batch.is_empty():
                     running_batch = new_batch
                 else:
@@ -4243,9 +4276,12 @@ class Scheduler(
             # DP attention converted to extend is last_batch itself: filtered
             # in place above, nothing to merge.
             if not last_batch.is_empty() and last_batch is not running_batch:
-                # Its launched prefills start running at the merge.
-                self.prefill_launched_reqs.leave(last_batch.reqs)
-                self.running_reqs.join(last_batch.reqs)
+                # Its prefills start running at the merge; its mixed decode rows
+                # are running already.
+                move(
+                    [req for req in last_batch.reqs if req not in self.running_reqs],
+                    self.running_reqs,
+                )
                 if running_batch.is_empty():
                     running_batch = last_batch
                 else:
@@ -4260,7 +4296,7 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
-            new_batch = self.get_new_batch_dllm(running_batch)
+            new_batch = self.get_new_batch_dllm(running_batch, staged)
         elif self._should_defer_prefill(running_batch):
             new_batch = None
         else:
@@ -4368,6 +4404,59 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _maybe_log_schedule_decision(
+        self,
+        *,
+        can_run_list: List[Req],
+        running_batch: ScheduleBatch,
+        adder: PrefillAdder,
+    ) -> None:
+        if not self.log_schedule_decisions:
+            return
+        if get_parallel().attn_tp_rank != 0 or get_parallel().attn_cp_rank != 0:
+            return
+        # KV budget this pass saw: free now plus what eviction could reclaim.
+        pool_stats = self.pool_stats_observer.get_pool_stats()
+        counters = (
+            len(self.waiting_queue),
+            len(running_batch.reqs),
+            len(adder.preempt_list),
+            pool_stats.full_available_size,
+            pool_stats.full_evictable_size,
+        )
+        if not can_run_list:
+            # A blocked queue retries every iteration; log only state changes.
+            if counters == self._last_empty_schedule_decision:
+                return
+            self._last_empty_schedule_decision = counters
+        else:
+            self._last_empty_schedule_decision = None
+
+        picked_rids = [req.rid for req in can_run_list[:_MAX_LOGGED_RIDS]]
+        num_hidden = len(can_run_list) - len(picked_rids)
+        more = f" (+{num_hidden} more)" if num_hidden > 0 else ""
+        num_left, num_running, num_preempted, kv_free, kv_evictable = counters
+        logger.info(
+            f"Schedule prefill: #picked={len(can_run_list)}, "
+            f"#left-in-queue={num_left}, "
+            f"#running={num_running}, "
+            f"#preempted={num_preempted}, "
+            f"kv-free-tokens={kv_free}, "
+            f"kv-evictable-tokens={kv_evictable}, "
+            f"picked-rids={picked_rids}{more}"
+        )
+
+    def _drop_unadmitted_match(self, req: Req) -> None:
+        """Undo what the prefix match staged for a request this pass does not admit."""
+        # init_next_round_input() may stage deferred Mamba COW/clear metadata,
+        # and take a state slot a session does not own.
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+        if req.kv.holds_mamba and req.session is None:
+            kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            ).release_state_slot(req)
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4429,7 +4518,7 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
-        self.waiting_queue.replace(
+        self.waiting_queue.reorder(
             self.policy.calc_priority(
                 self.waiting_queue,
                 running_batch,
@@ -4485,15 +4574,19 @@ class Scheduler(
             kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
         )
 
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
+        # The request between two chunks: in chunked_reqs, not in waiting_queue.
+        resumed_req = self.chunked_req
+        if resumed_req is not None:
+            resumed_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
-                self.chunked_req,
+                resumed_req,
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
             )
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            if adder.add_chunked_req(resumed_req) is None:
+                # Its last chunk is in this batch.
+                move([resumed_req], self.prefill_launched_reqs)
 
         if self.enable_lora:
             running_reqs = running_batch.reqs
@@ -4587,17 +4680,27 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
-            req.init_next_round_input(self.tree_cache)
+            # On a shared memory the match takes no state slot: admission prices
+            # it, and the slot is bound with the row. A request this pass leaves
+            # queued drops the copy its match staged.
+            defer_cow_slot = shares_memory(self.token_to_kv_pool_allocator)
+            req.init_next_round_input(self.tree_cache, defer_cow_slot=defer_cow_slot)
             if adder.should_defer(req):
+                if defer_cow_slot:
+                    self._drop_unadmitted_match(req)
                 break
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
+                if defer_cow_slot:
+                    self._drop_unadmitted_match(req)
                 continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
                 req.time_stats.observe_storage_staging_ready(staging_ready)
                 if not staging_ready:
+                    if defer_cow_slot:
+                        self._drop_unadmitted_match(req)
                     continue
             res = adder.add_one_req(
                 req,
@@ -4619,14 +4722,7 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
-                    # init_next_round_input() may stage deferred Mamba COW/clear
-                    # metadata before add_one_req() rejects the request.
-                    req.kv.mamba_cow_src_index = None
-                    req.kv.mamba_needs_clear = False
-                    if req.kv.holds_mamba and not getattr(req, "session", None):
-                        kv_storage_of(
-                            self.req_to_token_pool, self.token_to_kv_pool_allocator
-                        ).release_state_slot(req)
+                    self._drop_unadmitted_match(req)
                 if res == AddReqResult.UNSCHEDULABLE and not added:
                     # Nothing holding memory will give it back: waiting would
                     # keep the request queued forever.
@@ -4634,24 +4730,21 @@ class Scheduler(
                     continue
                 break
 
-        if unschedulable:
-            self.waiting_queue.leave(unschedulable)
-            for req in unschedulable:
-                if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                    # As a queued abort: the sender goes before the KV it reads.
-                    self.release_prefill_sender(req, abort_sender=True)
-                self._abort_unavailable(
-                    req,
-                    message=(
-                        "The request cannot be scheduled: it fits the KV memory "
-                        "pool only once memory held elsewhere is freed, and "
-                        "nothing that holds memory will free it."
-                    ),
-                )
+        for req in unschedulable:
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                # As a queued abort: the sender goes before the KV it reads.
+                self.release_prefill_sender(req, abort_sender=True)
+            self._abort_unavailable(
+                req,
+                message=(
+                    "The request cannot be scheduled: it fits the KV memory "
+                    "pool only once memory held elsewhere is freed, and "
+                    "nothing that holds memory will free it."
+                ),
+            )
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
-        self.running_reqs.leave(adder.preempt_list)
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -4660,6 +4753,10 @@ class Scheduler(
             # though the request they made room for was not admitted.
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
+            # Empty passes are the key signal for head-of-line blocking.
+            self._maybe_log_schedule_decision(
+                can_run_list=can_run_list, running_batch=running_batch, adder=adder
+            )
             return None, running_batch
 
         can_run_set = set(can_run_list)
@@ -4667,18 +4764,26 @@ class Scheduler(
         if self.enable_hicache_storage and retries is not None:
             for req in can_run_list:
                 retries.cancel(req.rid)
-        self.invariant_checker.check_admitted(
-            req for req in can_run_list if req in self.waiting_queue
+        # Every other request of the batch comes from the waiting queue.
+        admitted = [req for req in can_run_list if req is not resumed_req]
+        self.invariant_checker.check_admitted(admitted)
+        new_chunked_req = adder.new_chunked_req
+        if new_chunked_req is not None:
+            # Update chunked prefill
+            assert self.chunked_req is None
+            move([new_chunked_req], self.chunked_reqs)
+        move(
+            [req for req in admitted if req is not new_chunked_req],
+            self.prefill_launched_reqs,
         )
-        self.waiting_queue.leave(can_run_set)
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        if adder.new_chunked_req is not None:
-            # Update chunked prefill
-            assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
+        # After the re-queue, so #left-in-queue is what the next pass sees.
+        self._maybe_log_schedule_decision(
+            can_run_list=can_run_list, running_batch=running_batch, adder=adder
+        )
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -4817,7 +4922,7 @@ class Scheduler(
             lists[ListKind.PD_BOOTSTRAP] = self.disagg_prefill_bootstrap_queue.queue
         lists[ListKind.PD_SENDING] = self.disagg_prefill_transfer_queue
         if self.dllm_config is not None:
-            # Its staging queue is the part of this queue the current round runs.
+            # It also holds the requests the current round runs.
             lists[ListKind.DLLM] = self.dllm_manager.waiting_queue
         components = (
             self.disagg_decode_prealloc_queue,
@@ -4835,17 +4940,6 @@ class Scheduler(
             )
             lists.update(component_lists)
         return lists
-
-    def _join_prefill_launched(self, batch: ScheduleBatch) -> None:
-        """Launching a request's last prefill chunk moves it out of the chunked slot
-        into prefill_launched_reqs. A row that is running already stays; dLLM keeps
-        its requests in its own queue."""
-        if self.dllm_config is None and batch.forward_mode.is_extend():
-            self.prefill_launched_reqs.join(
-                r
-                for r in batch.reqs
-                if r is not batch.chunked_req and r not in self.running_reqs
-            )
 
     def still_in_batch(self, req: Req) -> bool:
         """Whether `req` is still in the batch: in running, prefill_launched or
@@ -4885,7 +4979,6 @@ class Scheduler(
             getattr(self, "token_to_kv_pool_allocator", None)
         )
         launch = None if forward_steps is None else forward_steps.forward_launched()
-        self._join_prefill_launched(batch)
         self.invariant_checker.run(CheckPhase.LAUNCH, batch)
         return launch
 
@@ -4919,8 +5012,8 @@ class Scheduler(
         if forward_steps is not None:
             forward_steps.forward_processed(getattr(result, "forward_launch", None))
         # Requests finish only in a step's processing.
-        self.running_reqs.leave_finished()
-        self.prefill_launched_reqs.leave_finished()
+        self.running_reqs._leave_finished()
+        self.prefill_launched_reqs._leave_finished()
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose step in flight commits their last output by length."""
@@ -4972,7 +5065,6 @@ class Scheduler(
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.request_retirer
             )
-            self.running_reqs.leave([*retracted_reqs, *reqs_to_abort])
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
@@ -5872,7 +5964,6 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
-            and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
@@ -5888,7 +5979,7 @@ class Scheduler(
                 # Their steps are counted through the batches above.
                 ListKind.DECODING,
                 ListKind.PREFILL_LAUNCHED,
-                # Only its staging part is counted, above.
+                # Only the part the last round ran is counted, via last_batch.
                 ListKind.DLLM,
                 # Held across a weight update, whose cache flush needs idle.
                 ListKind.PD_HELD,
@@ -6220,7 +6311,7 @@ class Scheduler(
     def _abort_waiting(self, recv_req: AbortReq) -> None:
         is_decode = self.disaggregation_mode == DisaggregationMode.DECODE
         is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
-        for req in self.waiting_queue.take(lambda req: recv_req.matches(req.rid)):
+        for req in [r for r in self.waiting_queue if recv_req.matches(r.rid)]:
             if is_prefill:
                 # A PD prefill request may hold KV its sender still reads; abort
                 # the sender before that KV is freed.
@@ -6340,19 +6431,19 @@ class Scheduler(
 
         if self.hisparse_coordinator is not None:
             # Only a running loop moves a staged request on; the whole queue, so
-            # TP ranks agree.
-            retract_reqs += self.hisparse_coordinator.ack_staging_queue.take()
+            # TP ranks agree. Its release in retract_all drops it from staging.
+            retract_reqs += list(self.hisparse_coordinator.ack_staging_queue)
 
         if self.dllm_config is not None:
-            # A dLLM request keeps its row between rounds; a finished one leaves
-            # the lists only at the next schedule, which a paused loop never reaches.
+            # A dLLM request keeps its row between rounds; a finished one is not
+            # retracted.
             self.dllm_manager.filter_finished_reqs()
             retract_reqs += self.dllm_manager.take(lambda r: r.kv.holds_kv)
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Transferred requests wait for a slot holding their row and KV;
             # retract them too, so their KV is rebuilt under the new weights.
-            retract_reqs += self.waiting_queue.take(lambda r: r.kv.holds_kv)
+            retract_reqs += [r for r in self.waiting_queue if r.kv.holds_kv]
 
         # The chunked, a staged or a dLLM request may also sit in a batch.
         retract_reqs = list(dict.fromkeys(retract_reqs))
@@ -6375,8 +6466,7 @@ class Scheduler(
             # Empties the batch through filter_batch so a beam tail goes with the reqs.
             running_batch.filter_batch(keep_indices=[])
             running_batch.batch_is_full = False
-        self.running_reqs.leave(retract_reqs)
-        self.prefill_launched_reqs.leave(retract_reqs)
+        # Each request leaves the list it is in as it is aborted or re-queued.
         for req in retract_reqs:
             if req in reqs_to_abort:
                 # retract_all recorded the reason and freed any member rows.
@@ -6387,13 +6477,14 @@ class Scheduler(
             else:
                 self._add_request_to_queue(req)
         # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
-        # freeing its KV under a live disagg KV-sender crashes pop_bootstrapped or
+        # freeing its KV under a live disagg KV-sender crashes move_bootstrapped or
         # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.
         # TODO(disagg-prefill-retract): tear the sender down (abort + release metadata
         # buffer + reset pending_bootstrap) before freeing KV, then retract for real.
         # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
-            self.chunked_req = None
+            # A finished chunked request was not retracted.
+            self.chunked_reqs._drop_all()
 
     def _publish_paused_state(self):
         # Surface the paused state to dashboards immediately. The scheduler
@@ -6788,8 +6879,8 @@ def configure_scheduler_process(
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
 
-    # Configure the logger
-    configure_logger(server_args, prefix=prefix)
+    # The PID suffix is parsed by debug_utils/log_parser.py; keep them in sync.
+    configure_logger(server_args, prefix=f"{prefix} PID%(process)d")
     suppress_other_loggers()
 
     # Set cpu affinity to this gpu process
@@ -6852,6 +6943,7 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     scheduler = None
+    hit_exception = False
     try:
         scheduler = Scheduler(server_args, port_args)
 
@@ -6863,6 +6955,7 @@ def run_scheduler_process(
 
     except Exception:
         logger.error(f"Scheduler hit an exception: {traceback.format_exc()}")
+        hit_exception = True
         if scheduler is not None:
             scheduler.dump_requests_before_crash()
         parent_process.send_signal(signal.SIGQUIT)
@@ -6889,3 +6982,7 @@ def run_scheduler_process(
                 close_custom_all_reduce()
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()
+
+    # SubprocessWatchdog treats exit code 0 as a clean shutdown, so a crash must not exit 0.
+    if hit_exception:
+        sys.exit(1)

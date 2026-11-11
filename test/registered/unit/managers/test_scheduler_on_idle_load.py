@@ -118,7 +118,6 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.running_batch.is_empty.return_value = True
         scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         scheduler.dllm_manager = MagicMock()
-        scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler.last_batch = None
         scheduler.enable_overlap = False
         scheduler._pp_microbatches_drained = MagicMock(return_value=True)
