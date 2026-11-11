@@ -214,7 +214,6 @@ class TestQueuedAbort(CustomTestCase):
         # Still listed in the last batch, as a requeued or dLLM request is.
         s = _scheduler([req], last_batch_reqs=[req])
         s.disaggregation_mode = DisaggregationMode.NULL
-        s.chunked_req = None
         s.mm_receiver = None
         s.dllm_config = None
         s.grammar_manager = MagicMock()
@@ -285,7 +284,6 @@ class TestRunningTimeout(CustomTestCase):
         s.enable_continuous_input_polling = True
         s.result_queue = deque([(_batch([stale]), None), (s.last_batch, None)])
         s.disaggregation_mode = DisaggregationMode.PREFILL
-        s.chunked_req = None
         s.mm_receiver = None
         s.dllm_config = None
         s.grammar_manager = MagicMock()

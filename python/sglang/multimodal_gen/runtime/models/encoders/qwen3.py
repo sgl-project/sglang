@@ -4,6 +4,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from sglang.kernels.ops.diffusion import BitExactFusionGate
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
@@ -15,7 +16,13 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rope
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    RotaryEmbedding,
+    get_rope,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import (
+    flashinfer_apply_rope_inplace,
+)
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -26,8 +33,87 @@ from sglang.multimodal_gen.runtime.models.encoders.base import (
     TextEncoder,
     get_attention_head_partition,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
+
+logger = init_logger(__name__)
+
+# The cache-indexed native NeoX RoPE launches ~27 elementwise kernels per layer;
+# FlashInfer applies it to Q and K in one. With a bf16/fp16 cache and Q/K every
+# product is exact in fp32, so both paths round the same difference once.
+_NEOX_ROPE = BitExactFusionGate(
+    "Qwen3 encoder FlashInfer NeoX RoPE", per_signature=True
+)
+
+
+def _fp32_cos_sin_cache(rotary_emb: RotaryEmbedding) -> torch.Tensor:
+    cache = rotary_emb.cos_sin_cache
+    held = getattr(rotary_emb, "_fp32_cos_sin_cache", None)
+    if held is None or held[0] != (cache.device, cache.data_ptr()):
+        held = ((cache.device, cache.data_ptr()), cache.float())
+        rotary_emb._fp32_cos_sin_cache = held
+    return held[1]
+
+
+def _apply_neox_rope(
+    rotary_emb: RotaryEmbedding,
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``rotary_emb(positions, q, k)`` for [batch, seq, heads * head_dim] Q/K."""
+
+    def reference():
+        return rotary_emb(positions, q, k)
+
+    if (
+        flashinfer_apply_rope_inplace is None
+        or type(rotary_emb) is not RotaryEmbedding
+        or not rotary_emb.is_neox_style
+        or not rotary_emb.use_precomputed_cache
+        or rotary_emb.rotary_dim != head_dim
+        or not q.is_cuda
+        or q.dtype not in (torch.bfloat16, torch.float16)
+        or k.dtype != q.dtype
+        or rotary_emb.cos_sin_cache.dtype not in (torch.bfloat16, torch.float16)
+        or not q.is_contiguous()
+        or not k.is_contiguous()
+        or positions.numel() != q.shape[0] * q.shape[1]
+        or torch.compiler.is_compiling()
+    ):
+        return reference()
+
+    cache = _fp32_cos_sin_cache(rotary_emb)
+    flat_positions = positions.reshape(-1)
+    # one check per head layout; the token count does not change the arithmetic
+    sig = (q.shape[-1], k.shape[-1], q.dtype, rotary_emb.cos_sin_cache.dtype, q.device)
+
+    def fused(in_place: bool):
+        qf = q.view(flat_positions.numel(), -1)
+        kf = k.view(flat_positions.numel(), -1)
+        if not in_place:
+            qf, kf = qf.clone(), kf.clone()
+        flashinfer_apply_rope_inplace(
+            positions=flat_positions,
+            query=qf,
+            key=kf,
+            head_size=head_dim,
+            cos_sin_cache=cache,
+            is_neox=True,
+        )
+        return qf.view_as(q), kf.view_as(k)
+
+    if not _NEOX_ROPE.disabled and _NEOX_ROPE.is_verified(sig):
+        return fused(in_place=True)
+    return _NEOX_ROPE.run(
+        lambda: fused(in_place=False),
+        reference,
+        sig=sig,
+        equal=lambda a, b: all(torch.equal(x, y) for x, y in zip(a, b)),
+        logger=logger,
+    )
 
 
 class Qwen3MLP(nn.Module):
@@ -178,8 +264,7 @@ class Qwen3Attention(nn.Module):
         q = q.reshape(batch_size, seq_len, -1)
         k = k.reshape(batch_size, seq_len, -1)
 
-        # Apply rotary embeddings
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = _apply_neox_rope(self.rotary_emb, positions, q, k, self.head_dim)
 
         # Reshape for attention
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
