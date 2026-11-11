@@ -6166,6 +6166,13 @@ class Scheduler(
                 backend=get_memory().unified_cache_external_linker_backend,
                 page_size=self.page_size,
             )
+        # Linker keys embed the attention-CP rank, so each CP shard is its own object.
+        if get_parallel().attn_cp_size > 1:
+            return disabled_l3_layout(
+                "External L3 layout does not support attention context parallelism",
+                backend="mooncake",
+                page_size=self.page_size,
+            )
         storage = cache_linker.storage
         window_trailing_pages = {
             str(window.pool_name): window.full_window_pages

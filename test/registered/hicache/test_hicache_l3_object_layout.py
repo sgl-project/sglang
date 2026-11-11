@@ -318,6 +318,11 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
             scheduler.get_init_info()["hicache_object_layout"], reply.layout
         )
 
+        with get_parallel().override(tp_size=2, attn_cp_size=2, moe_tp_size=2):
+            reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
+        self.assertFalse(reply.layout["enabled"])
+        self.assertIn("context parallelism", reply.layout["reason"])
+
         backend = get_memory().unified_cache_external_linker_backend
         scheduler.tree_cache.linker = SimpleNamespace(cache_linker=object())
         reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
