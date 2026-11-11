@@ -417,6 +417,44 @@ class TestChatCompletionRequest(CustomTestCase):
                     ],
                 )
 
+    def test_assistant_reasoning_alias_fills_reasoning_content(self):
+        """Bug regression: prior-turn reasoning replayed under `reasoning` (the
+        vLLM field name) was dropped silently, so the next prompt lost it."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "Hi"},
+                {"role": "Assistant", "content": "Hello", "reasoning": "greet back"},
+                {"role": "user", "content": "Bye"},
+            ],
+        )
+        self.assertEqual(request.messages[1].reasoning_content, "greet back")
+
+    def test_assistant_reasoning_content_wins_over_reasoning_alias(self):
+        for reasoning_content, expected in (("kept", "kept"), (None, "alias")):
+            with self.subTest(reasoning_content=reasoning_content):
+                request = ChatCompletionRequest(
+                    model="test-model",
+                    messages=[
+                        {
+                            "role": "assistant",
+                            "content": "Hello",
+                            "reasoning": "alias",
+                            "reasoning_content": reasoning_content,
+                        }
+                    ],
+                )
+                self.assertEqual(request.messages[0].reasoning_content, expected)
+
+    def test_reasoning_alias_ignores_other_roles_and_non_strings(self):
+        for message in (
+            {"role": "system", "content": "Be brief", "reasoning": "x"},
+            {"role": "assistant", "content": "Hello", "reasoning": {"text": "x"}},
+        ):
+            with self.subTest(message=message):
+                request = ChatCompletionRequest(model="test-model", messages=[message])
+                self.assertIsNone(request.messages[0].reasoning_content)
+
     def test_chat_completion_json_format(self):
         """Test chat completion json format"""
         transcript = "Good morning! It's 7:00 AM, and I'm just waking up. Today is going to be a busy day, "

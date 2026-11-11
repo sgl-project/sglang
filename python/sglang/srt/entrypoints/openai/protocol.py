@@ -856,6 +856,21 @@ class ChatCompletionMessageGenericParam(BaseModel):
             return v_lower
         raise ValueError("'role' must be a string")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _fill_reasoning_content_from_reasoning(cls, data):
+        # Clients that follow vLLM replay prior-turn reasoning as `reasoning`;
+        # an explicit reasoning_content wins.
+        if (
+            isinstance(data, dict)
+            and isinstance(data.get("role"), str)
+            and data["role"].lower() == "assistant"
+            and isinstance(data.get("reasoning"), str)
+            and data.get("reasoning_content") is None
+        ):
+            data = {**data, "reasoning_content": data["reasoning"]}
+        return data
+
     @model_validator(mode="after")
     def validate_thinking_parts_role(self):
         if self.role != "assistant" and isinstance(self.content, list):
