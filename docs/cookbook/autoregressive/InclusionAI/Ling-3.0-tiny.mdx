@@ -61,6 +61,7 @@ It is a thinking model with chain-of-thought enabled by default, and it supports
 - Only `--model-path`, `--host`, and `--port` are needed. SGLang auto-resolves the context length (native 128K from `max_position_embeddings`), the attention backend, and `--mem-fraction-static` from the GPU and the CUDA-graph runtime, so the recipes leave them unset.
 - The chat template defaults to thinking on. Turn it off per request with `"chat_template_kwargs": {"enable_thinking": false}` for direct answers without the `...</think>` block.
 - Ling-3.0-tiny ships no built-in MTP draft layer (`num_nextn_predict_layers: 0`), so `--speculative-algorithm NEXTN` is not applicable.
+- For a single running request on the BF16 checkpoint, the paired [inclusionAI/Ling-3.0-tiny-UBTree](https://huggingface.co/inclusionAI/Ling-3.0-tiny-UBTree) draft enables `--speculative-algorithm UBTREE` with FA3 attention. See [UBTree decoding](../../../docs/advanced_features/speculative_decoding#ubtree-decoding) for the launch command and sampling support.
 
 ## 3. Advanced Usage
 
