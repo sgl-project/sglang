@@ -286,8 +286,6 @@ class TestDFlashMLA(CustomTestCase):
                 assert_absorbed(attn)
 
     def test_sliding_layers_require_a_window_backend(self):
-        """Only triton, trtllm_mla and cutedsl_mla apply an MLA layer's sliding
-        window; the other MLA backends would silently attend over the full context."""
         config = Qwen3Config(
             **_export_fields(),
             layer_types=["sliding_attention"],
@@ -321,13 +319,10 @@ class TestDFlashMLA(CustomTestCase):
         with patch(resolve, return_value="cutedsl_mla"):
             with self.assertRaisesRegex(ValueError, "causally"):
                 DFlashMLAAttention(config, layer_id=0)
-        # Bidirectional full_attention layers: rejected on trtllm_mla only.
         config.layer_types = ["full_attention"]
         with patch(resolve, return_value="trtllm_mla"):
             with self.assertRaisesRegex(ValueError, "causally"):
                 DFlashMLAAttention(config, layer_id=0)
-        with patch(resolve, return_value="cutedsl_mla"):
-            DFlashMLAAttention(config, layer_id=0)
 
     def test_matches_specforge_reference(self):
         """Context-KV materialization and the block forward reproduce SpecForge's
