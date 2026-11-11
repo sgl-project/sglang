@@ -27,11 +27,12 @@ def test_matches_reference(num_tokens, block_size, taps):
     )
 
     out = dflash_grouped_conv(hidden, delta, base, block_size, group_size, taps)
-    if num_tokens < taps:
-        # The compiled reference pads a batch shorter than a tap to `tap` rows.
+    if num_tokens == 0:
         assert out.shape == hidden.shape
         return
     ref = _grouped_conv(hidden, delta, base, block_size, num_groups, group_size, taps)
+    # The reference returns extra rows for a batch shorter than `taps - 1`.
+    ref = ref[:num_tokens]
     if taps == 2:
         # The shipped DFlash2 drafts (conv_kernel_size 2) match bit for bit.
         torch.testing.assert_close(out, ref, rtol=0, atol=0)

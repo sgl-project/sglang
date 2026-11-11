@@ -568,15 +568,6 @@ def _parse_dflash_is_mla(dflash_cfg: dict, num_hidden_layers: Optional[int]) -> 
     return True
 
 
-def is_dflash_mla_draft_config(draft_hf_config: Any) -> bool:
-    num_hidden_layers = _parse_optional_int(
-        _cfg_get(_get_text_config(draft_hf_config), "num_hidden_layers", None),
-        field_name="DFLASH draft num_hidden_layers",
-        min_value=1,
-    )
-    return _parse_dflash_is_mla(_get_dflash_config(draft_hf_config), num_hidden_layers)
-
-
 # The served MLA layer reinterprets any RoPE scaling as DeepSeek YaRN.
 _DFLASH_MLA_ROPE_TYPES = frozenset({"default", "yarn", "deepseek_yarn"})
 

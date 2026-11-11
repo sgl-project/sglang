@@ -181,9 +181,6 @@ def _mla_draft(layer_types, sliding_window=None):
 
 
 class TestRejectDflashSlidingMlaDraftWindow(CustomTestCase):
-    """--speculative-draft-window-size with an MLA draft on the MLA-only DFLASH
-    draft backends, which apply the draft's own window."""
-
     def _check(self, draft_backend, window_size, draft_cfg):
         args = ServerArgs(
             model_path="dummy",

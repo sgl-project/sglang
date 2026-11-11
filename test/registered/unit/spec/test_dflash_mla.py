@@ -302,6 +302,21 @@ class TestDFlashMLA(CustomTestCase):
             with self.subTest(backend=backend), patch(resolve, return_value=backend):
                 attn = DFlashMLAAttention(config, layer_id=0)
                 self.assertEqual(attn.attn_mqa.sliding_window_size, 3)
+        # DSPARK's worker runs cutedsl_mla / trtllm_mla drafts on flashinfer.
+        with (
+            patch(
+                resolve,
+                side_effect=lambda algo_label=None: (
+                    "cutedsl_mla" if algo_label == "DFLASH" else "flashinfer"
+                ),
+            ),
+            patch(
+                "sglang.srt.models.dflash.get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="DSPARK"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "require .* triton"):
+                DFlashMLAAttention(config, layer_id=0)
         config.is_causal = False
         with patch(resolve, return_value="cutedsl_mla"):
             with self.assertRaisesRegex(ValueError, "causally"):
