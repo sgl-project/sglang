@@ -90,6 +90,36 @@ class TestFutureMapIndexOps(unittest.TestCase):
         self.assertEqual(results[1][1].tolist(), [9, 3, 17])
         self.assertEqual(results[1][1].dtype, torch.int64)
 
+    def test_staged_lengths_skip_the_publish_wait_and_the_gather(self):
+        """SGLANG_OPT_SPEC_STAGED_SEQ_LENS: a round given the previous round's published
+        lengths takes them as they are: no wait on the publish, no gather, and none of
+        the gathered rows' poisoning; without them it gathers as before."""
+        indices = torch.tensor([5, 1, 6], dtype=torch.int64)
+        staged = torch.tensor([17, 3, 9], dtype=torch.int64)
+        for given in (False, True):
+            future_map = self._future_map()
+            future_map.publish(indices, staged)
+            future_map.publish_ready = Mock()
+            future_map._publish_fresh = True
+            poison = Mock()
+            batch = SimpleNamespace(spec_info=SimpleNamespace(future_indices=indices))
+            with (
+                self.subTest(given=given),
+                patch.object(overlap_utils, "_DEBUG_ASSERT", True),
+                patch.object(overlap_utils, "_assert_nonneg_and_invalidate", poison),
+            ):
+                future_map.resolve_seq_lens_cpu(
+                    batch, staged_seq_lens=staged if given else None
+                )
+                self.assertEqual(future_map.publish_ready.wait.called, not given)
+                self.assertEqual(poison.called, not given)
+                self.assertFalse(future_map._publish_fresh)
+                if given:
+                    self.assertIs(batch.seq_lens, staged)
+                else:
+                    self.assertTrue(torch.equal(batch.seq_lens, staged))
+                    self.assertIsNot(batch.seq_lens, staged)
+
 
 class TestRoundOutputRing(unittest.TestCase):
     def test_ring_wraps_after_eight_tensors_of_a_shape(self):

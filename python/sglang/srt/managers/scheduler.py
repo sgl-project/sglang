@@ -29,6 +29,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Deque,
     Dict,
     List,
@@ -542,6 +543,8 @@ class Scheduler(
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
     _last_empty_schedule_decision: Optional[Tuple[int, ...]] = None
+    # SGLANG_OPT_SPEC_STAGED_SEQ_LENS (init_overlap); a class default for harnesses without it
+    _staged_seq_lens: Optional[Callable] = None
 
     def __init__(
         self,
@@ -1819,6 +1822,13 @@ class Scheduler(
             self._confidence_budget_prepare = (
                 self.draft_worker.get_confidence_budget_prepare()
             )
+        # SGLANG_OPT_SPEC_STAGED_SEQ_LENS: a staged decode round's lengths from the
+        # previous round's post-verify graph instead of the FutureMap gather
+        self._staged_seq_lens = (
+            getattr(self.draft_worker, "take_staged_seq_lens", None)
+            if envs.SGLANG_OPT_SPEC_STAGED_SEQ_LENS.get() and self.enable_overlap
+            else None
+        )
 
         # If enable async D2H copy when overlap is enabled
         # Currently used by NVIDIA Confidential Computing (CC) only
@@ -5349,7 +5359,14 @@ class Scheduler(
                     and not getattr(self.future_map, "needs_cpu_seq_lens", True)
                 )
                 if not gpu_only_lens:
-                    self.future_map.resolve_seq_lens_cpu(batch)
+                    self.future_map.resolve_seq_lens_cpu(
+                        batch,
+                        staged_seq_lens=(
+                            None
+                            if self._staged_seq_lens is None
+                            else self._staged_seq_lens(batch)
+                        ),
+                    )
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 

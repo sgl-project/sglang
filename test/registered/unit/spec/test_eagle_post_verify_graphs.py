@@ -794,6 +794,40 @@ class TestStagedNextDraft(CustomTestCase):
         tracker.forget()
         self.assertIsNone(tracker.count_draft(_decode_batch([3])))
 
+    def test_a_staged_round_takes_the_lengths_its_staging_came_from(self):
+        """SGLANG_OPT_SPEC_STAGED_SEQ_LENS: before a decode round's resolve, a round that
+        will take its staging takes the lengths the previous round published, without
+        consuming the note; any other round, a prefill, or no worker staging, gathers."""
+        staging, lengths = object(), torch.tensor([52])
+        tracker = staged_next_draft.StagedDraftTracker(width=4, graph_sizes=[1])
+        tracker.note_extend(_decode_batch([3], allocated=52), staging, lengths)
+        self.assertIsNone(tracker.take_seq_lens(_decode_batch([4])))
+        self.assertIs(tracker.take_seq_lens(_decode_batch([3])), lengths)
+        self.assertIs(tracker.count_draft(_decode_batch([3])), staging)
+        self.assertEqual(tracker.seq_lens_taken_ct, 1)
+        tracker.note_extend(_decode_batch([3], allocated=52), staging, None)
+        self.assertIsNone(tracker.take_seq_lens(_decode_batch([3])))
+
+        worker = eagle_worker_v2.EAGLEWorkerV2.__new__(eagle_worker_v2.EAGLEWorkerV2)
+        decode = _decode_batch([3])
+        decode.forward_mode = ForwardMode.DECODE
+        prefill = _decode_batch([3])
+        prefill.forward_mode = ForwardMode.EXTEND
+        self.assertIsNone(worker.take_staged_seq_lens(decode))
+        worker._staged_draft = tracker
+        tracker.note_extend(_decode_batch([3], allocated=52), staging, lengths)
+        self.assertIsNone(worker.take_staged_seq_lens(prefill))
+        self.assertIs(worker.take_staged_seq_lens(decode), lengths)
+
+    def test_a_slot_about_to_replay_must_not_hold_the_batch_lengths(self):
+        """Lengths taken from a slot's output are read through the whole round, so a
+        replay of that very slot is refused; the other slot's replay is fine."""
+        held, other = torch.tensor([20]), torch.tensor([20])
+        slot = SimpleNamespace(outputs=(None, None, None, held))
+        eagle_post_verify_graphs._check_lengths_outlive(slot, other)
+        with self.assertRaises(RuntimeError):
+            eagle_post_verify_graphs._check_lengths_outlive(slot, held)
+
     def test_the_draft_takes_a_fitting_staging_instead_of_its_launch(self):
         """prepare_for_draft takes a staging of this batch's size and M-RoPE choice
         for a round that plans its window: the window and positions are the staged

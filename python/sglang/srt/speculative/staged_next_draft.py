@@ -111,12 +111,20 @@ class StagedDraftTracker:
         self.noted: Optional[tuple] = None
         self.counts = collections.Counter()
         self.decode_round_ct = 0
+        # SGLANG_OPT_SPEC_STAGED_SEQ_LENS: staged rounds that took their lengths
+        self.seq_lens_taken_ct = 0
 
-    def note_extend(self, batch, next_draft: Optional[NextDraft]) -> None:
+    def note_extend(
+        self,
+        batch,
+        next_draft: Optional[NextDraft],
+        new_seq_lens: Optional[torch.Tensor] = None,
+    ) -> None:
         """At a decode round's end: the request slots in order, whether the draft graph
         runs that size unpadded, whether every request holds the next round's whole window
         (kv_allocated_len covers kv_committed_len plus three windows: the two rounds whose
-        acceptance the host has not read yet, then the window), and the staging."""
+        acceptance the host has not read yet, then the window), the staging, and the
+        lengths the round published (SGLANG_OPT_SPEC_STAGED_SEQ_LENS)."""
         reqs = batch.reqs
         need = 3 * self.width
         self.noted = (
@@ -124,6 +132,7 @@ class StagedDraftTracker:
             len(reqs) in self.graph_sizes,
             all(r.kv.kv_allocated_len >= r.kv.kv_committed_len + need for r in reqs),
             next_draft,
+            new_seq_lens,
         )
 
     def forget(self) -> None:
@@ -143,6 +152,15 @@ class StagedDraftTracker:
             return "not_staged_by_post_verify_graph"
         return "staged"
 
+    def take_seq_lens(self, batch) -> Optional[torch.Tensor]:
+        """Before a decode round's resolve, without consuming the note: the lengths the
+        previous decode round published when this round takes its staging, else None."""
+        noted = self.noted
+        if noted is None or noted[4] is None or self._reason(noted, batch) != "staged":
+            return None
+        self.seq_lens_taken_ct += 1
+        return noted[4]
+
     def count_draft(self, batch) -> Optional[NextDraft]:
         """At a decode round's start: the staging when it holds for this batch, else
         None; counts the first reason it does not."""
@@ -152,8 +170,9 @@ class StagedDraftTracker:
         self.decode_round_ct += 1
         if self.decode_round_ct % LOG_EVERY == 0:
             logger.info(
-                "Staged next draft: %d decode rounds: %s",
+                "Staged next draft: %d decode rounds: %s; lengths taken %d",
                 self.decode_round_ct,
                 ", ".join(f"{k} {v}" for k, v in sorted(self.counts.items())),
+                self.seq_lens_taken_ct,
             )
         return noted[3] if reason == "staged" else None

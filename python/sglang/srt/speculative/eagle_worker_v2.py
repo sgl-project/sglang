@@ -1496,6 +1496,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             runner_buffers=runner.buffers,
         )
 
+    def take_staged_seq_lens(self, batch: ScheduleBatch) -> Optional[torch.Tensor]:
+        """SGLANG_OPT_SPEC_STAGED_SEQ_LENS, before the scheduler resolves a decode round's
+        lengths: for a round that takes its staged draft inputs, the lengths the previous
+        round published, which its post-verify graph wrote; None otherwise."""
+        # a prefill reusing the last decode round's request slots matches its note too
+        if self._staged_draft is None or not batch.forward_mode.is_decode():
+            return None
+        return self._staged_draft.take_seq_lens(batch)
+
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
         self._init_staged_next_draft()
@@ -1620,7 +1629,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
                     if self._staged_draft is not None:
                         self._staged_draft.note_extend(
-                            batch, self._post_verify_graphs.next_draft
+                            batch,
+                            self._post_verify_graphs.next_draft,
+                            batch_output.new_seq_lens,
                         )
             if self._post_verify_graphs is not None:
                 # The mamba state commit may still run on a side stream.
