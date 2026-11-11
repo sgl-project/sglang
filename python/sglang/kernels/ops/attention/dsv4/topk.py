@@ -66,6 +66,7 @@ def _jit_topk_v2_module(deterministic: bool = False):
         ("topk_transform_ragged", f"{kernel}::transform_ragged"),
         ("topk_transform_packed", f"{kernel}::transform_packed"),
         ("topk_transform_candidates", f"{kernel}::transform_candidates"),
+        ("topk_transform_candidates_paged", f"{kernel}::transform_candidates_paged"),
         ("topk_plan", f"{kernel}::plan"),
         ("topk_transform_kpool", f"{kernel}::transform_kpool"),
         ("topk_transform_kpool_ragged", f"{kernel}::transform_kpool_ragged"),
@@ -279,6 +280,45 @@ def topk_transform_candidates_v2(
         dcp_rank,
         cluster_size,
         cluster_floor,
+    )
+
+
+def topk_transform_paged_candidates_v2(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    out_candidates: torch.Tensor,
+    world: int,
+    rank: int,
+    row_starts: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    cluster_floor: Optional[int] = None,
+    page_bits: int = 0,
+    overflow_rows: Optional[torch.Tensor] = None,
+    coarse_bits: int = 10,
+) -> None:
+    """:func:`topk_transform_candidates_v2` for rows split by page.
+
+    Local position ``l`` of rank ``rank`` is global position
+    ``((l >> b) * world + rank) << b | (l & (2**b - 1))`` with ``page_bits`` b
+    (b = 0 is the token interleave). ``cluster_floor`` (no ``row_starts``) splits
+    rows longer than it across a cluster at coarse bin width ``coarse_bits``
+    (10 / 11 / 12); the selection stays exact. ``overflow_rows`` (int32 [1])
+    counts rows redone past the tie buffer.
+
+    NOTE: ``scores`` is written in place as for the ragged entry point.
+    """
+    _jit_topk_v2_module(deterministic).topk_transform_candidates_paged(
+        scores,
+        seq_lens,
+        row_starts,
+        out_candidates,
+        world,
+        rank,
+        -1 if cluster_floor is None else int(cluster_floor),
+        int(page_bits),
+        overflow_rows,
+        int(coarse_bits),
     )
 
 

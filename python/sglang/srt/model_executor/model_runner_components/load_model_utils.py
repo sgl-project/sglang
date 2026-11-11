@@ -227,6 +227,28 @@ def resolve_sliding_window_size(model, model_config: ModelConfig) -> int | None:
     return sliding_window_size
 
 
+def resolve_sliding_layer_window_size(
+    model_cls, model_config: ModelConfig
+) -> int | None:
+    """`resolve_sliding_window_size` from the config alone, before the model is
+    built; a class with ``get_attention_sliding_window_size`` must state
+    ``sliding_layer_window_size(config)``, returning the same value."""
+    if hasattr(model_cls, "get_attention_sliding_window_size"):
+        rule = getattr(model_cls, "sliding_layer_window_size", None)
+        if rule is None:
+            raise ValueError(
+                f"{model_cls.__name__} resolves its attention window only once "
+                "built; state it from the config as `sliding_layer_window_size` "
+                "so storage for its window layers can be placed before it loads"
+            )
+        return rule(model_config.hf_config)
+    if model_config.is_hybrid_swa and model_config.sliding_window_size is not None:
+        return model_config.sliding_window_size
+    if model_config.attention_chunk_size is not None:
+        return model_config.attention_chunk_size
+    return None
+
+
 def report_online_quantization(*, model) -> None:
     # TODO: Make sure all models have `quant_config` attribute, and all online quantization methods register which layers they actually quantize.
     quantized_layers = getattr(

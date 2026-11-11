@@ -16,11 +16,15 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import release_only_retirer
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -59,6 +63,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         request_retirer=release_only_retirer(),
         abort_request=lambda *args, **kwargs: None,
         still_in_batch=lambda req: True,
+        prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
     )
 
 
@@ -66,7 +71,7 @@ class TestPrefillEmbeddingResults(CustomTestCase):
     def test_failed_kv_load_discarded_with_mixed_embedding_formats(self):
         reason = FINISH_ABORT("External KV cache load failed", 503)
         reqs = [
-            SimpleNamespace(
+            FakeReq(
                 encoding_format=encoding_format,
                 discard_output_reason=discard_reason,
                 is_retracted=False,
@@ -225,7 +230,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         self.assertIsNone(output.sampling_mask_output)
 
 
-class _PrefillReq:
+class _PrefillReq(FakeReq):
     def __init__(self, *, rid: str, return_hidden_states):
         self.rid = rid
         self.return_hidden_states = return_hidden_states
@@ -249,7 +254,7 @@ class _PrefillReq:
         return None
 
 
-class _DecodeReq:
+class _DecodeReq(FakeReq):
     request_finish = Req.request_finish
 
     def __init__(self):
