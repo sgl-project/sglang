@@ -449,6 +449,9 @@ def compress_nodes(
             module.ape,
             residue,
             plan.query_cu,
+            # query_cu comes from build_tree_metadata's arange and
+            # residue with remainder above. Neither needs a per-layer readback.
+            validate_values=False,
         )
         node_kv = compressor_tree(
             state,
