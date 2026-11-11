@@ -67,6 +67,7 @@ _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 _COMPACT_VERIFY_SAMPLING = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get()
 _PACKED_VERIFY_BCAST = envs.SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST.get()
+_DECODE_EMPTY_ALLOCATION = envs.SGLANG_OPT_SPEC_DECODE_EMPTY_ALLOCATION.get()
 
 # The binding defaults probe this explicit capability once instead of relying on
 # exception handling in the hot path.  Runtime itself remains independent of the
@@ -1347,6 +1348,26 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     )
     for r in batch.reqs:
         r.decode_batch_idx += 1
+
+    if num_needed_tokens == 0 and _DECODE_EMPTY_ALLOCATION:
+        # Nothing to allocate (nxt == cur, already checked against the row width):
+        # only the recorded lengths rise, from the host lists.
+        if batch.seq_lens_cpu is None:
+            batch.max_seq_len_host = max(cur_kv_lens)
+        alloc_for_spec_decode(
+            batch.tree_cache,
+            batch.req_to_token_pool,
+            reqs=batch.reqs,
+            req_pool_indices=None,
+            cur_kv_lens=None,
+            cur_kv_lens_cpu=None,
+            nxt_kv_lens=None,
+            nxt_kv_lens_cpu=None,
+            num_needed_tokens=0,
+            batch=batch,
+            nxt_kv_lens_list=nxt_kv_lens,
+        )
+        return
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")

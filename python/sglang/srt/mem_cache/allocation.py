@@ -835,14 +835,16 @@ def alloc_for_spec_decode(
     req_to_token_pool: ReqToTokenPool,
     *,
     reqs: list[Req],
-    req_pool_indices: torch.Tensor,
-    cur_kv_lens: torch.Tensor,
-    cur_kv_lens_cpu: torch.Tensor,
-    nxt_kv_lens: torch.Tensor,
-    nxt_kv_lens_cpu: torch.Tensor,
+    req_pool_indices: Optional[torch.Tensor],
+    cur_kv_lens: Optional[torch.Tensor],
+    cur_kv_lens_cpu: Optional[torch.Tensor],
+    nxt_kv_lens: Optional[torch.Tensor],
+    nxt_kv_lens_cpu: Optional[torch.Tensor],
     num_needed_tokens: int,
     batch: Optional[ScheduleBatch] = None,
+    nxt_kv_lens_list: Optional[list[int]] = None,
 ) -> None:
+    """With num_needed_tokens == 0 the tensors may be None and nxt_kv_lens_list given."""
     if num_needed_tokens > 0:
         if tree_cache.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
@@ -896,6 +898,7 @@ def alloc_for_spec_decode(
             len(reqs),
         )
 
-    nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
+    if nxt_kv_lens_list is None:
+        nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
     for req, nxt_kv_len in zip(reqs, nxt_kv_lens_list, strict=True):
         req.kv.allocate_spec_decode(nxt_kv_len)

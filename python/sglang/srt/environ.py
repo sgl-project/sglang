@@ -346,6 +346,11 @@ class Envs:
     SGLANG_OPT_FUTURE_MAP_INDEX_OPS = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # A spec decode step that needs no new KV pages (most steps at page size 64) skips the
+    # length tensors and their two H2D copies, which only the allocation reads.
+    SGLANG_OPT_SPEC_DECODE_EMPTY_ALLOCATION = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
