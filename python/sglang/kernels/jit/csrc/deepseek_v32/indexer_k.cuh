@@ -230,7 +230,8 @@ struct FusedKIndexerNormRopeKernel {
 
 // Indexer K + fused store: LayerNorm + RoPE + fp8 quant + paged store in one
 // launch. Page layout matches fused_store_index_cache.cuh: each page is
-// 132*page_size bytes (128*page_size fp8 keys, then 4*page_size fp32 scales).
+// 132*page_size bytes (128*page_size fp8 keys, then 4*page_size fp32 scales),
+// and consecutive pages are `cache_page_stride` bytes apart.
 struct FusedKIndexerNormRopeStoreParams {
   const void* __restrict__ k_input;         // (B, 128) DType
   void* __restrict__ cache;                 // (num_pages, 132*page_size) uint8
@@ -241,6 +242,8 @@ struct FusedKIndexerNormRopeStoreParams {
   const void* __restrict__ positions;       // (B,) PosT
   // Row stride for `k_input` (caller passes the non-contiguous wk slice directly).
   int64_t k_input_stride_batch;
+  // Bytes between consecutive pages of `cache`.
+  int64_t cache_page_stride;
   uint32_t batch_size;
   float eps;
 };
@@ -253,7 +256,6 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   constexpr int64_t kRopeDim = 64;
   constexpr int64_t kVecSize = 4;
   constexpr uint32_t kRopeSize = kRopeDim / kVecSize;  // = 16
-  constexpr int64_t kPageBytes = 132ll << kPageBits;
   static_assert(kHeadDim == kWarpThreads * kVecSize);
   static_assert(kRopeDim == kWarpThreads * 2);
   static_assert(kRopeSize <= kWarpThreads);
@@ -350,7 +352,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   const auto index = static_cast<const int64_t*>(params.indices)[work_id];
   const int32_t page = static_cast<int32_t>(index >> kPageBits);
   const int32_t offset = static_cast<int32_t>(index & ((1 << kPageBits) - 1));
-  const auto page_ptr = static_cast<uint8_t*>(params.cache) + page * kPageBytes;
+  const auto page_ptr = static_cast<uint8_t*>(params.cache) + page * params.cache_page_stride;
   const auto value_ptr = page_ptr + offset * kHeadDim;
   const auto scale_ptr = page_ptr + (kHeadDim << kPageBits) + offset * 4;
 
@@ -393,8 +395,10 @@ struct FusedKIndexerNormRopeStoreKernel {
         .with_dtype<DType>()
         .with_device(device_)
         .verify(k_input);
-    TensorMatcher({-1, -1})  //
-        .with_strides({kPageBytes, 1})
+    auto num_pages = SymbolicSize{"num_pages"};
+    auto page_stride = SymbolicSize{"page_stride"};
+    TensorMatcher({num_pages, kPageBytes})  // one row per page, rows may be strided
+        .with_strides({page_stride, 1})
         .with_dtype<uint8_t>()
         .with_device(device_)
         .verify(cache);
@@ -420,6 +424,14 @@ struct FusedKIndexerNormRopeStoreKernel {
         .with_device(device_)
         .verify(positions);
 
+    // A single-page view may report any row stride (DLPack normalizes it).
+    const int64_t cache_page_stride = num_pages.unwrap() > 1 ? page_stride.unwrap() : kPageBytes;
+    // the fp32 scales need 4-byte alignment in every page
+    RuntimeCheck(
+        cache_page_stride >= kPageBytes && cache_page_stride % 4 == 0,
+        "invalid index-K page stride: ",
+        cache_page_stride);
+
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
     if (batch_size == 0) return;
 
@@ -432,6 +444,7 @@ struct FusedKIndexerNormRopeStoreKernel {
         .cos_sin_cache = static_cast<const float*>(cos_sin_cache.data_ptr()),
         .positions = positions.data_ptr(),
         .k_input_stride_batch = k_input.stride(0),
+        .cache_page_stride = cache_page_stride,
         .batch_size = batch_size,
         .eps = static_cast<float>(eps),
     };
