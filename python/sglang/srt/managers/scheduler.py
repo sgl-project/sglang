@@ -6943,6 +6943,7 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     scheduler = None
+    hit_exception = False
     try:
         scheduler = Scheduler(server_args, port_args)
 
@@ -6954,6 +6955,7 @@ def run_scheduler_process(
 
     except Exception:
         logger.error(f"Scheduler hit an exception: {traceback.format_exc()}")
+        hit_exception = True
         if scheduler is not None:
             scheduler.dump_requests_before_crash()
         parent_process.send_signal(signal.SIGQUIT)
@@ -6980,3 +6982,7 @@ def run_scheduler_process(
                 close_custom_all_reduce()
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()
+
+    # SubprocessWatchdog treats exit code 0 as a clean shutdown, so a crash must not exit 0.
+    if hit_exception:
+        sys.exit(1)
