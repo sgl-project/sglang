@@ -39,6 +39,16 @@ BACKENDS = {
     "stage-b-kernel-test-1-gpu-ppu": "PPU",
     "stage-c-test-2-gpu-ppu": "PPU",
 }
+APPROVED_SKIPS = {
+    "stage-b-kernel-test-1-gpu-ppu": {
+        "registered.kernels.ops.diffusion.test_timestep_embedding.test_timestep_embedding_perf",
+        *(
+            f"registered.kernels.ops.attention.test_rope.test_partial_rope[64-96-{is_neox}-{batch_size}]"
+            for is_neox in (False, True)
+            for batch_size in (1, 129, 2048, 2049)
+        ),
+    }
+}
 
 
 def _register():
@@ -196,10 +206,10 @@ def verify(directory, lane, kernel=False):
             raise ValueError(f"Selection/registration mismatch: {suite}")
         if [r["file"] for r in report["files"]] != report["selected"]:
             raise ValueError(f"Missing selected file: {suite}")
-        if len(set(report["selected"])) != len(report["selected"]) or report.get(
-            "allowed_skips"
-        ):
-            # No platform skips are currently approved for these PPU suites.
+        allowed_skips = report.get("allowed_skips", [])
+        if len(set(report["selected"])) != len(report["selected"]) or set(
+            allowed_skips
+        ) != APPROVED_SKIPS.get(suite, set()):
             raise ValueError(f"Duplicate selection or unapproved skip policy: {suite}")
         xmls = {p.name for p in (directory / suite).glob("*.xml")}
         if xmls != {r.get("junit") for r in report["files"]} or len(xmls) != len(
@@ -213,7 +223,9 @@ def verify(directory, lane, kernel=False):
                 or record.get("returncode") != 0
             ):
                 raise ValueError(f"Empty/failed file in {suite}")
-            counts = runner.inspect_junit(directory / suite / record["junit"])
+            counts = runner.inspect_junit(
+                directory / suite / record["junit"], allowed_skips
+            )
             if any(record.get(key) != value for key, value in counts.items()):
                 raise ValueError(f"JUnit/summary disagreement: {suite}")
             log = record.get("log", "")
