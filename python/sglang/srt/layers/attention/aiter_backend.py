@@ -2513,14 +2513,12 @@ class AiterAttnBackend(AttentionBackend):
         q: torch.Tensor,
         layer: RadixAttention,
         kv_indices: torch.Tensor,
-        K_Buffer: torch.Tensor,
-        kv_lora_rank: int,
         qk_nope_head_dim: int,
     ) -> torch.Tensor:
         """MHA prefill over the cached latent at ``kv_indices`` (prefix + chunk)."""
-        rows = torch.index_select(K_Buffer, 0, kv_indices)
-        kvc = rows[..., :kv_lora_rank].to(q.dtype).contiguous()
-        k_pe = rows[..., kv_lora_rank:].to(q.dtype)
+        kvc, k_pe = self.kv_layers.read(layer.layer_id).read_mla(
+            layer, kv_indices, q.dtype
+        )
         kv = layer.kv_b_proj(kvc)[0].view(
             -1, layer.tp_k_head_num, qk_nope_head_dim + layer.v_head_dim
         )
@@ -4730,7 +4728,7 @@ class AiterAttnBackend(AttentionBackend):
                     kv_lora_rank + qk_rope_head_dim
                 ) and self._use_mla_prefix_fused_k(layer):
                     return self._mla_prefix_attn_fused(
-                        q, layer, kv_indices, K_Buffer, kv_lora_rank, qk_nope_head_dim
+                        q, layer, kv_indices, qk_nope_head_dim
                     )
                 elif layer.qk_head_dim != (kv_lora_rank + qk_rope_head_dim):
                     K_Buffer = torch.index_select(K_Buffer, 0, kv_indices)
