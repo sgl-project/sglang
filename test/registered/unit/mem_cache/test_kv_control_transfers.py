@@ -2550,6 +2550,14 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             assert done.public_result.ready_scope
             assert done.public_result.ready_location.tier == "host"
             assert not dma.pending
+            with patch.object(cache, "prefetch_from_storage") as storage:
+                resident = public_transfer(
+                    service, "prefetch", "storage", "host", "public-restore-resident"
+                )
+                ready = wait(service, resident)
+                assert ready.status == Status.COMPLETED, ready
+                assert ready.public_result.ready_scope == done.public_result.ready_scope
+                storage.assert_not_called()
             for node, _, _, _ in prefix_path(cache, service):
                 cd = node.component_data[FULL]
                 host = cache.host_pool_group.anchor_entry.host_pool

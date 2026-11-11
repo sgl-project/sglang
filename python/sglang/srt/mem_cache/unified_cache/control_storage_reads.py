@@ -458,9 +458,12 @@ class StorageCacheReads:
         job = self.jobs.get(key)
         if job is None:
             job = self._borrow_ordinary(tokens, compatibility)
+        rows = None
         if job is None:
             job = _Read(key, tokens, compatibility)
-            self._rows(job)
+            # Validate before registering the job. The first attempt can use
+            # this owner-local walk; queued retries must inspect the tree again.
+            rows = self._rows(job)
             self.jobs[key] = job
             self.stats["jobs_created"] += 1
         else:
@@ -475,10 +478,10 @@ class StorageCacheReads:
             )
         ] = job
         if job.operation is None:
-            self._start(job)
+            self._start(job, rows=rows)
         return self._take(interest)
 
-    def _start(self, job):
+    def _start(self, job, *, rows=None):
         # The owner polls storage before applying individual deadlines. A
         # newly available slot must not start a read for expired hints only.
         if not self._has_live_interest(job):
@@ -492,7 +495,8 @@ class StorageCacheReads:
                     code="scope_exceeds_destination_capacity",
                 )
                 return
-            rows = self._rows(job)
+            if rows is None:
+                rows = self._rows(job)
             if any(
                 n.write_through_pending_id is not None or self.executor._load_pending(n)
                 for n, _, _ in rows
@@ -501,7 +505,7 @@ class StorageCacheReads:
                 return
             host_length = self._host_length(job, rows)
             if host_length == len(job.tokens):
-                self._retire(job)
+                self._retire(job, host_length=host_length)
                 return
             if rows:
                 node, start, end = rows[-1]
@@ -676,7 +680,7 @@ class StorageCacheReads:
                 self._observe_cold_result(job)
                 self._retire(job)
 
-    def _retire(self, job, *, status=None, code=""):
+    def _retire(self, job, *, status=None, code="", host_length=None):
         length = 0
         try:
             if job.operation is not None and getattr(
@@ -685,7 +689,7 @@ class StorageCacheReads:
                 # Final ACK publication may have queued unused scratch pages
                 # after the previous drain's release-count snapshot.
                 self.cache.drain_storage_control_queues()
-            length = self._host_length(job)
+            length = self._host_length(job) if host_length is None else host_length
             scopes = {}
             for identity in job.interests:
                 interest = self.interests[identity]
