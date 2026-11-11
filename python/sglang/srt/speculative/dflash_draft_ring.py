@@ -49,11 +49,11 @@ def draft_kv_ring_unsupported_reason(
     from sglang.srt.configs.model_config import mla_attention_dcp_size
     from sglang.srt.speculative.dflash_utils import (
         get_dflash_layer_types,
-        is_dflash_mla_draft_config,
+        parse_dflash_draft_config,
     )
 
     draft_hf_config = load_draft_hf_config()
-    if not is_dflash_mla_draft_config(draft_hf_config):
+    if not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
         return "the draft is not MLA"
     layer_types = get_dflash_layer_types(draft_hf_config)
     if not layer_types or any(t != "sliding_attention" for t in layer_types):
