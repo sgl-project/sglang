@@ -25,6 +25,8 @@ impl CoreHandle {
             reasoning_parser: metadata.reasoning_parser.clone(),
             tool_call_parser: metadata.tool_call_parser.clone(),
             disaggregation_mode: metadata.disaggregation_mode,
+            model_type: metadata.model_type.clone(),
+            architectures: metadata.architectures.clone(),
             launch_fields: metadata.launch_model_info.clone(),
         }
     }
@@ -75,6 +77,7 @@ impl CoreHandle {
             tokenizer_path: metadata.tokenizer_path.clone(),
             max_context_length: metadata.max_context_length,
             max_total_num_tokens: metadata.max_total_num_tokens,
+            num_reserved_tokens: metadata.num_reserved_tokens,
             version: metadata.version.clone(),
             frontend: "rust",
             startup_time,
@@ -83,6 +86,8 @@ impl CoreHandle {
             port: metadata.port,
             incremental_streaming_output: metadata.incremental_streaming_output,
             disaggregation_mode: metadata.disaggregation_mode,
+            allow_auto_truncate: metadata.allow_auto_truncate,
+            skip_tokenizer_init: metadata.skip_tokenizer_init,
             deployment_info: metadata.deployment_info.clone(),
             dp_listeners,
         })
