@@ -45,7 +45,7 @@ _CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
     TypeError,
 ) + _MISTRAL_COMMON_ERRORS
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
-from jsonschema import Draft202012Validator, SchemaError
+from jsonschema import Draft202012Validator, FormatChecker, SchemaError
 
 from sglang.srt.entrypoints.openai import (
     chat_encoding,
@@ -1091,8 +1091,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
+                format_checker = Draft202012Validator.FORMAT_CHECKER
+                if tool.function.strict is not True:
+                    # JSON Schema patterns use ECMA-262, not Python's re syntax.
+                    format_checker = FormatChecker(
+                        formats=[f for f in format_checker.checkers if f != "regex"]
+                    )
                 Draft202012Validator.check_schema(
-                    without_schema_identifiers(tool.function.parameters)
+                    without_schema_identifiers(tool.function.parameters),
+                    format_checker=format_checker,
                 )
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"

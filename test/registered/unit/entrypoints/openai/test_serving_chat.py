@@ -2952,6 +2952,39 @@ class ServingChatTestCase(CustomTestCase):
                 call_kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
                 self.assertEqual(call_kwargs.get("tool_choice"), expected)
 
+    def test_tool_schema_ecma_regex_only_bypasses_non_strict_format_check(self):
+        """Python-only regex validation must not reject non-strict ECMA patterns
+        or hide other schema errors; strict tools retain backend-safe checks."""
+        for strict, schema_type, accepted in (
+            (None, "string", True),
+            (False, "string", True),
+            (None, 5, False),
+            (True, "string", False),
+        ):
+            with self.subTest(strict=strict, schema_type=schema_type):
+                function = {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"q": {"type": schema_type, "pattern": r"\p{L}"}},
+                    },
+                }
+                if strict is not None:
+                    function["strict"] = strict
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi"}],
+                    tools=[{"type": "function", "function": function}],
+                )
+
+                error = self.chat._validate_request(request)
+
+                if accepted:
+                    self.assertIsNone(error)
+                else:
+                    self.assertIn("invalid 'parameters' schema", error)
+                    self.assertIn("'regex'" if strict else "5", error)
+
     def test_validate_request_accepts_draft07_schema_identifiers(self):
         """A plain-name ``$id`` fragment is valid draft-07 but fails the 2020-12
         metaschema; it constrains nothing, so the tool is accepted."""
