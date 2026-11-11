@@ -11,7 +11,6 @@ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_ga
 from sglang.srt.environ import envs
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.models.dflash import candidate_topk
-from sglang.srt.runtime_context import get_exec
 from sglang.srt.speculative.dflash_utils import _get_dflash_config
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 
@@ -368,12 +367,6 @@ class LiLiCorrDraftSampler:
         self.out[:rows].copy_(selected.reshape(-1).to(torch.int64))
 
 
-def draft_graph_batch_sizes() -> list[int]:
-    return sorted(
-        {int(bs) for bs in get_exec().graph.cuda_graph_config.decode.bs if bs > 0}
-    )
-
-
 def build_lilicorr_draft_sampler(
     *,
     head,
@@ -381,22 +374,9 @@ def build_lilicorr_draft_sampler(
     embed_tokens,
     lm_head,
     block_size: int,
+    max_bs: int,
     sampling_enabled: bool = False,
-) -> Optional[LiLiCorrDraftSampler]:
-    def eager(reason: str) -> None:
-        logger.warning(
-            "LiLiCorr head kept eager (reason=%s): a bring-up path, not a serving "
-            "configuration. Expect a large throughput regression and numbers that are "
-            "not comparable to any published row.",
-            reason,
-        )
-        return None
-
-    batch_sizes = draft_graph_batch_sizes()
-    if not batch_sizes:
-        return eager("no draft graph batch sizes to size the static buffers from")
-    max_bs = batch_sizes[-1]
-
+) -> LiLiCorrDraftSampler:
     reject_added_vocab(lm_head)
     parameter = head.slot_embedding
     head.materialize_inference_buffers(parameter.device, parameter.dtype)

@@ -42,6 +42,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import SamplingPrewarmResult
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+    get_batch_sizes_to_capture,
+)
 from sglang.srt.model_executor.runner_utils.pool import (
     disable_graph_pool_borrow,
     graph_pool_borrow_enabled,
@@ -453,6 +456,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
+        self._draft_sampler_max_bs = 0
         self.draft_model = bundle.draft_model
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
@@ -915,6 +919,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
         if self.block_size <= 1:
             return _eager("block_size<=1")
+        runner = self.draft_model_runner
+        capture_bs, _ = get_batch_sizes_to_capture(
+            runner,
+            runner.decode_num_tokens_per_req(
+                num_draft_tokens=get_spec().speculative_num_draft_tokens
+            ),
+            gathered_buffer_required=any(runner.decode_graph_gather_requirements()),
+        )
+        self._draft_sampler_max_bs = max(capture_bs)
         target_model = self._target_worker.model_runner.model
         lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
         if lm_head is None:
@@ -942,7 +955,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             return _SelectorDraftSampler(
                 draft_model=self.draft_model,
                 block_size=self.block_size,
-                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                max_bs=self._draft_sampler_max_bs,
                 device=self.device,
                 sampling_enabled=self._selector_sampling_enabled,
             )
@@ -952,6 +965,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             return build_lilicorr_draft_sampler(
                 sampling_enabled=self._lilicorr_sampling_enabled,
                 head=self.lilicorr,
+                max_bs=self._draft_sampler_max_bs,
                 draft_model=self.draft_model,
                 embed_tokens=target_input_embeddings(target_model),
                 lm_head=lm_head,
@@ -982,7 +996,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 vocab_size=int(self.model_runner.model_config.vocab_size),
                 block_size=self.block_size,
                 shift_label=self.draft_model.shift_label,
-                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                max_bs=self._draft_sampler_max_bs,
                 candidate_pool_size=self.domino_candidate_pool_size,
                 tp_group=tp_group,
                 lm_head_org_vocab_start=(
@@ -1017,7 +1031,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             block_size=self.block_size,
             num_org=num_org,
             org_vocab_start=org_vocab_start,
-            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+            max_bs=self._draft_sampler_max_bs,
             tp_group=tp_group if tp_group.world_size > 1 else None,
         )
 
@@ -2797,24 +2811,35 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
-            if self._draft_sampler is not None:
-                # Consumed by the in-graph sample; must be staged before the replay.
-                self._draft_sampler.stage_sampling_params(
-                    bs=bs, sampling_info=batch.sampling_info
-                )
 
         with (
             torch.inference_mode(),
             draft_tp_context(self.draft_parallel_layout),
         ):
-            draft_out = self.draft_model_runner.forward(forward_batch)
+            runner = self.draft_model_runner
+            mode_check = (
+                forward_batch.forward_mode.is_cpu_graph
+                if runner.device == "cpu"
+                else forward_batch.forward_mode.is_cuda_graph
+            )
+            runs_sampler_graph = bool(
+                self._draft_sampler is not None
+                and bs <= self._draft_sampler_max_bs
+                and mode_check()
+                and runner.decode_cuda_graph_runner is not None
+                and runner.decode_cuda_graph_runner.can_run_graph(forward_batch)
+            )
+            if runs_sampler_graph and (
+                self.selector is not None or self.lilicorr is not None
+            ):
+                # Static sampling buffers belong only to admitted graph replays.
+                self._draft_sampler.stage_sampling_params(
+                    bs=bs, sampling_info=batch.sampling_info
+                )
+            draft_out = runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if (
-            self._is_domino
-            and self._draft_sampler is not None
-            and draft_out.can_run_graph
-        ):
+        if self._is_domino and runs_sampler_graph and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
@@ -2851,7 +2876,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 in_cuda_graph=False,
             )
-        elif self._draft_sampler is not None and draft_out.can_run_graph:
+        elif runs_sampler_graph and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
