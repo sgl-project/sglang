@@ -9,6 +9,8 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -32,16 +34,6 @@ def _load_backend():
         "sglang.srt.mem_cache.memory_pool": {"KVWriteLoc": Mock()},
         "sglang.srt.model_executor.forward_batch_info": {
             "ForwardBatch": object,
-        },
-        "sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph": {
-            "is_in_breakable_cuda_graph": lambda: False,
-        },
-        "sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph": {
-            "is_in_tc_piecewise_cuda_graph": lambda: False,
-        },
-        "sglang.srt.speculative.spec_info": {
-            "SpecInput": object,
-            "SpecInputType": Mock(),
         },
         "sglang.srt.speculative.spec_utils": {
             "draft_kv_indices_buffer_width": Mock(),
@@ -144,14 +136,9 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
             )
         return backend
 
-    def _batch(self, *, decode=False, verify=False, draft=False, spec_info=None):
+    def _batch(self, *, mode=ForwardMode.EXTEND, spec_info=None):
         return SimpleNamespace(
-            forward_mode=SimpleNamespace(
-                is_decode_or_idle=lambda: decode,
-                is_decode=lambda: decode,
-                is_target_verify=lambda: verify,
-                is_draft_extend_v2=lambda: draft,
-            ),
+            forward_mode=mode,
             spec_info=spec_info,
             seq_lens=torch.tensor([3, 2], dtype=torch.int32),
             seq_lens_sum=5,
@@ -177,7 +164,7 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
             return original_empty(*args, **kwargs)
 
         with patch.object(torch, "empty", side_effect=cpu_empty):
-            backend.init_forward_metadata(self._batch(decode=True))
+            backend.init_forward_metadata(self._batch(mode=ForwardMode.DECODE))
         torch.testing.assert_close(backend.forward_metadata.kv_rows, rows)
         torch.testing.assert_close(
             backend.decode_wrapper.plan.call_args.args[2],
@@ -190,16 +177,16 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
             None,
             None,
             layer,
-            self._batch(decode=True),
+            self._batch(mode=ForwardMode.DECODE),
         )
         kv_inputs = backend.decode_wrapper.run.call_args.args[2:4]
         expected = backend.kv_layers.read(0).key().to(torch.bfloat16)[rows.long()]
         torch.testing.assert_close(
             torch.cat(kv_inputs, dim=-1), expected, rtol=0, atol=0
         )
-        spec = SimpleNamespace(
-            kv_indices=rows, kv_indptr=torch.tensor([0, 3, 5], dtype=torch.int32)
-        )
+        spec = SpecInput(SpecInputType.EAGLE_DRAFT)
+        spec.kv_indices = rows
+        spec.kv_indptr = torch.tensor([0, 3, 5], dtype=torch.int32)
         result = updater.update(
             torch.tensor([3, 2]),
             5,
@@ -218,7 +205,9 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
                 with self.subTest(decode=decode, count=count):
                     rows = torch.arange(count, dtype=torch.int32).remainder(23)
                     backend = self._backend(rows=rows)
-                    batch = self._batch(decode=decode)
+                    batch = self._batch(
+                        mode=ForwardMode.DECODE if decode else ForwardMode.EXTEND
+                    )
                     batch.seq_lens = torch.tensor([count - 2, 2], dtype=torch.int32)
                     batch.seq_lens_sum = count
                     original_empty = torch.empty
@@ -289,10 +278,14 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
                 )
                 if kind == "oversized":
                     backend.fp8_kv_reader.pool_rows = 4
+                mode = ForwardMode.EXTEND
+                if kind == "draft":
+                    mode = ForwardMode.DRAFT_EXTEND_V2
+                elif kind == "verify":
+                    mode = ForwardMode.TARGET_VERIFY
                 batch = self._batch(
-                    draft=kind == "draft",
+                    mode=mode,
                     spec_info=object() if kind == "spec" else None,
-                    verify=kind == "verify",
                 )
                 if kind == "dcp":
                     batch.attn_dcp_metadata = SimpleNamespace(
@@ -346,7 +339,8 @@ class TestFlashInferMLABoundedKV(CustomTestCase):
                 backend.skip_prefill = kind == "draft"
                 self.parallel.dcp_enabled = kind == "dcp"
                 batch = self._batch(
-                    decode=True, spec_info=object() if kind == "spec" else None
+                    mode=ForwardMode.DECODE,
+                    spec_info=object() if kind == "spec" else None,
                 )
                 layer = SimpleNamespace(
                     layer_id=0, tp_q_head_num=1, v_head_dim=4, head_dim=8
