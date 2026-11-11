@@ -1295,7 +1295,13 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        self.spec_context_reserve = compute_spec_context_reserve(self.enable_overlap)
+        self.spec_context_reserve = compute_spec_context_reserve(
+            enable_overlap=self.enable_overlap,
+            # Overlap without PD disaggregation runs event_loop_overlap, which
+            # turns on enable_skip_finishing_decode.
+            skip_finishing_decode=self.enable_overlap
+            and get_disagg().disaggregation_mode == "null",
+        )
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None

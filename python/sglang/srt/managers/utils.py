@@ -541,23 +541,46 @@ def compute_num_reserved_tokens() -> int:
     )
 
 
-def compute_spec_context_reserve(enable_overlap: bool) -> int:
-    """Context slots kept free past a request's length cap for spec lookahead.
+def compute_spec_context_reserve(
+    enable_overlap: bool, skip_finishing_decode: bool = False
+) -> int:
+    """Context slots to keep free past a request's length cap for spec lookahead.
 
-    A step can accept up to one verify window past the cap, and one more window
-    of lookahead can still read the finished request: under overlap the
-    already-launched next batch verifies it once more, and under pipeline
-    parallelism (overlap off) the last stage tail-drafts its next chain from the
-    untrimmed seq_lens in the same step (EAGLEWorkerV2). Both windows must stay
-    within context_len (FA3 page table, RoPE cache). Every algorithm that
-    verifies a draft window needs this, not only EAGLE, whose window
-    additionally covers the draft tokens stored in output slots.
+    The cap is B <= context_len - 2 - reserve. The last step that sees a request
+    unfinished starts at seq_lens <= B - 2, as seq_lens leaves out the bonus token,
+    so the reads from there on may go 4 + reserve slots past that seq_lens:
+    - D: the step verifies D draft tokens and can accept all of them.
+    - 2D under overlap: the next batch verifies the finished request once more;
+      2D - 1 with skip_finishing_decode, which drops a request whose in-flight
+      step started at B - 2.
+    - 2D - 2 under PP: the last stage tail-drafts the next chain (EAGLEWorkerV2).
+    That is exact for single-chain verifies; other algorithms keep a whole window
+    per pass, which also covers the draft tokens EAGLE stores in output slots.
     """
-    if SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm).is_none():
+    spec = get_spec()
+    algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
+    if algorithm.is_none():
         return 0
-    window = max(compute_num_reserved_tokens(), max_speculative_num_draft_tokens() or 0)
-    two_windows = enable_overlap or get_parallel().pp_size > 1
-    return window * (2 if two_windows else 1)
+    num_draft_tokens = max_speculative_num_draft_tokens() or 0
+    pipeline = not enable_overlap and get_parallel().pp_size > 1
+    single_chain = algorithm in (
+        SpeculativeAlgorithm.DFLASH,
+        SpeculativeAlgorithm.DSPARK,
+    ) or (
+        algorithm in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.EAGLE3)
+        and spec.speculative_eagle_topk == 1
+        and not spec.enable_multi_layer_eagle
+    )
+    if not single_chain:
+        window = max(compute_num_reserved_tokens(), num_draft_tokens)
+        return window * (2 if enable_overlap or pipeline else 1)
+    if enable_overlap:
+        lookahead = 2 * num_draft_tokens - (1 if skip_finishing_decode else 0)
+    elif pipeline:
+        lookahead = 2 * num_draft_tokens - 2
+    else:
+        lookahead = num_draft_tokens
+    return max(0, lookahead - 4)
 
 
 def make_abort_req(

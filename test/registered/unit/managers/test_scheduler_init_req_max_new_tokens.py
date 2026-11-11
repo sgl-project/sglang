@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import compute_spec_context_reserve
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
@@ -227,116 +228,142 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             self.assertEqual(self._init_and_check(scheduler, req), 16)
             self.assertEqual(req.sampling_params.min_new_tokens, 16)
 
+    def _spec_reserve(
+        self,
+        *,
+        algorithm,
+        num_steps,
+        num_draft_tokens,
+        enable_overlap=False,
+        skip_finishing_decode=False,
+        pp_size=1,
+        **server_args,
+    ):
+        server_args = {
+            "speculative_algorithm": algorithm,
+            "speculative_num_steps": num_steps,
+            "speculative_eagle_topk": 1,
+            "speculative_num_draft_tokens": num_draft_tokens,
+            **server_args,
+        }
+        with (
+            get_context().override_server_args(**server_args),
+            get_parallel().override(pp_size=pp_size),
+        ):
+            return compute_spec_context_reserve(
+                enable_overlap=enable_overlap,
+                skip_finishing_decode=skip_finishing_decode,
+            )
+
+    def _assert_reads_end_at_context(self, *, reserve, reads_past_start):
+        """Reads that reach reads_past_start past the last unfinished step's
+        seq_lens (B - 2) stay within context_len, and hit it where the cap binds."""
+        context_len, input_len = 4096, 25
+        max_req_len = context_len - 1  # TpModelWorker.get_worker_info
+        for requested in (None, 1 << 20, context_len - 4 - input_len):
+            with self.subTest(reserve=reserve, requested=requested):
+                scheduler = self._new_scheduler(
+                    max_req_len=max_req_len,
+                    max_total_num_tokens=1 << 20,
+                    spec_context_reserve=reserve,
+                )
+                req = self._new_req(max_new_tokens=requested, input_len=input_len)
+                max_new_tokens = self._init_and_check(scheduler, req)
+                read = input_len + max_new_tokens - 2 + reads_past_start
+                self.assertLessEqual(read, context_len)
+                if requested is None or max_new_tokens < requested:
+                    self.assertEqual(read, context_len)
+
+    # (algorithm, num_steps, num_draft_tokens) of single-chain verifies.
+    _CHAINS = (
+        ("EAGLE", 3, 4),
+        ("EAGLE", 5, 6),
+        ("EAGLE", 6, 7),
+        ("EAGLE3", 7, 8),
+        ("DFLASH", None, 16),
+        ("DSPARK", None, 8),
+    )
+
     def test_no_spec_keeps_full_context(self):
         with get_context().override_server_args(speculative_algorithm=None):
             self.assertEqual(compute_spec_context_reserve(enable_overlap=True), 0)
 
-    def test_spec_overlap_tail_step_stays_within_context(self):
-        """A request run to the length cap under spec + overlap: the tail step's
-        accept-then-verify KV length must not exceed context_len."""
-        context_len, input_len = 4096, 25
-        max_req_len = context_len - 1  # TpModelWorker.get_worker_info
-
-        def tail_kv_len(max_new_tokens, num_draft_tokens):
-            # The last unfinished step accepts up to num_draft_tokens (bonus
-            # included, its KV not yet written); the tail step verifies that many.
-            return input_len + max_new_tokens + 2 * num_draft_tokens - 2
-
-        # EAGLE chains with 4 and 6 draft tokens (reserving num_draft_tokens once
-        # is not enough at 6), and a DFLASH block of 16, which reserves nothing
-        # in TokenizerManager.
-        for algorithm, num_steps, num_draft_tokens in (
-            ("EAGLE", 3, 4),
-            ("EAGLE", 5, 6),
-            ("DFLASH", None, 16),
-        ):
-            with get_context().override_server_args(
-                speculative_algorithm=algorithm,
-                speculative_num_steps=num_steps,
-                speculative_eagle_topk=1,
-                speculative_num_draft_tokens=num_draft_tokens,
-            ):
-                reserve = compute_spec_context_reserve(enable_overlap=True)
-            for requested in (None, 1 << 20, context_len - 4 - input_len):
-                with self.subTest(
+    def test_spec_verify_stays_within_context(self):
+        """The last unfinished step verifies and accepts D tokens past the cap."""
+        for algorithm, num_steps, num_draft_tokens in self._CHAINS:
+            self._assert_reads_end_at_context(
+                reserve=self._spec_reserve(
                     algorithm=algorithm,
+                    num_steps=num_steps,
                     num_draft_tokens=num_draft_tokens,
-                    requested=requested,
-                ):
-                    scheduler = self._new_scheduler(
-                        max_req_len=max_req_len,
-                        max_total_num_tokens=1 << 20,
-                        spec_context_reserve=reserve,
-                    )
-                    req = self._new_req(max_new_tokens=requested, input_len=input_len)
-                    max_new_tokens = self._init_and_check(scheduler, req)
-                    self.assertLessEqual(
-                        tail_kv_len(max_new_tokens, num_draft_tokens), context_len
-                    )
+                ),
+                reads_past_start=num_draft_tokens,
+            )
 
-        # Without the reserve the tail step overruns the context (the bug).
-        scheduler = self._new_scheduler(
-            max_req_len=max_req_len, max_total_num_tokens=1 << 20
-        )
-        req = self._new_req(max_new_tokens=None, input_len=input_len)
-        self.assertGreater(
-            tail_kv_len(self._init_and_check(scheduler, req), 4), context_len
-        )
+    def test_spec_overlap_tail_step_stays_within_context(self):
+        """Under overlap the finished request gets one more verify past the accept,
+        one slot lower with skip_finishing_decode."""
+        for algorithm, num_steps, num_draft_tokens in self._CHAINS:
+            for skip, tick_offset in ((False, 0), (True, 1)):
+                self._assert_reads_end_at_context(
+                    reserve=self._spec_reserve(
+                        algorithm=algorithm,
+                        num_steps=num_steps,
+                        num_draft_tokens=num_draft_tokens,
+                        enable_overlap=True,
+                        skip_finishing_decode=skip,
+                    ),
+                    reads_past_start=2 * num_draft_tokens - tick_offset,
+                )
+
+    def test_skip_finishing_decode_drops_the_last_step(self):
+        """A request whose in-flight step started at B - 2 skips the next batch;
+        one from B - 3 does not (the CPU lags one step behind)."""
+        input_len, max_new_tokens = 25, 100
+        cap = input_len + max_new_tokens
+        for start, skipped in ((cap - 2, True), (cap - 3, False)):
+            # Outputs through the previous step; seq_lens leaves out the bonus token.
+            req = SimpleNamespace(
+                output_ids=[0] * (start - input_len + 1),
+                sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
+            )
+            with self.subTest(start=start):
+                self.assertEqual(Req.next_output_finishes_by_length(req), skipped)
 
     def test_spec_pp_tail_draft_stays_within_context(self):
-        """A request run to the length cap under PP spec: overlap is off, but the
-        last stage tail-drafts the next chain in the same step, so the draft's
-        KV length must not exceed context_len."""
-        context_len, input_len = 4096, 25
-        max_req_len = context_len - 1  # TpModelWorker.get_worker_info
-
-        def tail_draft_kv_len(max_new_tokens, num_steps, num_draft_tokens):
-            # The last unfinished step accepts up to num_draft_tokens onto
-            # seq_lens; the tail draft decodes num_steps - 1 positions past that.
-            return input_len + max_new_tokens - 2 + num_draft_tokens + num_steps - 1
-
-        def reserve_for(num_steps, num_draft_tokens, pp_size):
-            with (
-                get_context().override_server_args(
-                    speculative_algorithm="EAGLE",
-                    speculative_num_steps=num_steps,
-                    speculative_eagle_topk=1,
-                    speculative_num_draft_tokens=num_draft_tokens,
+        """Under PP the last stage tail-drafts num_steps - 1 slots past the accept."""
+        for num_steps in (3, 5, 6, 7):
+            num_draft_tokens = num_steps + 1
+            self._assert_reads_end_at_context(
+                reserve=self._spec_reserve(
+                    algorithm="EAGLE",
+                    num_steps=num_steps,
+                    num_draft_tokens=num_draft_tokens,
+                    pp_size=2,
                 ),
-                get_parallel().override(pp_size=pp_size),
-            ):
-                return compute_spec_context_reserve(enable_overlap=False)
+                reads_past_start=num_draft_tokens + num_steps - 1,
+            )
 
-        # EAGLE chains up to 8 draft tokens; reserving one window only covers
-        # chains of 6 draft tokens or fewer.
-        for num_steps, num_draft_tokens in ((3, 4), (5, 6), (6, 7), (7, 8)):
-            reserve = reserve_for(num_steps, num_draft_tokens, pp_size=2)
-            for requested in (None, 1 << 20, context_len - 4 - input_len):
+    def test_spec_reserve_off_chain_keeps_whole_windows(self):
+        """Algorithms outside the exact form keep a whole window per pass."""
+        for algorithm, num_steps, num_draft_tokens, window, server_args in (
+            ("EAGLE", 3, 8, 12, {"speculative_eagle_topk": 4}),
+            ("EAGLE", 3, 4, 4, {"enable_multi_layer_eagle": True}),
+            ("FROZEN_KV_MTP", 3, 4, 4, {}),
+            ("NGRAM", 3, 12, 12, {}),
+        ):
+            for enable_overlap, passes in ((False, 1), (True, 2)):
                 with self.subTest(
-                    num_draft_tokens=num_draft_tokens, requested=requested
+                    algorithm=algorithm, enable_overlap=enable_overlap, **server_args
                 ):
-                    scheduler = self._new_scheduler(
-                        max_req_len=max_req_len,
-                        max_total_num_tokens=1 << 20,
-                        spec_context_reserve=reserve,
+                    reserve = self._spec_reserve(
+                        algorithm=algorithm,
+                        num_steps=num_steps,
+                        num_draft_tokens=num_draft_tokens,
+                        enable_overlap=enable_overlap,
+                        **server_args,
                     )
-                    req = self._new_req(max_new_tokens=requested, input_len=input_len)
-                    max_new_tokens = self._init_and_check(scheduler, req)
-                    self.assertLessEqual(
-                        tail_draft_kv_len(max_new_tokens, num_steps, num_draft_tokens),
-                        context_len,
-                    )
-
-        # The single non-overlap window overruns the context at 7 draft tokens.
-        scheduler = self._new_scheduler(
-            max_req_len=max_req_len,
-            max_total_num_tokens=1 << 20,
-            spec_context_reserve=reserve_for(6, 7, pp_size=1),
-        )
-        req = self._new_req(max_new_tokens=None, input_len=input_len)
-        self.assertGreater(
-            tail_draft_kv_len(self._init_and_check(scheduler, req), 6, 7), context_len
-        )
+                    self.assertEqual(reserve, window * passes)
 
     def test_unified_budget_rounds_prompt_and_decode_together(self):
         bundle = build_test_unified_pools(
