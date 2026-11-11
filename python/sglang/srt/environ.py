@@ -390,6 +390,12 @@ class Envs:
     SGLANG_OPT_SCHEDULER_LEADER_LINK_SPIN = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Graph-input staging (_grouped_foreach_copy_ of the decode / draft / draft-extend runners)
+    # through a JIT small-field copy plan cached per destination layout, ahead of the Triton
+    # small_copy whose per-call checks and launch cost ~100 us of host time.
+    SGLANG_OPT_CUDA_GRAPH_FIELD_COPY_PLAN = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

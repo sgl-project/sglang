@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
+_FIELD_COPY_PLAN = envs.SGLANG_OPT_CUDA_GRAPH_FIELD_COPY_PLAN.get()
 
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
@@ -59,6 +60,13 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
                 dst.copy_(src)
 
     if dsts and dsts[0].is_cuda:
+        if _FIELD_COPY_PLAN:
+            from sglang.kernels.ops.memory.small_field_copy import (
+                cached_small_field_copy,
+            )
+
+            if cached_small_field_copy(dsts, srcs):
+                return
         fast_path = envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.get()
         if fast_path and _has_foreach_copy and _one_dense_int_pair(dsts, srcs):
             # One foreach launch already writes what the small copy would; that kernel
