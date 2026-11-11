@@ -1044,16 +1044,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         extra_kwargs = {}
         if self.backend != "trtllm-gen":
             extra_kwargs["backend"] = self.backend
-        else:
+        elif (
+            is_sm100_supported()
+            and not (64 < query.size(-2) < 128)
+            and kv_cache.size(-2) in (32, 64)
+        ):
+            # FlashInfer defaults backend="auto", which builds every candidate
+            # runner and runs AutoTuner selection on each eager decode call.
+            # Pass backend="trtllm-gen" and its caller-owned counter buffer
+            # explicitly when trtllm-gen is eligible on SM10x; omit both on
+            # SM12x XQA and 64 < H < 128 / non-(32, 64) page-size fallbacks,
+            # where FlashInfer rejects multi_ctas_kv_counter_buffer.
+            extra_kwargs["backend"] = "trtllm-gen"
             extra_kwargs["multi_ctas_kv_counter_buffer"] = (
                 self._multi_ctas_kv_counter_buffer
             )
-            # FlashInfer defaults backend="auto", which builds every candidate
-            # runner and runs AutoTuner selection on each eager decode call.
-            # Pass backend="trtllm-gen" explicitly on SM10x outside trtllm-gen's
-            # (64, 128) head-count hole; leave "auto" for SM12x XQA and 64 < H < 128.
-            if is_sm100_supported() and not (64 < query.size(-2) < 128):
-                extra_kwargs["backend"] = "trtllm-gen"
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,

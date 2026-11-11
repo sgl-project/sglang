@@ -33,16 +33,33 @@ class TestTRTLLMMLAExplicitBackend(CustomTestCase):
         *,
         query: torch.Tensor,
         sm100_supported: bool,
+        page_size: int = 64,
         return_lse: bool = False,
     ) -> dict:
         captured: list[dict] = []
         sentinel = (torch.empty(0), torch.empty(0)) if return_lse else torch.empty(0)
-        flashinfer_stub = SimpleNamespace(
-            decode=SimpleNamespace(
-                trtllm_batch_decode_with_kv_cache_mla=lambda **kw: (
-                    captured.append(kw) or sentinel
-                )
+
+        def fake_decode(**kw):
+            backend_arg = kw.get("backend", "auto")
+            trtllm_eligible = (
+                sm100_supported
+                and not (64 < kw["query"].size(-2) < 128)
+                and kw["kv_cache"].size(-2) in (32, 64)
             )
+            if kw.get("multi_ctas_kv_counter_buffer") is not None:
+                if backend_arg not in ("auto", "trtllm-gen"):
+                    raise ValueError(
+                        "multi_ctas_kv_counter_buffer is only supported by the trtllm-gen backend"
+                    )
+                if backend_arg == "auto" and not trtllm_eligible:
+                    raise ValueError(
+                        "multi_ctas_kv_counter_buffer is only supported when a trtllm-gen runner is selected"
+                    )
+            captured.append(kw)
+            return sentinel
+
+        flashinfer_stub = SimpleNamespace(
+            decode=SimpleNamespace(trtllm_batch_decode_with_kv_cache_mla=fake_decode)
         )
         parallel = SimpleNamespace(dcp_enabled=False, dcp_size=1, dcp_rank=0)
         layer = SimpleNamespace(scaling=0.125, k_scale_float=None)
@@ -58,7 +75,7 @@ class TestTRTLLMMLAExplicitBackend(CustomTestCase):
         ):
             out = backend._run_decode_kernel(
                 query=query,
-                kv_cache=torch.zeros((4, 1, 64, 576), dtype=torch.bfloat16),
+                kv_cache=torch.zeros((4, 1, page_size, 576), dtype=torch.bfloat16),
                 block_tables=torch.zeros((2, 4), dtype=torch.int32),
                 seq_lens=torch.tensor([32, 64], dtype=torch.int64),
                 max_seq_len=64,
@@ -73,27 +90,32 @@ class TestTRTLLMMLAExplicitBackend(CustomTestCase):
     def test_sm100_supported_head_counts_pass_explicit_trtllm_gen(self):
         backend = self._make_backend("trtllm-gen")
         for num_heads in (16, 64, 128):
-            for q_len in (1, 4):
-                for return_lse in (False, True):
-                    with self.subTest(
-                        num_heads=num_heads, q_len=q_len, return_lse=return_lse
-                    ):
-                        query = torch.zeros(
-                            (2, q_len, num_heads, 576), dtype=torch.bfloat16
-                        )
-                        kw = self._invoke_decode(
-                            backend,
-                            query=query,
-                            sm100_supported=True,
+            for page_size in (32, 64):
+                for q_len in (1, 4):
+                    for return_lse in (False, True):
+                        with self.subTest(
+                            num_heads=num_heads,
+                            page_size=page_size,
+                            q_len=q_len,
                             return_lse=return_lse,
-                        )
-                        self.assertEqual(kw.get("backend"), "trtllm-gen")
-                        self.assertIs(
-                            kw.get("multi_ctas_kv_counter_buffer"),
-                            backend._multi_ctas_kv_counter_buffer,
-                        )
-                        self.assertEqual(kw["seq_lens"].dtype, torch.int32)
-                        self.assertEqual(kw["return_lse"], return_lse)
+                        ):
+                            query = torch.zeros(
+                                (2, q_len, num_heads, 576), dtype=torch.bfloat16
+                            )
+                            kw = self._invoke_decode(
+                                backend,
+                                query=query,
+                                sm100_supported=True,
+                                page_size=page_size,
+                                return_lse=return_lse,
+                            )
+                            self.assertEqual(kw.get("backend"), "trtllm-gen")
+                            self.assertIs(
+                                kw.get("multi_ctas_kv_counter_buffer"),
+                                backend._multi_ctas_kv_counter_buffer,
+                            )
+                            self.assertEqual(kw["seq_lens"].dtype, torch.int32)
+                            self.assertEqual(kw["return_lse"], return_lse)
 
     def test_sm100_three_dim_query_passes_explicit_trtllm_gen(self):
         backend = self._make_backend("trtllm-gen")
@@ -105,27 +127,35 @@ class TestTRTLLMMLAExplicitBackend(CustomTestCase):
             backend._multi_ctas_kv_counter_buffer,
         )
 
-    def test_sm100_head_count_hole_falls_back_to_auto(self):
+    def test_sm100_head_count_hole_falls_back_to_auto_without_counter_buffer(self):
         backend = self._make_backend("trtllm-gen")
         for num_heads in (65, 96, 127):
             with self.subTest(num_heads=num_heads):
                 query = torch.zeros((2, 1, num_heads, 576), dtype=torch.bfloat16)
                 kw = self._invoke_decode(backend, query=query, sm100_supported=True)
                 self.assertNotIn("backend", kw)
-                self.assertIs(
-                    kw.get("multi_ctas_kv_counter_buffer"),
-                    backend._multi_ctas_kv_counter_buffer,
-                )
+                self.assertNotIn("multi_ctas_kv_counter_buffer", kw)
 
-    def test_non_sm100_falls_back_to_auto_for_sm12x_xqa(self):
+    def test_sm100_non_trtllm_page_size_falls_back_to_auto_without_counter_buffer(self):
+        backend = self._make_backend("trtllm-gen")
+        for page_size in (16, 128):
+            with self.subTest(page_size=page_size):
+                query = torch.zeros((2, 1, 128, 576), dtype=torch.bfloat16)
+                kw = self._invoke_decode(
+                    backend,
+                    query=query,
+                    sm100_supported=True,
+                    page_size=page_size,
+                )
+                self.assertNotIn("backend", kw)
+                self.assertNotIn("multi_ctas_kv_counter_buffer", kw)
+
+    def test_non_sm100_falls_back_to_auto_for_sm12x_xqa_without_counter_buffer(self):
         backend = self._make_backend("trtllm-gen")
         query = torch.zeros((2, 1, 128, 576), dtype=torch.bfloat16)
         kw = self._invoke_decode(backend, query=query, sm100_supported=False)
         self.assertNotIn("backend", kw)
-        self.assertIs(
-            kw.get("multi_ctas_kv_counter_buffer"),
-            backend._multi_ctas_kv_counter_buffer,
-        )
+        self.assertNotIn("multi_ctas_kv_counter_buffer", kw)
 
     def test_non_trtllm_gen_backend_forwards_explicit_backend_without_counter_buffer(
         self,
