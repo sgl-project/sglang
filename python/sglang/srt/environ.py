@@ -418,6 +418,9 @@ class Envs:
     SGLANG_OPT_SPEC_INDEX_OUTPUT_RING = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # With SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION: post-verify graph sets (batch shape x
+    # verify logits buffer) kept before a new one runs eager (64 without the master).
+    SGLANG_POST_VERIFY_MAX_GRAPH_KEYS = EnvInt(64)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

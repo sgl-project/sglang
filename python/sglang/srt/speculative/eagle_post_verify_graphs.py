@@ -31,9 +31,17 @@ logger = logging.getLogger(__name__)
 
 # Eager rounds per post-verify key before its graphs are captured.
 _NUM_WARMUP = 2
-# Arbitrary bound on post-verify graph sets (key x verify logits buffer); a batch
-# past it runs SGLang's eager path.
-_MAX_POST_VERIFY_STATES = 64
+
+
+def _max_graph_keys() -> int:
+    """Arbitrary bound on post-verify graph sets (key x verify logits buffer); a batch
+    past it runs SGLang's eager path."""
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return 64
+    return envs.SGLANG_POST_VERIFY_MAX_GRAPH_KEYS.get()
+
+
+_MAX_POST_VERIFY_STATES = _max_graph_keys()
 # SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD: a round's inputs and its forced length staged in one launch.
 _ONE_LAUNCH_LOAD = envs.SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD.get()
 
