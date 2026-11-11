@@ -58,6 +58,22 @@ def register_model_override_predicate(predicate: Callable[[str], bool]):
     return decorator
 
 
+# --moe-a2a-backend values DSpark with DP attention is validated on, per
+# architecture that differs from the default.
+DSPARK_DP_A2A_BACKENDS_DEFAULT: Tuple[str, ...] = ("none", "megamoe", "mori")
+_DSPARK_DP_A2A_BACKENDS: Dict[str, Tuple[str, ...]] = {}
+
+
+def register_dspark_dp_a2a_backends(
+    architecture: str, backends: Tuple[str, ...]
+) -> None:
+    _DSPARK_DP_A2A_BACKENDS[architecture] = backends
+
+
+def dspark_dp_a2a_backends(architecture: str) -> Tuple[str, ...]:
+    return _DSPARK_DP_A2A_BACKENDS.get(architecture, DSPARK_DP_A2A_BACKENDS_DEFAULT)
+
+
 def _invoke_provider(
     fn: Callable[..., dict], server_args: Any, hf_config: Any
 ) -> Dict[str, Any]:

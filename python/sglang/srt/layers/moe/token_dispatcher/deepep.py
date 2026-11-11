@@ -305,6 +305,12 @@ class DeepEPBuffer:
         return state.buffer
 
     @classmethod
+    def layout_num_experts(cls):
+        """The expert count the low-latency buffer's zero-initialized signalling state is laid out for (its creator's);
+        every low-latency call must use it, or the counters a call leaves behind are read as another layout's."""
+        return cls._state().num_experts
+
+    @classmethod
     def clean_buffer(cls):
         state = cls._state()
         if not state.buffer.low_latency_mode:
@@ -757,6 +763,34 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.device_module = torch.get_device_module()
         self.quant_config = {}
 
+    def _buffer_layout(self):
+        """(buffer's expert count, this layer's local experts, the buffer's local experts) when this layer has fewer
+        experts than the shared buffer is laid out for (a speculative draft's MoE beside its target's), else None."""
+        total = DeepEPBuffer.layout_num_experts()
+        if total is None or total == self.num_experts:
+            return None
+        ranks = self.group.size()
+        local, local_total = self.num_experts // ranks, total // ranks
+        if self.num_experts % ranks or total % ranks or local > local_total:
+            raise NotImplementedError(
+                f"DeepEP low-latency buffer is laid out for {total} experts; a layer with {self.num_experts} "
+                "experts can use it only when it has no more local experts per rank"
+            )
+        if self.overlap_args is not None:
+            raise NotImplementedError(
+                "DeepEP combine overlap with a layer narrower than the shared buffer"
+            )
+        return total, local, local_total
+
+    @staticmethod
+    def _to_buffer_ids(topk_ids, layout):
+        """This layer's expert ids in the buffer's layout: expert e of rank e // local sits at the same rank's local
+        slot e % local of the wider layout (the remaining slots receive nothing)."""
+        _, local, local_total = layout
+        return torch.where(
+            topk_ids >= 0, (topk_ids // local) * local_total + topk_ids % local, -1
+        )
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -837,14 +871,15 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
         buffer = self._get_buffer()
+        layout = self._buffer_layout()
         _deepep_precompile_tp_barrier()
         npu_mxfp_quantization_opts = self._get_npu_mxfp_quantization_kwargs(buffer)
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
-                topk_ids,
+                topk_ids if layout is None else self._to_buffer_ids(topk_ids, layout),
                 self.num_max_dispatch_tokens_per_rank,
-                self.num_experts,
+                self.num_experts if layout is None else layout[0],
                 use_fp8=self.use_fp8,
                 **npu_mxfp_quantization_opts,
                 **(
@@ -863,6 +898,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 **fp8_deepgemm_scale_opts,
             )
         )
+        if layout is not None:
+            local = layout[1]
+            packed_recv_hidden = (
+                tuple(t[:local] for t in packed_recv_hidden)
+                if isinstance(packed_recv_hidden, tuple)
+                else packed_recv_hidden[:local]
+            )
+            self.packed_recv_count = self.packed_recv_count[:local]
         return packed_recv_hidden, self.packed_recv_count, event, hook
 
     def _get_npu_mxfp_quantization_kwargs(self, buffer: Buffer) -> dict:
@@ -945,6 +988,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         else:
             overlap_args_dict = {}
 
+        layout = self._buffer_layout()
+        if layout is not None:
+            # The buffer's wider local slots received no rows; the combine reads none of them.
+            padded = hidden_states.new_zeros((layout[2], *hidden_states.shape[1:]))
+            padded[: layout[1]] = hidden_states
+            hidden_states, topk_ids = padded, self._to_buffer_ids(topk_ids, layout)
         with ctx:
             _deepep_precompile_tp_barrier()
             combined_hidden_states, event, hook = buffer.low_latency_combine(
