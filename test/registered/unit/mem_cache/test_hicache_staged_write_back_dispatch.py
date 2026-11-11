@@ -8,6 +8,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import l2_transfer as transfer_module
@@ -690,6 +691,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         self.assertEqual(fallback.call_count, 0)
         self.assertEqual(load.call_count, layer_num)
         can_use_write_back_jit_kernel.assert_not_called()
+        # No SGLANG_HICACHE_LOAD_BLOCK_QUOTA: the load keeps the stock quota.
+        for call in load.call_args_list:
+            self.assertIsNone(call.kwargs["block_quota"])
         for layer_id in range(layer_num):
             self.assertTrue(
                 torch.equal(k_layers[layer_id][device_indices], expected_k[layer_id])
@@ -703,6 +707,70 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             self.assertTrue(
                 torch.equal(host.v_buffer[host_indices, layer_id], expected_v[layer_id])
             )
+
+    def test_mha_load_block_quota_needs_the_master_and_a_jit_layout(self):
+        """SGLANG_HICACHE_LOAD_BLOCK_QUOTA sets the CTA quota of the per-layer JIT
+        load, read only with the runtime master, for layer_first / page_first pools
+        whose JIT kernel builds at that quota; anything else keeps the stock quota."""
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        quota_env = envs.SGLANG_HICACHE_LOAD_BLOCK_QUOTA
+
+        def resolve(*, master_on, quota, layout="page_first", jit=True, builds=True):
+            host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+            host.layout, host.can_use_jit = layout, jit
+            host.page_size, host.element_dim, host.dtype = 64, 512, torch.bfloat16
+            with (
+                master.override(master_on),
+                quota_env.override(quota),
+                mock.patch(f"{MHA_POOL_HOST_MODULE}._is_cuda", True),
+                mock.patch(
+                    f"{MHA_POOL_HOST_MODULE}.can_use_hicache_jit_kernel",
+                    return_value=builds,
+                ) as can_use,
+                mock.patch(
+                    f"{MHA_POOL_HOST_MODULE}.use_hicache_tma_kernel",
+                    return_value=True,
+                ),
+            ):
+                return host._resolve_load_block_quota(), can_use
+
+        quota, can_use = resolve(master_on=True, quota=8)
+        self.assertEqual(quota, 8)
+        can_use.assert_called_once_with(page_size=64, element_size=1024, block_quota=8)
+        self.assertEqual(resolve(master_on=True, quota=8, layout="layer_first")[0], 8)
+        for kwargs in (
+            dict(master_on=False, quota=8),
+            dict(master_on=True, quota=None),
+            dict(master_on=True, quota=8, layout="page_unified"),
+            dict(master_on=True, quota=8, jit=False),
+            dict(master_on=True, quota=8, builds=False),
+        ):
+            with self.subTest(**kwargs):
+                self.assertIsNone(resolve(**kwargs)[0])
+        with self.assertRaisesRegex(ValueError, "positive CTA count"):
+            resolve(master_on=True, quota=0)
+
+    def test_mha_load_passes_its_block_quota_to_the_jit_load(self):
+        device_k = torch.zeros(8, 4, dtype=torch.uint8)
+        device_v = torch.zeros(8, 4, dtype=torch.uint8)
+        for layout in ("layer_first", "page_first"):
+            host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+            host.target_layer_num = 1
+            host.device_k_buffers, host.device_v_buffers = (device_k,), (device_v,)
+            host.layout, host.can_use_jit, host.page_size = layout, True, 1
+            host.element_dim = 4
+            host.kv_buffer = torch.zeros(2, 8, 1, 1, 4, dtype=torch.uint8)
+            host.k_data_refs = [host.k_buffer.transpose(0, 1)[0]]
+            host.v_data_refs = [host.v_buffer.transpose(0, 1)[0]]
+            host.load_block_quota = 6
+            with mock.patch(
+                f"{MHA_POOL_HOST_MODULE}.jit_transfer_hicache_one_layer"
+            ) as load:
+                host.load_to_device_per_layer(
+                    None, _indices(0, 2), _indices(2, 4), 0, io_backend="kernel"
+                )
+            with self.subTest(layout=layout):
+                self.assertEqual(load.call_args.kwargs["block_quota"], 6)
 
     def test_npu_mha_transfer_uses_contiguous_hicache_backing(self):
         """FIA views and packed drafts must restore without querying their owners."""
