@@ -15,8 +15,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.parser.deepseek_recipe_renderer import load_deepseek_recipe
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -137,6 +140,41 @@ class TestDeepSeekV41ConstrainedDecoding(CustomTestCase):
                     f"</{DSML} invoke>\n</{DSML} calls>"
                 )
                 self.assertTrue(_is_grammar_accept_string(grammar, text))
+
+    def test_builtin_strict_defaults_are_scoped_to_deepseek(self):
+        """DeepSeek defaults must not change other builtin tags or caller tools."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name=f"tool_{i}",
+                    parameters={"type": "object"},
+                    **flags,
+                ),
+            )
+            for i, flags in enumerate(
+                ({}, {"strict": None}, {"strict": True}, {"strict": False})
+            )
+        ]
+        original = [tool.model_dump() for tool in tools]
+        for detector in (
+            DeepSeekV41Detector(),
+            DeepSeekV4Detector(),
+            DeepSeekV32Detector(),
+            KimiK2Detector(),
+        ):
+            with self.subTest(tag=detector.get_structural_tag_name()):
+                with patch(
+                    "sglang.srt.function_call.base_format_detector.get_model_structural_tag",
+                    wraps=xgr.get_model_structural_tag,
+                ) as build_tag:
+                    detector.get_structural_tag(tools, "auto")
+                expected = [tool.model_dump() for tool in tools]
+                if not isinstance(detector, KimiK2Detector):
+                    expected[0]["function"]["strict"] = False
+                    expected[1]["function"]["strict"] = False
+                self.assertEqual(build_tag.call_args.kwargs["tools"], expected)
+                self.assertEqual([tool.model_dump() for tool in tools], original)
 
     def test_auto_tag_triggers_on_the_calls_block(self):
         tag = self.detector.get_structural_tag(tools=self.tools, tool_choice="auto")
