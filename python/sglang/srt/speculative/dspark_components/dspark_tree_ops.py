@@ -21,6 +21,11 @@ The public functions keep the same signatures for every backend. If an
 operator is unavailable the selected backend raises ``RuntimeError`` instead of
 silently falling through to a different implementation.
 
+``SGLANG_DSPARK_INDEXER_REUSE_METADATA=1`` (default) validates and caches
+plan-owned indexer geometry once per verify step. Set it to ``0`` before server
+startup for the original per-layer preparation. Reuse requires a kernel package
+with the ``max_length`` / ``validate_values`` indexer keyword arguments.
+
 Invariants (mirroring the reference ``tree/`` package):
 
 * token-level ``req_to_token``/``block_size = 1`` — the commit and compressor
@@ -69,6 +74,9 @@ _TREE_BACKEND_ALIASES = {
 }
 _TREE_OPS_LOADED = False
 _BYTE_BLOCK = 512
+_INDEXER_REUSE_METADATA = (
+    os.environ.get("SGLANG_DSPARK_INDEXER_REUSE_METADATA", "1") == "1"
+)
 
 __all__ = [
     "NodePlan",
@@ -135,6 +143,10 @@ class NodePlan:
     ] = field(default_factory=dict)
     swa_move_plan: SwaMovePlan | None = None
     indexer_lengths_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+    # These values belong to immutable geometry in this verify step only.
+    indexer_max_length_cache: int | None = None
+    indexer_cu_validated: bool = False
+    indexer_dummy_metadata_cache: torch.Tensor | None = None
     max_kv_cache: int | None = None
     indexer_metadata_cache: dict[
         tuple[tuple[int, ...], int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -911,6 +923,7 @@ def _invoke_tree_indexer(
     lengths,
     residual,
     schedule,
+    op_options=None,
 ):
     return op(
         query,
@@ -929,6 +942,7 @@ def _invoke_tree_indexer(
         residual,
         schedule,
         topk,
+        **(op_options or {}),
     )
 
 
@@ -938,12 +952,37 @@ def _sgl_kernel_tree_indexer(**kwargs) -> torch.Tensor:
     query = kwargs["query"]
     if kwargs["lengths"] is None or kwargs["residual"] is None:
         kwargs["lengths"], kwargs["residual"] = _cached_indexer_lengths(plan)
+    options = {}
+    # Only the plan-owned lengths are immutable and shared across layers.
+    # Caller-supplied lengths retain the operator's normal validation path.
+    if (
+        _INDEXER_REUSE_METADATA
+        and plan.indexer_lengths_cache is not None
+        and kwargs["lengths"] is plan.indexer_lengths_cache[0]
+    ):
+        if not plan.indexer_cu_validated:
+            expected = torch.arange(
+                plan.n + 1, dtype=torch.int32, device=plan.query_cu.device
+            )
+            if not torch.equal(plan.query_cu, expected):
+                raise ValueError("tree indexer query_cu must equal arange(n + 1)")
+            plan.indexer_cu_validated = True
+        if plan.indexer_max_length_cache is None:
+            plan.indexer_max_length_cache = int(kwargs["lengths"].max().item())
+        options = {
+            "max_length": plan.indexer_max_length_cache,
+            "validate_values": False,
+        }
     if kwargs["schedule"] is None:
-        # The Triton op validates the metadata ABI and ignores its contents.
-        kwargs["schedule"] = torch.zeros(
-            1024, dtype=torch.int32, device=query.device
-        )
-    return _invoke_tree_indexer(op, **kwargs)
+        # The kernel package validates the metadata ABI and ignores contents.
+        if not _INDEXER_REUSE_METADATA or plan.indexer_dummy_metadata_cache is None:
+            schedule = torch.zeros(1024, dtype=torch.int32, device=query.device)
+            if _INDEXER_REUSE_METADATA:
+                plan.indexer_dummy_metadata_cache = schedule
+        else:
+            schedule = plan.indexer_dummy_metadata_cache
+        kwargs["schedule"] = schedule
+    return _invoke_tree_indexer(op, op_options=options, **kwargs)
 
 
 def _vendor_tree_indexer(**kwargs) -> torch.Tensor:
