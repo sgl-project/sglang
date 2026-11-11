@@ -612,20 +612,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     fp8_dtype=fp8_dtype,
                 )
 
-        # The monokernel's K3.1 indexer (no rope, its own projections): the paged
-        # logits with their histogram and the top-k in one launch (gfx950), and the
-        # index-K store applying k_norm itself (dsa_indexer_hip).
-        self._mono_k31 = (
-            _use_aiter
-            and _use_aiter_preshuffle
-            and self.skip_rope
-            and get_exec().kernel.enable_amd_monokernel
-        )
-        self._hist_topk = (
-            dsa_indexer_hip.hist_topk_workspace(self, config)
-            if self._mono_k31 and not self.use_gfx950_fused_indexer
-            else None
-        )
+        if _use_aiter:
+            self._hist_topk = dsa_indexer_hip.hist_topk_workspace(self, config)
 
         # After the gfx950 fused indexer's gate, which may turn the writer off.
         global _FUSED_FP8_WRITER_LOGGED
@@ -2575,16 +2563,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             x, forward_batch, in_piecewise_or_breakable_cuda_graph, weights_proj_lora
         ):
             q_fp8, weights = self.rocm_nope_prologue.forward(
-                self,
-                x,
-                q_lora,
-                forward_batch,
-                layer_id,
-                act_quant,
-                fuse_k_norm=self._mono_k31
-                and dsa_indexer_hip.fuse_index_k_norm(
-                    self, forward_batch, _index_k_dcp()[0]
-                ),
+                self, x, q_lora, forward_batch, layer_id, act_quant
             )
         elif is_graph_dsa_split_op_surface(forward_batch):
             # Prefill under PCG/BCG (including CP): run the whole indexer

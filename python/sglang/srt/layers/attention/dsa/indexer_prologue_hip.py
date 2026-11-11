@@ -9,7 +9,10 @@ import torch
 
 from sglang.kernels.ops.attention.dsa.fp4_index_hip import indexer_q_fp4_head_gate
 from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
+from sglang.srt.layers.attention.dsa import dsa_indexer_hip
+from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.runtime_context import get_exec
 
 
 def make_rocm_nope_prologue(indexer) -> Optional[RocmNoPEPrologue]:
@@ -19,14 +22,19 @@ def make_rocm_nope_prologue(indexer) -> Optional[RocmNoPEPrologue]:
         and indexer.bf16_head_gate
         and indexer.head_dim == indexer.block_size == 128
     ):
-        return RocmNoPEPrologue()
+        return RocmNoPEPrologue(
+            mono_k_norm=aiter_can_use_preshuffle_paged_mqa()
+            and get_exec().kernel.enable_amd_monokernel
+        )
     return None
 
 
 class RocmNoPEPrologue:
-    def __init__(self) -> None:
+    def __init__(self, mono_k_norm: bool = False) -> None:
         # [wk | weights_proj] after merge_k_gate; the two weights become its views
         self.k_gate_weight: Optional[torch.Tensor] = None
+        # the monokernel's index-K store may apply k_norm itself (fuse_index_k_norm)
+        self.mono_k_norm = mono_k_norm
 
     def merge_k_gate(self, indexer) -> None:
         if not (
@@ -58,9 +66,10 @@ class RocmNoPEPrologue:
         forward_batch,
         layer_id: int,
         act_quant,
-        fuse_k_norm: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """fuse_k_norm: the index-K store applies k_norm (the monokernel's)."""
+        fuse_k_norm = self.mono_k_norm and dsa_indexer_hip.fuse_index_k_norm(
+            indexer, forward_batch
+        )
         # a monokernel plugin that already ran wk, weights_proj and wq_b hands
         # their outputs in (_mono_pre)
         pre = indexer.__dict__.get("_mono_pre")

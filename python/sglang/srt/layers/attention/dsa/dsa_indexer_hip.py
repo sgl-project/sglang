@@ -146,8 +146,22 @@ def verify_paged_mqa_logits(
 
 
 def hist_topk_workspace(indexer, config):
-    """Preallocate the gfx950 logits/top-k workspace before pools are sized,
-    or return None for unsupported shapes."""
+    """The monokernel's K3.1 indexer (no rope, its own projections): the paged logits
+    with their histogram and the top-k in one launch (gfx950). Preallocate the
+    workspace before pools are sized, or return None where it does not run."""
+    from sglang.srt.layers.attention.dsa.utils import (
+        aiter_can_use_preshuffle_paged_mqa,
+    )
+    from sglang.srt.runtime_context import get_exec
+
+    if not (
+        aiter_can_use_preshuffle_paged_mqa()
+        and indexer.skip_rope
+        and get_exec().kernel.enable_amd_monokernel
+        and not indexer.use_gfx950_fused_indexer
+    ):
+        return None
+
     from sglang.kernels.ops.attention.dsa.hip_gfx950 import loader
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.attention.dsa.gfx950_fused_indexer import (
@@ -268,8 +282,9 @@ def hist_topk_paged(
     return out
 
 
-def fuse_index_k_norm(indexer, forward_batch, dcp_size: int) -> bool:
+def fuse_index_k_norm(indexer, forward_batch) -> bool:
     """Whether this call's index-K store also applies k_norm (one launch)."""
+    from sglang.srt.layers.attention.dsa.dsa_indexer import _index_k_dcp
     from sglang.srt.layers.cp.utils import is_cp_active
     from sglang.srt.layers.layernorm import LayerNorm
     from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
@@ -292,7 +307,7 @@ def fuse_index_k_norm(indexer, forward_batch, dcp_size: int) -> bool:
         and kn.bias.dtype == torch.float32
         and (mode.is_decode_or_idle() or mode.is_target_verify())
         and not is_cp_active(forward_batch)
-        and dcp_size == 1
+        and _index_k_dcp()[0] == 1
     ):
         return False
     pool = get_token_to_kv_pool()
