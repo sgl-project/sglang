@@ -210,22 +210,10 @@ class MambaPoolHost(HostKVCache):
             self._buffer_device,
         )
         if _is_hip and allocation_bytes > available_bytes and host_size <= 0:
-            # ROCm: a ratio-sized pool takes what the pinnable budget left rather than failing
-            page_bytes = self.size_per_token * self.page_size
-            self.page_num = max(available_bytes // page_bytes, 1)
-            self.size = self.page_num * self.page_size
-            logger.warning(
-                "HiCache Mamba host pool clamped to %d state slots (%.2f GB): "
-                "%.2f GB requested by the host-to-device ratio, %.2f GB available.",
-                self.size,
-                self.size * self.size_per_token / 1e9,
-                allocation_bytes / 1e9,
-                available_bytes / 1e9,
-            )
-            allocation_bytes, available_bytes = host_memory_preflight(
-                self.get_mapping_lengths(),
-                self.allocator,
-                self._buffer_device,
+            from sglang.srt.mem_cache.pool_host.rocm_budget import clamp_mamba_pool
+
+            allocation_bytes, available_bytes = clamp_mamba_pool(
+                self, allocation_bytes, available_bytes
             )
         if allocation_bytes > available_bytes:
             raise ValueError(

@@ -18,12 +18,12 @@ from sglang.srt.mem_cache.pool_host.base import (
     host_memory_budget_plain_hugetlb,
     host_memory_budget_scope,
     ranks_per_host,
-    rocm_pinnable_share_bytes,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     get_allocator_class_from_storage,
     get_allocator_type,
 )
+from sglang.srt.mem_cache.pool_host.rocm_budget import rocm_pinnable_share_bytes
 from sglang.srt.runtime_context import get_context, get_memory, get_parallel
 
 if TYPE_CHECKING:
