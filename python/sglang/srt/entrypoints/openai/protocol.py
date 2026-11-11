@@ -264,20 +264,8 @@ class UsageInfo(BaseModel):
     # The OpenAI location of reasoning_tokens; set only when there are some.
     completion_tokens_details: Optional[CompletionTokensDetails] = None
 
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        data = handler(self)
-        # Absent unless a surface fills it (K3 does, per its stream spec), so
-        # every other model's usage object keeps its historical shape.
-        if data.get("completion_tokens_details") is None:
-            data.pop("completion_tokens_details", None)
-        return data
-
 
 class StreamOptions(BaseModel):
-    # None means "unset": fall back to the server default. An explicit false
-    # must be able to suppress the summary frame even when the server default
-    # turns it on, which a False default cannot express.
     include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
     # Kimi-K3 extension, ignored elsewhere: attach
