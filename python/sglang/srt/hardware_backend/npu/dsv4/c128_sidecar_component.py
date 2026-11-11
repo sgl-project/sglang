@@ -205,11 +205,7 @@ class C128SidecarComponent(TreeComponent):
             and insert_result.inserted_host_node is not None
             else None
         )
-        if (
-            target is None
-            or blocks_required == 0
-            or loaded_blocks < blocks_required
-        ):
+        if target is None or blocks_required == 0 or loaded_blocks < blocks_required:
             cache_actions.append(
                 FreeComponentHostSlot([host_indices], component_type=ct)
             )
