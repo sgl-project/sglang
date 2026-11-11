@@ -60,7 +60,7 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
     prepare_kv_shard_forward,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.dcp.layout import get_dcp_lens, is_mla_dcp_lse_base_on_e
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -1478,11 +1478,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Row p attends [p - sliding_window_size, p] via trtllm-gen sparse MLA;
         under DCP returns the rank-local (out, lse) for the caller's merge."""
-        # Import cycle: forward_mla -> dsa_backend -> trtllm_mla_backend.
-        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
-            is_mla_dcp_lse_base_on_e,
-        )
-
         bs, q_len, heads, head_dim = q.shape
         rows = bs * q_len
         assert rows < self._window_row_indptr.numel(), (
