@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 __all__ = ["CompressedTensorsW8A8Fp8MoE"]
 
 _is_hip = is_hip()
+_is_sail = is_sail()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
@@ -352,7 +353,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         # them in the SAIL package; this chain only places the result.
         use_sail_deepgemm_for_a2a = False
         use_sail_deepgemm_for_auto = False
-        if is_sail():
+        if _is_sail:
             from sglang.srt.hardware_backend.sail.moe.deepgemm_moe import (
                 deepgemm_moe_selected_for_a2a,
                 deepgemm_moe_selected_for_auto,
@@ -383,7 +384,9 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
-            or moe_runner_backend.is_deep_gemm()
+            # Only SAIL ships a DeepGEMM path for this scheme; elsewhere deep_gemm
+            # keeps falling through to the unhandled branch below.
+            or (_is_sail and moe_runner_backend.is_deep_gemm())
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:

@@ -334,12 +334,6 @@ class Mxfp4Config(QuantizationConfig):
 
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
-        ignored_layers = cls.get_from_keys_or(
-            config, ["ignore", "ignored_layers", "modules_to_not_convert"], None
-        )
-        fp8_channelwise_layers = cls.get_from_keys_or(
-            config, ["fp8_channelwise_layers"], None
-        )
 
         if _is_hip:
             if is_gfx95_supported():
@@ -352,11 +346,21 @@ class Mxfp4Config(QuantizationConfig):
                     f"Current platform {platform} not support mxfp4 computation"
                 )
 
-        return cls(
-            ignored_layers=ignored_layers,
-            is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized,
-            fp8_channelwise_layers=fp8_channelwise_layers,
-        )
+        if _is_sail:
+            # Only SAIL's dense MXFP4 path honors the checkpoint's skip lists;
+            # elsewhere they keep being ignored, as upstream always did.
+            return cls(
+                ignored_layers=cls.get_from_keys_or(
+                    config,
+                    ["ignore", "ignored_layers", "modules_to_not_convert"],
+                    None,
+                ),
+                is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized,
+                fp8_channelwise_layers=cls.get_from_keys_or(
+                    config, ["fp8_channelwise_layers"], None
+                ),
+            )
+        return cls(is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized)
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -384,7 +388,6 @@ class Mxfp4Config(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-        from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 
         # fp8 channelwise
         if self.fp8_channelwise_layers and is_layer_skipped(
@@ -392,6 +395,8 @@ class Mxfp4Config(QuantizationConfig):
             ignored_layers=self.fp8_channelwise_layers,
             fused_mapping=self.packed_modules_mapping,
         ):
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+
             return W8A8Fp8Config(is_checkpoint_fp8_serialized=True).get_quant_method(
                 layer, prefix
             )
@@ -535,8 +540,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
         self.num_experts = num_experts
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
@@ -545,9 +548,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             raise ValueError("SAIL MXFP4 W4A16 MMA does not support expert bias.")
         mxfp4_block = 32
         triton_kernels_padding_alignment = 64
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.GROUP.value}
-        )
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
@@ -1925,6 +1925,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.use_marlin:
             assert TopKOutputChecker.format_is_standard(topk_output)
             return self._apply_marlin(layer, dispatch_output)
+
         if self._fi_kernel == "cutlass_sm90":
             return self._apply_sm90_cutlass(layer, dispatch_output)
         if self._fi_kernel == "cutlass_sm120":
@@ -1959,15 +1960,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w13_precision_config=getattr(self, "w13_precision_config", None),
                 w2_precision_config=getattr(self, "w2_precision_config", None),
             )
-        elif backend.is_triton():
+        else:
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
             )
-        else:
-            raise NotImplementedError("Unsupported runner backend: %s" % backend)
         return self.runner.run(dispatch_output, quant_info)
 
     def _apply_aiter(self, layer, dispatch_output) -> CombineInput:

@@ -1553,10 +1553,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
             # Only use_fp8=False when SGLANG_DEEPEP_BF16_DISPATCH is true,
             # otherwise use_fp8=True for FP8 dispatch path
-            use_fp8 = (
-                not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
-                and w13_weight.dtype == torch.float8_e4m3fn
-            )
+            use_fp8 = not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
             quant_info = DeepGemmMoeQuantInfo(
                 w13_weight=w13_weight,
                 w2_weight=w2_weight,

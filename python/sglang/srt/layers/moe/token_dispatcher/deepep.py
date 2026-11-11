@@ -31,6 +31,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
+    get_cuda_version,
     is_blackwell,
     is_flashinfer_available,
     is_hip,
@@ -64,19 +65,6 @@ except Exception as exc:
     # failure to the first DeepEP use so other models still start.
     use_deepep = False
     _deepep_import_error = exc
-
-
-def _buffer_supports_use_fabric(buffer_type) -> bool:
-    """Only pass the fabric flag to vendor constructors that explicitly accept it."""
-    try:
-        return "use_fabric" in inspect.signature(buffer_type.__init__).parameters
-    except (TypeError, ValueError):
-        # Extensions without an inspectable signature keep the vendor default; this
-        # must not block importing non-DeepEP models.
-        return False
-
-
-DEEPEP_SUPPORT_USE_FABRIC = use_deepep and _buffer_supports_use_fabric(Buffer)
 
 from enum import Enum, IntEnum, auto
 
@@ -219,6 +207,17 @@ class DeepEPBuffer:
         return _is_mnnvl_fabric_supported()
 
     @classmethod
+    def buffer_accepts_use_fabric(cls) -> bool:
+        """Whether the DeepEP build takes the ``use_fabric`` constructor kwarg."""
+        # The DeepEP build we ship is keyed on the CUDA major version:
+        #   cu13x -> hybrid-ep, which gates fabric behind a use_fabric kwarg, so we
+        #            pass it when the device advertises fabric support.
+        #   cu12x -> fzyzcjy/DeepEP, which has no use_fabric kwarg but already
+        #            auto-enables fabric in C++ when supported, so we skip it:
+        #            https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
+        return get_cuda_version()[0] != 12
+
+    @classmethod
     def _configure_buffer(cls, buffer) -> None:
         """Platform hook, run once on the freshly created buffer."""
 
@@ -312,12 +311,8 @@ class DeepEPBuffer:
         # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
         # support, so cross-pod GB200/GB300 EP groups use
         # cuMemImportFromShareableHandle instead of the intra-node-only
-        # cudaIpcOpenMemHandle. Argument support cannot be inferred from the CUDA
-        # major version because it differs per vendor build; only signatures that
-        # explicitly accept use_fabric receive the argument, and everything else
-        # keeps the vendor default. fzyzcjy/DeepEP enables fabric inside C++:
-        # https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
-        if use_mnnvl_fabric and DEEPEP_SUPPORT_USE_FABRIC:
+        # cudaIpcOpenMemHandle.
+        if use_mnnvl_fabric and cls.buffer_accepts_use_fabric():
             buffer_kwargs["use_fabric"] = True
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
@@ -556,10 +551,6 @@ class _DeepEPDispatcherImplBase:
                 raise RuntimeError(
                     "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
                 )
-            elif self.deepep_output_dtype == DispatcherOutputDtype.UINT8:
-                raise RuntimeError(
-                    "Ascend A2/A3 NPU does not support uint8 deepep_dispatcher_output_dtype."
-                )
         else:
             if self.deepep_output_dtype == DispatcherOutputDtype.INT8:
                 logger.warning_once(
@@ -567,10 +558,6 @@ class _DeepEPDispatcherImplBase:
                     "deepep_dispatcher_output_dtype, switching to fp8..."
                 )
                 self.deepep_output_dtype = DispatcherOutputDtype.FP8
-            elif self.deepep_output_dtype == DispatcherOutputDtype.UINT8:
-                raise RuntimeError(
-                    "GPU does not support uint8 deepep_dispatcher_output_dtype."
-                )
             # NVFP4 is supported on GPU, no adjustment needed
 
     def _update_int8_quant_env(self) -> None:
