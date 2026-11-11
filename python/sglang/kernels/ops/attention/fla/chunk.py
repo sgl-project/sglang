@@ -208,13 +208,18 @@ def chunk_gated_delta_rule_fwd(
     output: Optional[torch.Tensor] = None,
     cu_seqlens_cpu: Optional[torch.LongTensor] = None,
 ):
-    parts, seq_len = _pipeline_plan(
-        q,
-        cu_seqlens,
-        initial_state,
-        initial_state_indices,
-        inplace_update,
-        cu_seqlens_cpu,
+    # The pipelined scan does not map its output through output_indices.
+    parts, seq_len = (
+        (0, 0)
+        if out is not None
+        else _pipeline_plan(
+            q,
+            cu_seqlens,
+            initial_state,
+            initial_state_indices,
+            inplace_update,
+            cu_seqlens_cpu,
+        )
     )
     if parts:
         return chunk_gated_delta_rule_fwd_pipelined(
