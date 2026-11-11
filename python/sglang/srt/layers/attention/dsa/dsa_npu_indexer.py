@@ -512,7 +512,7 @@ class DSANPUIndexerMixin:
             weights = weights.contiguous().view(-1, weights.shape[-1])
             actual_seq_lengths_q = actual_seq_lengths_q.to(q.device)
         elif is_prefill:
-            block_table = block_table[: actual_seq_lengths_q.numel()]
+            block_table = block_table[: actual_seq_lengths_q.size(0)]
 
         if shard is not None:
             if not q_sliced_early:
