@@ -111,7 +111,7 @@ class _HTTPExceptionOpenAI:
     def _convert_to_internal_request(self, chat_request, _raw_request):
         return SimpleNamespace(), chat_request
 
-    async def _handle_non_streaming_request(self, *_args):
+    async def _chat_completion_response(self, *_args):
         raise HTTPException(status_code=self.status_code, detail="at capacity")
 
     def _generate_chat_stream(self, *_args):
