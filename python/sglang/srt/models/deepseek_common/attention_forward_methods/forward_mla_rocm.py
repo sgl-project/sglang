@@ -609,9 +609,18 @@ class DeepseekMLARocmForwardMixin:
             latent_cache = pre["latent"]
             k_nope = pre["k_nope"].unsqueeze(1)
             q_lora = pre["q_lora"]
-            topk_indices = self._run_or_reuse_indexer(
-                hidden_states, q_lora, positions, forward_batch, prev_topk_indices
-            )
+            if self.should_run_indexer(prev_topk_indices):
+                topk_indices = self.indexer(
+                    x=hidden_states,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.layer_id,
+                )
+            else:
+                topk_indices = maybe_capture_indexer_topk(
+                    self.layer_id, prev_topk_indices
+                )
         elif self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -715,9 +724,20 @@ class DeepseekMLARocmForwardMixin:
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = k_nope.unsqueeze(1)
                     q = self.q_b_proj_forward(q)
-                topk_indices = self._run_or_reuse_indexer(
-                    hidden_states, q_lora, positions, forward_batch, prev_topk_indices
-                )
+                if self.should_run_indexer(prev_topk_indices):
+                    topk_indices = self.indexer(
+                        x=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=self.layer_id,
+                    )
+                else:
+                    # skip_topk reuses prev layer's indices; mirror into this
+                    # layer's slot so the captured buffer matches what's used.
+                    topk_indices = maybe_capture_indexer_topk(
+                        self.layer_id, prev_topk_indices
+                    )
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
@@ -731,13 +751,18 @@ class DeepseekMLARocmForwardMixin:
                     q = self.q_b_proj_forward(q)
 
                 if q_lora is not None:
-                    topk_indices = self._run_or_reuse_indexer(
-                        hidden_states,
-                        q_lora,
-                        positions,
-                        forward_batch,
-                        prev_topk_indices,
-                    )
+                    if self.should_run_indexer(prev_topk_indices):
+                        topk_indices = self.indexer(
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
+                    else:
+                        topk_indices = maybe_capture_indexer_topk(
+                            self.layer_id, prev_topk_indices
+                        )
         else:
             if q_replicate_active:
                 q = a16w16_linear(hidden_states, self.q_b_proj_qrep_weight).view(
@@ -773,10 +798,12 @@ class DeepseekMLARocmForwardMixin:
             # Write token-major directly; a head-major result would need a full
             # [T, H, kv_lora_rank] transpose copy before attention.
             q_nope_out = q_nope.new_empty(
-                (q_nope.shape[0], q_nope.shape[1], self.w_kc_qrep.shape[-1])
+                q_nope.shape[0], q_nope.shape[1], self.kv_lora_rank
             )
             torch.bmm(
-                q_nope.transpose(0, 1), self.w_kc_qrep, out=q_nope_out.transpose(0, 1)
+                q_nope.transpose(0, 1),
+                self.w_kc_qrep,
+                out=q_nope_out.transpose(0, 1),
             )
         elif q_replicate_active:
             q_nope_out = (
@@ -1314,24 +1341,3 @@ class DeepseekMLARocmForwardMixin:
             and self.current_attention_backend == "aiter"
             and self.rotary_emb is not None
         )
-
-    def _run_or_reuse_indexer(
-        self: DeepseekV2AttentionMLA,
-        hidden_states: torch.Tensor,
-        q_lora: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        prev_topk_indices: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        if self.should_run_indexer(prev_topk_indices):
-            return self.indexer(
-                x=hidden_states,
-                q_lora=q_lora,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
-            )
-        else:
-            # skip_topk reuses prev layer's indices; mirror into this
-            # layer's slot so the captured buffer matches what's used.
-            return maybe_capture_indexer_topk(self.layer_id, prev_topk_indices)
