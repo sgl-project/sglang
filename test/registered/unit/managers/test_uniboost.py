@@ -8,7 +8,6 @@ from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     CacheAgnosticPolicy,
-    CacheAwarePolicy,
     SchedulePolicy,
 )
 from sglang.srt.managers.uniboost import (
@@ -477,10 +476,13 @@ class TestSchedulePolicyUniBoost(CustomTestCase):
             _policy(uniboost_clock="wall", uniboost_gamma=0.05).uniboost_gamma, 0.05
         )
 
-    def test_large_queue_keeps_uniboost(self):
+    def test_long_queue_falls_back_to_fcfs_but_still_stamps(self):
+        # FCFS lets no newcomer overtake, so the wait bound holds; the stamps
+        # must still be taken, or A(r) would be the end of the fallback.
         queue = [_make_req(f"r{i}", [i]) for i in range(200)]
         policy = _policy()
-        self.assertIs(policy._determine_active_policy(queue), CacheAwarePolicy.UNIBOOST)
+        self.assertEqual(policy.calc_priority(queue, processed_tokens=7), queue)
+        self.assertTrue(all(r.uniboost_arrival_tokens == 7 for r in queue))
 
     def test_without_prefix_cache_falls_back_to_fcfs(self):
         with self.assertLogs("sglang.srt.managers.schedule_policy", level="WARNING"):
