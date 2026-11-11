@@ -139,7 +139,6 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
     "triton",
-    "triton_kernel",
     "flashinfer_trtllm",
     "experimental_sgl_trtllm",
     "flashinfer_trtllm_routed",
