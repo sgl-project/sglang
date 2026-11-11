@@ -36,7 +36,7 @@ from sglang.test.test_utils import (
 )
 
 DEFAULT_TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-NPU_RL_ENV = {"ASCEND_USE_FIA": "1"}
+A5_SPEC_ENV = {"ASCEND_USE_FIA": "1"}
 
 
 # ---------------------------------------------------------------------------
@@ -58,9 +58,9 @@ def _parse_npu_counts(out: str) -> Tuple[int, int]:
     """Parse ``npu-smi info -l`` output into ``(npu_count, chip_count)``.
 
     Driver versions disagree on this listing: some print a ``Chip Count``
-    header, others (e.g. 25.1.rc3) only list one ``NPU ID`` block per device
-    and omit it. Missing headers fall back to counting the listed devices and
-    to one chip per device instead of crashing on ``None``.
+    header, others (e.g. Ascend 950) only list one ``NPU ID`` block per device
+    and omit it. This only describes the listing layout; platform identity is
+    decided by :func:`_is_ascend_950` from the SOC version.
     """
     total = re.search(r"Total Count\s*:\s*(\d+)", out)
     chips = re.search(r"Chip Count\s*:\s*(\d+)", out)
@@ -73,10 +73,30 @@ def _parse_npu_counts(out: str) -> Tuple[int, int]:
     return npu_count, chip_count
 
 
+def _is_ascend_950() -> bool:
+    """Return whether the current NPU is an Ascend 950 (A5).
+
+    SOC versions 250-256 are A3; Ascend 950 reports 260.
+    """
+    if not npu_available() or _NPU_IMPORT_ERROR is not None:
+        return False
+    try:
+        return int(torch_npu.npu.get_soc_version()) >= 260
+    except Exception:
+        return False
+
+
+def npu_rl_env() -> Dict[str, str]:
+    """Return the extra server env required by the RL lifecycle tests."""
+    return dict(A5_SPEC_ENV) if _is_ascend_950() else {}
+
+
 def npu_device_count() -> int:
     if not npu_available():
         return 0
     npus, chips = _parse_npu_counts(_npu_smi("info", "-l"))
+    if _is_ascend_950():
+        chips = 1
     return npus * chips
 
 
@@ -98,13 +118,12 @@ def _physical_device_id(device: int) -> int:
 def _npu_smi_card_and_chip(physical_device: int) -> list[str]:
     """Translate a host device id into npu-smi's card/chip addressing.
 
-    Some drivers (e.g. Ascend 950) do not print ``Chip Count`` and do not
-    accept ``-c``; treat the missing header as one chip per NPU and use the
-    device id directly as the card id.
+    Ascend 950 has one chip per NPU and does not accept ``-c``, so it uses
+    ``-i <device>`` directly. A3 needs card/chip addressing.
     """
-    _, chips_per_card = _parse_npu_counts(_npu_smi("info", "-l"))
-    if chips_per_card <= 1:
+    if _is_ascend_950():
         return ["-i", str(physical_device)]
+    _, chips_per_card = _parse_npu_counts(_npu_smi("info", "-l"))
     return [
         "-i",
         str(physical_device // chips_per_card),
