@@ -64,8 +64,7 @@ def _require(hybrid, *, mode, algorithm="DFLASH", dcp=True, unified=True):
         setup._require_dcp_target_verify(runner, hybrid.target_verify_backend())
 
 
-def _kimi_k3_mode(algorithm: str) -> str:
-    """speculative_attention_mode after Kimi-K3's DCP override."""
+def _kimi_k3_overrides(algorithm: str) -> dict:
     cfg = SimpleNamespace(
         dcp_size=2,
         attention_backend=None,
@@ -73,6 +72,7 @@ def _kimi_k3_mode(algorithm: str) -> str:
         decode_attention_backend=None,
         enable_symm_mem=False,
         speculative_algorithm=algorithm,
+        speculative_attention_mode="prefill",
         dcp_replicate_q_proj=False,
         dcp_comm_backend="nccl",
         enable_prefill_cp=False,
@@ -85,8 +85,7 @@ def _kimi_k3_mode(algorithm: str) -> str:
             return_value=ragged_verify.RaggedVerifyMode.STATIC,
         ),
     ):
-        overrides = kimi_k3._kimi_k3_overrides(cfg, None)
-    return overrides.get("speculative_attention_mode", "prefill")
+        return kimi_k3._kimi_k3_overrides(cfg, None)
 
 
 class TestDcpTargetVerifyBackend(CustomTestCase):
@@ -114,7 +113,9 @@ class TestDcpTargetVerifyBackend(CustomTestCase):
     def test_kimi_k3_override_verifies_on_the_decode_backend(self):
         for algorithm in ("DSPARK", "DFLASH", "dflash"):
             with self.subTest(algorithm=algorithm):
-                mode = _kimi_k3_mode(algorithm)
+                overrides = _kimi_k3_overrides(algorithm)
+                self.assertEqual(overrides["decode_attention_backend"], "cutedsl_mla")
+                mode = overrides["speculative_attention_mode"]
                 self.assertEqual(mode, "decode")
                 _require(
                     _hybrid(TRTLLMMLABackend, CuteDslMLABackend, mode),
