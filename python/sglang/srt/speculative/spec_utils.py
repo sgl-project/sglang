@@ -558,6 +558,69 @@ def select_top_k_tokens(
     )
 
 
+class _SimAccLenStream:
+    """Pre-drawn torch.multinomial(probs, 1, generator) outcomes for a 2-way probs:
+    on CPU that call is argmax(probs / q) with q = Exp(1) draws of probs' shape, so a
+    (block, 2) draw holds the next `block` calls' q in order."""
+
+    def __init__(self, generator: torch.Generator, block: int = 4096):
+        self.generator, self.block = generator, block
+        self.q, self.pos, self.outcomes = None, block, {}
+
+    def next_index(self, weight_lower: float, weight_upper: float) -> int:
+        if self.pos >= self.block:
+            self.q = torch.empty((self.block, 2), dtype=torch.float32)
+            self.q.exponential_(1, generator=self.generator)
+            self.pos, self.outcomes = 0, {}
+        out = self.outcomes.get((weight_lower, weight_upper))
+        if out is None:
+            probs = torch.tensor([weight_lower, weight_upper], dtype=torch.float32)
+            out = self.outcomes[(weight_lower, weight_upper)] = (
+                torch.div(probs, self.q).argmax(dim=-1).tolist()
+            )
+        self.pos += 1
+        return out[self.pos - 1]
+
+
+_SIM_PREDRAW = envs.SGLANG_OPT_SPEC_SIM_ACC_LEN_PREDRAW.get()
+# id(generator) -> (generator, stream or None when the self-check failed). Whoever
+# rewinds a generator (the startup warm-up) clears this.
+_SIM_STREAMS: dict = {}
+
+
+def _sim_stream(generator: torch.Generator, simulate_acc_len: float, max_len: int):
+    entry = _SIM_STREAMS.get(id(generator))
+    if entry is not None and entry[0] is generator:
+        return entry[1]
+    # Self-check on copies of the generator: 3 blocks of the stream against 192
+    # single draws, outcomes and the generator state after them.
+    state = generator.get_state()
+    g_ref, g_new = torch.Generator(), torch.Generator()
+    g_ref.set_state(state)
+    g_new.set_state(state)
+    ref = [
+        _sample_simulated_acc_len(
+            simulate_acc_len, "match-expected", max_len, generator=g_ref
+        )
+        for _ in range(192)
+    ]
+    probe = _SimAccLenStream(g_new, block=64)
+    new = [
+        _sample_simulated_acc_len(
+            simulate_acc_len, "match-expected", max_len, stream=probe
+        )
+        for _ in range(192)
+    ]
+    ok = ref == new and torch.equal(g_ref.get_state(), g_new.get_state())
+    stream = _SimAccLenStream(generator) if ok else None
+    _SIM_STREAMS[id(generator)] = (generator, stream)
+    logger.info(
+        "Simulated acceptance lengths: pre-drawn %s",
+        "on" if ok else "off (self-check differs)",
+    )
+    return stream
+
+
 def sample_simulated_acc_len(
     simulate_acc_len: float,
     simulate_acc_method: str,
@@ -565,6 +628,25 @@ def sample_simulated_acc_len(
     generator: Optional[torch.Generator] = None,
 ) -> int:
     """Sample a simulated acceptance length in [1, max_len]."""
+    stream = None
+    if (
+        _SIM_PREDRAW
+        and simulate_acc_method == "match-expected"
+        and generator is not None
+    ):
+        stream = _sim_stream(generator, simulate_acc_len, max_len)
+    return _sample_simulated_acc_len(
+        simulate_acc_len, simulate_acc_method, max_len, generator, stream
+    )
+
+
+def _sample_simulated_acc_len(
+    simulate_acc_len: float,
+    simulate_acc_method: str,
+    max_len: int,
+    generator: Optional[torch.Generator] = None,
+    stream: Optional[_SimAccLenStream] = None,
+) -> int:
     if simulate_acc_method == "multinomial":
         simulated_values = torch.normal(
             mean=simulate_acc_len,
@@ -590,8 +672,13 @@ def sample_simulated_acc_len(
         else:
             weight_upper = simulate_acc_len - lower
             weight_lower = 1.0 - weight_upper
-            probs = torch.tensor([weight_lower, weight_upper], device="cpu")
-            sampled_index = torch.multinomial(probs, num_samples=1, generator=generator)
+            if stream is not None:
+                sampled_index = stream.next_index(weight_lower, weight_upper)
+            else:
+                probs = torch.tensor([weight_lower, weight_upper], device="cpu")
+                sampled_index = torch.multinomial(
+                    probs, num_samples=1, generator=generator
+                )
             simulate_acc_len = lower if sampled_index == 0 else upper
     else:
         raise ValueError(f"Invalid simulate_acc_method: {simulate_acc_method}")

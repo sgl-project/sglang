@@ -671,6 +671,34 @@ class TestPostVerifyGraphs(CustomTestCase):
         self.assertEqual(drawn, before)
         self.assertTrue(torch.equal(torch.get_rng_state(), state))
 
+    def test_predrawn_forced_lengths_are_the_single_draws(self):
+        """SGLANG_OPT_SPEC_SIM_ACC_LEN_PREDRAW: the lengths come from pre-drawn blocks of
+        the generator's exponentials, the same lengths in the same order as one
+        torch.multinomial per draw, across blocks and acceptance means."""
+        for acc_len, max_len in ((2.32, 4), (3.51, 4), (4.8, 7), (1.0, 4)):
+            ref_rng = simulated_acc_len_generator(5)
+            new_rng = simulated_acc_len_generator(5)
+            with patch.object(spec_utils, "_SIM_PREDRAW", False):
+                ref = [
+                    spec_utils.sample_simulated_acc_len(
+                        acc_len, "match-expected", max_len, generator=ref_rng
+                    )
+                    for _ in range(9000)
+                ]
+            spec_utils._SIM_STREAMS.clear()
+            try:
+                with patch.object(spec_utils, "_SIM_PREDRAW", True):
+                    new = [
+                        spec_utils.sample_simulated_acc_len(
+                            acc_len, "match-expected", max_len, generator=new_rng
+                        )
+                        for _ in range(9000)
+                    ]
+                self.assertIsNotNone(spec_utils._SIM_STREAMS[id(new_rng)][1])
+            finally:
+                spec_utils._SIM_STREAMS.clear()
+            self.assertEqual(new, ref, (acc_len, max_len))
+
     def test_compact_top_k_sampling_takes_only_batches_of_finite_top_k(self):
         """With SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING a verify samples on the
         top-k support when every request has a finite top-k within the compact

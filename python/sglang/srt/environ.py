@@ -426,6 +426,12 @@ class Envs:
     SGLANG_OPT_SPEC_POST_VERIFY_BONUS_I64 = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Forced acceptance lengths (SGLANG_SIMULATE_ACC_LEN, match-expected): pre-draw the
+    # generator's exponentials in blocks and take each draw's torch.multinomial outcome
+    # from them (same outcomes, checked once against single draws on a copy).
+    SGLANG_OPT_SPEC_SIM_ACC_LEN_PREDRAW = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # The post-verify graph stages the next round's draft lengths, positions and write
     # slots into the draft graph runner; a round that keeps its batch skips their launch
     # and copies. A chain EAGLE draft reserves three verify windows per decode step for it.

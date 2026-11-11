@@ -157,6 +157,35 @@ class TestDecodeWarmupRestore(CustomTestCase):
         self.assertTrue(torch.equal(torch.rand(4), cpu_first))
         self.assertIsNone(worker._staged_draft.noted)
 
+    def test_predrawn_forced_lengths_restart_at_the_restored_state(self):
+        from sglang.srt.speculative import spec_utils
+
+        def draw(rng, n):
+            return [
+                spec_utils.sample_simulated_acc_len(
+                    2.32, "match-expected", 4, generator=rng
+                )
+                for _ in range(n)
+            ]
+
+        unwarmed = draw(simulated_acc_len_generator(35), 64)
+        worker = self._worker(simulated_acc_len_generator(35))
+        spec_utils._SIM_STREAMS.clear()
+        try:
+            with (
+                mock.patch.object(spec_utils, "_SIM_PREDRAW", True),
+                mock.patch.object(torch.cuda, "get_rng_state", lambda: "cuda"),
+                mock.patch.object(torch.cuda, "set_rng_state", lambda state: None),
+                mock.patch.object(torch.cuda, "synchronize", lambda: None),
+            ):
+                saved = W._save_rng(worker)
+                draw(worker._simulated_acc_len_rng, 5)  # the warm-up rounds
+                W._restore(worker, saved)
+                served = draw(worker._simulated_acc_len_rng, 64)
+        finally:
+            spec_utils._SIM_STREAMS.clear()
+        self.assertEqual(served, unwarmed)
+
     def test_without_its_own_generator_the_cpu_generator_is_restored(self):
         worker = self._worker(None)
         torch.manual_seed(2)

@@ -472,6 +472,7 @@ class _PostVerifyGraphs:
         # The host runs up to ~2 rounds ahead; a pinned slot is rewritten only after
         # the event behind its last copy has completed.
         self._sim_host: list[torch.Tensor] = []
+        self._sim_np: Optional[list] = None
         self._sim_done: list[Optional[torch.cuda.Event]] = []
         self._sim_turn = 0
         # the slot of the last run that returned outputs
@@ -553,6 +554,7 @@ class _PostVerifyGraphs:
     def _draw_sim_len(
         self, max_len: int
     ) -> tuple[Optional[torch.Tensor], Optional[int]]:
+        from sglang.srt.speculative import spec_utils
         from sglang.srt.speculative.spec_utils import (
             SIMULATE_ACC_LEN,
             SIMULATE_ACC_METHOD,
@@ -566,15 +568,23 @@ class _PostVerifyGraphs:
                 torch.zeros((1,), dtype=torch.int64, pin_memory=True) for _ in range(4)
             ]
             self._sim_done = [None] * len(self._sim_host)
+            # numpy views write the drawn length without a torch indexing call.
+            self._sim_np = (
+                [h.numpy() for h in self._sim_host] if spec_utils._SIM_PREDRAW else None
+            )
         turn = self._sim_turn
         self._sim_turn = (turn + 1) % len(self._sim_host)
         done = self._sim_done[turn]
         if done is not None and not done.query():
             done.synchronize()
         host = self._sim_host[turn]
-        host[0] = sample_simulated_acc_len(
+        value = sample_simulated_acc_len(
             SIMULATE_ACC_LEN, SIMULATE_ACC_METHOD, max_len, generator=self._sim_rng
         )
+        if self._sim_np is not None:
+            self._sim_np[turn][0] = value
+        else:
+            host[0] = value
         return host, turn
 
     def draw_sim_len_on(

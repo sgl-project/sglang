@@ -323,3 +323,7 @@ def _restore(worker, saved) -> None:
         # Drawn on demand, one length per round: the first served draw is the one
         # a server without the warm-up makes.
         worker._simulated_acc_len_rng.set_state(sim_state)
+        from sglang.srt.speculative import spec_utils
+
+        # A pre-drawn block holds draws past the restored state.
+        spec_utils._SIM_STREAMS.clear()
