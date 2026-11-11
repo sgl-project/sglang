@@ -1,3 +1,5 @@
+import concurrent.futures
+import ctypes
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -7,6 +9,7 @@ import torch
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_transfer_entry_pairs,
@@ -309,6 +312,185 @@ class TestMiniMaxPPStagesPairByLayerId(unittest.TestCase):
                     [len(p) for p in stage.state_data_ptrs],
                     [len(index_ids), len(dense_ids)],
                 )
+
+
+class _MemcpyEngine:
+    """Fake transfer engine: the peers share this process's memory."""
+
+    def batch_transfer_sync(self, session_id, src_addrs, dst_addrs, lengths):
+        for src, dst, length in zip(src_addrs, dst_addrs, lengths):
+            ctypes.memmove(dst, src, length)
+        return 0
+
+
+def _fill_randn(tensor: torch.Tensor) -> None:
+    tensor.copy_(torch.randn(tensor.shape))
+
+
+def _m3_pool(*, start: int, end: int, kv_heads: int) -> MiniMaxSparseKVPool:
+    """M3 shape with dense layers: dense 0-2, K-only sparse 3-6, token-major K/V."""
+    return MiniMaxSparseKVPool(
+        size=16,
+        page_size=4,
+        dtype=torch.float32,
+        head_num=kv_heads,
+        head_dim=8,
+        idx_head_dim=16,
+        dense_layer_ids=[0, 1, 2],
+        sparse_layer_ids=[3, 4, 5, 6],
+        disable_value_sparse_layer_ids=[3, 4, 5, 6],
+        device="cpu",
+        start_layer=start,
+        end_layer=end,
+    )
+
+
+def _state_manager(pool, *, attn_tp_size: int, tp_rank: int, pp_size: int):
+    manager = object.__new__(MooncakeKVManager)
+    kv_args = _state_kv_args(pool)
+    kv_args.engine_rank = tp_rank
+    kv_args.page_size = pool.page_size
+    kv_args.kv_head_num = pool.head_num
+    kv_args.total_kv_head_num = 4
+    manager.kv_args = kv_args
+    manager.attn_tp_size = attn_tp_size
+    manager.pp_size = pp_size
+    manager.engine = _MemcpyEngine()
+    manager.enable_deferred_decode_kv_release = False
+    manager.enable_custom_mem_pool = False
+    manager.max_transfer_batch_indices = 0
+    manager.is_mla_backend = manager.is_hybrid_mla_backend = False
+    manager.state_strides_validated = set()
+    manager.request_status = {}
+    return manager
+
+
+class TestMiniMaxStateAcrossAttentionTP(unittest.TestCase):
+    """MiniMax state between different attention TP sizes on mooncake: the
+    one-head index K reaches every decode rank in full (written once), and the
+    dense-layer K/V is head-sliced like token-major main KV."""
+
+    SRC_PAGES = [3, 1]
+    DST_PAGES = [2, 0]
+
+    def _send(self, src, decode, *, dst_tp: int, dst_rank: int):
+        dst_args = _state_kv_args(decode)
+        req = SimpleNamespace(
+            mooncake_session_id="session",
+            room=7,
+            dst_state_indices=[self.DST_PAGES, self.DST_PAGES],
+        )
+        target = SimpleNamespace(
+            dst_state_data_ptrs=dst_args.state_data_ptrs,
+            dst_state_item_lens=dst_args.state_item_lens,
+            dst_state_dim_per_tensor=dst_args.state_dim_per_tensor,
+            dst_state_layer_ids=dst_args.state_layer_ids,
+            dst_attn_tp_size=dst_tp,
+            dst_tp_rank=dst_rank,
+        )
+        executor = concurrent.futures.ThreadPoolExecutor(2)
+        self.addCleanup(executor.shutdown)
+        rc = src.maybe_send_extra(
+            req, [self.SRC_PAGES, self.SRC_PAGES], executor, target
+        )
+        self.assertEqual(rc, 0)
+
+    def _tokens(self, pages):
+        return [p * 4 + t for p in pages for t in range(4)]
+
+    def test_tp1_stage_to_tp2_decode(self):
+        # PP stage [2, 5): dense layer 2, sparse 3-4.
+        stage = _m3_pool(start=2, end=5, kv_heads=4)
+        for layer in (2, 3, 4):
+            _fill_randn(stage.get_key_buffer(layer))
+            _fill_randn(stage.get_value_buffer(layer))
+        for layer in (3, 4):
+            _fill_randn(stage.get_index_k_buffer(layer))
+        manager = _state_manager(stage, attn_tp_size=1, tp_rank=0, pp_size=3)
+        src_tok, dst_tok = self._tokens(self.SRC_PAGES), self._tokens(self.DST_PAGES)
+        for rank in range(2):
+            with self.subTest(rank=rank):
+                decode = _m3_pool(start=0, end=7, kv_heads=2)
+                self._send(manager, decode, dst_tp=2, dst_rank=rank)
+                heads = slice(2 * rank, 2 * rank + 2)
+                for get in ("get_key_buffer", "get_value_buffer"):
+                    src_buf = getattr(stage, get)(2)
+                    dst_buf = getattr(decode, get)(2)
+                    self.assertTrue(
+                        torch.equal(dst_buf[dst_tok], src_buf[src_tok][:, heads])
+                    )
+                    # Other dense layers belong to other stages.
+                    self.assertFalse(getattr(decode, get)(0).any())
+                for layer in (3, 4):
+                    self.assertTrue(
+                        torch.equal(
+                            decode.get_index_k_buffer(layer)[dst_tok],
+                            stage.get_index_k_buffer(layer)[src_tok],
+                        )
+                    )
+                self.assertFalse(decode.get_index_k_buffer(5).any())
+
+    def test_tp2_to_tp1_elects_one_index_writer(self):
+        source = _m3_pool(start=0, end=7, kv_heads=2)
+        for layer in range(7):
+            _fill_randn(source.get_key_buffer(layer))
+        _fill_randn(source.get_index_k_buffer(3))
+        decode = _m3_pool(start=0, end=7, kv_heads=4)
+        manager = _state_manager(source, attn_tp_size=2, tp_rank=1, pp_size=1)
+        self._send(manager, decode, dst_tp=1, dst_rank=0)
+        dst_tok = self._tokens(self.DST_PAGES)
+        src_tok = self._tokens(self.SRC_PAGES)
+        # Rank 1 writes its two dense heads at head offset 2, and no index K.
+        self.assertTrue(
+            torch.equal(
+                decode.get_key_buffer(0)[dst_tok][:, 2:],
+                source.get_key_buffer(0)[src_tok],
+            )
+        )
+        self.assertFalse(decode.get_key_buffer(0)[dst_tok][:, :2].any())
+        self.assertFalse(decode.get_index_k_buffer(3).any())
+
+
+class TestMiniMaxHandshakeAcrossAttentionTP(unittest.TestCase):
+    """Only a backend that reslices MiniMax KV and state admits a prefill of
+    another attention TP size; the others still fail at the handshake."""
+
+    def _ensure(self, manager_cls):
+        manager = object.__new__(manager_cls)
+        manager.prefill_info_table = {}
+        manager.kv_args = _state_kv_args(_m31_pool(0, M31_LAYERS, nvfp4=False))
+        manager.kv_args.page_size = 128
+        manager.kv_cache_dtype_str = "fp8_e4m3"
+        manager.attn_tp_size = 4
+        manager.attn_cp_size = 1
+        manager.kv_layout = None
+        manager.dsv41_spec_layout = None
+        manager.spec_kv_layout = None
+        manager.is_mla_backend = manager.is_hybrid_mla_backend = False
+        manager.dcp_size = 1
+        manager._resolve_rank_mapping = lambda info: None
+        response = Mock(status_code=200)
+        response.json.return_value = dict(
+            attn_tp_size=1,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=4,
+            page_size=128,
+            kv_cache_dtype="fp8_e4m3",
+            follow_bootstrap_room=True,
+        )
+        with patch(
+            "sglang.srt.disaggregation.common.conn.requests.get",
+            return_value=response,
+        ):
+            return CommonKVManager.try_ensure_parallel_info(manager, "prefill:1")
+
+    def test_mooncake_admits_pp4_tp1_prefill_for_tp4_decode(self):
+        self.assertTrue(self._ensure(MooncakeKVManager))
+
+    def test_nixl_still_rejects(self):
+        with self.assertRaisesRegex(RuntimeError, "matching attention TP sizes"):
+            self._ensure(NixlKVManager)
 
 
 if __name__ == "__main__":
