@@ -1621,7 +1621,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             window._maybe_zero_pages(pages)
         return out
 
-    @_one_operation
     def _plan_and_take(
         self,
         demands: Dict[str, int],
@@ -1629,18 +1628,21 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         bind_at_frontier: bool = False,
         consumer: Consumer = Consumer.FORWARD,
     ) -> Optional[Dict[str, Optional[torch.Tensor]]]:
-        """Physical pages for ``demands`` (pages per band) in a planned layout;
-        None exactly when `feasible` says no, and a plan that does not realize
-        raises. With ``bind_at_frontier``, see `realize`."""
+        """Physical pages for ``demands`` (pages per band) in a planned layout,
+        as one allocator operation (`_one_operation`) that takes from the
+        demanded bands only; None exactly when `feasible` says no, and a plan
+        that does not realize raises. With ``bind_at_frontier``, see `realize`."""
         demands = {name: n for name, n in demands.items() if n > 0}
         if not demands:
             return {}
-        with self._relief(demands) as plan:
-            if plan is None:
-                return None
-            return self.realize(
-                plan, bind_at_frontier=bind_at_frontier, consumer=consumer
-            )
+        with allocator_operation(self.members) as op:
+            op.declare_takes(demands)
+            with self._relief(demands) as plan:
+                if plan is None:
+                    return None
+                return self.realize(
+                    plan, bind_at_frontier=bind_at_frontier, consumer=consumer
+                )
 
     @_one_operation
     def realize(

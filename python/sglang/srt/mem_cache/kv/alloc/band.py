@@ -219,10 +219,11 @@ class _CapacityField(Generic[_T]):
 class _AllocatorOperation:
     """One allocator operation over some bands (`allocator_operation`): which
     bands read ahead on the host, everything (``read``) or their free and
-    pending pages only (``geometry``), whether it moves pages, and whether a
-    stream wait was queued."""
+    pending pages only (``geometry``), whether it moves pages, whether a
+    stream wait was queued, and which bands it takes pages from (``takes``,
+    by name; None when any may)."""
 
-    __slots__ = ("bands", "read", "geometry", "moves", "waited")
+    __slots__ = ("bands", "read", "geometry", "moves", "waited", "takes")
 
     def __init__(self, bands, moves: bool) -> None:
         self.bands = list(bands)
@@ -230,6 +231,20 @@ class _AllocatorOperation:
         self.geometry: Set[int] = set()
         self.moves = moves
         self.waited = False
+        self.takes: Optional[Set[str]] = None
+
+    def declare_takes(self, names) -> None:
+        """Only the bands ``names`` take pages in the rest of this operation,
+        so only they read their geometry ahead of a wait (`Band._before_wait`).
+        Declarations accumulate. An operation that already waited or read with
+        every band open stays open, and so does one whose declaration adds a
+        band after a wait."""
+        names = set(names)
+        if self.takes is None:
+            if not self.waited and not self.geometry:
+                self.takes = names
+        elif not names <= self.takes:
+            self.takes = None if self.waited else self.takes | names
 
 
 @contextlib.contextmanager
@@ -744,9 +759,11 @@ class Band:
     def _before_wait(self) -> None:
         """Before a stream wait: every band of the current allocator operation
         that has not yet read ahead does (`_read_ahead`), once per operation,
-        and the operation counts as waited; without an operation, every chain
-        band reads ahead. Called whether or not the wait is then needed, so
-        every rank reads at the same points."""
+        and the operation counts as waited; an operation that moves nothing
+        reads only the geometry of the bands it takes from that a fence may
+        order. Without an operation, every chain band reads ahead. Called
+        whether or not the wait is then needed, so every rank reads at the
+        same points."""
         op = self._operation
         if op is None:
             for band in self._chain_bands():
@@ -758,7 +775,11 @@ class Band:
             if op.moves:
                 band._read_ahead()
                 op.read.add(id(band))
-            elif id(band) not in op.geometry and band._fence_may_order_takes():
+            elif (
+                id(band) not in op.geometry
+                and (op.takes is None or band.sub_pool_name in op.takes)
+                and band._fence_may_order_takes()
+            ):
                 band._read_ahead_geometry()
                 op.geometry.add(id(band))
         op.waited = True
@@ -793,28 +814,23 @@ class Band:
             or self._fence_may_order_takes()
         )
 
-    def _reach_bytes(self) -> Tuple[int, int]:
-        """The bytes ``[lo, hi)`` this band's span may cover before a move:
-        its span, and the gap up to the nearest opaque frontier it grows
-        into (both gaps for a float)."""
+    def _span_bytes(self, span: Optional[Tuple[int, int]] = None) -> Tuple[int, int]:
+        """The bytes ``[lo, hi)`` of the pages ``span`` (this band's span by
+        default)."""
+        first, end = self._span_range() if span is None else span
         epp = self.entry_bytes_per_page
-        first, end = self._span_range()
-        lo, hi = first * epp, end * epp
-        if self.grow_direction != "down":
-            hi = max(hi, self._chain_low_frontier_above_bytes())
-        if self.grow_direction != "up":
-            lo = min(lo, self._chain_high_frontier_below_bytes())
-        return lo, hi
+        return first * epp, end * epp
 
     def _fence_may_order_takes(self) -> bool:
-        """Whether an outstanding fence of any chain band's ledger meets the
-        bytes this band may span before a move, so that a take here chooses its
-        holes on the host. A fence only ever becomes done, so a band this skips
+        """Whether an outstanding fence of any chain band's ledger meets this
+        band's span, so that a take here chooses its holes on the host. Holes
+        lie in the span a take finds, never in the extension it adds
+        (`_acquire`), and a fence only ever becomes done, so a band this skips
         before a wait needs no host read after it."""
         chain = self._chain_bands()
         if not any(band.usage.has_fences() for band in chain):
             return False
-        lo, hi = self._reach_bytes()
+        lo, hi = self._span_bytes()
         return any(band.usage.fence_outstanding(lo, hi) for band in chain)
 
     def _read_ahead_geometry(self) -> None:
@@ -1167,6 +1183,9 @@ class Band:
                 # settle's wait, `settle_pending`); a float keeps its span (no park).
                 self.settle_pending(through=pending.batches_for(short))
             n_drain = min(num_pages, int(self._free_phys_pages.shape[0]))
+            # The holes lie in the span before the extension: a fence only on
+            # the extended pages orders none of them.
+            hole_span = self._span_range()
             # Extend, then take holes; every host read before the first wait.
             extension = None
             if need_more > 0:
@@ -1188,7 +1207,9 @@ class Band:
             )
             if n_drain > 0:
                 self._taken_holes_host = None
-                holes, hole_clearance = self._take_holes(n_drain, consumers)
+                holes, hole_clearance = self._take_holes(
+                    n_drain, consumers, span=hole_span
+                )
                 clearance.merge(hole_clearance)
                 if self._taken_holes_host is None:
                     acquired = None
@@ -1283,10 +1304,15 @@ class Band:
         return "low" if self.grow_direction == "up" else "high"
 
     def _take_holes(
-        self, n: int, consumers: Tuple[Consumer, ...]
+        self,
+        n: int,
+        consumers: Tuple[Consumer, ...],
+        *,
+        span: Tuple[int, int],
     ) -> Tuple[torch.Tensor, Clearance]:
         """Remove ``n`` holes from the free list for ``consumers`` and return
-        them, in the order they bind, with what they must clear.
+        them, in the order they bind, with what they must clear. ``span``: the
+        pages ``[first, end)`` that hold every hole.
 
         The choice depends on retirement and releases only, never on a fired
         event, so every rank takes the same pages: holes no unretired fence
@@ -1295,8 +1321,7 @@ class Band:
         free list only after its forward was processed or waited. A fixed page
         on the free list holds nothing to keep, so it is a hole like any."""
         end = self._hole_end()
-        epp = self.entry_bytes_per_page
-        lo, hi = (page * epp for page in self._span_range())
+        lo, hi = self._span_bytes(span)
         chain = self._chain_bands()
         # Byte ranges an unretired forward (or an unreleased transfer) makes
         # ``consumers`` wait to write: the only fences that order the choice.

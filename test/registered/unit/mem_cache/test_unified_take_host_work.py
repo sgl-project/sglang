@@ -273,33 +273,87 @@ class TestSmallTakesUnderAFenceScaleWithTheTakes(CustomTestCase):
         self.assertLessEqual(touched, 4 * self.TAKES)
         self.assertFalse(owner._free_pages_host_known())
 
-    def test_a_fence_out_of_reach_keeps_no_host_copy(self):
-        """A fence on bytes the band cannot span before a move (the state
-        end's, at the far end of the chain) orders nothing here."""
-        allocator = _chain(2 * 4096 + 64)
-        owner = allocator.full_attn_allocator
-        ids = owner.alloc(2 * 4096)
-        owner.free(ids[1::2])
-        owner.flush_opportunistic()
-        self.assertIsNotNone(allocator.alloc_state_slots(1))
-        state = next(
-            band
-            for band in owner._chain_bands()
-            if band is not owner and band.grow_direction != "float"
-        )
-        lo, hi = owner._reach_bytes()
-        epp = state.entry_bytes_per_page
-        first, end = state._span_range()
-        self.assertLess(first, end)
-        page = first
-        self.assertFalse(lo < (page + 1) * epp and page * epp < hi)
-        state.usage.vacate(
-            StreamTransfer(_Unfired()), [(page, page + 1)], page_bytes=epp
-        )
-        self.assertTrue(state.usage.has_fences())
-        self.assertFalse(owner._fence_may_order_takes())
-        self._work(owner)
+    def test_a_fence_outside_the_span_keeps_no_host_copy(self):
+        """A fence on bytes outside the band's span orders no hole it takes:
+        one on the state end at the far end of the chain, and one in the gap
+        the owner grows into, which only a take's extension may meet."""
+        for where in ("state end", "gap"):
+            with self.subTest(fence=where):
+                allocator = _chain(2 * 4096 + 64)
+                owner = allocator.full_attn_allocator
+                ids = owner.alloc(2 * 4096)
+                owner.free(ids[1::2])
+                owner.flush_opportunistic()
+                self.assertIsNotNone(allocator.alloc_state_slots(1))
+                state = next(
+                    band
+                    for band in owner._chain_bands()
+                    if band is not owner and band.grow_direction != "float"
+                )
+                band = state if where == "state end" else owner
+                epp = band.entry_bytes_per_page
+                if where == "state end":
+                    page = state._span_range()[0]
+                else:
+                    # The next page the owner would grow into.
+                    page, _, _ = owner._frontier_extension(1)
+                first, end = owner._span_range()
+                owner_epp = owner.entry_bytes_per_page
+                self.assertFalse(
+                    first * owner_epp < (page + 1) * epp
+                    and page * epp < end * owner_epp
+                )
+                band.usage.vacate(
+                    StreamTransfer(_Unfired()), [(page, page + 1)], page_bytes=epp
+                )
+                self.assertTrue(band.usage.has_fences())
+                self.assertFalse(owner._fence_may_order_takes())
+                self._work(owner)
+                self.assertFalse(owner._free_pages_host_known())
+
+
+class TestATakeExtendingOntoAFence(CustomTestCase):
+    """A take that drains every hole and extends onto bytes a fence of an
+    unretired forward still guards chooses its holes as without the fence,
+    and on the device: the fence meets only the extension, whose clearance
+    waits it, never a hole. Reading the free list for that choice would park
+    the host behind the stream."""
+
+    HOLES = 64
+
+    def _take(self, fenced):
+        owner = _holes_in_end(self.HOLES)
+        # A free without host ids leaves the free list unknown on the host.
+        owner.free(owner.alloc(4 * owner.page_size))
         self.assertFalse(owner._free_pages_host_known())
+        holes = owner._reusable_pages()
+        self.assertGreater(holes, 0)
+        extension = owner._frontier_extension(2)
+        if fenced:
+            event = _Fired()
+            owner.usage.register_forward(event)
+            owner.usage.vacate(
+                event, [extension[:2]], page_bytes=owner.entry_bytes_per_page
+            )
+        reads = []
+        real = band_module.Band._known_free_pages_host
+
+        def counting(band, *args, **kwargs):
+            if band._host_free is None:
+                reads.append(band.sub_pool_name)
+            return real(band, *args, **kwargs)
+
+        with mock.patch.object(band_module.Band, "_known_free_pages_host", counting):
+            taken = owner.take_physical_pages(holes + 2)
+        self.assertIsNotNone(taken)
+        self.assertEqual(owner.watermark_physical, extension[2])
+        return taken.tolist(), reads
+
+    def test_the_choice_reads_nothing_and_matches_the_unfenced_one(self):
+        unfenced, _ = self._take(fenced=False)
+        fenced, reads = self._take(fenced=True)
+        self.assertEqual(reads, [])
+        self.assertEqual(fenced, unfenced)
 
 
 if __name__ == "__main__":
