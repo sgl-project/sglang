@@ -12,6 +12,7 @@ register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -128,6 +129,7 @@ class TestApplyWithAddend(CustomTestCase):
             "compiling",
             "cutedsl",
             "splitk",
+            "low_m_autotune",
             "hopper_gemv",
             "noncontiguous_addend",
             "bias",
@@ -176,6 +178,17 @@ class TestApplyWithAddend(CustomTestCase):
                         _fake_kernel(kernel_calls, route),
                     )
                 )
+            elif route == "low_m_autotune":
+                enter(patch.object(unquant, "_CUTE_DSL_BF16_CTA_K", 64))
+                enter(
+                    patch.object(
+                        unquant,
+                        "_mm_bf16",
+                        lambda x, w_t, bias, **kw: _fake_kernel(kernel_calls, route)(
+                            x, w_t.t(), bias
+                        ),
+                    )
+                )
             elif route == "hopper_gemv":
                 enter(patch.object(unquant, "_use_hopper_bf16_gemv", lambda *a: True))
                 enter(
@@ -193,8 +206,49 @@ class TestApplyWithAddend(CustomTestCase):
         torch.testing.assert_close(
             output, self._reference(x, before, bias), rtol=_BF16_RTOL, atol=_BF16_ATOL
         )
-        if route in ("cutedsl", "splitk", "hopper_gemv"):
+        if route in ("cutedsl", "splitk", "low_m_autotune", "hopper_gemv"):
             self.assertEqual(kernel_calls, [route])
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestLowMAutotuneRankSymmetry(CustomTestCase):
+    @torch.no_grad()
+    def test_bias_only_on_one_rank_makes_the_same_tuning_calls(self):
+        """FlashInfer syncs each tuning call across TP ranks, and RowParallelLinear
+        passes its bias on rank 0 only; differing calls deadlock server startup."""
+        projection = ReplicatedLinear(
+            128, 128, bias=False, params_dtype=torch.bfloat16
+        ).cuda()
+        projection.weight.requires_grad_(False)
+        rank0_bias = torch.nn.Parameter(
+            torch.randn(128, device="cuda", dtype=torch.bfloat16)
+        )
+        x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+
+        def tuning_calls(bias):
+            calls = []
+
+            def fake_mm_bf16(a, w_t, b, **kw):
+                calls.append((tuple(a.shape), tuple(w_t.shape), b is None, kw))
+                return F.linear(a, w_t.t(), b)
+
+            with (
+                patch.object(
+                    unquant, "_BF16_GEMM_BACKEND", unquant.Bf16GemmBackend.CUTEDSL
+                ),
+                patch.object(unquant, "_mm_bf16", fake_mm_bf16),
+                patch.object(
+                    unquant,
+                    "_flashinfer_autotuner",
+                    SimpleNamespace(is_tuning_mode=True),
+                ),
+            ):
+                projection.quant_method.apply(projection, x, bias)
+            return calls
+
+        rank0_calls = tuning_calls(rank0_bias)
+        self.assertTrue(rank0_calls)
+        self.assertEqual(rank0_calls, tuning_calls(None))
 
 
 if __name__ == "__main__":

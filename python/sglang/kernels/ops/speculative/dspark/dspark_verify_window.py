@@ -326,12 +326,14 @@ class ScatterCompactToStrided:
         layout: RaggedVerifyLayout,
         fill_value: float,
         verify_num_draft_tokens: int,
+        point_mass_fill: bool = False,
     ) -> torch.Tensor:
         return scatter_compact_to_strided(
             compact=compact,
             layout=layout,
             fill_value=fill_value,
             verify_num_draft_tokens=verify_num_draft_tokens,
+            point_mass_fill=point_mass_fill,
         )
 
     @classmethod
@@ -342,12 +344,14 @@ class ScatterCompactToStrided:
         layout: RaggedVerifyLayout,
         fill_value: float,
         verify_num_draft_tokens: int,
+        point_mass_fill: bool = False,
     ) -> torch.Tensor:
         return scatter_compact_to_strided_triton(
             compact=compact,
             layout=layout,
             fill_value=fill_value,
             verify_num_draft_tokens=verify_num_draft_tokens,
+            point_mass_fill=point_mass_fill,
         )
 
 
@@ -357,7 +361,10 @@ def scatter_compact_to_strided(
     layout: RaggedVerifyLayout,
     fill_value: float,
     verify_num_draft_tokens: int,
+    point_mass_fill: bool = False,
 ) -> torch.Tensor:
+    """``point_mass_fill``: padding rows hold 0 in column 0 and ``fill_value``
+    elsewhere, so padded logits rows are point masses rather than uniform."""
     stride = verify_num_draft_tokens
     bs = layout.verify_lens.shape[0]
     dim = compact.shape[1]
@@ -366,6 +373,8 @@ def scatter_compact_to_strided(
     strided = torch.full(
         (bs * stride + 1, dim), fill_value, dtype=compact.dtype, device=device
     )
+    if point_mass_fill:
+        strided[:, 0] = 0
     req_id, within, valid = compact_row_index(
         verify_lens=layout.verify_lens,
         padded_total=layout.graph_num_tokens,
@@ -391,6 +400,7 @@ def _scatter_compact_to_strided_kernel(
     dim,
     fill_value,
     BLOCK_D: tl.constexpr,
+    POINT_MASS_FILL: tl.constexpr,
 ):
     o = tl.program_id(0).to(tl.int64)
     dblk = tl.program_id(1)
@@ -403,7 +413,10 @@ def _scatter_compact_to_strided_kernel(
     in_range = w < vl_i
     src = tl.where(in_range, start_i + w, 0)
     val = tl.load(compact_ptr + src * dim + d, mask=dmask & in_range, other=0)
-    val = tl.where(in_range, val, fill_value)
+    if POINT_MASS_FILL:
+        val = tl.where(in_range, val, tl.where(d == 0, 0, fill_value))
+    else:
+        val = tl.where(in_range, val, fill_value)
     tl.store(out_ptr + o * dim + d, val, mask=dmask)
 
 
@@ -414,6 +427,7 @@ def scatter_compact_to_strided_into(
     out: torch.Tensor,
     stride: int,
     fill_value: float,
+    point_mass_fill: bool = False,
 ) -> torch.Tensor:
     dim = compact.shape[1]
     fill_value = float(fill_value) if out.dtype.is_floating_point else int(fill_value)
@@ -432,6 +446,7 @@ def scatter_compact_to_strided_into(
         dim,
         fill_value,
         BLOCK_D=BLOCK_D,
+        POINT_MASS_FILL=point_mass_fill,
     )
     return out
 
@@ -442,6 +457,7 @@ def scatter_compact_to_strided_triton(
     layout: RaggedVerifyLayout,
     fill_value: float,
     verify_num_draft_tokens: int,
+    point_mass_fill: bool = False,
 ) -> torch.Tensor:
     stride = verify_num_draft_tokens
     bs = layout.verify_lens.shape[0]
@@ -454,6 +470,7 @@ def scatter_compact_to_strided_triton(
         out=out,
         stride=stride,
         fill_value=fill_value,
+        point_mass_fill=point_mass_fill,
     )
 
 
@@ -707,15 +724,19 @@ def build_out_tokens(
     verify_num_draft_tokens: int,
     gamma: int,
 ) -> torch.Tensor:
+    """Return accepted drafts, the bonus token, and zero-filled tail slots."""
     bs = draft_tokens.shape[0]
-    out_tokens = torch.empty(
+    out_tokens = torch.zeros(
         (bs, verify_num_draft_tokens),
         dtype=torch.int64,
         device=draft_tokens.device,
     )
-    out_tokens[:, :gamma].copy_(draft_tokens)
-    out_tokens[:, gamma].fill_(0)
-    out_tokens.scatter_(1, correct_len.to(torch.int64)[:, None], bonus[:, None])
+    correct_len = correct_len.to(torch.int64)
+    keep = (
+        torch.arange(gamma, device=draft_tokens.device)[None, :] < correct_len[:, None]
+    )
+    out_tokens[:, :gamma] = torch.where(keep, draft_tokens.to(torch.int64), 0)
+    out_tokens.scatter_(1, correct_len[:, None], bonus[:, None])
     return out_tokens
 
 
@@ -739,7 +760,8 @@ def _build_out_tokens_kernel(
     bonus = tl.load(bonus_ptr + b, mask=mask, other=0)
     draft_mask = mask & (k < gamma)
     draft = tl.load(draft_tokens_ptr + b * gamma + k, mask=draft_mask, other=0)
-    val = tl.where(k == cl, bonus, tl.where(k < gamma, draft, 0))
+    # Rejected drafts must not reach downstream token gathers.
+    val = tl.where(k == cl, bonus, tl.where(k < cl, draft, 0))
     tl.store(out_ptr + offs, val.to(tl.int64), mask=mask)
 
 

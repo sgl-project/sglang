@@ -19,13 +19,17 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.dllm.mixin.scheduler import DllmManager
 from sglang.srt.managers.cache_controller import HiCacheAck
+from sglang.srt.managers.hisparse_coordinator import HiSparseAct, HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
 )
-from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
@@ -40,6 +44,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
@@ -60,6 +65,7 @@ register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 class _FakeReq(SimpleNamespace):
     """A request stand-in compared and hashed by identity, like Req."""
 
+    owner_list = None
     __eq__ = object.__eq__
     __hash__ = object.__hash__
 
@@ -196,8 +202,11 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def _spy_requeue(self, scheduler: Scheduler) -> List[dict]:
         requeue_log: List[dict] = []
 
-        def record(req):
+        def record(req, is_retracted=False):
             requeue_log.append({"req": req, "is_retracted": req.is_retracted})
+            # The queue door takes every request out of its list.
+            if req.owner_list is not None:
+                req.owner_list.leave([req])
 
         scheduler._add_request_to_queue = MagicMock(side_effect=record)
         return requeue_log
@@ -283,6 +292,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         batch.spec_algorithm = SpeculativeAlgorithm.NONE
         scheduler.token_to_kv_pool_allocator.page_size = 1
+        scheduler.token_to_kv_pool_allocator.pools_share_memory = False
         scheduler.token_to_kv_pool_allocator.check_decode_capacity.return_value = False
         scheduler.tree_cache.req_to_token_pool.mamba_allocator = None
         scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
@@ -335,7 +345,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.last_batch = MagicMock()
         scheduler.cur_batch_for_debug = MagicMock()
-        scheduler.chunked_req = MagicMock()
+        scheduler.chunked_reqs.join([MagicMock(owner_list=None)])
 
         original_last_batch = scheduler.last_batch
         original_cur_batch = scheduler.cur_batch_for_debug
@@ -437,7 +447,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             forward_mode=ForwardMode.EXTEND,
             with_tensors=True,
         )
-        scheduler.chunked_req = MagicMock()
+        scheduler.chunked_reqs.join([MagicMock(owner_list=None)])
         scheduler.running_reqs.join([run_req_a, run_req_b, last_req])
         requeue_log = self._spy_requeue(scheduler)
 
@@ -486,6 +496,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         """retract of a folded-in last extend batch must release through the scheduler-owned hisparse coordinator."""
         scheduler = self._new_scheduler()
         scheduler.hisparse_coordinator = MagicMock()
+        scheduler.hisparse_coordinator.ack_staging_queue = IndexedReqList(
+            ListKind.HISPARSE_STAGING
+        )
         scheduler.init_request_retirer()
         last_req = self._make_req("last")
         last_req.kv.req_pool_idx = 0
@@ -504,8 +517,60 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         ):
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
-        scheduler.hisparse_coordinator.retract_req.assert_called_once_with(last_req)
+        scheduler.hisparse_coordinator.release_request.assert_called_once_with(last_req)
         self.assertEqual([entry["req"] for entry in requeue_log], [last_req])
+
+    def test_retract_takes_hisparse_staging_requests(self):
+        scheduler = self._new_scheduler()
+        # `older` was prefilled a step earlier and still waits for its host
+        # copy; `newer` is the last prefill batch, staged too.
+        older = self._make_req("older")
+        newer = self._make_req("newer")
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.ack_staging_queue = IndexedReqList(
+            ListKind.HISPARSE_STAGING, req_of=lambda act: act.req
+        )
+        coordinator.write_staging_stream = MagicMock()
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros((2, 8), dtype=torch.int64)
+        )
+        coordinator.token_to_kv_pool_allocator = MagicMock()
+        coordinator.mem_pool_host = MagicMock()
+        coordinator.mem_pool_host.allocated_host_indices.return_value = torch.empty(0)
+        coordinator.req_to_host_pool = torch.full((2, 8), -1, dtype=torch.int64)
+        coordinator.req_to_host_pool_allocated_len = torch.zeros(2, dtype=torch.int64)
+        coordinator._skip_first_backup = {}
+        coordinator.spec_swap = MagicMock()
+        for slot, req in enumerate((older, newer)):
+            req.kv.req_pool_idx = slot
+            req.extend_end = 3
+            req.hisparse_staging = True
+            coordinator.ack_staging_queue.join([HiSparseAct(None, MagicMock(), req)])
+        scheduler.hisparse_coordinator = coordinator
+        scheduler.init_request_retirer()
+        scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
+        prefill = self._make_batch(
+            scheduler,
+            reqs=[newer],
+            forward_mode=ForwardMode.EXTEND,
+            with_tensors=True,
+        )
+        scheduler.last_batch = prefill
+        requeue_log = self._spy_requeue(scheduler)
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+            side_effect=lambda req, *_, **__: setattr(req.kv, "req_pool_idx", None),
+        ):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual([entry["req"] for entry in requeue_log], [newer, older])
+        self.assertEqual(len(coordinator.ack_staging_queue), 0)
+        self.assertEqual(coordinator.write_staging_stream.synchronize.call_count, 2)
+        for req in (older, newer):
+            self.assertEqual(req.retraction_count, 1)
+            self.assertFalse(req.hisparse_staging)
+            self.assertFalse(req.kv.holds_kv)
 
     def test_retract_disagg_prefill_excludes_last_batch(self):
         """retract under disagg prefill must not release or requeue last extend reqs."""
@@ -560,7 +625,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         """retract with nothing to retract still clears chunked_req and batch_is_full."""
         scheduler = self._new_scheduler()
         scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
-        scheduler.chunked_req = MagicMock()
+        scheduler.chunked_reqs.join([MagicMock(owner_list=None)])
         requeue_log = self._spy_requeue(scheduler)
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
@@ -590,7 +655,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         scheduler.process_batch_result = MagicMock(side_effect=process_result)
         scheduler._add_request_to_queue = MagicMock(
-            side_effect=lambda req: event_log.append(
+            side_effect=lambda req, **_: event_log.append(
                 "requeue-released" if req.is_retracted else "requeue-unreleased"
             )
         )
@@ -607,9 +672,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler._add_request_to_queue = MagicMock()
         scheduler.last_batch = None
 
-        chunked_req = MagicMock()
+        chunked_req = MagicMock(owner_list=None)
         chunked_req.finished.return_value = False
-        scheduler.chunked_req = chunked_req
+        scheduler.chunked_reqs.join([chunked_req])
 
         with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
@@ -648,6 +713,10 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.disagg_decode_prealloc_queue = MagicMock()
+        held = IndexedReqList(ListKind.PD_HELD)
+        scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.side_effect = (
+            lambda req: move([req], held)
+        )
 
         def _req(rid, req_pool_idx):
             return _FakeReq(
@@ -672,11 +741,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         # device->host KV offload rather than offload-then-delete it.
         self.assertEqual(mock_retract_all.call_args.kwargs["offload_kv"], False)
         self.assertEqual(list(scheduler.waiting_queue), [unstaged])
-        held = [
-            c.args[0]
-            for c in scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.call_args_list
-        ]
-        self.assertEqual(held, [running, staged])
+        self.assertEqual(list(held), [running, staged])
 
     def test_retract_aborts_requests_the_recompute_cannot_rebuild(self):
         for decode in (False, True):
@@ -1002,6 +1067,99 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(scheduler.last_mbs, [None, None])
         self.assertEqual([mb.reqs for mb in scheduler.running_mbs], [[], []])
         self.assertEqual(len(scheduler.running_reqs), 0)
+
+    def test_pp_retract_takes_a_request_in_two_sources_once(self):
+        scheduler = self._new_scheduler()
+        running = self._make_req("running")
+        chunked = self._make_req("chunked")
+        chunked.kv.req_pool_idx = 0
+        # The chunked request's last chunk ran in the second micro-batch.
+        scheduler.chunked_reqs.join([chunked])
+        scheduler.pp_loop_size = 2
+        scheduler.running_mbs = [
+            self._make_batch(
+                scheduler, [running], forward_mode=ForwardMode.DECODE, with_tensors=True
+            ),
+            ScheduleBatch(reqs=[]),
+        ]
+        scheduler.last_mbs = [
+            None,
+            self._make_batch(
+                scheduler, [chunked], forward_mode=ForwardMode.EXTEND, with_tensors=True
+            ),
+        ]
+        scheduler.running_reqs.join([running])
+        requeue_log = self._spy_requeue(scheduler)
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+            side_effect=lambda req, *_, **__: setattr(req.kv, "req_pool_idx", None),
+        ):
+            scheduler._pp_retract_microbatches()
+
+        self.assertEqual([entry["req"] for entry in requeue_log], [running, chunked])
+        self.assertEqual(chunked.retraction_count, 1)
+        self.assertIsNone(scheduler.chunked_req)
+
+    def test_dllm_retract_takes_every_row_holder_and_restarts_it(self):
+        scheduler = self._new_scheduler()
+        dllm_config = DllmConfig(
+            algorithm="LowConfidence",
+            algorithm_config={},
+            block_size=4,
+            mask_id=99,
+            max_running_requests=4,
+        )
+        scheduler.dllm_config = dllm_config
+        scheduler.dllm_manager = DllmManager(dllm_config=dllm_config, abort=MagicMock())
+        decoding, prefilling, done = (
+            Req(
+                rid=rid,
+                origin_input_text="",
+                origin_input_ids=array("q", [1, 2, 3, 4, 5]),
+                sampling_params=SamplingParams(),
+                dllm_config=dllm_config,
+            )
+            for rid in ("decoding", "prefilling", "done")
+        )
+        # A prompt shorter than a block, with output past it.
+        decoding.origin_input_ids = array("q", [1, 2])
+        decoding.output_ids = array("q", [3, 4, 5])
+        # Left out of the last round, mid-decode with an unresolved FDFO block.
+        decoding.kv.req_pool_idx = 0
+        decoding.dllm_initialized = True
+        decoding.dllm_phase = DllmReqPhase.STAGING_DECODE
+        decoding.dllm_incomplete_ids = array("q", [7, 99, 99, 99])
+        decoding.dllm_algo_state = object()
+        prefilling.kv.req_pool_idx = 1
+        prefilling.dllm_phase = DllmReqPhase.STAGING_PREFILL
+        # Finished and released by the last round's result.
+        done.finished_reason = FINISH_LENGTH(length=0)
+        done.dllm_phase = DllmReqPhase.STAGING_PREFILL
+        scheduler.dllm_manager.waiting_queue.join([decoding, prefilling, done])
+        scheduler.dllm_manager.add_staging_reqs([prefilling, done])
+        scheduler.running_batch = self._make_batch(scheduler, [])
+        scheduler.last_batch = self._make_batch(
+            scheduler, [prefilling, done], forward_mode=ForwardMode.DLLM_EXTEND
+        )
+        requeue_log = self._spy_requeue(scheduler)
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+            side_effect=lambda req, *_, **__: setattr(req.kv, "req_pool_idx", None),
+        ):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(
+            [entry["req"] for entry in requeue_log], [prefilling, decoding]
+        )
+        self.assertEqual(len(scheduler.dllm_manager.waiting_queue), 0)
+        self.assertFalse(scheduler.dllm_manager.any_staging_reqs())
+        self.assertFalse(decoding.kv.holds_kv)
+        self.assertEqual(decoding.dllm_phase, DllmReqPhase.INCOMING_PREFILL)
+        self.assertFalse(decoding.dllm_initialized)
+        self.assertEqual(len(decoding.dllm_incomplete_ids), 0)
+        self.assertIsNone(decoding.dllm_algo_state)
 
 
 if __name__ == "__main__":

@@ -135,6 +135,12 @@ repos:
         entry: python3 scripts/lint/check_no_bare_pytest_main.py
         language: system
         files: ^(python|test)/.*\.py$
+      - id: export-cookbook-commands
+        name: regenerate python/sglang/cli/_commands/ from the Cookbook configs
+        entry: node docs/scripts/export_commands.mjs
+        language: system
+        files: ^(docs/src/snippets/(_deployment\.jsx|configs/.*)|docs/cookbook/.*\.mdx|docs/scripts/export_commands\.mjs|python/sglang/cli/_commands/.*)$
+        pass_filenames: false
       - id: check-registered-tests
         name: validate registered test CI registries
         entry: python3 scripts/lint/check_registered_tests.py
