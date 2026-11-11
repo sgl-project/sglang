@@ -435,11 +435,14 @@ def _build_response(
                 serialized_dit_sigmas=serialized_dit_sigmas,
             )
         else:
-            # some pipelines return a numpy array, which the inline path serializes as a tensor too
-            stored[f"generated_output.{sample_idx}"] = torch.as_tensor(out_i)
-            serialized_generated_output = {
-                "__store__": f"generated_output.{sample_idx}"
-            }
+            # None when the request skipped the decode
+            serialized_generated_output = None
+            if out_i is not None:
+                # some pipelines return a numpy array, which the inline path serializes as a tensor too
+                stored[f"generated_output.{sample_idx}"] = torch.as_tensor(out_i)
+                serialized_generated_output = {
+                    "__store__": f"generated_output.{sample_idx}"
+                }
             serialized = _serialize_rollout_trajectory_via_store(
                 result.rollout_trajectory_data,
                 sample_idx,

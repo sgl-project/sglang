@@ -750,6 +750,18 @@ class TestBuildResponseViaStore(unittest.TestCase):
         for a, b in zip(inline, via_store):
             _assert_same_tensors(self, a.generated_output, b.generated_output, stored)
 
+    def test_skipped_decode_stores_no_output(self):
+        """A request that skipped the decode has no output; storing one would fail on None."""
+        batch = _store_batch()
+        num_outputs = batch.output.shape[0]
+        batch.output = None
+        stored = {}
+        resps = _build_response(
+            "r", "p", 0, True, batch, stored=stored, num_outputs=num_outputs
+        )
+        self.assertEqual([resp.generated_output for resp in resps], [None] * len(resps))
+        self.assertFalse(any(key.startswith("generated_output.") for key in stored))
+
     def test_eval_response_stores_nothing(self):
         batch = OutputBatch(
             output=torch.randn(2, 1, 8, 8), rollout_trajectory_data=None
