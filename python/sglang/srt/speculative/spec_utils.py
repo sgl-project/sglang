@@ -1221,6 +1221,10 @@ def commit_mamba_states_after_verify(
     ):
         if batch.forward_mode.is_idle() or accept_index.numel() == 0:
             return
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            commit_ple_states_after_verify,
+        )
+
         # Persistent destinations are state slots; replay/scratch rows still
         # index requests.
         if state_slots is None:
@@ -1268,6 +1272,14 @@ def commit_mamba_states_after_verify(
             src_indices_raw=src_indices_raw,
             null_block_id=-1,
         )
+        commit_ple_states_after_verify(
+            model_runner.token_to_kv_pool.layer_router,
+            replay_state_indices,
+            last_correct_step_indices,
+            replay_track_indices,
+            mamba_steps_to_track,
+            src_indices_raw,
+        )
         return
 
     if (
@@ -1310,6 +1322,14 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+        )
+        commit_ple_states_after_verify(
+            model_runner.token_to_kv_pool.layer_router,
+            replay_state_indices,
+            last_correct_step_indices,
+            replay_track_indices,
+            mamba_steps_to_track,
+            src_indices_raw,
         )
         return
 

@@ -25,6 +25,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.linear.gdn_backend import (
     _validate_gdn_target_verify_layout,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -72,22 +73,25 @@ def _gdn_pool():
     )
 
 
-def _hybrid_backend(mamba_pool, spec_state, cache_indices):
-    """A HybridLinearAttnBackend whose sidecar translates virtual mamba ids by
-    +100, so the test can tell translated ids from raw ones."""
-    req_to_token_pool = SimpleNamespace(
-        mamba_pool=mamba_pool,
-        get_speculative_mamba2_params_all_layers=lambda: spec_state,
-        get_mamba_indices=lambda rows: rows // 2,
-        short_conv_pool=SimpleNamespace(conv_state=None, intermediate_conv_state=None),
-        ngram_pool=SimpleNamespace(context=None, intermediate_context=None),
-    )
+def _hybrid_backend(mamba_pool, spec_state, cache_indices, track_slots=None):
+    """A HybridLinearAttnBackend whose forward resolved ``cache_indices`` (and
+    ``track_slots``) as its state slots."""
+    mamba_pool.get_speculative_mamba2_params_all_layers = lambda: spec_state
+
+    def forward_state_slots(num_requests, track_ids):
+        track = None
+        if track_ids is not None:
+            track = track_slots[:num_requests]
+        return ForwardStateSlots(cache_indices[:num_requests], track)
+
     hybrid = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
     hybrid.linear_attn_backend = SimpleNamespace(
-        req_to_token_pool=req_to_token_pool,
-        forward_metadata=SimpleNamespace(mamba_cache_indices=cache_indices),
+        state_pool=mamba_pool,
+        forward_state_slots=forward_state_slots,
         accept_lens_pool=None,
-        _translate_mamba_indices=lambda ids: ids + 100,
+        token_to_kv_pool=SimpleNamespace(
+            layer_router=SimpleNamespace(part_view=lambda part: None)
+        ),
     )
     return hybrid
 
@@ -161,9 +165,14 @@ class TestGDNReplaySSMBackendCommit(CustomTestCase):
         # Every accepted window folds, so `temporal` is the committed state.
         self.assertIs(kwargs["fold_every_commit"], True)
 
-    def test_pp_rows_and_track_slots_are_translated(self):
+    def test_pp_rows_and_forward_track_slots(self):
         pool, state = _gdn_pool(), _spec_state()
-        hybrid = _hybrid_backend(pool, state, torch.tensor([7, 7, 7]))
+        hybrid = _hybrid_backend(
+            pool,
+            state,
+            torch.tensor([107, 111, 115]),
+            track_slots=torch.tensor([140, 141, 142]),
+        )
         req_rows = torch.tensor([14, 22, 30])
         track_steps = torch.tensor([1, -1, 5])
         with (
@@ -179,7 +188,8 @@ class TestGDNReplaySSMBackendCommit(CustomTestCase):
             )
 
         kwargs = commit.call_args.kwargs
-        # PP stable rows read the slots of the delayed batch's request rows.
+        # The commit writes the slots the verify forward resolved; PP stable
+        # rows only pick the delayed batch's scratch rows.
         self.assertEqual(kwargs["state_batch_indices"].tolist(), [107, 111, 115])
         self.assertEqual(kwargs["src_indices_raw"].tolist(), [14, 22, 30])
         self.assertEqual(kwargs["replay_indices"].tolist(), [14, 22, 30])
@@ -231,11 +241,11 @@ class TestGDNReplaySSMGenericCommit(CustomTestCase):
         from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
 
         target_worker = MagicMock()
-        req_pool = target_worker.model_runner.req_to_token_pool
-        req_pool.mamba_pool = _gdn_pool()
+        pool = _gdn_pool()
+        pool.get_speculative_mamba2_params_all_layers = lambda: _spec_state()
+        router = target_worker.model_runner.token_to_kv_pool.layer_router
+        router.part_view.return_value = pool
         slots = torch.tensor([5, -1])
-        req_pool.get_mamba_indices.return_value = slots
-        req_pool.get_speculative_mamba2_params_all_layers.return_value = _spec_state()
         batch = MagicMock()
         batch.forward_mode.is_idle.return_value = False
         batch.req_pool_indices = torch.tensor([17, 23])
@@ -254,6 +264,7 @@ class TestGDNReplaySSMGenericCommit(CustomTestCase):
                 "sglang.kernels.ops.mamba.mamba_state_scatter_triton."
                 "fused_conv_window_scatter_with_mask"
             ),
+            patch(f"{_BACKEND}.commit_ple_states_after_verify") as ple,
         ):
             commit_mamba_states_after_verify(
                 target_worker,
@@ -261,10 +272,21 @@ class TestGDNReplaySSMGenericCommit(CustomTestCase):
                 accept_lens,
                 accept_index,
                 draft_token_num=3,
+                state_slots=ForwardStateSlots(slots),
             )
 
-        self.assertIs(advance.call_args.kwargs["state_batch_indices"], slots)
-        self.assertIs(fold.call_args.kwargs["state_batch_indices"], slots)
+        for kernel in (advance, fold):
+            self.assertEqual(
+                kernel.call_args.kwargs["state_batch_indices"].tolist(),
+                slots.tolist(),
+            )
+        # PLE side states roll back with the same slots and accepted steps.
+        ple.assert_called_once()
+        router_arg, state_arg, steps_arg, track_arg = ple.call_args.args[:4]
+        self.assertIs(router_arg, router)
+        self.assertEqual(state_arg.tolist(), slots.tolist())
+        self.assertEqual(steps_arg.tolist(), [1, 0])
+        self.assertIsNone(track_arg)
 
 
 class TestGDNRaggedVerifyRefusal(CustomTestCase):

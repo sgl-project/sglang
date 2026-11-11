@@ -1824,54 +1824,72 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         src_indices_raw: Optional[torch.Tensor] = None,
     ):
-        """Roll the accepted per-step PLE side states into their main slots."""
-        router = self.linear_attn_backend.token_to_kv_pool.layer_router
+        commit_ple_states_after_verify(
+            self.linear_attn_backend.token_to_kv_pool.layer_router,
+            state_indices_tensor,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+            src_indices_raw,
+        )
+
+
+def commit_ple_states_after_verify(
+    router,
+    state_indices_tensor: torch.Tensor,
+    last_correct_step_indices: torch.Tensor,
+    mamba_track_indices: Optional[torch.Tensor],
+    mamba_steps_to_track: Optional[torch.Tensor],
+    src_indices_raw: Optional[torch.Tensor] = None,
+):
+    """Roll the accepted per-step PLE side states into their main slots."""
+    if mamba_track_indices is not None:
+        assert mamba_steps_to_track is not None
+
+    state_pairs = []
+    short_conv_pool = router.part_view(SHORT_CONV_PART)
+    if (
+        short_conv_pool is not None
+        and short_conv_pool.conv_state is not None
+        and short_conv_pool.intermediate_conv_state is not None
+    ):
+        state_pairs.append(
+            (
+                short_conv_pool.conv_state,
+                short_conv_pool.intermediate_conv_state,
+            )
+        )
+
+    ngram_pool = router.part_view(NGRAM_PART)
+    if (
+        ngram_pool is not None
+        and ngram_pool.context is not None
+        and ngram_pool.intermediate_context is not None
+    ):
+        state_pairs.append(
+            (
+                ngram_pool.context.unsqueeze(0),
+                ngram_pool.intermediate_context.unsqueeze(0),
+            )
+        )
+
+    scatter = HybridLinearAttnBackend._scatter_speculative_state_with_mask
+    for state, intermediate_state in state_pairs:
+        scatter(
+            state,
+            intermediate_state,
+            state_indices_tensor,
+            last_correct_step_indices,
+            src_indices_raw,
+        )
         if mamba_track_indices is not None:
-            assert mamba_steps_to_track is not None
-
-        state_pairs = []
-        short_conv_pool = router.part_view(SHORT_CONV_PART)
-        if (
-            short_conv_pool is not None
-            and short_conv_pool.conv_state is not None
-            and short_conv_pool.intermediate_conv_state is not None
-        ):
-            state_pairs.append(
-                (
-                    short_conv_pool.conv_state,
-                    short_conv_pool.intermediate_conv_state,
-                )
-            )
-
-        ngram_pool = router.part_view(NGRAM_PART)
-        if (
-            ngram_pool is not None
-            and ngram_pool.context is not None
-            and ngram_pool.intermediate_context is not None
-        ):
-            state_pairs.append(
-                (
-                    ngram_pool.context.unsqueeze(0),
-                    ngram_pool.intermediate_context.unsqueeze(0),
-                )
-            )
-
-        for state, intermediate_state in state_pairs:
-            self._scatter_speculative_state_with_mask(
+            scatter(
                 state,
                 intermediate_state,
-                state_indices_tensor,
-                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
                 src_indices_raw,
             )
-            if mamba_track_indices is not None:
-                self._scatter_speculative_state_with_mask(
-                    state,
-                    intermediate_state,
-                    mamba_track_indices,
-                    mamba_steps_to_track,
-                    src_indices_raw,
-                )
 
 
 class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
