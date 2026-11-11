@@ -155,6 +155,7 @@ class HunYuanSparseMoeBlock(nn.Module):
 
         self.experts = FusedMoE(
             num_experts=config.num_experts,
+            top_k=top_k,
             hidden_size=config.hidden_size,
             intermediate_size=intermediate_size,
             reduce_results=False,
