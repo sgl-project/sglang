@@ -35,7 +35,7 @@ enum ErrorClass {
     NoTarget,
     /// 504 — the router gave up waiting (any timeout / deadline).
     Timeout,
-    /// 501 — the path names a feature this router does not provide.
+    /// 501 — the path names a feature this router does not provide yet.
     NotImplemented,
     /// 500 — internal router fault.
     Internal,
@@ -186,9 +186,9 @@ pub enum ApiError {
         source: anyhow::Error,
     },
 
-    /// An sgl-model-gateway endpoint this router does not provide
+    /// An sgl-model-gateway endpoint this router does not provide yet
     /// (`/v1/responses`, `/workers`, ...); `path` is the request path.
-    #[error("{path} is not supported by sgl-router")]
+    #[error("{path} is not supported by sgl-router yet")]
     UnsupportedEndpoint { path: String },
 
     /// A non-OK status from an engine's gRPC server, relayed to a gRPC client unchanged.

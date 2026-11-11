@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Paths sgl-model-gateway serves for features this router does not provide.
-//! They answer 501 rather than a bare 404, so a client moved from the gateway
-//! learns the endpoint is unsupported rather than mistyped.
+//! Paths sgl-model-gateway serves for features this router does not provide
+//! yet. They answer 501 rather than a bare 404, so a client moved from the
+//! gateway learns the endpoint is not supported yet rather than mistyped.
 
 use crate::server::error::ApiError;
 use axum::http::Uri;
@@ -66,7 +66,7 @@ mod tests {
             assert_eq!(body["error"]["code"], "unsupported_endpoint", "{uri}");
             assert_eq!(
                 body["error"]["message"],
-                format!("{uri} is not supported by sgl-router"),
+                format!("{uri} is not supported by sgl-router yet"),
             );
         }
     }
