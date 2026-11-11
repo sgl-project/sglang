@@ -1,6 +1,7 @@
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -16,29 +17,48 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 )
 
 
-def _qkv(q_len: int, kv_len: int, heads: int = 32, head_dim: int = 64):
-    def tensor(seq_len: int):
+def _qkv(q_len: int, kv_len: int, heads: int = 32, head_dim: int = 64, kv_heads=None):
+    def tensor(seq_len: int, num_heads: int):
         return SimpleNamespace(
-            shape=(1, seq_len, heads, head_dim),
+            shape=(1, seq_len, num_heads, head_dim),
             dtype=torch.bfloat16,
             device=SimpleNamespace(type="cuda"),
         )
 
-    return tensor(q_len), tensor(kv_len), tensor(kv_len)
+    kv_heads = heads if kv_heads is None else kv_heads
+    return tensor(q_len, heads), tensor(kv_len, kv_heads), tensor(kv_len, kv_heads)
 
 
 class TestDynamicCudnnSDPARouting(unittest.TestCase):
     def _uses_cudnn(
-        self, q_len: int, kv_len: int, *, graph: bool = False, quality: str = "lossless"
+        self,
+        q_len: int,
+        kv_len: int,
+        kv_heads=None,
+        is_sm100: bool = True,
+        *,
+        graph: bool = False,
+        quality: str = "lossless",
     ) -> bool:
         impl = SimpleNamespace(
-            causal=False, _cudnn_failed=False, _is_sm100=True, _is_sm103=False
+            causal=False, _cudnn_failed=False, _is_sm100=is_sm100, _is_sm103=False
         )
         with (
             set_forward_context(0, None, quality=quality),
             enable_breakable_cuda_graph() if graph else nullcontext(),
         ):
-            return DynamicCudnnSDPAImpl._use_cudnn_sdpa(impl, *_qkv(q_len, kv_len))
+            return DynamicCudnnSDPAImpl._use_cudnn_sdpa(
+                impl, *_qkv(q_len, kv_len, kv_heads=kv_heads)
+            )
+
+    def test_blackwell_keeps_grouped_query_attention_on_cudnn(self):
+        # Cosmos3: 32 query heads over 8 KV heads, self- and cross-attention.
+        self.assertTrue(self._uses_cudnn(6144, 6144, kv_heads=8))
+        self.assertTrue(self._uses_cudnn(6144, 512, kv_heads=8))
+
+    def test_uneven_head_grouping_and_pre_blackwell_gqa_stay_on_fa(self):
+        self.assertFalse(self._uses_cudnn(6144, 6144, kv_heads=5))
+        self.assertFalse(self._uses_cudnn(1024, 1024, kv_heads=8, is_sm100=False))
 
     def test_blackwell_keeps_cudnn_when_both_sides_fill_a_tile(self):
         for q_len, kv_len in ((128, 128), (1536, 1024), (6144, 6144), (192, 6144)):
@@ -79,6 +99,40 @@ class TestDynamicCudnnSDPARouting(unittest.TestCase):
             self.assertEqual(get_forward_context().quality, "lossless")
         with set_forward_context(0, None):
             self.assertEqual(get_forward_context().quality, "exact")
+
+
+def _impl(capability: tuple[int, int], head_size: int = 128) -> DynamicCudnnSDPAImpl:
+    # the constructor also pins the process-wide FA version; keep it untouched
+    with (
+        patch("torch.cuda.get_device_capability", return_value=capability),
+        patch(
+            "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.set_fa_ver"
+        ),
+    ):
+        return DynamicCudnnSDPAImpl(
+            num_heads=2, head_size=head_size, causal=False, softmax_scale=0.125
+        )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestDynamicCudnnSelection(unittest.TestCase):
+    """Which kernel the constructed impl picks for each Blackwell variant."""
+
+    def test_sm103_long_self_attention_takes_fa4(self):
+        impl = _impl((10, 3))
+        self.assertFalse(impl._use_cudnn_sdpa(*_qkv(16384, 16384, 2, 128)))
+        self.assertFalse(impl._use_cudnn_sdpa(*_qkv(75600, 75600, 2, 128)))
+
+    def test_sm103_short_cross_and_hd64_keep_cudnn(self):
+        impl = _impl((10, 3))
+        self.assertTrue(impl._use_cudnn_sdpa(*_qkv(8192, 8192, 2, 128)))
+        self.assertTrue(impl._use_cudnn_sdpa(*_qkv(37800, 512, 2, 128)))
+        impl64 = _impl((10, 3), head_size=64)
+        self.assertTrue(impl64._use_cudnn_sdpa(*_qkv(18900, 18900, 2, 64)))
+
+    def test_sm100_keeps_cudnn(self):
+        impl = _impl((10, 0))
+        self.assertTrue(impl._use_cudnn_sdpa(*_qkv(75600, 75600, 2, 128)))
 
 
 if __name__ == "__main__":

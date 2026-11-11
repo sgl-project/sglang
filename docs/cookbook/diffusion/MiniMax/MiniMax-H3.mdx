@@ -69,6 +69,11 @@ The same FL2VA / Ref2VA split applies in
 Review the license and usage terms in the MiniMax-H3 model card before production or commercial use. SGLang support does not grant additional model usage rights.
 </Warning>
 
+### Image checkpoints
+
+For the separate six-step text-to-image and editing checkpoint, see
+[MiniMax-H3-Image](/cookbook/diffusion/MiniMax/MiniMax-H3-Image).
+
 ## 3. Deployment details
 
 The builder accepts legal custom GPU counts and topologies, marking them
@@ -670,9 +675,9 @@ that exact starting composition.
 Set `reference_resize_mode` on the request to choose how reference images are
 resized before encoding:
 
-- `diffusers` (default) scales the short edge to 2048 pixels, including upscaling
-  small inputs. This preserves the original preprocessing behavior.
-- `max` only downsizes references whose short edge exceeds 2048 pixels.
+- `max` (default) only downsizes references whose short edge exceeds 2048 pixels.
+- `diffusers` scales the short edge to 2048 pixels, including upscaling small
+  inputs. Select this explicitly to reproduce the original preprocessing.
 - `match` downsizes to the target canvas pixel area when needed, without
   upscaling smaller references. Use this with the
   [ModelTC Ref2VA Turbo LoRA](https://github.com/ModelTC/Minimax-H3-Turbo#note-on-reference-image-resizing),
@@ -683,6 +688,8 @@ multiple of 32. This rounding can slightly change the aspect ratio. The option
 affects Ref2VA image references, not FL2VA keyframes, video, or audio references.
 Changing it changes the conditioning input, so keep it fixed for quality and
 performance comparisons; the server does not infer it from the adapter name.
+FastH3 Omni retains its previous `diffusers` default; this native H3 change does
+not alter that distilled release's preprocessing.
 
 ```bash Command
 curl -sS -X POST http://127.0.0.1:30010/v1/videos \
@@ -692,7 +699,6 @@ curl -sS -X POST http://127.0.0.1:30010/v1/videos \
     "prompt": "Use <Picture 1> as the visual subject and <Audio 1> as the sound reference, with coherent natural motion.",
     "seconds": 5,
     "task": "ref2va",
-    "reference_resize_mode": "diffusers",
     "conditions": [
       {
         "type": "image",
@@ -1019,9 +1025,19 @@ release's `sigma_max` of 0.999 (FastGen's `max_t`).
 sglang serve \
   --model-path FastVideo/FastVideo-FastH3-Omni-8-Step-V1 \
   --num-gpus 2 --ulysses-degree 2 \
-  --dit-cpu-offload true --text-encoder-cpu-offload true --vae-cpu-offload true \
   --port 30010
 ```
+
+Everything stays resident on 141 GB and 180 GB cards. On a card that cannot
+hold it, add `--dit-cpu-offload true --text-encoder-cpu-offload true
+--vae-cpu-offload true`; on H200 and B200 the three offloads only cost time
+(image reference, 768 short edge, 124 frames, median of two requests after
+three warmups):
+
+| GPUs | Resident | With the three offloads |
+| --- | --- | --- |
+| 2× H200, Ulysses 2 | 39.0 s | 43.8 s |
+| 4× B200, Ulysses 4 | 10.3 s | 15.3 s |
 
 ```json Request
 {
@@ -1042,9 +1058,9 @@ region and take a per-region top-k, while text, reference images and audio
 rows stay dense. `--attention-backend-config` keys `vsa_tile_size`,
 `vsa_ref_keep_rate` and `VSA_sparsity` override the trained values.
 
-Warm request latency on 2× H200 (Ulysses 2, DiT / text encoder / VAE CPU
-offload; median of three requests after one full warmup, 124 frames at 24 FPS
-with audio, until the MP4 is saved):
+Warm request latency on 2× H200 with the three CPU offloads (Ulysses 2; median
+of three requests after one full warmup, 124 frames at 24 FPS with audio,
+until the MP4 is saved):
 
 | References | Short edge | Latency |
 | --- | --- | --- |

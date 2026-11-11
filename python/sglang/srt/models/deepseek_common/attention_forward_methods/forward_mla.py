@@ -25,7 +25,10 @@ from sglang.srt.layers.dcp import (
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
+    dcp_push_combine_fits,
+    dcp_push_combine_reduce,
 )
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.lora.utils import kv_b_lora_correction
@@ -60,6 +63,7 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
 
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
     is_in_full_prefill_graph,
     is_in_prefill_graph_scope,
@@ -90,7 +94,42 @@ def _select_local_dcp_heads_for_autotune(
 
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
+    if attention_backend == "dsa":
+        # trtllm-gen partials carry a base-2 LSE.
+        return dsa_shards_index_k() and get_exec().kernel.dsa_decode_backend != "trtllm"
     return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
+
+
+@eager_on_graph(True)
+def bcg_dcp_extend_kv_gather(
+    token_to_kv_pool,
+    attn_mqa,
+    forward_batch: ForwardBatch,
+    kv_lora_rank: int,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+) -> None:
+    """Assemble the DCP extend KV buffer; an eager break under breakable graphs.
+    Under a prefill graph, read the live batch: replay re-supplies the capture-time arg."""
+    if is_in_prefill_graph_scope():
+        forward_batch = get_forward_batch()
+    metadata = forward_batch.attn_dcp_metadata
+    if metadata.dcp_extend_prefix_lens_sum == 0:
+        # No prefix KV on any DCP rank: skip the collective.
+        metadata.dcp_kv_buffer[..., :kv_lora_rank] = k_nope
+        metadata.dcp_kv_buffer[..., kv_lora_rank:] = k_pe
+        return
+    all_gather_kv_cache_for_mla_extend(
+        token_to_kv_pool,
+        attn_mqa,
+        forward_batch.extend_prefix_lens_cpu,
+        metadata.dcp_local_prefix_kv_indices,
+        metadata.dcp_extend_prefix_lens_sum,
+        metadata.dcp_kv_buffer,
+        kv_lora_rank,
+        k_nope,
+        k_pe,
+    )
 
 
 if _is_cuda:
@@ -118,7 +157,36 @@ def _apply_attention_output_gate(module, attn_output, gate):
     )
 
 
+def _finish_absorb_output(module, attn_bmm_output, attention_output_gate, topk_indices):
+    if attention_output_gate is not None:
+        attn_bmm_output = _apply_attention_output_gate(
+            module, attn_bmm_output, attention_output_gate
+        )
+    output, _ = module.o_proj(attn_bmm_output)
+    if module.next_skip_topk is None:
+        return output
+    return output, topk_indices if module.next_skip_topk else None
+
+
 class DeepseekMLAForwardMixin:
+    # Set by subclasses whose prepare_mla_qkv needs the absorbed query
+    # materialized: disables deferred BMM fusion and born-FP8 query packing.
+    # Applies only to this mixin's absorbed path, not MLA_ROCM.
+    needs_unfused_mla_qkv = False
+    # Apply W_UV to the DCP decode partials before the reduce (DSA layers only)
+    dcp_v_preproject = False
+    _dcp_v_weights: Optional[torch.Tensor] = None
+
+    def _prepare_dcp_v_weights(self, group):
+        weights = group.all_gather(self.w_vc.contiguous(), dim=0)
+        cached = self._dcp_v_weights
+        if cached is None:
+            self._dcp_v_weights = weights
+        else:
+            # Captured graphs keep the gathered buffer's address on weight reload.
+            cached.copy_(weights)
+        return self._dcp_v_weights
+
     def is_dcp_mla_decode_phase(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
@@ -133,6 +201,7 @@ class DeepseekMLAForwardMixin:
                 # ROCm only: the draft shards its KV like the target, so its
                 # extend merges per-rank partials the same way the target does.
                 and mode.is_extend(include_draft_extend_v2=_is_hip)
+                and not dsa_shards_index_k()
             )
         )
 
@@ -142,7 +211,11 @@ class DeepseekMLAForwardMixin:
         if not get_parallel().dcp_replicate_q_proj or self.dcp_size == 1:
             return False
         mode = forward_batch.forward_mode
-        return mode.is_decode() or mode.is_target_verify()
+        if mode.is_decode() or mode.is_target_verify():
+            return True
+        # DSA extend on HIP merges owned partials like decode, so replicating
+        # q_b_proj replaces the per-layer [T, H, 576] Q all-gather there too.
+        return self.use_dsa and _is_hip and mode.is_extend(include_draft_extend_v2=True)
 
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
@@ -173,6 +246,8 @@ class DeepseekMLAForwardMixin:
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
+        if self.needs_unfused_mla_qkv:
+            return False
         if getattr(self, "_kimi_split_gguf_kv_b", False):
             return False
         if self.dcp_size > 1:
@@ -251,6 +326,8 @@ class DeepseekMLAForwardMixin:
         """
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
+        if self.needs_unfused_mla_qkv:
+            return None
         if llama_4_scaling is not None:
             return None
         if _is_hip or _is_cpu:
@@ -298,6 +375,42 @@ class DeepseekMLAForwardMixin:
             return None
         return backend
 
+    def run_mla_indexer(
+        self: DeepseekV2AttentionMLA,
+        hidden_states: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        """Run the shared MLA / dense MHA indexer; MLA_ROCM bypasses this hook."""
+        return self.indexer(
+            x=hidden_states,
+            q_lora=q_lora,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=self.layer_id,
+            return_indices=return_indices,
+        )
+
+    def prepare_mla_qkv(
+        self: DeepseekV2AttentionMLA,
+        positions: torch.Tensor,
+        q: Optional[torch.Tensor],
+        q_pe: torch.Tensor,
+        k: torch.Tensor,
+        k_pe: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare absorbed Q and normalized KV on the unfused rotary path.
+
+        Overrides that transform ``q`` must set ``needs_unfused_mla_qkv``.
+        MLA_ROCM and fused rotary paths bypass this hook.
+        """
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        return q, q_pe, k, k_pe
+
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -321,7 +434,11 @@ class DeepseekMLAForwardMixin:
 
         cp_overlap = (
             DSAInterleaveCPIndexerOverlap(self, forward_batch)
-            if self.use_dsa and is_interleave_extend(forward_batch)
+            if self.use_dsa
+            and is_interleave_extend(forward_batch)
+            # The overlap helper calls the native indexer CUDA entry directly.
+            and getattr(self.run_mla_indexer, "__func__", None)
+            is DeepseekMLAForwardMixin.run_mla_indexer
             else None
         )
         fuse_bmm_attention = (
@@ -385,12 +502,8 @@ class DeepseekMLAForwardMixin:
                 self.alt_stream.wait_stream(current_stream)
                 k_nope = k_nope.unsqueeze(1)
                 if self.should_run_indexer(prev_topk_indices):
-                    topk_indices = self.indexer(
-                        x=hidden_states,
-                        q_lora=q_lora,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        layer_id=self.layer_id,
+                    topk_indices = self.run_mla_indexer(
+                        hidden_states, q_lora, positions, forward_batch
                     )
                 else:
                     # skip_topk reuses prev layer's indices; mirror into this
@@ -433,6 +546,8 @@ class DeepseekMLAForwardMixin:
                     and self.alt_stream is not None
                     and q_lora is not None
                     and self.rotary_emb is not None
+                    and getattr(self.prepare_mla_qkv, "__func__", None)
+                    is DeepseekMLAForwardMixin.prepare_mla_qkv
                 ):
                     _born_backend_early = self._q8kv8_born_fp8_q_backend(
                         forward_batch, llama_4_scaling
@@ -470,12 +585,8 @@ class DeepseekMLAForwardMixin:
                                 latent_cache=latent_cache,
                             )
                         else:
-                            topk_indices = self.indexer(
-                                x=hidden_states,
-                                q_lora=q_lora,
-                                positions=positions,
-                                forward_batch=forward_batch,
-                                layer_id=self.layer_id,
+                            topk_indices = self.run_mla_indexer(
+                                hidden_states, q_lora, positions, forward_batch
                             )
                     else:
                         topk_indices = maybe_capture_indexer_topk(
@@ -614,7 +725,9 @@ class DeepseekMLAForwardMixin:
             # Already applied at the q-prep/indexer overlap fork.
             and not self._q8kv8_qprep_overlap_pending
         ):
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            q_nope_out, q_pe, k_nope, k_pe = self.prepare_mla_qkv(
+                positions, q_nope_out, q_pe, k_nope, k_pe, forward_batch
+            )
 
         if born_q_backend is not None:
             # Born-fp8 q (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): one fused
@@ -642,7 +755,7 @@ class DeepseekMLAForwardMixin:
                     q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
                 )
             born_q_backend.q8kv8_stash_born_q(
-                padded_extend_real_tokens(q_nope, forward_batch) or num_tokens,
+                padded_extend_real_tokens(q_nope.shape[0], forward_batch) or num_tokens,
                 self.attn_mqa.layer_id,
             )
             q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
@@ -677,17 +790,15 @@ class DeepseekMLAForwardMixin:
                     )
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
-                all_gather_kv_cache_for_mla_extend(
-                    get_token_to_kv_pool(),
-                    self.attn_mqa,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
-                    forward_batch.attn_dcp_metadata.dcp_kv_buffer,
-                    self.kv_lora_rank,
-                    k_nope,
-                    k_pe,
-                )
+                if not self.use_dsa:
+                    bcg_dcp_extend_kv_gather(
+                        get_token_to_kv_pool(),
+                        self.attn_mqa,
+                        forward_batch,
+                        self.kv_lora_rank,
+                        k_nope,
+                        k_pe,
+                    )
             else:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
@@ -814,6 +925,7 @@ class DeepseekMLAForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
 
+        dcp_v_projected = False
         # correct attn_output with respect to lse from other ranks
         if self.is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
@@ -834,14 +946,65 @@ class DeepseekMLAForwardMixin:
                     self.current_attention_backend
                 )
                 if dcp_comm_backend in ("a2a", "fi_a2a"):
-                    # A2A exchange of head partials + LSE, then local Triton combine.
-                    attn_output = dcp_a2a_lse_reduce(
-                        attn_output.contiguous(),
-                        lse.contiguous(),
-                        get_parallel().dcp_group,
-                        is_lse_base_on_e=is_lse_base_on_e,
-                        comm_backend=dcp_comm_backend,
-                    )
+                    # A head's linear V projection commutes with its LSE-weighted
+                    # reduction. Exchange the narrower projected partials.
+                    if (
+                        self.dcp_v_preproject
+                        and self.use_dsa
+                        and (
+                            attn_output.shape[0] >= 512
+                            # the push-combine reduce wins at any batch size
+                            or dcp_push_combine_fits(
+                                attn_output.shape[0] * self.num_local_heads
+                            )
+                        )
+                        and self.w_vc is not None
+                        and self.w_vc.dtype == torch.bfloat16
+                        and not self.use_deep_gemm_bmm
+                        and self.v_head_dim < self.kv_lora_rank
+                        and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+                        and not is_kv_b_lora_active(self)
+                    ):
+                        weights = self._dcp_v_weights
+                        if (
+                            weights is None
+                            and not torch.cuda.is_current_stream_capturing()
+                        ):
+                            weights = self._prepare_dcp_v_weights(
+                                get_parallel().dcp_group
+                            )
+                        if weights is not None:
+                            attn_output = torch.bmm(
+                                attn_output.transpose(0, 1), weights
+                            ).transpose(0, 1)
+                            dcp_v_projected = True
+                    reduced = None
+                    if dcp_v_projected:
+                        # One kernel pushes the peers' heads over NVLink and
+                        # combines this rank's by LSE.
+                        reduced = dcp_push_combine_reduce(
+                            attn_output,
+                            lse,
+                            get_parallel().dcp_group,
+                            is_lse_base_on_e=is_lse_base_on_e,
+                        )
+                    if reduced is not None:
+                        attn_output = reduced.view(
+                            -1, self.num_local_heads, self.v_head_dim
+                        )
+                    else:
+                        # A2A exchange of head partials + LSE, then local Triton combine.
+                        if not (self.use_dsa and dsa_shards_index_k()):
+                            # K3.1's DSA partials are strided views the pack reads as is
+                            attn_output = attn_output.contiguous()
+                            lse = lse.contiguous()
+                        attn_output = dcp_a2a_lse_reduce(
+                            attn_output,
+                            lse,
+                            get_parallel().dcp_group,
+                            is_lse_base_on_e=is_lse_base_on_e,
+                            comm_backend=dcp_comm_backend,
+                        )
                 else:
                     attn_output = cp_lse_ag_out_rs_mla(
                         attn_output,
@@ -850,6 +1013,10 @@ class DeepseekMLAForwardMixin:
                         is_lse_base_on_e=is_lse_base_on_e,
                     )
                     attn_output = attn_output.transpose(0, 1)
+        if dcp_v_projected:
+            return _finish_absorb_output(
+                self, attn_output.flatten(1, 2), attention_output_gate, topk_indices
+            )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None
@@ -866,6 +1033,36 @@ class DeepseekMLAForwardMixin:
 
             _kvb_v = mla_correction.prepare_v_correction(self, attn_output)
 
+        attn_bmm_output = self.project_mla_values(attn_output, zero_allocator)
+        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+            from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                kv_b_lora_v_apply,
+            )
+
+            attn_bmm_output = kv_b_lora_v_apply(
+                self, attn_output, attn_bmm_output, _kvb_v
+            )
+        elif kv_b_lora == "v2":
+            attn_bmm_output = mla_correction.apply_correction(_kvb_v, attn_bmm_output)
+        elif kv_b_lora == "legacy":
+            from sglang.srt.lora import deepseek_mla_correction
+
+            attn_bmm_output = deepseek_mla_correction.apply_v_correction(
+                self, attn_output, attn_bmm_output
+            )
+        return _finish_absorb_output(
+            self, attn_bmm_output, attention_output_gate, topk_indices
+        )
+
+    def project_mla_values(
+        self: DeepseekV2AttentionMLA,
+        attn_output: torch.Tensor,
+        zero_allocator: BumpAllocator,
+    ) -> torch.Tensor:
+        """Expand latent values before LoRA correction and output gating.
+
+        MLA_ROCM uses its own projection and bypasses this hook.
+        """
         if getattr(self, "_kimi_split_gguf_kv_b", False):
             from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
 
@@ -946,36 +1143,7 @@ class DeepseekMLAForwardMixin:
                     -1, self.num_local_heads, self.v_head_dim
                 ).transpose(0, 1),
             )
-        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-            from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
-                kv_b_lora_v_apply,
-            )
-
-            attn_bmm_output = kv_b_lora_v_apply(
-                self, attn_output, attn_bmm_output, _kvb_v
-            )
-        elif kv_b_lora == "v2":
-            attn_bmm_output = mla_correction.apply_correction(_kvb_v, attn_bmm_output)
-        elif kv_b_lora == "legacy":
-            from sglang.srt.lora import deepseek_mla_correction
-
-            attn_bmm_output = deepseek_mla_correction.apply_v_correction(
-                self, attn_output, attn_bmm_output
-            )
-        if attention_output_gate is not None:
-            attn_bmm_output = _apply_attention_output_gate(
-                self, attn_bmm_output, attention_output_gate
-            )
-        output, _ = self.o_proj(attn_bmm_output)
-
-        if self.next_skip_topk is None:
-            return output
-
-        # Return topk_indices for the next layer when enabling index cache
-        if not self.next_skip_topk:
-            return output, None
-        else:
-            return output, topk_indices
+        return attn_bmm_output
 
     def _fuse_rope_for_trtllm_mla(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
