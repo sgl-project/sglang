@@ -13,7 +13,7 @@ use axum::extract::Request;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::Response;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::message::config::ServerArgs;
 
@@ -23,11 +23,18 @@ const COMPRESSION_HEADER: &str = "x-body-compressed";
 /// 128 KiB.
 const MAX_ZSTD_EXPANSION: u64 = 32 * 1024;
 
+/// Compressed bytes of known length buffered at once. Arbitrary; no evidence
+/// this is the right budget.
+const BUFFERED_BUDGET_KIB: u32 = 1 << 20;
+
 /// Install the decompression middleware when `server_args` enables it;
 /// identity otherwise.
 pub(super) fn apply(app: Router, server_args: &ServerArgs) -> Router {
     if server_args.enable_request_decompression {
-        with_decompression(app, Arc::new(Semaphore::new(python_executor_workers())))
+        with_decompression(
+            app,
+            Limits::new(python_executor_workers(), BUFFERED_BUDGET_KIB),
+        )
     } else {
         app
     }
@@ -42,11 +49,46 @@ fn python_executor_workers() -> usize {
         .min(32)
 }
 
-fn with_decompression(app: Router, decompressions: Arc<Semaphore>) -> Router {
+/// Bodies decompressing at once, and compressed bytes buffered at once, in KiB
+/// because `acquire_many` takes a `u32`.
+#[derive(Clone)]
+struct Limits {
+    decompressions: Arc<Semaphore>,
+    buffered_kib: Arc<Semaphore>,
+    budget_kib: u32,
+}
+
+impl Limits {
+    fn new(decompressions: usize, budget_kib: u32) -> Self {
+        Self {
+            decompressions: Arc::new(Semaphore::new(decompressions)),
+            buffered_kib: Arc::new(Semaphore::new(budget_kib as usize)),
+            budget_kib,
+        }
+    }
+
+    async fn decompression(&self) -> Result<OwnedSemaphorePermit, String> {
+        self.decompressions
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// A body over the whole budget takes all of it rather than waiting forever.
+    async fn reserve(&self, length: u64) -> Result<OwnedSemaphorePermit, String> {
+        let kib = u32::try_from(length.div_ceil(1024)).unwrap_or(u32::MAX);
+        self.buffered_kib
+            .clone()
+            .acquire_many_owned(kib.min(self.budget_kib))
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn with_decompression(app: Router, limits: Limits) -> Router {
     app.layer(axum::middleware::from_fn(
-        move |request: Request, next: Next| {
-            decompress_request_body(decompressions.clone(), request, next)
-        },
+        move |request: Request, next: Next| decompress_request_body(limits.clone(), request, next),
     ))
 }
 
@@ -55,11 +97,7 @@ fn with_decompression(app: Router, decompressions: Arc<Semaphore>) -> Router {
 /// 128 MiB), an empty body stays empty, and the body is decompressed off the
 /// async workers. Python's rejections are 400s with a plain-text body and no
 /// content type.
-async fn decompress_request_body(
-    decompressions: Arc<Semaphore>,
-    request: Request,
-    next: Next,
-) -> Response {
+async fn decompress_request_body(limits: Limits, request: Request, next: Next) -> Response {
     let Some(method) = request.headers().get(COMPRESSION_HEADER) else {
         return next.run(request).await;
     };
@@ -71,7 +109,7 @@ async fn decompress_request_body(
     }
 
     let (mut parts, body) = request.into_parts();
-    let body = match decompress_zstd(body, decompressions).await {
+    let body = match decompress_zstd(body, &limits).await {
         Ok(body) => body,
         Err(error) => {
             tracing::warn!("request body decompress failed: {error}");
@@ -85,24 +123,30 @@ async fn decompress_request_body(
     next.run(Request::from_parts(parts, Body::from(body))).await
 }
 
-/// The body is read only once a permit is held, so a request waiting for one
-/// holds its headers, not its compressed body.
-async fn decompress_zstd(body: Body, decompressions: Arc<Semaphore>) -> Result<Vec<u8>, String> {
-    if body.size_hint().exact() == Some(0) {
+/// A body of known length (hyper's, from `Content-Length`) reserves its bytes
+/// and is read before it waits for a permit. One of unknown length cannot
+/// reserve, so it is read only under a permit, which bounds those instead.
+async fn decompress_zstd(body: Body, limits: &Limits) -> Result<Vec<u8>, String> {
+    let length = body.size_hint().exact();
+    if length == Some(0) {
         return Ok(Vec::new());
     }
-    let permit = decompressions
-        .acquire_owned()
-        .await
-        .map_err(|error| error.to_string())?;
+    let (reserved, permit) = match length {
+        Some(length) => (Some(limits.reserve(length).await?), None),
+        None => (None, Some(limits.decompression().await?)),
+    };
     let compressed = axum::body::to_bytes(body, usize::MAX)
         .await
         .map_err(|error| format!("reading the body: {error}"))?;
     if compressed.is_empty() {
         return Ok(Vec::new());
     }
+    let permit = match permit {
+        Some(permit) => permit,
+        None => limits.decompression().await?,
+    };
     tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+        let _held = (reserved, permit);
         decode_zstd(&compressed)
     })
     .await
@@ -142,13 +186,16 @@ fn bad_request(message: String) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::convert::Infallible;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
     use axum::routing::post;
     use bytes::Bytes;
-    use futures::StreamExt;
+    use http_body::{Frame, SizeHint};
     use tower::ServiceExt;
 
     use super::*;
@@ -256,10 +303,7 @@ mod tests {
                 Some(&three_blocks[..2 << 17]),
             ),
         ];
-        let app = with_decompression(
-            Router::new().route("/echo", post(|body: bytes::Bytes| async move { body })),
-            Arc::new(Semaphore::new(1)),
-        );
+        let app = echo_app(Limits::new(1, BUFFERED_BUDGET_KIB));
         for (case, frame, python) in cases {
             let request = Request::post("/echo")
                 .header(COMPRESSION_HEADER, "zstd")
@@ -279,9 +323,82 @@ mod tests {
         }
     }
 
-    /// A decompression past the limit waits for a permit instead of failing,
-    /// without reading its body until it has one, and a body declaring its
-    /// content size decodes without spare capacity.
+    fn echo_app(limits: Limits) -> Router {
+        with_decompression(
+            Router::new().route("/echo", post(|body: Bytes| async move { body })),
+            limits,
+        )
+    }
+
+    /// Hands out its chunks only when polled, like a socket, counting the bytes
+    /// read; `exact` declares the length, as hyper does from `Content-Length`.
+    struct LazyBody {
+        chunks: VecDeque<Bytes>,
+        remaining: u64,
+        exact: bool,
+        read: Arc<AtomicUsize>,
+    }
+
+    impl http_body::Body for LazyBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+            let chunk = self.chunks.pop_front();
+            Poll::Ready(chunk.map(|chunk| {
+                self.remaining -= chunk.len() as u64;
+                self.read.fetch_add(chunk.len(), Ordering::Relaxed);
+                Ok(Frame::data(chunk))
+            }))
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            if self.exact {
+                SizeHint::with_exact(self.remaining)
+            } else {
+                SizeHint::default()
+            }
+        }
+    }
+
+    /// A lazily read zstd request, and the count of its body bytes read.
+    fn lazy_request(compressed: &[u8], exact: bool) -> (Request, Arc<AtomicUsize>) {
+        let read = Arc::new(AtomicUsize::new(0));
+        let body = LazyBody {
+            chunks: compressed.chunks(256).map(Bytes::copy_from_slice).collect(),
+            remaining: compressed.len() as u64,
+            exact,
+            read: read.clone(),
+        };
+        let request = Request::post("/echo")
+            .header(COMPRESSION_HEADER, "zstd")
+            .body(Body::new(body))
+            .unwrap();
+        (request, read)
+    }
+
+    async fn still_waiting(
+        response: &mut tokio::task::JoinHandle<Result<Response, Infallible>>,
+    ) -> bool {
+        tokio::time::timeout(Duration::from_millis(200), response)
+            .await
+            .is_err()
+    }
+
+    async fn echoed(response: tokio::task::JoinHandle<Result<Response, Infallible>>) -> Bytes {
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    }
+
+    /// A decompression past the limit waits for a permit instead of failing;
+    /// a body of unknown length is not read until it has one. A body declaring
+    /// its content size decodes without spare capacity.
     #[tokio::test]
     async fn decompressions_past_the_limit_wait() {
         assert!((5..=32).contains(&python_executor_workers()));
@@ -293,31 +410,13 @@ mod tests {
             (&payload[..], payload.len())
         );
 
-        let decompressions = Arc::new(Semaphore::new(1));
-        let app = with_decompression(
-            Router::new().route("/echo", post(|body: bytes::Bytes| async move { body })),
-            decompressions.clone(),
-        );
-        let held = decompressions.clone().acquire_owned().await.unwrap();
-        // Read lazily, like a socket, counting the bytes the server pulls.
-        let read = Arc::new(AtomicUsize::new(0));
-        let chunks: Vec<_> = compressed.chunks(4).map(Bytes::copy_from_slice).collect();
-        let body = Body::from_stream(futures::stream::iter(chunks).map({
-            let read = read.clone();
-            move |chunk| {
-                read.fetch_add(chunk.len(), Ordering::Relaxed);
-                Ok::<_, Infallible>(chunk)
-            }
-        }));
-        let request = Request::post("/echo")
-            .header(COMPRESSION_HEADER, "zstd")
-            .body(body)
-            .unwrap();
+        let limits = Limits::new(1, BUFFERED_BUDGET_KIB);
+        let app = echo_app(limits.clone());
+        let held = limits.decompression().await.unwrap();
+        let (request, read) = lazy_request(&compressed, false);
         let mut response = tokio::spawn(app.oneshot(request));
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), &mut response)
-                .await
-                .is_err(),
+            still_waiting(&mut response).await,
             "decompressed without a permit"
         );
         assert_eq!(
@@ -326,12 +425,48 @@ mod tests {
             "read the body while queued"
         );
         drop(held);
-        let response = response.await.unwrap().unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(&body[..], payload);
+        assert_eq!(&echoed(response).await[..], payload);
         assert_eq!(read.load(Ordering::Relaxed), compressed.len());
+    }
+
+    /// A body of known length is read while it waits for a permit, but only
+    /// within the byte budget; one larger than the whole budget takes all of it.
+    #[tokio::test]
+    async fn known_lengths_wait_on_the_byte_budget() {
+        // About 1.5 KiB that zstd cannot shrink, against a 1 KiB budget.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let large: Vec<u8> = (0..1500)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let small = br#"{"text":"hello"}"#;
+        let large_frame = zstd::bulk::compress(&large, 3).unwrap();
+        let small_frame = zstd::bulk::compress(small, 3).unwrap();
+        assert!(large_frame.len() > 1024);
+
+        let limits = Limits::new(1, 1);
+        let app = echo_app(limits.clone());
+        let held = limits.decompression().await.unwrap();
+        let (request, large_read) = lazy_request(&large_frame, true);
+        let mut large_response = tokio::spawn(app.clone().oneshot(request));
+        assert!(still_waiting(&mut large_response).await);
+        assert_eq!(large_read.load(Ordering::Relaxed), large_frame.len());
+
+        let (request, small_read) = lazy_request(&small_frame, true);
+        let mut small_response = tokio::spawn(app.oneshot(request));
+        assert!(still_waiting(&mut small_response).await);
+        assert_eq!(
+            small_read.load(Ordering::Relaxed),
+            0,
+            "read past the budget"
+        );
+
+        drop(held);
+        assert_eq!(&echoed(large_response).await[..], &large[..]);
+        assert_eq!(&echoed(small_response).await[..], small);
     }
 }

@@ -91,5 +91,7 @@ sha2 = { version = "0.10", features = ["asm"] }
 [dev-dependencies]
 # An HTTP/2 client that can reset its streams, for the h2c listener's tests.
 h2 = "0.4"
+# `Frame` and `SizeHint` for a lazily read test body that declares its length.
+http-body = "1"
 # Paused virtual time for deadline tests.
 tokio = { workspace = true, features = ["test-util"] }

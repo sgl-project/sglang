@@ -4170,6 +4170,7 @@ dependencies = [
  "futures",
  "h2",
  "http",
+ "http-body",
  "hyper-util",
  "itertools",
  "mime",
