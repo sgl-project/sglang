@@ -33,6 +33,8 @@ from sglang.srt.utils.device import async_d2h as _async_d2h
 from sglang.srt.utils.device import is_cuda
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
+_RESULT_COPY_FAST_PATH = envs.SGLANG_OPT_RESULT_COPY_PROFILER_FAST_PATH.get()
+
 if TYPE_CHECKING:
     from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
     from sglang.srt.managers.auxiliary_output import (
@@ -195,12 +197,17 @@ class GenerationBatchResult:
     def get_num_generated_tokens(self, batch_size: int) -> int:
         return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
 
-    @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
+        if _RESULT_COPY_FAST_PATH and not torch.autograd._profiler_enabled():
+            return self._copy_to_cpu(return_logprob, return_hidden_states)
+        with torch.profiler.record_function("copy_result_to_cpu"):
+            return self._copy_to_cpu(return_logprob, return_hidden_states)
+
+    def _copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool):
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(

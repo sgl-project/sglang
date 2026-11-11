@@ -325,6 +325,11 @@ class Envs:
     SGLANG_OPT_SCHEDULER_ZMQ_EVENTS = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # GenerationBatchResult.copy_to_cpu opens its profiler range only while a torch profiler
+    # runs (the record_function decorator calls into the dispatcher every round).
+    SGLANG_OPT_RESULT_COPY_PROFILER_FAST_PATH = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

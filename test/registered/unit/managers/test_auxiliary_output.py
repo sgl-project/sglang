@@ -133,6 +133,26 @@ def test_auxiliary_output_releases_device_holder_after_copy():
     assert result.copy_done.record_count == 1
 
 
+@pytest.mark.parametrize(
+    "fast_path, profiling, ranges",
+    [(False, False, 1), (True, False, 0), (True, True, 1)],
+)
+def test_result_copy_opens_profiler_range_unless_fast_path_and_idle(
+    fast_path, profiling, ranges
+):
+    from sglang.srt.managers import utils as manager_utils
+
+    with (
+        patch.object(manager_utils, "_RESULT_COPY_FAST_PATH", fast_path),
+        patch("torch.autograd._profiler_enabled", return_value=profiling),
+        patch("torch.profiler.record_function") as record,
+        patch.object(GenerationBatchResult, "_copy_to_cpu") as copy,
+    ):
+        GenerationBatchResult().copy_to_cpu(True, False)
+    copy.assert_called_once_with(True, False)
+    assert record.call_count == ranges
+
+
 def test_sampling_mask_output_uses_generation_result_copy_path():
     sampling_output = SamplingMaskOutput(
         token_ids=torch.tensor([[3, 5]], dtype=torch.int32),
