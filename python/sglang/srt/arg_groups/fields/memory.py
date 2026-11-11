@@ -151,9 +151,10 @@ class Memory(msgspec.Struct):
     hicache_storage_backend: A[
         Optional[str],
         Arg(
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, npu_memcache, hf3fs, nixl, aibrix, tensorcast, seaweedfs. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, fast_file, mooncake, npu_memcache, hf3fs, nixl, aibrix, tensorcast, seaweedfs. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
+                "fast_file",
                 "sim",
                 "mooncake",
                 "npu_memcache",
@@ -271,7 +272,10 @@ class Memory(msgspec.Struct):
         Optional[Dict[str, Any]],
         Arg(
             help=(
-                "JSON configuration for the selected linker backend. Built-in "
+                "JSON configuration for the selected linker backend. Common "
+                "options include load_mode (layer_wise or prefetch) and "
+                "prefetch_policy (best_effort, wait_complete, or timeout). "
+                "Defaults are layer_wise and timeout. Built-in "
                 "backends accept storage options directly. The dynamic backend "
                 "requires linker (class name), linker_module_path (Python "
                 "module), and optional linker_extra_config (object). May be "

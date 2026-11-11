@@ -3,18 +3,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    FINISH_LENGTH,
-    Req,
-    ReqKvInfo,
-)
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     MatchResult,
 )
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -143,14 +138,14 @@ def test_finished_turn_leaves_its_record_in_the_slot():
     req = _FakeReq("session-a", req_pool_idx=0, committed=4, allocated=4)
     record = req.kv
     record.mamba_next_track_idx = 1
-    record.set_evicted_seqlen(ComponentType.SWA, 2)
+    record.set_evicted_seqlen("swa", 2)
     req.swa_branching_seqlen = 8
 
     slot = _finished_turn(_single_row_cache(), req)
 
     assert slot.kv is record
     assert slot.kv.mamba_next_track_idx == 1
-    assert slot.kv.component_evicted_seqlens == {ComponentType.SWA: 2}
+    assert slot.kv.window_evicted_seqlens == {"swa": 2}
     assert req.kv is not record
     assert req.swa_branching_seqlen is None
 
@@ -215,14 +210,14 @@ def test_trim_overshoot_postcondition():
     req = _FakeReq("session-a", req_pool_idx=0, committed=40, allocated=44)
     req.origin_input_ids = list(range(26))
     req.output_ids = list(range(14))
-    req.kv.set_evicted_seqlen(ComponentType.SWA, 42)
+    req.kv.set_evicted_seqlen("swa", 42)
 
     tree_cache.session._trim_overshoot(req, finished_len=12)
 
     target = 38
     assert req.kv.kv_committed_len == target
     assert req.kv.kv_allocated_len == target
-    assert req.kv.get_evicted_seqlen(ComponentType.SWA) == target
+    assert req.kv.get_evicted_seqlen("swa") == target
     assert len(req.output_ids) == 12
     # [38, 42) already gave its SWA back, so the free splits at 42.
     assert [t.tolist() for t in allocator.freed] == [[38, 39, 40, 41], [42, 43]]
@@ -247,7 +242,7 @@ def test_free_kv_aligned_skips_a_range_inside_the_partial_page(target, end, free
 
 
 @pytest.mark.parametrize("operation", ["trim", "match"])
-@pytest.mark.parametrize("component", [ComponentType.SWA, ComponentType.AUXILIARY_SWA])
+@pytest.mark.parametrize("component", ["swa", "window_64"])
 def test_session_rewind_keeps_component_cursors_page_aligned(operation, component):
     """Rewinding below any component cursor must free whole pages."""
     page_size = 16
@@ -260,7 +255,7 @@ def test_session_rewind_keeps_component_cursors_page_aligned(operation, componen
     req = _FakeReq("session-a", req_pool_idx=0, committed=52, allocated=64)
     req.origin_input_ids = list(range(26))
     req.output_ids = list(range(14))
-    req.kv.set_evicted_seqlen(ComponentType.SWA, 16)
+    req.kv.set_evicted_seqlen("swa", 16)
     req.kv.set_evicted_seqlen(component, 48)
 
     if operation == "trim":
@@ -277,12 +272,10 @@ def test_session_rewind_keeps_component_cursors_page_aligned(operation, componen
     assert req.kv.kv_committed_len == 32
     assert req.kv.get_evicted_seqlen(component) == 32
     assert req.kv.max_evicted_seqlen == 32
-    assert req.kv.get_evicted_seqlen(ComponentType.SWA) == (
-        32 if component == ComponentType.SWA else 16
-    )
+    assert req.kv.get_evicted_seqlen("swa") == (32 if component == "swa" else 16)
     assert [t.tolist() for t in allocator.freed] == (
         [list(range(32, 48)), list(range(48, 64))]
-        if component == ComponentType.SWA
+        if component == "swa"
         else [list(range(32, 64))]
     )
 

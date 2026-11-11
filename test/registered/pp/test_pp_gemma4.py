@@ -9,12 +9,13 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PLE_PP,
     DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PP,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
     is_in_amd_ci,
     popen_launch_server,
 )
 
 # tp=1 pp=2 -- two GPUs.
-register_cuda_ci(est_time=202, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=202, stage="nightly", runner_config="2-gpu-large")
 
 
 @unittest.skipIf(
@@ -33,7 +34,7 @@ class TestGemma4PPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PP
-        cls.base_url = "http://127.0.0.1:23333"
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -90,7 +91,7 @@ class TestGemma4PLEPPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PLE_PP
-        cls.base_url = "http://127.0.0.1:23339"
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
