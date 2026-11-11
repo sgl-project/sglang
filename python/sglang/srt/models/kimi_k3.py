@@ -208,13 +208,8 @@ _K31_GB300_BFA_SIDE_TGV_M_RANGES = {
 
 
 def _k31_gb300_tuning(config) -> bool:
-    """Kimi-K3.1 on GB300: _K31_GB300_* tactics and the 288-row side streams.
-    SGLANG_K31_DECODE_GEMM_TACTICS=0 restores the generic picks."""
-    return (
-        is_kimi_k31(config)
-        and get_platform().device_sm == 103
-        and envs.SGLANG_K31_DECODE_GEMM_TACTICS.get()
-    )
+    """Kimi-K3.1 on GB300: _K31_GB300_* tactics and the 288-row side streams."""
+    return is_kimi_k31(config) and get_platform().device_sm == 103
 
 
 def _k3_side_stream_max_tokens(config) -> int:
