@@ -4,6 +4,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
+from sglang.srt.managers import overlap_utils
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import overlap_events
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -55,6 +59,36 @@ class TestOverlapEventReuse(unittest.TestCase):
             self.assertEqual(len({id(event) for event in events[:4]}), 4)
             for index, event in enumerate(events):
                 self.assertIs(event, events[index % 4])
+
+
+class TestFutureMapIndexOps(unittest.TestCase):
+    def _future_map(self):
+        future_map = overlap_utils.FutureMap(
+            device=torch.device("cpu"),
+            spec_algo=SpeculativeAlgorithm.NONE,
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(8, 4)),
+            needs_cpu_seq_lens=False,
+        )
+        future_map.new_seq_lens_buf.fill_(-1)
+        return future_map
+
+    def test_publish_and_gather_match_advanced_indexing(self):
+        indices = torch.tensor([5, 1, 6], dtype=torch.int64)
+        lens = torch.tensor([17, 3, 9], dtype=torch.int32)
+        results = []
+        for index_ops in (False, True):
+            with patch.object(overlap_utils, "_INDEX_OPS", index_ops):
+                future_map = self._future_map()
+                future_map.publish(indices, lens)
+                batch = SimpleNamespace(
+                    spec_info=SimpleNamespace(future_indices=indices.flip(0))
+                )
+                future_map.resolve_seq_lens_cpu(batch)
+                results.append((future_map.new_seq_lens_buf.clone(), batch.seq_lens))
+        self.assertTrue(torch.equal(results[0][0], results[1][0]))
+        self.assertTrue(torch.equal(results[0][1], results[1][1]))
+        self.assertEqual(results[1][1].tolist(), [9, 3, 17])
+        self.assertEqual(results[1][1].dtype, torch.int64)
 
 
 if __name__ == "__main__":

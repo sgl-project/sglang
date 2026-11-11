@@ -341,6 +341,11 @@ class Envs:
     SGLANG_OPT_SCHEDULE_BATCH_FIELD_SNAPSHOT = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # The FutureMap's per-round seq-lens gather and publish scatter as index_select /
+    # index_copy_ for int64 indices instead of advanced indexing (same rows, less dispatch).
+    SGLANG_OPT_FUTURE_MAP_INDEX_OPS = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
