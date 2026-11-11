@@ -1,6 +1,6 @@
 """Plan token counts for prefill and speculative decoding across DP ranks."""
 
-from typing import List
+from typing import List, Optional
 
 import msgspec
 import torch
@@ -13,18 +13,24 @@ class DPSpecPrefillCoordinationPlan(msgspec.Struct, frozen=True):
     prefills: torch.Tensor
     draft_width: int
     verify_width: int
+    mixed_decode_counts: Optional[List[int]] = None
 
     @property
     def heterogeneous(self):
         return any(p and n for p, n in zip(self.prefills, self.counts)) and any(
-            not p and n for p, n in zip(self.prefills, self.counts)
+            (not p and n) or mixed
+            for p, n, mixed in zip(self.prefills, self.counts, self._mixed_counts)
         )
+
+    @property
+    def _mixed_counts(self):
+        return self.mixed_decode_counts or [0] * len(self.counts)
 
     def phase_counts(self, phase):
         if phase == "draft":
             tokens = [
-                0 if p else n * self.draft_width
-                for p, n in zip(self.prefills, self.counts)
+                (mixed if p else n) * self.draft_width
+                for p, n, mixed in zip(self.prefills, self.counts, self._mixed_counts)
             ]
             return tokens, tokens
         if phase not in ("target", "draft_extend"):

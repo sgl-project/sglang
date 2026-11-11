@@ -283,7 +283,8 @@ def verify_merged_mixed_enabled(
 ) -> bool:
     """Whether mixed steps run DSPARK's verify-merged path.
 
-    Supports eager Ascend DSV4 target forwards with DSPARK and mixed chunk.
+    Supports eager Ascend DSV4 target forwards with DSPARK and mixed chunk,
+    including phase-coordinated attention-DP ranks.
     Unsupported setups keep the default 1-token decode of running rows.
     """
     if not envs.SGLANG_ENABLE_MIXED_PREFILL_SPEC_COORDINATION.get():
@@ -301,7 +302,6 @@ def verify_merged_mixed_enabled(
                 (cfg.speculative_algorithm or "").upper() != "DSPARK",
             ),
             ("mixed chunk disabled", not cfg.enable_mixed_chunk),
-            ("DP attention", attn_dp_enabled_of(cfg)),
             ("pipeline parallelism", cfg.pp_size > 1),
             ("context parallelism", cfg.attn_cp_size > 1 or cfg.dcp_size > 1),
             # The mixed forward is a plain extend: it fills no per-draft

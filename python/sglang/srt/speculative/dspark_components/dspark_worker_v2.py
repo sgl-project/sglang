@@ -8,6 +8,7 @@ import torch
 from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
     make_rejection_noise,
 )
+from sglang.srt.arg_groups.validation_hook import verify_merged_mixed_enabled
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
@@ -195,6 +196,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_worker = None
         self.enable_dp_spec_prefill_coordination = (
             envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+            or (
+                get_parallel().attn_dp_enabled
+                and verify_merged_mixed_enabled(server_args)
+            )
         )
         self._hosts_draft = get_parallel().pp_group.is_last_rank
         if not self._hosts_draft:
@@ -775,21 +780,31 @@ class DSparkWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
             return batch_output
+        coordination_plan = None
+        if batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination:
+            plan = DPSpecPrefillCoordinationPlan(
+                *batch.dp_spec_prefill_coordination_metadata,
+                draft_width=self._proposer.query_token_num,
+                verify_width=self.verify_num_draft_tokens,
+                mixed_decode_counts=batch.dp_spec_prefill_mixed_decode_counts,
+            )
+            if plan.heterogeneous:
+                coordination_plan = plan
         if batch.forward_mode.is_mixed() and batch.num_prefill_rows is not None:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_mixed(batch, on_publish)
+            return self._forward_mixed(
+                batch, on_publish, coordination_plan=coordination_plan
+            )
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            if batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination:
-                plan = DPSpecPrefillCoordinationPlan(
-                    *batch.dp_spec_prefill_coordination_metadata,
-                    draft_width=self._proposer.query_token_num,
-                    verify_width=self.verify_num_draft_tokens,
+            if coordination_plan is not None:
+                return self._forward_dp_spec_prefill_coordination(
+                    batch,
+                    coordination_plan,
+                    on_publish,
+                    grammar_barrier,
+                    pp_proxy_tensors,
                 )
-                if plan.heterogeneous:
-                    return self._forward_dp_spec_prefill_coordination(
-                        batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
-                    )
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
@@ -914,7 +929,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         out.is_any_greedy = any(r.sampling_params.top_k <= 1 for r in reqs)
         return out
 
-    def _forward_mixed(self, batch: ScheduleBatch, on_publish) -> GenerationBatchResult:
+    def _forward_mixed(
+        self, batch: ScheduleBatch, on_publish, coordination_plan=None
+    ) -> GenerationBatchResult:
         """Verify-merged mixed step: one target forward carries the prefill
         chunk (rows [0, n_pre)) and every running row's W verify positions
         (bonus + drafts, rows [n_pre, bs)), verified with extend-shaped causal
@@ -953,8 +970,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                 tail_reqs=tail_reqs,
                 si_tail=si_tail,
                 draft_input=draft_input,
+                coordination_plan=coordination_plan,
             )
         )
+        if coordination_plan is not None:
+            coordination_plan.apply(
+                batch,
+                "target",
+                get_parallel().attn_dp_rank,
+                local_only=len(batch.global_num_tokens) == 1,
+            )
         fb, extend_lens_list = self._build_mixed_forward_batch(
             batch,
             tail,
@@ -1057,6 +1082,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         tail_reqs,
         si_tail,
         draft_input: DFlashDraftInputV2,
+        coordination_plan=None,
     ):
         """Draft the running rows at their committed length, as a decode batch."""
         W = int(self.verify_num_draft_tokens)
@@ -1073,6 +1099,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         tail.input_ids = tail.out_cache_loc = None
         tail.num_prefill_rows = None
         tail.global_num_tokens = tail.global_num_tokens_for_logprob = None
+        if coordination_plan is not None:
+            coordination_plan.apply(
+                tail,
+                "draft",
+                get_parallel().attn_dp_rank,
+                local_only=(
+                    len(batch.global_num_tokens) == 1
+                    or self.draft_parallel_layout.local_dp
+                ),
+            )
         tail.has_grammar = tail.return_logprob = False
         prefix_lens = tail.seq_lens
         prefix_lens.record_stream(torch.get_device_module(device).current_stream())
@@ -1409,7 +1445,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                         batch, "target", rank, local_only=target_local_only
                     )
                 self._verify_executor.run_idle_participation(
-                    batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
+                    batch=batch,
+                    idle_layout=(
+                        self._idle_verify_ragged_layout(batch)
+                        if coordination_plan is None
+                        else None
+                    ),
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
@@ -1504,14 +1545,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
         )
 
-        layout = self._verify_planner.schedule_layout(
-            req_pool_indices=batch.req_pool_indices,
-            prefix_lens=prefix_lens,
-            device=device,
-            confidence=confidence,
-            budget=verify_token_budget,
-            global_num_reqs=global_num_reqs,
-            dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+        # Coordinated peers already agreed on W verify positions per decode
+        # row. A compact layout would invalidate that phase's DP counts.
+        layout = (
+            self._verify_planner.schedule_layout(
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                device=device,
+                confidence=confidence,
+                budget=verify_token_budget,
+                global_num_reqs=global_num_reqs,
+                dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            )
+            if coordination_plan is None
+            else None
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 

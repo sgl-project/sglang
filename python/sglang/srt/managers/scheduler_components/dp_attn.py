@@ -175,6 +175,8 @@ class MLPSyncBatchInfo:
     is_shutting_down: bool = False
     # This rank's listener drain state (see DPDrainColumn).
     drain_state: int = 0
+    # Running requests carried by a verify-merged mixed prefill rank.
+    num_mixed_decode_reqs: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -183,6 +185,7 @@ class MLPSyncBatchInfo:
     sync_wait_seconds: float = 0.0
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
+    global_num_mixed_decode_reqs: list[int] = None
     global_attention_pairs: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
@@ -204,6 +207,7 @@ class MLPSyncBatchInfo:
                 self.attention_pairs,
                 int(self.is_shutting_down),
                 self.drain_state,
+                self.num_mixed_decode_reqs,
             ],
             device=device,
             dtype=dtype,
@@ -225,6 +229,7 @@ class MLPSyncBatchInfo:
                 0,  # attention_pairs
                 0,  # is_shutting_down
                 DRAIN_STATE_NO_LISTENER,  # drain_state
+                0,  # num_mixed_decode_reqs
             ],
             device=device,
             dtype=dtype,
@@ -235,6 +240,7 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
+        self.global_num_mixed_decode_reqs = [self.num_mixed_decode_reqs]
         self.global_attention_pairs = [self.attention_pairs]
         self.any_health_check = self.is_health_check
         self.any_shutting_down = self.is_shutting_down
@@ -307,6 +313,7 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
+        self.global_num_mixed_decode_reqs = tp0_info_cpu[:, 13].tolist()
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
@@ -350,7 +357,10 @@ def _update_gather_batch(
             batch.draft_global_num_tokens_for_logprob = [
                 mlp_sync_info.num_tokens_for_logprob
             ]
-    if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+    if (
+        envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+        or envs.SGLANG_ENABLE_MIXED_PREFILL_SPEC_COORDINATION.get()
+    ):
         # Fresh counts have not yet been adjusted by the coordination plan.
         batch.dp_spec_prefill_coordination_applied = False
         info = mlp_sync_info.tp0_info_cpu
@@ -358,6 +368,9 @@ def _update_gather_batch(
             mlp_sync_info.global_num_tokens,
             mlp_sync_info.global_num_tokens_for_logprob,
             info[:, 3],
+        )
+        batch.dp_spec_prefill_mixed_decode_counts = getattr(
+            mlp_sync_info, "global_num_mixed_decode_reqs", None
         )
     if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
@@ -601,6 +614,13 @@ def prepare_mlp_sync_batch_raw(
     num_dp_ranks = parallel.num_dp_ranks
     attn_tp_size = parallel.attn_tp_size
     tp_group = parallel.tp_group
+    num_mixed_decode_reqs = 0
+    if (
+        local_batch is not None
+        and local_batch.forward_mode.is_mixed()
+        and local_batch.num_prefill_rows is not None
+    ):
+        num_mixed_decode_reqs = local_batch.batch_size() - local_batch.num_prefill_rows
     # Check if other DP workers have running batches
     if (
         local_batch is None
@@ -627,10 +647,14 @@ def prepare_mlp_sync_batch_raw(
                 local_batch.extend_lens,
             )
         )
-        assert (
-            local_batch.return_logprob
-            or num_tokens_for_logprob == local_batch.batch_size()
-        )
+        # A verify-merged running row contributes every verify position to
+        # the LM head, while a prefill row only samples its final token.
+        expected_logits = local_batch.batch_size()
+        if num_mixed_decode_reqs:
+            expected_logits = local_batch.num_prefill_rows + sum(
+                local_batch.extend_lens[local_batch.num_prefill_rows :]
+            )
+        assert local_batch.return_logprob or num_tokens_for_logprob == expected_logits
 
     can_run_decode_cuda_graph = _local_decode_cuda_graph_vote(
         local_batch=local_batch, disable_cuda_graph=disable_cuda_graph
@@ -700,6 +724,7 @@ def prepare_mlp_sync_batch_raw(
         cp_size=parallel.attn_cp_size,
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
+        num_mixed_decode_reqs=num_mixed_decode_reqs,
         can_run_decode_cuda_graph=can_run_decode_cuda_graph,
         can_run_draft_cuda_graph=can_run_draft_cuda_graph,
         can_run_prefill_cuda_graph=can_run_prefill_cuda_graph,

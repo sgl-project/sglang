@@ -2072,6 +2072,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Full-DP metadata from the existing scheduler gather.
     dp_spec_prefill_coordination_metadata: Optional[tuple] = None
+    dp_spec_prefill_mixed_decode_counts: Optional[List[int]] = None
     dp_spec_prefill_coordination_applied: bool = False
 
     # For DP attention
@@ -3549,6 +3550,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             dp_spec_prefill_coordination_metadata=self.dp_spec_prefill_coordination_metadata,
+            dp_spec_prefill_mixed_decode_counts=self.dp_spec_prefill_mixed_decode_counts,
             dp_spec_prefill_coordination_applied=self.dp_spec_prefill_coordination_applied,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
