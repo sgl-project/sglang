@@ -54,6 +54,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.models import dflash_hip
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.utils import apply_qk_norm, bind_or_assign
 from sglang.srt.runtime_context import get_parallel, get_spec
@@ -1054,11 +1055,6 @@ class DFlashDecoderLayer(nn.Module):
         return self.mlp_conv.finish(hidden_states, mlp_kernel), residual, None
 
 
-# ROCm prefill: each rank projects its 1/TP of the rows, then all-gathers;
-# CUDA keeps the replicated fc, which its DFLASH aux graph overlaps on a side stream
-_FC_ROW_SHARD_MIN_ROWS = 4096
-
-
 class DFlashDraftModel(nn.Module):
     """SGLang DFlash draft model with an optional Nemotron embedding.
 
@@ -1257,13 +1253,8 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        if (
-            _is_hip
-            and self.fc_tp_columns is None
-            and target_hidden.shape[0] >= _FC_ROW_SHARD_MIN_ROWS
-            and get_parallel().tp_group.world_size > 1
-        ):
-            return self._project_row_sharded(target_hidden)
+        if _is_hip and dflash_hip.projects_row_sharded(self, target_hidden):
+            return dflash_hip.project_row_sharded(self, target_hidden)
         projected = self.fc(target_hidden)
         if self.quantizable:
             projected = projected[0]
@@ -1271,24 +1262,6 @@ class DFlashDraftModel(nn.Module):
             projected = self._gather_fc_columns(projected)
         ctx_hidden = self.hidden_norm(projected)
         return ctx_hidden
-
-    def _project_row_sharded(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        """The replicated fc and the norm on this rank's 1/TP of the rows, then
-        an all-gather, instead of every rank projecting every row."""
-        group = get_parallel().tp_group
-        num_rows = target_hidden.shape[0]
-        rows = -(-num_rows // group.world_size)
-        start = group.rank_in_group * rows
-        shard = target_hidden[start : start + rows]
-        if shard.shape[0] < rows:
-            shard = torch.nn.functional.pad(shard, (0, 0, 0, rows - shard.shape[0]))
-        projected = self.fc(shard)
-        if self.quantizable:
-            projected = projected[0]
-        normed = self.hidden_norm(projected)
-        gathered = normed.new_empty(rows * group.world_size, normed.shape[1])
-        group.all_gather_into_tensor(gathered, normed.contiguous())
-        return gathered[:num_rows]
 
     def _fc_tp_columns(self, hidden_size: int) -> Optional[Tuple[int, int]]:
         parallel = get_parallel()
