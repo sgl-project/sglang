@@ -11,9 +11,11 @@ graph launch.
 
 Correctness contract:
 
-- The caller only routes here when the replay is padding-free
-  (raw_bs == padded bs) and TBO / pdmux / LoRA are off, so every
-  Python-visible branch inside the backends is constant per key.
+- The caller only routes here when TBO / LoRA are off and the replay is
+  padding-free (raw_bs == padded bs) or, outside ragged verify mode, a padded
+  replay of a backend-declared DSV4 glue whose prep reads only the padded
+  slots; so every Python-visible branch inside the backends is constant per
+  key.
 - Python side effects (each backend's ``forward_metadata`` object) are
   snapshotted at capture time and re-installed on every replay; the graph
   replays only the device ops that refresh the tensors those objects point to.
@@ -63,7 +65,7 @@ class MetadataGlueGraph:
 
     def note_not_routed(self) -> None:
         """A replay the caller prepared eagerly without calling ``run`` (padding,
-        TBO, pdmux, LoRA, disabled)."""
+        TBO, LoRA, disabled)."""
         if self._states or self.disabled:
             self.eager += 1
 
@@ -93,6 +95,14 @@ class MetadataGlueGraph:
     def run(self, attn_backend, fb_view, key) -> None:
         """Run ``init_forward_metadata_out_graph`` for this replay, through the
         captured glue graph once it is ready."""
+        if any(
+            backend.requires_eager_metadata for backend in self._leaves(attn_backend)
+        ):
+            self.disabled = True
+            self.eager += 1
+            attn_backend.init_forward_metadata_out_graph(fb_view)
+            return
+
         st = self._states.get(key)
         if st is None:
             st = {"warmups": 0, "graph": None, "meta": None}

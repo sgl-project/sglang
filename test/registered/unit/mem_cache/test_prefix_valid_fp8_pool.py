@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, _resolve_fused_scale
+from sglang.srt.utils.device import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.prefix_valid import (
     assert_bytes_equal,
@@ -23,11 +24,12 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import arena_of
 
 # Preserve the original GPU lanes; the kernel file retains the other 25 seconds.
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # backend-specific: loaded FP8 scales are doubled for ROCm's E4M3FNUZ format.
 register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 
 DEVICE = "cuda"
+_is_hip = is_hip()
 
 
 def _make_pool(row_dim, total_slots, dtype=fp8_dtype):
@@ -247,7 +249,8 @@ class TestPrefixValidFp8Pool(CustomTestCase):
                     )
 
     def test_eager_fallbacks(self):
-        """Unresolved/missing scales and non-FP8 storage retain the old writer."""
+        """Unresolved GPU scales and non-FP8 storage retain the old writer; on ROCm a missing
+        scale fuses at 1.0, elsewhere it keeps the eager writer too."""
         unresolved = SimpleNamespace(
             layer_id=0,
             k_scale=torch.tensor(0.625, device=DEVICE),
@@ -271,7 +274,17 @@ class TestPrefixValidFp8Pool(CustomTestCase):
                 unresolved.v_scale,
                 True,
             ),
-            ("missing_k_scale", fp8_dtype, missing, None, missing.v_scale, True),
+            # ROCm: no K scale is the eager path's plain saturating cast, which the fused kernel
+            # does at 1.0; other platforms keep the eager writer.
+            ("missing_k_scale", fp8_dtype, missing, None, missing.v_scale, not _is_hip),
+            (
+                "no_scales",
+                fp8_dtype,
+                SimpleNamespace(layer_id=0),
+                None,
+                None,
+                not _is_hip,
+            ),
             (
                 "non_fp8_cache",
                 torch.bfloat16,

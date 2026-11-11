@@ -64,6 +64,7 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
         backend.use_mla = branch == "mla"
         backend.kv_cache_is_vectorized_5d = branch == "vectorized"
         backend.use_triton_unified_attention = branch != "legacy"
+        backend.use_muse_flydsl_decode = False
         backend.dcp_world_size = 1
         backend.kv_cache_dtype = kv_cache_dtype
         backend.input_dtype = torch.bfloat16
@@ -93,6 +94,7 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
             reduce_final_map=None,
             reduce_partial_map=None,
             num_kv_splits=None,
+            decode_num_partitions=None,
         )
         backend._mla_decode_fwd_with_head_pad = mock.Mock(
             return_value=torch.empty(
