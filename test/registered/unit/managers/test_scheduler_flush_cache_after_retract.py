@@ -59,7 +59,6 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.result_queue = deque()
         scheduler.waiting_queue = []
         scheduler.dllm_manager = MagicMock()
-        scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler._pp_microbatches_drained = MagicMock(return_value=True)
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.grammar_queue = []
