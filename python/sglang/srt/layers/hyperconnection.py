@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
 from sglang.srt.environ import envs
 from sglang.srt.layers.hc_mix_flydsl import (
+    flydsl_hc_fused_available,
     flydsl_hc_mix_supported,
     flydsl_hc_mix_weights_supported,
     weight_cache_key,
@@ -183,6 +184,7 @@ class GatedResidual(HyperConnectionBase):
             and self.hc_count == 4
             and self.config.hc_per_branch_norm
             and is_gfx95_supported()
+            and flydsl_hc_fused_available()
         )
         if self._fused_hc_ok:
             from sglang.kernels.ops.gemm.hc_fused_flydsl import (
