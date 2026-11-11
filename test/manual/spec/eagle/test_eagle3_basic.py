@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import is_hip
-from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE3,
@@ -44,7 +44,7 @@ class TestEagle3Basic(EagleServerBase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.72)
 
         server_info = requests.get(self.base_url + "/server_info").json()

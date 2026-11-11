@@ -34,29 +34,6 @@ hardware/version X).
 
 # A. Container re-image required
 
-## A.1. `flash_attn` SM10.x wheel missing
-
-**Affected**: `dual_chunk/test_dual_chunk_flash_attn.py` (entire class — 5
-test methods, ~18 subtests)
-
-**Symptom on GB300**:
-```
-ImportError: cannot import name 'flash_attn_varlen_func' from 'flash_attn'
-```
-
-**Root cause**: `DualChunkFlashAttentionBackend` calls `flash_attn_varlen_func`
-via `sglang.kernels.ops.attention.flash_attention`. On SM 8.x / 9.x that resolves to
-sgl-kernel's FA3 build (works on H200). On other SMs, the JIT kernel falls
-back to the upstream `flash_attn` (FA2) wheel — but the
-`lmsysorg/sglang:nightly-dev-cu13` container's `flash_attn` package on
-SM10.x is missing `flash_attn_varlen_func`.
-
-**Gate**: `_dual_chunk_fa_supported()` in
-`dual_chunk/test_dual_chunk_flash_attn.py` skips the whole class on the
-fallback-broken path. Hopper passes through unchanged.
-
-**Fix**: Re-image with an SM10.x-compiled `flash_attn` wheel.
-
 ## A.2. tilelang `wait_wgmma` template missing on SM10.x
 
 **Affected**:
@@ -89,17 +66,15 @@ so that "skipped: ..." results have a quick lookup.
 
 | Backend | Required SM | Gate location | Error if unguarded |
 |---|---|---|---|
-| `cutlass_mla` | exactly SM 10.0 (B200) | `mla/test_cutlass_mla.py::_supported` | `cutlass_mla_decode is only supported on compute capability 10.0, but found sm version 103` |
 | `flashmla` decode/verify | SM 9.0 (Hopper) only | `mla/test_flashmla.py:_DECODE_REQUIRES_SM90A` | `Dense decode MLA is only supported on SM90a architecture` |
 | `trtllm_mla` | SM 12.0a / 12.1a | `mla/test_trtllm_mla.py::_supported` | FlashInfer XQA MLA dispatch reject |
-| `tokenspeed_mla` | SM ≥ 10.0 + FP8 KV + pkg | `mla/test_tokenspeed_mla.py::_supported` | `tokenspeed_mla` import or kernel dispatch |
 | `trtllm_mha` prefill | SM ≥ 10.0 | `dense/test_trtllm_mha.py` decode-only matrix | FlashInfer TRT-LLM Gen FMHA reject (`Unsupported architecture`) |
 | `dsa` `fa3` impl | SM 9.x only | `dsa_impl_capability("fa3")` | `flash_attn at sgl-kernel is only supported on sm90 and above` |
 | `dsa` `trtllm` impl | exactly SM 10.0 | `dsa_impl_capability("trtllm")` | `Missing TRTLLM-GEN kernel` (compiled for SM10.0) |
 | `fa3` (non-MLA) | SM 80 or SM 90 | `_is_fa3_supported` in `flash_attention_v3.py` | `attention_registry.py:177-180` reject |
 
 **SM10.3 vs SM10.0**: GB300 is SM10.3. Gates that require exactly SM10.0
-(cutlass_mla, dsa trtllm) intentionally skip on GB300 because the kernel
+(dsa trtllm) intentionally skip on GB300 because the kernel
 binaries in the container aren't compiled for sm_103. Flip the gates to
 `major == 10` (drop the `minor == 0`) once GB300-compiled binaries land.
 
@@ -133,13 +108,7 @@ methods that record each backend's failure mode inline as
 | `mla/test_flashmla.py::test_layout_robustness_cases` (extend) | `non_monotonic_extend` | FlashMLA extend raises CUDA illegal memory access. |
 | `mla/test_flashmla.py::test_layout_robustness_cases` (decode) | `interleaved_pages` | FlashMLA decode raises `shape '[-1, 64, 1, 32]' is invalid for input of size N`. |
 
-### Dual-chunk
-
-| Test | Layout | Root cause |
-|---|---|---|
-| `dual_chunk/test_dual_chunk_flash_attn.py::test_layout_robustness_cases` (extend) | `non_monotonic_extend` | `_dual_chunk_flash_attn_prefill_func` uses `cu_seqlens_*` indexing into contiguous K slots (`dual_chunk_flashattention_backend.py:834+`); scattered extend-token slots break that contiguity. |
-
-**Total**: 9 layout-handling production bugs documented.
+**Total**: 8 layout-handling production bugs documented.
 
 ## C.2. Speculative-mode rejects
 
@@ -205,9 +174,7 @@ fail at backend init.
 | Backend | Required page size(s) | Citation |
 |---|---|---|
 | FlashMLA | `64` only | `server_args.py:2767-2770` |
-| Cutlass MLA | `128` only | `server_args.py:2776-2779`, `cutlass_mla_backend.py:31` |
 | TRT-LLM MLA | `{32, 64}` | `server_args.py:2790-2794` |
-| Tokenspeed MLA | `{32, 64}` | `server_args.py:2809-2813`, `tokenspeed_mla_backend.py:111-113` |
 | TRT-LLM MHA | `{16, 32, 64}` | `server_args.py:2849-2853` |
 | FA4 (non-MLA) | `128` when default-selected | `server_args.py:2862-2870` |
 | DSV4 | `256` only | `deepseek_v4_backend.py:355`, `dsv4/metadata.py:134` |
@@ -222,7 +189,6 @@ fail at backend init.
 | `flashinfer_mla` | `1` only | `flashinfer_mla_backend.py:910-913` |
 | `flashmla` | `1` only | `flashmla_backend.py:555-558` |
 | `trtllm_mla` | `1` only | `trtllm_mla_backend.py:1223-1229` (inherits) |
-| `tokenspeed_mla` | `1` only | `tokenspeed_mla_backend.py:341-347` (inherits) |
 | `dsv4` | `0` or `1` | `deepseek_v4_backend.py:369`, `:363` (HIP) |
 | `trtllm_mha` (graph replay) | `1` only | `trtllm_mha_backend.py:459,492`; `server_args.py:2391-2392` |
 
@@ -230,7 +196,6 @@ fail at backend init.
 
 | Backend | Allowed dtype | Citation |
 |---|---|---|
-| `tokenspeed_mla` | `fp8_e4m3` only | `server_args.py:2814-2818` |
 | `trtllm_mla` | `{fp8_e4m3, fp4_e2m1, bf16, auto}` | `server_args.py:2796-2799` |
 | `fa3` | not `fp8_e5m2` (silently falls back to `triton`) | `server_args.py:2855-2860` |
 | `dsv4` | Packed FP8/BF16 layout enforced by `DeepSeekV4TokenToKVPool` | `deepseek_v4_backend.py:363` |
@@ -241,12 +206,9 @@ fail at backend init.
 
 | Test file | Failure type | Section |
 |---|---|---|
-| `dual_chunk/test_dual_chunk_flash_attn.py` | Container: `flash_attn` SM10.x wheel | §A.1 |
-| `dual_chunk/test_dual_chunk_flash_attn.py::test_layout_robustness_cases` (non_monotonic_extend) | Layout-handling bug | §C.1 |
 | `dsa/test_dsa.py::test_sparse_tilelang_*` | Container: tilelang `wait_wgmma` | §A.2 |
 | `dsa/test_dsa.py::test_sparse_*_impl_variants` (tilelang row) | Container: tilelang `wait_wgmma` | §A.2 |
 | `dsa/test_dsa.py::test_sparse_*_impl_variants` (fa3 / trtllm rows) | Hardware gate | §B |
-| `mla/test_cutlass_mla.py` (all) | Hardware gate (SM 10.0 exactly) | §B |
 | `mla/test_flashmla.py` (DECODE/verify subtests) | Hardware gate (SM 9.0 Hopper) | §B |
 | `mla/test_flashinfer.py::test_runner_mode_eagle_draft_cuda_graph_runner_cases` | Backend bug gated on SM≥10 | §C.3 |
 | `mla/test_flashinfer.py::test_layout_robustness_cases` | Layout-handling bug | §C.1 |

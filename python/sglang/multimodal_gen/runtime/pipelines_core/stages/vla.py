@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
+from sglang.multimodal_gen.runtime.cache.conditioning import conditioning_weights_epoch
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
@@ -22,6 +24,11 @@ from sglang.multimodal_gen.runtime.vla.parallel import (
     broadcast_prefix_context,
     broadcast_tensor_from_rank,
     get_vla_split_group,
+)
+from sglang.multimodal_gen.runtime.vla.pi05_segment import (
+    Pi05FlowState,
+    advance_pi05_segment,
+    prefix_compatibility_key,
 )
 from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     PrefixContext,
@@ -84,12 +91,18 @@ def _effective_prefix_cache_enabled(
     server_args: ServerArgs,
 ) -> bool:
     options = vla_options(batch)
-    return bool(options.get("enable_prefix_cache", True)) and bool(
-        server_args.pipeline_config.enable_global_prefix_cache
-    )
+    return (
+        not server_args.disable_conditioning_cache
+        and server_args.conditioning_cache_max_size_mb > 0
+        and bool(options.get("enable_prefix_cache", True))
+    ) and bool(server_args.pipeline_config.enable_global_prefix_cache)
 
 
 def _cuda_graph_enabled(batch: Req) -> bool:
+    # Prefix graph replay owns mutable output buffers. A later fresh request
+    # must not overwrite K/V retained by a continuation.
+    if "pi05_segment_length" in vla_state(batch):
+        return False
     return bool(vla_options(batch).get("enable_cuda_graph", True))
 
 
@@ -97,6 +110,8 @@ def _grouped_fingerprint(
     batch: Req,
     server_args: ServerArgs,
 ) -> tuple[Any, ...]:
+    if vla_state(batch).get("pi05_flow") is not None:
+        return ("single", id(batch))
     if (
         batch.is_warmup
         or get_vla_split_group() is not None
@@ -125,7 +140,9 @@ def _grouped_fingerprint(
         tuple(observation.token_masks.shape),
         batch.action_horizon,
         batch.action_dim,
-        batch.num_inference_steps,
+        None
+        if "pi05_segment_length" in vla_state(batch)
+        else batch.num_inference_steps,
         _cuda_graph_enabled(batch),
     )
 
@@ -135,11 +152,9 @@ class VLAObservationPreprocessStage(PipelineStage):
         super().__init__()
         self.preprocessor = preprocessor
 
-    @property
-    def role_affinity(self) -> RoleType:
-        return RoleType.ENCODER
-
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        if vla_state(batch).get("pi05_flow") is not None:
+            return batch
         start = time.perf_counter()
         state = vla_state(batch)
         raw_observation = dict(state.get("observation") or {})
@@ -159,10 +174,6 @@ class VLAPrefixEncodingStage(PipelineStage):
         super().__init__()
         self.policy_model = policy_model
         self.prefix_cache = prefix_cache
-
-    @property
-    def role_affinity(self) -> RoleType:
-        return RoleType.ENCODER
 
     def run_grouped_requests(
         self,
@@ -264,6 +275,7 @@ class VLAPrefixEncodingStage(PipelineStage):
                 observation,
                 bucket_prompt=_cuda_graph_enabled(batch),
             )
+            cache_key = f"{conditioning_weights_epoch()}:{cache_key}"
             cached_context = self.prefix_cache.get(cache_key)
         else:
             cache_key = None
@@ -272,6 +284,8 @@ class VLAPrefixEncodingStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         state = vla_state(batch)
+        if state.get("pi05_flow") is not None:
+            return batch
         if batch.is_warmup:
             state["prefix_context"] = None
             state["cache"] = {"hit": False, "warmup": True}
@@ -357,6 +371,8 @@ class VLAActionDenoisingStage(PipelineStage):
         batches: list[Req],
         server_args: ServerArgs,
     ) -> list[Req]:
+        if any("pi05_segment_length" in vla_state(batch) for batch in batches):
+            return self._run_segmented_requests(batches, server_args)
         results: list[Req | None] = [None] * len(batches)
 
         def action_fingerprint(batch: Req) -> tuple[Any, ...]:
@@ -410,7 +426,90 @@ class VLAActionDenoisingStage(PipelineStage):
 
         return [result for result in results if result is not None]
 
+    def _run_segmented_requests(
+        self, batches: list[Req], server_args: ServerArgs
+    ) -> list[Req]:
+        config = server_args.pipeline_config
+        if (
+            not isinstance(config, Pi05PipelineConfig)
+            or not config.enable_segmented_actions
+        ):
+            raise RuntimeError("Segmented actions are not enabled")
+        model = self.policy_model
+        if get_vla_split_group() is not None:
+            raise RuntimeError("Segmented actions do not support split VLA stages")
+        if model._offload_action_expert_between_requests():
+            raise RuntimeError(
+                "Segmented actions do not support per-request action offload"
+            )
+        groups = {}
+        for batch in batches:
+            state = vla_state(batch)
+            if batch.is_warmup or "pi05_segment_length" not in state:
+                raise RuntimeError("Cannot mix segmented and ordinary action requests")
+            prefix = state["prefix_context"]
+            if model._can_use_action_sequence_parallel(
+                prefix, model.config.action_horizon
+            ):
+                raise RuntimeError(
+                    "Segmented actions do not support action sequence parallelism"
+                )
+            flow = state.get("pi05_flow")
+            if flow is None:
+                observation = state["observation_batch"]
+                noise = observation.noise
+                if noise is None:
+                    noise = model.sample_noise(
+                        observation.batch_size, generator=batch.generator
+                    )
+                else:
+                    noise = noise.to(device=model.device, dtype=torch.float32)
+                flow = Pi05FlowState.create(noise, prefix, batch.num_inference_steps)
+                state["pi05_flow"] = flow
+            if flow.num_steps != batch.num_inference_steps:
+                raise RuntimeError("Original action budget changed during continuation")
+            key = (
+                prefix_compatibility_key(prefix),
+                tuple(flow.x_t.shape),
+                flow.x_t.dtype,
+                flow.x_t.device,
+                state["pi05_segment_length"],
+            )
+            groups.setdefault(key, []).append(batch)
+        for group in groups.values():
+            start = time.perf_counter()
+            flows = [vla_state(batch)["pi05_flow"] for batch in group]
+            advance_pi05_segment(
+                model, flows, vla_state(group[0])["pi05_segment_length"]
+            )
+            for flow in flows:
+                if flow.remaining:
+                    flow.compact()
+            synchronize_vla_action_tensor(flows[0].x_t)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            for batch, flow in zip(group, flows):
+                state = vla_state(batch)
+                state["prefix_context"] = flow.prefix
+                for key in (
+                    "prefix_context_group",
+                    "observation_group",
+                    "observation_batch",
+                ):
+                    state.pop(key, None)
+                state.pop("actions_output", None)
+                state["actions"] = flow.x_t
+                state["parallel"] = model.action_parallel_info(flow.prefix)
+                timings = vla_timings(batch)
+                timings["action_denoise_ms"] = (
+                    timings.get("action_denoise_ms", 0.0) + elapsed_ms
+                )
+                timings["actual_nfe"] = flow.steps_done
+                timings["segment_count"] = timings.get("segment_count", 0) + 1
+        return batches
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        if "pi05_segment_length" in vla_state(batch):
+            return self._run_segmented_requests([batch], server_args)[0]
         start = time.perf_counter()
         state = vla_state(batch)
         observation = state.get("observation_batch")
@@ -478,6 +577,11 @@ class VLAActionPostprocessStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         start = time.perf_counter()
         state = vla_state(batch)
+        flow = state.get("pi05_flow")
+        if flow is not None and flow.remaining:
+            # Keep grouped output splitting one-to-one. The scheduler consumes
+            # this placeholder internally; no intermediate actions reach HTTP.
+            return OutputBatch(output=[None], metrics=batch.metrics)
         action_dim = server_args.pipeline_config.output_action_dim
         options = vla_options(batch)
         actions_out = state.get("actions_output")

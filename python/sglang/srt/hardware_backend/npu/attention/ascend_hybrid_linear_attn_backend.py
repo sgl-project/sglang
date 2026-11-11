@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
@@ -133,9 +133,14 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         num_padding: Optional[int] = None,
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
+        ragged_verify_layout=None,
         *args,
         **kwargs,
     ):
+        if ragged_verify_layout is not None:
+            raise NotImplementedError(
+                "Ascend hybrid linear attention does not support ragged verify"
+            )
         # out_graph passes seq_lens_cpu=None at capture; mirror the base guard.
         if seq_lens_cpu is None:
             num_padding = 0
@@ -233,6 +238,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
         req_pool_indices: Optional[torch.Tensor] = None,
+        state_slots=None,
     ):
         """
         Update mamba states after MTP verify using fully fused Triton kernel.
@@ -243,16 +249,18 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         - index_select kernel launches
         - nonzero kernel launches
         """
-        del req_pool_indices  # accepted for hook parity; slots come from metadata
+        del req_pool_indices  # accepted for hook parity
         request_number = last_correct_step_indices.shape[0]
 
-        state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                :request_number
-            ]
-        )
+        if state_slots is None:
+            state_slots = self.forward_state_slots(request_number, mamba_track_indices)
+        state_indices_tensor = state_slots.working[:request_number]
+        # Checkpoints go to the slots the same forward resolved.
+        if mamba_track_indices is not None:
+            assert state_slots.track is not None
+            mamba_track_indices = state_slots.track[:request_number]
 
-        mamba_caches = self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        mamba_caches = self.linear_attn_backend.state_pool.get_speculative_mamba2_params_all_layers()
 
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
@@ -290,11 +298,8 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             track_mask = mamba_steps_to_track >= 0
             # Track conv state from the verify-time window before rolling back
             # the working slot; NPU does not keep per-step conv intermediates.
-            track_indices = mamba_track_indices[track_mask]
-            if track_indices.numel() > 0:
-                conv_states[:, track_indices] = conv_states[
-                    :, dst_indices_tensor[track_mask]
-                ]
+            src_slots = torch.where(track_mask, dst_indices_tensor, mamba_track_indices)
+            conv_states[:, mamba_track_indices] = conv_states[:, src_slots]
 
         if dst_indices_tensor.numel() > 0:
             conv_state_rollback(

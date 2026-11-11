@@ -33,7 +33,10 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=7200, suite="nightly-amd-8-gpu-mi35x-kimi-k25-aiter-mla", nightly=True
+    est_time=7200,
+    suite="nightly-amd-8-gpu-mi35x-kimi-k25-aiter-mla",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 
@@ -160,7 +163,7 @@ class TestKimiK25AiterMlaEvalMI35x(unittest.TestCase):
                             num_questions=self.num_questions,
                             parallel=self.num_questions,
                             max_new_tokens=512,
-                            host="http://127.0.0.1",
+                            host="127.0.0.1",
                             port=int(self.base_url.split(":")[-1]),
                         )
                         metrics = run_eval_few_shot_gsm8k(args)

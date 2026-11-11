@@ -29,7 +29,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.hunyuan_v3 import HYV3DecoderLayer
 from sglang.srt.runtime_context import get_stream
@@ -154,8 +154,8 @@ class HYV3ForCausalLMNextN(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.get_device_module().empty_cache()
+        torch.get_device_module().synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         nextn_layer_id = self.config.num_hidden_layers
