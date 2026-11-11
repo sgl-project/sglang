@@ -313,10 +313,10 @@ def test_deepgemm_prenorm_dual_matches_two_calls(num_tokens):
         assert torch.equal(a, b)
 
 
-@pytest.mark.parametrize("num_tokens", [32, 33, 257, 4095, 4096])
+@pytest.mark.parametrize("num_tokens", [32, 33, 256, 257, 4095, 4096])
 def test_blackwell_compensated_mhc(num_tokens):
-    """Blackwell rows up to 65536 must take the BF16x3 projection, except
-    SM107 below 4096 rows, which keeps the DeepGEMM projection."""
+    """Blackwell takes the BF16x3 projection up to 256 rows (not on SM107) and
+    for 4096-65536 rows, and the DeepGEMM projection in between."""
     from unittest.mock import patch
 
     from sglang.srt.environ import envs
@@ -326,8 +326,10 @@ def test_blackwell_compensated_mhc(num_tokens):
 
     if not is_sm100_supported():
         pytest.skip("Blackwell compensated mHC dispatch")
-    if get_device_sm() == 107 and num_tokens < 4096:
-        pytest.skip("SM107 keeps the DeepGEMM projection below 4096 rows")
+    bf16x3 = num_tokens >= 4096 or (num_tokens <= 256 and get_device_sm() != 107)
+    unused = (
+        "hc_mix_stats_sinkhorn_deepgemm" if bf16x3 else "hc_mix_stats_sinkhorn_bf16x3"
+    )
     x, w, scale, base = _mhc_mix_inputs(num_tokens)
     norm = SimpleNamespace(weight=torch.ones(5120, device="cuda", dtype=torch.bfloat16))
     layer = _hopper_mhc_layer(norm, w, scale, base)
@@ -335,14 +337,11 @@ def test_blackwell_compensated_mhc(num_tokens):
         DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
         if layer._hc_attn_bf16_parts is None:
             pytest.skip("DeepGEMM tf32_hc_prenorm_gemm is unavailable")
-        with patch.object(
-            mhc,
-            "hc_mix_stats_sinkhorn_deepgemm",
-            side_effect=AssertionError("TF32 mHC projection"),
-        ):
+        with patch.object(mhc, unused, side_effect=AssertionError(unused)):
             actual = model_mhc.mix_stats(layer.attn_hc, x)
-    for result, expected in zip(actual, _mhc_mix_reference(x, w, scale, base)):
-        torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
+    if bf16x3:
+        for result, expected in zip(actual, _mhc_mix_reference(x, w, scale, base)):
+            torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 64, 4096])
