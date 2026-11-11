@@ -172,7 +172,7 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
                 self.kv_pool.get_index_k_scale_buffer(layer.layer_id),
                 self.kv_pool.index_k_pool.global_scale,
             )
-            kc, vc = self.kv_pool.get_kv_buffer(layer.layer_id)
+            kc, vc = self.kv_pool.layer_router.read(layer.layer_id).kv()
             out = plan.run_attention(
                 q[:total_q],
                 kc,
@@ -360,7 +360,7 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
             raise RuntimeError(
                 "MSA-v1 decode attention metadata was not prepared before forward."
             )
-        k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.kv_pool.layer_router.read(layer.layer_id).kv()
         return plan.run(
             q,
             topk_indices,

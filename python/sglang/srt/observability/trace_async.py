@@ -883,7 +883,7 @@ class TraceReqContextAsync:
         serializable_info = None
         if abort_info is not None:
             try:
-                from sglang.srt.managers.schedule_batch import BaseFinishReason
+                from sglang.srt.managers.req_types import BaseFinishReason
 
                 if isinstance(abort_info, BaseFinishReason):
                     serializable_info = abort_info.to_json()
