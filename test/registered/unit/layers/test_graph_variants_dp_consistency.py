@@ -3,18 +3,20 @@ step's agreed longest sequence (the MLP-sync bound), never reading device length
 and a DSA target-verify capture holds a single graph."""
 
 import dataclasses
-import inspect
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 from sglang.srt.layers.attention import graph_variants as gv
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components import dp_attn
+from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -252,26 +254,102 @@ class TestMLPSyncDecodeBound(CustomTestCase):
         )
         self.assertIsNone(batch.dp_decode_graph_max_seq_len)
 
-    def test_bound_reaches_the_forward_batch(self):
-        fields = {f.name for f in dataclasses.fields(ScheduleBatch)}
-        self.assertIn("dp_decode_graph_max_seq_len", fields)
-        self.assertRegex(
-            inspect.getsource(ScheduleBatch.copy),
-            r"dp_decode_graph_max_seq_len=\s*self\.dp_decode_graph_max_seq_len",
-        )
-        self.assertIn(
-            "dp_decode_graph_max_seq_len",
-            {f.name for f in dataclasses.fields(ForwardBatch)},
-        )
-        self.assertRegex(
-            inspect.getsource(ForwardBatch.init_new),
-            r"dp_decode_graph_max_seq_len=\s*batch\.dp_decode_graph_max_seq_len",
-        )
-        from sglang.srt.batch_overlap import two_batch_overlap
 
-        self.assertIn(
-            '"dp_decode_graph_max_seq_len"', inspect.getsource(two_batch_overlap)
+class TestBoundReachesTheRunner(CustomTestCase):
+    """The bound rides the ScheduleBatch, its copy (what overlap scheduling hands to
+    the result queue), the ForwardBatch built from it, and each TBO child."""
+
+    def test_schedule_batch_copy_keeps_the_bound(self):
+        batch = ScheduleBatch(
+            reqs=[],
+            req_to_token_pool=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(state_slots=SimpleNamespace()),
+            model_config=SimpleNamespace(is_encoder_decoder=False),
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            req_pool_indices=torch.zeros(0, dtype=torch.int64),
+            req_pool_indices_cpu=torch.zeros(0, dtype=torch.int64),
+            dp_decode_graph_max_seq_len=3000,
         )
+        self.assertEqual(batch.copy().dp_decode_graph_max_seq_len, 3000)
+
+    def test_forward_batch_takes_the_bound(self):
+        runner = SimpleNamespace(
+            device="cpu",
+            is_draft_worker=False,
+            model_config=SimpleNamespace(
+                requires_mm_token_modalities=False, model_is_mrope=False
+            ),
+            runner_ids=MagicMock(),
+            prefill_attention_backend_str="torch_native",
+            ngram_embedding_manager=SimpleNamespace(enabled=False),
+            lora_manager=None,
+            attn_backend=MagicMock(),
+            attn_tp_sequence_sharded=lambda _: False,
+        )
+        seq_lens = torch.tensor([9, 3000])
+        batch = ScheduleBatch(
+            reqs=[],
+            device="cpu",
+            model_config=SimpleNamespace(is_encoder_decoder=False, is_matryoshka=False),
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            forward_mode=ForwardMode.DECODE,
+            input_ids=torch.zeros(2, dtype=torch.int64),
+            req_pool_indices=torch.arange(2),
+            req_pool_indices_cpu=torch.arange(2),
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens,
+            seq_lens_sum=int(seq_lens.sum()),
+            orig_seq_lens=seq_lens,
+            out_cache_loc=torch.arange(2),
+            dp_decode_graph_max_seq_len=3000,
+        )
+        # Decode positions come from a fused op whose JIT path wants GPU tensors.
+        with (
+            get_context().override_server_args(device="cpu"),
+            patch.object(
+                forward_batch_info,
+                "clamp_position",
+                lambda seq_lens: torch.clamp(seq_lens - 1, min=0),
+            ),
+        ):
+            forward = ForwardBatch.init_new(
+                batch,
+                runner,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                return_hidden_states_before_norm=False,
+            )
+        self.assertEqual(forward.dp_decode_graph_max_seq_len, 3000)
+
+    def test_tbo_children_keep_the_bound(self):
+        parent = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=4,
+            input_ids=torch.zeros(4, dtype=torch.long),
+            positions=torch.zeros(4, dtype=torch.long),
+            out_cache_loc=torch.zeros(4, dtype=torch.long),
+            req_pool_indices=torch.zeros(4, dtype=torch.long),
+            seq_lens=torch.full((4,), 3000, dtype=torch.int32),
+            seq_lens_cpu=torch.full((4,), 3000, dtype=torch.int32),
+            seq_lens_sum=12000,
+            spec_info=None,
+            dp_decode_graph_max_seq_len=3000,
+        )
+        with (
+            get_context().override_server_args(
+                attention_backend="fa3", moe_dense_tp_size=None
+            ),
+            get_parallel().override(attn_tp_size=1),
+        ):
+            for lo, hi in ((0, 2), (2, 4)):
+                child = TboForwardBatchPreparer.filter_batch(
+                    parent,
+                    start_token_index=lo,
+                    end_token_index=hi,
+                    start_seq_index=lo,
+                    end_seq_index=hi,
+                    out_num_token_non_padded=torch.tensor(hi - lo),
+                )
+                self.assertEqual(child.dp_decode_graph_max_seq_len, 3000)
 
 
 if __name__ == "__main__":
