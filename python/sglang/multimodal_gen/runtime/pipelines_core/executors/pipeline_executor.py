@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Callable, List
 import torch
 
 from sglang.multimodal_gen.runtime.cache.conditioning import (
+    DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES,
     ConditioningCache,
     conditioning_cache_group,
 )
@@ -74,7 +75,9 @@ class PipelineExecutor(ABC):
                 else 0
             ),
             max_entries=(
-                server_args.conditioning_cache_max_entries if cache_enabled else None
+                server_args.conditioning_cache_max_entries
+                if cache_enabled
+                else DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES
             ),
         )
 

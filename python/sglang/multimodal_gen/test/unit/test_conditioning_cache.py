@@ -14,6 +14,7 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.runtime.cache.conditioning import (
+    DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES,
     ConditioningCache,
     cached_conditioning,
     cached_encoder_call,
@@ -24,6 +25,7 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
 )
+from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 
 
 class Encoder(EncoderTensorParallelMixin, torch.nn.Module):
@@ -185,6 +187,28 @@ def test_partial_edit_of_request_with_more_than_128_entries_reuses_the_rest():
         for x in edited:
             model(x)
     assert (model.calls, cache.hits, cache.evictions) == (151, 145, 0)
+
+
+@torch.no_grad()
+def test_group_tier_keeps_a_stage_with_more_than_128_private_entries():
+    """A grouped stage must reuse every private snapshot within the entry limit;
+    a fixed 128-entry group tier dropped the rest of a large tiled reference."""
+    cache = ConditioningCache(0)  # cross-request tier off, so only group hits count
+    model = Encoder().eval()
+    tiles = [torch.full((4,), float(value)) for value in range(148)]
+    with cache.scope(), cache.group_scope():
+        for _ in range(2):
+            for x in tiles:
+                model(x)
+    assert (model.calls, cache.group_hits) == (148, 148)
+
+
+def test_server_and_direct_construction_share_the_default_entry_limit():
+    # ServerArgs repeats the literal so argument parsing does not import the cache.
+    assert (
+        ServerArgs.conditioning_cache_max_entries
+        == DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES
+    )
 
 
 @torch.no_grad()

@@ -95,6 +95,9 @@ def prefer_conditioning_cache():
 # those blocks still identifies every byte, without copying the zeros to host.
 _SPARSE_HASH_BLOCK_BYTES = 64 * 1024
 _SPARSE_HASH_MIN_BYTES = 16 * 1024 * 1024
+# Arbitrary bound on bookkeeping, not memory; ServerArgs.conditioning_cache_max_entries
+# repeats it so argument parsing does not import this module.
+DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES = 4096
 
 
 def _tensor_digest(tensor):
@@ -250,6 +253,36 @@ class _GroupEntry:
         _map_output(self.output, record)
 
 
+# One stage's group-tier entries; copied_bytes totals the private snapshots.
+class _GroupEntries:
+    def __init__(self):
+        self._entries = {}
+        self.copied_bytes = 0
+
+    def __len__(self):
+        return len(self._entries)
+
+    def get(self, key):
+        return self._entries.get(key)
+
+    def items(self):
+        return self._entries.items()
+
+    def put(self, *, key, entry):
+        self.remove(key)
+        self._entries[key] = entry
+        self.copied_bytes += entry.copied_bytes
+
+    def remove(self, key):
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self.copied_bytes -= entry.copied_bytes
+
+    def clear(self):
+        self._entries.clear()
+        self.copied_bytes = 0
+
+
 def _copy_output(value, *, share_tensors=False):
     tensors = {}
 
@@ -297,14 +330,18 @@ def _map_output(value, tensor_fn, *, restore=False):
 class ConditioningCache:
     """One bounded cache per rank with host entries and device-hot conditioning."""
 
-    def __init__(self, max_bytes: int, *, max_entries: int | None = None):
+    def __init__(
+        self,
+        max_bytes: int,
+        *,
+        max_entries: int = DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES,
+    ):
         if max_bytes < 0:
             raise ValueError("conditioning cache capacity must be nonnegative")
-        if max_entries is not None and max_entries < 1:
+        if max_entries < 1:
             raise ValueError("conditioning cache entry limit must be positive")
         _live_caches.add(self)
         self.max_bytes = max_bytes
-        # None leaves only the byte budget.
         self.max_entries = max_entries
         self.bytes = 0
         self.hits = self.misses = self.evictions = self.bypasses = 0
@@ -378,7 +415,7 @@ class ConditioningCache:
         return True
 
     def _entries_full(self) -> bool:
-        return self.max_entries is not None and len(self._entries) >= self.max_entries
+        return len(self._entries) >= self.max_entries
 
     def _recycle_provisional_entries(self):
         """Free warmup-only entries so served snapshots reuse their pinned blocks
@@ -405,7 +442,7 @@ class ConditioningCache:
         if group_entries is not None:
             for key, entry in list(group_entries.items()):
                 if entry.owner in owners:
-                    del group_entries[key]
+                    group_entries.remove(key)
 
     def stats(self):
         return dict(
@@ -430,7 +467,7 @@ class ConditioningCache:
     @contextmanager
     def group_scope(self, enabled=True):
         """Keep device results only while a stage executes a group of requests."""
-        token = self._group_entries.set({} if enabled else None)
+        token = self._group_entries.set(_GroupEntries() if enabled else None)
         try:
             yield
         finally:
@@ -454,9 +491,8 @@ class ConditioningCache:
         )
         # private snapshots must not retain unbounded intermediate encoder states
         if not share_in_group and (
-            len(entries) >= 128
-            or size + sum(entry.copied_bytes for entry in entries.values())
-            > 512 * 1024**2
+            len(entries) >= self.max_entries
+            or size + entries.copied_bytes > 512 * 1024**2
         ):
             return
         stored = _copy_output(output, share_tensors=share_in_group)
@@ -466,7 +502,7 @@ class ConditioningCache:
                 t.device for t in tensors.values() if t.device.type == "cuda"
             }
         )
-        entries[key] = _GroupEntry(stored, owner, size, streams)
+        entries.put(key=key, entry=_GroupEntry(stored, owner, size, streams))
 
     @contextmanager
     def scope(self, enabled=True, *, refresh=False, cross_request=True):

@@ -642,8 +642,8 @@ class ServerArgs(DisaggServerArgsMixin):
     enable_cache_report: bool = False
     disable_conditioning_cache: bool = False
     conditioning_cache_max_size_mb: float = 512.0
-    # Arbitrary bound on bookkeeping, not memory: high enough that the byte budget
-    # binds first, since one tiled VAE reference alone stores 100+ small entries.
+    # Same as DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES in runtime/cache/conditioning.py:
+    # high enough that the byte budget binds first for tiled VAE references.
     conditioning_cache_max_entries: int = 4096
 
     # Tracing
