@@ -6,7 +6,12 @@ The Triton kernels migrated here live in this package
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 # (module, public_fn) migrated from mem_cache/triton_ops.
 _TRITON_KERNELS = [
@@ -80,7 +85,7 @@ register_kernel(
     KernelSpec(
         op="memory.small_field_copy",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.memory.small_field_copy:small_field_copy",
+        target="sglang.kernels.ops.memory.small_field_copy:SmallFieldCopyPlan",
         capabilities=CUDA_ONLY,
     )
 )
@@ -95,7 +100,6 @@ register_kernel(
 
 
 # In-tree Kimi K3 CuTe kernels; metadata imports no GPU implementation.
-from sglang.kernels.spec import CapabilityRequirement
 
 for _name, _target in (
     (
@@ -114,3 +118,10 @@ for _name, _target in (
         )
     )
 del _name, _target
+register_kernel(
+    KernelSpec(
+        op="memory.interleave_rows",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.interleave_rows:interleave_rows",
+    )
+)
