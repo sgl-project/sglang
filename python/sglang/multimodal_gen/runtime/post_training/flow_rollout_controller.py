@@ -15,11 +15,26 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
 _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
 
 
+def truncate_rollout_sigmas(
+    sigmas: torch.Tensor | list[float], *, stop_step_index: int
+) -> torch.Tensor | list[float]:
+    """Keep steps 0..stop_step_index of a sigma grid and send the last one to the terminal sigma."""
+    num_steps = len(sigmas) - 1
+    if not 0 <= stop_step_index < num_steps:
+        raise ValueError(
+            f"rollout_stop_step_index must be in [0, {num_steps}), got {stop_step_index}"
+        )
+    end = stop_step_index + 1
+    if isinstance(sigmas, torch.Tensor):
+        return torch.cat([sigmas[:end], sigmas[-1:]])
+    return sigmas[:end] + sigmas[-1:]
+
+
 class FlowRolloutController:
     """Rollout controller of one latent stream of one request, shared by every
-    flow-matching model: its SDE/CPS/ODE transition and the per-step log-probs.
-    The denoising stage creates it in ``batch.rollout_controllers`` and clears
-    that dict when the loop ends.
+    flow-matching model: the schedule the loop runs, its SDE/CPS/ODE transition
+    and the per-step log-probs. The denoising stage creates it in
+    ``batch.rollout_controllers`` and clears that dict when the loop ends.
     """
 
     def __init__(
@@ -36,6 +51,7 @@ class FlowRolloutController:
         shard_for_sp: Callable[[Any, torch.Tensor], torch.Tensor],
         gather_for_sp: Callable[[Any, torch.Tensor], torch.Tensor],
         sigmas: torch.Tensor,
+        timesteps: torch.Tensor,
         latents_shape: tuple,
         ode_transition: Callable[..., torch.Tensor] | None = None,
     ) -> None:
@@ -51,11 +67,19 @@ class FlowRolloutController:
         # read the request's live SP state, so the request is passed in per call.
         self.shard_for_sp = shard_for_sp
         self.gather_for_sp = gather_for_sp
-        # [T+1] sigma grid of the loop, terminal 0 included.
-        self.sigmas = sigmas
-        # FlowGRPO's sigma_max: sigmas[1], used in place of sigma == 1 so the SDE std
-        # never divides by 1 - sigma = 0.
+        # FlowGRPO's sigma_max: sigmas[1] of the model's grid, used in place of
+        # sigma == 1 so the SDE std never divides by 1 - sigma = 0. Fixed here, so
+        # a later stop_at(0) still draws the full rollout's noise at step 0.
         self.sigma_max = sigmas[min(1, len(sigmas) - 1)].item()
+        if len(sigmas) != len(timesteps) + 1:
+            raise ValueError(
+                f"a rollout schedule of {len(timesteps)} timesteps needs exactly "
+                f"{len(timesteps) + 1} sigmas (the terminal included), got {len(sigmas)}"
+            )
+        # The [T] timesteps the loop iterates and the [T+1] sigma grid they index,
+        # terminal included; stop_at cuts both.
+        self.sigmas = sigmas
+        self.timesteps = timesteps
         self.latents_shape = latents_shape
         # The model's own deterministic update, called as
         # ode_transition(model_output=, sample=, step_index=) on ODE steps;
@@ -74,6 +98,15 @@ class FlowRolloutController:
         self.step_latents: list[torch.Tensor] = []
         self.step_latent_indices: list[int] = []
         self.step_timesteps: list[torch.Tensor] = []
+
+    def stop_at(self, stop_step_index: int) -> None:
+        """Keep steps 0..stop_step_index; the last one steps to the terminal sigma.
+        Called by ``set_rollout_early_stop_if_enabled`` before the loop's first
+        step; loops do not call it themselves."""
+        self.sigmas = truncate_rollout_sigmas(
+            self.sigmas, stop_step_index=stop_step_index
+        )
+        self.timesteps = self.timesteps[: stop_step_index + 1]
 
     def _reset_rollout_debug_tensors(self) -> None:
         self.local_variance_noises = []
@@ -145,12 +178,21 @@ class FlowRolloutController:
         with ``batch`` bound by ``rollout_step_kwargs``;
         ``sample`` arrives already upcast to fp32 by ``step()``.
 
-        Draws variance noise from the request generator captured at creation, so
-        the caller's ``generator`` argument is not used. Records ``sample`` as the
+        Steps on the controller's own grid: the scheduler's ``next_sigma`` and
+        ``dt`` are not used, so a requested stop sends the last step to the
+        terminal sigma while the scheduler's grid stays untouched. Draws variance
+        noise from the request generator captured at creation, so the caller's
+        ``generator`` argument is not used either. Records ``sample`` as the
         step's x_t before advancing it.
         """
         if current_sigma.dim() != 0:
             raise ValueError("Rollout does not support per-token timesteps")
+        if step_index >= len(self.timesteps):
+            raise ValueError(
+                f"denoising step {step_index} is past the rollout schedule of "
+                f"{len(self.timesteps)} steps; a rollout loop must iterate the "
+                "controller's timesteps"
+            )
         self.record_trajectory_step(
             latents=sample, timestep_value=timestep, step_index=step_index
         )
@@ -159,7 +201,7 @@ class FlowRolloutController:
             model_output=model_output,
             sample=sample,
             current_sigma=current_sigma,
-            next_sigma=next_sigma,
+            next_sigma=self.sigmas[step_index + 1],
             step_index=step_index,
         )
 
