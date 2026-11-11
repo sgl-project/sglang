@@ -60,6 +60,7 @@ def _manager(manager_class=CommonKVManager):
     manager._deferred_ack_poisoned_rooms = set()
     manager.enable_staging = False
     manager.customized_info_enabled = False
+    manager.exchange_aux_item_lens = False
     return manager
 
 
@@ -291,6 +292,7 @@ class TestReceiverControlMessages(CustomTestCase):
             with self.subTest(backend=backend, customized_info=enabled):
                 receiver, sent = self._make_receiver(backend)
                 receiver.kv_mgr.customized_info_enabled = enabled
+                receiver.kv_mgr.exchange_aux_item_lens = enabled
                 expected_frames = list(expected[backend])
                 if backend != "mori":
                     # aux_item_lens follows aux_ptrs; empty when disabled.

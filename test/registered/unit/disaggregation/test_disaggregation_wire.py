@@ -236,6 +236,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 with self.subTest(layer_ids=layer_ids, outcome=outcome):
                     manager = object.__new__(MooncakeKVManager)
                     manager.customized_info_enabled = False
+                    manager.exchange_aux_item_lens = False
                     manager.kv_args = SimpleNamespace(
                         kv_data_ptrs=[],
                         state_types=[StateType.SWA, StateType.DSA],
@@ -887,6 +888,7 @@ class TestDisaggregationWire(unittest.TestCase):
         dst_ptrs, _, dst_lens = decode.get_buf_infos()
         manager = object.__new__(CommonKVManager)
         manager.customized_info_enabled = True
+        manager.exchange_aux_item_lens = True
         manager.kv_args = SimpleNamespace(
             aux_data_ptrs=src_ptrs, aux_item_lens=src_lens
         )
@@ -949,11 +951,48 @@ class TestDisaggregationWire(unittest.TestCase):
                     (src_ptrs, _, src_lens), (dst_ptrs, _, dst_lens) = layouts
                     manager = object.__new__(CommonKVManager)
                     manager.customized_info_enabled = prefill_enabled
+                    manager.exchange_aux_item_lens = prefill_enabled
                     manager.kv_args = SimpleNamespace(
                         aux_data_ptrs=src_ptrs, aux_item_lens=src_lens
                     )
                     peer_lens = dst_lens if decode_enabled else None
                     if prefill_enabled == decode_enabled:
+                        manager.validate_aux_buffers(dst_ptrs, peer_lens)
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError, "metadata buffer layout mismatch"
+                        ):
+                            manager.validate_aux_buffers(dst_ptrs, peer_lens)
+
+    def test_aux_buffer_validation_checks_top_logprobs_width(self):
+        legacy = MetadataBuffers.LEGACY_TOP_LOGPROBS_NUM
+        with (
+            get_context().override_server_args(disaggregation_enable_kv_checksum=False),
+            envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(0),
+        ):
+            for prefill_width, decode_width, accepted in (
+                (legacy, legacy, True),
+                (legacy, 2 * legacy, True),
+                (2 * legacy, 2 * legacy, True),
+                (2 * legacy, legacy, False),
+                (4 * legacy, 2 * legacy, False),
+            ):
+                with self.subTest(prefill=prefill_width, decode=decode_width):
+                    src_ptrs, _, src_lens = MetadataBuffers(
+                        1, 16, torch.float32, 0, prefill_width
+                    ).get_buf_infos()
+                    dst_ptrs, _, dst_lens = MetadataBuffers(
+                        1, 16, torch.float32, 0, decode_width
+                    ).get_buf_infos()
+                    manager = object.__new__(CommonKVManager)
+                    manager.customized_info_enabled = False
+                    # As CommonKVManager derives it on each side.
+                    manager.exchange_aux_item_lens = prefill_width != legacy
+                    manager.kv_args = SimpleNamespace(
+                        aux_data_ptrs=src_ptrs, aux_item_lens=src_lens
+                    )
+                    peer_lens = dst_lens if decode_width != legacy else None
+                    if accepted:
                         manager.validate_aux_buffers(dst_ptrs, peer_lens)
                     else:
                         with self.assertRaisesRegex(
@@ -994,6 +1033,7 @@ class TestDisaggregationWire(unittest.TestCase):
     def test_mooncake_aux_mismatch_fails_request_and_worker_continues(self):
         manager = object.__new__(MooncakeKVManager)
         manager.customized_info_enabled = True
+        manager.exchange_aux_item_lens = True
         manager.kv_args = SimpleNamespace(
             aux_data_ptrs=[0x1000] * 8,
             aux_item_lens=[64] * 6 + [4096, 64],
