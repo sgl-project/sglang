@@ -211,7 +211,10 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
 
         target_worker = MagicMock()
         target_worker.model_runner.attn_backend.forward_state_slots.return_value = (
-            ForwardStateSlots(torch.tensor([5, 7], dtype=torch.int32))
+            ForwardStateSlots(
+                torch.tensor([5, 7], dtype=torch.int32),
+                ring=torch.tensor([2, 3], dtype=torch.int32),
+            )
         )
         mamba_pool = MagicMock()
         router = target_worker.model_runner.token_to_kv_pool.layer_router
@@ -242,7 +245,7 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
             patch(
                 "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode."
                 "commit_gdn_replayssm_spec"
-            ),
+            ) as advance,
             patch(
                 "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode."
                 "commit_gdn_replayssm_circular"
@@ -262,6 +265,11 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
 
         scatter.assert_called_once()
         torch.testing.assert_close(scatter.call_args.args[4], batch.req_pool_indices)
+        # The ring is indexed by the rows the forward resolved.
+        torch.testing.assert_close(
+            advance.call_args.kwargs["replay_indices"],
+            torch.tensor([2, 3], dtype=torch.int32),
+        )
 
 
 class TestDelayedMambaCommitBatchPairing(CustomTestCase):

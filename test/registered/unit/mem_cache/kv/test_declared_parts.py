@@ -23,7 +23,6 @@ from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import (
     DerivedPartDecl,
     MHAGeometry,
-    RequestPartDecl,
     StateGeometry,
     StateReplay,
     TensorPartDecl,
@@ -59,6 +58,12 @@ DRAFT_WINDOW = ComponentType.of("DRAFT_SWA")
 TARGET_WINDOW = ComponentType.of("WINDOW_16")
 
 
+# GDN speculative ReplaySSM: its ring and cursors are request memory.
+_GDN_SPEC_REPLAY = StateReplay(
+    decode=False, speculative=True, is_kda=False, cache_len=8, key_heads=1
+)
+
+
 class _RequestKV:
     def __init__(self):
         self.req_pool_idx = None
@@ -69,10 +74,22 @@ class _RequestKV:
         return self.req_pool_idx is not None
 
 
+class _StateRequestKV(_RequestKV):
+    def __init__(self):
+        super().__init__()
+        self.mamba_pool_idx = None
+        self.mamba_needs_clear = False
+        self.mamba_cow_src_index = None
+        self.mamba_ping_pong_track_buffer = None
+
+    @property
+    def holds_mamba(self):
+        return self.mamba_pool_idx is not None
+
+
 def _build(
     *,
     extra=(),
-    requests=(),
     derived=(),
     state=False,
     gamma=None,
@@ -128,7 +145,6 @@ def _build(
         decls,
         page_size=4,
         speculative_num_draft_tokens=gamma,
-        request_parts=requests,
         derived_parts=derived,
         fused_draft=fused_draft,
     )
@@ -984,56 +1000,49 @@ class TestDeclaredParts(CustomTestCase):
         with self.assertRaises(RuntimeError):
             size_plan(plan, msgspec.structs.replace(inp, budget_bytes=16 * 1024 * 1024))
 
-    def test_each_request_part_resets_only_on_fresh_acquisition(self):
-        declarations = tuple(
-            RequestPartDecl(part=p)
-            for p in (
-                TensorPartDecl(name="cursor", shape=(), dtype=torch.int32),
-                TensorPartDecl(
-                    name="ring", shape=(4, 8), dtype=torch.float32, layer_ids=(1, 3)
-                ),
-                TensorPartDecl(
-                    name="context", shape=(3,), dtype=torch.int64, reset_value=7
-                ),
-            )
-        )
-        storage, _, sized = _build(requests=declarations)
-        memory = storage._request_memory
-        self.assertEqual(
-            memory.nbytes,
-            sum(t.bytes for t in sized.fixed if t.name != "request_table"),
-        )
-        req = SimpleNamespace(rid="r0", kv=_RequestKV())
+    def test_request_units_bind_with_rows_and_start_zeroed(self):
+        """A request sub-pool's unit is bound with its request row, zeroed when
+        a row binds it, kept while the row is held, and given back with it."""
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        (request,) = plan.requests()
+        allocator = storage.allocator
+        band = allocator.request_allocators[request.name]
+        ids = allocator.request_id_spaces()[request.name]
+        cursor = storage.view("mamba").replayssm_spec_write_pos
+        req = SimpleNamespace(rid="r0", kv=_StateRequestKV())
         row = storage.acquire([req])[0]
-        addresses = {n: t.data_ptr() for n, t in memory.tensors.items()}
-        for part in memory.parts:
-            tensor = memory.tensors[part.name].select(part.row_axis, row)
-            self.assertTrue(torch.all(tensor == part.reset_value))
-            tensor.fill_(19)
+        unit = int(ids.ids(torch.tensor([row]))[0])
+        self.assertGreater(unit, 0)
+        self.assertEqual(band.allocated_count(), 1)
+        self.assertEqual(int(cursor[unit]), 0)
+        cursor[unit] = 19
+        # A later chunk keeps its row, and with it its unit.
         self.assertEqual(storage.acquire([req]), [row])
-        for part in memory.parts:
-            self.assertTrue(
-                torch.all(memory.tensors[part.name].select(part.row_axis, row) == 19)
-            )
+        self.assertEqual(int(ids.ids(torch.tensor([row]))[0]), unit)
+        self.assertEqual(int(cursor[unit]), 19)
         storage.release_row(req)
-        other = SimpleNamespace(kv=_RequestKV())
-        self.assertEqual(storage.acquire([other]), [row])
-        # Handing the row out resets nothing; the next forward does.
-        for part in memory.parts:
-            self.assertTrue(
-                torch.all(memory.tensors[part.name].select(part.row_axis, row) == 19)
-            )
-        storage.reset_new_rows()
-        for part in memory.parts:
-            self.assertTrue(
-                torch.all(
-                    memory.tensors[part.name].select(part.row_axis, row)
-                    == part.reset_value
-                )
-            )
-        self.assertEqual(
-            addresses, {n: t.data_ptr() for n, t in memory.tensors.items()}
+        self.assertEqual(band.allocated_count(), 0)
+        other = SimpleNamespace(rid="r1", kv=_StateRequestKV())
+        row = storage.acquire([other])[0]
+        unit = int(ids.ids(torch.tensor([row]))[0])
+        self.assertEqual(int(cursor[unit]), 0)
+
+    def test_request_rows_are_priced_with_the_other_units(self):
+        """A demand's request rows take a unit of every request sub-pool, priced
+        in the same layout as its tokens and state slots; nothing evictable
+        frees one."""
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        allocator = storage.allocator
+        (request,) = plan.requests()
+        demand = KVDemand(full_tokens=4, state_slots=1, request_rows=2)
+        demands = allocator.page_demands(demand)
+        self.assertEqual(demands[request.name], 2)
+        self.assertEqual(demands["mamba"], 1)
+        units, reclaim = allocator._admission_units(
+            demand, {request.name: 5}, empty_pool=False
         )
+        self.assertEqual(units[request.name], 2)
+        self.assertEqual(reclaim[request.name], 0)
 
     def test_total_budget_charges_fixed_storage_once(self):
         storage, plan, _ = _build(state=True, gamma=3)
@@ -1475,6 +1484,7 @@ class TestDeclaredParts(CustomTestCase):
                 forward_slots = ForwardStateSlots(
                     state_ids.ids(req.get_mamba_indices(batch.req_pool_indices)),
                     state_ids.ids(track),
+                    runner.runner_ids.request_ids().ids(batch.req_pool_indices),
                 )
                 runner.attn_backend = SimpleNamespace(
                     forward_state_slots=lambda n, track_ids: forward_slots
@@ -1486,8 +1496,9 @@ class TestDeclaredParts(CustomTestCase):
                         (kw["state_batch_indices"], kw["mamba_track_indices"])
                     )
                     if "replay_indices" in kw:
+                        # The ring rows the forward resolved, not the table's.
                         torch.testing.assert_close(
-                            kw["replay_indices"], batch.req_pool_indices
+                            kw["replay_indices"], forward_slots.ring
                         )
 
                 def scatter(*args):
@@ -1613,45 +1624,43 @@ class TestDeclaredParts(CustomTestCase):
         self.assertTrue(torch.all(ngram.intermediate_context == 17))
         self.assertEqual(len(plan.scratch), 4)
 
-    def test_gdn_replay_request_parts_reset_on_row_reuse(self):
-        storage, plan, _ = _build(
-            state=True,
-            gamma=3,
-            replay=StateReplay(
-                decode=False,
-                speculative=True,
-                is_kda=False,
-                cache_len=8,
-                key_heads=1,
-            ),
-        )
+    def test_gdn_spec_ring_is_request_memory(self):
+        """The GDN speculative ring and its cursors form the request sub-pool: a
+        float of the chain the prefix tree, host stores and PD peers never see,
+        and no state slot (so no checkpoint) carries them."""
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
         view = storage.view("mamba")
         self.assertIsNone(view.mamba_cache.intermediate_ssm)
-        self.assertEqual(len(plan.request_parts), 8)
-        row = storage.take_rows(1)[0]
-        for part in storage._request_memory.parts:
-            with self.subTest(part=part.name):
-                storage._request_memory.tensors[part.name].select(
-                    part.row_axis, row
-                ).fill_(23)
-        storage.release_rows([row])
-        self.assertEqual(storage.take_rows(1), [row])
-        storage.reset_new_rows()
-        for part in storage._request_memory.parts:
-            with self.subTest(part=part.name):
-                self.assertTrue(
-                    torch.all(
-                        storage._request_memory.tensors[part.name].select(
-                            part.row_axis, row
-                        )
-                        == part.reset_value
-                    )
+        (request,) = plan.requests()
+        self.assertEqual(request.spec.grow_direction, "float")
+        self.assertEqual(
+            {p.name for p in request.geometry.parts},
+            {
+                f"mamba.{name}"
+                for name in (
+                    "replayssm_d",
+                    "replayssm_k",
+                    "replayssm_g",
+                    "replayssm_rawv",
+                    "replayssm_rawk",
+                    "replayssm_spec_write_pos",
+                    "replayssm_cache_base",
+                    "replayssm_is_flush",
                 )
-        self.assertIs(
-            view.replayssm_spec_write_pos,
-            storage._request_memory.tensors["mamba.replayssm_spec_write_pos"],
+            },
         )
+        self.assertNotIn(request.name, storage.sub_pool_names())
+        self.assertNotIn(request, plan.drive_order())
+        self.assertNotIn(request.name, {e.sub_pool for e in plan.wire_entries()})
+        self.assertTrue(view.replayssm_request_ring)
         self.assertEqual(view._checkpoint_extra_buffers, ())
+        self.assertNotIn(
+            "replayssm_d", {p.name for p in plan.sub_pool("mamba").spec.extra_parts}
+        )
+        # The cursors sit one per unit in the request entries.
+        entry = request.spec.entry_bytes()
+        self.assertEqual(view.replayssm_spec_write_pos.stride(0) * 4, entry)
+        self.assertEqual(view.replayssm_is_flush.stride(0), entry)
 
     def test_replay_state_records_and_cursor_move_together(self):
         for speculative in (False, True):
@@ -1668,7 +1677,7 @@ class TestDeclaredParts(CustomTestCase):
                     ),
                 )
                 view = storage.view("mamba")
-                self.assertFalse(plan.request_parts)
+                self.assertFalse(plan.requests())
                 self.assertEqual(len(view.extra_parts), 7 if speculative else 4)
                 for part in view.extra_parts:
                     view.extra_views[part.name].select(part.row_axis, 3).fill_(5)
@@ -3679,7 +3688,7 @@ class TestDeclaredParts(CustomTestCase):
                 )
                 self.assertEqual(storage.requests.size, sized.max_running_requests)
 
-    def test_retraction_carries_whole_entries_derived_pages_and_request_parts(self):
+    def test_retraction_carries_whole_entries_and_derived_pages(self):
         from unittest.mock import patch
 
         from torch.utils._python_dispatch import TorchDispatchMode
@@ -3739,20 +3748,10 @@ class TestDeclaredParts(CustomTestCase):
                             ),
                         ),
                     ),
-                    requests=(
-                        RequestPartDecl(
-                            part=TensorPartDecl(
-                                name="pending", shape=(3,), dtype=torch.int32
-                            )
-                        ),
-                    ),
                 )
                 allocator = storage.allocator
                 source = allocator.alloc(16)
                 state_ids = allocator.alloc_state_slots(1) if with_state else None
-                (request_row,) = storage.take_rows(1)
-                storage.reset_new_rows()
-                storage.request_memory.tensors["pending"][request_row].fill_(97)
                 original = {}
                 for n, band in enumerate(allocator.members):
                     ids = (
@@ -3778,12 +3777,11 @@ class TestDeclaredParts(CustomTestCase):
                     BoundedGather(),
                 ):
                     saved = allocator.get_cpu_copy(
-                        source, mamba_indices=state_ids, req_pool_index=request_row
+                        source, mamba_indices=state_ids, req_pool_index=None
                     )
                 # A distinct allocation changes both virtual and physical rows.
                 destination = allocator.alloc(16)
                 new_state = allocator.alloc_state_slots(1) if with_state else None
-                (new_row,) = storage.take_rows(1)
                 if not with_state:
                     allocator.free_swa_segment(destination[:4], start_pos=0)
                 with (
@@ -3798,7 +3796,7 @@ class TestDeclaredParts(CustomTestCase):
                         saved,
                         destination,
                         mamba_indices=new_state,
-                        req_pool_index=new_row,
+                        req_pool_index=None,
                     )
                 for band in allocator.members:
                     ids = (
@@ -3818,13 +3816,28 @@ class TestDeclaredParts(CustomTestCase):
                     destination[::4] // 4
                 ]
                 self.assertTrue(torch.all(blob[:, pages] == 83))
-                # The restore wrote the new row whole; the next forward keeps it.
-                storage.reset_new_rows()
-                self.assertTrue(
-                    torch.all(storage.request_memory.tensors["pending"][new_row] == 97)
-                )
 
-    def test_sparse_page_regions_and_request_ring_reuse(self):
+    def test_retraction_carries_request_units(self):
+        """A retracted request's request-sub-pool unit is backed up by its row
+        and restored into the unit its new row binds."""
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        (request,) = plan.requests()
+        allocator = storage.allocator
+        ids = allocator.request_id_spaces()[request.name]
+        entries = allocator.arena.entries(request.name)
+        source = allocator.alloc(4)
+        (row,) = storage.take_rows(1)
+        entries[int(ids.ids(torch.tensor([row]))[0])] = 97
+        saved = allocator.get_cpu_copy(source, req_pool_index=row)
+        storage.release_rows([row])
+        destination = allocator.alloc(4)
+        (other,) = [r for r in storage.take_rows(2) if r != row]
+        unit = int(ids.ids(torch.tensor([other]))[0])
+        self.assertTrue(torch.all(entries[unit] == 0))
+        allocator.load_cpu_copy(saved, destination, req_pool_index=other)
+        self.assertTrue(torch.all(entries[unit] == 97))
+
+    def test_sparse_page_regions(self):
         # Packed DSA pages put all 128-byte keys before the 4-byte scales;
         # QSA pages contain two compressed K rows. Neither is token-interleaved.
         dsa = TensorPartDecl(
@@ -3837,36 +3850,16 @@ class TestDeclaredParts(CustomTestCase):
             layer_ids=(0, 4),
             slice_axis=1,
         )
-        tails = tuple(
-            RequestPartDecl(
-                part=TensorPartDecl(
-                    name=name, shape=(7, 128), dtype=torch.bfloat16, layer_ids=(0, 4)
-                ),
-                wire="dsa_tail",
-            )
-            for name in ("tail_k", "tail_score")
-        )
-        pending = RequestPartDecl(
-            part=TensorPartDecl(
-                name="pending", shape=(2, 2, 8), dtype=torch.bfloat16, layer_ids=(0, 4)
-            ),
-            wire="qsa_pending",
-        )
-        rope = RequestPartDecl(
-            part=TensorPartDecl(name="rope", shape=(2, 3), dtype=torch.int64),
-            wire="qsa_pending",
-        )
         storage, plan, sized = _build(
             derived=(
                 DerivedPartDecl(sub_pool="full", part=dsa, wire="dsa"),
                 DerivedPartDecl(sub_pool="full", part=qsa, wire="qsa_compressed"),
             ),
-            requests=(*tails, pending, rope),
         )
         wires = plan.wire_entries()
         self.assertEqual(
             [e.state_type for e in wires],
-            ["swa", "dsa", "dsa_tail", "qsa_pending", "qsa_compressed"],
+            ["swa", "dsa", "qsa_compressed"],
         )
         self.assertEqual(storage.regions("full", part="dsa").item_lens, (528, 528))
         region = storage.regions("full", part="qsa_compressed")
@@ -3874,46 +3867,12 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(region.layer_ids, (0, 4))
         self.assertEqual(region.dim_per_tensor, (2, 2))
         self.assertEqual(region.slice_outer_counts, (2, 2))
-        self.assertEqual(
-            storage.regions("full", part="dsa_tail").item_lens, (1792,) * 4
-        )
-        self.assertEqual(
-            storage.regions("full", part="qsa_pending").item_lens, (64, 64, 48)
-        )
         arena = storage.allocator.arena
         for tensor in arena.page_parts["full"].tensors.values():
             tensor[:, 3].fill_(7)
         arena.move_units("full", torch.tensor([9]), torch.tensor([3]))
         for tensor in arena.page_parts["full"].tensors.values():
             self.assertTrue(torch.all(tensor[:, 9] == 7))
-        for declared in plan.request_parts:
-            storage._request_memory.tensors[declared.part.name].fill_(9)
-        row = storage.take_rows(1)[0]
-        storage.reset_new_rows()
-        for declared in plan.request_parts:
-            part = declared.part
-            tensor = storage._request_memory.tensors[part.name]
-            self.assertTrue(
-                torch.all(tensor.select(part.row_axis, row) == part.reset_value)
-            )
-        storage.release_rows([row])
-        for declared in plan.request_parts:
-            part = declared.part
-            storage._request_memory.tensors[part.name].select(part.row_axis, row).fill_(
-                11
-            )
-        self.assertEqual(storage.take_rows(1), [row])
-        storage.reset_new_rows()
-        for declared in plan.request_parts:
-            part = declared.part
-            self.assertTrue(
-                torch.all(
-                    storage._request_memory.tensors[part.name].select(
-                        part.row_axis, row
-                    )
-                    == part.reset_value
-                )
-            )
 
     def test_derived_page_blobs_move_with_physical_pages(self):
         part = TensorPartDecl(

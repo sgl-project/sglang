@@ -1223,8 +1223,8 @@ def commit_mamba_states_after_verify(
     if mamba_pool is not None and (
         mamba_pool.replayssm_spec_fold or mamba_pool.replayssm_cache_base is not None
     ):
-        # Persistent destinations are state slots; replay/scratch rows still
-        # index requests.
+        # Persistent destinations are state slots; a request-scoped ring is
+        # indexed by the rows the forward resolved (`ForwardStateSlots.ring`).
         if state_slots is None:
             state_slots = model_runner.attn_backend.forward_state_slots(
                 bs, batch.mamba_track_indices
@@ -1273,7 +1273,8 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
-        replay_indices = batch.req_pool_indices
+        assert state_slots.ring is not None, "the GDN ring is indexed per request"
+        replay_indices = state_slots.ring[:bs]
         # Advance the per-request circular cursors by the accepted count (incl. the
         # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
         commit_gdn_replayssm_spec(
@@ -1386,6 +1387,7 @@ def relayed_commit_state_slots(
     return ForwardStateSlots(
         state_ids.ids(req_pool.get_mamba_indices(batch.req_pool_indices)),
         None if track is None else state_ids.ids(track),
+        model_runner.runner_ids.request_ids().ids(batch.req_pool_indices),
     )
 
 

@@ -108,6 +108,9 @@ class MambaAttnBackendBase(AttentionBackend):
         # identity or one gather through the id space's table, both of which
         # `fused_replay_state_indices` reproduces in its own launch.
         self._state_ids = model_runner.runner_ids.state_ids(pool.state_sub_pool)
+        # Request rows as a request-scoped ReplaySSM ring indexes them: the
+        # identity on static pools, the request sub-pool's units under unified.
+        self._ring_ids = model_runner.runner_ids.request_ids()
         self._fused_state_indices_ok = (
             torch.device(self.device).type == "cuda" and pool.holds_state_slots
         )
@@ -156,7 +159,12 @@ class MambaAttnBackendBase(AttentionBackend):
                 "commit writes"
             )
             track = track[:num_requests]
-        return ForwardStateSlots(md.mamba_cache_indices[:num_requests], track)
+        ring = md.replayssm_ring_indices
+        return ForwardStateSlots(
+            md.mamba_cache_indices[:num_requests],
+            track,
+            None if ring is None else ring[:num_requests],
+        )
 
     def state_layer(self, layer_id: int) -> KVLayer:
         """The layer's recurrent-state route, once a layer-wise host load-back
@@ -243,9 +251,9 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
         replayssm_ring_indices = None
         if self._replayssm_request_ring():
-            replayssm_ring_indices = forward_batch.req_pool_indices[:bs].to(
-                dtype=torch.int32
-            )
+            replayssm_ring_indices = self._ring_ids.ids(
+                forward_batch.req_pool_indices[:bs]
+            ).to(dtype=torch.int32)
         if forward_batch.mamba_track_indices is not None:
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
@@ -668,7 +676,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return None
         buf = self.replayssm_ring_indices_list[bs - 1]
         n = min(bs, int(req_pool_indices.shape[0]))
-        buf[:n].copy_(req_pool_indices[:n].to(dtype=buf.dtype))
+        buf[:n].copy_(self._ring_ids.ids(req_pool_indices[:n]).to(dtype=buf.dtype))
         if num_padding:
             buf[bs - num_padding : bs].fill_(-1)
         return buf

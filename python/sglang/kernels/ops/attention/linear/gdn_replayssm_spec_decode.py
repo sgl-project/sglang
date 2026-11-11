@@ -109,6 +109,11 @@ def gdn_replayssm_spec_circular_kernel(
     IS_FLUSH: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    # Element strides between the replay rows of each cursor: 1 when the
+    # cursors are their own arrays, a whole entry when they sit in one.
+    STRIDE_WP: tl.constexpr = 1,
+    STRIDE_CB: tl.constexpr = 1,
+    STRIDE_FL: tl.constexpr = 1,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -141,7 +146,7 @@ def gdn_replayssm_spec_circular_kernel(
     if IS_FLUSH:
         if state_idx <= NULL_BLOCK_ID:
             return
-        b_is_flush = tl.load(is_flush_flags + replay_idx) != 0
+        b_is_flush = tl.load(is_flush_flags + replay_idx * STRIDE_FL) != 0
         if not b_is_flush:
             return
     else:
@@ -153,12 +158,12 @@ def gdn_replayssm_spec_circular_kernel(
                 mask=full_mask,
             )
             return
-        b_is_flush = tl.load(is_flush_flags + replay_idx) != 0
+        b_is_flush = tl.load(is_flush_flags + replay_idx * STRIDE_FL) != 0
         if b_is_flush:
             return
 
-    b_write_pos = tl.load(write_pos + replay_idx).to(tl.int64)
-    b_cache_base = tl.load(cache_base + replay_idx).to(tl.int32)
+    b_write_pos = tl.load(write_pos + replay_idx * STRIDE_WP).to(tl.int64)
+    b_cache_base = tl.load(cache_base + replay_idx * STRIDE_CB).to(tl.int32)
 
     out_mask = mask_s[:, None] & mask_v[None, :]
 
@@ -507,6 +512,11 @@ def gdn_replayssm_exact_fold_kernel(
     MAX_CACHE_LEN: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
+    # Element strides between the replay rows of each cursor: 1 when the
+    # cursors are their own arrays, a whole entry when they sit in one.
+    STRIDE_WP: tl.constexpr = 1,
+    STRIDE_CB: tl.constexpr = 1,
+    STRIDE_FL: tl.constexpr = 1,
 ):
     """Closed-loop exact fold: sequentially replay the committed ring window
     into the fp32 checkpoint on flush rows.
@@ -534,12 +544,12 @@ def gdn_replayssm_exact_fold_kernel(
     replay_idx = tl.load(replay_indices + i_n * stride_replay_indices).to(tl.int64)
     if state_idx <= NULL_BLOCK_ID:
         return
-    if tl.load(is_flush_flags + replay_idx) == 0:
+    if tl.load(is_flush_flags + replay_idx * STRIDE_FL) == 0:
         return
-    b_write_pos = tl.load(write_pos + replay_idx).to(tl.int32)
+    b_write_pos = tl.load(write_pos + replay_idx * STRIDE_WP).to(tl.int32)
     if b_write_pos <= 0:
         return
-    b_cache_base = tl.load(cache_base + replay_idx).to(tl.int32)
+    b_cache_base = tl.load(cache_base + replay_idx * STRIDE_CB).to(tl.int32)
 
     o_k = tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
@@ -636,6 +646,11 @@ def gdn_replayssm_compact_commit_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
+    # Element strides between the replay rows of each cursor: 1 when the
+    # cursors are their own arrays, a whole entry when they sit in one.
+    STRIDE_WP: tl.constexpr = 1,
+    STRIDE_CB: tl.constexpr = 1,
+    STRIDE_FL: tl.constexpr = 1,
 ):
     """Materialize the checkpoint directly from compact ReplaySSM D/K/G."""
     i_v = tl.program_id(0)
@@ -649,8 +664,8 @@ def gdn_replayssm_compact_commit_kernel(
     replay_idx = tl.load(replay_indices + i_n * stride_replay_indices).to(tl.int64)
     if state_idx <= NULL_BLOCK_ID:
         return
-    n_history = tl.load(write_pos + replay_idx).to(tl.int32)
-    fold_active = tl.load(is_flush_flags + replay_idx) != 0
+    n_history = tl.load(write_pos + replay_idx * STRIDE_WP).to(tl.int32)
+    fold_active = tl.load(is_flush_flags + replay_idx * STRIDE_FL) != 0
     if HAS_TRACK:
         track_idx = tl.load(mamba_track_indices + i_n * stride_track).to(tl.int64)
         track_step = tl.load(mamba_steps_to_track + i_n * stride_steps).to(tl.int32)
@@ -670,7 +685,7 @@ def gdn_replayssm_compact_commit_kernel(
     g_cache += i_layer * stride_g_layer
     d_residual_cache += i_layer * stride_d_residual_layer
     k_residual_cache += i_layer * stride_k_residual_layer
-    base = tl.load(cache_base + replay_idx).to(tl.int32)
+    base = tl.load(cache_base + replay_idx * STRIDE_CB).to(tl.int32)
     o_t = tl.arange(0, MAX_CACHE_LEN)
     phys = (base + o_t) & (MAX_CACHE_LEN - 1)
     o_k = tl.arange(0, K)
@@ -782,6 +797,11 @@ def _finish_gdn_replayssm_circular_fold_kernel(
     MAX_CACHE_LEN: tl.constexpr,
     BLOCK: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
+    # Element strides between the replay rows of each cursor: 1 when the
+    # cursors are their own arrays, a whole entry when they sit in one.
+    STRIDE_WP: tl.constexpr = 1,
+    STRIDE_CB: tl.constexpr = 1,
+    STRIDE_FL: tl.constexpr = 1,
 ):
     offs = tl.arange(0, BLOCK)
     row_mask = offs < n_rows
@@ -796,17 +816,21 @@ def _finish_gdn_replayssm_circular_fold_kernel(
         other=0,
     ).to(tl.int64)
     valid = row_mask & (state_idx > NULL_BLOCK_ID)
-    do_fold = tl.load(is_flush + replay_idx, mask=valid, other=0) != 0
-    n_history = tl.load(write_pos + replay_idx, mask=valid, other=0).to(tl.int32)
-    base = tl.load(cache_base + replay_idx, mask=valid, other=0).to(tl.int32)
+    do_fold = tl.load(is_flush + replay_idx * STRIDE_FL, mask=valid, other=0) != 0
+    n_history = tl.load(write_pos + replay_idx * STRIDE_WP, mask=valid, other=0).to(
+        tl.int32
+    )
+    base = tl.load(cache_base + replay_idx * STRIDE_CB, mask=valid, other=0).to(
+        tl.int32
+    )
     mask = valid & do_fold
     tl.store(
-        cache_base + replay_idx,
+        cache_base + replay_idx * STRIDE_CB,
         (base + n_history) & (MAX_CACHE_LEN - 1),
         mask=mask,
     )
-    tl.store(write_pos + replay_idx, 0, mask=mask)
-    tl.store(is_flush + replay_idx, 0, mask=mask)
+    tl.store(write_pos + replay_idx * STRIDE_WP, 0, mask=mask)
+    tl.store(is_flush + replay_idx * STRIDE_FL, 0, mask=mask)
 
 
 @triton.jit
@@ -825,6 +849,11 @@ def _advance_gdn_spec_cursors_kernel(
     FOLD_EVERY_COMMIT: tl.constexpr,
     BLOCK: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
+    # Element strides between the replay rows of each cursor: 1 when the
+    # cursors are their own arrays, a whole entry when they sit in one.
+    STRIDE_WP: tl.constexpr = 1,
+    STRIDE_CB: tl.constexpr = 1,
+    STRIDE_FL: tl.constexpr = 1,
 ):
     offs = tl.arange(0, BLOCK)
     row_mask = offs < n_rows
@@ -835,9 +864,15 @@ def _advance_gdn_spec_cursors_kernel(
     ).to(tl.int64)
     valid = row_mask & (blk > NULL_BLOCK_ID)
 
-    write_pos = tl.load(write_pos_ptr + blk, mask=valid, other=0).to(tl.int32)
-    cache_base = tl.load(cache_base_ptr + blk, mask=valid, other=0).to(tl.int32)
-    is_flush_cur = tl.load(is_flush_ptr + blk, mask=valid, other=0).to(tl.int32)
+    write_pos = tl.load(write_pos_ptr + blk * STRIDE_WP, mask=valid, other=0).to(
+        tl.int32
+    )
+    cache_base = tl.load(cache_base_ptr + blk * STRIDE_CB, mask=valid, other=0).to(
+        tl.int32
+    )
+    is_flush_cur = tl.load(is_flush_ptr + blk * STRIDE_FL, mask=valid, other=0).to(
+        tl.int32
+    )
     num_acc = tl.load(num_accepted_ptr + offs * stride_na, mask=valid, other=0).to(
         tl.int32
     )
@@ -867,9 +902,9 @@ def _advance_gdn_spec_cursors_kernel(
     else:
         next_is_flush = ((new_wp + 2 * MAX_SPEC_LEN) > MAX_CACHE_LEN).to(tl.int8)
 
-    tl.store(write_pos_ptr + blk, new_wp, mask=valid)
-    tl.store(cache_base_ptr + blk, new_base, mask=valid)
-    tl.store(is_flush_ptr + blk, next_is_flush, mask=valid)
+    tl.store(write_pos_ptr + blk * STRIDE_WP, new_wp, mask=valid)
+    tl.store(cache_base_ptr + blk * STRIDE_CB, new_base, mask=valid)
+    tl.store(is_flush_ptr + blk * STRIDE_FL, next_is_flush, mask=valid)
 
 
 # ---------------------------------------------------------------------------
@@ -1001,6 +1036,9 @@ def _launch_gdn_spec(
         DOT_PRECISION=dot_precision,
         num_warps=num_warps,
         num_stages=num_stages,
+        STRIDE_WP=write_pos.stride(0),
+        STRIDE_CB=cache_base.stride(0),
+        STRIDE_FL=is_flush.stride(0),
     )
 
 
@@ -1062,6 +1100,9 @@ def _launch_gdn_exact_fold(
         NULL_BLOCK_ID=null_block_id,
         num_warps=1,
         num_stages=3,
+        STRIDE_WP=write_pos.stride(0),
+        STRIDE_CB=cache_base.stride(0),
+        STRIDE_FL=is_flush.stride(0),
     )
 
 
@@ -1263,6 +1304,9 @@ def commit_gdn_replayssm_spec(
         FOLD_EVERY_COMMIT=fold_every_commit,
         BLOCK=BLOCK,
         NULL_BLOCK_ID=null_block_id,
+        STRIDE_WP=write_pos.stride(0),
+        STRIDE_CB=cache_base.stride(0),
+        STRIDE_FL=is_flush.stride(0),
     )
 
 
@@ -1354,6 +1398,9 @@ def commit_gdn_replayssm_circular(
         HAS_RESIDUAL=has_residual,
         num_warps=4,
         num_stages=2,
+        STRIDE_WP=write_pos.stride(0),
+        STRIDE_CB=cache_base.stride(0),
+        STRIDE_FL=is_flush.stride(0),
     )
     block = triton.next_power_of_2(max(1, B))
     _finish_gdn_replayssm_circular_fold_kernel[(1,)](
@@ -1368,4 +1415,7 @@ def commit_gdn_replayssm_circular(
         MAX_CACHE_LEN=max_cache_len,
         BLOCK=block,
         NULL_BLOCK_ID=null_block_id,
+        STRIDE_WP=write_pos.stride(0),
+        STRIDE_CB=cache_base.stride(0),
+        STRIDE_FL=is_flush.stride(0),
     )
