@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from enum import Enum
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -860,14 +861,11 @@ def can_use_xpu_fp8_moe(
     except (RuntimeError, ValueError):
         pass
 
-    try:
-        import sgl_kernel
-
-        is_xe2 = getattr(sgl_kernel, "is_xe2_arch", None)
+    kernel = sys.modules.get("sgl_kernel")
+    if kernel is not None:
+        is_xe2 = getattr(kernel, "is_xe2_arch", None)
         if is_xe2 is not None and not is_xe2():
             return False
-    except Exception:
-        pass
 
     return True
 
