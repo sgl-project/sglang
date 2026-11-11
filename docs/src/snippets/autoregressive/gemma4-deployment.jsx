@@ -104,15 +104,15 @@ export const Gemma4Deployment = () => {
     xeon: {
       e2b: { tp: 1, mem: 0.9 },
       e4b: { tp: 1, mem: 0.9 },
-      '12b': { tp: 6, revision: '43c9d014b231474fa7212dbb48a762566c2b255d' },
+      '12b': { tp: 6, mem: 0.9 },
       '31b': { tp: 4, mem: 0.5 },
       '26b-a4b': { tp: 2, mem: 0.5 },
     },
   };
 
   const xeonQatConfigs = {
-    e2b: { tp: 4, revision: '6befbaca7398925921802abd1f277b495b78b738' },
-    e4b: { tp: 4, revision: '476025a01dbf99361c062bbeca3d6a76bb4c4566' },
+    e2b: { tp: 4, mem: 0.9 },
+    e4b: { tp: 4, mem: 0.9 },
   };
 
   const generateCommand = (values) => {
@@ -126,8 +126,8 @@ export const Gemma4Deployment = () => {
     const xeonQatConfig = xeonQatConfigs[modelSize];
     if (xeonQat && !xeonQatConfig) return '# Error: No validated Xeon QAT recipe for this model size';
     const xeonPreset = xeonQat ? xeonQatConfig :
-      (hardware === 'xeon' && hwConfig.revision ? hwConfig : null);
-    if (xeonPreset) tp = xeonPreset.tp;
+      (isXeonTextOnly(values) ? hwConfig : null);
+    if (xeonPreset) ({ tp, mem } = xeonPreset);
 
     const modelNames = {
       'e2b': 'google/gemma-4-E2B-it',
@@ -146,14 +146,9 @@ export const Gemma4Deployment = () => {
       tp = 2;
     }
 
-    let cmd = `sglang serve --model-path ${modelPath}`;
+    let cmd = `sglang serve ${hardware === 'xeon' ? '--model' : '--model-path'} ${modelPath}`;
     if (hardware === 'xeon') {
-      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
-      if (xeonPreset) {
-        cmd += ` \\\n  --revision ${xeonPreset.revision}`;
-        cmd += ` \\\n  --dtype bfloat16 \\\n  --max-total-tokens 8192`;
-        cmd = `SGLANG_USE_CPU_ENGINE=1 RAYON_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false OPENBLAS_NUM_THREADS=1 ${cmd}`;
-      }
+      cmd += ` \\\n  --device cpu`;
     }
     if (tp > 1) {
       cmd += ` \\\n  --tp ${tp}`;
@@ -188,8 +183,8 @@ export const Gemma4Deployment = () => {
       cmd += ` \\\n  --device xpu`;
     }
 
-    if (!xeonPreset) cmd += ` \\\n  --mem-fraction-static ${mem}`;
-    cmd += ` \\\n  --host 0.0.0.0 --port 30000`;
+    cmd += ` \\\n  --mem-fraction-static ${mem}`;
+    cmd += hardware === 'xeon' ? ` \\\n  --host 0.0.0.0` : ` \\\n  --host 0.0.0.0 --port 30000`;
 
     return cmd;
   };
@@ -397,6 +392,9 @@ export const Gemma4Deployment = () => {
 
   return (
     <div style={containerStyle} className="not-prose">
+      {values.hardware === 'xeon' && (
+        <p>Before serving on CPU, export <code>SGLANG_USE_CPU_ENGINE=1</code> in your shell.</p>
+      )}
       {Object.entries(options).map(([key, option]) => {
         if (option.condition && !option.condition(values)) {
           return null;

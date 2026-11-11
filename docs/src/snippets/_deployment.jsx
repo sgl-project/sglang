@@ -73,6 +73,8 @@
 //                      dockerMounts carry role-specific rendering metadata.
 //   cell.autoMambaRatio optional — false keeps calculator ratios out of a
 //                      fixed recipe (defaults to enabled).
+//   cell.omitDefaultServerAddress optional — omit the default loopback host
+//                      and port, while preserving custom server addresses.
 //   modelNames         HF slug lookup, `hw|variant|quant`, `variant|quant`,
 //                      `hw|quant`, `quant`, `hw`, then `default`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?, showWhen?(sel)}
@@ -831,7 +833,9 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     // Xeon's "nodes" selector sizes --tp-size, not a real multi-machine launch.
     const multinode = nnodes > 1 && sel.hw !== "xeon";
     const cellEnv = [...(cell.env || []), ...overlayEnv(sel)];
-    const flags = overlayCompose(cell.flags, sel);
+    const flags = overlayCompose(cell.flags, sel).filter((flag) =>
+      !cell.omitDefaultServerAddress ||
+      !["--host 127.0.0.1", "--port 30000"].includes(interpolate(flag, envValues, modelName)));
     if (multinode) {
       // Insert the multi-node trio after the last parallelism flag,
       // falling back to right after --model-path.
