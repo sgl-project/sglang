@@ -249,6 +249,9 @@ class SchedulePolicy:
         """The waiting requests in the order the policy admits them."""
         waiting_queue = list(waiting)
         policy = self._determine_active_policy(waiting_queue)
+        if self.policy == CacheAwarePolicy.UNIBOOST:
+            # Also on the long-queue FCFS fallback, so A(r) stays the first sighting.
+            self._stamp_uniboost_arrivals(waiting_queue, processed_tokens)
 
         # Cache-agnostic policies sort without matching; match anyway so the load
         # snapshot sees num_matched_prefix_tokens. Decode never prefills.
@@ -266,7 +269,7 @@ class SchedulePolicy:
                     waiting_queue, self.priority_sign
                 )
         elif policy == CacheAwarePolicy.UNIBOOST:
-            self._sort_by_uniboost(waiting_queue, processed_tokens)
+            self._sort_by_uniboost(waiting_queue)
         elif isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
@@ -345,10 +348,8 @@ class SchedulePolicy:
         for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
 
-    def _sort_by_uniboost(
-        self,
-        waiting_queue: List[Req],
-        processed_tokens: int,
+    def _stamp_uniboost_arrivals(
+        self, waiting_queue: List[Req], processed_tokens: int
     ) -> None:
         now_s = time.perf_counter()
         if self.uniboost_rate is not None:
@@ -356,6 +357,8 @@ class SchedulePolicy:
         uniboost.stamp_arrivals(
             waiting_queue, processed_tokens=processed_tokens, now_s=now_s
         )
+
+    def _sort_by_uniboost(self, waiting_queue: List[Req]) -> None:
         temporary_deprioritized = self._compute_prefix_matches(
             waiting_queue, CacheAwarePolicy.UNIBOOST
         )
@@ -399,6 +402,7 @@ class SchedulePolicy:
             in (
                 CacheAwarePolicy.LPM,
                 CacheAwarePolicy.HRRN,
+                CacheAwarePolicy.UNIBOOST,
             )
             and len(waiting_queue) > WAITING_QUEUE_PREFIX_MATCH_MAX
         ):
