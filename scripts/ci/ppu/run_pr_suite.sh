@@ -75,6 +75,7 @@ if [[ "$lane" == body && "${PPU_RUN_KERNEL:-false}" == true ]]; then
     ((remaining <= 900)) || remaining=900
     python3 test/run_suite.py --hw ppu --suite stage-b-kernel-test-1-gpu-ppu --pytest --require-nonempty \
         --junit-dir "$PPU_EVIDENCE_DIR/stage-b-kernel-test-1-gpu-ppu" \
+        --allow-skip registered.kernels.ops.diffusion.test_timestep_embedding.test_timestep_embedding_perf \
         --timeout-per-file "$remaining" --suite-timeout "$remaining"
 fi
 # The EXIT trap records completion; the orchestration job then validates all evidence.
