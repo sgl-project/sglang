@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.linear.kda_prefill_graph import (
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
+    PoolStaging,
     stage_pool_states,
     unstage_pool_states,
 )
@@ -1237,6 +1238,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         return (core_attn_out, z) if return_z else core_attn_out
 
+    def _prefill_state_staging(self) -> PoolStaging:
+        metadata = self.forward_metadata
+        if metadata.prefill_state_staging is None:
+            metadata.prefill_state_staging = PoolStaging.from_indices(
+                metadata.mamba_cache_indices
+            )
+        return metadata.prefill_state_staging
+
     def _convolve_prefill(
         self,
         layer: RadixLinearAttention,
@@ -1438,13 +1447,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
         )
         if needs_state_gather:
-            # Row 0 of the copies is the padding sink, as in the pool: the
-            # prefill kernels treat state index 0 as padding.
-            (
-                (conv_states_contig, ssm_states_contig),
-                state_cache_indices,
-                staged_pool_rows,
-            ) = stage_pool_states((conv_states, ssm_states), cache_indices)
+            staging = self._prefill_state_staging()
+            conv_states_contig, ssm_states_contig = stage_pool_states(
+                (conv_states, ssm_states), staging
+            )
+            state_cache_indices = staging.kernel_rows
         else:
             conv_states_contig = conv_states
             ssm_states_contig = ssm_states
@@ -1639,7 +1646,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 unstage_pool_states(
                     (conv_states, ssm_states),
                     (conv_states_contig, ssm_states_contig),
-                    staged_pool_rows,
+                    staging,
                 )
 
             if forward_metadata.has_mamba_track_mask:
