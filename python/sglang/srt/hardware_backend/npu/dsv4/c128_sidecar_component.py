@@ -541,7 +541,7 @@ class C128SidecarComponent(TreeComponent):
         heapq.heapify(heap)
         while tracker.get(ct, 0) < num_tokens and heap:
             _, node = heapq.heappop(heap)
-            if node not in tree.evictable_host_leaves or not tree._is_host_leaf(node):
+            if node not in tree.evictable_host_leaves:
                 continue
             first_free = len(host_frees.get(ct, ()))
             tree._evict_host_leaf(

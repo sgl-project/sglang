@@ -265,6 +265,7 @@ class TestC128HostEviction(CustomTestCase):
     def test_preserves_locked_nodes_and_prefers_non_session_leaves(self):
         locked = self._node()
         locked.component_data[C128].host_lock_ref = 1
+        self.tree.evictable_host_leaves.discard(locked)
         session = self._node()
         session.component_data[C128].session_ref = 1
         victim = self._node()
@@ -287,6 +288,7 @@ class TestC128HostEviction(CustomTestCase):
     def test_no_evictable_leaf_returns_without_reclaiming(self):
         locked = self._node()
         locked.component_data[ComponentType.FULL].lock_ref = 1
+        self.tree.evictable_host_leaves.discard(locked)
         self._evict(16)
         self.tree._evict_host_leaf.assert_not_called()
         self.assertEqual(self.tracker[C128], 0)
