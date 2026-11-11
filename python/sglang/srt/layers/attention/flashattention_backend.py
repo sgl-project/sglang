@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, NamedTuple, Optional
 
 import torch
 
@@ -106,6 +106,15 @@ def _should_disable_scheduler_metadata_precompute() -> bool:
     return bool(get_parallel().enable_prefill_cp or get_parallel().attn_dp_enabled)
 
 
+class FlashAttentionKernels(NamedTuple):
+    """Kernels ``FlashAttentionBackend`` calls, with the arguments of
+    ``flash_attn_varlen_func`` and ``flash_attn_with_kvcache`` in
+    ``sglang.kernels.ops.attention.flash_attention_v3``."""
+
+    varlen_func: Callable
+    with_kvcache_func: Callable
+
+
 @dataclass
 class FlashAttentionMetadata:
     """Metadata to be init once in the model forward pass,
@@ -201,7 +210,14 @@ class FlashAttentionBackend(AttentionBackend):
         topk=0,
         speculative_num_steps=0,
         fa_impl_ver=3,
+        kernels: Optional[FlashAttentionKernels] = None,
     ):
+        """
+        Args:
+            fa_impl_ver: The FA version whose metadata layout the backend builds.
+            kernels: Kernels to run instead of the FA build of ``fa_impl_ver``,
+                e.g. a custom paged attention kernel; they get every layer's call.
+        """
         super().__init__()
 
         assert not (
@@ -348,7 +364,13 @@ class FlashAttentionBackend(AttentionBackend):
                 f"the fa3 backend runs head_dim {model_head_dim} layers on FA4. "
                 "Use a BF16 or fp8_e4m3 KV cache."
             )
-        self._init_flash_attention_functions(device_capability)
+        if kernels is None:
+            self._init_flash_attention_functions(device_capability)
+        else:
+            # The FA3 scheduler metadata and FA4 runtime policy are the FA builds'.
+            self._get_scheduler_metadata = None
+            self._get_fa_runtime_policy = None
+            self._fa_kernels = {3: tuple(kernels), 4: tuple(kernels)}
 
         # Store head info for precomputing FA3 scheduler metadata
         self.head_dim = model_runner.model_config.head_dim
