@@ -63,6 +63,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_ZMQ_EVENTS = envs.SGLANG_OPT_SCHEDULER_ZMQ_EVENTS.get()
+
+
+def _zmq_readable(sock) -> bool:
+    # Not a zmq socket (a scripted test proxy): let recv decide.
+    if not isinstance(sock, zmq.Socket):
+        return True
+    return bool(sock.get(zmq.EVENTS) & zmq.POLLIN)
+
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
@@ -146,23 +155,25 @@ class SchedulerRequestReceiver:
                     )
                     return recv_reqs
 
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                if not _ZMQ_EVENTS or _zmq_readable(self.recv_from_tokenizer):
+                    while True:
+                        try:
+                            if self.recv_limit_reached(len(recv_reqs)):
+                                break
+                            recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
+                        except zmq.ZMQError:
                             break
-                        recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_req)
+                        recv_reqs.append(recv_req)
 
-                while True:
-                    try:
-                        if self.recv_limit_reached(len(recv_reqs)):
+                if not _ZMQ_EVENTS or _zmq_readable(self.recv_from_rpc):
+                    while True:
+                        try:
+                            if self.recv_limit_reached(len(recv_reqs)):
+                                break
+                            recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
+                        except zmq.ZMQError:
                             break
-                        recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
+                        recv_reqs.append(recv_rpc)
             else:
                 recv_reqs = None
         else:

@@ -320,6 +320,11 @@ class Envs:
     SGLANG_OPT_MAMBA_HOST_ONLY_CONCURRENT_FETCH = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Scheduler request poll: recv from a zmq socket only when ZMQ_EVENTS says a message
+    # is waiting, instead of a NOBLOCK recv that raises on an empty socket.
+    SGLANG_OPT_SCHEDULER_ZMQ_EVENTS = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

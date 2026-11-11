@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+import zmq
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -17,6 +18,9 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.io_struct import (  # noqa: E402
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+)
+from sglang.srt.managers.scheduler_components import (  # noqa: E402
+    request_receiver,
 )
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
@@ -151,6 +155,41 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
             parallel.tp_group.cpu_group,
             src=parallel.tp_group.ranks[0],
         )
+
+
+class TestRequestReceiverZmqReadiness(unittest.TestCase):
+    def setUp(self):
+        self.context = zmq.Context()
+        self.tokenizer = self.context.socket(zmq.PAIR)
+        self.peer = self.context.socket(zmq.PAIR)
+        self.tokenizer.bind("inproc://receiver-readiness")
+        self.peer.connect("inproc://receiver-readiness")
+        self.addCleanup(self.context.term)
+        self.addCleanup(self.tokenizer.close)
+        self.addCleanup(self.peer.close)
+
+    def test_readable_follows_pending_input(self):
+        self.assertFalse(request_receiver._zmq_readable(self.tokenizer))
+        self.peer.send(b"req")
+        self.assertTrue(self.tokenizer.poll(1000, zmq.POLLIN))
+        self.assertTrue(request_receiver._zmq_readable(self.tokenizer))
+        self.assertTrue(request_receiver._zmq_readable(object()))
+
+    def test_idle_poll_skips_recv_only_when_enabled(self):
+        receiver = _make_receiver()
+        object.__setattr__(receiver, "recv_from_tokenizer", self.tokenizer)
+        object.__setattr__(receiver, "recv_from_rpc", self.peer)
+        parallel = SimpleNamespace(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0)
+        for enabled, recv_calls in ((True, 0), (False, 2)):
+            with (
+                patch.object(request_receiver, "_ZMQ_EVENTS", enabled),
+                patch.object(request_receiver, "get_parallel", return_value=parallel),
+                patch.object(
+                    request_receiver, "sock_recv", side_effect=zmq.Again
+                ) as recv,
+            ):
+                self.assertEqual(receiver._pull_raw_reqs(), [])
+                self.assertEqual(recv.call_count, recv_calls)
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
