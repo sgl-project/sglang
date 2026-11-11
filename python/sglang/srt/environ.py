@@ -396,6 +396,12 @@ class Envs:
     SGLANG_OPT_CUDA_GRAPH_FIELD_COPY_PLAN = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # CudaGraphBufferRegistry.fill_from replays a per-shape plan (which slots reset their
+    # padding, each copy slot's destination view, the post-fill hooks) instead of walking
+    # and slicing every slot on each call.
+    SGLANG_OPT_CUDA_GRAPH_FILL_PLAN = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

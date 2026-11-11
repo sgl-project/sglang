@@ -1595,5 +1595,69 @@ class TestComputedSlots(unittest.TestCase):
         )
 
 
+class _WithFillPlan:
+    """Rerun a fill_from test class with SGLANG_OPT_CUDA_GRAPH_FILL_PLAN on."""
+
+    def setUp(self):
+        from sglang.srt.model_executor import cuda_graph_buffer_registry as registry
+
+        patcher = patch.object(registry, "_FILL_PLAN", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
+
+
+class TestFillFromAndExtractWithPlan(_WithFillPlan, TestFillFromAndExtract):
+    pass
+
+
+class TestMissingAndOptionalSlotsWithPlan(_WithFillPlan, TestMissingAndOptionalSlots):
+    pass
+
+
+class TestPostFillHookWithPlan(_WithFillPlan, TestPostFillHook):
+    pass
+
+
+class TestSliceFnSlotWithPlan(_WithFillPlan, TestSliceFnSlot):
+    pass
+
+
+class TestSourceFnSlotsWithPlan(_WithFillPlan, TestSourceFnSlots):
+    pass
+
+
+class TestFillPlanCache(_WithFillPlan, unittest.TestCase):
+    def test_plan_is_kept_per_shape_and_dropped_on_registration(self):
+        r = TestFillFromAndExtract._build_registry(self)
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            input_ids=torch.arange(2),
+            req_pool_indices=torch.arange(2),
+            seq_lens=torch.arange(2, dtype=torch.int32),
+            out_cache_loc=torch.arange(2),
+            positions=torch.arange(2),
+            seq_lens_cpu=torch.arange(2, dtype=torch.int32),
+        )
+        shape = dict(raw_bs=2, padded_bs=4, raw_num_tokens=2, padded_num_tokens=8)
+        r.fill_from(fb, **shape)
+        r.fill_from(fb, **shape)
+        self.assertEqual(len(r._fill_plans), 1)
+        r.fill_from(fb, **{**shape, "padded_bs": 2, "padded_num_tokens": 2})
+        self.assertEqual(len(r._fill_plans), 2)
+        r.get_slot("positions").enabled = False
+        r.fill_from(fb, **shape)
+        self.assertEqual(len(r._fill_plans), 3)
+        r.register_slot(
+            GraphSlot(
+                name="extra",
+                shape_fn=lambda bs, mt: (bs,),
+                dtype=torch.int32,
+                axis="bs",
+            )
+        )
+        self.assertEqual(r._fill_plans, {})
+
+
 if __name__ == "__main__":
     unittest.main()
