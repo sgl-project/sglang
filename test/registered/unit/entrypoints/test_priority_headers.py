@@ -210,7 +210,7 @@ class TestPriorityHeaders(CustomTestCase):
                     self._assert_priority(path, expected, headers)
 
     def test_invalid_rfc_urgency_is_ignored(self):
-        """RFC9218 requires ignoring invalid types/ranges, not bool-to-int coercion."""
+        """Invalid RFC dictionaries/types/ranges fall back without failing requests."""
         invalid = [
             "u=?1",
             "u=?0",
@@ -232,6 +232,7 @@ class TestPriorityHeaders(CustomTestCase):
             'u=1, x="unterminated',
             "u=1, =bad",
             "u=1, x=(1",
+            "u=1, x=@",
             "u=1;bad=",
             "u=1, x=:!:",
         ]
