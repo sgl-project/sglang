@@ -168,9 +168,10 @@ class _FakeReq:
         return len(self.origin_input_ids) + len(self.output_ids)
 
 
-class TestForwardBatchPrefillCompletion(unittest.TestCase):
-    def test_first_commit_or_zero_token_completion_keeps_gate_open(self):
-        runner = types.SimpleNamespace(
+class TestForwardBatchPrefillCompletion(CustomTestCase):
+    @staticmethod
+    def _make_runner():
+        return types.SimpleNamespace(
             device="cpu",
             is_draft_worker=False,
             model_config=types.SimpleNamespace(
@@ -183,6 +184,63 @@ class TestForwardBatchPrefillCompletion(unittest.TestCase):
             attn_backend=MagicMock(),
             attn_tp_sequence_sharded=lambda _: False,
         )
+
+    def test_mixed_boundary_uses_request_identity_only_on_mlu(self):
+        """One-token prefills stay prefill; other platforms leave MLU metadata unset."""
+        runner = self._make_runner()
+        for mlu_available, mode, expected in (
+            (True, ForwardMode.MIXED, 1),
+            (False, ForwardMode.MIXED, None),
+            (True, ForwardMode.EXTEND, None),
+        ):
+            with self.subTest(mlu_available=mlu_available, mode=mode):
+                reqs = [
+                    Req(rid, "", array("q", range(3)), SamplingParams())
+                    for rid in ("incoming", "running")
+                ]
+                for req in reqs:
+                    req.refresh_fill_ids()
+                    req.extend_end = 3
+                seq_lens = torch.tensor([3, 3])
+                batch = ScheduleBatch(
+                    reqs=reqs,
+                    decoding_reqs=reqs[1:] if mode.is_mixed() else None,
+                    device="cpu",
+                    model_config=types.SimpleNamespace(
+                        is_encoder_decoder=False, is_matryoshka=False
+                    ),
+                    spec_algorithm=SpeculativeAlgorithm.NONE,
+                    forward_mode=mode,
+                    input_ids=torch.zeros(2, dtype=torch.int64),
+                    req_pool_indices=torch.arange(2),
+                    req_pool_indices_cpu=torch.arange(2),
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=seq_lens,
+                    seq_lens_sum=6,
+                    orig_seq_lens=seq_lens.clone(),
+                    out_cache_loc=torch.arange(2),
+                    prefix_lens=[2, 2],
+                    extend_lens=[1, 1],
+                    extend_num_tokens=2,
+                    extend_logprob_start_lens=[0, 0],
+                )
+                with (
+                    get_context().override_server_args(device="cpu"),
+                    patch(
+                        "sglang.srt.model_executor.forward_batch_info.is_mlu",
+                        return_value=mlu_available,
+                    ),
+                ):
+                    forward = ForwardBatch.init_new(
+                        batch,
+                        runner,
+                        capture_hidden_mode=CaptureHiddenMode.NULL,
+                        return_hidden_states_before_norm=False,
+                    )
+                self.assertEqual(forward.mixed_prefill_reqs, expected)
+
+    def test_first_commit_or_zero_token_completion_keeps_gate_open(self):
+        runner = self._make_runner()
         for algorithm, (output_len, end, mixed, zero_tokens, completing) in product(
             (
                 SpeculativeAlgorithm.NONE,

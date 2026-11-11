@@ -107,6 +107,15 @@ def resolve_decode_backend(
             enable_memory_saver=enable_memory_saver,
         )
 
+    if current_platform.is_mlu() and backend_name == Backend.BREAKABLE:
+        from sglang.srt.hardware_backend.mlu.graph import BreakableMluGraphBackend
+
+        return BreakableMluGraphBackend(
+            cuda_graph_runner,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            debug_eager=get_exec().graph.debug_cuda_graph,
+        )
+
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(
             cuda_graph_runner,
@@ -121,7 +130,7 @@ def resolve_decode_backend(
         raise ValueError(f"Unsupported decode graph backend: {backend_name}")
 
     full_backend_cls = None
-    if current_platform.is_out_of_tree():
+    if current_platform.is_out_of_tree() or current_platform.is_mlu():
         full_backend_cls = current_platform.get_full_graph_backend_cls()
 
     if full_backend_cls is None:
@@ -141,6 +150,9 @@ def resolve_prefill_backend(
     cfg = get_exec().graph.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.BREAKABLE
 
+    if current_platform.is_mlu() and backend_name != Backend.BREAKABLE:
+        raise ValueError("MLU prefill graph requires the breakable backend.")
+
     if model_runner.device == "xpu" and backend_name == Backend.FULL:
         from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
             FullXPUGraphBackend,
@@ -150,6 +162,15 @@ def resolve_prefill_backend(
             cuda_graph_runner,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             reuse_output_buffer=True,
+        )
+
+    if current_platform.is_mlu() and backend_name == Backend.BREAKABLE:
+        from sglang.srt.hardware_backend.mlu.graph import BreakableMluGraphBackend
+
+        return BreakableMluGraphBackend(
+            cuda_graph_runner,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            debug_eager=get_exec().graph.debug_cuda_graph,
         )
 
     if backend_name == Backend.BREAKABLE:
