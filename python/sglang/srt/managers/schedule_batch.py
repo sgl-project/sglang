@@ -160,6 +160,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
+    from sglang.srt.managers.scheduler_components.request_list import ReqList
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
     )
@@ -429,6 +430,9 @@ class ReqKvInfo:
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
+    # The scheduler list holding the request; `ReqList` keeps it.
+    owner_list: Optional[ReqList] = None
+
     def __init__(
         self,
         rid: str,
@@ -633,10 +637,6 @@ class Req(ReqDllmMixin):
         # time and used to estimate uncached tokens / sort by longest prefix for
         # load reporting.
         self.num_matched_prefix_tokens = 0
-        # Uncached tokens seen by the last prefix match, kept while the request
-        # waits so --pp-min-chunked-prefill-size does not re-match it every
-        # step. None until matched; reset on retraction.
-        self.pp_uncached_hint: Optional[int] = None
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         self.storage_hit_start: Optional[int] = None
@@ -1513,7 +1513,6 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
-        self.pp_uncached_hint = None
         self.lock = None
         self.swa_branching_seqlen = None
         self.extend_end = None

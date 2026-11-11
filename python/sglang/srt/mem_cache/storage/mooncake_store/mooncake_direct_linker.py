@@ -52,6 +52,9 @@ def _storage_suffix(
     return "_".join(parts)
 
 
+_LEASE_RENEW_ATTEMPTS = 4
+
+
 def _shared_pool_suffix(
     *,
     tp_shared: bool,
@@ -63,11 +66,7 @@ def _shared_pool_suffix(
     dcp_rank: int,
 ) -> str:
     """Key suffix for a pool whose pages are byte-identical across attention TP.
-
-    Dropping the TP axis makes one object serve every attention-TP rank, so
-    the store holds one copy instead of one per rank. The dropped axis adds its
-    own namespace term so a shared object can never alias an older per-rank one.
-    """
+    The versioned shared term keeps it from aliasing an older per-rank object."""
     parts = ["tpshared_v1" if tp_shared else f"tp{tp_rank}"]
     if dcp_sharded:
         parts.append(f"dcp{dcp_size}r{dcp_rank}")
@@ -87,15 +86,8 @@ def _storage_sharing(
     dcp_size: int,
     dcp_rank: int,
 ):
-    """Per-pool key suffixes and the pools this rank offloads.
-
-    A pool replicated across attention TP is written by attention-TP rank 0
-    only; every rank still reads it, with its own indices, under the shared key.
-    A rank-replicated group has no sharded pool, so its group-level suffix
-    already drops the tp term and nothing is overridden here.
-    A DCP-sharded pool is written by the first DCP block of the TP group,
-    one object per DCP rank.
-    """
+    """Per-pool key suffixes and the pools this rank offloads. A pool replicated
+    across attention TP is written by TP rank 0 (or the first DCP block) only."""
     dcp_sharded = {name for name, pool in pools.items() if pool.dcp_sharded}
     tp_shared = {
         name
@@ -200,8 +192,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
-        # An MLA-family pool holds identical pages on every attention-TP rank.
-        # KDA state stays in its own rank namespace.
         self.storage.pool_suffixes, self.offload_pools, tp_shared = _storage_sharing(
             self.pools,
             rank_replicated=rank_replicated,
@@ -210,13 +200,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             attn_cp_rank=params.attn_cp_rank,
             pp_rank=params.pp_rank,
             offload_owner=self.offload_owner,
-            dcp_size=parallel.attn_dcp_size,
-            dcp_rank=parallel.attn_dcp_rank,
+            dcp_size=get_parallel().attn_dcp_size,
+            dcp_rank=get_parallel().attn_dcp_rank,
         )
         logger.info(
             "Mooncake direct linker storage topology: "
             "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s, "
-            "tp_shared=%s, offload_pools=%s, pool_suffixes=%s",
+            "tp_shared=%s, offload_pools=%s",
             rank_replicated,
             tp_rank,
             tp_size,
@@ -224,7 +214,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             storage_suffix,
             sorted(tp_shared),
             sorted(self.offload_pools),
-            dict(sorted(self.storage.pool_suffixes.items())),
         )
 
         self.register_buffers()
@@ -482,47 +471,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             finally:
                 self.load_queue.task_done()
 
-    def _get_layer_ranges(self, keys, ptrs, sizes, offsets):
-        store = self.storage.store
-        result = store.batch_get_into_multi_buffer_ranges(keys, ptrs, sizes, offsets)
-        if result is None or isinstance(result, int):
-            return result
-        result = list(result)
-        if len(result) != len(keys):
-            return result
-        expected = [sum(item) for item in sizes]
-        # Mooncake ErrorCode::LEASE_EXPIRED. Session leases can expire between
-        # layers of a long prefix. The synchronous read has drained its writers;
-        # reacquire only those immutable content-addressed objects and retry
-        # their current layer once. Other failures still abort the request.
-        expired = [i for i, value in enumerate(result) if value == -707]
-        if not expired or any(
-            value not in (want, -707) for value, want in zip(result, expected)
-        ):
-            return result
-        expired_keys = [keys[i] for i in expired]
-        renewed = list(store.batch_get_session_start(expired_keys))
-        if renewed != [0] * len(expired_keys):
-            raise RuntimeError(
-                f"Mooncake get session renewal failed: keys={len(expired_keys)}, "
-                f"result_sample={renewed[:8]}"
-            )
-        retried = store.batch_get_into_multi_buffer_ranges(
-            expired_keys,
-            [ptrs[i] for i in expired],
-            [sizes[i] for i in expired],
-            [offsets[i] for i in expired],
-        )
-        if retried is None or isinstance(retried, int):
-            return retried
-        retried = list(retried)
-        if len(retried) != len(expired):
-            raise RuntimeError("Mooncake renewed range get returned wrong result count")
-        for index, value in zip(expired, retried):
-            result[index] = value
-        logger.debug("Refreshed Mooncake read leases for %d objects", len(expired))
-        return result
-
     def load_layer_wise(
         self,
         counter_index: int,
@@ -680,6 +628,52 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 sizes[start : start + step],
                 offsets[start : start + step],
             )
+
+    def _get_layer_ranges(self, keys, ptrs, sizes, offsets):
+        store = self.storage.store
+        result = store.batch_get_into_multi_buffer_ranges(keys, ptrs, sizes, offsets)
+        if result is None or isinstance(result, int):
+            return result
+        result = list(result)
+        if len(result) != len(keys):
+            return result
+        expected = [sum(item) for item in sizes]
+        # A long load can outlive its read leases: the first read of a lapsed key
+        # reports -707, later reads -600. A renewal can race reads still in flight
+        # on the old lease, so renew and retry a few times with backoff.
+        for attempt in range(_LEASE_RENEW_ATTEMPTS):
+            expired = [
+                i
+                for i, (value, want) in enumerate(zip(result, expected))
+                if value != want
+            ]
+            if not expired or any(result[i] not in (-707, -600) for i in expired):
+                return result
+            if attempt:
+                time.sleep(0.05 * 2 ** (attempt - 1))
+            lapsed = list(dict.fromkeys(keys[i] for i in expired))
+            renewed = list(store.batch_get_session_start(lapsed))
+            if renewed != [0] * len(lapsed):
+                raise RuntimeError(
+                    f"Mooncake get session renewal failed: keys={len(lapsed)}, "
+                    f"result_sample={renewed[:8]}"
+                )
+            retried = store.batch_get_into_multi_buffer_ranges(
+                [keys[i] for i in expired],
+                [ptrs[i] for i in expired],
+                [sizes[i] for i in expired],
+                [offsets[i] for i in expired],
+            )
+            if retried is None or isinstance(retried, int):
+                return retried
+            retried = list(retried)
+            if len(retried) != len(expired):
+                raise RuntimeError(
+                    "Mooncake renewed range get returned wrong result count"
+                )
+            for index, value in zip(expired, retried):
+                result[index] = value
+        return result
 
     def _range_get(self, name: PoolName, keys, ptrs, sizes, offsets) -> None:
         result = self._get_layer_ranges(keys, ptrs, sizes, offsets)

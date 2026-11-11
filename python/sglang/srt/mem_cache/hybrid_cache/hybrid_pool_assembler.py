@@ -1719,7 +1719,6 @@ def _build_mha_mla_host_pool(
         end_layer=pool.end_layer,
         target_layer_num=pool.layer_num,
         override_kv_cache_dim=pool.kv_cache_dim,
-        # Only the MLA host pool translates at the transfer boundary.
         dcp_size=dcp_size,
         dcp_rank=dcp_rank,
         write_back_staging=pool.hicache_write_back_staging,

@@ -579,6 +579,9 @@ class Envs:
     # Argmax every draft row, sampling requests included, accepted as a one-hot
     # draft: no step logits kept, lower acceptance at high temperatures.
     SGLANG_DSPARK_USE_GREEDY_DRAFT = EnvBool(False)
+    # Ragged verify takes its confidences from the online acceptance estimator even
+    # when the draft checkpoint has a confidence head.
+    SGLANG_DSPARK_USE_ONLINE_ESTIMATOR = EnvBool(False)
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
     SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
@@ -946,6 +949,8 @@ class Envs:
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    SGLANG_ENABLE_NIXL_KV_PACKING = EnvBool(False)
+    SGLANG_NIXL_KV_PACK_BUFFER_SIZE_MB = EnvInt(64)
     # Queue incoming KV scatters between forwards; disabled by default.
     SGLANG_PLB_SCATTER_DEFER = EnvBool(False)
     # Decode stream priority relative to background KV scatters.
@@ -1235,9 +1240,14 @@ class Envs:
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
-    # Select the AITER MLA kernel for decode, "asm" or "gluon".
+    # Select the AITER MLA kernel for decode: "asm" (aiter.mla.mla_decode_fwd),
+    # "gluon" (aiter mla_gluon where prefer_mla_gluon_decode holds, else ASM) or
+    # "triton" (aiter.ops.triton.attention.mla.mla_decode_fwd, not sglang's
+    # --decode-attention-backend triton; gfx1250 with bf16 activations, no DCP
+    # and qk_rope_head_dim > 0, else startup raises). "auto" is "triton" there,
+    # else "asm". Explicit values are honored as-is.
     SGLANG_AITER_MLA_DECODE_BACKEND = EnvStrWithAlias(
-        "asm", deprecated_name="SGLANG_AITER_MLA_DCP_DECODE_BACKEND"
+        "auto", deprecated_name="SGLANG_AITER_MLA_DCP_DECODE_BACKEND"
     )
     # Select the AITER MLA kernel for target verify, "asm" or "gluon".
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
@@ -1252,11 +1262,6 @@ class Envs:
     # target-verify kept running the norm+RoPE as separate kernels. Set to 0 to
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
-    # DSPARK: run the target lm_head projection (verify logits) in fp8 via
-    # torch._scaled_mm (per-token activation scale + per-output-channel weight
-    # scale, weight quantized once and cached). Halves the per-step head GEMM;
-    # off by default. Only engages for a floating-point (non-quantized) head.
-    SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD = EnvBool(False)
     # Pooled prefill-logits budget of the HIP FP4 indexer, in MiB.
     SGLANG_DSV4_FP4_LOGITS_BUDGET_MB = EnvInt(2048)
     # Split-K for HCA streams in the HIP unified-KV paged decode; 0 keeps the heuristic.
@@ -1406,7 +1411,6 @@ class Envs:
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
     SGLANG_OPT_SM120_NVFP4_PHASE_LAYOUT = EnvBool(False)
-    SGLANG_OPT_SM120_MTP_ROUTER_TOP22 = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
@@ -1897,13 +1901,6 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
-    # Total seconds to download one media URL (redirects and body included).
-    # Falls back to the legacy REQUEST_TIMEOUT when only that is set.
-    SGLANG_MEDIA_URL_TIMEOUT = EnvFloat(
-        lambda: float(os.getenv("REQUEST_TIMEOUT", "5"))
-    )
-    # Whether client media may name local files (paths or file:// URLs).
-    SGLANG_MEDIA_ALLOW_LOCAL_FILES = EnvBool(True)
 
     # ===================================================================
     # Unlimited-OCR v2
@@ -2709,6 +2706,9 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         note="Strategy-based prefill context parallelism is now the only generic implementation."
     ),
     "SGLANG_TRACE_QWEN35_FINAL_NORM": _DeprecatedEnv(),
+    "SGLANG_OPT_SM120_MTP_ROUTER_TOP22": _DeprecatedEnv(
+        note="The default MoE router is faster for this shape."
+    ),
     "SGLANG_DSPARK_FAST_SAMPLING": _DeprecatedEnv(
         note="DSpark draft sampling always uses Gumbel-max."
     ),
@@ -2741,6 +2741,9 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     ),
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": _DeprecatedEnv(
         note="Please use '--prefill-delayer-token-usage-low-watermark' instead."
+    ),
+    "SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD": _DeprecatedEnv(
+        note="Please use '--speculative-dspark-lm-head-dtype fp8' instead."
     ),
     "SGLANG_USE_SGL_XPU": _DeprecatedEnv(
         note="Intel XPU always uses the sgl-kernel MoE kernels; pass "

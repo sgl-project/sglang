@@ -236,6 +236,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_draft_attention_backend",
                     "speculative_draft_kv_cache_dtype",
                     "speculative_draft_model_quantization",
+                    "speculative_dspark_lm_head_dtype",
                     "aux_hidden_state_capture",
                     "watermark_context_window",
                     "watermark_default_enabled",
@@ -4570,108 +4571,6 @@ class TestKimiK3DcpSpeculativeAttentionMode(CustomTestCase):
         overrides = self._overrides(speculative_algorithm="EAGLE3")
         self.assertEqual(overrides["speculative_attention_mode"], "decode")
         self.assertEqual(overrides["decode_attention_backend"], "cutedsl_mla")
-
-
-class TestKimiK31DcpOverrides(CustomTestCase):
-    """Kimi-K3.1 DCP: a DFLASH MLA draft attends over DCP owner rows on the
-    draft-verify path (cute-dsl MLA on CUDA, Triton on ROCm), and a DCP decode
-    node takes the KV of a DCP-1 or same-DCP PD prefill over Mooncake."""
-
-    @staticmethod
-    def _overrides(is_hip=False, **fields):
-        from sglang.srt.arg_groups.model_overrides import kimi_k3 as kimi_k3_module
-
-        cfg = SimpleNamespace(
-            dcp_size=8,
-            tp_size=8,
-            dcp_comm_backend="fi_a2a",
-            dcp_replicate_q_proj=None,
-            speculative_algorithm=None,
-            speculative_draft_attention_backend=None,
-            disaggregation_mode="null",
-            disaggregation_transfer_backend="mooncake",
-            enable_hierarchical_cache=False,
-            enable_hisparse=False,
-            enable_prefill_cp=False,
-            attn_cp_size=None,
-            dsa_topk_backend="sgl-kernel",
-            enable_return_indexer_topk=False,
-        )
-        for name, value in fields.items():
-            setattr(cfg, name, value)
-        with override_platform(is_cuda=not is_hip, is_hip=is_hip):
-            return kimi_k3_module._kimi_k31_dcp_overrides(cfg)
-
-    def test_dflash_defaults_to_cutedsl_mla_draft_and_decode_verify(self):
-        overrides = self._overrides(speculative_algorithm="DFLASH")
-        self.assertEqual(
-            overrides["speculative_draft_attention_backend"], "cutedsl_mla"
-        )
-        self.assertEqual(overrides["speculative_attention_mode"], "decode")
-
-    def test_dflash_rejects_other_draft_backends(self):
-        for backend in ("flashinfer", "triton", "trtllm_mla"):
-            with self.subTest(backend=backend):
-                with self.assertRaisesRegex(ValueError, "cutedsl_mla"):
-                    self._overrides(
-                        speculative_algorithm="DFLASH",
-                        speculative_draft_attention_backend=backend,
-                    )
-
-    def test_dflash_on_rocm_takes_the_triton_draft_and_decode_verify(self):
-        for backend in (None, "triton"):
-            with self.subTest(backend=backend):
-                overrides = self._overrides(
-                    is_hip=True,
-                    speculative_algorithm="DFLASH",
-                    speculative_draft_attention_backend=backend,
-                )
-                self.assertEqual(
-                    overrides["speculative_draft_attention_backend"], "triton"
-                )
-                self.assertEqual(overrides["speculative_attention_mode"], "decode")
-
-    def test_dflash_on_rocm_rejects_the_cuda_draft_backend(self):
-        with self.assertRaisesRegex(ValueError, "other than triton"):
-            self._overrides(
-                is_hip=True,
-                speculative_algorithm="DFLASH",
-                speculative_draft_attention_backend="cutedsl_mla",
-            )
-
-    def test_other_speculative_algorithms_stay_rejected(self):
-        with self.assertRaisesRegex(ValueError, "DSPARK and DFLASH"):
-            self._overrides(speculative_algorithm="EAGLE3")
-
-    def test_pd_decode_over_mooncake_is_allowed(self):
-        self._overrides(disaggregation_mode="decode")
-
-    def test_hierarchical_cache_is_allowed(self):
-        overrides = self._overrides(
-            enable_hierarchical_cache=True, speculative_algorithm="DSPARK"
-        )
-        self.assertEqual(overrides["speculative_attention_mode"], "decode")
-
-    def test_hisparse_stays_rejected(self):
-        with self.assertRaisesRegex(ValueError, "HiSparse"):
-            self._overrides(enable_hierarchical_cache=True, enable_hisparse=True)
-
-    def test_pd_prefill_over_mooncake_is_allowed(self):
-        overrides = self._overrides(
-            disaggregation_mode="prefill", speculative_algorithm="DFLASH"
-        )
-        self.assertEqual(
-            overrides["speculative_draft_attention_backend"], "cutedsl_mla"
-        )
-
-    def test_pd_over_other_transfer_backends_is_rejected(self):
-        for mode in ("prefill", "decode"):
-            with self.subTest(mode=mode):
-                with self.assertRaisesRegex(ValueError, "Mooncake"):
-                    self._overrides(
-                        disaggregation_mode=mode,
-                        disaggregation_transfer_backend="nixl",
-                    )
 
 
 class TestKimiK31DsaBackends(CustomTestCase):

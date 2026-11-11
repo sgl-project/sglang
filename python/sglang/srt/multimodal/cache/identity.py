@@ -145,8 +145,9 @@ def _read_media_bytes(media: str | bytes) -> bytes:
     if media.startswith(("http://", "https://", "data:")):
         return get_image_bytes(media)
     # ``load_image`` accepts relative local paths only by image extension.
-    # Match that contract instead of probing arbitrary base64 as a filename.
-    if media.lower().endswith(image_extension_names) and Path(media).is_file():
+    # Match that contract instead of probing arbitrary base64 as a filename;
+    # base64 has no ".", so it never takes this branch.
+    if media.lower().endswith(image_extension_names):
         return read_local_media_file(media)
     return get_image_bytes(media)
 
@@ -168,15 +169,17 @@ def snapshot_media(media: Any) -> MediaSnapshot:
             media = media["image"]
 
     if isinstance(media, (str, bytes)):
-        from sglang.srt.multimodal.media_io import CLIENT_MEDIA_EXCEPTIONS
+        from sglang.srt.multimodal.media_io import (
+            CLIENT_MEDIA_EXCEPTIONS,
+            shorten_media_source,
+        )
 
         try:
             payload = _read_media_bytes(media)
-        except CLIENT_MEDIA_EXCEPTIONS + (OSError,) as e:
-            source = str(media)
-            if len(source) > 100:
-                source = source[:100] + "..."
-            raise ValueError(f"Could not load media {source}: {e}") from e
+        except CLIENT_MEDIA_EXCEPTIONS as e:
+            raise ValueError(
+                f"Could not load media {shorten_media_source(str(media))}: {e}"
+            ) from e
         return MediaSnapshot(payload, _digest_bytes(payload), len(payload), "bytes")
     if isinstance(media, Image.Image):
         return _snapshot_pil(media)

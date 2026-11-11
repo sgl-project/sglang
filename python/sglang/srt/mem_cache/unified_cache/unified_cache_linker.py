@@ -338,17 +338,6 @@ class UnifiedCacheLinkerWrapper:
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
 
-    def _lookup_transfers(self, hashes: list[str]) -> list[PoolTransfer]:
-        transfers = []
-        for component in self._components:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOOKUP, None, hashes
-            )
-            if transfer is None:
-                return []
-            transfers.append(transfer)
-        return transfers
-
     @property
     def layer_done_counter(self) -> object:
         return self.cache_linker.layer_done_counter
@@ -373,9 +362,17 @@ class UnifiedCacheLinkerWrapper:
         if not tail_hashes:
             return result
 
-        lookup_transfers = self._lookup_transfers(tail_hashes)
-        if not lookup_transfers:
-            return result
+        lookup_transfers = []
+        for component in self._components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.LOOKUP, None, tail_hashes
+            )
+            if transfer is None:
+                return result
+            lookup_transfers.append(transfer)
+        by_pool = {transfer.name: transfer for transfer in lookup_transfers}
+
+        # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         hit_pages = self._sync_restorable_prefix(
             self.cache_linker.lookup(req.rid, lookup_transfers),
             num_pages=len(tail_hashes),
@@ -383,7 +380,6 @@ class UnifiedCacheLinkerWrapper:
         )
         if hit_pages == 0:
             return result
-        by_pool = {transfer.name: transfer for transfer in lookup_transfers}
         hit_tokens = hit_pages * page
 
         # Mamba keeps a single state slot per node, so a hit is worth one slot.

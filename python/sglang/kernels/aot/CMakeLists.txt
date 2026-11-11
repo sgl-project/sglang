@@ -64,14 +64,6 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-fmt)
 
-# Triton kernel
-FetchContent_Declare(
-    repo-triton
-    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.8.0.tar.gz
-    URL_HASH SHA256=d50981f98bf61a5ce21d2a0c6ac067c20b7f741acf3bee4b8370edc3b63fd337
-)
-FetchContent_Populate(repo-triton)
-
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
@@ -531,9 +523,3 @@ target_include_directories(infllm_ops PRIVATE
 find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" REQUIRED)
 target_link_libraries(infllm_ops PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} c10 cuda)
 install(TARGETS infllm_ops LIBRARY DESTINATION "sgl_kernel")
-
-# ============================ Extra Install: triton kernels ============================= #
-install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
-        DESTINATION "triton_kernels"
-        PATTERN ".git*" EXCLUDE
-        PATTERN "__pycache__" EXCLUDE)

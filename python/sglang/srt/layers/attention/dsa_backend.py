@@ -757,7 +757,6 @@ class DeepseekSparseAttnBackend(
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.num_q_heads = self.local_num_q_heads * sharded_dcp_size
-        # sizes the trtllm multi-CTA counters, so it covers the padded heads
         self.num_dcp_q_heads = _trtllm_padded_heads(
             self.local_num_q_heads * self.attn_dcp_size
         )
@@ -1261,8 +1260,6 @@ class DeepseekSparseAttnBackend(
             and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
         )
         if forward_mode.is_target_verify() and self.dsa_shards_index_k:
-            # DCP: each verify row scores this rank's share of its causal length,
-            # laid out [B, next_n] for DG-native (one index-K read per request).
             lens = _to_2d_context_lens(seqlens_expanded, batch_size)
             if dg_native_verify and lens.numel() == batch_size * next_n:
                 lens = lens.view(batch_size, next_n)
@@ -2692,8 +2689,6 @@ class DeepseekSparseAttnBackend(
             self.dsa_shards_index_k
             and not forward_batch.forward_mode.is_target_verify()
         ):
-            # Prefill attends over the gathered KV; target verify, like decode,
-            # attends over this rank's shard and returns a partial for the merge.
             kv_cache = self.dcp_gather_kv_cache(kv_cache, forward_batch, metadata)
 
         if q_rope is not None:
@@ -4525,19 +4520,13 @@ class DeepseekSparseAttnBackend(
 
         # The BF16 no-RoPE path passes a zero-width q_rope tensor.
         merge_query = q_rope is not None and self.qk_rope_head_dim > 0
-        # Kimi-K3.1 sharded DCP: decode / target verify attend over this rank's
-        # KV and return a partial for the merge; prefill attends over the
-        # gathered KV.
         sharded_dcp = self.dsa_shards_index_k
         dcp_partial = sharded_dcp and (
             not is_prefill or forward_batch.forward_mode.is_target_verify()
         )
         replicated_dcp = self.attn_dcp_size > 1 and not sharded_dcp
         if (dcp_partial or replicated_dcp) and get_in_autotune_dummy_run():
-            # Like dense MLA, skip attention only when this warmup discards its
-            # output. FlashInfer's nested tuning expands synthetic batches past
-            # our workspace-bounded chunks, overflowing the full-head DCP slab.
-            # Real requests, graph capture, and gathered-KV prefill still attend.
+            # Discarded warmup: nested FlashInfer tuning overflows the DCP slab.
             return (
                 torch.zeros(
                     (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),

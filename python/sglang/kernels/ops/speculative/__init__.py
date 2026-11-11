@@ -38,6 +38,9 @@ _TRITON_KERNELS = [
     ("lilicorr", "lilicorr_sample_path"),
     ("reject_sampling", "chain_speculative_sampling_triton"),
     ("target_only_sampling", "tree_speculative_sampling_target_only_triton"),
+    ("acceptance_estimator", "predict_acceptance"),
+    ("acceptance_estimator", "accumulate_acceptance_counts"),
+    ("acceptance_estimator", "refit_acceptance"),
     ("reconstruct_tree", "reconstruct_indices_from_tree_mask_triton"),
     ("reconstruct_tree", "reconstruct_indices_from_tree_mask_func"),
 ]
