@@ -95,6 +95,51 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         queue._resolve_pending_reqs.assert_called_once()
 
+    def test_incompatible_prefill_fails_its_requests_but_keeps_other_peers(self):
+        bad_addr, good_addr = "127.0.0.1:11500", "127.0.0.1:11600"
+        reason = "PD state entry mismatch: prefill has no draft SWA"
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._ensure_retry_interval = 0
+        queue._ensure_retry_count = {bad_addr: 2}
+        queue._ensure_last_attempt_time = {}
+        queue.kv_manager = MagicMock()
+        queue.kv_manager.try_ensure_parallel_info.side_effect = [
+            RuntimeError(reason),
+            True,
+        ]
+        waiting = [
+            SimpleNamespace(
+                req=SimpleNamespace(bootstrap_room=room),
+                kv_receiver=MagicMock(),
+                awaiting_prefill_dp_rank=True,
+            )
+            for room in [7, 8]
+        ]
+        good_reqs = [object()]
+
+        ready = queue._ensure_prefill_info({bad_addr: waiting, good_addr: good_reqs})
+
+        self.assertEqual(ready, {good_addr: good_reqs})
+        self.assertEqual(queue._ensure_retry_count, {})
+        self.assertEqual(queue._ensure_last_attempt_time, {})
+        for entry in waiting:
+            entry.kv_receiver.abort.assert_called_once()
+            self.assertFalse(entry.awaiting_prefill_dp_rank)
+            queue.kv_manager.record_failure.assert_any_call(
+                entry.req.bootstrap_room,
+                f"Incompatible prefill server {bad_addr}: {reason}",
+            )
+
+    def test_prefill_info_programming_errors_still_propagate(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue._ensure_retry_interval = 0
+        queue._ensure_last_attempt_time = {}
+        queue.kv_manager = MagicMock()
+        queue.kv_manager.try_ensure_parallel_info.side_effect = ValueError("bad value")
+
+        with self.assertRaisesRegex(ValueError, "bad value"):
+            queue._ensure_prefill_info({"127.0.0.1:11500": []})
+
     def test_prefetches_prefill_dp_rank_query(self):
         addr = "127.0.0.1:11500"
         executor = MagicMock()

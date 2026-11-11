@@ -1503,7 +1503,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             self._ensure_last_attempt_time[bootstrap_addr] = now
 
-            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
+            try:
+                ready_info = self.kv_manager.try_ensure_parallel_info(bootstrap_addr)
+            except RuntimeError as exc:
+                # Peer layout checks reject this handshake, not the scheduler.
+                error_msg = f"Incompatible prefill server {bootstrap_addr}: {exc}"
+                logger.error(error_msg)
+                for decode_req in reqs:
+                    decode_req.awaiting_prefill_dp_rank = False
+                    decode_req.kv_receiver.abort()
+                    # abort() records a generic reason; retain the layout error
+                    # for the normal failed-handshake response and cleanup.
+                    self.kv_manager.record_failure(
+                        decode_req.req.bootstrap_room, error_msg
+                    )
+                self._ensure_retry_count.pop(bootstrap_addr, None)
+                self._ensure_last_attempt_time.pop(bootstrap_addr, None)
+                continue
+
+            if ready_info:
                 if bootstrap_addr in self._ensure_retry_count:
                     del self._ensure_retry_count[bootstrap_addr]
                 if bootstrap_addr in self._ensure_last_attempt_time:
