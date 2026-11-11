@@ -95,7 +95,7 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
-from sglang.srt.utils import is_cpu, use_intel_amx_backend
+from sglang.srt.utils import is_cpu, is_hip, use_intel_amx_backend
 from sglang.srt.utils.device import get_device_capability, is_cuda
 
 _is_cpu = is_cpu()
@@ -1152,7 +1152,7 @@ class MuseSpark1xModel(nn.Module):
                     or moe_layers[0].expert_hidden_size % 256
                     or comm.max_push_size < moe_layers[0].expert_hidden_size * 2
                     or not 0
-                    < comm._push_counter.numel()
+                    < comm.config.num_push_blocks
                     <= torch.cuda.get_device_properties(
                         comm.device
                     ).multi_processor_count
@@ -1647,6 +1647,13 @@ class MuseSparkTextForCausalLM(nn.Module):
                 and not self.int4_checkpoint
             ):
                 module.experts.prepare_trtllm_weights(module.experts.post_expert_norm)
+
+
+# Preserve the CUDA implementation and its FlashInfer/JIT optimizations.
+# The independently validated MI355 implementation keeps the fused boundaries,
+# Quark loader, and kernel rounding points that were measured together.
+if is_hip():
+    from sglang.srt.rocm_muse_spark.model import MuseSparkTextForCausalLM
 
 
 __all__ = [

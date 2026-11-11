@@ -561,5 +561,10 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_max_page_tokens",
     "enable_fp4_indexer",
     "paged_experts_enable_disk",
+    "disable_normalize_embedding",
+    "log_schedule_decisions",
+    "speculative_dspark_lm_head_dtype",
+    "media_url_timeout",
+    "allow_local_media_files",
 )
 # fmt: on

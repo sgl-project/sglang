@@ -20,6 +20,7 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.request_list import move
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -93,7 +94,7 @@ def test_response_is_filtered_until_completion_and_released_once():
 
 
 @pytest.mark.parametrize(
-    "invalid", ["unfinished", "sent", "duplicate", "prefill", "decode"]
+    "invalid", ["unfinished", "sent", "duplicate", "listed", "prefill", "decode"]
 )
 def test_defer_response_rejects_invalid_ownership(invalid):
     scheduler, req = _scheduler(), _req("request")
@@ -104,6 +105,8 @@ def test_defer_response_rejects_invalid_ownership(invalid):
     elif invalid == "duplicate":
         scheduler.defer_response(req, Future())
         req = _req(req.rid)
+    elif invalid == "listed":
+        move([req], scheduler.running_reqs)
     else:
         scheduler.disaggregation_mode = DisaggregationMode(invalid)
         scheduler.init_deferred_responses()
@@ -213,7 +216,6 @@ def test_held_responses_do_not_change_idle_state():
     scheduler.last_batch = None
     scheduler.running_batch = SimpleNamespace(is_empty=lambda: True)
     scheduler.result_queue = deque()
-    scheduler.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
     scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
     scheduler.enable_hierarchical_cache = False
     scheduler.enable_lmcache = False

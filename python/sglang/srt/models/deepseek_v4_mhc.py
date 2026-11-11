@@ -471,9 +471,28 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
 # ---------------------------------------------------------------------------
 
 
+_deferred_attn_fork: Optional[torch.cuda.Stream] = None
+
+
+def defer_attn_stats_fork(stats_stream: torch.cuda.Stream) -> None:
+    """Hold the attention mix's fork until the attention core starts (its idle SMs),
+    instead of beside the full-grid projection GEMMs."""
+    global _deferred_attn_fork
+    assert _deferred_attn_fork is None
+    _deferred_attn_fork = stats_stream
+
+
+def run_deferred_attn_stats_fork() -> None:
+    global _deferred_attn_fork
+    if _deferred_attn_fork is not None:
+        fork_stats_stream(_deferred_attn_fork)
+        _deferred_attn_fork = None
+
+
 def fork_stats_stream(stats_stream: Optional[torch.cuda.Stream]) -> None:
-    """Let the side stream pick up from here; the layers call it right before
-    each combine (fork position measured indistinguishable across batch sizes)."""
+    """Let the side stream pick up from here; reads call it right before the
+    combine, except MegaAttention attention reads, which defer it to the core
+    (``defer_attn_stats_fork``)."""
     if stats_stream is not None:
         stats_stream.wait_stream(torch.cuda.current_stream())
 
@@ -674,6 +693,7 @@ def _compute_triplet(
 ) -> HcTriplet:
     """Issue the triplet (on the side stream, beside the sublayer) and join before
     the post reads it."""
+    run_deferred_attn_stats_fork()
     if precomputed is not None:
         return precomputed
     coefficients = mix_stats(hc, residual, stats_stream)
@@ -762,6 +782,9 @@ def _post_fusion(
         and _can_use_decode_post_combine(cfg, y.shape[0])
     ):
         quant = next.accepts_mxfp8
+        moe_input = None
+        if not quant and next.mega_moe_input is not None:
+            moe_input = next.mega_moe_input(y)
         updated, normalized, q, sf = mhc_post_combine_norm_decode(
             y,
             residual,
@@ -771,11 +794,14 @@ def _post_fusion(
             next.norm.weight,
             next.norm.variance_epsilon,
             quant=quant,
+            moe_input=None if moe_input is None else moe_input.views(),
         )
         if quant:
             return HcState(
                 updated, pre, HcQuantized(normalized, Mxfp8SwizzledInput(q, sf))
             )
+        if moe_input is not None:
+            moe_input.mark(normalized)
         return HcState(updated, pre, HcNormed(normalized))
     if (
         next is not None
