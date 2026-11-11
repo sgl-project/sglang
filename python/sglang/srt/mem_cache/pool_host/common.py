@@ -32,6 +32,13 @@ _is_hip = is_hip()
 _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
 _HOST_LOCKED_RANGE_ATTR = "_sglang_host_locked_range"
 
+# cudaErrorHostMemoryAlreadyRegistered. Registering an already-pinned range
+# returns this error instead of succeeding; it also lingers in the thread's
+# CUDA error slot (torch's cudart binding exposes no cudaGetLastError to
+# clear it) and later surfaces at an unrelated CUDA call as a confusing
+# failure (e.g. torch.empty failing with "operation not supported").
+_CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED = 712
+
 
 class HostTensorAllocator:
     def __init__(self):
@@ -208,6 +215,12 @@ def _cuda_host_register(
     buffer: torch.Tensor, registration_granularity_bytes: int | None = None
 ) -> None:
     # Avoid oversized cudaHostRegister calls on large host pools.
+    if getattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, None):
+        # This buffer was already registered by a previous call. Re-issuing
+        # cudaHostRegister on the same ranges fails with
+        # cudaErrorHostMemoryAlreadyRegistered, so treat registration as
+        # idempotent and keep the ranges recorded by the first call.
+        return
     cudart = torch.cuda.cudart()
     base = buffer.data_ptr()
     total = buffer.numel() * buffer.element_size()
@@ -241,12 +254,21 @@ def _cuda_host_register(
             )
         chunk_bytes = (chunk_limit_bytes // alignment_bytes) * alignment_bytes
     registered_ranges: list[tuple[int, int]] = []
+    already_registered_ranges: list[tuple[int, int]] = []
     try:
         offset = 0
         while offset < total:
             size = min(chunk_bytes, total - offset)
             ptr = base + offset
             rc = int(cudart.cudaHostRegister(ptr, size, 0))
+            if rc == _CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED:
+                # The range is already pinned by another owner of the same
+                # mapped memory (e.g. a background pre-registration path).
+                # It is not ours to unregister, so do not record it in the
+                # buffer's managed ranges.
+                already_registered_ranges.append((ptr, size))
+                offset += size
+                continue
             if rc != 0:
                 raise RuntimeError(
                     f"cudaHostRegister failed (rc={rc}, "
@@ -256,6 +278,15 @@ def _cuda_host_register(
                 )
             registered_ranges.append((ptr, size))
             offset += size
+
+        if already_registered_ranges:
+            logger.warning(
+                "cudaHostRegister: %d of %d chunk(s) of this buffer were already "
+                "registered by another owner and were skipped; they will not be "
+                "unregistered together with this buffer",
+                len(already_registered_ranges),
+                len(already_registered_ranges) + len(registered_ranges),
+            )
 
         # Keep the exact registration bases alive with the tensor. CUDA requires
         # cudaHostUnregister to receive each base pointer, not just the tensor's
