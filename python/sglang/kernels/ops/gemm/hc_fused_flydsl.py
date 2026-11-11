@@ -62,6 +62,23 @@ def _bucket_rows(m):
 
 HC_FUSED_ROW_BUCKETS = tuple(sorted({_bucket_rows(m) for m in range(1, _MAX_ROWS + 1)}))
 
+# Calling a JitFunction re-traces it to MLIR on every call, which costs far more than the
+# kernels outside CUDA graphs; dispatch a CompiledFunction per Constexpr set instead.
+_compiled = {}
+
+
+def _dispatch(launcher, constexprs, *args):
+    key = (launcher, constexprs)
+    compiled = _compiled.get(key)
+    if compiled is not None:
+        compiled(*args)
+        return
+    # flyc.compile also runs the launch. Tensor layouts stay dynamic, so one compile
+    # serves every row count that shares these Constexprs.
+    compiled = flyc.compile(launcher, *args)
+    if compiled is not None:
+        _compiled[key] = compiled
+
 
 def _load(tensor, offset, width, dtype):
     """Buffer load of `width` elements at `offset`; OOB reads return zero."""
@@ -455,9 +472,10 @@ def hc_fused_mix(h, weights: HcFusedWeights, sumsq=None):
                 f"got {sumsq.dtype} {list(sumsq.shape)}"
             )
         np_, ss_out = sumsq.shape[1] // _HC, False
-    _launch(
-        h, weights.down, weights.up, weights.w1, p, sumsq, t, g, sc, out,
-        mb, k, weights.rp, weights.r, weights.ni, _SPLIT_K, np_, ss_out, weights.eps,
+    constexprs = (mb, k, weights.rp, weights.r, weights.ni, _SPLIT_K, np_, ss_out, weights.eps)
+    _dispatch(
+        _launch, constexprs,
+        h, weights.down, weights.up, weights.w1, p, sumsq, t, g, sc, out, *constexprs,
         torch.cuda.current_stream(dev),
     )  # fmt: skip
     return out[:m], (g[:m] if weights.ni else None)
@@ -537,9 +555,11 @@ def hc_apply_inject(h, y, g):
     mb = _bucket_rows(m)
     out = torch.empty((mb, k), device=h.device, dtype=h.dtype)
     ss = torch.empty((mb, k // _INJECT_BLOCK), device=h.device, dtype=torch.float32)
-    _launch_inject(
-        h, y, g, out, ss, mb, k, g.shape[1], torch.cuda.current_stream(h.device)
-    )
+    constexprs = (mb, k, g.shape[1])
+    _dispatch(
+        _launch_inject, constexprs,
+        h, y, g, out, ss, *constexprs, torch.cuda.current_stream(h.device),
+    )  # fmt: skip
     return out[:m], ss[:m]
 
 
