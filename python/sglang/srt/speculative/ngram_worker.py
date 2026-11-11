@@ -2,6 +2,7 @@ import logging
 
 import numpy as np
 import torch
+
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
 )

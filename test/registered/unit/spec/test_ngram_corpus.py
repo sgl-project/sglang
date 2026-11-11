@@ -5,6 +5,7 @@ import unittest
 import uuid
 
 import numpy as np
+
 from sglang.srt.speculative.cpp_ngram.external_corpus import (
     iter_external_corpus_chunks,
 )

@@ -98,12 +98,12 @@ class Trie {
   // Recompute all cached anchors from the current tail. After this, for every
   // d in [1, min(len, max_trie_depth)], anchors[d - 1] represents the suffix of
   // length d ending at context[len - 1].
-  void rebuildMatchState_(
-      const int32_t* context, size_t len, MatchState& state, size_t total_len, uint64_t ns_key) const;
+  void
+  rebuildMatchState_(const int32_t* context, size_t len, MatchState& state, size_t total_len, uint64_t ns_key) const;
   // Advance the cached anchors by consuming the newly appended suffix one
   // token at a time, without re-walking all suffixes from root.
-  bool advanceMatchState_(
-      MatchState& state, const int32_t* tokens, size_t len, size_t total_len, uint64_t ns_key) const;
+  bool
+  advanceMatchState_(MatchState& state, const int32_t* tokens, size_t len, size_t total_len, uint64_t ns_key) const;
   // Namespace 0 is root_. Any other key is a pinned root that is not on the
   // global LRU, so isolation is preserved when leaves are evicted.
   TrieNode* mutableEffectiveRoot(uint64_t ns_key);

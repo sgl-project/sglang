@@ -2,6 +2,7 @@ import logging
 from collections.abc import Iterable, Sequence
 
 import numpy as np
+
 from sglang.kernels.ops.speculative.ngram_corpus import get_ngram_corpus_cls
 
 logger = logging.getLogger(__name__)

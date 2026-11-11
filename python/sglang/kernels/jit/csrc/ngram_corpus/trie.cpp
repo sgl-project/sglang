@@ -153,7 +153,8 @@ bool Trie::validateMatchState_(const MatchState& state) const {
   return true;
 }
 
-void Trie::rebuildMatchState_(const int32_t* context, size_t len, MatchState& state, size_t total_len, uint64_t ns_key) const {
+void Trie::rebuildMatchState_(
+    const int32_t* context, size_t len, MatchState& state, size_t total_len, uint64_t ns_key) const {
   const auto max_match_depth = std::min(len, param_.max_trie_depth);
   state.trie_epoch = trie_epoch_;
   state.ns_key = ns_key;
@@ -182,7 +183,8 @@ void Trie::rebuildMatchState_(const int32_t* context, size_t len, MatchState& st
   }
 }
 
-bool Trie::advanceMatchState_(MatchState& state, const int32_t* tokens, size_t len, size_t total_len, uint64_t ns_key) const {
+bool Trie::advanceMatchState_(
+    MatchState& state, const int32_t* tokens, size_t len, size_t total_len, uint64_t ns_key) const {
   if (!validateMatchState_(state) || state.ns_key != ns_key) {
     return false;
   }
@@ -247,8 +249,7 @@ Trie::match(const int32_t* context, size_t len, MatchState& state, size_t total_
   const bool can_advance = state.trie_epoch == trie_epoch_ && state.ns_key == ns_key && has_forward_progress &&
                            appended_len <= len && state.anchors.size() == expected_prev_depth;
 
-  if (can_advance &&
-      advanceMatchState_(state, context + len - appended_len, appended_len, total_len, ns_key)) {
+  if (can_advance && advanceMatchState_(state, context + len - appended_len, appended_len, total_len, ns_key)) {
     return getExpandableAnchors_(state);
   }
 
