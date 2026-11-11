@@ -218,8 +218,9 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             self.add_stage(InputValidationStage())
         if release_metadata is not None:
             self.add_stage(MiniMaxH3PartitionAdmissionStage(release_metadata))
-        if not self.is_video_pipeline:
-            visual = self.get_module("text_encoder").model.visual
+        text_encoder = self.get_module("text_encoder")
+        visual = getattr(getattr(text_encoder, "model", None), "visual", None)
+        if not self.is_video_pipeline and visual is not None:
             # CPU initialization computes pow differently from CUDA. Image
             # releases rebuild the small vision frequency table after offload
             # transfers so conditioning matches the GPU-resident encoder, as in
