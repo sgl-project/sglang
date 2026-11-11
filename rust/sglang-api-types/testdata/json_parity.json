@@ -648,6 +648,12 @@
         "hicache_write_policy": ""
       },
       "canonical": "{\"hicache_storage_backend\":\"file\",\"hicache_storage_backend_extra_config_json\":\"\",\"hicache_storage_prefetch_policy\":\"\",\"hicache_write_policy\":\"\"}"
+    },
+    {
+      "type": "PauseGenerationRequest",
+      "name": "mode defaults to abort as in Python",
+      "input": {},
+      "canonical": "{\"mode\":\"abort\"}"
     }
   ]
 }

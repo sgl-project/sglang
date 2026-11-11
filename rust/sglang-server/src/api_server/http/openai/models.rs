@@ -25,6 +25,7 @@ async fn available_models(State(state): State<Arc<AppState>>) -> Response {
     let models: Vec<_> = state
         .core
         .list_models()
+        .await
         .into_iter()
         .map(model_card)
         .collect();
@@ -35,6 +36,7 @@ async fn retrieve_model(State(state): State<Arc<AppState>>, Path(model): Path<St
     let Some(card) = state
         .core
         .list_models()
+        .await
         .into_iter()
         .find(|card| card.id == model)
     else {

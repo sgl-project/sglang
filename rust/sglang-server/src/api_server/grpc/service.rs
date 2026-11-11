@@ -107,6 +107,8 @@ fn response_timeout(secs: u64) -> Duration {
     Duration::from_secs(secs)
 }
 
+impl GrpcService {}
+
 #[tonic::async_trait]
 impl SglangService for GrpcService {
     type GenerateStream = ResponseStream<api::GenerateStreamItem>;
@@ -180,7 +182,7 @@ impl SglangService for GrpcService {
         &self,
         _request: Request<api::GetModelInfoRequest>,
     ) -> Result<Response<api::GetModelInfoResponse>, Status> {
-        info::model_info(self.core.model_info())
+        info::model_info(self.core.model_info().await)
             .map(Response::new)
             .map_err(Status::internal)
     }
@@ -193,6 +195,46 @@ impl SglangService for GrpcService {
         info::server_info(server_info)
             .map(Response::new)
             .map_err(Status::internal)
+    }
+
+    async fn freeze_gc(
+        &self,
+        _request: Request<api::FreezeGcRequest>,
+    ) -> Result<Response<api::FreezeGcResponse>, Status> {
+        self.core
+            .freeze_gc_all()
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::FreezeGcResponse {}))
+    }
+
+    async fn pause_generation(
+        &self,
+        request: Request<api::PauseGenerationRequest>,
+    ) -> Result<Response<api::GenerationPauseResponse>, Status> {
+        let mode = request.into_inner().mode.unwrap_or_else(|| "abort".into());
+        self.core
+            .pause_generation(&mode)
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::GenerationPauseResponse {
+            message: "Generation paused successfully.".into(),
+            status: "ok".into(),
+        }))
+    }
+
+    async fn continue_generation(
+        &self,
+        request: Request<api::ContinueGenerationRequest>,
+    ) -> Result<Response<api::GenerationPauseResponse>, Status> {
+        self.core
+            .continue_generation(request.into_inner().torch_empty_cache.unwrap_or(true))
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::GenerationPauseResponse {
+            message: "Generation continued successfully.".into(),
+            status: "ok".into(),
+        }))
     }
 
     async fn get_hi_cache_storage(
@@ -243,7 +285,7 @@ impl SglangService for GrpcService {
         _request: Request<api::ListModelsRequest>,
     ) -> Result<Response<api::ListModelsResponse>, Status> {
         Ok(Response::new(api::ListModelsResponse {
-            models: self.core.list_models(),
+            models: self.core.list_models().await,
         }))
     }
 
@@ -284,6 +326,9 @@ impl SglangService for GrpcService {
             ),
         }))
     }
+
+    // The OpenAI interface: the schema is in place for the adapter
+    // refactor; the gRPC methods answer UNIMPLEMENTED until it lands.
 }
 
 /// `--grpc-port` refuses `--admin-api-key` at startup, so a gRPC server never

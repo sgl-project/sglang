@@ -112,6 +112,7 @@ def _build_server_args(
         "max_prefill_tokens": get_schedule().max_prefill_tokens,
         "enable_dp_attention": get_parallel().attn_dp_size > 1,
         "speculative_algorithm": get_spec().speculative_algorithm,
+        "gc_threshold": get_device().gc_threshold,
         "enable_hierarchical_cache": get_memory().enable_hierarchical_cache,
         "hicache_ratio": get_memory().hicache_ratio,
         "hicache_size": get_memory().hicache_size,

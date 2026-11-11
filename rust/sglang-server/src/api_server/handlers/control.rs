@@ -9,19 +9,20 @@ use crate::message::ids::Rid;
 use tokio::sync::oneshot;
 
 use crate::message::io_struct::{
-    AbortReq, CheckWeightsReqInput, ControlRequest, FlushCacheReqInput, FreezeGCReq,
-    ProfileOptions, ProfileReq,
+    AbortReq, CheckWeightsReqInput, ContinueGenerationReqInput, ControlRequest, FlushCacheReqInput,
+    FreezeGCReq, PauseGenerationReqInput, ProfileOptions, ProfileReq,
 };
 use crate::message::request::RequestKind;
 use crate::message::response::ResponseItem;
 use crate::message::types::ForwardedControlReq;
+use crate::utils::environ;
 
+use super::frontend_state::RelayedEffect;
 use super::generate::AbortEnding;
 use super::handle::{CoreHandle, translate_runtime_error};
 use crate::api_server::core::CoreError;
 use crate::api_server::core::fanout::{self, RankReply, RequestBuilder};
 use crate::tokenizer_manager::wiring::TmEvent;
-use crate::utils::environ;
 
 /// One relayed abort, connect to reply: the client was answered already,
 /// and a peer that has not answered by then is logged as missed.
@@ -70,6 +71,117 @@ impl CoreHandle {
         Ok(FlushCacheOutcome { success, message })
     }
 
+    /// Start a profiler capture on every DP rank. Fills the defaults Python's
+    /// `TokenizerManager.start_profile` fills: `with_stack` and `record_shapes`
+    /// are on unless the client or the env flag says no, and a missing
+    /// `profile_id` is the current time. Succeeds only if every rank did.
+    pub(crate) async fn start_profile(
+        &self,
+        options: ProfileOptions,
+    ) -> Result<ProfileOutcome, CoreError> {
+        // Python's `str(time.time())`: seconds since the epoch, fractional.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or_default();
+        let options = resolve_start_profile(options, environ::get_bool_env_var, now);
+        self.profile(&|| {
+            ControlRequest::ProfileReq(ProfileReq::start(Rid::new().to_string(), options.clone()))
+        })
+        .await
+    }
+
+    /// Stop the profiler capture on every DP rank; succeeds only if every rank did.
+    pub(crate) async fn stop_profile(&self) -> Result<ProfileOutcome, CoreError> {
+        self.profile(&|| ControlRequest::ProfileReq(ProfileReq::stop(Rid::new().to_string())))
+            .await
+    }
+
+    async fn profile(&self, build: &RequestBuilder<'_>) -> Result<ProfileOutcome, CoreError> {
+        let outcomes = self
+            .control(build)
+            .await
+            .decode::<ProfileOutcome>("profile")?;
+        let (success, message) = fanout::merge_status(
+            outcomes
+                .iter()
+                .map(|outcome| (outcome.success, outcome.message.as_str())),
+        );
+        Ok(ProfileOutcome { success, message })
+    }
+
+    /// `/freeze_gc`: freeze the Python garbage collector on every DP rank's
+    /// scheduler with the launch's `--gc-threshold`, and wait for each ack.
+    /// The frontend itself has no GC to freeze.
+    pub(crate) async fn freeze_gc_all(&self) -> Result<(), CoreError> {
+        let gc_threshold = self.inner.metadata.deployment_info.gc_threshold.clone();
+        self.ack("freeze-gc", &|| {
+            ControlRequest::FreezeGCReq(FreezeGCReq::new(
+                Rid::new().to_string(),
+                gc_threshold.clone(),
+            ))
+        })
+        .await
+    }
+
+    /// Pause generation, as Python's `TokenizerManager.pause_generation`: this
+    /// listener stops admitting generates first, then `in_place` / `retract`
+    /// reach every scheduler (and, through the relay, every other listener's
+    /// flag), while `abort` is frontend-only: cancel what is in flight and
+    /// wait for it to drain.
+    pub(crate) async fn pause_generation(&self, mode: &str) -> Result<(), CoreError> {
+        if !matches!(mode, "abort" | "in_place" | "retract") {
+            return Err(CoreError::InvalidArgument(format!(
+                "mode must be one of abort, in_place, retract; got {mode:?}"
+            )));
+        }
+        if mode == "abort" && !self.inner.peer_endpoints.is_empty() {
+            // Python's abort mode never reaches a scheduler, so there is no
+            // message to relay the pause to the other listeners with.
+            return Err(CoreError::InvalidArgument(
+                "pause_generation mode 'abort' is not supported across DP ranks; use in_place or retract".into(),
+            ));
+        }
+        self.inner.frontend.set_paused(true);
+        if mode == "abort" {
+            loop {
+                self.abort(None, AbortEnding::CancelledError);
+                if self.inner.generations.is_empty() {
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        self.ack("pause-generation", &|| {
+            ControlRequest::PauseGenerationReqInput(PauseGenerationReqInput::new(
+                Rid::new().to_string(),
+                mode.to_owned(),
+            ))
+        })
+        .await
+    }
+
+    /// Resume generation on every DP rank and admit generates again.
+    pub(crate) async fn continue_generation(
+        &self,
+        torch_empty_cache: bool,
+    ) -> Result<(), CoreError> {
+        self.inner.frontend.set_paused(false);
+        self.ack("continue-generation", &|| {
+            ControlRequest::ContinueGenerationReqInput(ContinueGenerationReqInput::new(
+                Rid::new().to_string(),
+                torch_empty_cache,
+            ))
+        })
+        .await
+    }
+
+    /// A control operation whose scheduler output carries no fields: done
+    /// once every rank acknowledged.
+    async fn ack(&self, what: &str, build: &RequestBuilder<'_>) -> Result<(), CoreError> {
+        self.control(build).await.decode::<Ack>(what).map(|_| ())
+    }
+
     /// Run the weight checker on every DP rank; merge as Python's `check_weights` does.
     pub(crate) async fn check_weights(
         &self,
@@ -108,44 +220,14 @@ impl CoreHandle {
         })
     }
 
-    /// Start profiling on every DP rank's scheduler (each broadcasts to its
-    /// TP ranks), resolving `options` as Python's
-    /// `TokenizerManager.start_profile` does (see [`resolve_start_profile`]).
-    pub(crate) async fn start_profile(
-        &self,
-        options: ProfileOptions,
-    ) -> Result<ProfileOutcome, CoreError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        let options = resolve_start_profile(options, environ::get_bool_env_var, now);
-        self.profile(&|| ProfileReq::start(Rid::new().to_string(), options.clone()))
-            .await
+    /// Whether `/pause_generation` holds this listener (Python's `is_pause`).
+    pub(crate) fn is_paused(&self) -> bool {
+        self.inner.frontend.is_paused()
     }
 
-    /// Stop profiling on every DP rank and write their traces.
-    pub(crate) async fn stop_profile(&self) -> Result<ProfileOutcome, CoreError> {
-        self.profile(&|| ProfileReq::stop(Rid::new().to_string()))
-            .await
-    }
-
-    /// Fan one `ProfileReq` out to every rank; succeeds only if all ranks did
-    /// (a refusal — already profiling, nothing to stop — carries its reason).
-    async fn profile(
-        &self,
-        build: &(dyn Fn() -> ProfileReq + Sync),
-    ) -> Result<ProfileOutcome, CoreError> {
-        let outcomes = self
-            .control(&|| ControlRequest::ProfileReq(build()))
-            .await
-            .decode::<ProfileOutcome>("profile")?;
-        let (success, message) = fanout::merge_status(
-            outcomes
-                .iter()
-                .map(|outcome| (outcome.success, outcome.message.as_str())),
-        );
-        Ok(ProfileOutcome { success, message })
+    #[cfg(test)]
+    pub(crate) fn set_paused_for_test(&self, paused: bool) {
+        self.inner.frontend.set_paused(paused);
     }
 
     /// Deliver one control request to every DP rank of the deployment.
@@ -165,6 +247,10 @@ impl CoreHandle {
     /// registry, not to its scheduler, which sees internal ids, so it ends
     /// this listener's own generations as `/abort_request` does, and the
     /// reply is whether any matched (see [`CoreHandle::abort_peers`]).
+    /// Afterwards apply the request's frontend effect here too (the origin
+    /// listener applied it to itself), so pause and the model facts are
+    /// deployment-wide. Applied after the reply, not before, or a read in
+    /// between would re-cache the old facts.
     pub(crate) async fn forward_control_req(
         &self,
         header: bytes::Bytes,
@@ -180,8 +266,24 @@ impl CoreHandle {
                 .map(bytes::Bytes::from)
                 .map_err(|error| CoreError::Internal(error.to_string()));
         }
-        self.submit_control_req(ControlRequest::Forwarded(forwarded))
-            .await
+        let effect = RelayedEffect::for_tag(&forwarded.tag);
+        // A weight update holds this listener too while its scheduler runs
+        // it (the origin holds its own), released once the reply is in.
+        let hold = match effect {
+            RelayedEffect::WeightUpdate => Some(self.inner.frontend.hold_for_update().await),
+            _ => None,
+        };
+        let reply = self
+            .submit_control_req(ControlRequest::Forwarded(forwarded))
+            .await;
+        drop(hold);
+        match effect {
+            RelayedEffect::None | RelayedEffect::WeightUpdate => {}
+            // Set regardless of the reply, as the origin did before fanning out.
+            RelayedEffect::SetPaused(paused) => self.inner.frontend.set_paused(paused),
+            RelayedEffect::Invalidate => self.inner.frontend.invalidate(),
+        }
+        reply
     }
 
     /// Relay an abort `/abort_request` served locally to every other DP
@@ -256,7 +358,10 @@ impl CoreHandle {
     }
 
     /// Deliver one control request to the local scheduler only.
-    async fn submit_control_req(&self, request: ControlRequest) -> Result<bytes::Bytes, CoreError> {
+    pub(super) async fn submit_control_req(
+        &self,
+        request: ControlRequest,
+    ) -> Result<bytes::Bytes, CoreError> {
         let mut call = self.submit(RequestKind::Control(Box::new(request))).await?;
         match call.recv().await {
             Some(ResponseItem::Control(bytes)) => Ok(bytes),
@@ -269,18 +374,21 @@ impl CoreHandle {
     }
 }
 
-/// The scheduler's `FlushCacheReqOutput`: whether the flush ran, and why not.
+/// A scheduler output with no fields of its own (`BaseReq` only).
+#[derive(Debug, serde::Deserialize)]
+struct Ack {}
+
+/// The scheduler's `ProfileReqOutput`.
 #[derive(Debug, serde::Deserialize, PartialEq)]
-pub(crate) struct FlushCacheOutcome {
+pub(crate) struct ProfileOutcome {
     pub(crate) success: bool,
     #[serde(default)]
     pub(crate) message: String,
 }
 
-/// The scheduler's `ProfileReqOutput`: whether the profiler call succeeded,
-/// and why not.
+/// The scheduler's `FlushCacheReqOutput`: whether the flush ran, and why not.
 #[derive(Debug, serde::Deserialize, PartialEq)]
-pub(crate) struct ProfileOutcome {
+pub(crate) struct FlushCacheOutcome {
     pub(crate) success: bool,
     #[serde(default)]
     pub(crate) message: String,
@@ -326,7 +434,9 @@ mod tests {
     use crate::api_server::core::ReceivedAs;
     use crate::api_server::handlers::test_utils::*;
     use crate::api_server::handlers::{CoreConfig, CoreMetadata};
+    use crate::message::ids::Rid;
     use crate::message::io_struct::GetInternalStateReq;
+    use crate::message::request::GenerateRequest;
     use bytes::Bytes;
 
     /// `start_profile` resolves the body as Python's
@@ -605,6 +715,134 @@ mod tests {
         let started = tokio::time::Instant::now();
         handle.abort_peers("client-rid".into(), false).await;
         assert_eq!(started.elapsed(), 2 * second);
+    }
+
+    /// Pause holds this listener's generates before the schedulers hear of
+    /// it, continue releases them, and a relayed pause from another listener
+    /// does the same here after the local scheduler replied.
+    #[tokio::test]
+    async fn pause_and_continue_gate_generates_locally_and_through_the_relay() {
+        let harness = Harness::unbounded(8);
+        let bare =
+            Bytes::from(rmp_serde::to_vec_named(&serde_json::json!({"success": true})).unwrap());
+        let handle = harness.handle.clone();
+        let (outcome, mode) = tokio::join!(handle.pause_generation("in_place"), async {
+            let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+            assert!(
+                harness.handle.inner.frontend.is_paused(),
+                "paused before the scheduler is asked"
+            );
+            let RequestKind::Control(control) = &request.kind else {
+                panic!("expected a control request");
+            };
+            let rmpv::Value::Array(items) =
+                rmpv::decode::read_value(&mut &control.encode().unwrap()[..]).unwrap()
+            else {
+                panic!("positional wire");
+            };
+            request
+                .sink
+                .try_send(ResponseItem::Control(bare.clone()))
+                .unwrap();
+            items[3].as_str().map(str::to_owned)
+        });
+        outcome.unwrap();
+        assert_eq!(mode.as_deref(), Some("in_place"));
+
+        let gen_handle = harness.handle.clone();
+        let parked = tokio::spawn(async move {
+            gen_handle
+                .generate(
+                    GenerateRequest {
+                        rid: Rid::new(),
+                        input_ids: Some(vec![1]),
+                        ..Default::default()
+                    },
+                    ReceivedAs::without_headers(),
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(!parked.is_finished(), "generate waits while paused");
+        assert!(harness.intake_rx.try_recv().is_err());
+
+        let handle = harness.handle.clone();
+        let (outcome, ()) = tokio::join!(handle.continue_generation(true), async {
+            let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+            request
+                .sink
+                .try_send(ResponseItem::Control(bare.clone()))
+                .unwrap();
+        });
+        outcome.unwrap();
+        let released = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        assert!(matches!(released.kind, RequestKind::Generate(_)));
+        drop(parked);
+
+        let header = ControlRequest::PauseGenerationReqInput(PauseGenerationReqInput::new(
+            "peer-rid".into(),
+            "retract".into(),
+        ))
+        .encode()
+        .unwrap();
+        let handle = harness.handle.clone();
+        let (reply, ()) = tokio::join!(handle.forward_control_req(header), async {
+            let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+            assert!(
+                !harness.handle.inner.frontend.is_paused(),
+                "the flag flips only after the scheduler replied"
+            );
+            request
+                .sink
+                .try_send(ResponseItem::Control(bare.clone()))
+                .unwrap();
+        });
+        reply.unwrap();
+        assert!(harness.handle.inner.frontend.is_paused());
+        assert_eq!(
+            harness
+                .handle
+                .pause_generation("sideways")
+                .await
+                .unwrap_err()
+                .kind(),
+            crate::api_server::core::CoreErrorKind::InvalidArgument
+        );
+    }
+
+    /// Abort-mode pause is frontend-only: it cancels the in-flight generates
+    /// and returns once they are gone, never asking a scheduler.
+    #[tokio::test]
+    async fn abort_pause_drains_in_flight_generations_without_a_scheduler_round_trip() {
+        let harness = Harness::unbounded(8);
+        let gen_handle = harness.handle.clone();
+        let call = tokio::spawn(async move {
+            gen_handle
+                .generate(
+                    GenerateRequest {
+                        rid: Rid::from_client("in-flight"),
+                        input_ids: Some(vec![1]),
+                        ..Default::default()
+                    },
+                    ReceivedAs::without_headers(),
+                )
+                .await
+        });
+        let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        let mut call = call.await.unwrap().unwrap();
+        harness.handle.pause_generation("abort").await.unwrap();
+        assert!(harness.handle.inner.frontend.is_paused());
+        assert!(
+            harness.intake_rx.try_recv().is_err(),
+            "no scheduler message"
+        );
+        assert!(matches!(
+            call.recv().await,
+            Some(crate::api_server::core::CoreEvent::Failed(
+                CoreError::Cancelled(_)
+            ))
+        ));
+        drop(request);
     }
 
     #[tokio::test]

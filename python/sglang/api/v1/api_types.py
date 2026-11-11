@@ -127,6 +127,78 @@ class ErrorBody(msgspec.Struct, kw_only=True, frozen=True):
         return encode_ErrorBody(self)
 
 
+class FreezeGcRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.FreezeGcRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "FreezeGcRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_FreezeGcRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_FreezeGcRequest(self)
+
+
+class FreezeGcResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.FreezeGcResponse: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "FreezeGcResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_FreezeGcResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_FreezeGcResponse(self)
+
+
+class PauseGenerationRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PauseGenerationRequest: JSON object (unknown keys ignored)."""
+
+    mode: Optional[str] = "abort"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PauseGenerationRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PauseGenerationRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PauseGenerationRequest(self)
+
+
+class ContinueGenerationRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ContinueGenerationRequest: JSON object (unknown keys ignored)."""
+
+    torch_empty_cache: Optional[bool] = True
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ContinueGenerationRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ContinueGenerationRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ContinueGenerationRequest(self)
+
+
+class GenerationPauseResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GenerationPauseResponse: JSON object (unknown keys ignored)."""
+
+    message: str = ""
+    status: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GenerationPauseResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GenerationPauseResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GenerationPauseResponse(self)
+
+
 class FinishStop(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.FinishStop: JSON object (unknown keys ignored)."""
 
@@ -1186,6 +1258,76 @@ def encode_ErrorBody(v: ErrorBody) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     d["message"] = v.message
     d["code"] = v.code
+    return d
+
+
+def decode_FreezeGcRequest(value: Any) -> FreezeGcRequest:
+    m = _expect_map(value, expected="struct FreezeGcRequest")
+    return FreezeGcRequest()
+
+
+def encode_FreezeGcRequest(v: FreezeGcRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_FreezeGcResponse(value: Any) -> FreezeGcResponse:
+    m = _expect_map(value, expected="struct FreezeGcResponse")
+    return FreezeGcResponse()
+
+
+def encode_FreezeGcResponse(v: FreezeGcResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_PauseGenerationRequest(value: Any) -> PauseGenerationRequest:
+    m = _expect_map(value, expected="struct PauseGenerationRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "mode":
+            kw["mode"] = "abort" if x is None else _expect_str(x, expected="a string")
+    return PauseGenerationRequest(**kw)
+
+
+def encode_PauseGenerationRequest(v: PauseGenerationRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.mode is not None:
+        d["mode"] = v.mode
+    return d
+
+
+def decode_ContinueGenerationRequest(value: Any) -> ContinueGenerationRequest:
+    m = _expect_map(value, expected="struct ContinueGenerationRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "torch_empty_cache":
+            kw["torch_empty_cache"] = True if x is None else _expect_bool(x, expected="a boolean")
+    return ContinueGenerationRequest(**kw)
+
+
+def encode_ContinueGenerationRequest(v: ContinueGenerationRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.torch_empty_cache is not None:
+        d["torch_empty_cache"] = v.torch_empty_cache
+    return d
+
+
+def decode_GenerationPauseResponse(value: Any) -> GenerationPauseResponse:
+    m = _expect_map(value, expected="struct GenerationPauseResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "status":
+            kw["status"] = _expect_str(x, expected="a string")
+    return GenerationPauseResponse(**kw)
+
+
+def encode_GenerationPauseResponse(v: GenerationPauseResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["message"] = v.message
+    d["status"] = v.status
     return d
 
 
