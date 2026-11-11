@@ -19,6 +19,7 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -197,7 +198,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.req_device_buffer_tokens.fill_(-1)
         self.coordinator.req_device_buffer_token_locs.fill_(-1)
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
-        self.coordinator.ack_staging_queue.clear()
+        self.coordinator.ack_staging_queue._drop_all()
         self.coordinator._has_pending_backup = False
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False
@@ -642,7 +643,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self._write_device_patterns(kv_loc, fill_len)
 
         launched = KeyedReqList(ListKind.PREFILL_LAUNCHED)
-        launched.join([req])
+        move([req], launched)
         self.coordinator.admit_request_into_staging(req)
         self.assertTrue(req.hisparse_staging)
 
@@ -682,7 +683,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self._write_device_patterns(kv_loc, fill_len)
 
         launched = KeyedReqList(ListKind.PREFILL_LAUNCHED)
-        launched.join([req])
+        move([req], launched)
         self.coordinator.admit_request_into_staging(req)
         get_device_module().synchronize()
         ready = self.coordinator.move_ready_reqs(KeyedReqList(ListKind.DECODING))
