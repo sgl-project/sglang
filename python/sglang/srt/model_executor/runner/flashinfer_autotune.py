@@ -182,7 +182,6 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     ]
     # Retune caches created before FlashInfer's default tactic joined the race.
     model_key_parts.append("candidate_selection=v2_default")
-    # Retune caches whose MoE tactics were profiled on the constant-token dummy.
     model_key_parts.append("dummy_tokens=varied")
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
@@ -381,12 +380,9 @@ def autotune_dummy_run_ctx(model_runner: ModelRunner, buffers):
         else empty_context()
     )
     with canary_run_ctx:
-        # A constant token routes every row to the same experts, a load serving never sees.
         input_ids = buffers.input_ids
         vocab_size = mr.model_config.vocab_size
-        # Seeded per attention-DP rank: ranks sharing a batch feed identical rows.
         generator = torch.Generator().manual_seed(get_parallel().attn_dp_rank)
-        # The dummy has no multimodal inputs, so every id below vocab_size embeds as text.
         ids = torch.randint(
             vocab_size, input_ids.shape, generator=generator, dtype=input_ids.dtype
         )
