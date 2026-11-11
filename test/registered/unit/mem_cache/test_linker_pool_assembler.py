@@ -990,7 +990,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             {name: entry.tp_replicated for name, entry in group.entry_map.items()},
             {
                 PoolName.KV: True,
-                PoolName.INDEXER: True,
+                PoolName.INDEXER: False,
                 PoolName.MAMBA: False,
                 PoolName.DRAFT: False,
             },
@@ -1018,12 +1018,28 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         params.sidecar_draft_device_pools = (draft,)
 
         params.mtp_draft_device_pools = (object(),)
-        with self.assertRaisesRegex(ValueError, "plain MLA"):
+        with self.assertRaisesRegex(ValueError, "plain MLA, MHA or DSA"):
             resolve()
         params.mtp_draft_device_pools = ()
-        kvcache.full_kv_pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
-        with self.assertRaisesRegex(ValueError, "plain MLA"):
+
+        mha = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        mha.k_scale_buffer = mha.native_k_scale_buffer = None
+        mha.k_buffer = [torch.zeros((8, 3), dtype=torch.uint8) for _ in range(2)]
+        mha.v_buffer = [torch.zeros((8, 4), dtype=torch.uint8) for _ in range(2)]
+        kvcache.full_kv_pool = mha
+        group = resolve()
+        kv = group.entry_map[PoolName.KV]
+        self.assertFalse(group.rank_replicated)
+        self.assertEqual(kv.layer_mapping, {1: (0, 2), 3: (1, 3)})
+        self.assertFalse(kv.tp_replicated)
+        self.assertFalse(kv.dcp_sharded)
+        self.assertEqual(kv.prepare_locations(torch.tensor([2, 3])), [2])
+        # One slot transfers a whole page: its K block then its V block.
+        self.assertEqual(kv.get_page_buffer_meta(torch.tensor([2, 3]))[1], [6, 6, 8, 8])
+        mha.k_scale_buffer = object()
+        with self.assertRaisesRegex(ValueError, "scaled KV"):
             resolve()
+        mha.k_scale_buffer = None
 
     def test_minimax_m31_nvfp4_maps_page_rows_and_draft(self):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool

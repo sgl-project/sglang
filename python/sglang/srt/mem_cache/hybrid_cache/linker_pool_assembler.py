@@ -567,6 +567,7 @@ def _build_mamba_device_pool_group(
     from sglang.srt.mem_cache.memory_pool import (
         DSATokenToKVPool,
         HybridLinearKVPool,
+        MHATokenToKVPool,
         MLATokenToKVPool,
     )
 
@@ -574,12 +575,13 @@ def _build_mamba_device_pool_group(
     full_kv_pool = kvcache.full_kv_pool
     if (
         type(kvcache) is not HybridLinearKVPool
-        or type(full_kv_pool) not in (MLATokenToKVPool, DSATokenToKVPool)
+        or type(full_kv_pool)
+        not in (MLATokenToKVPool, DSATokenToKVPool, MHATokenToKVPool)
         or params.mtp_draft_device_pools
     ):
         raise ValueError(
-            "The direct external linker supports FULL + MAMBA models only with a "
-            "plain MLA or DSA pool, without packed draft KV."
+            "The direct external linker supports MAMBA + FULL models only with a "
+            "plain MLA, MHA or DSA pool, without packed draft KV."
         )
     parallel = get_parallel()
     dcp_size = parallel.attn_dcp_size
@@ -597,8 +599,13 @@ def _build_mamba_device_pool_group(
     full_mapping = _stage_local_layer_mapping(
         kvcache.full_attention_layer_id_mapping, kvcache.start_layer
     )
-    entries = [
-        DevicePoolEntry(
+    if type(full_kv_pool) is MHATokenToKVPool:
+        # MHA keeps a K and a V buffer per layer, each TP-sharded.
+        full_entry = _mha_device_pool_entry(
+            PoolName.KV, full_kv_pool, full_mapping, page_size // dcp_size
+        )
+    else:
+        full_entry = DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
             device_pool=full_kv_pool,
@@ -609,7 +616,9 @@ def _build_mamba_device_pool_group(
             tp_replicated=True,
             dcp_sharded=dcp_sharded,
             index_mapper=dcp_mapper,
-        ),
+        )
+    entries = [
+        full_entry,
         _mamba_device_pool_entry(
             params.token_to_kv_pool_allocator.state, kvcache.start_layer
         ),
@@ -638,7 +647,8 @@ def _build_mamba_device_pool_group(
                     },
                     page_size=page_size // dcp_size,
                     rows_are_pages=True,
-                    tp_replicated=True,
+                    # The indexer rides the KV pool's DCP split regardless of
+                    # whether its own layers use an MLA or MHA full pool.
                     dcp_sharded=dcp_sharded,
                     index_mapper=dcp_mapper,
                 )
