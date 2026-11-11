@@ -309,7 +309,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if model_runner.sliding_window_size is not None and (
             model_runner.sliding_window_size >= 0
         ):
-            max_rows = model_runner.max_running_requests * max(
+            # The parent's q_indptr_decode covers the padded batch, which can
+            # exceed max_running_requests under MLP sync.
+            max_rows = (self.q_indptr_decode.numel() - 1) * max(
                 self.num_draft_tokens or 1, 1
             )
             self._window_counter_buffer = make_persistent_multi_ctas_kv_counter_buffer(
@@ -1483,6 +1485,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         bs, q_len, heads, head_dim = q.shape
         rows = bs * q_len
+        assert rows < self._window_row_indptr.numel(), (
+            f"{rows} window rows exceed the {self._window_row_indptr.numel() - 1} "
+            "sized at init"
+        )
         if get_in_autotune_dummy_run():
             # Autotune discards attention; its metadata overflows the workspace.
             out, lse = self._dummy_dcp_decode_for_autotune(
