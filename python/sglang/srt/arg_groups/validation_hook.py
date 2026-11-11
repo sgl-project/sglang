@@ -269,6 +269,13 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
                 "PP + speculative decoding (MTP) is only supported on prefill nodes "
                 "(disaggregation-mode=prefill)"
             )
+    # Stage 0 relays its received requests to the next stage every
+    # iteration, but later stages only receive on the iterations the recv
+    # skipper lets through, so the stages fall out of step.
+    assert cfg.scheduler_recv_interval <= 1, (
+        "--scheduler-recv-interval > 1 is not supported with pipeline "
+        "parallelism; use --scheduler-recv-interval 1"
+    )
     assert cfg.min_free_slots_delay is None, (
         "--min-free-slots-delay is not supported with pipeline "
         "parallelism: allocatable slots per microbatch are bounded by "
