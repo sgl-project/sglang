@@ -344,3 +344,29 @@ def test_uno_replay_uses_final_host_lengths_without_adding_width():
         seq_lens_cpu=torch.tensor([32, 64], dtype=torch.int32),
     )
     assert backend._decode_update_lengths(batch) == [32, 64, 0, 0]
+
+
+@pytest.mark.parametrize("variant", ["lora", "nolora"])
+def test_uno_preplanned_replay_preserves_lora_graph_variant(variant):
+    backend, runner, _ = make_backend(uno=True, width=8)
+    runner.raw_num_token = 16
+    runner.buffers = SimpleNamespace(
+        input_ids=torch.empty(16, dtype=torch.int64),
+        positions=torch.empty(16, dtype=torch.int64),
+    )
+    runner._resolve_lora_variant = mock.Mock(return_value=variant)
+    runner._resolve_attention_variant = mock.Mock(return_value=None)
+    runner._make_graph_key = mock.Mock(return_value=variant)
+    batch = SimpleNamespace(
+        needs_forward_metadata_init=lambda: False,
+        input_ids=torch.arange(16),
+        positions=torch.arange(16),
+    )
+    with mock.patch.object(
+        mod.envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM, "get", return_value=False
+    ):
+        assert backend.prepare_replay(batch)
+    runner._make_graph_key.assert_called_once_with(
+        4, variant_label=variant, attention_variant=None
+    )
+    assert runner._replay_graph_key == variant
