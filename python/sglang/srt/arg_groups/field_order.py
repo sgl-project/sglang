@@ -247,7 +247,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_precise_embedding_interpolation",
     "enable_fused_moe_sum_all_reduce",
     "enable_deepseek_v4_fp4_indexer",
-    "enable_dsa_fp4_indexer",
     "disable_custom_all_reduce",
     "enable_mscclpp",
     "enable_torch_symm_mem",
@@ -569,5 +568,6 @@ POSITIONAL_FIELD_ORDER = (
     "allow_local_media_files",
     # Kimi-K3.1 additions, appended to keep existing positional slots
     "enable_flashmla_prefill_token_packing",
+    "enable_dsa_fp4_indexer",
 )
 # fmt: on
