@@ -2285,8 +2285,15 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             -e SGLANG_DIFFUSION_ARTIFACT_DIR="/sglang-checkout/diffusion-artifacts" \
-            pytest test/registered/amd/test_zimage_turbo.py -v -s ${{ inputs.continue_on_error && '|| true' || '' }} || TEST_EXIT_CODE=$?
+            pytest test/registered/amd/test_zimage_turbo.py -v -s || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          if [[ ${TEST_EXIT_CODE:-0} -ne 0 ]]; then
+            echo "::warning::Z-Image-Turbo test failed with exit code $TEST_EXIT_CODE"
+            echo "Z-Image-Turbo test failed with exit code $TEST_EXIT_CODE." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ "${{ inputs.continue_on_error }}" == "true" ]]; then
+            exit 0
+          fi
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Upload generated images
