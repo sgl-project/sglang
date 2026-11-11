@@ -236,7 +236,7 @@ def kda_decode_mtp_kernel(
     sVall = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
     )
-    sState = smem.allocate_tensor(cutlass.Float32, smem_state_layout, 16)
+    sState = smem.allocate_tensor(h0.element_type, smem_state_layout, 16)
     if cutlass.const_expr(APPLY_ONORM):
         sOall = smem.allocate_tensor(
             cutlass.Float32, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
@@ -803,13 +803,23 @@ def kda_decode_mtp_kernel(
                         _st = (i_l * P2_BATCHES + b) * P2_VEC
                         v_row = warp_idx * NUM_V_ROWS + b * P2_ROWS_LANE + row_grp
                         for j in range(P2_VEC):
-                            ht[
-                                scratch_row,
-                                i_t,
-                                i_hv,
-                                v_base + v_row,
-                                j * P2_LANES_K + k_grp,
-                            ] = r_state[_st + j]
+                            if cutlass.const_expr(ht.element_type == cutlass.Float32):
+                                ht[
+                                    scratch_row,
+                                    i_t,
+                                    i_hv,
+                                    v_base + v_row,
+                                    j * P2_LANES_K + k_grp,
+                                ] = r_state[_st + j]
+                            else:
+                                # Narrow (bf16 state) snapshot; compute stays fp32.
+                                ht[
+                                    scratch_row,
+                                    i_t,
+                                    i_hv,
+                                    v_base + v_row,
+                                    j * P2_LANES_K + k_grp,
+                                ] = ht.element_type(r_state[_st + j])
 
     if cutlass.const_expr(APPLY_ONORM):
         cute.arch.barrier()
@@ -901,9 +911,12 @@ def _run_kda_decode_mtp_dspark(
         if NUM_SPEC == 0 and BLOCK_THREADS == BLOCK_THREADS_WIDE
         else cpasync.LoadCacheMode.GLOBAL
     )
+    # 128-bit cp.async: 4 fp32 or 8 bf16 state elements per copy.
+    state_dtype = h0.element_type
+    state_vec = 128 // state_dtype.width
     state_copy_atom = cute.make_copy_atom(
         cpasync.CopyG2SOp(cache_mode=state_cache_mode),
-        cutlass.Float32,
+        state_dtype,
         num_bits_per_copy=128,
     )
     state_g2s_copy = cute.make_tiled_copy_tv(
@@ -912,14 +925,14 @@ def _run_kda_decode_mtp_dspark(
             (TILE_V, BLOCK_THREADS // TILE_V),
             stride=(BLOCK_THREADS // TILE_V, 1),
         ),
-        val_layout=cute.make_layout((1, 4)),
+        val_layout=cute.make_layout((1, state_vec)),
     )
     t_loop = 1 + NUM_SPEC
     smem_bytes = (
         # sQ, sK, sG, sBeta, and sVall.
         (3 * t_loop * qk_elems + t_loop + t_loop * TILE_K) * 4
         # State stages and the raw output tile for normalization.
-        + state_smem_elems * 4
+        + state_smem_elems * (state_dtype.width // 8)
         + (t_loop * TILE_K * 4 if cutlass.const_expr(APPLY_ONORM) else 0)
         + ((t_loop + 1) * TILE_K * 4 if APPLY_ONORM else 0)
         + 256
@@ -1112,15 +1125,23 @@ def fused_kda_decode_mtp_dspark(
     num_spec = T // N - 1
     if recurrent_state.shape[1:] != (H, TILE_K, TILE_K):
         raise ValueError("expected recurrent state layout [pool, H, V=128, K=128]")
+    # 16-byte cp.async: slot pitch / offset must be a multiple of 4 fp32 or
+    # 8 bf16 elements.
+    state_align = 16 // recurrent_state.element_size()
     if (
-        recurrent_state.dtype != torch.float32
+        recurrent_state.dtype not in (torch.float32, torch.bfloat16)
         or tuple(recurrent_state.stride()[-3:]) != (TILE_K * TILE_K, TILE_K, 1)
-        or recurrent_state.stride(0) % 4 != 0
-        or recurrent_state.storage_offset() % 4 != 0
+        or recurrent_state.stride(0) % state_align != 0
+        or recurrent_state.storage_offset() % state_align != 0
     ):
         raise ValueError(
-            "cp.async recurrent state requires fp32 contiguous [H, V, K] "
+            "cp.async recurrent state requires fp32/bf16 contiguous [H, V, K] "
             "inner layout and 16-byte-aligned slot offsets"
+        )
+    if intermediate_ssm is not None and intermediate_ssm.dtype != recurrent_state.dtype:
+        raise ValueError(
+            "intermediate_ssm dtype must match the recurrent state dtype, got "
+            f"{intermediate_ssm.dtype} vs {recurrent_state.dtype}"
         )
     rings = (replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta)
     cache_ring = all(ring is not None for ring in rings)

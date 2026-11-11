@@ -57,6 +57,8 @@ def test_latent_layout_and_frame_alignment():
 def test_bcg_requires_resident_transformer_only_when_enabled(enabled):
     required = []
     args = SimpleNamespace(
+        ring_degree=1,
+        sp_degree=1,
         enable_breakable_cuda_graph=enabled,
         require_component_resident=lambda name, **_: required.append(name),
     )

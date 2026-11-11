@@ -144,6 +144,11 @@ for 832×480, 81-frame requests. Other resolutions or frame counts run eagerly.
 The default prompt length is fixed at 300 tokens, so no text bucket flag is
 needed for this command.
 
+With two GPUs, add `--num-gpus 2` to split the video tokens across them
+(sequence parallelism). The result is not bit-identical to the single-GPU
+result. The sequence-parallel degree must divide the 10 softmax attention
+heads; `--ring-degree` above 1 and `--enable-cfg-parallel` are not supported.
+
 For offline weights, keep the model directory name, such as
 `/path/to/SANA-Video_2.0_5B_720p`, and pass it as `--model-path`. That directory
 must contain `config.yaml` and `checkpoints/SANA_Video_2.0_5B_720p.pth`. Set

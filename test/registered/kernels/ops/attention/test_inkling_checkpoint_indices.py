@@ -397,41 +397,66 @@ class TestInklingCheckpointIndices(CustomTestCase):
             backend._prepare_slot_indices(batch)
         self.assertEqual(backend._graph_track_indices.data_ptr(), pointer)
 
-    def test_verify_commit_translates_both_destinations(self):
-        backend, allocator, _, slots = self.make_backend()
+    def test_verify_commit_writes_the_forward_slots_after_row_reuse(self):
+        """A commit after the verify's shared reads writes the slots the forward
+        resolved, not those of the request that reused its row."""
+        for recordable in (False, True):
+            for tracking in (False, True):
+                with self.subTest(recordable=recordable, tracking=tracking):
+                    self._check_commit_after_row_reuse(recordable, tracking)
+
+    def _check_commit_after_row_reuse(self, recordable, tracking):
+        backend, allocator, _, slots = self.make_backend(fused=recordable, slot_count=8)
         allocator.free(slots[:1].clone())
-        indices = torch.tensor([0], device="cuda")
-        for tracking in (False, True):
-            with self.subTest(tracking=tracking):
-                ids = slots[-1:].clone() if tracking else None
-                with (
-                    patch.object(
-                        backend.state_pool,
-                        "get_speculative_mamba2_params_all_layers",
-                        return_value=object(),
-                    ),
-                    patch(
-                        _BACKEND + ".scatter_mamba_states_after_mtp_verify"
-                    ) as scatter,
-                ):
-                    backend.commit_conv_state_after_mtp_verify(
-                        req_pool_indices=indices,
-                        last_correct_step_indices=indices,
-                        mamba_track_indices=ids,
-                        mamba_steps_to_track=indices if tracking else None,
-                    )
-                if tracking:
-                    torch.testing.assert_close(
-                        scatter.call_args.args[3], backend._translate_mamba_indices(ids)
-                    )
-                    torch.testing.assert_close(ids, slots[-1:], rtol=0, atol=0)
-                else:
-                    self.assertIsNone(scatter.call_args.args[3])
-                    self.assertIsNone(scatter.call_args.args[4])
-                torch.testing.assert_close(
-                    scatter.call_args.args[1],
-                    backend._translate_mamba_indices(slots[1:2].to(torch.int32)),
-                )
+        allocator._flush(urgent=True)
+        pool = backend.req_to_token_pool
+        ids = slots[-1:].clone() if tracking else None
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=1,
+            req_pool_indices=torch.tensor([0], device="cuda"),
+            mamba_track_indices=ids,
+            mamba_track_mask=None,
+        )
+        # The verify forward resolves its slots during metadata preparation.
+        backend._prepare_slot_indices(batch)
+        working = backend._translate_mamba_indices(slots[1:2]).to(torch.int32)
+        track = None if ids is None else backend._translate_mamba_indices(ids)
+        # Its request finishes; row 0 goes to a new request with another slot,
+        # and the freed checkpoint slot's id is unbound.
+        allocator.free(torch.cat([slots[1:2], slots[-1:]]).clone())
+        pool.req_index_to_mamba_index_mapping[0] = slots[3]
+        live = backend._translate_mamba_indices(
+            pool.get_mamba_indices(batch.req_pool_indices)
+        )
+        self.assertFalse(torch.equal(live.to(torch.int32), working))
+        if ids is not None:
+            self.assertFalse(torch.equal(backend._translate_mamba_indices(ids), track))
+        steps = torch.tensor([0], device="cuda")
+        with (
+            patch.object(
+                backend.state_pool,
+                "get_speculative_mamba2_params_all_layers",
+                return_value=object(),
+            ),
+            patch(_BACKEND + ".scatter_mamba_states_after_mtp_verify") as scatter,
+        ):
+            backend.commit_conv_state_after_mtp_verify(
+                last_correct_step_indices=steps,
+                mamba_track_indices=ids,
+                mamba_steps_to_track=steps if tracking else None,
+            )
+        torch.testing.assert_close(
+            scatter.call_args.args[1].to(torch.int32), working, rtol=0, atol=0
+        )
+        if tracking:
+            torch.testing.assert_close(
+                scatter.call_args.args[3].to(track.dtype), track, rtol=0, atol=0
+            )
+            torch.testing.assert_close(ids, slots[-1:], rtol=0, atol=0)
+        else:
+            self.assertIsNone(scatter.call_args.args[3])
+            self.assertIsNone(scatter.call_args.args[4])
 
     def test_explicit_none_tracking_still_refreshes_active_slots(self):
         backend, allocator, _, slots = self.make_backend()
@@ -921,14 +946,14 @@ class TestInklingCheckpointIndices(CustomTestCase):
                 patch(_BACKEND + ".scatter_mamba_states_after_mtp_verify") as scatter,
             ):
                 backend.commit_conv_state_after_mtp_verify(
-                    req_pool_indices=batch.req_pool_indices[:3],
                     last_correct_step_indices=batch.req_pool_indices[:3],
                     mamba_track_indices=ids[:3],
                     mamba_steps_to_track=batch.req_pool_indices[:3],
                 )
                 torch.testing.assert_close(scatter.call_args.args[1], active[:3])
                 torch.testing.assert_close(
-                    scatter.call_args.args[3], backend._translate_mamba_indices(ids[:3])
+                    scatter.call_args.args[3],
+                    backend._translate_mamba_indices(ids[:3]).long(),
                 )
         self.assertFalse(torch.equal(before, backend._cache_indices))
         torch.testing.assert_close(ids, original, rtol=0, atol=0)
