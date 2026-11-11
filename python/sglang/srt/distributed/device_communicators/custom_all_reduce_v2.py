@@ -3,7 +3,7 @@
 The CUDA side is split into independent pieces:
 
 - ``PushPlane``: the zero-filled symmetric push buffers plus a rank-local
-  phase counter.
+  phase word shared by every push kernel.
 - ``PullPlane``: the symmetric pull buffers plus the per-block semaphores
   guarding them. The buffers exist only because this class hands the
   all-reduce tensors that are not symmetric memory, so it stages them
@@ -44,6 +44,7 @@ from sglang.kernels.ops.communication.all_reduce import (
     PullPlane,
     PushPlane,
     custom_all_reduce,
+    custom_pair_stage,
     get_all_reduce_module,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
@@ -51,6 +52,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.cuda_vmm_utils import (
     VmmGraphInputManager,
     compute_graph_capture_bases,
@@ -58,8 +60,10 @@ from sglang.srt.utils.cuda_vmm_utils import (
 )
 
 from .configs.custom_all_reduce_v2 import (
+    Range,
     get_all_reduce_config,
     get_supported_world_sizes,
+    two_shot_push_slot_bytes,
 )
 from .custom_all_reduce_utils import (
     can_use_custom_all_reduce_with_nvlink,
@@ -69,10 +73,16 @@ from .custom_all_reduce_utils import (
 
 logger = logging.getLogger(__name__)
 
+# FABRIC workspaces whose collective release timed out; unmapping them while a
+# peer may still be draining would fault it, so they live until process exit.
+_unreleased_buffers: list = []
+
+_is_hip = is_hip()
+
 MB = 1024 * 1024
 
 _ALIGN_BYTES = 1024
-_SEMAPHORE_BYTES = 128
+_SEMAPHORE_BYTES = 128  # sizeof(Semaphore)
 _MAX_GRAPH_INPUTS = 131072
 # resolved once at import time; explicit constructor sizes take precedence
 _DEFAULT_MAX_SIZE = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.get() * 1024
@@ -86,7 +96,55 @@ def _ceil_align(nbytes: int, align: int) -> int:
     return (nbytes + align - 1) // align * align
 
 
-def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: ProcessGroup):
+def _hier_max_bytes(config, max_size: int, *, sizes_own_push: bool) -> int:
+    """Largest hier_2shot_push message the workspace should hold, or 0.
+
+    A pair slot holds half a message and, like every push slot, stays within
+    ``max_size``.
+    """
+    if sizes_own_push:
+        return 0
+    hier = max(
+        (h.hier_2shot_push for h in (config.graph, config.eager)),
+        key=lambda r: r.max_bytes,
+    )
+    hier_max = min(hier.max_bytes, 2 * max_size) // 32 * 32
+    return hier_max if hier_max > hier.min_bytes else 0
+
+
+def _fit_hier(config, hier_max: int):
+    """Clip hier_2shot_push to ``hier_max`` (0 disables it).
+
+    Where it then covers the whole 2shot_push range, 2shot_push keeps only the
+    sizes below it, so the push slots need not grow for sizes hier takes; in
+    that range, sizes it cannot halve into 16 B vectors fall back to NCCL.
+    """
+
+    def fit(heuristic):
+        hier = heuristic.hier_2shot_push
+        if not hier_max:
+            return heuristic._replace(hier_2shot_push=Range(0, 0))
+        hier = Range(hier.min_bytes, min(hier.max_bytes, hier_max))
+        two_shot = heuristic.two_shot_push_threshold
+        if hier.max_bytes >= two_shot:
+            two_shot = min(two_shot, hier.min_bytes)
+        return heuristic._replace(
+            hier_2shot_push=hier, two_shot_push_threshold=two_shot
+        )
+
+    return config._replace(graph=fit(config.graph), eager=fit(config.eager))
+
+
+def _allocate_symmetric_memory(
+    nbytes: int, device: torch.device, group: ProcessGroup, multinode: bool = False
+) -> Tuple[object, List[torch.Tensor], int]:
+    """``(owner, per-rank uint8 views, multicast VA or 0)``; keep ``owner`` alive."""
+    if _is_hip:
+        from sglang.srt.utils.hip_vmm_utils import HipSymmetricBuffer
+
+        buffer = HipSymmetricBuffer(nbytes, device, group, require_fabric=multinode)
+        return buffer, buffer.buffers, 0
+
     from torch._C._distributed_c10d import _SymmetricMemory
 
     if torch.__version__ < "2.11.0":
@@ -101,7 +159,11 @@ def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: Process
         group.group_name,
     )
     symm_mem = _SymmetricMemory.rendezvous(tensor)
-    return tensor, symm_mem
+    slabs = [
+        symm_mem.get_buffer(i, [nbytes], torch.uint8)
+        for i in range(dist.get_world_size(group=group))
+    ]
+    return (tensor, symm_mem), slabs, int(symm_mem.multicast_ptr)
 
 
 class AllReduceConfig(NamedTuple):
@@ -132,8 +194,9 @@ class CustomAllReduceV2:
                               push-only instance.
         :param max_push_size: explicit per-slot push workspace size;
                               overrides both the tuned size and ``max_size``.
-        :param max_pull_blocks: cap on the barrier plane's block count; ``0``
-                                builds a push-only instance.
+        :param max_pull_blocks: cap on the pull kernels' default launch width;
+                                ``0`` builds a push-only instance.
+        :param max_push_blocks: the push kernels' default launch width.
 
         ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB`` /
         ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB`` take the highest
@@ -148,6 +211,22 @@ class CustomAllReduceV2:
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
         base_config = get_all_reduce_config(self.world_size)
+        # hier_2shot_push needs both DPX partitions of every SoC in the group;
+        # callers that size their own push plane or run push-only get none
+        hier_max = _hier_max_bytes(
+            base_config,
+            max_size,
+            sizes_own_push=max_push_size is not None
+            or max_pull_blocks == 0
+            or _FORCE_PUSH_SIZE_KB is not None,
+        )
+        self._dpx_pairs = None
+        if hier_max and _is_hip:
+            from .gfx1250_fabric import probe_dpx_pairs
+
+            self._dpx_pairs = probe_dpx_pairs(group, device)
+        self.hier_max_size = hier_max if self._dpx_pairs else 0
+        base_config = _fit_hier(base_config, self.hier_max_size)
         if max_pull_size is None:
             max_pull_size = min(base_config.max_pull_bytes, max_size)
         if max_push_size is None:
@@ -203,9 +282,15 @@ class CustomAllReduceV2:
         # On a multi-node (MNNVL) group the symm-mem workspace plane works
         # across nodes, but graph zero-copy input registration (cudaIpc /
         # node-local VMM remap) does not — force eager pull inside graphs.
+        # On ROCm the 2-shot graph path would store into peers' cached input
+        # buffers, which XGMI does not keep coherent; stage through the
+        # uncached workspace inside graphs instead.
         is_multinode = not all(in_the_same_node_as(group, source_rank=0))
+        self._is_multinode = is_multinode
         tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-        self._is_graph_mode_supported = not tms_cudagraph and not is_multinode
+        self._is_graph_mode_supported = (
+            not tms_cudagraph and not is_multinode and not _is_hip
+        )
         # device-side pointer table: one row of world_size pointers per
         # graph-captured all-reduce input
         self.graph_params = torch.zeros(
@@ -214,7 +299,8 @@ class CustomAllReduceV2:
             device=self.device,
         )
         self._init_workspace()
-        self._ipc_manager = IPCManager()
+        # only graph-input registration opens IPC handles
+        self._ipc_manager = IPCManager() if self._is_graph_mode_supported else None
         self._vmm_graph_input_manager = VmmGraphInputManager(
             obj=self,
             group=self.group,
@@ -228,16 +314,13 @@ class CustomAllReduceV2:
         self.disabled = False
 
     def supports_push(self, *, nbytes: int, num_blocks: int) -> bool:
-        """Whether the push plane can hold a payload and its synchronization blocks.
+        """Whether the push plane can hold a payload launched over ``num_blocks``.
 
         This checks allocated capacity, not algorithm-selection thresholds or
-        tensor eligibility. Disabled communicators have no usable capacity.
+        tensor eligibility. Any grid size is legal: the phase word is shared.
+        Disabled communicators have no usable capacity.
         """
-        return (
-            not self.disabled
-            and 0 < nbytes <= self.max_push_size
-            and 0 < num_blocks <= self._push_counter.numel()
-        )
+        return not self.disabled and 0 < nbytes <= self.max_push_size and num_blocks > 0
 
     def reserve_push_capacity(self, nbytes: int) -> None:
         """Grow shared storage without changing AR dispatch or counter capacity.
@@ -270,26 +353,45 @@ class CustomAllReduceV2:
         """Slice one symmetric-memory allocation into every shared buffer.
 
         Layout per rank: ``[2 * world_size push slots | pull buffer | pull
-        semaphores]``. One allocation rather than three keeps it to a single
-        rendezvous and a single multicast base to offset from. The push
-        counter is rank-local, so it lives in a plain CUDA tensor.
+        semaphores | 2 * 2 pair slots | 2 * world_size / 2 cross slots]``; the
+        pair and cross slots exist only with hier_2shot_push. One allocation
+        rather than several keeps it to a single rendezvous and a single
+        multicast base to offset from. The push counters are rank-local, so
+        they live in plain CUDA tensors.
         """
         cfg = self.config
         push_num_slots = 2 * self.world_size  # 2 phases x world_size peers
         push_bytes = push_num_slots * self.max_push_size
         pull_bytes = self.max_pull_size  # 0 when the pull half is disabled
-        sem_bytes = _SEMAPHORE_BYTES * cfg.num_pull_blocks if self.pull_enabled else 0
-        total_bytes = push_bytes + pull_bytes + sem_bytes
+        # Semaphores are indexed by block, so capacity only bounds a grid; at
+        # least one per SM, the persistent width every pull kernel stays within.
+        num_sm = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.num_semaphores = (
+            max(num_sm, cfg.num_pull_blocks) if self.pull_enabled else 0
+        )
+        sem_bytes = _SEMAPHORE_BYTES * self.num_semaphores
+        # hier_2shot_push: a pair reduce-scatter / all-gather of N bytes moves
+        # one N/2 chunk per slot; the cross 2shot_push all-reduces N/2
+        cross_world = self.world_size // 2
+        pair_slot = _ceil_align(self.hier_max_size // 2, _ALIGN_BYTES)
+        cross_slot = _ceil_align(
+            two_shot_push_slot_bytes(self.hier_max_size // 2, cross_world),
+            _ALIGN_BYTES,
+        )
+        pair_bytes = 2 * 2 * pair_slot if self.hier_max_size else 0
+        cross_bytes = 2 * cross_world * cross_slot if self.hier_max_size else 0
         pull_offset = push_bytes
         sem_offset = push_bytes + pull_bytes
+        pair_offset = sem_offset + sem_bytes
+        cross_offset = pair_offset + pair_bytes
+        total_bytes = cross_offset + cross_bytes
 
-        self._symm_tensor, symm_mem = _allocate_symmetric_memory(
-            total_bytes, device=self.device, group=self.group
+        self._symm_owner, slabs, multicast_ptr = _allocate_symmetric_memory(
+            total_bytes,
+            device=self.device,
+            group=self.group,
+            multinode=self._is_multinode,
         )
-        slabs = [
-            symm_mem.get_buffer(i, [total_bytes], torch.uint8)
-            for i in range(self.world_size)
-        ]
         # The push slots (lamport pos-zero markers) and the semaphores must
         # start zeroed; the pull buffer need not, but it rides along in the
         # one-shot memset.
@@ -305,22 +407,21 @@ class CustomAllReduceV2:
             assert offset + nbytes <= total_bytes
             return [slab[offset : offset + nbytes].view(shape) for slab in slabs]
 
-        multicast_ptr = int(symm_mem.multicast_ptr)
         self.has_multicast = multicast_ptr != 0
 
         def mc_at(offset: int) -> Optional[int]:
             return multicast_ptr + offset if self.has_multicast else None
 
-        self._push_counter = torch.zeros(
-            (cfg.num_push_blocks,), dtype=torch.uint32, device=self.device
-        )
+        # one u64 phase word shared by every push kernel (EpochCounter)
+        self._push_counter = torch.zeros((1,), dtype=torch.int64, device=self.device)
         self._push_workspaces = slice_all([push_num_slots, self.max_push_size], 0)
         self._push_multicast_ptr = mc_at(0)
         push_plane = PushPlane(
             self.rank,
             self.world_size,
             workspaces=self._push_workspaces,
-            counter=self._push_counter.view(-1, 1).view(torch.uint8),
+            counter=self._push_counter,
+            default_blocks=cfg.num_push_blocks,
             mc_workspace=mc_at(0),
         )
         pull_plane = None
@@ -330,13 +431,51 @@ class CustomAllReduceV2:
                 self.world_size,
                 workspaces=slice_all([pull_bytes], pull_offset),
                 semaphores=slice_all(
-                    [cfg.num_pull_blocks, _SEMAPHORE_BYTES], sem_offset
+                    [self.num_semaphores, _SEMAPHORE_BYTES], sem_offset
                 ),
                 mc_workspace=mc_at(pull_offset),
                 mc_semaphore=mc_at(sem_offset),
+                default_blocks=cfg.num_pull_blocks,
             )
         if not self.has_multicast or not self.pull_enabled:
             self.config = self.config._replace(num_mc_blocks=None)
+
+        self._pair_obj = self._cross_obj = None
+        if self.hier_max_size:
+            # partition p of a pair reduces half p, which the cross plane of
+            # every SoC's partition p then all-reduces
+            pair = next(ranks for ranks in self._dpx_pairs if self.rank in ranks)
+            p = pair.index(self.rank)
+            cross = [ranks[p] for ranks in self._dpx_pairs]
+            # one EpochCounter per sub-plane: pair, cross
+            self._hier_counters = torch.zeros(
+                (2,), dtype=torch.int64, device=self.device
+            )
+
+            def sub_communicator(ranks, offset, slot_bytes, counter):
+                # 2 phases x len(ranks) peers, like the full push plane
+                nbytes = 2 * len(ranks) * slot_bytes
+                assert offset + nbytes <= total_bytes
+                workspaces = [
+                    slabs[r][offset : offset + nbytes].view(-1, slot_bytes)
+                    for r in ranks
+                ]
+                return Communicator(
+                    push=PushPlane(
+                        ranks.index(self.rank),
+                        len(ranks),
+                        workspaces=workspaces,
+                        counter=counter,
+                        default_blocks=cfg.num_push_blocks,
+                    )
+                )
+
+            self._pair_obj = sub_communicator(
+                pair, pair_offset, pair_slot, self._hier_counters[0:1]
+            )
+            self._cross_obj = sub_communicator(
+                cross, cross_offset, cross_slot, self._hier_counters[1:2]
+            )
 
         self.obj = Communicator(push=push_plane, pull=pull_plane)
         if self.config.num_mc_blocks is not None:
@@ -344,11 +483,13 @@ class CustomAllReduceV2:
         if self.rank == 0:
             logger.info(
                 "All Reduce config: symmetric_memory = %.2f MB, "
-                "local_buffer = %.2f MB, multicast = %s, pull = %s",
+                "local_buffer = %.2f MB, multicast = %s, pull = %s, "
+                "hier_2shot_push = %s",
                 total_bytes / MB,
                 (self.graph_params.nbytes + self._push_counter.nbytes) / MB,
                 self.config.num_mc_blocks is not None,
                 self.pull_enabled,
+                self._dpx_pairs if self.hier_max_size else None,
             )
         dist.barrier(group=self.group)
 
@@ -392,6 +533,9 @@ class CustomAllReduceV2:
         can_use_multicast = self.config.num_mc_blocks is not None
         if nbytes <= heuristic.one_shot_push_threshold:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
+        # the pair halves must stay whole 16 B vectors
+        if nbytes % 32 == 0 and heuristic.hier_2shot_push.contains(nbytes):
+            return AllReduceConfig(AllReduceAlgo.HIER_2SHOT_PUSH)
         if nbytes <= heuristic.two_shot_push_threshold:
             return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PUSH)
         if nbytes <= heuristic.one_shot_pull_threshold:
@@ -415,6 +559,8 @@ class CustomAllReduceV2:
         if not is_weak_contiguous(inp):
             return False
         if self.override_algo is not None:
+            if self.override_algo == AllReduceAlgo.HIER_2SHOT_PUSH:
+                return inp_size % 32 == 0 and inp_size <= self.hier_max_size
             return inp_size <= self.max_size
         if not self._graph_mode_allowed:
             return self._eager_plan(inp_size, inp.dtype) is not None
@@ -427,15 +573,17 @@ class CustomAllReduceV2:
         key = (nbytes, dtype)
         if key not in self._eager_plans:
             config = self._pick_config(nbytes, False)
-            self._eager_plans[key] = (
-                None
-                if config is None
-                else (
+            if config is None:
+                self._eager_plans[key] = None
+            elif config.algo == AllReduceAlgo.HIER_2SHOT_PUSH:
+                # runs over the pair and cross planes, not one module
+                self._eager_plans[key] = (None, config.algo.algo_name, False)
+            else:
+                self._eager_plans[key] = (
                     get_all_reduce_module(dtype, self.world_size),
                     config.algo.algo_name,
                     config.use_multicast,
                 )
-            )
         return self._eager_plans[key]
 
     # ------------------------------------------------------------------
@@ -469,6 +617,8 @@ class CustomAllReduceV2:
             plan = self._eager_plan(nbytes, input.dtype)
             assert plan is not None, f"No config for {nbytes = }"
             module, algo_name, use_multicast = plan
+            if module is None:
+                return self._hier_all_reduce(input)
             out = module.all_reduce(self.obj, input, algo_name, None, use_multicast)
             return out if isinstance(out, torch.Tensor) else torch.from_dlpack(out)
         if self.override_algo is not None:
@@ -480,6 +630,8 @@ class CustomAllReduceV2:
             config = self._pick_config(nbytes, self._can_use_graph())
             assert config is not None, f"No config for {nbytes = }"
             algo, use_graph, use_multicast = config
+        if algo == AllReduceAlgo.HIER_2SHOT_PUSH:
+            return self._hier_all_reduce(input)
         graph_params = self._allocate_graph_row(input, nbytes) if use_graph else None
         return custom_all_reduce(
             self.obj,
@@ -488,6 +640,14 @@ class CustomAllReduceV2:
             graph_params=graph_params,
             use_multicast=use_multicast,
         )
+
+    def _hier_all_reduce(self, input: torch.Tensor) -> torch.Tensor:
+        half = custom_pair_stage(self._pair_obj, input.view(-1), all_gather=False)
+        half = custom_all_reduce(
+            self._cross_obj, half, algo=AllReduceAlgo.TWO_SHOT_PUSH
+        )
+        out = custom_pair_stage(self._pair_obj, half, all_gather=True)
+        return out.view(input.shape)
 
     def _allocate_graph_row(self, input: torch.Tensor, nbytes: int) -> torch.Tensor:
         index = self._graph_counter + len(self._graph_inputs)
@@ -569,9 +729,28 @@ class CustomAllReduceV2:
 
     def close(self):
         if not self.disabled and hasattr(self, "obj"):
-            self._ipc_manager.destroy()
-            dist.barrier(group=self.group)
-            del self.obj  # drop the pointer holder before the workspace tensors
+            if self._ipc_manager is not None:
+                self._ipc_manager.destroy()
+            fabric = _is_hip and self._is_multinode
+            if fabric:
+                from sglang.srt.utils.hip_vmm_utils import teardown_barrier
+
+                # Free the FABRIC workspace only after every rank's kernels have
+                # drained; a peer that never arrives leaves it to process exit.
+                peers_alive = teardown_barrier(self.group)
+                if peers_alive:
+                    torch.cuda.synchronize(self.device)
+                    peers_alive = teardown_barrier(self.group)
+            else:
+                dist.barrier(group=self.group)
+            # drop the pointer holders before the workspace tensors
+            del self.obj
+            self._pair_obj = self._cross_obj = None
+            if fabric:
+                if peers_alive:
+                    self._symm_owner.close(group=self.group)
+                else:
+                    _unreleased_buffers.append(self._symm_owner)
         if hasattr(self, "_vmm_graph_input_manager"):
             self._vmm_graph_input_manager.close()
 
@@ -583,10 +762,31 @@ def can_use_custom_all_reduce_v2(
     group: ProcessGroup,
     device: torch.device,
 ) -> bool:
+    if _is_hip:
+        from sglang.srt.utils.hip_vmm_utils import (
+            MIN_HIP_VERSION,
+            hip_runtime_version,
+        )
+
+        version = hip_runtime_version()
+        if version[:2] < MIN_HIP_VERSION:
+            logger.warning(
+                "CustomAllReduceV2 is disabled: HIP runtime %s is older than %s, "
+                "the oldest it is validated on.",
+                ".".join(map(str, version)),
+                ".".join(map(str, MIN_HIP_VERSION)),
+            )
+            return False
     supported = get_supported_world_sizes()
     if dist.get_world_size(group=group) not in supported:
         return False
     if not all(in_the_same_node_as(group, source_rank=0)):
+        if _is_hip:
+            from .gfx1250_fabric import probe_fabric_clique
+
+            # NVML cliques do not exist on ROCm; only a gfx1250 UALink fabric
+            # clique can host a multi-node workspace
+            return probe_fabric_clique(group, device)
         return is_one_nvlink_clique(group, device)
     full_nvlink = can_use_custom_all_reduce_with_nvlink(
         group=group,
