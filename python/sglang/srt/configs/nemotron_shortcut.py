@@ -129,6 +129,7 @@ register_linear_attn_model(
         arch_names=["Nemotron4ForConditionalGeneration"],
         uses_mamba_radix_cache=True,
         support_mamba_cache=True,
+        support_mamba_cache_extra_buffer=True,
         unwrap_text_config=True,
     )
 )
