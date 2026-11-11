@@ -206,7 +206,7 @@ tensor copy at each residual site.
 | `try_fused_flux2_qkv_epilogue` | KDA (JIT CUDA) | bit-exact vs the selected BF16 chain | FLUX.2 QK RMSNorm + RoPE + joint QKV packing |
 | `try_fused_qwen_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes; SM90+ |
 | `rmsnorm_cast_before_weight_rope_bitexact` | Triton | ATen-ordered RMSNorm plus exact BF16 rotate-half RoPE, MOSS-Image width 128 |
-| `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
+| `fused_rope_rotate_half_bitexact` | Triton | separate BF16 rounding after each product and the sum; HiDream-O1-Image reuses it for contiguous Q/K with first-call verification and eager fallback |
 | `fused_rope_rotate_half_fp32` | Triton | paired split-half Q/K RoPE with separately rounded FP32 products and sum before the FP16/BF16 cast; Anima verifies each new signature against eager |
 | `flux3_video_qknorm_rope` | Triton | bit-exact vs affine-free ``nn.RMSNorm`` (head dim 64) plus eager rotate-half RoPE; FLUX 3 video VAE, ``eps=1e-5`` |
 | `fused_complex_rope` | Triton | preserves CUDA complex64 multiply rounding for contiguous BSHD inputs; Qwen-Image 2.1 verifies its first call against eager |

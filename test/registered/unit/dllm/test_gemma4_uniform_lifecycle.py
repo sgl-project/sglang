@@ -223,7 +223,8 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder = object.__new__(PrefillAdder)
         adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=True)
         adder.can_run_list = []
-        adder._get_dllm_remain_tokens = lambda req=None: 64
+        adder._get_dllm_remain_tokens = lambda req=None, **_: 64
+        adder.memory_budget = SimpleNamespace(prices_by_demand=False)
         adder._state_slots_for_req = lambda req: 0
         adder._update_prefill_budget = Mock()
 
@@ -395,6 +396,11 @@ class TestGemma4RequestValidation(unittest.TestCase):
         sender = Mock()
         scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=sender)
         scheduler.rust_server = None
+        scheduler.tree_cache = Mock()
+        scheduler.beam_coordinator = Mock()
+        scheduler.hisparse_coordinator = None
+        scheduler.uocr_runtime = None
+        scheduler.init_request_retirer()
         recv_req = MagicMock(
             session_params=None,
             session_id=None,

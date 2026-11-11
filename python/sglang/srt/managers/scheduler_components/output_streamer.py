@@ -391,6 +391,7 @@ class SchedulerOutputStreamer:
         has_phs = False
         for req in reqs:
             if req.finished():
+                record_send(req, "stream")
                 rids.append(req.rid)
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
