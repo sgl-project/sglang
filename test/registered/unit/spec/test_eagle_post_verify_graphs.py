@@ -705,6 +705,7 @@ class TestSideStreamCommitWritesTheForwardSlots(CustomTestCase):
         caches = SimpleNamespace(
             temporal=torch.zeros((1, slots, width), device=device),
             intermediate_ssm=torch.zeros((1, slots, steps, width), device=device),
+            intermediate_ssm_u=None,
             conv=[torch.empty(0, device=device)],
             intermediate_conv_window=[torch.empty(0, device=device)],
         )
