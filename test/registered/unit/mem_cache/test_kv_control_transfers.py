@@ -581,6 +581,72 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
         service.progress()
         return span
 
+    def test_cancelled_queued_read_drains_before_later_storage_io(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            scopes = [cache_fixtures.target(range(i, i + 4)) for i in (1, 5, 9)]
+            self._cold_scopes(owner, scopes)
+            cc = cache.cache_controller
+            entered = [threading.Event(), threading.Event()]
+            release = [threading.Event(), threading.Event()]
+            original, calls = cc.page_get_func, []
+
+            def blocked(operation, *args, **kwargs):
+                index = len(calls)
+                calls.append(operation)
+                entered[index].set()
+                assert release[index].wait(5)
+                return original(operation, *args, **kwargs)
+
+            request = CacheRequestHandle("later-ordinary-read", 0)
+            results = []
+            try:
+                with (
+                    patch.object(cc, "page_get_func", blocked),
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    first = self._restore(service, scopes[0], "active")
+                    results.append(first)
+                    wait_for(service, entered[0].is_set)
+                    self._ordinary_prefetch(cache, service, scopes[1], request)
+                    cancelled = self._restore(service, scopes[2], "cancel-queued")
+                    results.append(cancelled)
+                    wait_for(service, lambda: cc.prefetch_buffer.qsize() == 2)
+                    self.assertFalse(
+                        service.control.cancel(cancelled.ref).update.quiescent
+                    )
+                    release[0].set()
+                    wait_for(service, entered[1].is_set)
+                    deadline = time.monotonic() + 1
+                    while (
+                        not current(service, cancelled).status.terminal
+                        and time.monotonic() < deadline
+                    ):
+                        service.progress()
+                        time.sleep(0.005)
+                    self.assertEqual(
+                        current(service, cancelled).status, Status.CANCELLED
+                    )
+                    self.assertTrue(current(service, cancelled).update.quiescent)
+                    self.assertFalse(release[1].is_set())
+                    self.assertEqual(len(calls), 2)
+                    release[1].set()
+                    self.assertEqual(wait(service, first).status, Status.COMPLETED)
+                    self.assertEqual(
+                        self._consume_ordinary_prefetch(cache, service, request)[0], 4
+                    )
+            finally:
+                for event in release:
+                    event.set()
+                for result in results:
+                    wait(service, result)
+                if request in cache.ongoing_prefetch:
+                    self._consume_ordinary_prefetch(cache, service, request)
+            assert_retired(cache, service)
+
     def test_prefetch_keeps_host_anchor_without_pinning_device_prefix(self):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 

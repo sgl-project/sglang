@@ -298,6 +298,19 @@ class PrefetchOperation(StorageOperation):
             return self._terminated_flag
 
 
+class _PrefetchBuffer(Queue):
+    """Drain cancelled reads before live I/O for a single storage participant."""
+
+    def _get(self):
+        for index, operation in enumerate(self.queue):
+            if operation is not None and operation.is_terminated():
+                self.queue.rotate(-index)
+                cancelled = self.queue.popleft()
+                self.queue.rotate(index)
+                return cancelled
+        return super()._get()
+
+
 class HiCacheController:
     def __init__(
         self,
@@ -484,7 +497,10 @@ class HiCacheController:
         )
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
-        self.prefetch_buffer = Queue()
+        # Collective ACKs require identical operation order across participants.
+        self.prefetch_buffer = (
+            Queue() if self.prefetch_completion_sync_groups else _PrefetchBuffer()
+        )
         self.prefetch_sync_queue = Queue()
         self.prefetch_hit_queue = Queue()
         self.ack_prefetch_queue = Queue()
