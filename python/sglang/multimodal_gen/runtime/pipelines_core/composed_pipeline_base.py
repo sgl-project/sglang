@@ -978,20 +978,14 @@ class ComposedPipelineBase(ABC):
             prepare_extra_kwargs=prepare_extra_timestep_kwargs
         )
         if progressive_denoising_stage_cls is None:
-            if standard_denoising_stage_cls is DenoisingStage:
-                self.add_standard_denoising_stage()
-            else:
-                self.add_standard_denoising_stage(
-                    stage_cls=standard_denoising_stage_cls
-                )
+            self.add_standard_denoising_stage(
+                stage_cls=standard_denoising_stage_cls,
+            )
         else:
-            if standard_denoising_stage_cls is DenoisingStage:
-                self.add_progressive_denoising_stage(progressive_denoising_stage_cls)
-            else:
-                self.add_progressive_denoising_stage(
-                    progressive_denoising_stage_cls,
-                    standard_stage_cls=standard_denoising_stage_cls,
-                )
+            self.add_progressive_denoising_stage(
+                progressive_denoising_stage_cls,
+                standard_stage_cls=standard_denoising_stage_cls,
+            )
         self.add_standard_decoding_stage()
 
         return self
