@@ -523,14 +523,24 @@ class OpenAIServingChat(OpenAIServingBase):
             tokenizer = self.tokenizer_manager.tokenizer
             added_ids = tokenizer.encode("")
             self._tokenizer_auto_adds_specials = len(added_ids) > 0
-            # A nonempty input distinguishes a BOS prefix from an EOS suffix,
-            # even when the tokenizer uses the same ID for both.
             if (
                 self._tokenizer_auto_adds_specials
                 and added_ids[0] == getattr(tokenizer, "bos_token_id", None)
                 and tokenizer.encode("x")[:1] == added_ids[:1]
             ):
-                self._auto_added_bos_id = added_ids[0]
+                content_ids = tokenizer.encode("x", add_special_tokens=False)
+                # If the content itself starts with BOS (e.g. UNK shares its ID),
+                # only the special-token mask distinguishes a prefix from a suffix.
+                if content_ids[:1] == added_ids[:1]:
+                    probe = tokenizer("x", return_special_tokens_mask=True)
+                    mask = probe["special_tokens_mask"]
+                    prepends_bos = mask[:1] == [1] and len(mask) == len(
+                        probe["input_ids"]
+                    )
+                else:
+                    prepends_bos = bool(content_ids)
+                if prepends_bos:
+                    self._auto_added_bos_id = added_ids[0]
         except Exception:
             self._tokenizer_auto_adds_specials = True
         self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()

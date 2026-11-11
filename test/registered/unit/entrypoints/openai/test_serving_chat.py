@@ -1696,11 +1696,11 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertEqual(choice.finish_reason, "tool_calls")
 
     def test_text_only_multimodal_prompt_distinguishes_bos_prefix_from_eos_suffix(self):
-        """A tokenizer can use the same ID for a BOS prefix or an EOS suffix."""
+        """An unknown token can share its ID with both BOS and EOS."""
         self.tm.model_config.is_multimodal = True
         self.template_manager.chat_template_name = None
         backend = BackendTokenizer(
-            tokenizer_models.WordLevel({"<s>": 0, "hi": 1, "[UNK]": 2}, "[UNK]")
+            tokenizer_models.WordLevel({"<s>": 0, "hi": 1}, "<s>")
         )
         backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
         for pattern, expected in [("<s> $A", [0, 1]), ("$A <s>", [0, 1, 0])]:
@@ -1712,7 +1712,7 @@ class ServingChatTestCase(CustomTestCase):
                     tokenizer_object=backend,
                     bos_token="<s>",
                     eos_token="<s>",
-                    unk_token="[UNK]",
+                    unk_token="<s>",
                     chat_template="{{ bos_token }} {{ messages[0].content }}",
                 )
                 self.tm.tokenizer = tokenizer
