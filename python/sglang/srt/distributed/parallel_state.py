@@ -70,6 +70,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     is_mlu,
     is_musa,
@@ -1330,9 +1331,12 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
+                    # gfx1250: aiter cannot exchange captured graph buffers across
+                    # ranks, so registering here crashes flush_graph_buffers.
                     if (
                         envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
                         or envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
+                        or is_gfx1250_supported()
                     ):
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
