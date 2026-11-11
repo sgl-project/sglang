@@ -13,7 +13,8 @@ from typing import Any, Dict, Mapping, NoReturn, Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import MultiprocessingSerializer, is_npu
+from sglang.srt.platforms import current_platform
+from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import send_msg
 
@@ -58,6 +59,13 @@ def _recv_fd(sock: socket.socket) -> Tuple[int, int]:
 
 class WeightCacheTransportBackend(ABC):
     name: str
+
+    @classmethod
+    def can_export_state(
+        cls, state_tensors: Mapping[str, Tuple[torch.Tensor, bool]]
+    ) -> bool:
+        """Whether this backend can export every one of these tensors."""
+        return True
 
     @abstractmethod
     def prepare_export(
@@ -187,42 +195,47 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
         self._raise_not_implemented()
 
 
+TRANSPORT_BACKENDS: Dict[str, type[WeightCacheTransportBackend]] = {
+    TORCH_IPC_BACKEND: TorchIpcTransportBackend,
+    VMM_FD_BACKEND: VmmFdTransportBackend,
+}
+
+
+def resolve_transport_backend_cls(name: str) -> type[WeightCacheTransportBackend]:
+    backend_cls = TRANSPORT_BACKENDS.get(name)
+    if backend_cls is None:
+        raise RuntimeError(
+            f"Unknown weight cache transport backend {name!r}; registered "
+            f"backends are {sorted(TRANSPORT_BACKENDS)}"
+        )
+    return backend_cls
+
+
 def choose_daemon_transport_backend(
     state_tensors: Mapping[str, Tuple[torch.Tensor, bool]],
 ) -> WeightCacheTransportBackend:
-    if is_npu():
-        # torch_npu must be imported before the first ForkingPickler dump of an
-        # NPU tensor so its reducer is registered; otherwise the tensor falls
-        # back to a CPU copy instead of zero-copy IPC. Probe once and warn (rather
-        # than error) if zero-copy is unavailable, so weight caching still works
-        # by copying the weights through the CPU.
-        import torch.multiprocessing.reductions as _reductions
-        import torch_npu  # noqa: F401
-
-        first = next(iter(state_tensors.values()), None)
-        if first is not None:
-            rebuild_fn, _ = _reductions.reduce_tensor(first[0].data)
-            if getattr(rebuild_fn, "__name__", None) != "rebuild_npu_tensor":
-                logger.warning(
-                    "NPU weight-cache zero-copy IPC is unavailable: tensor "
-                    "reduced to %r instead of torch_npu's rebuild_npu_tensor; "
-                    "falling back to a CPU copy. Zero-copy requires Ascend HDK "
-                    ">= 25.3.RC1 and CANN >= 8.3.RC1, and is unsupported on "
-                    "Ascend 950DT.",
-                    rebuild_fn,
-                )
-        logger.info("[weight_cache] Using transport backend: %s", TORCH_IPC_BACKEND)
-        return TorchIpcTransportBackend()
-    if VmmFdTransportBackend.can_export_state(state_tensors):
-        logger.info("[weight_cache] Using transport backend: %s", VMM_FD_BACKEND)
-        return VmmFdTransportBackend()
-    logger.info("[weight_cache] Using transport backend: %s", TORCH_IPC_BACKEND)
-    return TorchIpcTransportBackend()
+    """Pick the first transport this platform declares that can export these tensors."""
+    declared = current_platform.capabilities.weight_cache_transports
+    if not declared:
+        raise RuntimeError(
+            f"Platform {current_platform.device_type!r} declares no weight cache "
+            f"transport, so the daemon cannot export weights. Disable the weight "
+            f"cache (--weight-cache-mode off)."
+        )
+    for name in declared:
+        backend_cls = resolve_transport_backend_cls(name)
+        if not backend_cls.can_export_state(state_tensors):
+            continue
+        logger.info("[weight_cache] Using transport backend: %s", name)
+        return backend_cls()
+    raise RuntimeError(
+        f"None of the transports declared by platform "
+        f"{current_platform.device_type!r} ({list(declared)}) can export these "
+        f"weights."
+    )
 
 
 def get_client_transport_backend(name: Optional[str]) -> WeightCacheTransportBackend:
-    if name in (None, "", TORCH_IPC_BACKEND):
+    if name in (None, ""):
         return TorchIpcTransportBackend()
-    if name == VMM_FD_BACKEND:
-        return VmmFdTransportBackend()
-    raise RuntimeError(f"Unknown weight cache transport backend {name!r}")
+    return resolve_transport_backend_cls(name)()

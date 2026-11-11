@@ -23,5 +23,8 @@ class MusaSRTPlatform(MusaDeviceMixin, SRTPlatform):
     """Default in-tree MUSA SRT platform."""
 
     capabilities = PlatformCapabilities(
-        supports_triton=True, graph_capture=True, supports_pynccl=True
+        supports_triton=True,
+        graph_capture=True,
+        supports_pynccl=True,
+        weight_cache_transports=("vmm_fd", "torch_ipc"),
     )

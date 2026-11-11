@@ -29,4 +29,5 @@ class RocmSRTPlatform(RocmDeviceMixin, SRTPlatform):
         piecewise_graph=True,
         hicache_device_kernels=True,
         supports_pynccl=True,
+        weight_cache_transports=("vmm_fd", "torch_ipc"),
     )
