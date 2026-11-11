@@ -400,7 +400,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 self.hidden_size,
                 self.n_heads,
                 bias=False,
-                params_dtype=torch.bfloat16,
+                params_dtype=(
+                    torch.float32
+                    if _is_npu
+                    and config is not None
+                    and config.architectures[0]
+                    in ("LongcatFlashForCausalLM", "LongcatFlashForCausalLMNextN")
+                    else torch.bfloat16
+                ),
                 prefix=add_prefix("weights_proj", prefix),
             )
         k_norm_eps_kwargs = {} if k_norm_eps is None else {"eps": k_norm_eps}
