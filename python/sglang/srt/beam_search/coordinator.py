@@ -228,7 +228,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 f"KV slots, but the pool holds only "
                 f"{self.token_to_kv_pool_allocator.size}."
             )
-        stop_token_ids = self._collect_stop_token_ids(req, user_params)
+        stop_token_ids = self._collect_stop_token_ids(
+            req, user_params, vocab_size=self.model_config.vocab_size
+        )
         if self.trie_constraint is not None:
             config = self.trie_constraint.config
             if max_new_tokens != config.num_codebooks:
@@ -296,7 +298,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         )
 
     @staticmethod
-    def _collect_stop_token_ids(req: Req, user_params) -> List[int]:
+    def _collect_stop_token_ids(req: Req, user_params, *, vocab_size: int) -> List[int]:
         if user_params.ignore_eos:
             return []
         stop_ids = set(user_params.stop_token_ids or ())
@@ -306,7 +308,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             if getattr(tokenizer, "eos_token_id", None) is not None:
                 stop_ids.add(tokenizer.eos_token_id)
             stop_ids |= set(getattr(tokenizer, "additional_stop_token_ids", None) or ())
-        return sorted(stop_ids)
+        # Out-of-vocab ids never match; past int64 they would break BeamGroup's tensor.
+        return sorted(t for t in stop_ids if 0 <= t < vocab_size)
 
     def maybe_select_and_relay(
         self, batch: ScheduleBatch, batch_result, chunked_req: Optional[Req] = None
