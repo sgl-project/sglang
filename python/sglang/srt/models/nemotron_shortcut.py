@@ -12,9 +12,7 @@
 # limitations under the License.
 """Nemotron Shortcut: the GDP / SDSA hybrid text stack and the Pixtral vision tower.
 
-Not served yet: the MTP head, the top-k sparse
-attention indexer (attention is dense, exact for contexts <= index_topk) and
-TP/EP > 1.
+Not served yet: the MTP head and TP/EP > 1.
 """
 
 from __future__ import annotations
@@ -282,7 +280,8 @@ class NemotronShortcutAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        # TODO(nemotron_shortcut): top-k sparse attention; the indexer is loaded, unused.
+        # SDSA: the indexer's one-head query/key pick each query's top-k keys
+        # (layers/attention/sdsa_backend.py).
         self.indexer = (
             NemotronShortcutIndexer(
                 config, quant_config=quant_config, prefix=add_prefix("indexer", prefix)
@@ -304,7 +303,14 @@ class NemotronShortcutAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        out = self.attn(q, k, v, forward_batch)
+        if self.indexer is None:
+            out = self.attn(q, k, v, forward_batch)
+        else:
+            index_q, _ = self.indexer.q_proj(hidden_states)
+            index_k, _ = self.indexer.k_proj(hidden_states)
+            out = self.attn(
+                q, k, v, forward_batch, sdsa_index_q=index_q, sdsa_index_k=index_k
+            )
         out, _ = self.o_proj(out)
         return out
 
@@ -670,12 +676,6 @@ class NemotronShortcutForConditionalGeneration(nn.Module):
             prefix=add_prefix("lm_head", prefix),
         )
         self.logits_processor = LogitsProcessor(text_config)
-        if text_config.index_topk is not None:
-            logger.warning(
-                "Nemotron Shortcut sparse attention is not implemented; attention is dense "
-                "and matches the model only for contexts <= %d tokens.",
-                text_config.index_topk,
-            )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.language_model.embed_tokens

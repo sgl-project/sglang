@@ -2937,7 +2937,15 @@ class KVCacheConfigurator:
                 f"--qsa-indexer-dtype {qsa_indexer_dtype} needs a model with a "
                 "compressed QSA indexer (Qwen4-Exp); this model has none"
             )
-        if qsa_profile is None:
+        from sglang.srt.configs.nemotron_shortcut import sdsa_index_head_dim
+
+        sdsa_head_dim = sdsa_index_head_dim(self.model_config.hf_config)
+        if sdsa_head_dim is not None:
+            from sglang.srt.mem_cache.sdsa_kv_pool import SdsaTokenToKVPool
+
+            pool_class = SdsaTokenToKVPool
+            extra_args["sdsa_index_head_dim"] = sdsa_head_dim
+        elif qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
         else:

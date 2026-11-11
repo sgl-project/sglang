@@ -27,6 +27,8 @@ before the mixer runs.
 
 from __future__ import annotations
 
+from typing import Optional
+
 from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.linear_attn_model_registry import (
@@ -118,6 +120,14 @@ class NemotronShortcutLayout:
         )
 
 
+def sdsa_index_head_dim(hf_config: PretrainedConfig) -> Optional[int]:
+    """Index-key width when SDSA serves this model's attention, else None."""
+    text_config = hf_config.get_text_config()
+    if is_nemotron_shortcut_text_config(text_config) and text_config.index_topk:
+        return text_config.index_head_dim
+    return None
+
+
 register_linear_attn_model(
     LinearAttnModelSpec(
         config_class=PretrainedConfig,
@@ -131,5 +141,8 @@ register_linear_attn_model(
         support_mamba_cache=True,
         support_mamba_cache_extra_buffer=True,
         unwrap_text_config=True,
+        full_attn_backend_factory_name=(
+            "sglang.srt.layers.attention.sdsa_backend.create_sdsa_backend"
+        ),
     )
 )

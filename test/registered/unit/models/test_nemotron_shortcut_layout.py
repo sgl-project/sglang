@@ -11,7 +11,11 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     get_linear_attn_spec,
 )
-from sglang.srt.configs.nemotron_shortcut import NemotronShortcutLayout, gdp_conv_dim
+from sglang.srt.configs.nemotron_shortcut import (
+    NemotronShortcutLayout,
+    gdp_conv_dim,
+    sdsa_index_head_dim,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -98,6 +102,12 @@ class TestLayout(CustomTestCase):
     def test_unequal_gdp_groups_are_rejected(self):
         with self.assertRaises(ValueError):
             NemotronShortcutLayout(_text_config(gdp_num_groups=4))
+
+
+class TestSdsaGating(CustomTestCase):
+    def test_index_cache_only_with_index_topk(self):
+        self.assertEqual(sdsa_index_head_dim(_config()), 128)
+        self.assertIsNone(sdsa_index_head_dim(_config(_text_config(index_topk=None))))
 
 
 if __name__ == "__main__":
