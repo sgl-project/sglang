@@ -1546,12 +1546,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         pack_buffer,
         pack_offset_bytes: int,
     ) -> list:
-        """Transfer params moving index-K rows ``src_rows`` to ``dst_rows``.
-
-        An index-K page holds the fp8 keys of its tokens, then their scales, so
-        a token's row is two pieces: each is addressed in units of its own
-        width, which the page bytes are a multiple of. The source pieces are
-        packed in destination order when the pack buffer has room."""
         src_ptrs, dst_ptrs, page_bytes = dsa_index_k
         page_size = self.kv_args.page_size
         value_bytes, scale_bytes = self.kv_args.dsa_index_k_token_bytes
@@ -1600,8 +1594,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def dsa_index_k_dcp_entries(
         self, registration_info: KVArgsRegisterInfo
     ) -> Optional[Tuple[List[int], List[int], int]]:
-        """The DSA index-K a PD DCP relayout moves with the KV: (source,
-        destination buffers, page bytes), or None when the pool has none."""
         state_types = self.kv_args.state_types
         if StateType.DSA not in state_types:
             return None
@@ -1618,7 +1610,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             registration_info.dst_state_item_lens[i],
             StateType.DSA,
         )
-        # Layers that reuse the previous top-k keep no index-K on either side.
         pairs = [
             (src, dst, src_len)
             for src, dst, src_len, dst_len in zip(
@@ -1667,9 +1658,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         draft_rows_collapsed: bool = False,
         dsa_index_k: Optional[Tuple[List[int], List[int], int]] = None,
     ) -> int:
-        """``dsa_index_k``: (source, destination buffers, page bytes) of a DSA
-        index-K the decode shards by token like its KV (Kimi-K3.1); its rows
-        move with the target KV rows."""
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
         physical_page_size = self.kv_args.page_size
@@ -1749,7 +1737,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 plan.target_src_token_indices,
                 plan.target_dst_token_indices,
                 pack_buffer,
-                # after the target and draft KV rows packed for this transfer
                 pack_offset_bytes=(
                     plan.target_src_token_indices.size
                     * sum(dcp_token_item_lens[:num_target])
@@ -2242,7 +2229,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 and target_rank_registration_info is not None
                 and target_rank_registration_info.requires_dcp_relayout
             ):
-                # Moved row by row with the KV (send_kvcache_dcp).
                 continue
             src_data_ptrs = self.kv_args.state_data_ptrs[i]
             src_item_lens = self.kv_args.state_item_lens[i]

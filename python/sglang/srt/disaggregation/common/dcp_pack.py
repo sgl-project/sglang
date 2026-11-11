@@ -95,8 +95,6 @@ def try_pack_dcp_src(
 
 
 def dsa_index_k_item_lens(kv_args) -> List[int]:
-    """Page bytes of the DSA index-K buffers a PD DCP relayout moves token by
-    token, or [] when the pool has none it can move that way."""
     if kv_args.dsa_index_k_token_bytes is None:
         return []
     from sglang.srt.disaggregation.base.conn import StateType
@@ -140,7 +138,6 @@ def init_dcp_pack_buffers(
     size_bytes = dcp_pack_buffer_bytes(
         kv_item_lens, kv_args.page_size, max_tokens, dcp_size
     )
-    # DSA index-K moves with the target KV rows (see dsa_index_k_dcp_entries).
     index_k_token_bytes = sum(
         item_len // kv_args.page_size for item_len in dsa_index_k_item_lens(kv_args)
     )

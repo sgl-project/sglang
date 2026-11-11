@@ -426,19 +426,15 @@ def dcp_global_topk(
     *,
     all_gather: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> torch.Tensor:
-    """Decode / target verify: global top-k over the DCP group as widened KV
-    slots, -1 padded.
+    """Decode: global top-k over the DCP group as widened KV slots, -1 padded.
 
-    Row i is a query row (decode: request i; target verify: request i // n,
-    draft step i % n). ``local_lens`` / ``global_lens``: [rows] visible keys
-    of this rank / of the whole sequence for that row. ``page_table``: [rows,
-    pages] this rank's physical page ids, which are the widened page ids of the
-    row's request:
+    Row i is request i. ``local_lens`` / ``global_lens``: [rows] visible keys
+    of this rank / of the whole sequence. ``page_table``: [rows, pages] this
+    rank's physical page ids, which are the widened page ids of the request:
     global position p maps to slot ``page_table[p // span] * span + p % span``
     with span ``page_size * dcp_size``. ``plan``: the v2 top-k plan of
-    ``global_lens``. ``all_gather`` replaces the group all-gather (tests run
-    every rank in one process). Every rank must call this with the same number
-    of rows, also when it has no local keys.
+    ``global_lens``. Every rank must call this with the same number of rows,
+    also when it has no local keys.
 
     With ``DcpTopKMerge`` the result holds only this rank's slots, which is all
     ``dcp_localize_compact`` keeps.
