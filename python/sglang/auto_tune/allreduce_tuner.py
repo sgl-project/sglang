@@ -50,6 +50,11 @@ MODES = ("eager", "graph")
 
 _NUM_WARMUP = 20
 
+# The kernels spin-wait on their peers, so a call only completes once every
+# rank runs it. Nothing inside a timing loop keeps the ranks together, so they
+# are brought back in step every this many calls or replays.
+_SYNC_EVERY = 10
+
 
 @dataclasses.dataclass
 class AllreduceConfig:
@@ -104,19 +109,29 @@ def _normalize_sizes(sizes: List[int]) -> List[int]:
 # ---------------------------------------------------------------------------
 
 
-def _time_eager(step, num_iters: int, use_median: bool) -> float:
+def _time_eager(
+    step,
+    num_iters: int,
+    use_median: bool,
+    barrier: Callable[[], None],
+    sync_every: int,
+) -> float:
     """Microseconds per call, launched from Python one call at a time."""
     import torch
 
     for _ in range(_NUM_WARMUP):
         step()
-    torch.cuda.synchronize()
+    barrier()
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
     for i in range(num_iters):
         starts[i].record()
         step()
         ends[i].record()
+        # Each event pair spans one call, so re-syncing between calls stays
+        # out of the measurement.
+        if sync_every and (i + 1) % sync_every == 0:
+            barrier()
     torch.cuda.synchronize()
     if use_median:
         return statistics.median(
@@ -128,17 +143,32 @@ def _time_eager(step, num_iters: int, use_median: bool) -> float:
         )
 
 
+def _replay(
+    graph, count: int, barrier: Callable[[], None], sync_every: int
+) -> None:
+    """Replay ``count`` times, letting the ranks drift at most a chunk apart."""
+    for i in range(count):
+        graph.replay()
+        if i + 1 == count or (sync_every and (i + 1) % sync_every == 0):
+            barrier()
+
+
 def _time_graph(
     step,
     capture: Callable[[], ContextManager],
     num_iters: int,
     ingraph_calls: int,
     use_median: bool,
+    barrier: Callable[[], None],
+    sync_every: int,
 ) -> float:
     """Microseconds per call, from replays of a graph that holds ``ingraph_calls`` calls.
 
     The calls are recorded back to back, as consecutive layers' all-reduces
     are in a decode graph. ``num_iters`` is the number of timed replays.
+
+    ``barrier`` brings every rank to the same point. It is called the same
+    number of times on every rank, so it cannot itself hang.
     """
     import torch
 
@@ -147,7 +177,7 @@ def _time_graph(
     # zeros, so it would not exercise the kernel.
     for _ in range(_NUM_WARMUP):
         step()
-    torch.cuda.synchronize()
+    barrier()
 
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
@@ -158,17 +188,22 @@ def _time_graph(
         with torch.cuda.graph(graph, stream=stream):
             for _ in range(ingraph_calls):
                 step()
-    torch.cuda.synchronize()
+    # Registration only agreed on the peers' addresses, it did not wait for
+    # them. A rank that replays now hands its kernel an address a peer has yet
+    # to publish.
+    barrier()
 
-    for _ in range(_NUM_WARMUP):
-        graph.replay()
-    torch.cuda.synchronize()
+    _replay(graph, _NUM_WARMUP, barrier, sync_every)
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]
     for i in range(num_iters):
         starts[i].record()
         graph.replay()
         ends[i].record()
+        # Each event pair spans one replay, so re-syncing between replays
+        # stays out of the measurement.
+        if sync_every and (i + 1) % sync_every == 0:
+            barrier()
     torch.cuda.synchronize()
     samples = (
         starts[i].elapsed_time(ends[i]) * 1000 / ingraph_calls for i in range(num_iters)
@@ -185,6 +220,8 @@ def _time_backend(
     num_iters: int,
     ingraph_calls: int,
     use_median: bool,
+    barrier: Callable[[], None],
+    sync_every: int,
 ) -> float:
     def step():
         out = backend.call(tensor)
@@ -193,8 +230,16 @@ def _time_backend(
         return out
 
     if mode == "graph":
-        return _time_graph(step, backend.capture, num_iters, ingraph_calls, use_median)
-    return _time_eager(step, num_iters, use_median)
+        return _time_graph(
+            step,
+            backend.capture,
+            num_iters,
+            ingraph_calls,
+            use_median,
+            barrier,
+            sync_every,
+        )
+    return _time_eager(step, num_iters, use_median, barrier, sync_every)
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +627,7 @@ def tune_allreduce(
     ignore_scr_max_size: bool = False,
     qr_cast_bf16_to_fp16: bool = True,
     use_median: bool = False,
+    sync_every: int = _SYNC_EVERY,
 ) -> Tuple[List[AllreduceConfig], List[Dict[str, Any]]]:
     """Time each backend at each size in ``mode`` and return the fastest per size."""
     import torch
@@ -671,6 +717,8 @@ def tune_allreduce(
                             num_iters,
                             ingraph_calls,
                             use_median,
+                            barrier,
+                            sync_every,
                         )
                     except Exception as e:
                         t = None
@@ -729,6 +777,7 @@ def run_allreduce_tuning(
     ignore_scr_max_size: bool = False,
     qr_cast_bf16_to_fp16: bool = True,
     use_median: bool = False,
+    sync_every: int = _SYNC_EVERY,
 ) -> Dict[str, Any]:
     """Tune, then write ``allreduce_configs_<mode>.json`` into ``output_dir``."""
     if verbose:
@@ -749,6 +798,7 @@ def run_allreduce_tuning(
         ignore_scr_max_size=ignore_scr_max_size,
         qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
         use_median=use_median,
+        sync_every=sync_every,
     )
     if not results:
         if verbose:

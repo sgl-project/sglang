@@ -19,10 +19,15 @@ import os
 import sys
 
 from sglang.auto_tune.allreduce_tuner import (
+    _SYNC_EVERY,
     QR_QUANT_REGIMES,
     print_allreduce_summary,
     run_allreduce_tuning,
 )
+
+
+_STACK_DIR = os.environ.get("ALLREDUCE_TUNE_STACK_DIR", "/tmp/ar-tune-stacks")
+_STACK_PERIOD_S = 20
 
 
 def _bool01(value: str) -> bool:
@@ -126,26 +131,49 @@ def create_parser() -> argparse.ArgumentParser:
         default="allreduce_tune_out",
         help="Rank 0 writes allreduce_configs_<eager|graph>.json here.",
     )
+    parser.add_argument(
+        "--sync-every",
+        type=int,
+        default=_SYNC_EVERY,
+        help=(
+            "Barrier across ranks every this many timed calls (eager) or "
+            f"replays (graph). Default {_SYNC_EVERY}. 0 never barriers inside "
+            "the loop, which is what hangs: the kernels spin-wait on their "
+            "peers, so the ranks must not drift far apart."
+        ),
+    )
+    parser.add_argument(
+        "--timeout",
+        dest="stack_period_s",
+        type=float,
+        default=_STACK_PERIOD_S,
+        help=(
+            "Seconds of no progress before every rank's stack is dumped, "
+            f"repeating. Default {_STACK_PERIOD_S}. 0 turns the dumps off. "
+            "Raise it when a size legitimately takes longer than this, so "
+            "the dumps do not bury the results."
+        ),
+    )
     return parser
 
 
-_STACK_DIR = os.environ.get("ALLREDUCE_TUNE_STACK_DIR", "/tmp/ar-tune-stacks")
-_STACK_PERIOD_S = 20
-
-
-def _enable_stack_dumps(rank: int) -> None:
+def _enable_stack_dumps(rank: int, period_s: float = _STACK_PERIOD_S) -> None:
     """Print every rank's stack into this terminal while the run is hung.
 
     A rank inside torch.cuda.synchronize is waiting on a kernel. A rank inside
-    broadcast_object_list or barrier is waiting on a peer.
+    broadcast_object_list or barrier is waiting on a peer. ``period_s`` is how
+    long a rank may make no progress before it dumps; 0 turns the dumps off.
     """
     import faulthandler
     import threading
 
+    if period_s <= 0:
+        return
+
     os.makedirs(_STACK_DIR, exist_ok=True)
     stream = open(os.path.join(_STACK_DIR, f"rank{rank}.txt"), "w")
     faulthandler.enable(file=stream, all_threads=True)
-    faulthandler.dump_traceback_later(_STACK_PERIOD_S, repeat=True, file=stream)
+    faulthandler.dump_traceback_later(period_s, repeat=True, file=stream)
     if rank != 0:
         return
 
@@ -154,7 +182,7 @@ def _enable_stack_dumps(rank: int) -> None:
     def _report() -> None:
         import time
 
-        time.sleep(_STACK_PERIOD_S + 5)
+        time.sleep(period_s + 5)
         while True:
             parts = ["\n===== where each rank is ====="]
             for other in range(world_size):
@@ -166,12 +194,12 @@ def _enable_stack_dumps(rank: int) -> None:
                 tail = "".join(lines[-8:]).rstrip() or "(no dump yet)"
                 parts.append(f"--- rank {other} ---\n{tail}")
             print("\n".join(parts), file=sys.stderr, flush=True)
-            time.sleep(_STACK_PERIOD_S)
+            time.sleep(period_s)
 
     threading.Thread(target=_report, name="stack-report", daemon=True).start()
 
 
-def _init_distributed() -> None:
+def _init_distributed(stack_period_s: float = _STACK_PERIOD_S) -> None:
     import torch
     import torch.distributed as dist
 
@@ -182,7 +210,9 @@ def _init_distributed() -> None:
             "--tp 8 --sizes <bytes>..."
         )
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    _enable_stack_dumps(int(os.environ.get("RANK", os.environ["LOCAL_RANK"])))
+    _enable_stack_dumps(
+        int(os.environ.get("RANK", os.environ["LOCAL_RANK"])), stack_period_s
+    )
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
 
@@ -193,9 +223,11 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit("-n must be at least 1")
     if args.ingraph_calls < 1:
         sys.exit("--ingraph-calls must be at least 1")
+    if args.sync_every < 0:
+        sys.exit("--sync-every must be 0 or more")
     if any(size <= 0 or size % 2 for size in args.sizes):
         sys.exit("--sizes must be positive multiples of 2 bytes (bf16 tensors)")
-    _init_distributed()
+    _init_distributed(args.stack_period_s)
 
     import torch.distributed as dist
 
@@ -220,11 +252,11 @@ def main(argv: list[str] | None = None) -> None:
             qr_quants=args.qr_quant,
             num_iters=args.num_iters,
             ingraph_calls=args.ingraph_calls,
-            sizes=args.sizes,
             ignore_acr_max_size=args.ignore_acr_max_size,
             ignore_scr_max_size=args.ignore_scr_max_size,
             qr_cast_bf16_to_fp16=bool(args.qr_cast_bf16_to_fp16),
             use_median=args.median,
+            sync_every=args.sync_every,
         )
         if rank == 0:
             print_allreduce_summary(results)
