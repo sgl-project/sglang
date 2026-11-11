@@ -241,7 +241,7 @@ __global__ void moe_align_block_size_kernel(
   if (tid >= num_experts && tid < scan_size) scan_buf[tid] = 0;
   __syncthreads();
 
-  // Perform 2 level exclusive-prefix-sum to scan_buf
+  // Compute the two-level exclusive prefix sum.
   int v = (tid < scan_size) ? scan_buf[tid] : 0;
   int pre = warp_exclusive_scan(v);
   if (lane_id == WARP_SIZE - 1) warp_sums[warp_id] = pre + v;
@@ -254,11 +254,8 @@ __global__ void moe_align_block_size_kernel(
   __syncthreads();
 
   int offset = warp_sums[warp_id];
-  if (tid < scan_size) scan_buf[tid] = pre + offset;
+  if (tid < num_experts) prefix[tid] = pre + offset;
   __syncthreads();
-
-  // Write prefix[0..num_experts - 1] and cumsum
-  if (tid < num_experts) prefix[tid] = scan_buf[tid];
 #endif
 
   if (tid <= num_experts) {
@@ -268,16 +265,16 @@ __global__ void moe_align_block_size_kernel(
   const int32_t num_blocks = s_total_tokens_post_pad / block_size;
   for (int32_t i = tid; i < num_blocks; i += stride) {
     int32_t block_start = i * block_size;
-    int left = 0, right = num_experts;
+    uint32_t left = 0, right = num_experts;
     while (left < right) {
-      int mid = (left + right) >> 1;
+      uint32_t mid = (left + right) >> 1;
       if (prefix[mid] <= block_start) {
         left = mid + 1;
       } else {
         right = mid;
       }
     }
-    expert_ids[i] = left - 2;
+    expert_ids[i] = static_cast<int32_t>(left) - 2;
   }
 }
 

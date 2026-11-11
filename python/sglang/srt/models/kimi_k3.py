@@ -156,6 +156,9 @@ from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
 from sglang.srt.utils.log_utils import rank0_log
 
+if TYPE_CHECKING:
+    from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import TGVMRanges
+
 logger = logging.getLogger(__name__)
 
 # `experts.<expert_id>.<w1|w2|w3>.` fragment of a checkpoint tensor name, the
@@ -164,6 +167,35 @@ _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+
+# (n, k) -> ((m_lo, m_hi, tactic), ...); tactic None = the ladder pick.
+_K3_TGV_M_RANGES = {
+    (6144, 7168): ((1, 64, None),),  # KDA fused qkvg
+    (6016, 7168): ((1, 64, None),),  # merged MoE front
+    (1536, 7168): ((1, 64, None),),  # MLA q_a / shared gate_up / output gate
+    (2112, 7168): ((1, 64, None),),  # MLA fused q_a + kv_a
+}
+
+# Fixed TGV tactics measured on GB300 at TP8 verify rows.
+_K3_GB300_TGV_M_RANGES = {
+    (6144, 7168): ((72, 96, 24),),  # KDA fused qkvg
+    (2112, 7168): ((72, 120, 21), (132, 132, 23), (156, 240, 23), (264, 288, 24)),
+    (1536, 7168): ((72, 192, 21), (240, 288, 23)),  # MLA output gate
+    (7168, 1536): ((72, 84, 24),),  # KDA / MLA o_proj
+    (896, 3584): ((84, 156, 21),),  # TP-sharded latent-up slice
+}
+
+# KDA [f_a | b] on the attention side stream only; run alone these tactics lose.
+_K3_GB300_BFA_SIDE_TGV_M_RANGES = {
+    (144, 7168): ((72, 128, 21), (129, 256, 23), (257, 288, 24)),
+}
+
+
+def _k3_side_stream_max_tokens() -> int:
+    """Largest graphed batch whose attention side-stream GEMMs overlap."""
+    if not get_platform().is_blackwell:
+        return 64
+    return 288 if get_platform().device_sm == 103 else 128
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -1754,10 +1786,9 @@ class KimiK3DeltaAttention(nn.Module):
         # stream (graphed decode/verify only; SM bound as the MLA gate stream).
         self._bfa_alt_stream = bfa_alt_stream
         self._bfa_bs_limit = (
-            (128 if get_platform().is_blackwell else 64)
-            if bfa_alt_stream is not None
-            else 0
+            _k3_side_stream_max_tokens() if bfa_alt_stream is not None else 0
         )
+        self._bfa_side_tgv_m_ranges: Optional[TGVMRanges] = None
         self.tp_size = get_parallel().tp_size
         # KDA is an attention layer: head-sharded params follow the
         # attention-TP group, matching the mamba state cache sizing. Under
@@ -2095,6 +2126,17 @@ class KimiK3DeltaAttention(nn.Module):
             )
             self._bfa_f_b_w = self.f_b_proj.weight
         self._bfa_fa_size, self._bfa_b_size = sizes
+        from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
+
+        if get_platform().device_sm == 103 and get_bf16_gemm_backend().is_cutedsl():
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import TGVMRanges
+
+            m_ranges = TGVMRanges()
+            for m_lo, m_hi, tactic in _K3_GB300_BFA_SIDE_TGV_M_RANGES.get(
+                tuple(self._bfa_w.shape), ()
+            ):
+                m_ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=tactic)
+            self._bfa_side_tgv_m_ranges = m_ranges
 
     def _merge_kda_inproj_weights_hip(self) -> bool:
         """ROCm only: append the [f_a | b] tail to the wide [q,k,v,g] buffer so
@@ -2316,8 +2358,19 @@ class KimiK3DeltaAttention(nn.Module):
                     cur = torch.cuda.current_stream()
                     alt.wait_stream(cur)
                     fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                    m_ranges = self._bfa_side_tgv_m_ranges
+                    tgv_tactic = (
+                        None if m_ranges is None else m_ranges(hidden_states.shape[0])
+                    )
                     with torch.cuda.stream(alt):
-                        bfa = gemm(hidden_states, w)
+                        if tgv_tactic is None:
+                            bfa = gemm(hidden_states, w)
+                        else:
+                            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                                cutedsl_bf16_gemm,
+                            )
+
+                            bfa = cutedsl_bf16_gemm(hidden_states, w, tactic=tgv_tactic)
                         forget_gate = (
                             bfa[..., :n_fa]
                             if defer_f_b
@@ -2574,13 +2627,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self._gate_hidden_states = None
             self._gate_pending_stream = None
             self._gate_alt_stream = gate_alt_stream
-            # Above this token count the attention-core kernels fill the SMs
-            # on their own and the overlap only adds sync overhead (same
-            # bound as deepseek_v4).
             self._gate_bs_limit = (
-                (128 if get_platform().is_blackwell else 64)
-                if self._gate_alt_stream is not None
-                else 0
+                _k3_side_stream_max_tokens() if self._gate_alt_stream is not None else 0
             )
             self._pre_o_proj_out: Optional[torch.Tensor] = None
             self._return_pre_o_proj = False
@@ -3373,6 +3421,11 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import register_tgv_m_ranges
+
+        register_tgv_m_ranges(_K3_TGV_M_RANGES)
+        if get_platform().device_sm == 103:
+            register_tgv_m_ranges(_K3_GB300_TGV_M_RANGES)
         if quant_config is not None:
             if isinstance(quant_config, ModelSlimConfig):
                 model_mapping = {
