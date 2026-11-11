@@ -575,7 +575,6 @@ class LTX2ImageEncodingStage(PipelineStage):
     # generation -- the only signal that separates them.
     _DEFAULT_IMAGE_CRF = 33
     _LTX_2_5_IMAGE_CRF = 18
-    _GEMMA_4_MODEL_TYPES = ("gemma4_unified", "gemma4")
 
     @classmethod
     def _resolve_image_conditioning_crf(cls, server_args: ServerArgs) -> int:
