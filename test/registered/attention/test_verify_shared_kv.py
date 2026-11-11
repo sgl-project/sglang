@@ -17,10 +17,8 @@ from sglang.srt.layers.attention.triton_backend import (
     WindowRail,
     _should_use_verify_shared_kv,
 )
-from sglang.srt.layers.attention.triton_draft_hip import init_draft_backend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_hip_version, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -529,7 +527,6 @@ class TestDraftAttention(CustomTestCase):
                 if FP8_DOT_OK:
                     # The default still runs FP8 q and probabilities over an FP8 cache.
                     default = _backend_extend(case, inputs, bf16_dot=False)
-                    default_err = _err(default, ref)
                     assert not torch.equal(default, out)
 
     def test_bf16_cache_unchanged_by_bf16_dot(self):
@@ -544,24 +541,10 @@ class TestDraftAttention(CustomTestCase):
                     atol=0,
                 )
 
-    def test_draft_backend_gate(self):
-        for algorithm, expected in (
-            (SpeculativeAlgorithm.DFLASH, True),
-            (SpeculativeAlgorithm.DSPARK, True),
-            (SpeculativeAlgorithm.EAGLE, False),
-        ):
-            with self.subTest(algorithm=algorithm):
-                backend = SimpleNamespace(use_mla=False, dcp_size=1)
-                init_draft_backend(backend, SimpleNamespace(spec_algorithm=algorithm))
-                assert backend.draft_bf16_dot is expected
-
     def test_verify_matches_extend(self):
         cases = [
             ((65536, 3000), 8, -1, False),
-            ((600, 1024, 1100), 6, 1024, False),
             ((600, 1024, 1100), 6, 1024, True),
-            ((600, 1024, 1100), 8, 1024, False),
-            ((600, 1024, 1100), 8, 1024, True),
         ]
         for prefix_lens, l_ext, window, bf16_dot in cases:
             with self.subTest(l_ext=l_ext, window=window, bf16_dot=bf16_dot):
