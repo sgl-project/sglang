@@ -135,6 +135,7 @@ from sglang.srt.hf_transformers import (
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.layers.dp_attention import get_dp_tp_group, require_mlp_sync
+from sglang.srt.layers.layernorm_sp import is_muse_spark_architecture
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -1746,6 +1747,19 @@ class Scheduler(
                 scheduler=self,
             )
 
+    def _gpu_work_on_forward_stream(self) -> bool:
+        # Muse Spark's monokernel launches need every one of their workgroups resident
+        # at once (they wait on each other); a kernel on another stream that takes a CU
+        # while one is dispatched can leave it waiting forever. Keep the scheduler's GPU
+        # work and the result readback on the forward stream (the host side still
+        # overlaps; its kernels queue behind the forward's).
+        architectures = self.model_config.hf_config.architectures
+        return bool(
+            get_exec().kernel.enable_amd_monokernel
+            and architectures
+            and is_muse_spark_architecture(architectures[0])
+        )
+
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
 
@@ -1797,11 +1811,9 @@ class Scheduler(
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
-        # under a monokernel backend the result readback stays on the forward stream
-        # too (see the schedule stream in the event loop setup)
         self.copy_stream: CudaStream = (
             self.forward_stream
-            if get_exec().kernel.enable_amd_monokernel
+            if self._gpu_work_on_forward_stream()
             else self.device_module.Stream(
                 priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
             )
@@ -2107,12 +2119,7 @@ class Scheduler(
             # stream aliases forward_stream, which would eliminate scheduler
             # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
             # other accelerators (e.g. NPU/XPU) skip the alias check.
-            if get_exec().kernel.enable_amd_monokernel:
-                # A monokernel launch needs every one of its workgroups resident at
-                # once (they wait on each other); a kernel on another stream that
-                # takes a CU while one is dispatched can leave it waiting forever.
-                # Keep the scheduler's GPU work on the forward stream (the host side
-                # still overlaps; its kernels queue behind the forward's).
+            if self._gpu_work_on_forward_stream():
                 self.schedule_stream = self.forward_stream
             elif self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream:
                 self.schedule_stream = allocate_distinct_stream(
