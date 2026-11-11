@@ -304,6 +304,51 @@ pub struct GenerationPauseResponse {
     #[prost(string, tag = "2")]
     pub status: ::prost::alloc::string::String,
 }
+/// `/pd_role_switch`: flip this instance between prefill and decode at
+/// runtime (`--enable-pd-role-switch`). With several DP ranks the frontend
+/// first runs a `prepare_only` preflight on every rank.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PdRoleSwitchRequest {
+    #[prost(string, optional, tag = "1")]
+    pub new_role: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub decode_cuda_graph_bs: ::core::option::Option<Int64List>,
+    #[prost(double, optional, tag = "3")]
+    pub decode_cuda_graph_memory_gb: ::core::option::Option<f64>,
+    #[prost(bool, tag = "4")]
+    pub prepare_only: bool,
+}
+/// Python's `PdRoleSwitchReqOutput`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PdRoleSwitchResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub old_role: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub new_role: ::prost::alloc::string::String,
+    #[prost(bool, tag = "5")]
+    pub safe_to_restore: bool,
+}
+/// `/update_weight_version`: relabel the served weights on every DP rank.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateWeightVersionRequest {
+    #[prost(string, tag = "1")]
+    pub new_version: ::prost::alloc::string::String,
+    #[prost(bool, optional, tag = "2")]
+    pub abort_all_requests: ::core::option::Option<bool>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateWeightVersionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub new_version: ::core::option::Option<::prost::alloc::string::String>,
+}
 /// Python's `matched` key, `Union\[str, int, List[int]\]`: the three wire shapes
 /// are disjoint, so shape alone picks the arm (untagged).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

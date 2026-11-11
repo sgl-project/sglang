@@ -16,7 +16,7 @@ use crate::api_server::handlers::{AbortEnding, CoreHandle, HiCacheError, HiCache
 use crate::message::config::{
     DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS, PreferredSamplingParams, ServerArgs,
 };
-use crate::message::io_struct::{ExpertDistributionAction, ProfileOptions};
+use crate::message::io_struct::{ExpertDistributionAction, PdRoleSwitch, ProfileOptions};
 use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
 use crate::utils::environ;
@@ -357,6 +357,57 @@ impl SglangService for GrpcService {
             message: "Generation continued successfully.".into(),
             status: "ok".into(),
         }))
+    }
+
+    async fn pd_role_switch(
+        &self,
+        request: Request<api::PdRoleSwitchRequest>,
+    ) -> Result<Response<api::PdRoleSwitchResponse>, Status> {
+        let request = request.into_inner();
+        let outcome = self
+            .core
+            .pd_role_switch(PdRoleSwitch {
+                new_role: request.new_role.unwrap_or_default(),
+                decode_cuda_graph_bs: request.decode_cuda_graph_bs.map(|list| list.items),
+                decode_cuda_graph_memory_gb: request.decode_cuda_graph_memory_gb,
+                prepare_only: request.prepare_only,
+            })
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::PdRoleSwitchResponse {
+            success: outcome.success,
+            message: outcome.message,
+            old_role: outcome.old_role,
+            new_role: outcome.new_role,
+            safe_to_restore: outcome.safe_to_restore,
+        }))
+    }
+
+    async fn update_weight_version(
+        &self,
+        request: Request<api::UpdateWeightVersionRequest>,
+    ) -> Result<Response<api::UpdateWeightVersionResponse>, Status> {
+        let request = request.into_inner();
+        let new_version = request.new_version;
+        match self
+            .core
+            .update_weight_version(
+                new_version.clone(),
+                request.abort_all_requests.unwrap_or(true),
+            )
+            .await
+        {
+            Ok(()) => Ok(Response::new(api::UpdateWeightVersionResponse {
+                success: true,
+                message: format!("Weight version updated to {new_version}"),
+                new_version: Some(new_version),
+            })),
+            Err(error) => Ok(Response::new(api::UpdateWeightVersionResponse {
+                success: false,
+                message: format!("Failed to update weight version: {error}"),
+                new_version: None,
+            })),
+        }
     }
 
     async fn get_hi_cache_storage(

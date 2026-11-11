@@ -11,8 +11,9 @@ use tokio::sync::oneshot;
 use crate::message::io_struct::{
     AbortReq, CheckWeightsReqInput, ContinueGenerationReqInput, ControlRequest,
     ExpertDistributionAction, ExpertDistributionReq, FlushCacheReqInput, FreezeGCReq,
-    PauseGenerationReqInput, ProfileOptions, ProfileReq, ReleaseMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqInput, SetInternalStateReq, SlowDownReqInput,
+    PauseGenerationReqInput, PdRoleSwitch, PdRoleSwitchReqInput, ProfileOptions, ProfileReq,
+    ReleaseMemoryOccupationReqInput, ResumeMemoryOccupationReqInput, SetInternalStateReq,
+    SlowDownReqInput, UpdateWeightVersionReqInput,
 };
 use crate::message::request::RequestKind;
 use crate::message::response::ResponseItem;
@@ -198,6 +199,115 @@ impl CoreHandle {
             ))
         })
         .await
+    }
+
+    /// Switch the PD role on every DP rank, as Python's
+    /// `TokenizerManager.pd_role_switch`: with several ranks a `prepare_only`
+    /// preflight runs first and the switch only if every rank is ready.
+    pub(crate) async fn pd_role_switch(
+        &self,
+        switch: PdRoleSwitch,
+    ) -> Result<PdRoleSwitchOutcome, CoreError> {
+        if !self.inner.metadata.deployment_info.enable_pd_role_switch {
+            return Ok(PdRoleSwitchOutcome {
+                success: false,
+                message: "--enable-pd-role-switch is not set on this server".into(),
+                old_role: self
+                    .model_facts()
+                    .await
+                    .disaggregation_mode
+                    .as_str()
+                    .to_owned(),
+                new_role: switch.new_role,
+                safe_to_restore: true,
+            });
+        }
+        let dp_size = self.inner.metadata.deployment_info.dp_size.max(1);
+        let mut results = if dp_size > 1 {
+            let prepare = PdRoleSwitch {
+                prepare_only: true,
+                ..switch.clone()
+            };
+            let results = self.role_switch_round(&prepare).await?;
+            if results.iter().all(|result| result.success) && !switch.prepare_only {
+                self.role_switch_round(&switch).await?
+            } else {
+                results
+            }
+        } else {
+            self.role_switch_round(&switch).await?
+        };
+        let all_success = !results.is_empty() && results.iter().all(|result| result.success);
+        let safe_to_restore =
+            !results.is_empty() && results.iter().all(|result| result.safe_to_restore);
+        let message = if all_success && !switch.prepare_only {
+            // The role changed on every scheduler; refresh the cached mode.
+            self.inner.frontend.invalidate();
+            "ok".to_owned()
+        } else if all_success {
+            "ready".to_owned()
+        } else {
+            results
+                .iter()
+                .filter(|result| !result.success)
+                .map(|result| result.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let old_role = if results.is_empty() {
+            String::new()
+        } else {
+            std::mem::take(&mut results[0].old_role)
+        };
+        Ok(PdRoleSwitchOutcome {
+            success: all_success,
+            message,
+            old_role,
+            new_role: switch.new_role,
+            safe_to_restore,
+        })
+    }
+
+    async fn role_switch_round(
+        &self,
+        switch: &PdRoleSwitch,
+    ) -> Result<Vec<PdRoleSwitchOutcome>, CoreError> {
+        self.control(&|| {
+            ControlRequest::PdRoleSwitchReqInput(PdRoleSwitchReqInput::new(
+                Rid::new().to_string(),
+                switch.clone(),
+            ))
+        })
+        .await
+        .decode::<PdRoleSwitchOutcome>("pd-role-switch")
+    }
+
+    /// Relabel the served weights on every DP rank. `abort_all_requests`
+    /// cancels this listener's in-flight generations first, as Python's
+    /// handler does. The cached `weight_version` is refreshed afterwards.
+    pub(crate) async fn update_weight_version(
+        &self,
+        new_version: String,
+        abort_all_requests: bool,
+    ) -> Result<(), CoreError> {
+        if new_version.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "missing field `new_version`".into(),
+            ));
+        }
+        if abort_all_requests {
+            self.abort(None, AbortEnding::CancelledError);
+        }
+        self.ack("update-weight-version", &|| {
+            ControlRequest::UpdateWeightVersionReqInput(UpdateWeightVersionReqInput::new(
+                Rid::new().to_string(),
+                new_version.clone(),
+                abort_all_requests,
+            ))
+        })
+        .await?;
+        self.inner.frontend.invalidate();
+        Ok(())
     }
 
     /// Start, stop, or dump the expert-distribution recorder on every DP rank.
@@ -475,6 +585,20 @@ fn parse_server_args(
         )));
     }
     Ok(map)
+}
+
+/// The scheduler's `PdRoleSwitchReqOutput`, and the merged outcome.
+#[derive(Debug, Default, PartialEq, serde::Deserialize)]
+pub(crate) struct PdRoleSwitchOutcome {
+    pub(crate) success: bool,
+    #[serde(default)]
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) old_role: String,
+    #[serde(default)]
+    pub(crate) new_role: String,
+    #[serde(default)]
+    pub(crate) safe_to_restore: bool,
 }
 
 /// A scheduler output with no fields of its own (`BaseReq` only).
@@ -1177,6 +1301,108 @@ mod tests {
             ))
         ));
         drop(request);
+    }
+
+    /// A role switch on several ranks preflights with `prepare_only` and only
+    /// then switches; the cached role is refreshed after a real switch.
+    #[tokio::test]
+    async fn pd_role_switch_preflights_across_ranks_and_refreshes_the_role() {
+        use crate::api_server::core::fanout::testing::DummyTarget;
+        use crate::message::config::DeploymentInfo;
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let reply = |success: bool| {
+            Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({
+                    "success": success, "message": "", "old_role": "prefill",
+                    "new_role": "decode", "safe_to_restore": true,
+                }))
+                .unwrap(),
+            )
+        };
+        let handle = CoreHandle::new(
+            intake_tx,
+            abort_tx,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: true,
+                multimodal: false,
+                metrics: None,
+                request_log: None,
+                generate_validator: None,
+                mm_limits: Vec::new(),
+                metadata: CoreMetadata {
+                    deployment_info: DeploymentInfo {
+                        dp_size: 2,
+                        enable_pd_role_switch: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                peer_endpoints: vec![DummyTarget::replying(&[1], move |_| Ok(reply(true)))],
+            },
+        );
+        let switch = PdRoleSwitch {
+            new_role: "decode".into(),
+            decode_cuda_graph_bs: None,
+            decode_cuda_graph_memory_gb: None,
+            prepare_only: false,
+        };
+        let (outcome, prepare_flags) = tokio::join!(handle.pd_role_switch(switch), async {
+            let mut flags = Vec::new();
+            for _ in 0..2 {
+                let request = accept_intake(intake_rx.recv_async().await.unwrap());
+                let RequestKind::Control(control) = &request.kind else {
+                    panic!("expected a control request");
+                };
+                let rmpv::Value::Array(items) =
+                    rmpv::decode::read_value(&mut &control.encode().unwrap()[..]).unwrap()
+                else {
+                    panic!("positional wire");
+                };
+                // [tag, rid, ipc, new_role, decode_cuda_graph_bs, memory_gb, prepare_only]
+                flags.push(items[6].as_bool().unwrap());
+                request
+                    .sink
+                    .try_send(ResponseItem::Control(reply(true)))
+                    .unwrap();
+            }
+            flags
+        });
+        assert_eq!(
+            prepare_flags,
+            [true, false],
+            "preflight first, then the switch"
+        );
+        assert_eq!(
+            outcome.unwrap(),
+            PdRoleSwitchOutcome {
+                success: true,
+                message: "ok".into(),
+                old_role: "prefill".into(),
+                new_role: "decode".into(),
+                safe_to_restore: true,
+            }
+        );
+        assert!(
+            handle.inner.frontend.is_stale(),
+            "the role changed; refresh next read"
+        );
+
+        let disabled = Harness::unbounded(8).handle;
+        let outcome = disabled
+            .pd_role_switch(PdRoleSwitch {
+                new_role: "decode".into(),
+                decode_cuda_graph_bs: None,
+                decode_cuda_graph_memory_gb: None,
+                prepare_only: false,
+            })
+            .await
+            .unwrap();
+        assert!(!outcome.success && outcome.safe_to_restore);
+        assert_eq!(outcome.old_role, "null");
     }
 
     #[tokio::test]
