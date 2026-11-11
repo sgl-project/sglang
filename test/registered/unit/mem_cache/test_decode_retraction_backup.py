@@ -20,6 +20,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.managers.utils import allocate_distinct_stream
 from sglang.srt.mem_cache.allocator import (
@@ -381,7 +382,6 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 queue=decode_queue(ListKind.PD_RECEIVING), enable_staging=False
             ),
             queue=decode_queue(ListKind.PD_PREALLOC),
-            pending_reqs=[],
             retracted_queue=IndexedReqList(ListKind.PD_RETRACTED),
             _prefill_dp_rank_queries={},
             _num_published_destinations=0,
@@ -622,7 +622,10 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 receiver.poll.return_value = KVPoll.WaitingForInput
                 decode_req = DecodeRequest(req=req, kv_receiver=receiver)
                 queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
-                self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+                self.assertEqual(
+                    queue.move_preallocated(queue.transfer_queue.queue),
+                    ([decode_req], []),
+                )
                 self.assertEqual(decode_req.host_staged, host_staged)
                 self.assertEqual(len(host_admissions), int(host_staged))
                 self.assertEqual(req.kv.req_pool_idx is None, host_staged)
@@ -674,7 +677,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
                 host_free_before = cache.host_pool_group.available_size()
                 blocker = env.allocator.alloc(self.pool_size)
-                self.assertEqual(queue.pop_preallocated(), ([], []))
+                self.assertEqual(
+                    queue.move_preallocated(queue.transfer_queue.queue), ([], [])
+                )
                 receiver.send_metadata.assert_not_called()
                 self.assertEqual(
                     cache.host_pool_group.available_size(), host_free_before
@@ -682,7 +687,10 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 env.allocator.free(blocker)
                 pressure = env.allocator.alloc(num_slots)
                 receiver.supports_host_destination = True
-                self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+                self.assertEqual(
+                    queue.move_preallocated(queue.transfer_queue.queue),
+                    ([decode_req], []),
+                )
                 self.assertIsNone(req.kv.req_pool_idx)
                 self.assertEqual(
                     env.allocator.available_size(), self.pool_size - num_slots
@@ -742,7 +750,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 )
                 pending = DecodeRequest(req=pending_req, kv_receiver=receiver)
                 queue.queue = decode_queue(ListKind.PD_PREALLOC, [pending])
-                self.assertEqual(queue.pop_preallocated(), ([], []))
+                self.assertEqual(
+                    queue.move_preallocated(queue.transfer_queue.queue), ([], [])
+                )
                 self.assertEqual(list(queue.queue.items()), [pending])
                 self.assertIsNone(pending_req.kv.req_pool_idx)
                 self.assertIsNone(pending_req.kv.retraction_backup)
@@ -788,7 +798,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     cache.host_pool_group.available_size(), host_free_before
                 )
                 # Abort cleanup uses the same descriptor, including sidecars.
-                self.assertEqual(queue.pop_preallocated(), ([pending], []))
+                self.assertEqual(
+                    queue.move_preallocated(queue.transfer_queue.queue), ([pending], [])
+                )
                 cache.discard_kv_cache_backup(pending_req.kv.retraction_backup)
                 self.assertEqual(
                     cache.host_pool_group.available_size(), host_free_before
@@ -841,7 +853,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 )
 
             queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
-            queue.retracted_queue.join([req])
+            move([req], queue.retracted_queue)
             with (
                 patch.object(queue, "_uses_swa_reservation", return_value=False),
                 patch.object(queue, "_allocatable_token_budgets", return_value=1 << 20),
@@ -850,7 +862,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 patch.object(queue, "_pre_alloc", side_effect=pre_alloc),
                 torch.cuda.stream(queue.scheduler.schedule_stream),
             ):
-                self.assertEqual(queue.resume_retracted_reqs(), [req])
+                self.assertEqual(
+                    queue.move_resumed(IndexedReqList(ListKind.WAITING)), [req]
+                )
             torch.cuda.synchronize()
             restored = [buffer[reused].clone() for buffer in buffers]
             env.allocator.free(reused)
@@ -896,7 +910,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
         decode_req = DecodeRequest(req=req, kv_receiver=receiver)
         queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
         host_free_before = cache.host_pool_group.available_size()
-        self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+        self.assertEqual(
+            queue.move_preallocated(queue.transfer_queue.queue), ([decode_req], [])
+        )
         self.assertIsNone(req.kv.req_pool_idx)
         self.assertEqual(cache.protected_size(), 4)
         env.allocator.free(pressure)
