@@ -1076,8 +1076,11 @@ fn insert_overlap_recovers_a_tombstone_inside_the_window() {
     let [action0, action1] = result.cache_actions.as_slice() else {
         panic!("expected FreeDeviceKVFullOnly then SwaRebuild");
     };
-    let FreeDeviceKVFullOnly { indices: freed } =
-        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: freed,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    assert!(*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,
@@ -1239,15 +1242,20 @@ fn insert_overlap_straddling_the_boundary_splits_and_recovers_the_tail() {
             action_kinds(&result.cache_actions)
         );
     };
-    let FreeDeviceKVFullOnly { indices: old_tail } =
-        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: old_tail,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    assert!(*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,
     } = expect_action::<SwaRebuild>(action1.as_ref());
     let FreeDeviceKVFullOnly {
         indices: duplicates,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action2.as_ref());
+    assert!(!*tree_owned);
     assert!(old_tail[0].equal(&Tensor::from_slice(&[12i64, 13])));
     assert_eq!(*node_id, tc.arena.node(node).id);
     assert!(source_value.equal(&Tensor::from_slice(&[22i64, 23])));
@@ -1291,7 +1299,9 @@ fn insert_overlap_straddling_with_a_locked_full_defers_the_tail() {
     } = expect_action::<RecoverSwaWithLockedFull>(action0.as_ref());
     let FreeDeviceKVFullOnly {
         indices: duplicates,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
+    assert!(!*tree_owned);
     assert_eq!(*node_id, tc.arena.node(node).id);
     assert!(kept_full.equal(&Tensor::from_slice(&[12i64, 13])));
     assert!(incoming_full.equal(&Tensor::from_slice(&[22i64, 23])));
@@ -1312,8 +1322,11 @@ fn insert_overlap_entirely_outside_the_window_is_all_duplicate() {
     let [action] = result.cache_actions.as_slice() else {
         panic!("expected one FreeDeviceKVFullOnly action");
     };
-    let FreeDeviceKVFullOnly { indices: freed } =
-        expect_action::<FreeDeviceKVFullOnly>(action.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: freed,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action.as_ref());
+    assert!(!*tree_owned);
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
 }
 
@@ -1371,9 +1384,14 @@ fn insert_overlap_boundary_at_the_node_start_recovers_the_whole_node() {
     };
     let FreeDeviceKVFullOnly {
         indices: duplicates,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
-    let FreeDeviceKVFullOnly { indices: old_full } =
-        expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
+    assert!(!*tree_owned);
+    let FreeDeviceKVFullOnly {
+        indices: old_full,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
+    assert!(*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,
@@ -1427,16 +1445,23 @@ fn insert_overlap_straddling_a_second_level_node_recovers_the_tail() {
     };
     let FreeDeviceKVFullOnly {
         indices: duplicates_head,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
-    let FreeDeviceKVFullOnly { indices: old_tail } =
-        expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
+    assert!(!*tree_owned);
+    let FreeDeviceKVFullOnly {
+        indices: old_tail,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
+    assert!(*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,
     } = expect_action::<SwaRebuild>(action2.as_ref());
     let FreeDeviceKVFullOnly {
         indices: duplicates_tail,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action3.as_ref());
+    assert!(!*tree_owned);
     assert!(duplicates_head[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     assert!(old_tail[0].equal(&Tensor::from_slice(&[14i64])));
     assert_eq!(*node_id, tc.arena.node(b).id);
@@ -1483,7 +1508,9 @@ fn insert_overlap_straddling_a_second_level_locked_node_defers_the_tail() {
     };
     let FreeDeviceKVFullOnly {
         indices: duplicates_head,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    assert!(!*tree_owned);
     let RecoverSwaWithLockedFull {
         node_id,
         kept_full,
@@ -1491,7 +1518,9 @@ fn insert_overlap_straddling_a_second_level_locked_node_defers_the_tail() {
     } = expect_action::<RecoverSwaWithLockedFull>(action1.as_ref());
     let FreeDeviceKVFullOnly {
         indices: duplicates_tail,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action2.as_ref());
+    assert!(!*tree_owned);
     assert!(duplicates_head[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     assert_eq!(*node_id, tc.arena.node(b).id);
     assert!(kept_full.equal(&Tensor::from_slice(&[14i64])));
@@ -1539,8 +1568,11 @@ fn insert_overlap_prev_prefix_strictly_inside_the_node_recovers_only_beyond_it()
             action_kinds(&result.cache_actions)
         );
     };
-    let FreeDeviceKVFullOnly { indices: old_tail } =
-        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: old_tail,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    assert!(*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,
@@ -1867,7 +1899,9 @@ fn reinsert_boundary_at_the_node_start_rebuilds_the_whole_node() {
     };
     let FreeDeviceKVFullOnly {
         indices: duplicates,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    assert!(!*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,
@@ -4441,15 +4475,20 @@ fn insert_overlap_straddling_with_a_partial_prev_prefix_recovers_the_tail() {
             action_kinds(&result.cache_actions)
         );
     };
-    let FreeDeviceKVFullOnly { indices: old_tail } =
-        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: old_tail,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    assert!(*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,
     } = expect_action::<SwaRebuild>(action1.as_ref());
     let FreeDeviceKVFullOnly {
         indices: duplicates,
+        tree_owned,
     } = expect_action::<FreeDeviceKVFullOnly>(action2.as_ref());
+    assert!(!*tree_owned);
     assert!(old_tail[0].equal(&Tensor::from_slice(&[12i64, 13])));
     assert_eq!(*node_id, tc.arena.node(node).id);
     assert!(source_value.equal(&Tensor::from_slice(&[22i64, 23])));
@@ -6409,8 +6448,11 @@ fn recovered_swa_span_evicts_before_the_window_leaf() {
             action_kinds(&step.actions)
         );
     };
-    let FreeDeviceKVFullOnly { indices: old_full } =
-        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: old_full,
+        tree_owned,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    assert!(*tree_owned);
     let SwaRebuild {
         node_id,
         source_value,

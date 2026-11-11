@@ -2422,11 +2422,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return False
 
         # Commit the loaded KV back onto the node + apply its emitted actions.
-        self._apply_cache_actions(
-            self.tree_core.commit_load_back(
-                node_id, device_indices, kv_xfer, comp_xfers
-            )
-        )
+        self._commit_load_back(node_id, device_indices, kv_xfer, comp_xfers)
         self.name_loaded_window_rows_by_owner(aux_xfers)
 
         receipt = _OngoingLoadBack(
@@ -2446,6 +2442,19 @@ class UnifiedRadixCache(BasePrefixCache):
             self.ongoing_load_back[node_id] = receipt
 
         return True
+
+    def _commit_load_back(
+        self,
+        node_id: NodeId,
+        device_indices: torch.Tensor,
+        kv_xfer: PoolTransfer,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+    ) -> None:
+        self._apply_cache_actions(
+            self.tree_core.commit_load_back(
+                node_id, device_indices, kv_xfer, comp_xfers
+            )
+        )
 
     def name_loaded_window_rows_by_owner(self, transfers) -> None:
         """A queued host load reserved window rows and the tree has bound them
