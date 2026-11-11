@@ -103,6 +103,9 @@ def _controller(cls: type, storage_host_pool: Any, mem_pool_host: Any) -> Any:
     controller = object.__new__(cls)
     controller.enable_storage = False
     controller.storage_stop_event = threading.Event()
+    controller.prefetch_thread = controller.prefetch_io_aux_thread = None
+    controller._storage_worker_failures = {}
+    controller.prefetch_sync_thread = controller.backup_thread = None
     controller.storage_host_pool = storage_host_pool
     controller.mem_pool_host = mem_pool_host
     controller.page_size = PAGE
@@ -127,11 +130,21 @@ def _attach(
     host_pools: Optional[List[PoolEntry]] = None,
 ) -> None:
     """Run ``attach_storage_backend`` with the heavy pieces stubbed out."""
-    storage_config = SimpleNamespace(is_mla_model=False, extra_config={})
+    storage_config = SimpleNamespace(
+        is_mla_model=False, extra_config={}, unified_suffixes=None
+    )
     # Only the hybrid attach accepts host_pools; the base attach's burst is
     # the anchor pool alone.
     kwargs = {"host_pools": host_pools} if host_pools is not None else {}
     with (
+        mock.patch(
+            "sglang.srt.managers.cache_controller.get_memory",
+            return_value=SimpleNamespace(hicache_storage_key_scheme="rank-suffix"),
+        ),
+        mock.patch(
+            "sglang.srt.managers.cache_controller.get_parallel",
+            return_value=SimpleNamespace(attn_dcp_size=1),
+        ),
         mock.patch.object(
             StorageBackendFactory, "create_backend", return_value=backend
         ),
@@ -181,7 +194,7 @@ class TestRegistrationBurstOrder(CustomTestCase):
         controller = _controller(HiCacheController, pool, pool)
         backend = RecordingBackend(order, fail_on_complete=True)
 
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RuntimeError, "registration failed in the backend"):
             _attach(controller, backend, order)
 
         self.assertEqual(order, ["v1", "complete"])
@@ -201,7 +214,7 @@ class TestRegistrationBurstOrder(CustomTestCase):
         )
         backend = RecordingBackend(order, fail_on_complete=True)
 
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RuntimeError, "registration failed in the backend"):
             _attach(controller, backend, order, host_pools=group.entries)
 
         self.assertEqual(order, ["v1", "threads", "v2:kv", "v2:mamba", "complete"])

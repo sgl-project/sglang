@@ -4,8 +4,9 @@ from unittest.mock import patch
 
 from PIL import UnidentifiedImageError
 from transformers import LlavaConfig
+from transformers.models.auto.modeling_auto import AutoModel
 
-from sglang.srt.models.llava import AutoModel, LlavaForConditionalGeneration
+from sglang.srt.models.llava import LlavaForConditionalGeneration
 from sglang.srt.multimodal.processors.llava import (
     LlavaImageProcessor,
     LlavaMultimodalProcessor,
@@ -15,7 +16,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class PixtralVisionConfig:
