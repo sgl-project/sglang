@@ -424,6 +424,14 @@ class StorageCacheReads:
                 continue
             if (job := self.jobs.get(request)) is not None:
                 return job
+            if request in self.demands:
+                # An ordinary suffix may still own a shared ancestor. A new
+                # job must not replace its demand and strand the prefix hold.
+                if exact:
+                    continue
+                raise ControlError(
+                    "unavailable", "Ordinary suffix still owns a shared prefix"
+                )
             if self.cache.prefetch_stop_policy != "wait_complete":
                 raise ControlError(
                     "unavailable", "Compatible ordinary restore uses early stop"
