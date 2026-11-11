@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
@@ -32,6 +33,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
+from sglang.srt.speculative.staged_next_draft import STAGED_INPUTS
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -465,6 +467,61 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             }
         for name, buf in staged[False].items():
             self.assertTrue(torch.equal(staged[True][name], buf), name)
+
+    def test_a_staged_round_copies_none_of_the_staged_inputs(self):
+        """SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT: a round whose lengths, write slots,
+        positions and request slots the previous post-verify graph wrote into the
+        buffers copies none of them, planned or not, and the rest as before; those
+        inputs stay out of the shared input pool only under the switch."""
+        from sglang.kernels.ops.memory import small_field_copy
+
+        class _CopyPlan:
+            def __call__(self, dsts, srcs):
+                assert len(dsts) == len(srcs) > 0
+                for dst, src in zip(dsts, srcs):
+                    dst.copy_(src)
+                return True
+
+        staged_names = ("seq_lens", "out_cache_loc", "positions", "req_pool_indices")
+        for planned in (False, True):
+            runner = self._build_runner(_RecordingDraftBackend())
+            runner._planned_inputs = {}
+            for buf in vars(runner.buffers).values():
+                if buf is not None:
+                    buf.fill_(-1)
+            for name in staged_names:
+                getattr(runner.buffers, name).fill_(99)
+            forward_batch = self._build_forward_batch([3, 4, 5, 6], 18)
+            forward_batch.spec_info.hidden_states = torch.arange(8.0).view(4, 2)
+            with (
+                self.subTest(planned=planned),
+                patch.object(draft_graph, "_GRAPH_INPUT_PLAN", planned),
+                patch.object(small_field_copy, "SmallFieldCopyPlan", _CopyPlan),
+            ):
+                runner.execute(forward_batch, inputs_staged=True)
+                for name in staged_names:
+                    self.assertTrue(
+                        torch.all(getattr(runner.buffers, name) == 99), name
+                    )
+                spec_info = forward_batch.spec_info
+                for name in ("topk_p", "topk_index", "hidden_states"):
+                    self.assertTrue(
+                        torch.equal(
+                            getattr(runner.buffers, name), getattr(spec_info, name)
+                        ),
+                        name,
+                    )
+        for switch in (False, True):
+            with (
+                self.subTest(switch=switch),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                envs.SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT.override(switch),
+                patch.object(
+                    draft_graph, "spec_relay_bypass_enabled", return_value=False
+                ),
+            ):
+                private = draft_graph._relay_private_inputs()
+                self.assertEqual(private, STAGED_INPUTS if switch else frozenset())
 
     def test_a_refused_input_plan_falls_back_and_stays_refused(self):
         from sglang.kernels.ops.memory import small_field_copy

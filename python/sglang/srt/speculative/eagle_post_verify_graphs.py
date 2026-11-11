@@ -19,6 +19,7 @@ from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
+from sglang.srt.speculative import staged_next_draft
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     make_post_verify_io,
@@ -77,6 +78,32 @@ class EaglePostVerifyGraphs:
             commit=self._commit,
             sim_rng=simulated_acc_len_rng,
         )
+        # SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT (enable_staged_next_draft): the graphs also
+        # stage the next round's draft inputs; next_draft is the last run's staging
+        self._staging: Optional[SimpleNamespace] = None
+        self.next_draft: Optional[staged_next_draft.NextDraft] = None
+
+    def enable_staged_next_draft(
+        self,
+        *,
+        num_steps: int,
+        window: int,
+        seq_len_fill_value: int,
+        mrope: bool,
+        req_to_token: torch.Tensor,
+        runner_buffers: Any,
+    ) -> None:
+        """Each graph also writes the next round's draft inputs into
+        ``runner_buffers`` (the draft graph runner's static inputs) and its write window
+        into the slot's own buffer."""
+        self._staging = SimpleNamespace(
+            num_steps=num_steps,
+            window=window,
+            seq_len_fill_value=seq_len_fill_value,
+            mrope=mrope,
+            req_to_token=req_to_token,
+            runner_buffers=runner_buffers,
+        )
 
     def run(
         self,
@@ -92,12 +119,13 @@ class EaglePostVerifyGraphs:
         sampling and commit run eagerly. max_top_k: the compact top-k branch's
         support (compact_verify_max_top_k), None for the dense branch."""
         self.join()
+        self.next_draft = None
         key = self._key(
             batch, verify_input, logits_output, can_run_cuda_graph, max_top_k
         )
         if key is None:
             return None
-        return self._graphs.run(
+        outputs = self._graphs.run(
             key=key,
             inputs=_post_verify_inputs(
                 batch, verify_input, self._verify_state_slots(batch)
@@ -107,6 +135,9 @@ class EaglePostVerifyGraphs:
             ),
             sim_max_len=verify_input.max_tree_depth,
         )
+        if outputs is not None and self._staging is not None:
+            self.next_draft = self._graphs.last_slot.next_draft
+        return outputs
 
     def _verify_state_slots(self, batch: ScheduleBatch) -> Optional[ForwardStateSlots]:
         """The verify forward's state slots, which the mamba commit writes; None
@@ -194,7 +225,19 @@ class EaglePostVerifyGraphs:
         from sglang.srt.runtime_context import mamba_track_grid
 
         info = batch.sampling_info
+        staging = self._staging
         return SimpleNamespace(
+            next_draft=(
+                None
+                if staging is None
+                else staged_next_draft.make_next_draft(
+                    num_requests=len(batch.seq_lens),
+                    num_steps=staging.num_steps,
+                    window=staging.window,
+                    mrope=staging.mrope,
+                    runner_buffers=staging.runner_buffers,
+                )
+            ),
             num_requests=len(batch.seq_lens),
             tokens_per_request=verify_input.draft_token_num,
             max_tree_depth=verify_input.max_tree_depth,
@@ -236,6 +279,17 @@ class EaglePostVerifyGraphs:
                 bonus_dtype=_BONUS_DTYPE,
             )
         )
+        if slot.next_draft is not None:
+            staging = self._staging
+            staged_next_draft.stage_next_draft(
+                slot.next_draft,
+                req_pool_indices=slot.staged["req_pool_indices"],
+                new_seq_lens=new_seq_lens,
+                req_to_token=staging.req_to_token,
+                num_steps=staging.num_steps,
+                window=staging.window,
+                seq_len_fill_value=staging.seq_len_fill_value,
+            )
         return (
             predict,
             accept_lens,
@@ -361,6 +415,8 @@ class _PostVerifyGraphs:
         self._sim_host: list[torch.Tensor] = []
         self._sim_done: list[Optional[torch.cuda.Event]] = []
         self._sim_turn = 0
+        # the slot of the last run that returned outputs
+        self.last_slot: Optional[SimpleNamespace] = None
 
     def run(
         self, *, key: tuple, inputs: dict, make_slot: Callable, sim_max_len: int
@@ -389,6 +445,7 @@ class _PostVerifyGraphs:
         self._load(slot, inputs, sim_len)
         if sim_len is not None:
             self._record_sim_done(sim_turn)
+        self.last_slot = slot
         if slot.graph is None:
             if state.warmups < _NUM_WARMUP * 2:
                 state.warmups += 1

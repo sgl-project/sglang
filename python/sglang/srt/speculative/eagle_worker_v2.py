@@ -116,6 +116,7 @@ from sglang.srt.speculative.spec_utils import (
     simulated_acc_len_generator,
     spec_stage_span,
 )
+from sglang.srt.speculative.staged_next_draft import NextDraft, StagedDraftTracker
 from sglang.srt.utils import overlap_events
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
@@ -177,6 +178,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     draft_runtime: eagle_megakernel.EagleDraftRuntime = (
         eagle_megakernel.STOCK_EAGLE_DRAFT_RUNTIME
     )
+    # SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT: the staging the next draft() takes when it fits
+    staged_next_draft: Optional[NextDraft] = None
 
     def __init__(
         self,
@@ -670,6 +673,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info
+        staged, self.staged_next_draft = self.staged_next_draft, None
         forward_batch, can_run_decode_cuda_graph, iteration_ids = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
@@ -680,7 +684,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.speculative_num_steps,
             target_translator=self.target_worker.model_runner.runner_ids,
             num_draft_tokens=self.speculative_num_draft_tokens,
+            staged=staged,
         )
+        # prepare_for_draft took the staging only when it fits this batch
+        inputs_staged = staged is not None and batch.out_cache_loc is staged.window
         if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
@@ -711,7 +718,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Run draft
             if can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.cuda_graph_runner.execute(forward_batch)
+                    self.cuda_graph_runner.execute(
+                        forward_batch, inputs_staged=inputs_staged
+                    )
                 )
                 if draft_probs is not None:
                     # draft_probs is the one graph output read after the target
@@ -1326,6 +1335,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
     _post_verify_graphs: Optional[EaglePostVerifyGraphs] = None
     _simulated_acc_len_rng: Optional[torch.Generator] = None
     _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
+    # SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT: which decode rounds take the staged draft inputs
+    _staged_draft: Optional[StagedDraftTracker] = None
 
     @property
     def draft_parallel_layout(self):
@@ -1449,8 +1460,45 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_runtime_hooks=self._speculative_runtime_hooks,
         )
 
+    def _init_staged_next_draft(self) -> None:
+        """SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT: the post-verify graphs stage the next
+        round's draft inputs into the draft graph runner's static inputs."""
+        if not envs.SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT.get():
+            return
+        draft = self._draft_worker
+        runner = None if draft is None else draft.cuda_graph_runner
+        if self._post_verify_graphs is None or runner is None:
+            refusal = "it needs the post-verify graphs and a draft graph runner"
+        elif runner.require_mlp_tp_gather:
+            # a gathered batch can pad past the staged rows, whose fill clears them
+            refusal = "the draft graph pads gathered batches"
+        elif draft.draft_runner.runner_ids.is_translating:
+            # the staging writes virtual KV ids; a translating draft pool reads physical ones
+            refusal = "the draft's KV ids are translated"
+        elif self.adaptive_controller is not None:
+            refusal = "adaptive speculative decoding swaps the draft graph runner"
+        elif runner.buffers.out_cache_loc.dtype != torch.int64:
+            refusal = "the draft graph's write slots are not int64"
+        else:
+            refusal = None
+        if refusal is not None:
+            logger.warning("The staged next draft is off: %s", refusal)
+            return
+        self._staged_draft = StagedDraftTracker(
+            width=self.speculative_num_draft_tokens, graph_sizes=runner.capture_bs
+        )
+        self._post_verify_graphs.enable_staged_next_draft(
+            num_steps=self.speculative_num_steps,
+            window=self.speculative_num_draft_tokens,
+            seq_len_fill_value=runner.seq_len_fill_value,
+            mrope=draft.draft_runner.model_config.model_is_mrope,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            runner_buffers=runner.buffers,
+        )
+
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
+        self._init_staged_next_draft()
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             self.adaptive_controller.register(
@@ -1482,6 +1530,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
     ):
         self._wait_for_fused_hicache_load(batch)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            if self._staged_draft is not None:
+                self._staged_draft.forget()
             if not (
                 batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination
             ):
@@ -1538,6 +1588,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
                 ):
+                    if self._staged_draft is not None:
+                        self.draft_worker.staged_next_draft = (
+                            self._staged_draft.count_draft(batch)
+                        )
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
@@ -1564,6 +1618,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(
                         batch, batch_output, iteration_ids=verify_input.iteration_ids
                     )
+                    if self._staged_draft is not None:
+                        self._staged_draft.note_extend(
+                            batch, self._post_verify_graphs.next_draft
+                        )
             if self._post_verify_graphs is not None:
                 # The mamba state commit may still run on a side stream.
                 self._post_verify_graphs.join()

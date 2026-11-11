@@ -426,6 +426,12 @@ class Envs:
     SGLANG_OPT_SPEC_POST_VERIFY_BONUS_I64 = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # The post-verify graph stages the next round's draft lengths, positions and write
+    # slots into the draft graph runner; a round that keeps its batch skips their launch
+    # and copies. A chain EAGLE draft reserves three verify windows per decode step for it.
+    SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

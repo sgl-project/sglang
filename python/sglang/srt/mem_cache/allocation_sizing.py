@@ -76,9 +76,26 @@ def get_alloc_reserve_per_decode() -> int:
     """KV length reserved per request at each decode step.
 
     The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
-    mode; see eagle_utils.eagle_prepare_for_decode.
+    mode; see eagle_utils.eagle_prepare_for_decode. A chain EAGLE draft under
+    SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT reserves 3x: the window after the next one
+    is allocated before the round that stages it.
     """
-    return 2 * get_alloc_len_per_decode()
+    return _decode_reserve_windows() * get_alloc_len_per_decode()
+
+
+def _decode_reserve_windows() -> int:
+    from sglang.srt.environ import envs
+
+    spec = get_spec()
+    if (
+        not envs.SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT.get()
+        or (spec.speculative_eagle_topk or 1) != 1
+    ):
+        return 2
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    algo = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
+    return 3 if algo.is_eagle() else 2
 
 
 def page_aligned_decode_alloc_lens(
