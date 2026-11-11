@@ -263,15 +263,6 @@ python3 -m sglang.launch_server \
   - `interface_v1`: 0 (disable) or 1 (enable) to control usage of batch_get_v1 and batch_set_v1 methods
 
 
-## Community and Support
-
-- **GitHub Issues**: Report bugs and feature requests
-- **Slack Channel**: Join community discussions in #sgl-kv-cache-store
-- **Documentation**: Refer to storage backend-specific guides
-
-***
-*This document will be continuously updated based on community feedback and new features. Contributions and suggestions are welcome!*
-
 ## Attributing Cache Misses and HiCache Restores via KV Events
 
 When running multi-turn agents, `--enable-cache-report` returns `cached_tokens` per request, but that counter alone does not distinguish:
@@ -308,4 +299,15 @@ Send requests to `http://127.0.0.1:8080/v1`, then run `prefixwise report --detai
 - **If another DP rank holds the prefix:** The verdict is `routing_miss, confirmed`.
 - **If the client changed the prompt:** The verdict names the first changed block (`volatile_system`, `tool_reserialize`, `history_edit`, `tool_result_mutation`). Pass `--fix canonical_tools` to canonicalize tool order in flight.
 
+This recipe covers GPU and host-memory HiCache (L1 and L2). With an L3 backend (`--hicache-storage-backend`), SGLang does not yet publish KV events for the storage tier ([#29709](https://github.com/sgl-project/sglang/issues/29709)): a prefix prefetched from storage is published as a host (`CPU_PINNED`) store and then a GPU load-back, so it reads as a host restore.
+
 See the [Prefixwise SGLang guide](https://github.com/tejachavali/prefixwise/blob/main/docs/SGLANG.md) for benchmark results.
+
+## Community and Support
+
+- **GitHub Issues**: Report bugs and feature requests
+- **Slack Channel**: Join community discussions in #sgl-kv-cache-store
+- **Documentation**: Refer to storage backend-specific guides
+
+***
+*This document will be continuously updated based on community feedback and new features. Contributions and suggestions are welcome!*
