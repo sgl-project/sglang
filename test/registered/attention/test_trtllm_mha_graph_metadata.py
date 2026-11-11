@@ -15,6 +15,7 @@ import torch
 from torch.utils import _pytree as pytree
 from torch.utils._python_dispatch import TorchDispatchMode
 
+import sglang.kernels.ops.attention.trtllm_mha_graph_metadata as graph_metadata
 import sglang.srt.layers.attention.trtllm_mha_backend as trtllm_mha_backend
 from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
     Q_MODE_CUMSUM,
@@ -1175,9 +1176,14 @@ def _make_swa_mapping(pool_token_cap, seed):
 # max_num_pages upper bound, not a per-batch dynamic width. The kernel self-guards
 # on the device-side seqlen, so the checks compare only the live prefix per row.
 @pytest.mark.parametrize("static_width", [False, True])
-def test_metadata_correctness(bs, seqlen_offset, q_mode, with_swa, static_width):
+# SGLANG_OPT_TRTLLM_MHA_METADATA_ROW_SPLIT: 8 programs per row write the same bytes.
+@pytest.mark.parametrize("row_split", [1, 8])
+def test_metadata_correctness(
+    bs, seqlen_offset, q_mode, with_swa, static_width, row_split, monkeypatch
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
+    monkeypatch.setattr(graph_metadata, "_ROW_SPLIT", row_split)
 
     seed = (
         1234

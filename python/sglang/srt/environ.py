@@ -448,6 +448,11 @@ class Envs:
     SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # TRT-LLM MHA graph metadata: 8 programs per batch row rebuild its page table, page
+    # blocks dealt round-robin (same writes), instead of one program walking the row.
+    SGLANG_OPT_TRTLLM_MHA_METADATA_ROW_SPLIT = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
