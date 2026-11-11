@@ -137,7 +137,7 @@ def test_factorized_tree_matches_serial_model_shape(width, lower_bound):
 def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
     width, lower_bound
 ):
-    from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
+    from sglang.kernels.ops.attention.linear.kda_replayssm_tree_commit import (
         commit_kda_replayssm_tree_all_layers,
     )
 
