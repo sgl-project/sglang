@@ -24,10 +24,12 @@ from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+LONG_PROMPT = "x" * 257
+
 
 class _BlockingTokenizer(PreTrainedTokenizerFast):
     def __init__(self, started, release):
-        backend = Tokenizer(WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]"))
+        backend = Tokenizer(WordLevel({"[UNK]": 0, LONG_PROMPT: 1}, unk_token="[UNK]"))
         super().__init__(tokenizer_object=backend, unk_token="[UNK]")
         self.started = started
         self.release = release
@@ -83,7 +85,7 @@ class TestHTTPServerLiveness(CustomTestCase):
                 transport=transport, base_url="http://test"
             ) as client:
                 generate_task = asyncio.create_task(
-                    client.post("/generate", json={"text": "hello"})
+                    client.post("/generate", json={"text": LONG_PROMPT})
                 )
                 # Queue liveness before tokenization gets its first loop turn.
                 ping_task = asyncio.create_task(client.get("/ping"))

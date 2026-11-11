@@ -241,6 +241,7 @@ from sglang.srt.utils.weight_versions import (
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
+_MAX_INLINE_TOKENIZER_CHARS = 256
 
 logger = logging.getLogger(__name__)
 
@@ -1182,7 +1183,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     encoded.get("token_type_ids") if is_cross_encoder else None,
                 )
 
-            worker_tokenizer = self._regular_tokenizer_for_worker()
+            # Avoid an executor round trip for a bounded single text. The
+            # event loop owns its backend, even while a worker encodes longer
+            # inputs on the isolated backend.
+            inline_short_text = (
+                isinstance(texts, str)
+                and not is_cross_encoder
+                and len(texts) <= _MAX_INLINE_TOKENIZER_CHARS
+            )
+            worker_tokenizer = (
+                None if inline_short_text else self._regular_tokenizer_for_worker()
+            )
             if worker_tokenizer is None:
                 input_ids, token_type_ids = tokenize_sync(self.tokenizer)
             else:

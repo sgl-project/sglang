@@ -71,7 +71,9 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
         watchdog.start()
 
         async def tokenize_and_probe_loop():
-            tokenize_task = asyncio.create_task(manager._tokenize_texts("hello"))
+            tokenize_task = asyncio.create_task(
+                manager._tokenize_texts("hello".ljust(257))
+            )
             await asyncio.sleep(0)
             loop_progressed.set()
             return await tokenize_task
@@ -128,6 +130,34 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
         )
         self.assertIsNone(manager._regular_tokenizer_for_worker())
         self.assertEqual(asyncio.run(manager._tokenize_texts("hello")), ([3], None))
+
+    def test_short_single_text_avoids_executor(self):
+        started, release = threading.Event(), threading.Event()
+        release.set()
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.tokenizer = _BlockingFastTokenizer(started, release)
+        manager.async_dynamic_batch_tokenizer = None
+        manager.model_config = types.SimpleNamespace(is_embedding_gemma=False)
+        manager.init_tokenizer_executor()
+        self.addCleanup(manager._tokenizer_executor.shutdown, wait=True)
+
+        with patch.object(
+            manager,
+            "run_in_tokenizer_executor",
+            wraps=manager.run_in_tokenizer_executor,
+        ) as offload:
+            self.assertEqual(
+                asyncio.run(manager._tokenize_texts("hello".ljust(256))), ([1], None)
+            )
+            offload.assert_not_awaited()
+            self.assertEqual(
+                asyncio.run(manager._tokenize_texts("hello".ljust(257))), ([1], None)
+            )
+            self.assertEqual(
+                asyncio.run(manager._tokenize_texts(["hello", "hello"])),
+                ([[1], [1]], None),
+            )
+            self.assertEqual(offload.await_count, 2)
 
     def test_custom_tokenizers_keep_the_synchronous_path(self):
         loop_thread = threading.get_ident()
