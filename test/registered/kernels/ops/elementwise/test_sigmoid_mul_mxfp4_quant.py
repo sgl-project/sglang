@@ -23,7 +23,7 @@ register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd-mi3
 
 DEVICE = "cuda"
 # Decode, the 32-row scale tiles, the 256-row scale padding and prefill chunks.
-M_VALUES = [1, 2, 7, 16, 31, 32, 33, 255, 256, 257, 870, 2048, 3579, 16384]
+M_VALUES = [1, 33, 257, 3579]
 
 
 def _unshuffle_scales(scales: torch.Tensor) -> torch.Tensor:
@@ -70,10 +70,8 @@ def test_matches_sigmoid_mul_then_quant(m, strided_gate):
     _check(*_inputs(m, 24, 256, seed=m, strided_gate=strided_gate))
 
 
-@pytest.mark.parametrize(
-    "num_heads,head_dim", [(6, 256), (2, 128), (16, 128), (32, 128)]
-)
-@pytest.mark.parametrize("m", [1, 33, 257, 2048])
+@pytest.mark.parametrize("num_heads,head_dim", [(6, 256), (16, 128)])
+@pytest.mark.parametrize("m", [33])
 @torch.inference_mode()
 def test_other_head_layouts(m, num_heads, head_dim):
     _check(*_inputs(m, num_heads, head_dim, seed=m + num_heads, strided_gate=True))

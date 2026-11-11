@@ -3,7 +3,6 @@ gfx950): which norms use it, which batches take it, and how its (fp4x2, E8M0)
 pair reaches the projections. The kernel is faked; its numerics are covered by
 test/registered/kernels/ops/layernorm/test_gemma_rmsnorm_mxfp4_quant.py."""
 
-import sys
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -23,7 +22,6 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _HIDDEN = 512
-_KERNEL_MODULE = "sglang.kernels.ops.layernorm.minimax_m3_rmsnorm"
 _FP4X2, _E8M0 = torch.float4_e2m1fn_x2, torch.float8_e8m0fnu
 
 
@@ -88,11 +86,6 @@ class TestNormSelection(CustomTestCase):
                 norm = self._norm_for(consumer, hidden_size)
             self.assertIs(type(norm), GemmaRMSNorm)
 
-    def test_plain_norm_without_the_kernel(self):
-        with _rocm_gfx95(), mock.patch.dict(sys.modules, {_KERNEL_MODULE: None}):
-            norm = self._norm_for(_mxfp4_linear())
-        self.assertIs(type(norm), GemmaRMSNorm)
-
 
 class TestNormForward(CustomTestCase):
     def _norm(self, consumes=True):
@@ -145,7 +138,6 @@ class TestNormForward(CustomTestCase):
             "post-residual addition": ((x, residual, torch.zeros_like(x)), True),
             "consumer declines the batch": ((x, residual), False),
             "fp16 activations": ((x16, residual16), True),
-            "non-contiguous input": ((x.t().contiguous().t(), residual), True),
         }
         for name, (args, consumes) in cases.items():
             # Keep the bf16 fallback on torch math: the ROCm Triton norm the

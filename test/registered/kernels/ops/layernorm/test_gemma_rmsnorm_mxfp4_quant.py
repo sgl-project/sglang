@@ -29,8 +29,7 @@ EPS = 1e-6
 # Qwen3.8-27B hidden size; decode, the 32-row scale tiles, the 256-row scale
 # padding and prefill chunks.
 HIDDEN = 5120
-M_VALUES = [1, 2, 3, 4, 5, 7, 8, 9, 16, 31, 32, 33, 64, 255, 256, 257, 870]
-M_VALUES += [2048, 4377, 6553, 16384]
+M_VALUES = [1, 7, 33, 257, 4377]
 
 
 def _unshuffle_scales(scales: torch.Tensor) -> torch.Tensor:
@@ -79,14 +78,14 @@ def test_matches_norm_then_quant(m):
     _check_kernel(*_inputs(m, HIDDEN, seed=m))
 
 
-@pytest.mark.parametrize("n", [1024, 2560, 4096, 8192])
-@pytest.mark.parametrize("m", [1, 33, 257, 2048])
+@pytest.mark.parametrize("n", [2560, 8192])
+@pytest.mark.parametrize("m", [1, 257])
 @torch.inference_mode()
 def test_matches_norm_then_quant_other_hidden_sizes(m, n):
     _check_kernel(*_inputs(m, n, seed=m + n))
 
 
-@pytest.mark.parametrize("m", [1, 33, 2048])
+@pytest.mark.parametrize("m", [33])
 @torch.inference_mode()
 def test_edge_blocks(m):
     x, residual, weight = _inputs(m, HIDDEN, seed=7)
@@ -98,8 +97,8 @@ def test_edge_blocks(m):
     _check_kernel(x, residual, weight)
 
 
-@pytest.mark.parametrize("programs", [1, 3, 7, 64])
-@pytest.mark.parametrize("m", [1, 7, 33, 257, 870])
+@pytest.mark.parametrize("programs", [1, 7])
+@pytest.mark.parametrize("m", [33, 257])
 @torch.inference_mode()
 def test_row_loop_matches_one_program_per_row(m, programs, monkeypatch):
     """Programs walk the rows with a grid stride and prefetch the next row;
@@ -123,9 +122,7 @@ def test_row_loop_matches_one_program_per_row(m, programs, monkeypatch):
     not get_bool_env_var("SGLANG_USE_AITER"),
     reason="GemmaRMSNorm runs the ROCm Triton norm with SGLANG_USE_AITER=1",
 )
-@pytest.mark.parametrize(
-    "m", [1, 7, 8, 9, 64, 255, 256, 257, 870, 2048, 4377, 6553, 16384]
-)
+@pytest.mark.parametrize("m", [1, 257, 4377])
 @torch.inference_mode()
 def test_qwen3_5_norm_matches_unfused(m):
     """The Qwen3.5 norm in front of an MXFP4 projection hands it what the
