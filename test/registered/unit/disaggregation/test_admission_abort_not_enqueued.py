@@ -80,7 +80,9 @@ def _make_scheduler():
     retirer = release_only_retirer(MagicMock(), beam_coordinator=beam_coordinator)
     retirer.stream_output = output_streamer.stream_output
     retirer.retire_unadmitted = MagicMock(
-        side_effect=lambda req: RequestRetirer.retire_unadmitted(retirer, req)
+        side_effect=lambda req, **kwargs: RequestRetirer.retire_unadmitted(
+            retirer, req, **kwargs
+        )
     )
     return SimpleNamespace(
         output_streamer=output_streamer,
@@ -93,7 +95,8 @@ def _prefill_queue(sched):
     q = SimpleNamespace(
         scheduler=sched,
         queue=IndexedReqList(ListKind.PD_BOOTSTRAP),
-        create_sender=MagicMock(return_value=True),
+        create_sender=MagicMock(),
+        _check_if_req_exceed_kv_capacity=MagicMock(return_value=False),
     )
     return q
 
