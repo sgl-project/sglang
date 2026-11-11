@@ -654,8 +654,14 @@ def handle_deterministic_inference(server_args: Any):
         run_post_process_pass(server_args, _deterministic_attention_backend)
 
         attention_backend = resolved_view(server_args).attention_backend
+        # dsa reaches this point only in the configuration the check above accepted,
+        # which also keeps the radix cache deterministic.
+        radix_supported = (
+            attention_backend in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
+            or attention_backend == "dsa"
+        )
         if is_deepseek_model:
-            if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
+            if not radix_supported:
                 raise ValueError(
                     f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with absorbed-MLA models. But you're using {attention_backend}."
                 )
@@ -667,7 +673,7 @@ def handle_deterministic_inference(server_args: Any):
                     "implements on those archs."
                 )
 
-        if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
+        if not radix_supported:
             # Currently, only certain backends support radix cache. Support for other backends is in progress
             declare_resolution(
                 server_args,
