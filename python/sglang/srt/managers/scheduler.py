@@ -3465,8 +3465,8 @@ class Scheduler(
         if (
             isinstance(self.spec_algorithm, SpeculativeAlgorithm)
             and self.spec_algorithm.is_some()
-            and not self.spec_algorithm.is_ubtree()
             and req.sampling_params.min_p > 0
+            and not self.spec_algorithm.is_ubtree()
         ):
             error_msg = (
                 f"min_p is not supported with {self.spec_algorithm.name} "
