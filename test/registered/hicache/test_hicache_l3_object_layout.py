@@ -32,6 +32,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     SidecarPoolSpec,
 )
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    DevicePoolEntry,
+    DevicePoolGroup,
+)
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -255,8 +259,28 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
 
     def test_direct_linker_describes_its_own_store(self):
         """The direct external linker has no HiCache controller or host KV buffer:
-        its own MooncakeStore is described, with KV among the registered pools."""
-        store = self._store(registered=(PoolName.KV, PoolName.SWA))
+        its own MooncakeStore is described, with KV among the registered pools,
+        and a pool indexed from SWA keeps the trailing-page policy it is read with."""
+        sources = {
+            PoolName.KV: PoolName.KV,
+            PoolName.SWA: PoolName.SWA,
+            PoolName.DEEPSEEK_V4_C4_STATE: PoolName.SWA,
+        }
+        entries = [
+            DevicePoolEntry(
+                name=name,
+                indices_from_pool=source,
+                device_pool=None,
+                components=[[torch.zeros(4, 8)]],
+                layer_mapping={0: 0},
+                page_size=64,
+                rows_are_pages=True,
+            )
+            for name, source in sources.items()
+        ]
+        store = self._store()
+        store.mem_pool_host = DevicePoolGroup(entries, num_layers=1, page_size=64)
+        store.registered_pools = {entry.name: entry for entry in entries}
         scheduler = self._scheduler(hierarchical=False)
         scheduler.enable_unified_cache_external_linker = True
         scheduler.tree_cache.cache_controller = None
@@ -271,11 +295,18 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
         self.assertTrue(reply.layout["enabled"])
         pools = reply.layout["hicache_object_layout"]["pools"]
-        self.assertEqual([p["pool"] for p in pools], ["kv", "swa"])
         self.assertEqual(
-            [p["hit_policy"] for p in pools], ["all_pages", "trailing_pages"]
+            [p["pool"] for p in pools], ["kv", "swa", "deepseek_v4_c4_state"]
         )
-        self.assertEqual(pools[1]["trailing_pages"], 2)
+        self.assertEqual(
+            [p["suffixes"] for p in pools],
+            [["__k"], ["__swa"], ["__deepseek_v4_c4_state"]],
+        )
+        self.assertEqual(
+            [p["hit_policy"] for p in pools],
+            ["all_pages", "trailing_pages", "trailing_pages"],
+        )
+        self.assertEqual([p.get("trailing_pages") for p in pools], [None, 2, 2])
         self.assertEqual(
             scheduler.get_init_info()["hicache_object_layout"], reply.layout
         )

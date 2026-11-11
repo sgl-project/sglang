@@ -6143,7 +6143,15 @@ class Scheduler(
     def _linker_l3_layout(self) -> dict:
         """The direct external linker's Mooncake objects, described like HiCache's:
         the linker writes through its own MooncakeStore with the same key builders."""
-        from sglang.srt.mem_cache.hicache_storage import disabled_l3_layout
+        from sglang.srt.mem_cache.hicache_storage import (
+            PoolHitPolicy,
+            PoolName,
+            SidecarPoolSpec,
+            disabled_l3_layout,
+        )
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            DevicePoolGroup,
+        )
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
             MooncakeStore,
         )
@@ -6155,14 +6163,34 @@ class Scheduler(
             return disabled_l3_layout(
                 "Mooncake external linker is not attached", page_size=self.page_size
             )
+        window_trailing_pages = {
+            str(window.pool_name): window.full_window_pages
+            for window in (
+                tree_cache.components[ct] for ct in tree_cache.window_slots()
+            )
+        }
+        # The linker never fills tree_cache.sidecar_pool_specs; resolve_transfers
+        # gives each entry its index source's hit policy, so mirror that here.
+        trailing_sources = {str(PoolName.MAMBA), *window_trailing_pages}
+        pool_group = storage.mem_pool_host
+        sidecar_pool_specs = [
+            SidecarPoolSpec(
+                pool_name=entry.name,
+                indices_from_pool=entry.indices_from_pool,
+                hit_policy=(
+                    PoolHitPolicy.TRAILING_PAGES
+                    if str(entry.indices_from_pool) in trailing_sources
+                    else PoolHitPolicy.ALL_PAGES
+                ),
+            )
+            for entry in (
+                pool_group.entries if isinstance(pool_group, DevicePoolGroup) else ()
+            )
+            if entry.indices_from_pool != entry.name
+        ]
         return storage.describe_l3_object_layout(
-            sidecar_pool_specs=tree_cache.sidecar_pool_specs,
-            window_trailing_pages={
-                str(window.pool_name): window.full_window_pages
-                for window in (
-                    tree_cache.components[ct] for ct in tree_cache.window_slots()
-                )
-            },
+            sidecar_pool_specs=sidecar_pool_specs,
+            window_trailing_pages=window_trailing_pages,
             page_size=self.page_size,
         )
 
