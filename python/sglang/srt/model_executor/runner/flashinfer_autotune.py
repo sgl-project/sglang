@@ -373,41 +373,37 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
 
 
 @contextlib.contextmanager
-def autotune_varied_input_ids(input_ids: torch.Tensor, *, vocab_size: int):
-    """Fill an autotune dummy forward's ``input_ids`` with pseudo-random token ids.
-
-    FlashInfer's MoE tuners profile every token bucket up to the forward's row
-    count with that forward's own routed top-k rows. The static buffers hold one
-    constant token, which routes every row to the same few experts and ranks
-    tactics for a load that serving never sees. The ids are restored on exit.
-    """
-    from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
-
-    if (
-        not get_in_autotune_dummy_run()
-        or not envs.SGLANG_FLASHINFER_AUTOTUNE_VARIED_TOKENS.get()
-    ):
-        yield
-        return
-    # Fixed per attention-DP rank: the ranks sharing one batch feed the same
-    # rows, and attention-DP ranks feed distinct ones, as their requests differ.
-    generator = torch.Generator().manual_seed(get_parallel().attn_dp_rank)
-    # Any id below vocab_size has an embedding row; the dummy has no multimodal
-    # inputs, so special and placeholder ids embed like ordinary text.
-    ids = torch.randint(
-        vocab_size, input_ids.shape, generator=generator, dtype=input_ids.dtype
+def autotune_dummy_run_ctx(model_runner: ModelRunner, buffers):
+    """Run context of an autotune dummy forward: canary manager and varied token ids."""
+    mr = model_runner
+    canary_run_ctx = (
+        c.with_active_single_forward_manager(0)
+        if (c := mr.canary_manager) is not None
+        else empty_context()
     )
-    log_info_on_rank0(
-        logger,
-        f"FlashInfer autotune: dummy forward runs {input_ids.numel()} varied "
-        f"token ids in [0, {vocab_size}).",
-    )
-    saved = input_ids.clone()
-    input_ids.copy_(ids)
-    try:
-        yield
-    finally:
-        input_ids.copy_(saved)
+    with canary_run_ctx:
+        if not envs.SGLANG_FLASHINFER_AUTOTUNE_VARIED_TOKENS.get():
+            yield
+            return
+        # A constant token routes every row to the same experts, a load serving never sees.
+        input_ids = buffers.input_ids
+        vocab_size = mr.model_config.vocab_size
+        # Seeded per attention-DP rank: ranks sharing a batch feed identical rows.
+        generator = torch.Generator().manual_seed(get_parallel().attn_dp_rank)
+        # The dummy has no multimodal inputs, so every id below vocab_size embeds as text.
+        ids = torch.randint(
+            vocab_size, input_ids.shape, generator=generator, dtype=input_ids.dtype
+        )
+        log_info_on_rank0(
+            logger,
+            f"FlashInfer autotune: dummy forward runs varied token ids in [0, {vocab_size}).",
+        )
+        saved = input_ids.clone()
+        input_ids.copy_(ids)
+        try:
+            yield
+        finally:
+            input_ids.copy_(saved)
 
 
 def run_flashinfer_autotune_forward(
@@ -512,17 +508,11 @@ def maybe_flashinfer_autotune_extend(
         num_tokens_per_req=per_req,
         allocate_logits_buffer=False,
     )
-    canary_run_ctx = (
-        c.with_active_single_forward_manager(0)
-        if (c := mr.canary_manager) is not None
-        else empty_context()
-    )
-
     forward_fn = functools.partial(
         runner._dummy_run,
         batch_size=batch_size,
         buffers=buffers,
-        run_ctx=canary_run_ctx,
+        run_ctx=autotune_dummy_run_ctx(mr, buffers),
         forward_mode_override=ForwardMode.EXTEND,
         extend_num_tokens_per_req=num_tokens_per_req,
     )

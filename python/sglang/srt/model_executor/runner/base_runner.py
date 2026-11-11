@@ -46,7 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
-    autotune_varied_input_ids,
+    autotune_dummy_run_ctx,
     maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
@@ -415,17 +415,12 @@ class BaseRunner(ABC):
         runner exists; a freshly-allocated dummy set in the eager path).
         """
         mr = self.model_runner
-        canary_run_ctx = (
-            c.with_active_single_forward_manager(0)
-            if (c := mr.canary_manager) is not None
-            else empty_context()
-        )
 
         def forward_fn():
             self._dummy_run(
                 batch_size=batch_size,
                 buffers=buffers,
-                run_ctx=canary_run_ctx,
+                run_ctx=autotune_dummy_run_ctx(mr, buffers),
             )
 
         run_flashinfer_autotune_forward(
@@ -795,12 +790,7 @@ class BaseRunner(ABC):
         with forward_context(
             ForwardContext(attn_backend=mr.attn_backend), forward_batch=forward_batch
         ):
-            with (
-                run_ctx or empty_context(),
-                autotune_varied_input_ids(
-                    input_ids, vocab_size=mr.model_config.vocab_size
-                ),
-            ):
+            with run_ctx or empty_context():
                 run_once()
 
     def _autotune_buffers(self) -> Tuple[Optional[Any], Optional[int]]:
