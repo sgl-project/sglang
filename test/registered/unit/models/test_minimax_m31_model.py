@@ -126,6 +126,7 @@ def server_args(**kwargs):
 
 
 def cutile_server_args(**kwargs):
+    """Start from a supported opt-in configuration, then vary one contract."""
     defaults = dict(
         moe_runner_backend="flashinfer_cutile",
         quantization="minimax_m3_nvfp4",
@@ -245,7 +246,9 @@ class TestMiniMaxM31ConfigResolution(CustomTestCase):
         _validate_flashinfer_cutile_config(SimpleNamespace(moe_runner_backend="auto"))
 
     def test_cutile_memory_saver_requires_recoverable_weights(self):
-        """Releasing unbacked weights is unsafe when cuTile cannot reload them."""
+        """Reject unsafe configuration before memory release can discard weights."""
+        # This covers the startup guard; GPU release/resume and CPU-backup
+        # restoration need a separate runtime integration test.
         cases = (
             (False, False, None),
             (False, True, None),
@@ -311,6 +314,8 @@ class TestMiniMaxM31ConfigResolution(CustomTestCase):
                 _validate_flashinfer_cutile_config(cutile_server_args())
 
     def test_cutile_rejects_incompatible_modes_before_backend_rewrite(self):
+        # An explicit unsupported cuTile request must fail before the common
+        # post-processing path can silently replace the selected backend.
         cases = (
             (dict(quantization="mxfp8"), "minimax_m3_nvfp4"),
             (dict(enable_memory_saver=True), "enable-weights-cpu-backup"),

@@ -81,6 +81,8 @@ class MoeRunner:
                 "--moe-runner-backend hpc_ops for this model."
             )
 
+        # An explicit cuTile request must reach the supported quantization
+        # scheme; silently selecting another per-layer runner hides a mismatch.
         if (
             get_moe_runner_backend().is_flashinfer_cutile()
             and not runner_backend.is_flashinfer_cutile()

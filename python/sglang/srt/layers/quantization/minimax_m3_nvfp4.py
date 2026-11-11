@@ -133,7 +133,11 @@ class MiniMaxM3Nvfp4Config(Fp8Config):
 
 
 class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
-    """MegaMoE and TRT-LLM experts on Blackwell, requantized on gfx950, Marlin W4A16 elsewhere."""
+    """Select an expert backend for MiniMax's compressed-tensors NVFP4 weights.
+
+    cuTile is opt-in on SM12x. Existing paths use MegaMoE/TRT-LLM on Blackwell,
+    requantized experts on gfx950, or Marlin W4A16 elsewhere.
+    """
 
     # Cleared because __init__ below supplies a non-Blackwell expert path.
     requires_blackwell = False
@@ -201,8 +205,10 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
             **extra_weight_attrs,
         )
         if self.use_flashinfer_cutile:
-            # The updater and exporter check these model-owned constraints
-            # before any loader or transport. All ranks select them at startup.
+            # Register these restrictions before preparing or dropping any
+            # parameters. Updater/exporter preflight checks inspect the model's
+            # modules, so every rank rejects before loading, writing or sending
+            # weights, even if the execution pack has not been built yet.
             setattr(layer, "_derived_weight_cache_error", _CUTILE_WEIGHT_UPDATE_ERROR)
             setattr(layer, "_weight_export_error", _CUTILE_WEIGHT_EXPORT_ERROR)
             # Dynamic-activation checkpoints may omit these scales. Set their
@@ -323,10 +329,13 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         self.cutile_quant_info = prepare_flashinfer_cutile_nvfp4_weights(
             layer=layer, config=self.moe_runner_config
         )
-        # The pack owns the execution tensors for this model's lifetime.
-        # CPU offload is rejected at argument validation; online updates are
-        # rejected by the model-owned marker before any weight can be changed.
-        # Do not retain the original gate/up and unswizzled scale copies.
+        # Release checkpoint-layout copies only after preparation succeeds.
+        # The pack owns the execution tensors outside nn.Module's parameter
+        # traversal. Parameter-based CPU offload is therefore rejected at
+        # startup, and the model-owned markers reject online updates and exports
+        # before they could mutate weights or serialize an incomplete checkpoint.
+        # Memory saver must preserve these allocations through its CPU backup;
+        # this backend cannot reload the discarded checkpoint layout in place.
         for name in (
             "w13_weight_packed",
             "w2_weight_packed",
