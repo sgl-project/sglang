@@ -1,7 +1,7 @@
 // ring_simple, CustomAllReduceV2's ring all-reduce for ROCm gfx1250 (MI450): each
 // chunk goes to the next rank only, through a fixed-size FIFO behind 64-bit
-// counters, in 2 * (world_size - 1) hops per loop. It runs over the
-// communicator's ring plane.
+// counters, in 2 * (world_size - 1) hops per loop. It runs over a ring plane of
+// its own (`RingPlaneObj` below), not over the shared communicator.
 #include <sgl_kernel/ffi.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -16,8 +16,12 @@
 
 #include <tvm/ffi/extra/stl.h>
 #include <tvm/ffi/object.h>
+#include <tvm/ffi/reflection/registry.h>
 
+#include <array>
 #include <cstdint>
+#include <limits>
+#include <vector>
 
 #ifndef USE_ROCM
 #error "ring_simple is ROCm only"
@@ -27,7 +31,47 @@ namespace sglang {
 
 namespace ring_simple {
 
-using device::distributed::RingWorkSpace;
+/// One ring's state on one rank, padded to a cache line. All counts are 64-bit
+/// so no comparison ever wraps.
+struct alignas(128) RingSemaphore {
+  uint64_t drained;  // packets the successor has drained from this rank; only the successor writes it
+  uint64_t packet;   // packets this rank's ring has sent (and received); rank-local
+  uint64_t ready;    // packets the predecessor has published here; only the predecessor writes it
+};
+static_assert(sizeof(RingSemaphore) == 128, "must match _SEMAPHORE_BYTES in ring_simple_all_reduce.py");
+
+/// Kernel-facing view of a ring plane from one rank: its own receive FIFOs
+/// (the predecessor pushes into them), the successor's FIFOs (this rank pushes
+/// into them), and the semaphore rows of this rank and both neighbours.
+/// `credits` (local) holds what the neighbours report; `prev_credits` is where
+/// this rank reports what it drained, `next_credits` what it published.
+struct RingWorkSpace {
+  uint8_t* recv;
+  uint8_t* send;
+  RingSemaphore* credits;
+  RingSemaphore* prev_credits;
+  RingSemaphore* next_credits;
+  uint32_t slot_bytes;
+  uint32_t num_slots;
+};
+
+/// A 64-bit sequence flag: payload the writer stored before the flag is
+/// visible once this load sees it.
+SGL_DEVICE uint64_t load_acquire_sys(const uint64_t* ptr) {
+  return __hip_atomic_load(const_cast<uint64_t*>(ptr), __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+/// Publishes this wave's system-scope stores (`st_relaxed_16B`) before a later
+/// flag store, without the cache writeback `fence_release_sys` adds for plain
+/// stores: those stores bypass the cache, so completing them is enough. Only
+/// gfx12 counts stores apart from loads; elsewhere this is the full fence.
+SGL_DEVICE void wait_stores_sys() {
+#if defined(__gfx1250__)
+  asm volatile("s_wait_storecnt 0x0" ::: "memory");
+#else
+  device::ptx::fence_release_sys();
+#endif
+}
 
 struct Params {
   const void* __restrict__ input;
@@ -93,7 +137,7 @@ __global__ __launch_bounds__(kRingSimpleThreads, 1) __attribute__((
   uint64_t ready = 0, drained = 0;
   const auto wait_until = [&](uint64_t& seen, const uint64_t* ptr, uint64_t target) {
     while (seen < target) {
-      seen = ptx::load_acquire_sys(ptr);
+      seen = load_acquire_sys(ptr);
       if (seen < target) __builtin_amdgcn_s_sleep(1);
     }
   };
@@ -109,7 +153,7 @@ __global__ __launch_bounds__(kRingSimpleThreads, 1) __attribute__((
   // Once every wave's stores (and so the loads feeding them) completed: tell
   // the predecessor `recv_p` is drained and the successor `send_p` is ready.
   const auto post = [&](bool recv, uint64_t recv_p, bool send, uint64_t send_p) {
-    ptx::wait_stores_sys();
+    wait_stores_sys();
     __syncthreads();
     if (threadIdx.x == 0) {
       if (recv) ptx::store_relaxed_sys(&prev_sem.drained, recv_p + 1);
@@ -231,15 +275,115 @@ __global__ __launch_bounds__(kRingSimpleThreads, 1) __attribute__((
 
 }  // namespace ring_simple
 
+namespace host::distributed {
+
+/**
+ * \brief Ring plane: symmetric FIFOs per rank plus one semaphore per ring.
+ *
+ * Each block of the launch runs one ring (channel), so each rank holds
+ * `[num_rings][num_slots][slot_bytes]`: ring i of the predecessor streams
+ * packets into slot `packet % num_slots` of row i. The counters in the
+ * semaphores persist across launches, so the semaphores MUST be zero-filled
+ * before first use.
+ *
+ * Holds no storage: the caller (Python) owns the tensors and their lifetime.
+ * Everything is inline: the registration module and every kernel module are
+ * separate shared objects that only share this header.
+ */
+struct RingPlaneObj : public tvm::ffi::Object {
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("sgl.distributed.RingPlane", RingPlaneObj, tvm::ffi::Object);
+
+  RingPlaneObj(
+      uint32_t rank,
+      uint32_t world_size,
+      std::vector<tvm::ffi::TensorView> workspaces,  // world_size * [num_rings][num_slots][slot_bytes]
+      std::vector<tvm::ffi::TensorView> semaphores)  // world_size * [num_rings][sizeof(RingSemaphore)]
+      : rank(rank), world_size(world_size), num_rings(), num_slots(), slot_bytes(), semaphores{}, workspaces{} {
+    CHECK_HOST(1 < world_size && world_size <= kMaxWorldSize) << "Invalid world size: " << world_size;
+    CHECK_HOST(rank < world_size) << "Invalid rank " << rank << " for world size " << world_size;
+    CHECK_HOST(workspaces.size() == world_size) << "Bad ring workspace count";
+    CHECK_HOST(semaphores.size() == world_size) << "Bad ring semaphore count";
+    auto R = SymbolicSize{"num_rings"};
+    auto S = SymbolicSize{"num_slots"};
+    auto N = SymbolicSize{"slot_bytes"};
+    auto device_sym = SymbolicDevice{};
+    device_sym.set_options<kDLGPU>();
+    for (uint32_t i = 0; i < world_size; ++i) {
+      TensorMatcher({R, S, N})  //
+          .with_dtype<uint8_t>()
+          .with_device(device_sym)
+          .verify(workspaces[i]);
+      TensorMatcher({R, static_cast<int64_t>(sizeof(ring_simple::RingSemaphore))})  //
+          .with_dtype<uint8_t>()
+          .with_device(device_sym)
+          .verify(semaphores[i]);
+    }
+    const auto rings = R.unwrap(), slots = S.unwrap(), bytes = N.unwrap();
+    CHECK_HOST(rings > 0 && bytes > 0 && bytes % 16 == 0) << "Bad ring slot: " << rings << " x " << bytes;
+    CHECK_HOST(slots >= 2 && (slots & (slots - 1)) == 0) << "Ring slot count must be a power of two >= 2: " << slots;
+    // the kernel forms FIFO offsets in 32 bits
+    CHECK_HOST(rings * slots * bytes <= std::numeric_limits<uint32_t>::max())
+        << rings * slots * bytes << " bytes of ring FIFO exceeds the 32-bit offset range";
+
+    this->num_rings = static_cast<uint32_t>(rings);
+    this->num_slots = static_cast<uint32_t>(slots);
+    this->slot_bytes = bytes;
+    for (uint32_t i = 0; i < world_size; ++i) {
+      this->semaphores[i] = static_cast<ring_simple::RingSemaphore*>(semaphores[i].data_ptr());
+      this->workspaces[i] = static_cast<uint8_t*>(workspaces[i].data_ptr());
+    }
+  }
+
+  uint32_t rank;
+  uint32_t world_size;
+  uint32_t num_rings;                                                 // one per block of the launch
+  uint32_t num_slots;                                                 // FIFO depth per ring, a power of two
+  int64_t slot_bytes;                                                 // one packet
+  std::array<ring_simple::RingSemaphore*, kMaxWorldSize> semaphores;  // symmetric memory
+  std::array<uint8_t*, kMaxWorldSize> workspaces;                     // symmetric memory
+
+  ring_simple::RingWorkSpace get_workspace() const {
+    const auto next = (rank + 1) % world_size;
+    const auto prev = (rank + world_size - 1) % world_size;
+    return ring_simple::RingWorkSpace{
+        workspaces[rank],
+        workspaces[next],
+        semaphores[rank],
+        semaphores[prev],
+        semaphores[next],
+        static_cast<uint32_t>(slot_bytes),
+        num_slots,
+    };
+  }
+};
+
+SGLANG_REGISTER_FFI_REFERENCE_CLASS(RingPlaneRef, RingPlaneObj);
+
+}  // namespace host::distributed
+
+inline void register_ring_plane() {
+  namespace refl = tvm::ffi::reflection;
+  namespace dist = host::distributed;
+  using Tensors = std::vector<tvm::ffi::TensorView>;
+
+  refl::ObjectDef<dist::RingPlaneObj>()
+      .def(refl::init<uint32_t, uint32_t, Tensors, Tensors>(), "__init__")
+      .def_ro("rank", &dist::RingPlaneObj::rank)
+      .def_ro("world_size", &dist::RingPlaneObj::world_size)
+      .def_ro("num_rings", &dist::RingPlaneObj::num_rings)
+      .def_ro("num_slots", &dist::RingPlaneObj::num_slots)
+      .def_ro("slot_bytes", &dist::RingPlaneObj::slot_bytes);
+}
+
 template <typename T, uint32_t kWorldSize, bool kUsePDL>
 struct RingSimpleKernel {
   using Tensor = tvm::ffi::Tensor;
 
-  /// All-reduce `in` over the communicator's ring plane, one ring per block.
-  static Tensor run(const host::distributed::CommunicatorRef comm_ref, const Tensor in) {
+  /// All-reduce `in` over the ring plane, one ring per block.
+  static Tensor run(const host::distributed::RingPlaneRef ring_ref, const Tensor in) {
     using namespace host;
-    const auto& comm = *comm_ref.get();
-    CHECK_HOST(comm.get_world_size() == kWorldSize) << comm.get_world_size();
+    const auto& ring = *ring_ref.get();
+    CHECK_HOST(ring.world_size == kWorldSize) << ring.world_size;
     CHECK_HOST(in.IsContiguous() && is_type<T>(in.dtype()) && in.device().device_type == kDLGPU);
     const auto num_elems = in.numel();
     const auto nbytes = static_cast<int64_t>(num_elems * sizeof(T));
@@ -247,7 +391,6 @@ struct RingSimpleKernel {
     const auto num_vecs = static_cast<uint32_t>(nbytes / 16);
     CHECK_HOST(int64_t{num_vecs} * 16 == nbytes) << nbytes;
 
-    const auto& ring = comm.get_ring_simple_obj();
     Tensor out = ffi::empty_like(in);
     const auto params = ring_simple::Params{
         .input = in.data_ptr(),

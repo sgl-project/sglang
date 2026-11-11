@@ -180,8 +180,9 @@ def test_gfx1250_table_enables_hier_only_at_tp16():
     ],
 )
 def test_gfx1250_table_picks_measured_best(world_size, nbytes, expected):
-    picked = _gfx1250_comm(world_size)._pick_config(nbytes, False)
-    assert (None if picked is None else picked.algo.name) == expected
+    assert (
+        _choice_name(_gfx1250_comm(world_size)._pick_config(nbytes, False)) == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -204,8 +205,8 @@ def test_gfx1250_table_picks_measured_best(world_size, nbytes, expected):
     ],
 )
 def test_gfx1250_dev_kernarg_table(world_size, nbytes, expected):
-    picked = _gfx1250_comm(world_size, dev_kernarg=True)._pick_config(nbytes, False)
-    assert (None if picked is None else picked.algo.name) == expected
+    comm = _gfx1250_comm(world_size, dev_kernarg=True)
+    assert _choice_name(comm._pick_config(nbytes, False)) == expected
 
 
 @pytest.mark.parametrize("dev_kernarg", [False, True])
@@ -271,7 +272,9 @@ def test_hier_sizing(max_size, sizes_own_push, hier_max, two_shot):
 def _choice_name(choice):
     if choice is None:
         return None
-    return "HIER_2SHOT_PUSH" if choice.use_hier else choice.algo.name
+    if choice.use_hier:
+        return "HIER_2SHOT_PUSH"
+    return "RING_SIMPLE" if choice.use_ring else choice.algo.name
 
 
 @pytest.mark.parametrize(
