@@ -1,6 +1,7 @@
 import unittest
 from collections import OrderedDict
 from contextlib import ExitStack, nullcontext
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -15,7 +16,10 @@ from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     BaseBreakableCudaGraphRunner,
 )
 from sglang.multimodal_gen.runtime.layers.attention import layer
-from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
+    CudnnSDPABackend,
+    SDPABackend,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
     LTX2AudioVideoRotaryPosEmbed,
@@ -26,6 +30,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
     _prepare_ltx2_rope_coords_for_bcg,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.test.unit.host_sync_guard import (
+    RecordOps,
+    forbid_host_syncs,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -427,7 +435,6 @@ class TestLTX2DenseAttentionBCG(CustomTestCase):
     def test_capture_and_eager_break_replay_changed_masks(self):
         with ExitStack() as stack:
             for name, value in (
-                ("get_attn_backend", SDPABackend),
                 ("get_compute_dtype", torch.bfloat16),
                 ("get_sequence_parallel_world_size", 1),
                 ("get_ring_parallel_world_size", 1),
@@ -436,9 +443,19 @@ class TestLTX2DenseAttentionBCG(CustomTestCase):
             ):
                 stack.enter_context(patch.object(layer, name, return_value=value))
             stack.enter_context(set_forward_context(0, None))
-            for cls in (layer.LocalAttention, layer.USPAttention):
+            for backend, cls in product(
+                (SDPABackend, CudnnSDPABackend),
+                (layer.LocalAttention, layer.USPAttention),
+            ):
                 for capture_dense in (False, True):
-                    with self.subTest(layer=cls.__name__, capture_dense=capture_dense):
+                    with (
+                        self.subTest(
+                            backend=backend.__name__,
+                            layer=cls.__name__,
+                            capture_dense=capture_dense,
+                        ),
+                        patch.object(layer, "get_attn_backend", return_value=backend),
+                    ):
                         attention = cls(
                             num_heads=4,
                             head_size=64,
@@ -498,6 +515,82 @@ class TestLTX2DenseAttentionBCG(CustomTestCase):
                 self.assertEqual(result, "eager")
                 model.assert_called_once_with(value=7)
                 stage._maybe_get_bcg_runner.assert_not_called()
+
+
+class TestLTX2StepHostOverhead(CustomTestCase):
+    def test_video_coord_constants_uploaded_once(self):
+        def rope():
+            return LTX2AudioVideoRotaryPosEmbed(
+                dim=48, patch_size=1, patch_size_t=1, scale_factors=(8, 32, 32)
+            )
+
+        kwargs = dict(
+            batch_size=2, num_frames=3, height=4, width=5, device=torch.device("cpu")
+        )
+        expected = rope().prepare_video_coords(**kwargs, fps=24.0)
+        cached = rope()
+        cached.prepare_video_coords(**kwargs, fps=24.0)
+        # every later call reuses the device constants instead of uploading them
+        with patch.object(torch, "tensor", wraps=torch.tensor) as upload:
+            actual = [
+                cached.prepare_video_coords(**kwargs, fps=24.0, start_frame=start)
+                for start in (0, 3)
+            ]
+        self.assertEqual(upload.call_count, 0)
+        torch.testing.assert_close(
+            actual,
+            [expected, rope().prepare_video_coords(**kwargs, fps=24.0, start_frame=3)],
+            rtol=0,
+            atol=0,
+        )
+
+    def test_sde_coefficients_never_read_on_host(self):
+        sigma_next = torch.tensor(0.4, dtype=torch.float64)
+        # a 0-dim boolean index goes through nonzero, a device sync
+        with forbid_host_syncs():
+            actual = LTX2DenoisingStage._ltx2_get_sde_coeff(
+                sigma_next, sigma_up=sigma_next * 0.5
+            )
+        sigma_up = (sigma_next * 0.5).clamp(max=sigma_next * 0.9999)
+        residual = (sigma_next**2 - sigma_up**2).clamp(min=0) ** 0.5
+        alpha_ratio = (1 - sigma_next) + residual
+        torch.testing.assert_close(
+            actual, (alpha_ratio, residual / alpha_ratio, sigma_up), rtol=0, atol=0
+        )
+
+    @torch.no_grad()
+    def test_bongmath_refinement_casts_once(self):
+        stage = object.__new__(LTX2DenoisingStage)
+        stage._ltx2_apply_clean_latent_mask = lambda latents, ctx: latents
+        generator = torch.Generator().manual_seed(0)
+        ctx = SimpleNamespace(
+            latents=torch.randn(1, 6, 4, generator=generator),
+            audio_latents=torch.randn(1, 3, 4, generator=generator),
+            use_native_hq_res2s_sde_noise=False,
+        )
+        stage._randn_like_with_batch_generators = lambda latents, batch: torch.randn(
+            latents.shape, generator=generator
+        )
+
+        def midpoint_model_call(video, audio, sigma):
+            return video * 0.5, audio * 0.5, None, None
+
+        with RecordOps() as ops:
+            video, audio = stage._ltx2_stage2_res2s_step(
+                ctx=ctx,
+                batch=None,
+                sigma=torch.tensor(0.6),
+                sigma_next=torch.tensor(0.45),
+                model_video_velocity=torch.ones(1, 6, 4),
+                model_audio_velocity=torch.ones(1, 3, 4),
+                model_video_timestep=None,
+                model_audio_timestep=None,
+                midpoint_model_call=midpoint_model_call,
+            )
+        self.assertTrue(torch.isfinite(video).all() and torch.isfinite(audio).all())
+        # the 100-iteration refinement casts the denoised estimates once, not per
+        # iteration (two modalities x 100 casts before)
+        self.assertLess(ops.casts(), 100)
 
 
 if __name__ == "__main__":
