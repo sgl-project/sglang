@@ -371,7 +371,13 @@ def fused_marlin_moe(
     elif activation == "silu" and not is_gated:
         intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
     elif activation == "relu2" and not is_gated:
-        intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
+        gemm1_out = intermediate_cache1.view(-1, N)
+        if clamp_limit is not None:
+            # Nemotron Shortcut: relu(c * tanh(x / c))^2, the soft clamp taken in FP32.
+            gemm1_out = (clamp_limit * torch.tanh(gemm1_out.float() / clamp_limit)).to(
+                gemm1_out.dtype
+            )
+        intermediate_cache2 = torch.square(F.relu(gemm1_out))
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
