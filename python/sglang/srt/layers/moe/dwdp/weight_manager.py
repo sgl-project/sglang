@@ -12,7 +12,7 @@ import torch
 from sglang.srt.layers.moe.dwdp.layout import PeerRanges, lookup_owner
 from sglang.srt.layers.moe.dwdp.transport import DWDPTransport
 from sglang.srt.layers.moe.dwdp.weight_buffer import PREFETCH_DEPTH, WeightBuffer
-from sglang.srt.utils.common import create_device_stream, device_stream_context
+from sglang.srt.utils.device import create_device_stream, device_stream_context
 
 logger = logging.getLogger(__name__)
 

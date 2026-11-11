@@ -193,7 +193,7 @@ class TestCosmos3Config(CustomTestCase):
         # not one implementation class.
         from transformers import AutoConfig
 
-        import sglang.srt.utils.hf_transformers.common  # noqa: F401
+        import sglang.srt.hf_transformers.common  # noqa: F401
 
         cfg = AutoConfig.for_model(
             "cosmos3_omni",

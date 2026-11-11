@@ -28,7 +28,6 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.srt.distributed.device_communicators.cuda_wrapper import find_loaded_library
 from sglang.srt.environ import envs
 from sglang.srt.utils.vmm_backend import VmmBackend
 from sglang.srt.utils.vmm_common import Reservation, all_ranks_ok
@@ -179,6 +178,11 @@ def _missing_symbol(lib: ctypes.CDLL, symbols: Tuple[str, ...]) -> Optional[str]
 
 
 def _loader_candidates() -> Iterator[str]:
+    # utils must not import srt.distributed at module level
+    from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+        find_loaded_library,
+    )
+
     # the copy torch mapped first, then every install the linker cache knows about
     yield find_loaded_library("libze_loader") or _LOADER_SONAME
     yield from _ldconfig_paths(_LOADER_SONAME)

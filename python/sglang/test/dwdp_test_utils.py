@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from sglang.benchmark.serving import run_benchmark
-from sglang.srt.utils.common import get_device_count, get_device_module
+from sglang.srt.utils.device import get_device_count, get_device_module
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,

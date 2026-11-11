@@ -194,5 +194,22 @@ def test_real_uvicorn_worker_accepts_on_private_listener(config):
         supervisor.join_all()
 
 
+def test_supervisor_forwards_sigquit_to_handler_installed_before_it(config):
+    """uvicorn's supervisor must not swallow a failed child's SIGQUIT, or the
+    server keeps serving after its schedulers die."""
+    received = []
+    signal.signal(signal.SIGQUIT, lambda signum, frame: received.append(signum))
+    supervisor = http_server._SigquitForwardingMultiprocess(config, sockets=[])
+
+    signal.raise_signal(signal.SIGQUIT)
+    assert received == []  # uvicorn's own handler only queues it
+    supervisor.handle_signals()
+
+    assert received == [signal.SIGQUIT]
+    assert issubclass(
+        http_server._ReusePortMultiprocess, http_server._SigquitForwardingMultiprocess
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
