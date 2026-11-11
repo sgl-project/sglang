@@ -136,7 +136,7 @@ class TestPrefillReservationBudget(CustomTestCase):
                 is_cp_sharded_padded=lambda: False,
             ),
         ):
-            Scheduler._admit_chunked_req(scheduler, adder)
+            Scheduler._admit_chunked_req(scheduler, adder, continuation)
         return scheduler
 
     def test_input_budget_preserves_waiter_budget(self):

@@ -4377,9 +4377,8 @@ class Scheduler(
 
         return res
 
-    def _admit_chunked_req(self, adder: PrefillAdder) -> None:
+    def _admit_chunked_req(self, adder: PrefillAdder, resumed_req: Req) -> None:
         # The request between two chunks: in chunked_reqs, not in waiting_queue.
-        resumed_req = self.chunked_req
         resumed_req.init_next_round_input()
         budget = adder.rem_chunk_tokens or 0
         if (
@@ -4599,8 +4598,9 @@ class Scheduler(
             kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
         )
 
-        if self.chunked_req is not None:
-            self._admit_chunked_req(adder)
+        resumed_req = self.chunked_req
+        if resumed_req is not None:
+            self._admit_chunked_req(adder, resumed_req)
 
         if self.enable_lora:
             running_reqs = running_batch.reqs
