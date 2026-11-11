@@ -9,6 +9,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
     ReqList,
+    move,
 )
 
 if TYPE_CHECKING:
@@ -51,7 +52,13 @@ class DeferredResponses:
             raise ValueError("only finished, unstreamed responses can be deferred")
         if any(held.rid == req.rid for held in self.held):
             raise ValueError(f"response {req.rid!r} is already deferred")
-        self.held.join([(req, completion)])
+        if req.owner_list is not None:
+            # Its release would take it out of the deferred list.
+            raise ValueError(
+                f"response {req.rid!r} is still in {req.owner_list.kind.name}; "
+                "defer it after its release"
+            )
+        move([(req, completion)], self.held)
         req.defer_output = True
         self.output_streamer.defer_outputs = True
 
@@ -62,7 +69,7 @@ class DeferredResponses:
         for req, completion in list(self.held.items()):
             if not completion.done():
                 continue
-            self.held.leave([req])
+            self.held._leave([req])
             req.defer_output = False
             try:
                 completion.result()
@@ -91,7 +98,7 @@ class DeferredResponses:
     def _abort(self, recv_req: AbortReq) -> None:
         for req, completion in list(self.held.items()):
             if recv_req.matches(req.rid):
-                self.held.leave([req])
+                self.held._leave([req])
                 try:
                     completion.cancel()
                 except Exception:
