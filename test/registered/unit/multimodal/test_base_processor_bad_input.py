@@ -19,12 +19,12 @@ from unittest.mock import MagicMock, patch
 import requests
 from PIL import Image
 
+from sglang.srt.multimodal.media_io import CLIENT_MEDIA_EXCEPTIONS
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils.common import CLIENT_MEDIA_EXCEPTIONS
 from sglang.test.test_utils import CustomTestCase
 
 MODALITIES = (Modality.IMAGE, Modality.AUDIO, Modality.VIDEO)
@@ -58,7 +58,7 @@ class TestBadInputIsClientError(CustomTestCase):
             for modality in MODALITIES:
                 with self.subTest(exc=type(exc).__name__, modality=modality):
                     with patch(
-                        "sglang.srt.utils.common.get_mm_http_session",
+                        "sglang.srt.multimodal.media_io.get_mm_http_session",
                         return_value=_session_raising(exc),
                     ):
                         self._assert_client_error("https://media.host/clip", modality)
@@ -98,7 +98,7 @@ class TestBadInputIsClientError(CustomTestCase):
     def test_undecodable_video_bytes(self):
         # Decoder is patched so no codec backend needs to be installed.
         with patch(
-            "sglang.srt.utils.common.VideoDecoderWrapper",
+            "sglang.srt.multimodal.media_io.VideoDecoderWrapper",
             side_effect=RuntimeError("invalid data found when processing input"),
         ):
             self._assert_client_error(b"definitely not a video", Modality.VIDEO)
@@ -109,7 +109,8 @@ class TestServerFaultStaysServerError(CustomTestCase):
 
     def _assert_server_error(self, side_effect):
         with patch(
-            "sglang.srt.utils.common.VideoDecoderWrapper", side_effect=side_effect
+            "sglang.srt.multimodal.media_io.VideoDecoderWrapper",
+            side_effect=side_effect,
         ):
             with self.assertRaises(RuntimeError):
                 _StubProcessor._load_single_item(b"payload", Modality.VIDEO)
@@ -122,7 +123,7 @@ class TestServerFaultStaysServerError(CustomTestCase):
 
     def test_image_source_os_error(self):
         with patch(
-            "sglang.srt.utils.common.get_image_bytes",
+            "sglang.srt.multimodal.media_io.get_image_bytes",
             side_effect=OSError("too many open files"),
         ):
             with self.assertRaisesRegex(RuntimeError, "too many open files"):

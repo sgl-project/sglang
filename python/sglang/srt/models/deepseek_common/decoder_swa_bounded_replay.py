@@ -7,7 +7,7 @@ import torch
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len_from_batch
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch

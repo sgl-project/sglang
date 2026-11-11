@@ -1047,7 +1047,6 @@ class DeepseekV4HipRadixBackend(
             self.enable_deepseek_v4_fp4_indexer
             and self.speculative_num_steps == 0
             and self.has_c4
-            and envs.SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP.get()
         ):
             from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
                 aiter_has_fp4_rowgroup,
@@ -1064,10 +1063,9 @@ class DeepseekV4HipRadixBackend(
                     self._fp4_c4_rowgroup_columns,
                 )
             else:
-                logger.warning(
-                    "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP is set but the installed AITER "
-                    "has no row-group FP4 MQA logits kernel (#6145); keeping the "
-                    "schedule-based C4 indexer."
+                logger.info(
+                    "DSv4 C4 indexer: the installed AITER has no row-group FP4 MQA "
+                    "logits kernel (#6145); using the schedule-based C4 indexer."
                 )
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
