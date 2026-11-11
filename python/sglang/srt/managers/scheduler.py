@@ -1755,7 +1755,8 @@ class Scheduler(
         # overlaps; its kernels queue behind the forward's).
         architectures = self.model_config.hf_config.architectures
         return bool(
-            get_exec().kernel.enable_amd_monokernel
+            _is_hip
+            and get_exec().kernel.enable_amd_monokernel
             and architectures
             and is_muse_spark_architecture(architectures[0])
         )
