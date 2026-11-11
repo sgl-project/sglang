@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::off_worker;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::tokenizer::adapter;
@@ -64,7 +65,7 @@ pub async fn tokenize(
     // fires from IntoResponse — duplication is intentional: the route-level
     // line carries `model` / `prompt_len`, the IntoResponse line carries
     // the full anyhow chain.
-    let ids = adapter::encode(&tok, &req.prompt).map_err(|e| {
+    let ids = off_worker::run(|| adapter::encode(&tok, &req.prompt)).map_err(|e| {
         tracing::error!(
             route = "/v1/tokenize",
             model = %req.model,
@@ -87,17 +88,18 @@ pub async fn detokenize(
 ) -> Result<Json<DetokenizeResponse>, ApiError> {
     let tok = tokenizer_for(&ctx, &req.model)?;
     let text =
-        adapter::decode_complete(&tok, &req.tokens, req.skip_special_tokens).map_err(|e| {
-            tracing::error!(
-                route = "/v1/detokenize",
-                model = %req.model,
-                n_tokens = req.tokens.len(),
-                skip_special = req.skip_special_tokens,
-                error = ?e,
-                "detokenize.decode_complete failed",
-            );
-            ApiError::Internal(e)
-        })?;
+        off_worker::run(|| adapter::decode_complete(&tok, &req.tokens, req.skip_special_tokens))
+            .map_err(|e| {
+                tracing::error!(
+                    route = "/v1/detokenize",
+                    model = %req.model,
+                    n_tokens = req.tokens.len(),
+                    skip_special = req.skip_special_tokens,
+                    error = ?e,
+                    "detokenize.decode_complete failed",
+                );
+                ApiError::Internal(e)
+            })?;
     Ok(Json(DetokenizeResponse {
         model: req.model,
         text,
