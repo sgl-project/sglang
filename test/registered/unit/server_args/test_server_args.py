@@ -3469,6 +3469,7 @@ class TestPipelineParallelCompat(CustomTestCase):
             disaggregation_mode="prefill",
             min_free_slots_delay=None,
             scheduler_recv_interval=1,
+            enable_return_routed_experts=False,
         )
         cfg.update(overrides)
         return SimpleNamespace(**cfg)
