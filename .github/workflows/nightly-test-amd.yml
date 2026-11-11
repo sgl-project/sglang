@@ -670,6 +670,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        id: install-dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm (8-GPU GPT-OSS)
@@ -687,7 +688,7 @@ jobs:
       # two models, and an MI30x job spends ~49 min pulling the image and
       # installing dependencies before it runs anything.
       - name: Performance Test ROCm (8-GPU GPT-OSS)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -723,6 +724,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
@@ -742,7 +744,7 @@ jobs:
       # Shares this job with the accuracy step above rather than taking its own,
       # so the container setup and the GPT-OSS weight cache are paid for once.
       - name: Performance Test MI35x ROCm (8-GPU GPT-OSS)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -782,6 +784,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        id: install-dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm (8-GPU Grok1-INT4)
@@ -796,7 +799,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test ROCm (8-GPU Grok1-INT4)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 60
         continue-on-error: true
         id: performance
@@ -840,6 +843,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
@@ -857,7 +861,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU Grok1-INT4)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 60
         continue-on-error: true
         id: performance
@@ -905,6 +909,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        id: install-dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm (8-GPU Grok2)
@@ -919,7 +924,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test ROCm (8-GPU Grok2)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 60
         continue-on-error: true
         id: performance
@@ -963,6 +968,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
@@ -980,7 +986,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU Grok2)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 60
         continue-on-error: true
         id: performance
@@ -1029,6 +1035,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
@@ -1046,7 +1053,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU DeepSeek-R1-MXFP4)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 300
         continue-on-error: true
         id: performance
@@ -1091,6 +1098,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
@@ -1107,7 +1115,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Accuracy Test MI35x ROCm (DeepSeek-R1-MXFP4 TP4 MTP)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 180
         run: |
           > github_summary.md
@@ -1144,6 +1152,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
@@ -1161,7 +1170,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU DeepSeek-R1-MXFP4 KV FP8)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 300
         continue-on-error: true
         id: performance
@@ -1206,6 +1215,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
@@ -1223,7 +1233,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU DeepSeek-R1-MXFP4 AllReduce Fusion)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 300
         continue-on-error: true
         id: performance
@@ -1358,6 +1368,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           # --skip-test-time-deps: GSM8K + bench_one_batch_server don't need lmms-eval / human-eval.
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
@@ -1376,7 +1387,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
       - name: Accuracy + Performance Test MI35x ROCm (8-GPU DeepSeek-V4-Flash FP8 + FP4, triton)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 300
         run: |
           > github_summary.md  # Clear summary file
@@ -1414,6 +1425,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           # --skip-test-time-deps: GSM8K + bench_one_batch_server don't need lmms-eval / human-eval.
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
@@ -1432,7 +1444,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
       - name: Accuracy + Performance Test MI35x ROCm (8-GPU DeepSeek-V4-Pro FP8 + FP4, triton)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 480
         run: |
           > github_summary.md  # Clear summary file
@@ -1470,6 +1482,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           # --skip-test-time-deps: GSM8K + send_one don't need lmms-eval / human-eval.
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
@@ -1488,7 +1501,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
       - name: Accuracy + MTP Accept Length Test MI35x ROCm (8-GPU DeepSeek-V4-Pro FP8 MTP, triton)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 240
         run: |
           > github_summary.md  # Clear summary file
@@ -1830,6 +1843,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common "lm-eval[api]"
@@ -1846,7 +1860,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test ROCm (8-GPU Qwen 3.5 FP8)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 120
         continue-on-error: true
         id: performance
@@ -1891,6 +1905,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
@@ -1908,7 +1923,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU Qwen 3.5 FP8)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 120
         continue-on-error: true
         id: performance
@@ -2188,6 +2203,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test MI35x ROCm (4-GPU MiniMax-M3 MXFP8)
@@ -2205,7 +2221,7 @@ jobs:
       # Run perf only after correctness passes. Keeping both steps in this job
       # reuses the cached checkpoint and one scarce MI35x slot.
       - name: Performance Test MI35x ROCm (4-GPU MiniMax-M3 MXFP8)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 120
         continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
         id: performance
@@ -2298,6 +2314,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm (8-GPU MiniMax-M2.7)
@@ -2313,7 +2330,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test ROCm (8-GPU MiniMax-M2.7)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 120
         continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
         id: performance
