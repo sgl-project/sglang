@@ -32,6 +32,9 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensor
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    _unsupported_derived_weight_cache_error,
+)
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
@@ -328,10 +331,8 @@ class TestWNA16Dequantize(CustomTestCase):
 
 
 class TestPostLoadPackedKvBProj(CustomTestCase):
-    def test_absorbed_weights_come_from_the_dequantized_kv_b_proj(self):
-        """post_load_weights read kv_b_proj.weight, which a packed W4A16 layer
-        does not have (the issue's AttributeError)."""
-        heads, nope, v, kv_lora_rank = 2, 4, 8, 64
+    def _post_load(self, nope, v):
+        heads, kv_lora_rank = 2, 64
         kv_b_proj, w = _packed_layer(heads * (nope + v), kv_lora_rank)
         kv_b_proj.quant_method = CompressedTensorsLinearMethod(
             CompressedTensorsConfig.from_config(_GLM47_FLASH_W4A16)
@@ -354,11 +355,28 @@ class TestPostLoadPackedKvBProj(CustomTestCase):
         )
 
         loader.post_load_weights()
+        return self_attn, w
+
+    def test_absorbed_weights_come_from_the_dequantized_kv_b_proj(self):
+        """post_load_weights read kv_b_proj.weight, which a packed W4A16 layer
+        does not have (the issue's AttributeError)."""
+        nope, v = 4, 8
+        self_attn, w = self._post_load(nope, v)
 
         w_kc, w_vc = w.unflatten(0, (-1, nope + v)).split([nope, v], dim=1)
         torch.testing.assert_close(self_attn.w_kc, w_kc, rtol=0, atol=0)
         torch.testing.assert_close(self_attn.w_vc, w_vc.transpose(1, 2), rtol=0, atol=0)
         self.assertEqual(self_attn.w_scale, 1.0)
+
+    def test_online_weight_updates_are_refused_before_writing(self):
+        """An online update ends in post_load_weights, which cannot dequantize
+        the repacked kv_b_proj again; it raised after the new weights were
+        already written. The update must be refused before it starts."""
+        self_attn, _ = self._post_load(4, 8)
+        model = torch.nn.ModuleDict({"kv_b_proj": self_attn.kv_b_proj})
+        error = _unsupported_derived_weight_cache_error(model)
+        self.assertIsNotNone(error)
+        self.assertIn("compressed-tensors WNA16", error)
 
 
 class TestGlm47FlashW4A16Config(CustomTestCase):
@@ -398,8 +416,9 @@ class TestGlm47FlashW4A16Config(CustomTestCase):
 
     def test_only_a_precision_mismatch_vetoes_shared_expert_fusion(self):
         """GLM fused the BF16 shared expert into the W4A16 routed-expert buffers
-        on SM80+. Fusion must stop exactly when the shared expert is kept at a
-        higher precision than that layer's routed experts."""
+        on SM80+. Fusion must stop exactly when any projection of the shared
+        expert has a different precision from the same projection of that
+        layer's routed experts, in either direction."""
         shared = [
             f"model.layers.1.mlp.shared_experts.{p}"
             for p in ("gate_proj", "up_proj", "down_proj")
@@ -419,6 +438,15 @@ class TestGlm47FlashW4A16Config(CustomTestCase):
             # Anchored to layers that no explicit entry names.
             (["lm_head", r"re:model\.layers\.(3|5)\.mlp\.shared_experts\..*"], False),
             (["lm_head", "shared_experts.gate_proj"], False),
+            # Only one shared projection kept BF16 (its down weight was skipped).
+            (["lm_head", "model.layers.1.mlp.shared_experts.down_proj"], False),
+            (["lm_head", "model.layers.1.mlp.shared_experts.up_proj"], False),
+            (["lm_head", "shared_experts.down_proj"], False),
+            # The same projection kept BF16 on both sides still fuses.
+            (["lm_head", shared[2], routed[2]], True),
+            # Routed experts kept BF16 beside quantized shared experts.
+            (["lm_head", *routed], False),
+            (["lm_head", r"re:.*mlp\.experts\..*"], False),
             (["lm_head", r"re:.*mlp\..*"], True),
         ):
             with self.subTest(ignore=ignore):

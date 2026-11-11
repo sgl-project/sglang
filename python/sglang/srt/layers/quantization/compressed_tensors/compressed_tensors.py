@@ -122,10 +122,12 @@ class DeviceCapability(NamedTuple):
 _LAYER_MLP_PREFIX = re.compile(r"^(?!re:)(.*\.layers\.\d+\.mlp)\.")
 # Layers probed for `ignore` entries that name none (regexes, bare suffixes).
 _FUSION_PROBE_LAYERS = 256
-_EXPERT_PROBE_TAILS = (
-    "mlp.experts.0.gate_proj",
-    "mlp.shared_experts.gate_proj",
-    "mlp.shared_expert.gate_proj",
+_EXPERT_PROJS = ("gate_proj", "up_proj", "down_proj")
+_SHARED_EXPERT_NAMES = ("shared_experts", "shared_expert")
+_EXPERT_PROBE_TAILS = tuple(
+    f"mlp.{expert}.{proj}"
+    for expert in ("experts.0", *_SHARED_EXPERT_NAMES)
+    for proj in _EXPERT_PROJS
 )
 
 
@@ -184,9 +186,12 @@ class CompressedTensorsConfig(QuantizationConfig):
     def can_fuse_shared_expert(self) -> bool:
         """Whether shared experts can fuse into the routed-expert FusedMoE.
 
-        Not where `ignore` keeps a layer's shared expert unquantized but its
-        routed experts quantized. Both are resolved per MoE layer with
-        should_ignore_layer, so names and regexes match alike.
+        Not where `ignore` gives any projection of a layer's shared expert a
+        different precision from the same projection of its routed experts,
+        in either direction: fusion would load BF16 weights into quantized
+        expert buffers, or quantized weights into BF16 ones. Each projection
+        is resolved per MoE layer with should_ignore_layer, so names and
+        regexes match alike.
         """
         prefixes = set()
         for name in self.ignore:
@@ -209,13 +214,15 @@ class CompressedTensorsConfig(QuantizationConfig):
             )
 
         for prefix in prefixes:
-            if ignored(f"{prefix}.experts.0.gate_proj"):
-                continue
-            if any(
-                ignored(f"{prefix}.{shared}.gate_proj")
-                for shared in ("shared_experts", "shared_expert")
-            ):
-                return False
+            for proj in _EXPERT_PROJS:
+                routed = ignored(f"{prefix}.experts.0.{proj}")
+                # A model names its shared expert one way, so an ignored
+                # projection under either name counts as ignored.
+                shared = any(
+                    ignored(f"{prefix}.{name}.{proj}") for name in _SHARED_EXPERT_NAMES
+                )
+                if shared != routed:
+                    return False
         return True
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):

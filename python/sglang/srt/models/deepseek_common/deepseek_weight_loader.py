@@ -697,6 +697,15 @@ class DeepseekV2WeightLoaderMixin:
                 # Still in the checkpoint layout: the kernel repack runs after
                 # load_weights.
                 w = self_attn.kv_b_proj.scheme.dequantize_weight(self_attn.kv_b_proj)
+                # Once repacked it cannot be read back, so an online update's
+                # post_load_weights could not rebuild w_kc/w_vc. Refuse updates
+                # before they write any weight.
+                self_attn.kv_b_proj._derived_weight_cache_error = (
+                    "Online weight updates are not supported for compressed-"
+                    "tensors WNA16 MLA checkpoints: the absorbed w_kc/w_vc "
+                    "weights are built from kv_b_proj before its kernel repack "
+                    "and cannot be rebuilt afterwards."
+                )
             else:
                 w = self_attn.kv_b_proj.weight
 
