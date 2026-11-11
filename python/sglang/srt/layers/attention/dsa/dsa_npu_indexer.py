@@ -250,6 +250,11 @@ class DSANPUIndexerMixin:
             and not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
         )
+        use_cp_indexer = (
+            is_prefill
+            and self.dsa_enable_prefill_cp
+            and forward_batch.attn_cp_metadata is not None
+        )
 
         bs = q_lora.shape[0]
 
@@ -258,12 +263,9 @@ class DSANPUIndexerMixin:
         # index-K, which is what lets any of them score a subset. Neox only: the
         # other branch rotates q and k in one call. Prefill CP is excluded: its
         # indexer below knows nothing of this shard.
-        uses_prefill_cp = (
-            self.dsa_enable_prefill_cp and forward_batch.attn_cp_metadata is not None
-        )
         shard = (
             _get_indexer_query_shard(forward_batch, bs)
-            if is_prefill and not uses_prefill_cp
+            if is_prefill and not use_cp_indexer
             else None
         )
         q_sliced_early = shard is not None and self.rotary_emb.is_neox_style
@@ -401,11 +403,7 @@ class DSANPUIndexerMixin:
             q = torch.cat([q_pe, q_nope], dim=-1)
             k = torch.cat([k_pe, k_nope], dim=-1)
 
-        if (
-            is_prefill
-            and self.dsa_enable_prefill_cp
-            and forward_batch.attn_cp_metadata is not None
-        ):
+        if use_cp_indexer:
             k = cp_gather_full_sequence_states(
                 k.contiguous().view(-1, self.head_dim),
                 forward_batch,
@@ -443,10 +441,7 @@ class DSANPUIndexerMixin:
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
-            if (
-                self.dsa_enable_prefill_cp
-                and forward_batch.attn_cp_metadata is not None
-            ):
+            if use_cp_indexer:
                 # V2: local metadata already prepared by prepare_dsa_cp_metadata.
                 actual_seq_lengths_q = (
                     get_attn_backend().forward_metadata.actual_seq_lengths_q
@@ -491,9 +486,10 @@ class DSANPUIndexerMixin:
         if _use_ag_after_qlora and input_on_attn_tp_slices:
             weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = get_attn_backend().forward_metadata.block_tables
+        query = q.view(-1, self.n_heads, self.head_dim)
         if self.num_init_tokens or self.num_local_tokens:
             return self._forward_npu_lsa_indexer(
-                q.view(-1, self.n_heads, self.head_dim),
+                query,
                 past_key_states,
                 weights,
                 actual_seq_lengths_q,
@@ -502,105 +498,30 @@ class DSANPUIndexerMixin:
                 if is_prefill
                 else block_table,
             )
-        if (
-            is_prefill
-            and self.dsa_enable_prefill_cp
-            and forward_batch.attn_cp_metadata is not None
-        ):
-            topk_indices = self.do_npu_cp_balance_indexer(
-                q.view(-1, self.n_heads, self.head_dim),
-                past_key_states,
-                weights,
-                actual_seq_lengths_q,
-                actual_seq_lengths_kv,
-                block_table,
-            )
-            return topk_indices
-        else:
-            block_table = (
-                block_table[: actual_seq_lengths_q.size()[0]]
-                if is_prefill
-                else block_table
-            )
-            query = q.view(-1, self.n_heads, self.head_dim)
-            # The full width for the gather, NOT query.shape[0] (already cut).
-            num_query_tokens = bs
-            if shard is not None:
-                if not q_sliced_early:
-                    query = shard.take(query)
-                # A late take: under _use_ag_after_qlora weights is gathered
-                # to full width above, so an earlier slice would cut twice.
-                weights = shard.take(weights)
-                actual_seq_lengths_q = shard.actual_seq_lengths_q
-                actual_seq_lengths_kv = shard.actual_seq_lengths_kv
+        if use_cp_indexer:
+            # Each rank indexes the full paged K cache with its local Q rows.
+            weights = weights.contiguous().view(-1, weights.shape[-1])
+        elif is_prefill:
+            block_table = block_table[: actual_seq_lengths_q.numel()]
 
-            if use_quant_indexer:
-                query, query_scale = _quantize_npu_indexer_activation(
-                    query,
-                    pool.indexer_hadamard_128,
-                    pool.dtype,
-                )
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
-                    query=query,
-                    key=past_key_states,
-                    weights=weights,
-                    query_dequant_scale=query_scale,
-                    key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
-                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                    actual_seq_lengths_key=actual_seq_lengths_kv.to(
-                        device=k.device, dtype=torch.int32
-                    ),
-                    block_table=block_table,
-                    layout_query="TND",
-                    layout_key="PA_BSND",
-                    sparse_count=self.index_topk,
-                    sparse_mode=3,
-                    query_quant_mode=0,
-                    key_quant_mode=0,
-                ).squeeze(1)
-            else:
-                topk_indices = torch_npu.npu_lightning_indexer(
-                    query=query,
-                    key=past_key_states,
-                    weights=weights,
-                    actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-                    actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
-                        torch.int32
-                    ),
-                    block_table=block_table,
-                    layout_query="TND",
-                    layout_key="PA_BSND",
-                    sparse_count=self.index_topk,
-                    sparse_mode=3,
-                )[0].squeeze(1)
-            if shard is not None:
-                topk_indices = shard.gather(topk_indices, num_query_tokens)
-            # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
-            return topk_indices
+        if shard is not None:
+            if not q_sliced_early:
+                query = shard.take(query)
+            # Under _use_ag_after_qlora the weights are gathered above.
+            weights = shard.take(weights)
+            actual_seq_lengths_q = shard.actual_seq_lengths_q
+            actual_seq_lengths_kv = shard.actual_seq_lengths_kv
 
-    def do_npu_cp_balance_indexer(
-        self,
-        q,
-        past_key_states,
-        indexer_weights,
-        actual_seq_lengths_q,
-        actual_seq_lengths_kv,
-        block_table,
-    ):
-        # V2: Q is local (sharded); single indexer call against full KV.
-        if indexer_weights is not None:
-            indexer_weights = indexer_weights.contiguous().view(
-                -1, indexer_weights.shape[-1]
-            )
-        topk_indices = torch_npu.npu_lightning_indexer(
-            query=q,
+        indexer_kwargs = dict(
             key=past_key_states,
-            weights=indexer_weights,
+            weights=weights,
             actual_seq_lengths_query=actual_seq_lengths_q.to(
-                device=q.device, dtype=torch.int32
+                device=q.device if use_cp_indexer else actual_seq_lengths_q.device,
+                dtype=torch.int32,
             ),
             actual_seq_lengths_key=actual_seq_lengths_kv.to(
-                device=q.device, dtype=torch.int32
+                device=q.device if use_cp_indexer else k.device,
+                dtype=torch.int32,
             ),
             block_table=block_table,
             layout_query="TND",
@@ -608,7 +529,27 @@ class DSANPUIndexerMixin:
             sparse_count=self.index_topk,
             sparse_mode=3,
         )
-        return topk_indices[0].squeeze(1)
+        if use_quant_indexer:
+            query, query_scale = _quantize_npu_indexer_activation(
+                query, pool.indexer_hadamard_128, pool.dtype
+            )
+            # custom_ops can replace the torch_npu alias with a different schema.
+            topk_indices = torch.ops.npu.npu_quant_lightning_indexer(
+                query=query,
+                query_dequant_scale=query_scale,
+                key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
+                query_quant_mode=0,
+                key_quant_mode=0,
+                **indexer_kwargs,
+            ).squeeze(1)
+        else:
+            topk_indices = torch_npu.npu_lightning_indexer(
+                query=query, **indexer_kwargs
+            )[0].squeeze(1)
+        if shard is not None:
+            topk_indices = shard.gather(topk_indices, bs)
+        # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
+        return topk_indices
 
 
 def scattered_to_tp_attn_full(
