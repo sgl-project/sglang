@@ -6149,9 +6149,6 @@ class Scheduler(
             SidecarPoolSpec,
             disabled_l3_layout,
         )
-        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
-            DevicePoolGroup,
-        )
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
             MooncakeDirectLinker,
         )
@@ -6179,7 +6176,6 @@ class Scheduler(
         # The linker never fills tree_cache.sidecar_pool_specs; resolve_transfers
         # gives each entry its index source's hit policy, so mirror that here.
         trailing_sources = {str(PoolName.MAMBA), *window_trailing_pages}
-        pool_group = storage.mem_pool_host
         sidecar_pool_specs = [
             SidecarPoolSpec(
                 pool_name=entry.name,
@@ -6190,9 +6186,7 @@ class Scheduler(
                     else PoolHitPolicy.ALL_PAGES
                 ),
             )
-            for entry in (
-                pool_group.entries if isinstance(pool_group, DevicePoolGroup) else ()
-            )
+            for entry in storage.mem_pool_host.entries
             if entry.indices_from_pool != entry.name
         ]
         return storage.describe_l3_object_layout(
