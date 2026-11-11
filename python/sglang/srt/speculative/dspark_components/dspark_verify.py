@@ -1012,8 +1012,8 @@ class DsparkVerifyEpilogue:
             fill_value=0,
         )
         candidates = candidates.view(bs, self.stride)
-        # A padding id of 0 past verify_len matches the argmax of a zero logits row;
-        # the eager accept compares the real drafts there, so take them here too.
+        # The compact ids stop at draft verify_len - 1, but the last scored row also
+        # judges draft verify_len; take the real drafts so that match is checked.
         candidates[:, 1:].copy_(draft_tokens)
         commit_lens = self._accept(
             candidates=candidates,
