@@ -8,7 +8,9 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
+from sglang.srt.mem_cache.pool_host import slot_state_copy
 from sglang.srt.mem_cache.pool_host._kvcacheio import require_kvcacheio_ops
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
@@ -364,6 +366,7 @@ class MambaPoolHost(HostKVCache):
             )
             for state in self.slot_state_device_tensors
         ]
+        slot_state_copy.warm(self.slot_state_device_tensors, self.slot_state_buffers)
         # destroy() unregisters via kv_buffer; without this list the pinned
         # registrations leak past the buffers' mmap. 0-element buffers
         # (conv-only models' temporal state) were never registered.
@@ -851,8 +854,24 @@ class MambaPoolHost(HostKVCache):
         """Copy the registered side-state rows for these slots, one leg or the
         other. Blocking copies: the rows are a few hundred KB per checkpoint and
         correctness of the ordering against the completion event matters more
-        than the microseconds."""
+        than the microseconds. Under SGLANG_OPT_HICACHE_MAMBA_SLOT_STATE_ASYNC the
+        backup leg (and, under host-only checkpoints, the load leg) is instead a
+        kernel queued on the current stream, ahead of that event."""
         if not self.slot_state_device_tensors:
+            return
+        copy = slot_state_copy.load_rows if to_device else slot_state_copy.backup_rows
+        if (
+            (not to_device or envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get())
+            and slot_state_copy.applies(
+                self.slot_state_device_tensors, self.slot_state_buffers
+            )
+            and copy(
+                self.slot_state_device_tensors,
+                self.slot_state_buffers,
+                device_indices=device_indices,
+                host_indices=host_indices,
+            )
+        ):
             return
         for state, host_buf in zip(
             self.slot_state_device_tensors, self.slot_state_buffers

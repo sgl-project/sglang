@@ -469,6 +469,12 @@ class Envs:
     SGLANG_OPT_POST_VERIFY_POOL_PRESIZE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # HiCache Mamba side-state rows (PLE short-conv / n-gram) of a checkpoint slot are
+    # backed up to the pinned host pool by a stream-ordered kernel instead of blocking copies
+    # (and loaded the same way under SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT); same bytes.
+    SGLANG_OPT_HICACHE_MAMBA_SLOT_STATE_ASYNC = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
