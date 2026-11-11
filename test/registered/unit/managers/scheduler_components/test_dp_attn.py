@@ -470,6 +470,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner.prefill_backend_name = Backend.BREAKABLE
         runner.has_mha_companion_layers = False
         runner._has_uncapturable_chunked_prefix.return_value = False
+        runner._dcp_extend_active = False
         runner.max_num_tokens = 64
         runner.capture_num_tokens = [4, 64]
         runner._pad_to_bucket = runner_cls._pad_to_bucket
