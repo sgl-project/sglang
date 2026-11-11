@@ -64,6 +64,7 @@ from sglang.srt.speculative.dflash_utils import (
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import BumpAllocator, is_cuda, is_gfx95_supported, is_hip, is_npu
 from sglang.srt.utils.device import get_compiler_backend
 
@@ -539,13 +540,16 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
             config, layer_id
         )
         if sliding_window_size > -1 or attn_type != AttentionType.DECODER:
-            # Deferred as on main: draft_worker_common pulls in tp_worker.
             from sglang.srt.speculative.draft_worker_common import (
                 resolve_draft_worker_attention_backend,
             )
 
+            # DSPARK builds this layer too; its worker resolves without the DFLASH label.
+            is_dflash = SpeculativeAlgorithm.from_string(
+                get_spec().speculative_algorithm
+            ).is_dflash()
             draft_attention_backend = resolve_draft_worker_attention_backend(
-                algo_label="DFLASH"
+                algo_label="DFLASH" if is_dflash else None
             )
             # The other MLA backends ignore a layer's sliding window.
             if sliding_window_size > -1 and draft_attention_backend not in (
@@ -557,13 +561,12 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
                     "--speculative-draft-attention-backend triton, trtllm_mla or "
                     f"cutedsl_mla, got {draft_attention_backend!r}."
                 )
-            # Both verify causally. cutedsl_mla keeps main's behavior for
-            # full_attention layers, which serve the shipped full-attention drafts.
+            # trtllm_mla runs every layer causally; the window path of both is causal.
             if attn_type != AttentionType.DECODER and (
                 draft_attention_backend == "trtllm_mla"
                 or (
                     sliding_window_size > -1
-                    and draft_attention_backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS
+                    and draft_attention_backend == "cutedsl_mla"
                 )
             ):
                 raise ValueError(

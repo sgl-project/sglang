@@ -135,6 +135,24 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="quantization.mxfp8_group_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.mxfp8_group_quant:mxfp8_group_quant",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="quantization.mxfp4_dequant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.mxfp4_dequant:mxfp4_dequant",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="quantization.quantize_fp4_indexer_tensor",
         backend=KernelBackend.TRITON,
         target=(

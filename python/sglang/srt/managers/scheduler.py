@@ -2287,7 +2287,7 @@ class Scheduler(
             # Document windows released while their predecessor's KV was freed.
             released = self.uocr_runtime.released
             for req in list(released):
-                self._add_request_to_queue(req, src=released)
+                self._add_request_to_queue(req)
         local_reqs = []
         # Avoid re-enqueuing timeout aborts while dispatch is stopped at a pause.
         if (
@@ -2765,6 +2765,11 @@ class Scheduler(
                 *(self.running_mbs if get_parallel().pp_size > 1 else ()),
             ),
             get_pp_mbs=lambda: self.mbs if get_parallel().pp_size > 1 else (),
+            get_offloading_reqs=lambda: (
+                self.decode_offload_manager.offload_inflight
+                if self.decode_offload_manager is not None
+                else ()
+            ),
             # Hisparse pool counters diverge during host backup (see the
             # _get_swa_token_info clamp), and pending deferred KV releases hold
             # pages out of the allocator by design.
@@ -2968,6 +2973,18 @@ class Scheduler(
         )
 
     def init_req_max_new_tokens(self, req):
+        # PD prefill never decodes: budget the single handoff token and return
+        # before the clamps, which could only lower it to a dummy prefill-only
+        # 0. Constant output: every PP rank must derive the same
+        # sampling_params (rank consensus hashes them).
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            req.sampling_params.max_new_tokens = 1
+            # min <= max invariant; EOS stays legal as the handoff token
+            # unless the user set min_new_tokens.
+            req.sampling_params.min_new_tokens = min(
+                req.sampling_params.min_new_tokens, 1
+            )
+            return
         input_len = len(req.origin_input_ids)
         max_new_tokens = (
             req.sampling_params.max_new_tokens
@@ -3780,30 +3797,27 @@ class Scheduler(
         self,
         req: Req,
         is_retracted: bool = False,
-        *,
-        src: Optional[ReqList] = None,
     ):
-        """Queue a request moving out of `src`, or entering its first list when
-        `src` is None. After the call it is never in `src`: one refused at the
-        door (an abort, the queue limit, the KV capacity) is finished and leaves
-        `src` for no list."""
+        """Queue a request, moving it out of the list it is in, if any. One
+        refused at the door (an abort, the queue limit, the KV capacity) is
+        finished and leaves for no list."""
         # Every request the scheduler keeps owes its output from here; one rejected
         # at intake without being queued sends it in the call that built it.
         self.invariant_checker.expect_output(req)
-        if not self._set_or_validate_priority(req, src=src):
+        if not self._set_or_validate_priority(req):
             return
         if is_retracted:
             req.storage_prefetch_retry_attempts = 0
             req.storage_prefetch_last_match_len = None
             req.staged_prefetch_plan = None
         if self.disaggregation_mode == DisaggregationMode.NULL:
-            if self._abort_on_queued_limit(req, src=src):
+            if self._abort_on_queued_limit(req):
                 return
             self._prefetch_kvcache(req)
             if self.uocr_runtime is None:
-                move([req], src, self.waiting_queue)
+                move([req], self.waiting_queue)
             elif not self.uocr_runtime.enqueue(
-                self.waiting_queue, req, is_retracted=is_retracted, src=src
+                self.waiting_queue, req, is_retracted=is_retracted
             ):
                 return
             req.time_stats.set_wait_queue_entry_time()
@@ -3811,13 +3825,11 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
-                req, self.model_config.num_key_value_heads, src=src
+                req, self.model_config.num_key_value_heads
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.disagg_decode_prealloc_queue.add(
-                req, is_retracted=is_retracted, src=src
-            )
+            self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
             else:
@@ -3833,11 +3845,9 @@ class Scheduler(
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
         self.request_retirer.retire_unadmitted(req)
 
-    def _set_or_validate_priority(
-        self, req: Req, *, src: Optional[ReqList] = None
-    ) -> bool:
+    def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the
-        priority scheduling mode; an aborted one leaves `src`."""
+        priority scheduling mode."""
         if self.enable_priority_scheduling and req.priority is None:
             if self.schedule_low_priority_values_first:
                 req.priority = sys.maxsize
@@ -3851,17 +3861,13 @@ class Scheduler(
             self._abort_unavailable(
                 req,
                 message="Using priority is disabled for this server. Please send a new request without a priority.",
-                src=src,
             )
             return False
         return True
 
-    def _abort_unavailable(
-        self, req: Req, *, message: str, src: Optional[ReqList] = None
-    ) -> None:
+    def _abort_unavailable(self, req: Req, *, message: str) -> None:
         self.request_retirer.abort(
             req,
-            src=src,
             reason=FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE),
             finished_reason={
                 "type": "abort",
@@ -3881,11 +3887,9 @@ class Scheduler(
         for req in reqs:
             self.request_retirer.abort(req, finished_reason=finished_reason)
 
-    def _abort_on_queued_limit(
-        self, recv_req: Req, *, src: Optional[ReqList] = None
-    ) -> bool:
+    def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full.
-        Returns True if the incoming request is aborted; it leaves `src`."""
+        Returns True if the incoming request is aborted."""
         if (
             self.max_queued_requests is None
             or len(self.waiting_queue) + 1 <= self.max_queued_requests
@@ -3910,14 +3914,13 @@ class Scheduler(
                 self._abort_unavailable(
                     candidate_req,
                     message="The request is aborted by a higher priority request.",
-                    src=self.waiting_queue,
                 )
                 # An evicted request sharing the incoming rid refuses it too.
                 if candidate_req.rid != recv_req.rid:
                     return False
 
         # Reject the incoming request by default.
-        self._abort_unavailable(recv_req, message="The request queue is full.", src=src)
+        self._abort_unavailable(recv_req, message="The request queue is full.")
         return True
 
     def _poll_timeout_aborts(self) -> List[AbortReq]:
@@ -4147,7 +4150,6 @@ class Scheduler(
             req, finished_reason=req.discard_output_reason and reason.to_json()
         )
 
-        self.chunked_reqs.clear()
         self._pending_chunked_abort_req = None
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
@@ -4222,16 +4224,16 @@ class Scheduler(
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
+        staged = []
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
+            # Read before the merge below empties last_batch.
+            staged = self.dllm_manager.staged_reqs(last_batch)
 
         # Merge the prefill batch into the running batch
-        reqs_to_exclude = set()
-
-        if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
-            reqs_to_exclude.update(self.dllm_manager.staging_queue)
-            for req in self.dllm_manager.staging_queue:
-                self.finish_dllm_forward(req)
+        reqs_to_exclude = set(staged)
+        for req in staged:
+            self.finish_dllm_forward(req)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
@@ -4283,7 +4285,6 @@ class Scheduler(
                 # are running already.
                 move(
                     [req for req in last_batch.reqs if req not in self.running_reqs],
-                    self.prefill_launched_reqs,
                     self.running_reqs,
                 )
                 if running_batch.is_empty():
@@ -4300,7 +4301,7 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
-            new_batch = self.get_new_batch_dllm(running_batch)
+            new_batch = self.get_new_batch_dllm(running_batch, staged)
         elif self._should_defer_prefill(running_batch):
             new_batch = None
         else:
@@ -4470,7 +4471,7 @@ class Scheduler(
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
-                self._add_request_to_queue(req, src=self.grammar_manager.grammar_queue)
+                self._add_request_to_queue(req)
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -4522,7 +4523,7 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
-        self.waiting_queue.replace(
+        self.waiting_queue.reorder(
             self.policy.calc_priority(
                 self.waiting_queue,
                 running_batch,
@@ -4590,7 +4591,7 @@ class Scheduler(
             )
             if adder.add_chunked_req(resumed_req) is None:
                 # Its last chunk is in this batch.
-                move([resumed_req], self.chunked_reqs, self.prefill_launched_reqs)
+                move([resumed_req], self.prefill_launched_reqs)
 
         if self.enable_lora:
             running_reqs = running_batch.reqs
@@ -4740,7 +4741,6 @@ class Scheduler(
                 self.release_prefill_sender(req, abort_sender=True)
             self._abort_unavailable(
                 req,
-                src=self.waiting_queue,
                 message=(
                     "The request cannot be scheduled: it fits the KV memory "
                     "pool only once memory held elsewhere is freed, and "
@@ -4757,7 +4757,7 @@ class Scheduler(
             # Preemption already released these requests; requeue them even
             # though the request they made room for was not admitted.
             for req in adder.preempt_list:
-                self._add_request_to_queue(req, src=self.running_reqs)
+                self._add_request_to_queue(req)
             # Empty passes are the key signal for head-of-line blocking.
             self._maybe_log_schedule_decision(
                 can_run_list=can_run_list, running_batch=running_batch, adder=adder
@@ -4776,15 +4776,14 @@ class Scheduler(
         if new_chunked_req is not None:
             # Update chunked prefill
             assert self.chunked_req is None
-            move([new_chunked_req], self.waiting_queue, self.chunked_reqs)
+            move([new_chunked_req], self.chunked_reqs)
         move(
             [req for req in admitted if req is not new_chunked_req],
-            self.waiting_queue,
             self.prefill_launched_reqs,
         )
         if adder.preempt_list:
             for req in adder.preempt_list:
-                self._add_request_to_queue(req, src=self.running_reqs)
+                self._add_request_to_queue(req)
 
         # After the re-queue, so #left-in-queue is what the next pass sees.
         self._maybe_log_schedule_decision(
@@ -4928,7 +4927,7 @@ class Scheduler(
             lists[ListKind.PD_BOOTSTRAP] = self.disagg_prefill_bootstrap_queue.queue
         lists[ListKind.PD_SENDING] = self.disagg_prefill_transfer_queue
         if self.dllm_config is not None:
-            # Its staging queue is the part of this queue the current round runs.
+            # It also holds the requests the current round runs.
             lists[ListKind.DLLM] = self.dllm_manager.waiting_queue
         components = (
             self.disagg_decode_prealloc_queue,
@@ -5018,8 +5017,8 @@ class Scheduler(
         if forward_steps is not None:
             forward_steps.forward_processed(getattr(result, "forward_launch", None))
         # Requests finish only in a step's processing.
-        self.running_reqs.leave_finished()
-        self.prefill_launched_reqs.leave_finished()
+        self.running_reqs._leave_finished()
+        self.prefill_launched_reqs._leave_finished()
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose step in flight commits their last output by length."""
@@ -5093,9 +5092,7 @@ class Scheduler(
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
                 # retract_decode recorded the reason and freed any member rows.
-                self.request_retirer.abort_retracted(
-                    req, reason=req.to_finish, src=self.running_reqs
-                )
+                self.request_retirer.abort_retracted(req, reason=req.to_finish)
 
             msg_prefix = (
                 "KV cache pool is full. Retract requests. "
@@ -5112,9 +5109,7 @@ class Scheduler(
             logger.warning(msg_prefix + msg_details)
 
             for req in retracted_reqs:
-                self._add_request_to_queue(
-                    req, is_retracted=True, src=self.running_reqs
-                )
+                self._add_request_to_queue(req, is_retracted=True)
         else:
             self.new_token_ratio_tracker.decay_step()
 
@@ -5974,7 +5969,6 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
-            and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
@@ -5990,7 +5984,7 @@ class Scheduler(
                 # Their steps are counted through the batches above.
                 ListKind.DECODING,
                 ListKind.PREFILL_LAUNCHED,
-                # Only its staging part is counted, above.
+                # Only the part the last round ran is counted, via last_batch.
                 ListKind.DLLM,
                 # Held across a weight update, whose cache flush needs idle.
                 ListKind.PD_HELD,
@@ -6322,7 +6316,7 @@ class Scheduler(
     def _abort_waiting(self, recv_req: AbortReq) -> None:
         is_decode = self.disaggregation_mode == DisaggregationMode.DECODE
         is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
-        for req in self.waiting_queue.take(lambda req: recv_req.matches(req.rid)):
+        for req in [r for r in self.waiting_queue if recv_req.matches(r.rid)]:
             if is_prefill:
                 # A PD prefill request may hold KV its sender still reads; abort
                 # the sender before that KV is freed.
@@ -6446,20 +6440,15 @@ class Scheduler(
             retract_reqs += list(self.hisparse_coordinator.ack_staging_queue)
 
         if self.dllm_config is not None:
-            # A dLLM request keeps its row between rounds; a finished one leaves
-            # the lists only at the next schedule, which a paused loop never reaches.
+            # A dLLM request keeps its row between rounds; a finished one is not
+            # retracted.
             self.dllm_manager.filter_finished_reqs()
-            # The manager drops them from its waiting and staging queues.
             retract_reqs += self.dllm_manager.take(lambda r: r.kv.holds_kv)
 
-        # A request re-queued moves out of the scheduler list it is in; a staged
-        # or dLLM one has left its component's list already.
-        holders = [self.running_reqs, self.prefill_launched_reqs, self.chunked_reqs]
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Transferred requests wait for a slot holding their row and KV;
             # retract them too, so their KV is rebuilt under the new weights.
             retract_reqs += [r for r in self.waiting_queue if r.kv.holds_kv]
-            holders.append(self.waiting_queue)
 
         # The chunked, a staged or a dLLM request may also sit in a batch.
         retract_reqs = list(dict.fromkeys(retract_reqs))
@@ -6482,16 +6471,16 @@ class Scheduler(
             # Empties the batch through filter_batch so a beam tail goes with the reqs.
             running_batch.filter_batch(keep_indices=[])
             running_batch.batch_is_full = False
+        # Each request leaves the list it is in as it is aborted or re-queued.
         for req in retract_reqs:
-            src = next((holder for holder in holders if req in holder), None)
             if req in reqs_to_abort:
                 # retract_all recorded the reason and freed any member rows.
-                self.request_retirer.abort_retracted(req, reason=req.to_finish, src=src)
+                self.request_retirer.abort_retracted(req, reason=req.to_finish)
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 req.time_stats.set_retract_time()
-                self.disagg_decode_prealloc_queue.hold_rebootstrap(req, src=src)
+                self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:
-                self._add_request_to_queue(req, src=src)
+                self._add_request_to_queue(req)
         # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
         # freeing its KV under a live disagg KV-sender crashes move_bootstrapped or
         # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.
@@ -6500,7 +6489,7 @@ class Scheduler(
         # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             # A finished chunked request was not retracted.
-            self.chunked_reqs.clear()
+            self.chunked_reqs._drop_all()
 
     def _publish_paused_state(self):
         # Surface the paused state to dashboards immediately. The scheduler
@@ -6959,6 +6948,7 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     scheduler = None
+    hit_exception = False
     try:
         scheduler = Scheduler(server_args, port_args)
 
@@ -6970,6 +6960,7 @@ def run_scheduler_process(
 
     except Exception:
         logger.error(f"Scheduler hit an exception: {traceback.format_exc()}")
+        hit_exception = True
         if scheduler is not None:
             scheduler.dump_requests_before_crash()
         parent_process.send_signal(signal.SIGQUIT)
@@ -6996,3 +6987,7 @@ def run_scheduler_process(
                 close_custom_all_reduce()
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()
+
+    # SubprocessWatchdog treats exit code 0 as a clean shutdown, so a crash must not exit 0.
+    if hit_exception:
+        sys.exit(1)
