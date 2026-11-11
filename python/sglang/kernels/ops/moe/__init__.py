@@ -322,6 +322,22 @@ for _bk in ("torch", "jit", "triton"):
 del _bk
 register_kernel(
     KernelSpec(
+        op="moe.muse_spark_route_warp_ring",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.muse_spark_route_warp_ring:muse_spark_route_warp_ring",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.muse_spark_ring_pick",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.muse_spark_route_warp_ring:muse_spark_ring_pick",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="moe.muse_spark_post_expert_finalize",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton:fused_post_expert_norm_weighted_sum",

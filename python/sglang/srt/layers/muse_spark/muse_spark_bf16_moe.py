@@ -40,6 +40,7 @@ if TYPE_CHECKING:
         FlashinferCombineInput,
         FlashinferDispatchOutput,
     )
+    from sglang.srt.layers.muse_spark.muse_eplb_ring import RingLayout
 
 # Cap on the batched-expert intermediate, in elements (64 MiB at bf16).
 _EXPERT_GROUP_ELEMS = 32 << 20
@@ -101,8 +102,13 @@ class MuseSpark1xBf16Experts(nn.Module):
         expert_hidden_size: int,
         intermediate_size: int,
         top_k: int,
+        eplb_ring: Optional[RingLayout] = None,
     ):
         super().__init__()
+        # With the ring the weights hold [home | buddy] slots; the counts below
+        # stay the home (logical) view used by SP prefill.
+        self.eplb_ring = eplb_ring
+        num_slots = num_local_experts if eplb_ring is None else eplb_ring.num_slots
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
         self.local_expert_offset = local_expert_offset
@@ -131,7 +137,7 @@ class MuseSpark1xBf16Experts(nn.Module):
         self.register_buffer("_post_expert_norm_weight", None, persistent=False)
         self.gate_up_proj = nn.Parameter(
             torch.empty(
-                num_local_experts,
+                num_slots,
                 2 * intermediate_size,
                 expert_hidden_size,
             ),
@@ -139,7 +145,7 @@ class MuseSpark1xBf16Experts(nn.Module):
         )
         self.down_proj = nn.Parameter(
             torch.empty(
-                num_local_experts,
+                num_slots,
                 expert_hidden_size,
                 intermediate_size,
             ),
@@ -163,6 +169,8 @@ class MuseSpark1xBf16Experts(nn.Module):
                 "shuffled for TRT-LLM, and per-expert loading needs the "
                 "checkpoint layout"
             )
+        if self.eplb_ring is not None:
+            raise RuntimeError("Ring expert slots load from stacked expert tensors.")
         local_id = expert_id - self.local_expert_offset
         if not 0 <= local_id < self.num_local_experts:
             return
@@ -190,6 +198,10 @@ class MuseSpark1xBf16Experts(nn.Module):
         if self.use_trtllm or self.use_triton:
             return
         if not _trtllm_bf16_moe_supported(self.gate_up_proj.device):
+            if self.eplb_ring is not None:
+                raise RuntimeError(
+                    "--ep-dispatch-algorithm ring needs the TRT-LLM BF16 MoE (SM10x)."
+                )
             if _triton_bf16_moe_supported(self.gate_up_proj.device):
                 self._triton_runner_config = self._build_triton_runner_config()
                 self.use_triton = True
@@ -236,10 +248,11 @@ class MuseSpark1xBf16Experts(nn.Module):
 
         cache: dict = {}
         half = self.intermediate_size
+        num_slots = self.gate_up_proj.shape[0]
         old_shape_w13 = self.gate_up_proj.data[0].shape
         old_shape_w2 = self.down_proj.data[0].shape
         new_shape_w13 = new_shape_w2 = None
-        for i in range(self.num_local_experts):
+        for i in range(num_slots):
             # Muse's checkpoint is [w1, w3]; the kernel's gated row interleave
             # assumes [w3, w1] (see muse_spark_nvfp4_moe for the FP4 twin).
             gate, up = self.gate_up_proj.data[i].split(half, dim=0)
@@ -262,11 +275,9 @@ class MuseSpark1xBf16Experts(nn.Module):
             self.gate_up_proj.data[i] = w13.view(torch.bfloat16).reshape(old_shape_w13)
             self.down_proj.data[i] = w2.view(torch.bfloat16).reshape(old_shape_w2)
         self.gate_up_proj.data = self.gate_up_proj.data.reshape(
-            self.num_local_experts, *new_shape_w13
+            num_slots, *new_shape_w13
         )
-        self.down_proj.data = self.down_proj.data.reshape(
-            self.num_local_experts, *new_shape_w2
-        )
+        self.down_proj.data = self.down_proj.data.reshape(num_slots, *new_shape_w2)
 
     def _build_finalize_op(self, post_expert_norm: Optional[nn.Module]) -> None:
         """Which RMSNorm form applies is selected by ``use_ffn_learnable_scales``
@@ -313,9 +324,12 @@ class MuseSpark1xBf16Experts(nn.Module):
             raise RuntimeError(
                 "Muse Spark SP prefill requires prepared TRTLLM BF16 expert weights."
             )
+        w13, w2 = self.gate_up_proj, self.down_proj
+        if self.eplb_ring is not None:
+            w13, w2 = w13[: self.num_local_experts], w2[: self.num_local_experts]
         quant_info = FlashInferTrtllmBf16MoeQuantInfo(
-            gemm1_weights=self.gate_up_proj,
-            gemm2_weights=self.down_proj,
+            gemm1_weights=w13,
+            gemm2_weights=w2,
             global_num_experts=self.num_experts,
             local_expert_offset=self.local_expert_offset,
         )
@@ -449,6 +463,20 @@ class MuseSpark1xBf16Experts(nn.Module):
                 topk_ids.to(torch.int32).contiguous(),
                 topk_scores.to(torch.float32).contiguous(),
             )
+        num_experts, local_offset, local_num = (
+            self.num_experts,
+            self.local_expert_offset,
+            self.num_local_experts,
+        )
+        if self.eplb_ring is not None:
+            # Ring packed ids are physical ids (muse_eplb_ring.route_and_pick).
+            assert packed_topk_ids is not None
+            ring = self.eplb_ring
+            num_experts, local_offset, local_num = (
+                ring.num_physical,
+                ring.phys_offset,
+                ring.num_slots,
+            )
 
         gemm2_out, expert_weights, expanded_idx_to_permuted_idx = (
             trtllm_bf16_routed_moe(
@@ -456,13 +484,13 @@ class MuseSpark1xBf16Experts(nn.Module):
                 hidden_states=hidden_states,
                 gemm1_weights=self.gate_up_proj,
                 gemm2_weights=self.down_proj,
-                num_experts=self.num_experts,
+                num_experts=num_experts,
                 top_k=top_k,
                 n_group=None,
                 topk_group=None,
                 intermediate_size=self.intermediate_size,
-                local_expert_offset=self.local_expert_offset,
-                local_num_experts=self.num_local_experts,
+                local_expert_offset=local_offset,
+                local_num_experts=local_num,
                 # Muse folds its route_scale into the top-k weights, so the
                 # kernel applies none of its own -- but it wants 1.0, not None.
                 routed_scaling_factor=1.0,
