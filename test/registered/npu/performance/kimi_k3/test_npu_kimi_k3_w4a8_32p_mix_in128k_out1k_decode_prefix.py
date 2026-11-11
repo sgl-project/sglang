@@ -127,9 +127,9 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     TestNpuPerfMultiNodePdMixTestCaseBase
 ):
     """Pure decode low latency: 128k input with a fully shared prefix
-    (repeat_rate=1, ~100% cache hit) / 1024 out, C4, mean TPOT <= 30 ms
-    and output throughput >= 60 token/s, via the official aisbench
-    prefix mode."""
+    (repeat_rate=1, ~100% cache hit, natural GSM8K text pool) / 1024 out,
+    C4, mean TPOT <= 30 ms and output throughput >= 60 token/s, via the
+    official aisbench prefix mode."""
 
     model_config = KIMI_K3_W4A8_32P_MODEL_CONFIG
     benchmark_tool = AISBENCHMARK
@@ -143,6 +143,7 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     request_rate = 0
     dp = 4
     seed = 5
+    prefix_natural_text = True
     tpot = 30.0
     output_token_throughput = 60.0
 
