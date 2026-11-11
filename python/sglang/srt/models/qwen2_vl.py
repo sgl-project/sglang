@@ -46,6 +46,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
@@ -56,7 +57,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import WeightsMapper, compute_cu_seqlens_from_grid_numpy
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 

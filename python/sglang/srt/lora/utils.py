@@ -4,6 +4,7 @@ from enum import Enum
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
+from torch import nn
 
 from sglang.srt.hf_transformers import AutoConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -729,3 +730,14 @@ def kv_b_lora_correction(attn_module) -> str | None:
     if layer.lora_backend.name != "triton_v2":
         return "legacy"
     return "v2" if layer.lora_active else None
+
+
+# source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
+def replace_submodule(
+    model: nn.Module, module_name: str, new_module: nn.Module
+) -> nn.Module:
+    """Replace a submodule in a model with a new module."""
+    parent = model.get_submodule(".".join(module_name.split(".")[:-1]))
+    target_name = module_name.split(".")[-1]
+    setattr(parent, target_name, new_module)
+    return new_module
