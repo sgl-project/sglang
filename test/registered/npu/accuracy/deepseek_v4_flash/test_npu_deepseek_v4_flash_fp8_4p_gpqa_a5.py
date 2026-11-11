@@ -11,12 +11,12 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-# TEMP: disabled during overlap-schedule validation.
-# register_npu_ci(
-#     est_time=7200,
-#     suite="nightly-acc-4-npu-a5",
-#     nightly=True,
-# )
+register_npu_ci(
+    est_time=7200,
+    suite="nightly-acc-4-npu-a5",
+    nightly=True,
+    disabled="TEMP: disabled during overlap-schedule validation",
+)
 
 DEEPSEEK_V4_FLASH_FP8_4P_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
