@@ -161,6 +161,36 @@ class TestUnoAscendLoRA(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "token route"):
             self.backend._route(512)
 
+    def test_embedding_rank_one_scaling_regression(self):
+        # The reported failure produced delta=4 for s=2. With rank-one,
+        # all-one weights, each adapted output must instead have delta=s.
+        for dtype in (torch.float32, torch.bfloat16):
+            for scaling in (0.0, 0.5, 2.0, -2.0):
+                with self.subTest(dtype=dtype, scaling=scaling):
+                    self.backend.prepare_lora_token_segments(
+                        segment_lens=[1, 3],
+                        weight_indices=[0, 1],
+                        lora_ranks=[0, 1],
+                        scalings=[0.0, scaling],
+                    )
+                    ids = torch.arange(4)
+                    a = torch.ones(2, 1, 4, dtype=dtype)
+                    b = torch.ones(2, 3, 1, dtype=dtype)
+                    base = torch.full((4, 3), 3.0, dtype=dtype)
+                    hidden = self.backend.run_lora_a_embedding(ids, a, 4)
+                    torch.testing.assert_close(
+                        hidden,
+                        torch.tensor([[0.0], [1.0], [1.0], [1.0]], dtype=dtype),
+                        atol=0,
+                        rtol=0,
+                    )
+                    actual = self.backend.run_lora_b_sgemm(
+                        hidden, b, base_output=base.clone()
+                    )
+                    expected = base.clone()
+                    expected[1:] += scaling
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
     def test_embedding_scales_once_and_keeps_seed_base_only(self):
         for reverse in (False, True):
             slot = self.prepare(2, 128, reverse=reverse)
