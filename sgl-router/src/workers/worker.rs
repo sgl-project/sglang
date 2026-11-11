@@ -83,16 +83,39 @@ fn grpc_client(host: &str, port: u16) -> Option<SglangServiceClient<tonic::trans
     )
 }
 
+/// Estimated engine work of one request on a DP rank, in tokens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RankLoad {
+    /// Prompt tokens the rank has yet to prefill.
+    pub input_tokens: u64,
+    /// Tokens the rank has yet to generate, up to its decode budget.
+    pub output_tokens: u64,
+}
+
+/// What this router has in flight on one DP rank.
+#[derive(Default)]
+struct RankSlot {
+    requests: AtomicUsize,
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
+}
+
 /// Holds one router in-flight slot on a DP rank; see [`Worker::dp_rank_guard`].
 #[must_use = "dropping a DpRankGuard releases the rank slot"]
 pub struct DpRankGuard {
-    inflight: Arc<[AtomicUsize]>,
+    slots: Arc<[RankSlot]>,
     rank: usize,
+    load: RankLoad,
 }
 
 impl Drop for DpRankGuard {
     fn drop(&mut self) {
-        self.inflight[self.rank].fetch_sub(1, Ordering::Relaxed);
+        let slot = &self.slots[self.rank];
+        slot.requests.fetch_sub(1, Ordering::Relaxed);
+        slot.input_tokens
+            .fetch_sub(self.load.input_tokens, Ordering::Relaxed);
+        slot.output_tokens
+            .fetch_sub(self.load.output_tokens, Ordering::Relaxed);
     }
 }
 
@@ -251,8 +274,8 @@ pub struct Worker {
     /// [`crate::discovery::WorkerSpec`].
     version_group: Option<String>,
     services: RwLock<BTreeSet<String>>,
-    /// Router in-flight requests per DP rank; one slot per rank.
-    dp_rank_inflight: Arc<[AtomicUsize]>,
+    /// Router in-flight requests and their estimated tokens, one slot per DP rank.
+    dp_rank_slots: Arc<[RankSlot]>,
     /// Round-robin position over this worker's DP ranks.
     dp_rank_turn: AtomicUsize,
     openai: Option<Arc<OpenAiSettings>>,
@@ -300,7 +323,7 @@ impl Worker {
             pooled_at: tokio::time::Instant::now(),
             version_group: spec.version_group,
             services: RwLock::new(spec.services),
-            dp_rank_inflight: (0..dp_ranks.max(1)).map(|_| AtomicUsize::new(0)).collect(),
+            dp_rank_slots: (0..dp_ranks.max(1)).map(|_| RankSlot::default()).collect(),
             dp_rank_turn: AtomicUsize::new(0),
             openai,
         }
@@ -392,11 +415,22 @@ impl Worker {
     }
 
     pub fn dp_ranks(&self) -> u32 {
-        self.dp_rank_inflight.len() as u32
+        self.dp_rank_slots.len() as u32
     }
 
     pub fn dp_rank_inflight(&self, rank: u32) -> usize {
-        self.dp_rank_inflight[rank as usize].load(Ordering::Relaxed)
+        self.dp_rank_slots[rank as usize]
+            .requests
+            .load(Ordering::Relaxed)
+    }
+
+    /// Estimated tokens this router has in flight on `rank`.
+    pub fn dp_rank_load(&self, rank: u32) -> RankLoad {
+        let slot = &self.dp_rank_slots[rank as usize];
+        RankLoad {
+            input_tokens: slot.input_tokens.load(Ordering::Relaxed),
+            output_tokens: slot.output_tokens.load(Ordering::Relaxed),
+        }
     }
 
     /// Advances the round-robin DP-rank position and returns the previous one.
@@ -404,12 +438,19 @@ impl Worker {
         self.dp_rank_turn.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub fn dp_rank_guard(&self, rank: u32) -> DpRankGuard {
+    /// Counts one request, with its estimated `load`, on `rank` until dropped.
+    pub fn dp_rank_guard(&self, rank: u32, load: RankLoad) -> DpRankGuard {
         let rank = rank as usize;
-        self.dp_rank_inflight[rank].fetch_add(1, Ordering::Relaxed);
+        let slot = &self.dp_rank_slots[rank];
+        slot.requests.fetch_add(1, Ordering::Relaxed);
+        slot.input_tokens
+            .fetch_add(load.input_tokens, Ordering::Relaxed);
+        slot.output_tokens
+            .fetch_add(load.output_tokens, Ordering::Relaxed);
         DpRankGuard {
-            inflight: Arc::clone(&self.dp_rank_inflight),
+            slots: Arc::clone(&self.dp_rank_slots),
             rank,
+            load,
         }
     }
 

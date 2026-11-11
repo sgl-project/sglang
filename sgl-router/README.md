@@ -339,7 +339,8 @@ unset fields inherit the CLI flags. See
   [circuit breaker](REFERENCE.md#circuit-breaker).
 - **DP-rank routing**: `--dp-aware` also picks the DP rank inside multi-rank
   engines, and `--dp-rank-policy round_robin` cycles ranks that no routing key
-  or cached prefix decides; in PD mode, `--decode-dispatch-limit N` picks the
+  or cached prefix decides, and `--dp-rank-policy shape_aware` balances their
+  prefill and decode load separately; in PD mode, `--decode-dispatch-limit N` picks the
   decode rank shortly before the KV arrives; see
   [DP-rank routing](REFERENCE.md#dp-rank-routing).
 - **PD version groups**: `--pd-version-group-label <key>` pairs prefill and

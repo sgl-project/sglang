@@ -169,6 +169,10 @@ pub enum DpRankPolicy {
     /// The worker's ranks in turn.
     #[value(name = "round_robin")]
     RoundRobin,
+    /// The rank whose heavier phase, prefill or decode, stays lightest once the
+    /// request joins, by the prompt and output tokens this router has in flight.
+    #[value(name = "shape_aware")]
+    ShapeAware,
 }
 
 /// Role served by a static bucket.

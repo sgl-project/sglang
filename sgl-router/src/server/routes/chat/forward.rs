@@ -8,7 +8,7 @@ use super::preparation::{
     append_fields, generate_room_id, generate_room_id_for_rank, BootstrapFields, PreparedRequest,
 };
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
-use crate::policies::dp_rank::select_dp_rank;
+use crate::policies::dp_rank::{request_rank_load, select_dp_rank};
 use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
 use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
 use crate::proxy::Proxy;
@@ -19,7 +19,7 @@ use crate::server::metrics::{
     RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
-use crate::workers::{DecodeSlot, DpRankGuard, LoadGuard, Worker};
+use crate::workers::{DecodeSlot, DpRankGuard, LoadGuard, RankLoad, Worker};
 use axum::body::Body;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
@@ -187,8 +187,18 @@ async fn dispatch<T: Transport>(
     // The engine gives fan-out item i the room `room + i`, so in PD decode looks
     // for each item on a different prefill rank; one pinned rank would break that.
     let unpin_prefill = dp_aware && decode.is_some() && request.fans_out;
+    // In PD mode the prefill rank only computes the prompt; decode owns the output.
+    let request_load = request_rank_load(request.input_token_count, request.output_tokens);
+    let prefill_load = RankLoad {
+        output_tokens: if decode.is_some() {
+            0
+        } else {
+            request_load.output_tokens
+        },
+        ..request_load
+    };
     let prefill_rank = (dp_aware && !unpin_prefill)
-        .then(|| prompt_dp_rank(ctx, request, &headers, &prefill))
+        .then(|| prompt_dp_rank(ctx, request, &headers, &prefill, prefill_load))
         .flatten();
 
     // Track worker occupancy and the prompt's contribution to active load.
@@ -253,7 +263,7 @@ async fn dispatch<T: Transport>(
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
-        prefill_rank.map(|rank| prefill.dp_rank_guard(rank)),
+        prefill_rank.map(|rank| prefill.dp_rank_guard(rank, prefill_load)),
     );
 
     // In PD mode, prefill runs independently and decode supplies the client response.
@@ -296,8 +306,20 @@ async fn dispatch<T: Transport>(
                 .await?;
                 abort.disarm();
             }
+            let decode_rank_load = RankLoad {
+                input_tokens: 0,
+                ..request_load
+            };
             let decode_rank = dp_aware
-                .then(|| select_dp_rank(&decode, None, &[], ctx.config.model.dp_rank_policy))
+                .then(|| {
+                    select_dp_rank(
+                        &decode,
+                        None,
+                        &[],
+                        ctx.config.model.dp_rank_policy,
+                        decode_rank_load,
+                    )
+                })
                 .flatten();
             let decode_load_guards = (
                 decode_load,
@@ -308,7 +330,7 @@ async fn dispatch<T: Transport>(
                     1,
                     request_started_at.elapsed(),
                 ),
-                decode_rank.map(|rank| decode.dp_rank_guard(rank)),
+                decode_rank.map(|rank| decode.dp_rank_guard(rank, decode_rank_load)),
             );
             let decode_leg = Leg::new(
                 dp_aware,
@@ -697,6 +719,7 @@ fn prompt_dp_rank(
     request: &PreparedRequest,
     headers: &HeaderMap,
     worker: &Worker,
+    load: RankLoad,
 ) -> Option<u32> {
     if worker.dp_ranks() <= 1 {
         return None;
@@ -717,7 +740,7 @@ fn prompt_dp_rank(
         }
         _ => Vec::new(),
     };
-    select_dp_rank(worker, key, &prefix_depths, model.dp_rank_policy)
+    select_dp_rank(worker, key, &prefix_depths, model.dp_rank_policy, load)
 }
 
 /// Under `--dp-aware` the router owns the rank: the header pins it for chat, and
