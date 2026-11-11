@@ -105,12 +105,16 @@ def scattered_dp_counts(num_tokens: int, num_rows: int) -> Tuple[int, List[int]]
 
 def _tail_kv_store(attention, x, positions, qkv_a, q_rope) -> None:
     # The SWA store writes the step's live tail slots, so a tail graph breaks here.
+    from sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense import (
+        live_rows,
+    )
+
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     num_rows = forward_batch.global_num_token_non_padded_cpu
     if num_rows == 0:
         return
     attention._compute_kv_to_cache(
-        x[:num_rows],
+        live_rows(x, num_rows),
         positions[:num_rows],
         forward_batch,
         get_attn_backend(),

@@ -176,11 +176,12 @@ class TestBreaksOutOfPrefillGraph(CustomTestCase):
 
 
 class TestTailKvStore(CustomTestCase):
-    def _store(self, num_rows, q_rope):
+    def _store(self, num_rows, q_rope, x=None):
         attention = MagicMock()
         forward_batch = SimpleNamespace(global_num_token_non_padded_cpu=num_rows)
         backend = object()
-        x, positions, qkv_a = (torch.arange(16).view(8, 2) + k for k in range(3))
+        rows, positions, qkv_a = (torch.arange(16).view(8, 2) + k for k in range(3))
+        x = rows if x is None else x
         with (
             patch.object(
                 replay_tail,
@@ -216,6 +217,23 @@ class TestTailKvStore(CustomTestCase):
         self.assertIsNone(call.call_args.kwargs["q_rope"])
         call, _ = self._store(0, torch.zeros(8, 3))
         call.assert_not_called()
+
+    def test_slices_a_quantized_input_by_its_rows(self):
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+            Fp8GridActivation,
+            Mxfp8Activation,
+        )
+
+        q, scale = torch.arange(16).view(8, 2), torch.arange(8).view(8, 1)
+        call, _ = self._store(3, None, x=Mxfp8Activation(q, scale))
+        live = call.call_args.args[0]
+        self.assertIsInstance(live, Mxfp8Activation)
+        torch.testing.assert_close(live.q, q[:3])
+        torch.testing.assert_close(live.scale, scale[:3])
+        call, _ = self._store(3, None, x=Fp8GridActivation(q))
+        live = call.call_args.args[0]
+        self.assertIsInstance(live, Fp8GridActivation)
+        torch.testing.assert_close(live.x, q[:3])
 
 
 if __name__ == "__main__":
