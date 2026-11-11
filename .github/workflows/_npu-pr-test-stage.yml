@@ -311,3 +311,12 @@ jobs:
             --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
             $ONLY_FILE_ARGS $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG 2>&1 | tee "${LOG_FILE}"
+
+      - name: Upload test logs for failure analysis
+        if: ${{ always() && !inputs.use_coverage_runner && !inputs.is_nightly_pipeline_job }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: selected-test-logs-${{ inputs.self_name }}-part${{ matrix.partition }}-${{ github.run_attempt }}
+          path: /tmp/test-logs/*.log
+          if-no-files-found: ignore
+          retention-days: 7
