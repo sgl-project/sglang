@@ -300,7 +300,8 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         empty_request_lists(scheduler)
         scheduler.running_reqs.join(running)
         scheduler.waiting_queue = list(waiting)
-        scheduler.chunked_req = chunked
+        if chunked is not None:
+            scheduler.chunked_reqs.join([chunked])
         scheduler.serving = _ServingStub(version)
         for name, value in (
             ("get_serving", scheduler.serving),

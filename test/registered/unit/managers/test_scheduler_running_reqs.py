@@ -26,6 +26,10 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
@@ -88,7 +92,7 @@ def _invariant_checker(s):
 def _scheduler():
     s = _Scheduler.__new__(_Scheduler)
     empty_request_lists(s)
-    s.dllm_manager = SimpleNamespace(waiting_queue=[])
+    s.dllm_manager = SimpleNamespace(waiting_queue=IndexedReqList(ListKind.DLLM))
     s.running_batch = ScheduleBatch(reqs=[])
     s.invariant_checker = _invariant_checker(s)
     s.disaggregation_mode = DisaggregationMode.NULL
@@ -150,12 +154,14 @@ class TestRequestListsCheck(CustomTestCase):
         self.s.running_batch = ScheduleBatch(reqs=reqs)
         self.s.running_reqs.join(reqs)
 
-    def test_fails_a_request_in_two_lists(self):
+    def test_fails_a_request_owned_by_another_list(self):
         req = _req("a")
         self.s.running_reqs.join([req])
-        self.s.waiting_queue.join([req])
+        req.owner_list = self.s.waiting_queue
 
-        with self.assertRaisesRegex(RuntimeError, "a is in both WAITING and DECODING"):
+        with self.assertRaisesRegex(
+            RuntimeError, "a is in DECODING but owned by WAITING"
+        ):
             self.check(ScheduleBatch(reqs=[]))
 
     def test_fails_a_launched_row_in_no_list(self):
@@ -170,7 +176,7 @@ class TestRequestListsCheck(CustomTestCase):
         self._start_running([decoding])
         self.s.running_batch.reqs += [retracted, chunk]
         self.s.waiting_queue.join([retracted])
-        self.s.chunked_req = chunk
+        self.s.chunked_reqs.join([chunk])
 
         with self.assertRaisesRegex(
             RuntimeError, r"running batch but not in running: \['w'\]"
@@ -213,6 +219,7 @@ class TestRequestListsCheck(CustomTestCase):
         new, decoding = _req("n"), _req("d")
         mixed = _batch([new, decoding], ForwardMode.MIXED)
         self.s.running_reqs.join([decoding])
+        self.s.prefill_launched_reqs.join([new])
         _launch(self.s, mixed)
         self.s.invariant_checker.get_pp_mbs = lambda: [mixed, None]
         self.s.invariant_checker.get_running_batches = lambda: (
@@ -229,23 +236,26 @@ class TestRunningReqsHooks(CustomTestCase):
         super().setUp()
         enter_scope(self, published_topology())
 
-    def test_launch_holds_prefills_until_the_merge(self):
+    def test_prefills_wait_in_prefill_launched_until_the_merge(self):
         s = _scheduler()
         a, chunk, new, decoding = (_req(rid) for rid in ("a", "c", "n", "d"))
         s.running_batch = ScheduleBatch(reqs=[decoding])
         s.running_reqs.join([decoding])
-        s.chunked_req = chunk
+        s.chunked_reqs.join([chunk])
         # A parked chunk: scheduling has no KV of it to stash.
         chunk.extend_end = chunk.prefix_len
+        # As admission leaves them.
+        s.prefill_launched_reqs.join([a, new])
 
+        # A launch moves no request between lists.
         _launch(s, _batch([a, chunk], ForwardMode.EXTEND, chunked_req=chunk))
         mixed = _batch([new, decoding], ForwardMode.MIXED)
         _launch(s, mixed)
         _launch(s, _batch([decoding], ForwardMode.DECODE))
 
-        self.assertEqual(list(s.prefill_launched_reqs), [a, new])
         self.assertEqual(list(s.running_reqs), [decoding])
 
+        # The merge moves the mixed step's prefill; its decode row stays put.
         _schedule_without_admission(s)
         with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
             Scheduler.get_next_batch_to_run(
@@ -257,8 +267,8 @@ class TestRunningReqsHooks(CustomTestCase):
         # dLLM keeps its requests in its own queue.
         s = _scheduler()
         s.dllm_config = object()
-        s.dllm_manager.waiting_queue.append(_req("p"))
-        _launch(s, _batch(s.dllm_manager.waiting_queue, ForwardMode.EXTEND))
+        s.dllm_manager.waiting_queue.join([_req("p")])
+        _launch(s, _batch(list(s.dllm_manager.waiting_queue), ForwardMode.EXTEND))
         self.assertEqual(list(s.prefill_launched_reqs), [])
 
     def test_ngram_grammar_step_launches_no_finished_row(self):
@@ -356,6 +366,7 @@ class TestRunningReqsHooks(CustomTestCase):
         running_batch = ScheduleBatch(reqs=[victim, other])
         s.running_reqs.join(running_batch.reqs)
         waiting = SimpleNamespace(
+            owner_list=None,
             beam_group=None,
             init_next_round_input=Mock(),
             kv=SimpleNamespace(holds_mamba=False),
@@ -408,12 +419,15 @@ class TestRunningReqsHooks(CustomTestCase):
         s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
         s.truncation_align_size = None
-        s._add_request_to_queue = Mock()
+        s.uocr_runtime = None
+        s._set_or_validate_priority = Mock(return_value=True)
+        s._abort_on_queued_limit = Mock(return_value=False)
+        s._prefetch_kvcache = Mock()
 
         new_batch, _ = s._get_new_batch_prefill_raw(None, running_batch)
 
         self.assertIsNone(new_batch)
-        s._add_request_to_queue.assert_called_once_with(victim)
+        self.assertEqual(list(s.waiting_queue), [waiting, victim])
         self.assertEqual(list(s.running_reqs), [other])
 
     def test_launch_counts_in_flight_steps_and_processing_drops_them(self):

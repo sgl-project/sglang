@@ -2151,15 +2151,24 @@ def triton_w8a8_block_fp8_linear(
     return output.to(dtype=output_dtype).view(*output_shape)
 
 
-@lru_cache(maxsize=1)
-def _get_triton_mxfp8_downcast():
-    try:
-        from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
-    except Exception as err:
-        raise RuntimeError(
-            "MXFP8 quantization requires triton_kernels with MXFP8 support."
-        ) from err
-    return downcast_to_mxfp
+def _mxfp8_group_quantize_torch(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Eager MXFP8 quantization with the same ROUND_UP E8M0 scale as the JIT kernel."""
+    m, k = x.shape
+    blocks = x.to(torch.float32).view(m, k // 32, 32)
+    dequant = blocks.abs().amax(dim=-1, keepdim=True) / 448.0
+    # Adding 0x007FFFFF carries into the exponent unless the mantissa is zero.
+    scale_bits = (dequant.view(torch.int32) + 0x007FFFFF) & 0x7F800000
+    dequant_rounded = scale_bits.view(torch.float32)
+    quant_scale = torch.where(
+        dequant_rounded == 0,
+        torch.zeros_like(dequant_rounded),
+        1.0 / dequant_rounded,
+    )
+    q = (blocks * quant_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    scale_u8 = (scale_bits >> 23).to(torch.uint8)
+    return q.view(m, k), scale_u8.view(m, k // 32)
 
 
 def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -2174,9 +2183,13 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         )
 
         return mxfp8_e4m3_quantize(x)
-    downcast_to_mxfp = _get_triton_mxfp8_downcast()
-    q_input, scale_u8 = downcast_to_mxfp(x, torch.float8_e4m3fn, axis=1)
-    return q_input.contiguous(), scale_u8.contiguous()
+    if _is_cuda:
+        from sglang.kernels.ops.quantization.mxfp8_group_quant import (
+            mxfp8_group_quant,
+        )
+
+        return mxfp8_group_quant(x)
+    return _mxfp8_group_quantize_torch(x)
 
 
 # (N, K) of the dense MXFP8 GEMMs where cuDNN's SM107 kernel beats the CuTe-DSL one at
