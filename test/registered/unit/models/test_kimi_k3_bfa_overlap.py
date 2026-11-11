@@ -16,7 +16,7 @@ from sglang.srt.models.kimi_k3 import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="4-gpu-b200")
 
 _H = 7168
 _QKVG = 6144  # q,k,v,g slices per rank at TP8
@@ -50,6 +50,7 @@ def _make_owner(with_stream: bool):
         split_sizes=[3 * 1536, 1536],
         _bfa_alt_stream=torch.cuda.Stream() if with_stream else None,
         _bfa_bs_limit=128 if with_stream else 0,
+        _bfa_side_tgv_m_ranges=None,
     )
     return owner
 
@@ -94,6 +95,54 @@ class TestKimiK3BfaOverlap(CustomTestCase):
                                 captured, serial, ("qkv", "beta", "forget_gate", "g")
                             ):
                                 self.assertTrue(torch.equal(got, ref), name)
+
+    def test_side_bfa_tgv_capture_matches_eager_tgv(self):
+        """Graph replay of the side-stream TGV [f_a | b] matches the eager kernel."""
+        if torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest("TGV needs SM10x")
+        from sglang.kernels.ops.gemm import cutedsl_bf16_gemm as cg
+        from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
+        from sglang.srt.models import kimi_k3
+
+        forward = KimiK3DeltaAttention.forward_qkvbfg_fused
+        ranges = cg.TGVMRanges()
+        for m_lo, m_hi, tactic in kimi_k3._K3_GB300_BFA_SIDE_TGV_M_RANGES[
+            (_BFA_W_ROWS, _H)
+        ]:
+            ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=tactic)
+        for T, tactic in ((72, 21), (144, 23), (264, 24)):
+            with (
+                self.subTest(T=T),
+                patch(
+                    "sglang.srt.models.kimi_k3.get_is_capture_mode",
+                    return_value=True,
+                ),
+            ):
+                x = torch.empty(T, _H, device="cuda", dtype=torch.bfloat16)
+                x.normal_(std=0.05)
+                owner = _make_owner(with_stream=True)
+                owner._bfa_bs_limit = 288
+                owner._bfa_side_tgv_m_ranges = ranges
+                forward(owner, x)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = forward(owner, x)
+                for _ in range(2):
+                    x.normal_(std=0.05)
+                    bfa = cg.cutedsl_bf16_gemm(x, owner._bfa_w, tactic=tactic)
+                    beta = bfa[:, _N_FA : _N_FA + _N_B]
+                    forget = kimi_k3_tiny_gemm(bfa[:, :_N_FA], owner._bfa_f_b_w)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    self.assertTrue(torch.equal(captured[1], beta))
+                    self.assertTrue(torch.equal(captured[2], forget))
+                    ref = torch.nn.functional.linear(x, owner._bfa_w)
+                    torch.testing.assert_close(
+                        captured[1],
+                        ref[:, _N_FA : _N_FA + _N_B],
+                        rtol=2e-2,
+                        atol=2e-3,
+                    )
 
     def test_eager_stream_branch_not_taken(self):
         x = torch.randn(3, _H, device="cuda", dtype=torch.bfloat16)
