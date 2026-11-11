@@ -54,6 +54,22 @@ class TestComputeAttentionAndMoeLayers(CustomTestCase):
         self.assertEqual(attention_layers, [None, None, local_attention])
         self.assertEqual(mha_companion_layers, [None, None, None])
 
+    def test_model_lists_its_attention_layers(self):
+        attention = SimpleNamespace()
+        # The attribute paths would find the decoy; the model's list wins.
+        layers = [SimpleNamespace(self_attn=SimpleNamespace(attn=object())), object()]
+        layer_model = SimpleNamespace(
+            layers=layers, get_attention_layers=lambda: [attention, None]
+        )
+
+        attention_layers, *_ = compute_attention_and_moe_layers(layer_model)
+
+        self.assertEqual(attention_layers, [attention, None])
+
+        layer_model.get_attention_layers = lambda: [attention]
+        with self.assertRaisesRegex(ValueError, "1 entries for 2 layers"):
+            compute_attention_and_moe_layers(layer_model)
+
 
 NUM_LAYERS = 36
 GLOBAL_FULL_IDS = list(range(1, NUM_LAYERS, 2))
