@@ -178,15 +178,13 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
         )
     else:
         parallel.dcp_group.all_gather_into_tensor(gathered_kv_a, kv_a)
-    # Reorder byte-packed rows (any size on ROCm, large ones on SM100) with word
-    # loads after the collective, keeping every rank's wire dtype/count unchanged.
+    # Reorder large byte-packed rows with word loads after the collective,
+    # keeping every rank's wire dtype/count unchanged.
     reorder_dtype = None
     if (
-        (
-            get_platform().is_hip
-            or (get_platform().is_sm100 and gathered_kv_a.numel() >= 64 * 1024 * 1024)
-        )
+        get_platform().is_sm100
         and kv_a.dtype == torch.uint8
+        and gathered_kv_a.numel() >= 64 * 1024 * 1024
         and kv_a.shape[-1] % 4 == 0
     ):
         reorder_dtype = torch.int64 if kv_a.shape[-1] % 8 == 0 else torch.int32
