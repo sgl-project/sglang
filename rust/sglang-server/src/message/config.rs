@@ -586,6 +586,9 @@ pub struct DeploymentInfo {
     pub gc_threshold: Option<Vec<i64>>,
     /// `--enable-pd-role-switch`.
     pub enable_pd_role_switch: bool,
+    /// `--elastic-ep-backend`; `None` when elastic EP is off, which is what
+    /// `/scale_elastic_ep` and `/is_scaling_elastic_ep` report.
+    pub elastic_ep_backend: Option<String>,
     /// `--enable-streaming-session`, which `/open_session` needs for a
     /// streaming session.
     pub enable_streaming_session: bool,

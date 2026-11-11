@@ -1765,6 +1765,617 @@ impl<'de> ::serde::Deserialize<'de> for UpdateWeightVersionResponse {
     }
 }
 
+impl ::serde::Serialize for GetHiCacheL3CacheLayoutRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for GetHiCacheL3CacheLayoutRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = GetHiCacheL3CacheLayoutRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct GetHiCacheL3CacheLayoutRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(GetHiCacheL3CacheLayoutRequest {})
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for GetHiCacheL3CacheLayoutResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.layout {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "layout",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for GetHiCacheL3CacheLayoutResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = GetHiCacheL3CacheLayoutResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct GetHiCacheL3CacheLayoutResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_layout = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "layout" => {
+                            if f_layout.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("layout"));
+                            }
+                            f_layout = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(GetHiCacheL3CacheLayoutResponse {
+                    layout: f_layout.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ConfigureLoggingRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.log_requests {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "log_requests", v)?;
+        }
+        if let Some(v) = &self.log_requests_level {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "log_requests_level", v)?;
+        }
+        if let Some(v) = &self.log_requests_format {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "log_requests_format", v)?;
+        }
+        if let Some(v) = &self.log_level {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "log_level", v)?;
+        }
+        if let Some(v) = &self.dump_requests_folder {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "dump_requests_folder", v)?;
+        }
+        if let Some(v) = &self.dump_requests_threshold {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "dump_requests_threshold", v)?;
+        }
+        if let Some(v) = &self.crash_dump_folder {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "crash_dump_folder", v)?;
+        }
+        if let Some(v) = &self.dump_requests_exclude_meta_keys {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "dump_requests_exclude_meta_keys",
+                v,
+            )?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ConfigureLoggingRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ConfigureLoggingRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ConfigureLoggingRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_log_requests = None;
+                let mut f_log_requests_level = None;
+                let mut f_log_requests_format = None;
+                let mut f_log_level = None;
+                let mut f_dump_requests_folder = None;
+                let mut f_dump_requests_threshold = None;
+                let mut f_crash_dump_folder = None;
+                let mut f_dump_requests_exclude_meta_keys = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "log_requests" => {
+                            if f_log_requests.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("log_requests"));
+                            }
+                            f_log_requests = Some(map.next_value::<Option<bool>>()?);
+                        }
+                        "log_requests_level" => {
+                            if f_log_requests_level.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "log_requests_level",
+                                ));
+                            }
+                            f_log_requests_level = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "log_requests_format" => {
+                            if f_log_requests_format.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "log_requests_format",
+                                ));
+                            }
+                            f_log_requests_format =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "log_level" => {
+                            if f_log_level.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("log_level"));
+                            }
+                            f_log_level =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "dump_requests_folder" => {
+                            if f_dump_requests_folder.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "dump_requests_folder",
+                                ));
+                            }
+                            f_dump_requests_folder =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "dump_requests_threshold" => {
+                            if f_dump_requests_threshold.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "dump_requests_threshold",
+                                ));
+                            }
+                            f_dump_requests_threshold = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "crash_dump_folder" => {
+                            if f_crash_dump_folder.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "crash_dump_folder",
+                                ));
+                            }
+                            f_crash_dump_folder =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "dump_requests_exclude_meta_keys" => {
+                            if f_dump_requests_exclude_meta_keys.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "dump_requests_exclude_meta_keys",
+                                ));
+                            }
+                            f_dump_requests_exclude_meta_keys =
+                                Some(map.next_value::<Option<StringList>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ConfigureLoggingRequest {
+                    log_requests: f_log_requests.flatten(),
+                    log_requests_level: f_log_requests_level.flatten(),
+                    log_requests_format: f_log_requests_format.flatten(),
+                    log_level: f_log_level.flatten(),
+                    dump_requests_folder: f_dump_requests_folder.flatten(),
+                    dump_requests_threshold: f_dump_requests_threshold.flatten(),
+                    crash_dump_folder: f_crash_dump_folder.flatten(),
+                    dump_requests_exclude_meta_keys: f_dump_requests_exclude_meta_keys.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ConfigureLoggingResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ConfigureLoggingResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ConfigureLoggingResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ConfigureLoggingResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ConfigureLoggingResponse {})
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for DumperControlRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "method", &self.method)?;
+        if let Some(v) = &self.body {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "body",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DumperControlRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = DumperControlRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct DumperControlRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_method = None;
+                let mut f_body = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "method" => {
+                            if f_method.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("method"));
+                            }
+                            f_method = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "body" => {
+                            if f_body.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("body"));
+                            }
+                            f_body = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(DumperControlRequest {
+                    method: f_method.unwrap_or_default(),
+                    body: f_body.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for DumperControlResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.responses {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "responses",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DumperControlResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = DumperControlResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct DumperControlResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_responses = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "responses" => {
+                            if f_responses.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("responses"));
+                            }
+                            f_responses = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(DumperControlResponse {
+                    responses: f_responses.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ScaleElasticEpRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "new_ep_size", &self.new_ep_size)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ScaleElasticEpRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ScaleElasticEpRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ScaleElasticEpRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_new_ep_size = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "new_ep_size" => {
+                            if f_new_ep_size.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("new_ep_size"));
+                            }
+                            f_new_ep_size = Some(map.next_value::<i64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ScaleElasticEpRequest {
+                    new_ep_size: f_new_ep_size.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ScaleElasticEpResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", &self.message)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "old_ep_size", &self.old_ep_size)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "new_ep_size", &self.new_ep_size)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ScaleElasticEpResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ScaleElasticEpResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ScaleElasticEpResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_message = None;
+                let mut f_old_ep_size = None;
+                let mut f_new_ep_size = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "message" => {
+                            if f_message.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("message"));
+                            }
+                            f_message = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "old_ep_size" => {
+                            if f_old_ep_size.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("old_ep_size"));
+                            }
+                            f_old_ep_size = Some(map.next_value::<i64>()?);
+                        }
+                        "new_ep_size" => {
+                            if f_new_ep_size.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("new_ep_size"));
+                            }
+                            f_new_ep_size = Some(map.next_value::<i64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ScaleElasticEpResponse {
+                    message: f_message.unwrap_or_default(),
+                    old_ep_size: f_old_ep_size.unwrap_or_default(),
+                    new_ep_size: f_new_ep_size.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ElasticEpStateRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ElasticEpStateRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ElasticEpStateRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ElasticEpStateRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ElasticEpStateRequest {})
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ElasticEpStateResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "is_scaling_elastic_ep",
+            &self.is_scaling_elastic_ep,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "effective_ep_size",
+            &self.effective_ep_size,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "pending_ep_size",
+            &self.pending_ep_size,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "scale_phase", &self.scale_phase)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "last_error", &self.last_error)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ElasticEpStateResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ElasticEpStateResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ElasticEpStateResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_is_scaling_elastic_ep = None;
+                let mut f_effective_ep_size = None;
+                let mut f_pending_ep_size = None;
+                let mut f_scale_phase = None;
+                let mut f_last_error = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "is_scaling_elastic_ep" => {
+                            if f_is_scaling_elastic_ep.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "is_scaling_elastic_ep",
+                                ));
+                            }
+                            f_is_scaling_elastic_ep = Some(map.next_value::<bool>()?);
+                        }
+                        "effective_ep_size" => {
+                            if f_effective_ep_size.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "effective_ep_size",
+                                ));
+                            }
+                            f_effective_ep_size = Some(map.next_value::<i64>()?);
+                        }
+                        "pending_ep_size" => {
+                            if f_pending_ep_size.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("pending_ep_size"));
+                            }
+                            f_pending_ep_size = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "scale_phase" => {
+                            if f_scale_phase.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("scale_phase"));
+                            }
+                            f_scale_phase =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "last_error" => {
+                            if f_last_error.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("last_error"));
+                            }
+                            f_last_error =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ElasticEpStateResponse {
+                    is_scaling_elastic_ep: f_is_scaling_elastic_ep.unwrap_or_default(),
+                    effective_ep_size: f_effective_ep_size.unwrap_or_default(),
+                    pending_ep_size: f_pending_ep_size.flatten(),
+                    scale_phase: f_scale_phase.unwrap_or_default(),
+                    last_error: f_last_error.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 impl ::serde::Serialize for OpenSessionRequest {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;

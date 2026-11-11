@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{
-        Query, State,
+        Path, Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
     http::{StatusCode, header},
@@ -26,10 +26,10 @@ use std::sync::Arc;
 use super::app::AppState;
 use super::native_api::native_error;
 use crate::api_server::core::{CoreError, FORWARD_PEER_PATH};
-use crate::api_server::handlers::{AbortEnding, ProfileOutcome};
+use crate::api_server::handlers::{AbortEnding, DumperOutcome, ElasticEpState, ProfileOutcome};
 use crate::message::info::ServerInfo;
 use crate::message::io_struct::{
-    ExpertDistributionAction, PdRoleSwitch, ProfileOptions, SessionOpen,
+    ExpertDistributionAction, LoggingConfig, PdRoleSwitch, ProfileOptions, SessionOpen,
 };
 
 /// The routes this module owns, mounted by `api_server::serve`.
@@ -44,8 +44,19 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         // also needs the server unpaused.
         .route("/ping", get(ping))
         .route("/ready", get(ready))
+        .route(
+            "/get_hicache_l3_cache_layout",
+            get(get_hicache_l3_cache_layout),
+        )
+        .route(
+            "/configure_logging",
+            get(configure_logging).post(configure_logging),
+        )
         .route("/open_session", get(open_session).post(open_session))
         .route("/close_session", get(close_session).post(close_session))
+        .route("/scale_elastic_ep", post(scale_elastic_ep))
+        .route("/is_scaling_elastic_ep", get(is_scaling_elastic_ep))
+        .merge(dumper_routes())
         // Static config, no scheduler round-trip. `/get_model_info` (+ `/model_info`
         // alias).
         .route("/get_model_info", get(model_info))
@@ -553,6 +564,92 @@ fn flag_status(ok: bool) -> Response {
     }
 }
 
+/// `GET /get_hicache_l3_cache_layout` — the merged L3 layout, always 200.
+async fn get_hicache_l3_cache_layout(State(state): State<Arc<AppState>>) -> Response {
+    match state.core.hicache_l3_cache_layout().await {
+        Ok(layout) => Json(layout).into_response(),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+/// `GET|POST /configure_logging` — Python's empty 200; an unknown level is
+/// refused (Python's `setLevel` raises, which its route does not catch).
+async fn configure_logging(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::ConfigureLoggingRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    let outcome = state
+        .core
+        .configure_logging(LoggingConfig {
+            log_requests: body.log_requests,
+            log_requests_level: body.log_requests_level,
+            log_requests_format: body.log_requests_format,
+            log_level: body.log_level,
+            dump_requests_folder: body.dump_requests_folder,
+            dump_requests_threshold: body.dump_requests_threshold,
+            crash_dump_folder: body.crash_dump_folder,
+            dump_requests_exclude_meta_keys: body
+                .dump_requests_exclude_meta_keys
+                .map(|list| list.items),
+        })
+        .await;
+    match outcome {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+/// `POST /dumper/{method}`, mounted only under `DUMPER_SERVER_PORT=reuse`
+/// as Python mounts it.
+fn dumper_routes() -> Router<Arc<AppState>> {
+    let router = Router::new();
+    if std::env::var("DUMPER_SERVER_PORT").as_deref() == Ok("reuse") {
+        router.route("/dumper/{method}", post(dumper_control))
+    } else {
+        router
+    }
+}
+
+/// Python's rendering: the ranks' responses flattened as a JSON array, or a
+/// 400 carrying every failed rank's error as `{"error": [...]}`. The body
+/// must be a JSON object (empty when absent).
+async fn dumper_control(
+    State(state): State<Arc<AppState>>,
+    Path(method): Path<String>,
+    body: Bytes,
+) -> Response {
+    let body = if body.is_empty() {
+        Map::new()
+    } else {
+        match serde_json::from_slice::<Value>(&body) {
+            Ok(Value::Object(object)) => object,
+            Ok(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Request body must be a JSON object."})),
+                )
+                    .into_response();
+            }
+            Err(error) => return native_error(StatusCode::BAD_REQUEST, &error.to_string(), false),
+        }
+    };
+    match state.core.dumper_control(method, body).await {
+        Ok(DumperOutcome::Responses(responses)) => Json(Value::Array(responses)).into_response(),
+        Ok(DumperOutcome::Failed(errors)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": errors})),
+        )
+            .into_response(),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
 /// Python's `_create_error_response`: `{"error": {"message": ...}}`, 400.
 fn session_error(message: &str) -> Response {
     (
@@ -602,6 +699,68 @@ async fn close_session(
     match state.core.close_session(body.session_id).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(error) => session_error(&error.to_string()),
+    }
+}
+
+/// Python's `{"error": ...}` 404 without `--elastic-ep-backend`.
+fn elastic_ep_disabled() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "elastic EP is not enabled (set --elastic-ep-backend)"})),
+    )
+        .into_response()
+}
+
+/// `POST /scale_elastic_ep` — the body is checked as Python checks it (a
+/// JSON object with a positive integer `new_ep_size`) before the backend
+/// gate. The Rust frontend serves no scale: with a backend, the refusal
+/// says so.
+async fn scale_elastic_ep(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let error = |status: StatusCode, message: String| {
+        (status, Json(serde_json::json!({"error": message}))).into_response()
+    };
+    let body = match serde_json::from_slice::<Value>(&body) {
+        Ok(Value::Object(object)) => object,
+        Ok(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "request body must be a JSON object".into(),
+            );
+        }
+        Err(e) => return error(StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")),
+    };
+    let positive = body
+        .get("new_ep_size")
+        .and_then(Value::as_i64)
+        .filter(|size| *size > 0 && !body["new_ep_size"].is_boolean())
+        .is_some();
+    if !positive {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "new_ep_size must be a positive integer".into(),
+        );
+    }
+    if state.core.elastic_ep_state().is_none() {
+        return elastic_ep_disabled();
+    }
+    error(
+        StatusCode::BAD_REQUEST,
+        "elastic EP scaling is not served by the Rust frontend".into(),
+    )
+}
+
+/// `GET /is_scaling_elastic_ep` — Python's `get_elastic_ep_state`.
+async fn is_scaling_elastic_ep(State(state): State<Arc<AppState>>) -> Response {
+    match state.core.elastic_ep_state() {
+        None => elastic_ep_disabled(),
+        Some(ElasticEpState { effective_ep_size }) => Json(serde_json::json!({
+            "is_scaling_elastic_ep": false,
+            "effective_ep_size": effective_ep_size,
+            "pending_ep_size": null,
+            "scale_phase": "idle",
+            "last_error": null,
+        }))
+        .into_response(),
     }
 }
 
@@ -2637,6 +2796,250 @@ mod tests {
         assert_eq!(
             probe("/ready").await.status(),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// `/get_hicache_l3_cache_layout` answers the merged layout as the bare
+    /// object; `/configure_logging` is Python's empty 200 and refuses an
+    /// unknown level before any rank.
+    #[tokio::test]
+    async fn l3_layout_and_configure_logging_routes_answer_python_shapes() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let response = tokio::spawn(
+            routes().with_state(state.clone()).oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/get_hicache_l3_cache_layout")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("the layout read must submit one control request");
+        };
+        assert!(admission.try_accept());
+        let layout = serde_json::json!({"enabled": false, "hicache_object_layout": {"pools": []}, "reason": "off"});
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({"layout": layout})).unwrap(),
+            )))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(any_json(response).await, layout);
+
+        let post = |body: &'static str| {
+            let app = routes().with_state(state.clone());
+            async move {
+                app.oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/configure_logging")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let response = post(r#"{"log_level": "loud"}"#).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(intake_rx.try_recv().is_err());
+        let response = post(r#"{"dump_requests_threshold": 3}"#).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(to_bytes(response.into_body(), 16).await.unwrap().is_empty());
+        assert!(intake_rx.try_recv().is_err(), "no level, no message");
+    }
+
+    /// Without `--elastic-ep-backend` both elastic routes are Python's 404,
+    /// after the body checks `/scale_elastic_ep` runs first; with one, the
+    /// state is idle and a scale is refused.
+    #[tokio::test]
+    async fn elastic_ep_routes_gate_on_the_backend() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let scale = |state: Arc<AppState>, body: &'static str| async move {
+            let response = routes()
+                .with_state(state)
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/scale_elastic_ep")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            (status, any_json(response).await)
+        };
+        for (body, message) in [
+            ("[1]", "request body must be a JSON object"),
+            (
+                r#"{"new_ep_size": 0}"#,
+                "new_ep_size must be a positive integer",
+            ),
+            (
+                r#"{"new_ep_size": true}"#,
+                "new_ep_size must be a positive integer",
+            ),
+            (
+                r#"{"new_ep_size": "4"}"#,
+                "new_ep_size must be a positive integer",
+            ),
+        ] {
+            let (status, json) = scale(state.clone(), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"], message, "{body}");
+        }
+        let (status, json) = scale(state.clone(), "{not json").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("Invalid JSON: ")
+        );
+        let (status, json) = scale(state.clone(), r#"{"new_ep_size": 8}"#).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            json["error"],
+            "elastic EP is not enabled (set --elastic-ep-backend)"
+        );
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/is_scaling_elastic_ep")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(intake_rx.try_recv().is_err());
+
+        let mut args = ServerArgs::default();
+        args.deployment_info.elastic_ep_backend = Some("mooncake".into());
+        args.deployment_info.dp_size = 2;
+        let (state, _intake_rx, _abort_rx) = test_state(args);
+        let (status, json) = scale(state.clone(), r#"{"new_ep_size": 8}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json["error"],
+            "elastic EP scaling is not served by the Rust frontend"
+        );
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/is_scaling_elastic_ep")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            any_json(response).await,
+            serde_json::json!({
+                "is_scaling_elastic_ep": false, "effective_ep_size": 2,
+                "pending_ep_size": null, "scale_phase": "idle", "last_error": null
+            })
+        );
+    }
+
+    /// `/dumper/{method}` is mounted only under `DUMPER_SERVER_PORT=reuse`;
+    /// it takes an object body (empty when absent), flattens the ranks'
+    /// responses, and answers the failures as Python's `{"error": [...]}`.
+    #[tokio::test]
+    async fn dumper_route_is_env_gated_and_flattens_rank_responses() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let post = |state: Arc<AppState>, body: &'static str| {
+            tokio::spawn(
+                routes().with_state(state).oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri("/dumper/get_state")
+                        .body(Body::from(body))
+                        .unwrap(),
+                ),
+            )
+        };
+        // The env is read when the router is built; the tests share one
+        // process, so the gate is only ever turned on here.
+        if std::env::var("DUMPER_SERVER_PORT").as_deref() != Ok("reuse") {
+            let response = post(state.clone(), "").await.unwrap().unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "not mounted by default"
+            );
+            unsafe { std::env::set_var("DUMPER_SERVER_PORT", "reuse") };
+        }
+        let response = post(state.clone(), "[1]").await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            any_json(response).await["error"],
+            "Request body must be a JSON object."
+        );
+        assert!(intake_rx.try_recv().is_err());
+
+        let response = post(state.clone(), "");
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("the dumper call must submit one control request");
+        };
+        assert!(admission.try_accept());
+        let RequestKind::Control(control) = &request.kind else {
+            panic!("expected a control request");
+        };
+        let rmpv::Value::Array(items) =
+            rmpv::decode::read_value(&mut &control.encode().unwrap()[..]).unwrap()
+        else {
+            panic!("positional wire");
+        };
+        assert_eq!(items[3].as_str(), Some("get_state"));
+        assert_eq!(
+            items[4],
+            rmpv::Value::Map(vec![]),
+            "an absent body is an empty object"
+        );
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({
+                    "success": true, "response": [{"step": 3}], "error": ""
+                }))
+                .unwrap(),
+            )))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(any_json(response).await, serde_json::json!([{"step": 3}]));
+
+        let response = post(state, r#"{"k": 1}"#);
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("expected a control request");
+        };
+        assert!(admission.try_accept());
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({
+                    "success": false, "response": [], "error": "boom"
+                }))
+                .unwrap(),
+            )))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            any_json(response).await,
+            serde_json::json!({"error": ["boom"]})
         );
     }
 

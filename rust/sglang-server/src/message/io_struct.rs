@@ -229,6 +229,28 @@ control_messages! {
         session_id: String,
     }
 
+    /// `/get_hicache_l3_cache_layout`'s control request: a bare `BaseReq`.
+    GetHiCacheL3LayoutReq {}
+
+    /// `/configure_logging`: Python's `ConfigureLoggingReq`. The scheduler
+    /// reads `log_level`; the rest is the Python frontend's own.
+    ConfigureLoggingReq {
+        log_requests: Option<bool>,
+        log_requests_level: Option<i64>,
+        log_requests_format: Option<String>,
+        log_level: Option<String>,
+        dump_requests_folder: Option<String>,
+        dump_requests_threshold: Option<i64>,
+        crash_dump_folder: Option<String>,
+        dump_requests_exclude_meta_keys: Option<Vec<String>>,
+    }
+
+    /// `/dumper/{method}`: Python's `DumperControlReqInput`.
+    DumperControlReqInput {
+        method: String,
+        body: serde_json::Map<String, serde_json::Value>,
+    }
+
     /// `/update_weights_from_disk`: Python's `UpdateWeightFromDiskReqInput`.
     /// `is_async`, `keep_pause`, `token_step` and `manifest` are carried as
     /// Python carries them; its scheduler reads none of them.
@@ -555,6 +577,52 @@ impl OpenSessionReqInput {
 impl CloseSessionReqInput {
     pub fn new(rid: String, session_id: String) -> Self {
         Self { rid, session_id }
+    }
+}
+
+impl GetHiCacheL3LayoutReq {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
+    }
+}
+
+/// The `/configure_logging` fields; the owned form of
+/// `api::ConfigureLoggingRequest`.
+#[derive(Debug, Clone, Default)]
+pub struct LoggingConfig {
+    pub log_requests: Option<bool>,
+    pub log_requests_level: Option<i64>,
+    pub log_requests_format: Option<String>,
+    pub log_level: Option<String>,
+    pub dump_requests_folder: Option<String>,
+    pub dump_requests_threshold: Option<i64>,
+    pub crash_dump_folder: Option<String>,
+    pub dump_requests_exclude_meta_keys: Option<Vec<String>>,
+}
+
+impl ConfigureLoggingReq {
+    pub fn new(rid: String, config: LoggingConfig) -> Self {
+        Self {
+            rid,
+            log_requests: config.log_requests,
+            log_requests_level: config.log_requests_level,
+            log_requests_format: config.log_requests_format,
+            log_level: config.log_level,
+            dump_requests_folder: config.dump_requests_folder,
+            dump_requests_threshold: config.dump_requests_threshold,
+            crash_dump_folder: config.crash_dump_folder,
+            dump_requests_exclude_meta_keys: config.dump_requests_exclude_meta_keys,
+        }
+    }
+}
+
+impl DumperControlReqInput {
+    pub fn new(
+        rid: String,
+        method: String,
+        body: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        Self { rid, method, body }
     }
 }
 

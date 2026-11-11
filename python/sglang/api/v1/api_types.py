@@ -436,6 +436,164 @@ class UpdateWeightVersionResponse(msgspec.Struct, kw_only=True, frozen=True):
         return encode_UpdateWeightVersionResponse(self)
 
 
+class GetHiCacheL3CacheLayoutRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GetHiCacheL3CacheLayoutRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GetHiCacheL3CacheLayoutRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GetHiCacheL3CacheLayoutRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GetHiCacheL3CacheLayoutRequest(self)
+
+
+class GetHiCacheL3CacheLayoutResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GetHiCacheL3CacheLayoutResponse: JSON object (unknown keys ignored)."""
+
+    layout: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GetHiCacheL3CacheLayoutResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GetHiCacheL3CacheLayoutResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GetHiCacheL3CacheLayoutResponse(self)
+
+
+class ConfigureLoggingRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ConfigureLoggingRequest: JSON object (unknown keys ignored)."""
+
+    log_requests: Optional[bool] = None
+    log_requests_level: Optional[int] = None
+    log_requests_format: Optional[str] = None
+    log_level: Optional[str] = None
+    dump_requests_folder: Optional[str] = None
+    dump_requests_threshold: Optional[int] = None
+    crash_dump_folder: Optional[str] = None
+    dump_requests_exclude_meta_keys: Optional[StringList] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ConfigureLoggingRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ConfigureLoggingRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ConfigureLoggingRequest(self)
+
+
+class ConfigureLoggingResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ConfigureLoggingResponse: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ConfigureLoggingResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ConfigureLoggingResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ConfigureLoggingResponse(self)
+
+
+class DumperControlRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DumperControlRequest: JSON object (unknown keys ignored)."""
+
+    method: str = ""
+    body: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DumperControlRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DumperControlRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DumperControlRequest(self)
+
+
+class DumperControlResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DumperControlResponse: JSON object (unknown keys ignored)."""
+
+    responses: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DumperControlResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DumperControlResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DumperControlResponse(self)
+
+
+class ScaleElasticEpRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ScaleElasticEpRequest: JSON object (unknown keys ignored)."""
+
+    new_ep_size: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ScaleElasticEpRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ScaleElasticEpRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ScaleElasticEpRequest(self)
+
+
+class ScaleElasticEpResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ScaleElasticEpResponse: JSON object (unknown keys ignored)."""
+
+    message: str = ""
+    old_ep_size: int = 0
+    new_ep_size: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ScaleElasticEpResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ScaleElasticEpResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ScaleElasticEpResponse(self)
+
+
+class ElasticEpStateRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ElasticEpStateRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ElasticEpStateRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ElasticEpStateRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ElasticEpStateRequest(self)
+
+
+class ElasticEpStateResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ElasticEpStateResponse: JSON object (unknown keys ignored)."""
+
+    is_scaling_elastic_ep: bool = False
+    effective_ep_size: int = 0
+    pending_ep_size: Optional[int] = None
+    scale_phase: str = ""
+    last_error: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ElasticEpStateResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ElasticEpStateResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ElasticEpStateResponse(self)
+
+
 class OpenSessionRequest(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.OpenSessionRequest: JSON object (unknown keys ignored)."""
 
@@ -2545,6 +2703,194 @@ def encode_UpdateWeightVersionResponse(v: UpdateWeightVersionResponse) -> Dict[s
     d["message"] = v.message
     if v.new_version is not None:
         d["new_version"] = v.new_version
+    return d
+
+
+def decode_GetHiCacheL3CacheLayoutRequest(value: Any) -> GetHiCacheL3CacheLayoutRequest:
+    m = _expect_map(value, expected="struct GetHiCacheL3CacheLayoutRequest")
+    return GetHiCacheL3CacheLayoutRequest()
+
+
+def encode_GetHiCacheL3CacheLayoutRequest(v: GetHiCacheL3CacheLayoutRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_GetHiCacheL3CacheLayoutResponse(value: Any) -> GetHiCacheL3CacheLayoutResponse:
+    m = _expect_map(value, expected="struct GetHiCacheL3CacheLayoutResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "layout":
+            kw["layout"] = x
+    return GetHiCacheL3CacheLayoutResponse(**kw)
+
+
+def encode_GetHiCacheL3CacheLayoutResponse(v: GetHiCacheL3CacheLayoutResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.layout is not None:
+        d["layout"] = v.layout
+    return d
+
+
+def decode_ConfigureLoggingRequest(value: Any) -> ConfigureLoggingRequest:
+    m = _expect_map(value, expected="struct ConfigureLoggingRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "log_requests":
+            kw["log_requests"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "log_requests_level":
+            kw["log_requests_level"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "log_requests_format":
+            kw["log_requests_format"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "log_level":
+            kw["log_level"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "dump_requests_folder":
+            kw["dump_requests_folder"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "dump_requests_threshold":
+            kw["dump_requests_threshold"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "crash_dump_folder":
+            kw["crash_dump_folder"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "dump_requests_exclude_meta_keys":
+            kw["dump_requests_exclude_meta_keys"] = None if x is None else decode_StringList(x)
+    return ConfigureLoggingRequest(**kw)
+
+
+def encode_ConfigureLoggingRequest(v: ConfigureLoggingRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.log_requests is not None:
+        d["log_requests"] = v.log_requests
+    if v.log_requests_level is not None:
+        d["log_requests_level"] = v.log_requests_level
+    if v.log_requests_format is not None:
+        d["log_requests_format"] = v.log_requests_format
+    if v.log_level is not None:
+        d["log_level"] = v.log_level
+    if v.dump_requests_folder is not None:
+        d["dump_requests_folder"] = v.dump_requests_folder
+    if v.dump_requests_threshold is not None:
+        d["dump_requests_threshold"] = v.dump_requests_threshold
+    if v.crash_dump_folder is not None:
+        d["crash_dump_folder"] = v.crash_dump_folder
+    if v.dump_requests_exclude_meta_keys is not None:
+        d["dump_requests_exclude_meta_keys"] = encode_StringList(v.dump_requests_exclude_meta_keys)
+    return d
+
+
+def decode_ConfigureLoggingResponse(value: Any) -> ConfigureLoggingResponse:
+    m = _expect_map(value, expected="struct ConfigureLoggingResponse")
+    return ConfigureLoggingResponse()
+
+
+def encode_ConfigureLoggingResponse(v: ConfigureLoggingResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_DumperControlRequest(value: Any) -> DumperControlRequest:
+    m = _expect_map(value, expected="struct DumperControlRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "method":
+            kw["method"] = _expect_str(x, expected="a string")
+        elif key == "body":
+            kw["body"] = x
+    return DumperControlRequest(**kw)
+
+
+def encode_DumperControlRequest(v: DumperControlRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["method"] = v.method
+    if v.body is not None:
+        d["body"] = v.body
+    return d
+
+
+def decode_DumperControlResponse(value: Any) -> DumperControlResponse:
+    m = _expect_map(value, expected="struct DumperControlResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "responses":
+            kw["responses"] = x
+    return DumperControlResponse(**kw)
+
+
+def encode_DumperControlResponse(v: DumperControlResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.responses is not None:
+        d["responses"] = v.responses
+    return d
+
+
+def decode_ScaleElasticEpRequest(value: Any) -> ScaleElasticEpRequest:
+    m = _expect_map(value, expected="struct ScaleElasticEpRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "new_ep_size":
+            kw["new_ep_size"] = _expect_int(x, expected="i64")
+    return ScaleElasticEpRequest(**kw)
+
+
+def encode_ScaleElasticEpRequest(v: ScaleElasticEpRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["new_ep_size"] = v.new_ep_size
+    return d
+
+
+def decode_ScaleElasticEpResponse(value: Any) -> ScaleElasticEpResponse:
+    m = _expect_map(value, expected="struct ScaleElasticEpResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "old_ep_size":
+            kw["old_ep_size"] = _expect_int(x, expected="i64")
+        elif key == "new_ep_size":
+            kw["new_ep_size"] = _expect_int(x, expected="i64")
+    return ScaleElasticEpResponse(**kw)
+
+
+def encode_ScaleElasticEpResponse(v: ScaleElasticEpResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["message"] = v.message
+    d["old_ep_size"] = v.old_ep_size
+    d["new_ep_size"] = v.new_ep_size
+    return d
+
+
+def decode_ElasticEpStateRequest(value: Any) -> ElasticEpStateRequest:
+    m = _expect_map(value, expected="struct ElasticEpStateRequest")
+    return ElasticEpStateRequest()
+
+
+def encode_ElasticEpStateRequest(v: ElasticEpStateRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_ElasticEpStateResponse(value: Any) -> ElasticEpStateResponse:
+    m = _expect_map(value, expected="struct ElasticEpStateResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "is_scaling_elastic_ep":
+            kw["is_scaling_elastic_ep"] = _expect_bool(x, expected="a boolean")
+        elif key == "effective_ep_size":
+            kw["effective_ep_size"] = _expect_int(x, expected="i64")
+        elif key == "pending_ep_size":
+            kw["pending_ep_size"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "scale_phase":
+            kw["scale_phase"] = _expect_str(x, expected="a string")
+        elif key == "last_error":
+            kw["last_error"] = None if x is None else _expect_str(x, expected="a string")
+    return ElasticEpStateResponse(**kw)
+
+
+def encode_ElasticEpStateResponse(v: ElasticEpStateResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["is_scaling_elastic_ep"] = v.is_scaling_elastic_ep
+    d["effective_ep_size"] = v.effective_ep_size
+    d["pending_ep_size"] = v.pending_ep_size
+    d["scale_phase"] = v.scale_phase
+    d["last_error"] = v.last_error
     return d
 
 

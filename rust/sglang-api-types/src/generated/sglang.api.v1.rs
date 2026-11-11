@@ -349,6 +349,93 @@ pub struct UpdateWeightVersionResponse {
     #[prost(string, optional, tag = "3")]
     pub new_version: ::core::option::Option<::prost::alloc::string::String>,
 }
+/// `/get_hicache_l3_cache_layout`: the HiCache L3 (object storage) layout,
+/// read from every DP rank and merged as Python's `merge_l3_layouts` merges
+/// them (replicas must agree, pipeline stages concatenate).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetHiCacheL3CacheLayoutRequest {}
+/// The merged layout as JSON text: Python's scheduler-sanitized dict, or the
+/// `disabled_l3_layout` envelope with its reason.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetHiCacheL3CacheLayoutResponse {
+    #[prost(string, optional, tag = "1")]
+    pub layout: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/configure_logging`: Python's `ConfigureLoggingReq`. `log_level` reaches
+/// every scheduler rank; the other fields configure the Python frontend's
+/// own request logging and dumps, which the Rust frontend does not apply.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ConfigureLoggingRequest {
+    #[prost(bool, optional, tag = "1")]
+    pub log_requests: ::core::option::Option<bool>,
+    #[prost(int64, optional, tag = "2")]
+    pub log_requests_level: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "3")]
+    pub log_requests_format: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub log_level: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub dump_requests_folder: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "6")]
+    pub dump_requests_threshold: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "7")]
+    pub crash_dump_folder: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "8")]
+    pub dump_requests_exclude_meta_keys: ::core::option::Option<StringList>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ConfigureLoggingResponse {}
+/// `/dumper/{method}`: a method of the debug dumper's control surface
+/// (`get_state`, `configure`, `reset`) with the request's JSON object as its
+/// body, on every rank. Served only when the frontend runs with
+/// `DUMPER_SERVER_PORT=reuse`, as Python mounts it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DumperControlRequest {
+    #[prost(string, tag = "1")]
+    pub method: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub body: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Python's success body: every rank's per-worker responses flattened, as
+/// JSON text; a failure is a status carrying the ranks' errors.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DumperControlResponse {
+    #[prost(string, optional, tag = "1")]
+    pub responses: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `/scale_elastic_ep` and `/is_scaling_elastic_ep`. Both answer Python's
+/// "elastic EP is not enabled" without `--elastic-ep-backend`; the Rust
+/// frontend does not serve a scale on a deployment that has it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScaleElasticEpRequest {
+    #[prost(int64, tag = "1")]
+    pub new_ep_size: i64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScaleElasticEpResponse {
+    #[prost(string, tag = "1")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub old_ep_size: i64,
+    #[prost(int64, tag = "3")]
+    pub new_ep_size: i64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ElasticEpStateRequest {}
+/// Python's `get_elastic_ep_state`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ElasticEpStateResponse {
+    #[prost(bool, tag = "1")]
+    pub is_scaling_elastic_ep: bool,
+    #[prost(int64, tag = "2")]
+    pub effective_ep_size: i64,
+    #[prost(int64, optional, tag = "3")]
+    pub pending_ep_size: ::core::option::Option<i64>,
+    #[prost(string, tag = "4")]
+    pub scale_phase: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "5")]
+    pub last_error: ::core::option::Option<::prost::alloc::string::String>,
+}
 /// `/open_session`: open a multi-turn session on every DP rank's scheduler.
 /// Python's `OpenSessionReqInput`; the frontend mints `session_id` when unset.
 #[derive(Clone, PartialEq, ::prost::Message)]
