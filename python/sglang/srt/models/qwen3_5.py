@@ -187,6 +187,7 @@ _gdn_decode_fused_proj_conv = (
     or (
         current_platform.is_out_of_tree()
         and current_platform.capabilities.supports_triton
+        and not _is_npu
     )
 ) and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 _gdn_online_mxfp4 = (
