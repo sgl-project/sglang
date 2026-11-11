@@ -783,16 +783,13 @@ class _Accumulator(ABC):
         self._expert_location_metadata = expert_location_metadata
         self._communication_group = get_eplb_group()
         # NPU communication uses stage-local ranks; collective roots are global.
-        self._group_rank = (
-            rank
-            if self._communication_group is None
-            else torch.distributed.get_rank(self._communication_group)
-        )
-        self._root_global_rank = (
-            0
-            if self._communication_group is None
-            else torch.distributed.get_global_rank(self._communication_group, 0)
-        )
+        self._group_rank = rank
+        self._root_global_rank = 0
+        if self._communication_group is not None:
+            self._group_rank = torch.distributed.get_rank(self._communication_group)
+            self._root_global_rank = torch.distributed.get_global_rank(
+                self._communication_group, 0
+            )
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
