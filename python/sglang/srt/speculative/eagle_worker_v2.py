@@ -38,6 +38,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
+    with_phase,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
@@ -1992,6 +1993,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             get_spec().speculative_num_draft_tokens,
             get_exec().graph.cuda_graph_bs_decode,
             get_exec().graph.disable_cuda_graph,
+            get_exec().graph.cuda_graph_config,
         )
 
         self.speculative_num_steps = speculative_num_steps
@@ -2011,6 +2013,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             get_context().override(
                 "adaptive_spec.capture_override",
                 cuda_graph_bs_decode=cuda_graph_bs,
+                cuda_graph_config=with_phase(
+                    backup[14],
+                    Phase.DECODE,
+                    bs=cuda_graph_bs,
+                    **({"backend": Backend.DISABLED} if not cuda_graph_bs else {}),
+                ),
                 **({"disable_cuda_graph": True} if not cuda_graph_bs else {}),
             )
         dw._rebuild_topk1_chain_buffers()
@@ -2036,6 +2044,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 speculative_num_draft_tokens=backup[11],
                 cuda_graph_bs_decode=backup[12],
                 disable_cuda_graph=backup[13],
+                cuda_graph_config=backup[14],
             )
             dw._rebuild_topk1_chain_buffers()
 
