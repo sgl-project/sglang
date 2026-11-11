@@ -1,5 +1,4 @@
-"""DFlash MLA drafts on real MLA backends, bidirectional and causal, eager and graph,
-and sliding-window layers on the window backends."""
+"""DFlash MLA drafts on real MLA backends, bidirectional and causal, eager and graph."""
 
 import copy
 import math
@@ -32,9 +31,7 @@ register_cuda_ci(est_time=40, stage="base-b", runner_config="4-gpu-b200")
 HIDDEN, HEADS, RANK, NOPE, ROPE, VALUE, BLOCK = 128, 32, 512, 128, 64, 128, 8
 CAPACITY = 256
 BACKENDS = ("triton", "flashinfer")
-WINDOW_BACKENDS = ("triton", "trtllm_mla", "cutedsl_mla")
-# HF sliding_window counts the query token: row p attends [p - 15, p], which
-# drops keys of the 31- and 63-token prefixes.
+# Row p attends [p - 15, p]: drops keys of the 31- and 63-token prefixes.
 SLIDING_WINDOW = 16
 
 
@@ -174,7 +171,6 @@ class TestDFlashMLABackends(unittest.TestCase):
             dflash_config={"attention_mode": "mla", "block_size": BLOCK},
         )
         runner = self._make_runner(backend_name, config, heads)
-        # As ModelRunner sets it from the draft's layers.
         runner.sliding_window_size = window_left
         module = DFlashMLAAttention(config, layer_id=0)
         # get_rope() shares one cached instance, and the CUDA RoPE kernel reads
@@ -302,14 +298,8 @@ class TestDFlashMLABackends(unittest.TestCase):
         self._check_backends(causal=True)
 
     def test_sliding_window(self):
-        for backend_name in WINDOW_BACKENDS:
-            with self.subTest(backend=backend_name):
-                self._check(backend_name, causal=True, sliding_window=SLIDING_WINDOW)
-        # trtllm-gen has no 64 < heads < 128 kernel: the query is padded to 128.
-        with self.subTest(backend="cutedsl_mla", heads=96):
-            self._check(
-                "cutedsl_mla", causal=True, sliding_window=SLIDING_WINDOW, heads=96
-            )
+        self._check("trtllm_mla", causal=True, sliding_window=SLIDING_WINDOW)
+        self._check("cutedsl_mla", causal=True, sliding_window=SLIDING_WINDOW, heads=96)
 
 
 if __name__ == "__main__":

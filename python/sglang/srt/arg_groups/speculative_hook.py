@@ -1074,7 +1074,6 @@ def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
     draft_hf_config = _load_draft_hf_config(cfg)
     if not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
         return
-    # Sliding layers index req_to_token by absolute position, not the compact table.
     layer_types = get_dflash_layer_types(draft_hf_config)
     if layer_types and "sliding_attention" in layer_types:
         raise ValueError(

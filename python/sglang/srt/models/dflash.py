@@ -561,7 +561,6 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
                     "--speculative-draft-attention-backend triton, trtllm_mla or "
                     f"cutedsl_mla, got {draft_attention_backend!r}."
                 )
-            # trtllm_mla runs every layer causally; the window path of both is causal.
             if attn_type != AttentionType.DECODER and (
                 draft_attention_backend == "trtllm_mla"
                 or (
