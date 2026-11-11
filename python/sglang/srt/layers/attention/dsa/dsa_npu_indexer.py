@@ -250,11 +250,6 @@ class DSANPUIndexerMixin:
             and not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
         )
-        use_cp_indexer = (
-            is_prefill
-            and self.dsa_enable_prefill_cp
-            and forward_batch.attn_cp_metadata is not None
-        )
 
         bs = q_lora.shape[0]
 
@@ -263,9 +258,12 @@ class DSANPUIndexerMixin:
         # index-K, which is what lets any of them score a subset. Neox only: the
         # other branch rotates q and k in one call. Prefill CP is excluded: its
         # indexer below knows nothing of this shard.
+        uses_prefill_cp = (
+            self.dsa_enable_prefill_cp and forward_batch.attn_cp_metadata is not None
+        )
         shard = (
             _get_indexer_query_shard(forward_batch, bs)
-            if is_prefill and not use_cp_indexer
+            if is_prefill and not uses_prefill_cp
             else None
         )
         q_sliced_early = shard is not None and self.rotary_emb.is_neox_style
@@ -403,7 +401,11 @@ class DSANPUIndexerMixin:
             q = torch.cat([q_pe, q_nope], dim=-1)
             k = torch.cat([k_pe, k_nope], dim=-1)
 
-        if use_cp_indexer:
+        if (
+            is_prefill
+            and self.dsa_enable_prefill_cp
+            and forward_batch.attn_cp_metadata is not None
+        ):
             k = cp_gather_full_sequence_states(
                 k.contiguous().view(-1, self.head_dim),
                 forward_batch,
@@ -441,7 +443,10 @@ class DSANPUIndexerMixin:
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
-            if use_cp_indexer:
+            if (
+                self.dsa_enable_prefill_cp
+                and forward_batch.attn_cp_metadata is not None
+            ):
                 # V2: local metadata already prepared by prepare_dsa_cp_metadata.
                 actual_seq_lengths_q = (
                     get_attn_backend().forward_metadata.actual_seq_lengths_q
@@ -498,9 +503,14 @@ class DSANPUIndexerMixin:
                 if is_prefill
                 else block_table,
             )
-        if use_cp_indexer:
+        if (
+            is_prefill
+            and self.dsa_enable_prefill_cp
+            and forward_batch.attn_cp_metadata is not None
+        ):
             # Each rank indexes the full paged K cache with its local Q rows.
             weights = weights.contiguous().view(-1, weights.shape[-1])
+            actual_seq_lengths_q = actual_seq_lengths_q.to(q.device)
         elif is_prefill:
             block_table = block_table[: actual_seq_lengths_q.numel()]
 
@@ -515,13 +525,9 @@ class DSANPUIndexerMixin:
         indexer_kwargs = dict(
             key=past_key_states,
             weights=weights,
-            actual_seq_lengths_query=actual_seq_lengths_q.to(
-                device=q.device if use_cp_indexer else actual_seq_lengths_q.device,
-                dtype=torch.int32,
-            ),
+            actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
             actual_seq_lengths_key=actual_seq_lengths_kv.to(
-                device=q.device if use_cp_indexer else k.device,
-                dtype=torch.int32,
+                device=k.device, dtype=torch.int32
             ),
             block_table=block_table,
             layout_query="TND",
