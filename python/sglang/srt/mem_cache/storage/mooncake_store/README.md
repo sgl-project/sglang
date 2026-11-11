@@ -80,6 +80,9 @@ to 16 MiB. Size it for concurrent reads and writes, including large recurrent
 state objects. This is per-client transient memory, separate from the shared
 `global_segment_size`; include both in the host memory budget.
 
+To keep the storage engine independent of a PD NVLink engine, set
+`SGLANG_HICACHE_MOONCAKE_REUSE_TE=0`.
+
 ### Direct Linker with RDMA
 
 The direct Linker requires `--pp-size 1`; pipeline parallelism is not supported.
