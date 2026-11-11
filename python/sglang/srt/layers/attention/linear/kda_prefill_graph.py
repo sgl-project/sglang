@@ -363,26 +363,12 @@ def _hip_extend_between_segments(
     ``out``. The kernel reads every row's state slot and picks its launch layout
     from the host token count, row count and longest row, so it cannot be
     captured over the bucket's padded rows; on the real rows it matches the
-    eager extend bitwise."""
+    eager extend bitwise. DP-padded batches, and any batch the kernel declines,
+    run the Triton extend on the graph tables instead."""
     bs, real_bs, max_seqlen, total = (int(x) for x in meta.host_batch)
-    if real_bs < bs:
-        out.copy_(
-            _chunk_extend_on_tables(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                ssm_states,
-                h_track,
-                meta=meta,
-                kernel_dispatcher=kernel_dispatcher,
-                layer=layer,
-            )
-        )
-        return
-    out[:, :total].copy_(
-        kda_gfx950_prefill.extend(
+    hip_out = None
+    if real_bs == bs:
+        hip_out = kda_gfx950_prefill.extend(
             q[:, :total],
             k[:, :total],
             v[:, :total],
@@ -399,7 +385,23 @@ def _hip_extend_between_segments(
             track_state=None if h_track is None else h_track[:bs],
             track_chunk_idx=None if h_track is None else meta.track_chunk_idx[:bs],
         )
-    )
+    if hip_out is None:
+        out.copy_(
+            _chunk_extend_on_tables(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states,
+                h_track,
+                meta=meta,
+                kernel_dispatcher=kernel_dispatcher,
+                layer=layer,
+            )
+        )
+    else:
+        out[:, :total].copy_(hip_out)
 
 
 def kda_extend_in_graph(

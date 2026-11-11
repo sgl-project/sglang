@@ -391,6 +391,23 @@ class TestBreakableHipKDAPrefillGraph(TestKDAPrefillGraph):
         self.ssm_pool.copy_(snapshot[1])
         return meta, graph, out
 
+    def test_replays_match_eager_when_hip_declines(self):
+        """A batch the HIP kernel declines at replay runs the Triton extend on
+        the graph tables inside the break."""
+        from sglang.kernels.ops.attention.linear import kda_gfx950_prefill
+
+        meta, graph, out = self._capture()
+        with patch.object(kda_gfx950_prefill, "extend", return_value=None):
+            self._check_replay(
+                meta,
+                graph,
+                out,
+                lens=[37, 100, 5, 192],
+                prefixes=[0, 64, 130, 0],
+                track={1: 70, 3: 192},
+                seed=400,
+            )
+
 
 class TestFlashInferKDAPrefillGraph(TestKDAPrefillGraph):
     prefill_backend = LinearAttnKernelBackend.FLASHINFER
