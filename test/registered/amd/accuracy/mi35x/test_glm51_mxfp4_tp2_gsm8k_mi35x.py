@@ -25,6 +25,7 @@ register_amd_ci(
     est_time=3600,
     suite="nightly-amd-2-gpu-mi35x-glm51-mxfp4",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 GLM51_MXFP4_MODEL_ID = "amd/GLM-5.1-MXFP4"

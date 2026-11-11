@@ -15,6 +15,7 @@ from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardSteps
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
@@ -283,6 +284,10 @@ class TestTriPoolSWAHandoutZeroing(unittest.TestCase):
     """A tri-pool hands its sliding-window pages out through the float middle's
     own allocator; they must leave it zeroed like every other MHA page."""
 
+    def setUp(self):
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
+
     def test_fresh_and_recycled_swa_pages_zeroed(self):
         buf, swa, allocator = _build_tri("cuda")
         sa = allocator.swa_attn_allocator
@@ -333,6 +338,251 @@ class TestPoisonSparesTheSlotZeroSink(unittest.TestCase):
         self.assertEqual(table[0, :2].tolist(), [0, 0])  # freed: the sink
         v = bundle.token_to_kv_pool.layer_router.view("swa").v_buffer[0]
         self.assertFalse(torch.isnan(v[:ps].float()).any().item())
+
+
+# An FP32 word whose low half, read as BF16, is a NaN: 1.0038987 is finite.
+FP32_WITH_BF16_NAN = 0x3F807FC1
+
+
+def _build_state_attn(device):
+    """[mamba (up) | full (down)]: an FP32 state band beside a BF16 MHA band
+    that zeroes its pages on hand-out, so the attention band can grow into
+    bytes a state slot held."""
+    full_spec = MHASubPoolSpec(
+        name="full",
+        layer_num=2,
+        grow_direction="down",
+        head_num=2,
+        head_dim=8,
+        store_dtype=torch.bfloat16,
+    )
+    mamba_spec = MambaSubPoolSpec(
+        name="mamba",
+        layer_num=1,
+        grow_direction="up",
+        conv_state_shapes=((3, 8),),
+        conv_dtype=torch.bfloat16,
+        temporal_state_shape=(2, 4, 4),
+        temporal_dtype=torch.float32,
+    )
+    roles = ChainRoles(owner="full", state="mamba")
+    buf = arena_of(
+        total_bytes=16 * full_spec.entry_bytes() + 4 * mamba_spec.entry_bytes(),
+        sub_pool_specs=[full_spec, mamba_spec],
+        device=device,
+        enable_memory_saver=False,
+        page_size=1,
+    )
+    kvcache = SimpleNamespace(
+        full_kv_pool=MHAView(
+            arena=buf,
+            spec=buf.spec("full"),
+            page_size=1,
+            model_layer_ids=tuple(range(full_spec.layer_num)),
+        ),
+        attach_allocators=lambda **_: None,
+    )
+    allocator = ChainAllocator(
+        roles=roles,
+        arena=buf,
+        kvcache=kvcache,
+        views=stand_in_views(
+            roles, kvcache, SimpleNamespace(move_kv_cache=lambda dst, src: None)
+        ),
+        device=device,
+        page_size=1,
+        need_sort=False,
+    )
+    return buf, allocator
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required (streams)")
+class TestZeroingWaitsALateStateWrite(unittest.TestCase):
+    """Bytes of a state slot freed while a forward still writes it reach the
+    attention band only once that forward is processed; otherwise the page's
+    zeroing races the forward's late FP32 state write, leaving BF16 NaNs in
+    the page's unwritten rows."""
+
+    def setUp(self):
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
+
+    def _free_slot_under_a_late_write(self, sleep_cycles):
+        """Fill [state | attention], then free the top state slot while a
+        forward on its own stream, ``sleep_cycles`` late, writes FP32 words
+        into it; the attention band then grows into the slot's bytes. Returns
+        the arena, the attention page bytes, the pages handed out over the
+        slot, and whether the forward still ran at the hand-out."""
+        buf, alloc = _build_state_attn("cuda")
+        state, full = alloc.mamba_allocator, alloc.full_attn_allocator
+        slots = alloc.alloc_state_slots(4)
+        self.assertIsNotNone(slots)
+        self.assertIsNotNone(alloc.alloc(full.available_size()))
+        self.assertEqual(full.available_size(), 0)
+
+        top = slots[-1:]
+        slot = int(state.ids.virtual_to_physical[top][0])
+        lo = slot * state.entry_bytes_per_page
+        hi = lo + state.entry_bytes_per_page
+        forward_stream = torch.cuda.Stream()
+        forward_done = torch.cuda.Event()
+        with torch.cuda.stream(forward_stream):
+            torch.cuda._sleep(sleep_cycles)
+            buf.raw[lo:hi].view(torch.int32).fill_(FP32_WITH_BF16_NAN)
+            forward_done.record(forward_stream)
+        alloc.set_latest_forward_done_event(forward_done)
+        alloc.set_inflight_forward(forward_done, None, top)
+        launch = alloc.forward_steps.forward_launched()
+        alloc.forward_steps.forward_recorded(forward_done)
+        state.free(top)
+        alloc.flush_opportunistic()
+        # Held while the forward runs: the slot's bytes stay the state band's.
+        running = not forward_done.query()
+        self.assertEqual(full.available_size(), 0)
+        self.assertGreater(state._byte_high_frontier(), lo)
+
+        torch.cuda.synchronize()
+        alloc.forward_steps.forward_processed(launch)
+        alloc.flush_opportunistic()
+        self.assertLessEqual(state._byte_high_frontier(), lo)
+        grown = alloc.alloc(full.available_size())
+        self.assertIsNotNone(grown)
+        epp = full.entry_bytes_per_page
+        pages = [
+            p
+            for p in (full.ids.translate(grown) // full.page_size).unique().tolist()
+            if p * epp < hi and lo < (p + 1) * epp
+        ]
+        self.assertTrue(pages, "the attention band did not reach the slot's bytes")
+        return buf, epp, pages, running
+
+    def test_unused_attention_rows_stay_finite(self):
+        # Load every kernel the path launches first: a module load
+        # synchronizes the device, which would hide the race.
+        self._free_slot_under_a_late_write(0)
+        torch.cuda.synchronize()
+
+        buf, epp, pages, running = self._free_slot_under_a_late_write(2_000_000_000)
+        self.assertTrue(running, "the forward ended before its pages went pending")
+        torch.cuda.synchronize()
+        # Nothing has written the new pages since their hand-out.
+        env = torch.stack([buf.raw[p * epp : (p + 1) * epp] for p in pages])
+        self.assertFalse(torch.isnan(env.view(torch.bfloat16).float()).any().item())
+        self.assertTrue((env == 0).all().item())
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required (streams)")
+class TestReuseWaitsAForwardThatReadsTheFreedPage(unittest.TestCase):
+    """A forward launched before a release may still read the released pages
+    until it ends: its attention page table was prepared with them. No later
+    writer of those bytes -- the zeroing of a hand-out, or another band growing
+    into them -- reaches them before it ends, even when it writes none of
+    them."""
+
+    def setUp(self):
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
+
+    def _forward_reading(self, buf, lo, hi, sleep_cycles):
+        """A forward on its own stream that, ``sleep_cycles`` late, reads bytes
+        ``[lo, hi)``; returns its done event and what it read."""
+        seen = torch.empty(hi - lo, dtype=torch.uint8, device="cuda")
+        stream = torch.cuda.Stream()
+        done = torch.cuda.Event()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(sleep_cycles)
+            seen.copy_(buf.raw[lo:hi])
+            done.record(stream)
+        return done, seen
+
+    def _zero_a_page_the_forward_reads(self, sleep_cycles):
+        buf, _kvcache, band = _build_mha("cuda")
+        ps, epp = band.page_size, band.entry_bytes_per_page
+        written = band.alloc(ps)
+        freed = band.alloc(ps)
+        self.assertIsNotNone(written)
+        self.assertIsNotNone(freed)
+        page = int(band.ids.translate(freed[:1])[0]) // ps
+        lo, hi = page * epp, (page + 1) * epp
+        buf.raw[lo:hi].fill_(0x11)
+        torch.cuda.synchronize()
+        done, seen = self._forward_reading(buf, lo, hi, sleep_cycles)
+        band.set_latest_forward_done_event(done)
+        band.set_inflight_forward(done, written)
+        steps = ForwardSteps((band,))
+        launch = steps.forward_launched()
+        steps.forward_recorded(done)
+        band.free(freed)
+        running = not done.query()
+        # Pending while the forward runs: the hand-out takes it, its zeroing
+        # queued behind the forward.
+        out = band.alloc(ps)
+        self.assertIsNotNone(out)
+        self.assertEqual(int(band.ids.translate(out[:1])[0]) // ps, page)
+        torch.cuda.synchronize()
+        steps.forward_processed(launch)
+        return buf, lo, hi, seen, running
+
+    def test_zeroing_waits_a_forward_that_only_reads_the_page(self):
+        # Load every kernel the path launches first: a module load
+        # synchronizes the device, which would hide the race.
+        self._zero_a_page_the_forward_reads(0)
+        torch.cuda.synchronize()
+
+        buf, lo, hi, seen, running = self._zero_a_page_the_forward_reads(2_000_000_000)
+        self.assertTrue(running, "the forward ended before its pages went pending")
+        torch.cuda.synchronize()
+        self.assertTrue(
+            bool((seen == 0x11).all()), "the forward read a page zeroed under it"
+        )
+        self.assertTrue(bool((buf.raw[lo:hi] == 0).all()), "the page was not zeroed")
+
+    def _state_into_bytes_the_forward_reads(self, sleep_cycles):
+        """[state | attention]: free every attention page while a forward that
+        writes none of them reads the bytes the next state slot lands on; the
+        state band then grows into them and a state copy writes FP32 words."""
+        buf, alloc = _build_state_attn("cuda")
+        state, full = alloc.mamba_allocator, alloc.full_attn_allocator
+        self.assertIsNotNone(alloc.alloc_state_slots(4))
+        ids = alloc.alloc(full.available_size())
+        self.assertIsNotNone(ids)
+        lo = state._byte_high_frontier()
+        hi = lo + state.entry_bytes_per_page
+        buf.raw[lo:hi].fill_(0x11)
+        torch.cuda.synchronize()
+        done, seen = self._forward_reading(buf, lo, hi, sleep_cycles)
+        alloc.set_latest_forward_done_event(done)
+        alloc.set_inflight_forward(done, None, None)
+        launch = alloc.forward_steps.forward_launched()
+        alloc.forward_steps.forward_recorded(done)
+        alloc.free(ids)
+        running = not done.query()
+        # Pending while the forward runs: an urgent flush settles them behind
+        # a stream wait on it, so the state band grows into the bytes at once
+        # and its copy queues after the forward.
+        full.flush_for_allocation()
+        slot = alloc.alloc_state_slots(1)
+        self.assertIsNotNone(slot, "the state band did not grow into the bytes")
+        page = int(state.ids.virtual_to_physical[slot][0])
+        self.assertEqual(page * state.entry_bytes_per_page, lo)
+        # A state copy into the new slot, on the schedule stream.
+        buf.raw[lo:hi].view(torch.int32).fill_(FP32_WITH_BF16_NAN)
+        torch.cuda.synchronize()
+        alloc.forward_steps.forward_processed(launch)
+        return seen, running
+
+    def test_a_state_write_waits_a_forward_that_reads_the_bytes(self):
+        self._state_into_bytes_the_forward_reads(0)
+        torch.cuda.synchronize()
+
+        seen, running = self._state_into_bytes_the_forward_reads(2_000_000_000)
+        self.assertTrue(running, "the forward ended before its pages went pending")
+        torch.cuda.synchronize()
+        self.assertTrue(
+            bool((seen == 0x11).all()),
+            "the forward read another band's bytes as its attention page",
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

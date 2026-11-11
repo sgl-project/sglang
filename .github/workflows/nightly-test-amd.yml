@@ -53,12 +53,11 @@ on:
           - nightly-accuracy-2-gpu-vlm
           - nightly-perf-2-gpu-text
           - nightly-perf-2-gpu-vlm
+          - nightly-2-gpu
           - nightly-4-gpu
-          # 2-GPU GLM-5.1-MXFP4 (MI35x only)
-          - nightly-2-gpu-mi35x-glm51-mxfp4
           # 2-GPU DeepSeek-R1-MXFP4 TP2 (MI35x only)
           - nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2
-          # 8-GPU GPT-OSS (MI35x mixes Qwen3-Coder-Next)
+          # 8-GPU GPT-OSS (MI35x also runs Qwen3.5 FP8 AR fusion)
           - nightly-accuracy-8-gpu
           - nightly-accuracy-8-gpu-mi35x
           # 8-GPU Grok1-INT4 (MI30x + MI35x)
@@ -87,10 +86,12 @@ on:
           - nightly-4-gpu-mi35x-deepseek-v41-flash
           # 8-GPU Kimi-K2.6 (MI30x)
           - nightly-8-gpu-kimi-k26
-          # 8-GPU MI30x tests moved out of PR CI (Kimi-K2, MoRI EP extra configs)
+          # 8-GPU MI30x tests moved out of PR CI (MoRI EP configs)
           - nightly-8-gpu
-          # 8-GPU Kimi-K3 (MI35x only - native MXFP4 needs gfx95x)
-          - nightly-8-gpu-mi35x-kimi-k3
+          # 8-GPU Kimi-K3.1-Pro (MI35x only - native MXFP4 needs gfx95x)
+          - nightly-8-gpu-mi35x-kimi-k31-pro
+          # 8-GPU Muse Spark Open MXFP4 (MI35x only - native MXFP4 needs gfx95x)
+          - nightly-8-gpu-mi35x-muse-spark
           # 8-GPU Qwen3.8-MXFP4 (MI35x only - MXFP4 needs gfx95x)
           - nightly-8-gpu-mi35x-qwen38-mxfp4
           # 8-GPU Qwen 3.5 (MI30x + MI35x)
@@ -102,12 +103,10 @@ on:
           # 8-GPU GLM-5.3 FP8 (MI30x + MI35x)
           - nightly-8-gpu-glm53
           - nightly-8-gpu-mi35x-glm53
-          # 4-GPU MiniMax-M2.5 (MI35x)
-          - nightly-4-gpu-mi35x-minimax-m25
           # 4-GPU MiniMax-M3 MXFP8 (MI35x accuracy + performance)
           - nightly-4-gpu-mi35x-minimax-m3
-          # 4-GPU MiniMax-M3 MXFP4 (MI35x)
-          - nightly-4-gpu-mi35x-minimax-m3-mxfp4
+          # 4-GPU MiniMax-M3.1-Flash MXFP4 + DSpark (MI35x)
+          - nightly-4-gpu-mi35x-minimax-m31-flash-mxfp4
           # 8-GPU MiniMax-M2.7 (MI30x only)
           - nightly-8-gpu-minimax-m27
           # Diffusion (MI30x)
@@ -170,11 +169,15 @@ jobs:
   # ==============================================================================
 
   nightly-test-1-gpu-unit:
-    name: ${{ format('nightly-test-1-gpu-unit ({0}, linux-mi300-1gpu-sglang)', matrix.rocm_version) }}
+    # The shard goes after the closing parenthesis: amd-ci-job-monitor.yml matches nightly jobs by the
+    # "<job> (<rocm>, <runner>)" prefix, so all shards of a flavor stay in one report row.
+    name: ${{ format('nightly-test-1-gpu-unit ({0}, linux-mi300-1gpu-sglang) part {1}', matrix.rocm_version, matrix.part) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '0 16 * * *' && '["rocm10"]' || github.event.schedule == '0 21 2-30/2 * *' && '["rocm724"]' || github.event.schedule == '0 21 1-31/2 * *' && '["rocm720"]' || '["rocm10", "rocm724", "rocm720"]') }}
+        # ~90 min of tests by est_time; three shards keep each well under the step timeout.
+        part: [0, 1, 2]
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-test-1-gpu-unit,'))
     runs-on: linux-mi300-1gpu-sglang
     steps:
@@ -200,7 +203,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-1-gpu --nightly --timeout-per-file 900 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-1-gpu --nightly --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -413,46 +416,6 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-2-gpu-mi35x-glm51-mxfp4:
-    name: ${{ format('nightly-2-gpu-mi35x-glm51-mxfp4 ({0}, linux-mi35x-gpu-2)', matrix.rocm_version) }}
-    strategy:
-      fail-fast: false
-      matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '0 16 * * *' && '["rocm10"]' || github.event.schedule == '0 21 2-30/2 * *' && '["rocm724"]' || github.event.schedule == '0 21 1-31/2 * *' && '["rocm720"]' || '["rocm10", "rocm724", "rocm720"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-2-gpu-mi35x-glm51-mxfp4,'))
-    runs-on: linux-mi35x-gpu-2
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Setup docker (${{ matrix.rocm_version }})
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
-          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
-
-      - name: Accuracy Test MI35x ROCm (2-GPU GLM-5.1-MXFP4 GSM8K)
-        timeout-minutes: 120
-        run: |
-          > github_summary.md
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-2-gpu-mi35x-glm51-mxfp4 --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
   nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2:
     name: ${{ format('nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2 ({0}, linux-mi35x-gpu-2)', matrix.rocm_version) }}
     strategy:
@@ -607,6 +570,43 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
+  nightly-2-gpu:
+    name: ${{ format('nightly-2-gpu ({0}, linux-mi300-2gpu-sglang)', matrix.rocm_version) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '0 16 * * *' && '["rocm10"]' || github.event.schedule == '0 21 2-30/2 * *' && '["rocm724"]' || github.event.schedule == '0 21 1-31/2 * *' && '["rocm720"]' || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-2-gpu,'))
+    runs-on: linux-mi300-2gpu-sglang
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (${{ matrix.rocm_version }})
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Nightly Test ROCm (2-GPU)
+        timeout-minutes: 90
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-2-gpu --nightly --timeout-per-file 1800 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
   nightly-4-gpu:
     name: ${{ format('nightly-4-gpu ({0}, linux-mi300-4gpu-sglang)', matrix.rocm_version) }}
     strategy:
@@ -645,7 +645,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 8-GPU GPT-OSS (MI35x mixes Qwen3-Coder-Next)
+  # 8-GPU GPT-OSS (MI35x also runs Qwen3.5 FP8 AR fusion)
   # ==============================================================================
 
   nightly-accuracy-8-gpu:
@@ -1656,8 +1656,8 @@ jobs:
   # ==============================================================================
   # 8-GPU Kimi-K2.6 (MI30x)
   #
-  # Kept on MI30x: Kimi-K3 needs gfx95x for its native MXFP4 weights, so it
-  # cannot take over here the way it does on MI35x.
+  # Kept on MI30x: Kimi-K3.1-Pro needs gfx95x for its native MXFP4 weights, so
+  # it cannot take over here the way it does on MI35x.
   # ==============================================================================
 
   nightly-8-gpu-kimi-k26:
@@ -1743,16 +1743,16 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 8-GPU Kimi-K3 (MI35x only - native MXFP4 needs gfx95x)
+  # 8-GPU Kimi-K3.1-Pro (MI35x only - native MXFP4 needs gfx95x)
   # ==============================================================================
 
-  nightly-8-gpu-mi35x-kimi-k3:
-    name: ${{ format('nightly-8-gpu-mi35x-kimi-k3 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+  nightly-8-gpu-mi35x-kimi-k31-pro:
+    name: ${{ format('nightly-8-gpu-mi35x-kimi-k31-pro ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '0 16 * * *' && '["rocm10"]' || github.event.schedule == '0 21 2-30/2 * *' && '["rocm724"]' || github.event.schedule == '0 21 1-31/2 * *' && '["rocm720"]' || '["rocm10", "rocm724", "rocm720"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-kimi-k3,'))
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-kimi-k31-pro,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1777,16 +1777,16 @@ jobs:
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      # The 2.8T MXFP4 checkpoint is ~1.56 TB, so weight download and load
+      # The 2.8T MXFP4 checkpoint is ~1.5 TB, so weight download and load
       # dominate wall time well before the eval itself starts.
-      - name: Accuracy Test MI35x ROCm (8-GPU Kimi-K3)
+      - name: Accuracy Test MI35x ROCm (8-GPU Kimi-K3.1-Pro)
         timeout-minutes: 300
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-kimi-k3 --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-kimi-k31-pro --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -1796,7 +1796,7 @@ jobs:
       # throughput is never measured on a build that got the tokens wrong.
       # continue-on-error matches every other combined accuracy + perf job here,
       # so a perf hiccup cannot turn the accuracy result red.
-      - name: Performance Test MI35x ROCm (8-GPU Kimi-K3)
+      - name: Performance Test MI35x ROCm (8-GPU Kimi-K3.1-Pro)
         if: ${{ !cancelled() }}
         timeout-minutes: 300
         continue-on-error: true
@@ -1805,7 +1805,53 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 registered/amd/perf/mi35x/test_kimi_k3_perf_mi35x.py || TEST_EXIT_CODE=$?
+            python3 registered/amd/perf/mi35x/test_kimi_k31_pro_perf_mi35x.py || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ==============================================================================
+  # 8-GPU Muse Spark Open MXFP4 (MI35x only - native MXFP4 needs gfx95x)
+  # ==============================================================================
+
+  nightly-8-gpu-mi35x-muse-spark:
+    name: ${{ format('nightly-8-gpu-mi35x-muse-spark ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '0 16 * * *' && '["rocm10"]' || github.event.schedule == '0 21 2-30/2 * *' && '["rocm724"]' || github.event.schedule == '0 21 1-31/2 * *' && '["rocm720"]' || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-muse-spark,'))
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (${{ matrix.rocm_version }})
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          # Install tabulate for run_suite.py (missing in MI35x container)
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      # The MXFP4 checkpoint is ~470 GB plus the ~10 GB DFlash2 draft.
+      - name: Accuracy Test MI35x ROCm (8-GPU Muse Spark Open MXFP4)
+        timeout-minutes: 240
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-muse-spark --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -2154,51 +2200,6 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 4-GPU MiniMax-M2.5 (MI35x)
-  # ==============================================================================
-
-  nightly-4-gpu-mi35x-minimax-m25:
-    name: ${{ format('nightly-4-gpu-mi35x-minimax-m25 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
-    strategy:
-      fail-fast: false
-      matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '0 16 * * *' && '["rocm10"]' || github.event.schedule == '0 21 2-30/2 * *' && '["rocm724"]' || github.event.schedule == '0 21 1-31/2 * *' && '["rocm720"]' || '["rocm10", "rocm724", "rocm720"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m25,'))
-    runs-on: linux-mi35x-gpu-8
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Setup docker (${{ matrix.rocm_version }})
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-          ENABLE_CACHE_HOST: "1"
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
-
-      - name: Accuracy Test MI35x ROCm (4-GPU MiniMax-M2.5)
-        timeout-minutes: 120
-        run: |
-          > github_summary.md
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e SGLANG_USE_AITER=1 \
-            -e SGLANG_USE_AITER_UNIFIED_ATTN=1 \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-4-gpu-mi35x-minimax-m25-tp4 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
-  # ==============================================================================
-  # 4-GPU MiniMax-M3 MXFP8 (MI35x accuracy + performance)
   # ==============================================================================
 
   nightly-4-gpu-mi35x-minimax-m3:
@@ -2258,16 +2259,16 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 4-GPU MiniMax-M3 MXFP4 (MI35x)
+  # 4-GPU MiniMax-M3.1-Flash MXFP4 + DSpark (MI35x)
   # ==============================================================================
 
-  nightly-4-gpu-mi35x-minimax-m3-mxfp4:
-    name: ${{ format('nightly-4-gpu-mi35x-minimax-m3-mxfp4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+  nightly-4-gpu-mi35x-minimax-m31-flash-mxfp4:
+    name: ${{ format('nightly-4-gpu-mi35x-minimax-m31-flash-mxfp4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '0 16 * * *' && '["rocm10"]' || github.event.schedule == '0 21 2-30/2 * *' && '["rocm724"]' || github.event.schedule == '0 21 1-31/2 * *' && '["rocm720"]' || '["rocm10", "rocm724", "rocm720"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m3-mxfp4,'))
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m31-flash-mxfp4,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -2289,15 +2290,14 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
-      - name: Accuracy Test MI35x ROCm (4-GPU MiniMax-M3 MXFP4)
+      - name: Accuracy Test MI35x ROCm (4-GPU MiniMax-M3.1-Flash MXFP4 + DSpark)
         timeout-minutes: 120
         run: |
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_USE_AITER=1 \
-            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-4-gpu-mi35x-minimax-m3-mxfp4-tp4 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-4-gpu-mi35x-minimax-m31-flash-mxfp4 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -2423,10 +2423,10 @@ jobs:
       - nightly-accuracy-2-gpu-vlm
       - nightly-perf-2-gpu-text
       - nightly-perf-2-gpu-vlm
+      - nightly-2-gpu
       - nightly-4-gpu
-      - nightly-2-gpu-mi35x-glm51-mxfp4
       - nightly-2-gpu-mi35x-deepseek-r1-mxfp4-tp2
-      # 8-GPU GPT-OSS (MI35x mixes Qwen3-Coder-Next)
+      # 8-GPU GPT-OSS (MI35x also runs Qwen3.5 FP8 AR fusion)
       - nightly-accuracy-8-gpu
       - nightly-accuracy-8-gpu-mi35x
       # 8-GPU Grok1-INT4 (MI30x + MI35x)
@@ -2456,8 +2456,10 @@ jobs:
       # 8-GPU Kimi-K2.6 (MI30x)
       - nightly-8-gpu-kimi-k26
       - nightly-8-gpu
-      # 8-GPU Kimi-K3 (MI35x only - native MXFP4 needs gfx95x)
-      - nightly-8-gpu-mi35x-kimi-k3
+      # 8-GPU Kimi-K3.1-Pro (MI35x only - native MXFP4 needs gfx95x)
+      - nightly-8-gpu-mi35x-kimi-k31-pro
+      # 8-GPU Muse Spark Open MXFP4 (MI35x only - native MXFP4 needs gfx95x)
+      - nightly-8-gpu-mi35x-muse-spark
       # 8-GPU Qwen3.8-MXFP4 (MI35x only - MXFP4 needs gfx95x)
       - nightly-8-gpu-mi35x-qwen38-mxfp4
       # 8-GPU Qwen 3.5 (MI30x + MI35x)
@@ -2469,12 +2471,10 @@ jobs:
       # 8-GPU GLM-5.3 FP8 (MI30x + MI35x)
       - nightly-8-gpu-glm53
       - nightly-8-gpu-mi35x-glm53
-      # 4-GPU MiniMax-M2.5 (MI35x)
-      - nightly-4-gpu-mi35x-minimax-m25
       # 4-GPU MiniMax-M3 MXFP8 (MI35x accuracy + performance)
       - nightly-4-gpu-mi35x-minimax-m3
-      # 4-GPU MiniMax-M3 MXFP4 (MI35x)
-      - nightly-4-gpu-mi35x-minimax-m3-mxfp4
+      # 4-GPU MiniMax-M3.1-Flash MXFP4 + DSpark (MI35x)
+      - nightly-4-gpu-mi35x-minimax-m31-flash-mxfp4
       # 8-GPU MiniMax-M2.7 (MI30x only)
       - nightly-8-gpu-minimax-m27
       # Diffusion (MI30x)

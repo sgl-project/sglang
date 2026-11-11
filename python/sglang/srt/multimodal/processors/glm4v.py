@@ -10,6 +10,7 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
+from sglang.srt.multimodal.media_io import GLM_MEDIA_CONFIG_KEYS
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -17,7 +18,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS, print_warning_once
+from sglang.srt.utils import print_warning_once
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 try:
