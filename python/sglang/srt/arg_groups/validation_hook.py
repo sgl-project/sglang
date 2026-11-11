@@ -386,9 +386,9 @@ def check_server_args(server_args: Any):
         assert not cfg.enable_unified_memory, (
             "--prefill-cache-reserve does not support --enable-unified-memory"
         )
-        # A PD prefill server runs no decode batch, so the reserve would never hold.
-        assert cfg.disaggregation_mode == "null", (
-            "--prefill-cache-reserve does not support PD disaggregation"
+        # PD prefill and dLLM run no decode batch, so the reserve would never hold.
+        assert cfg.disaggregation_mode == "null" and cfg.dllm_algorithm is None, (
+            "--prefill-cache-reserve does not support PD disaggregation or dLLM"
         )
         # Any order but arrival lets admitted requests pass a held one every
         # pass, so it would never get its turn.
