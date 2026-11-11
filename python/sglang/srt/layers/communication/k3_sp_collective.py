@@ -463,6 +463,12 @@ def attn_res_all_gather(
 
 
 _PREFILL_SP_AG = "prefill_sp_all_gather"
+_PREFILL_SP_ROUTED = (
+    "prefill_sp_routed_w",
+    "prefill_sp_routed_ids",
+    "prefill_sp_routed_xq",
+    "prefill_sp_routed_sf",
+)
 _PREFILL_SP_COMM = None
 _PREFILL_SP_COMM_INIT = False
 
@@ -501,14 +507,14 @@ def prefill_sp_comm():
     return comm
 
 
-def _pull_tuning(comm, num_blocks: int, block_size: int):
+def _pull_tuning(comm, num_blocks: int, block_size: int, unroll: int = 1):
     from sglang.kernels.ops.communication import sp_collective
 
     try:
         cap = int(comm.config.num_pull_blocks)
     except Exception:
         cap = num_blocks
-    return sp_collective.Tuning(max(1, min(num_blocks, cap)), block_size)
+    return sp_collective.Tuning(max(1, min(num_blocks, cap)), block_size, unroll)
 
 
 def prefill_sp_reduce_scatter(
@@ -518,6 +524,7 @@ def prefill_sp_reduce_scatter(
     *,
     num_blocks: int,
     block_size: int = 1024,
+    unroll: int = 1,
 ) -> torch.Tensor:
     group = get_parallel().tp_group
     comm = prefill_sp_comm()
@@ -531,7 +538,7 @@ def prefill_sp_reduce_scatter(
             out,
             residual,
             input_mc_ptr=mc_ptr,
-            tuning=_pull_tuning(comm, num_blocks, block_size),
+            tuning=_pull_tuning(comm, num_blocks, block_size, unroll),
         )
     group.reduce_scatter_tensor(out, x)
     if residual is not None:
@@ -540,7 +547,7 @@ def prefill_sp_reduce_scatter(
 
 
 def prefill_sp_all_gather(
-    x: torch.Tensor, *, num_blocks: int, block_size: int = 1024
+    x: torch.Tensor, *, num_blocks: int, block_size: int = 1024, unroll: int = 1
 ) -> torch.Tensor:
     group = get_parallel().tp_group
     rows = x.shape[0] * group.world_size
@@ -554,8 +561,35 @@ def prefill_sp_all_gather(
             x,
             out,
             output_mc_ptr=k3_ar_fusion.get_mc_ptr(out),
-            tuning=_pull_tuning(comm, num_blocks, block_size),
+            tuning=_pull_tuning(comm, num_blocks, block_size, unroll),
         )
     out = x.new_empty((rows, *x.shape[1:]))
     group.all_gather_into_tensor(out, x.contiguous())
     return out
+
+
+def prefill_sp_gather_routed(
+    segments: list[torch.Tensor], *, num_blocks: int, block_size: int, unroll: int
+) -> list[torch.Tensor]:
+    group = get_parallel().tp_group
+    comm = prefill_sp_comm()
+    inputs = [
+        t.contiguous().view(torch.uint8).reshape(t.shape[0], -1) for t in segments
+    ]
+    if comm is None or any(t.shape[1] % 16 for t in inputs):
+        return group.all_gatherv(segments)
+    from sglang.kernels.ops.communication import sp_collective
+
+    rows = inputs[0].shape[0] * group.world_size
+    outputs = [
+        k3_ar_fusion.symm_buffer(name, rows, t.shape[1], torch.uint8)
+        for name, t in zip(_PREFILL_SP_ROUTED, inputs)
+    ]
+    sp_collective.all_gather_multi(
+        group.world_size,
+        inputs,
+        outputs,
+        [k3_ar_fusion.get_mc_ptr(t) for t in outputs],
+        tuning=_pull_tuning(comm, num_blocks, block_size, unroll),
+    )
+    return [out.view(t.dtype) for out, t in zip(outputs, segments)]

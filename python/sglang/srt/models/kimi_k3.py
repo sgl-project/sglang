@@ -508,9 +508,12 @@ def _uses_ep_a2a() -> bool:
     )
 
 
-_PREFILL_SP_RS_BLOCKS = 96
-_PREFILL_SP_AG_BLOCKS = 32
-_PREFILL_SP_SHARED_RS_BLOCKS = 16
+_PREFILL_SP_RS = dict(num_blocks=96, block_size=1024, unroll=1)
+_PREFILL_SP_AG = dict(num_blocks=32, block_size=1024, unroll=2)
+_PREFILL_SP_SHARED_RS = dict(num_blocks=8, block_size=1024, unroll=4)
+_PREFILL_SP_SHARED_AG = dict(num_blocks=8, block_size=1024, unroll=2)
+_PREFILL_SP_LATENT_RS = dict(num_blocks=32, block_size=1024, unroll=8)
+_PREFILL_SP_ROUTED_AG = dict(num_blocks=32, block_size=512, unroll=2)
 
 
 @cache
@@ -561,10 +564,10 @@ class _PrefillSP:
         self.bank_storage: Optional[torch.Tensor] = None
         self.entered = False
 
-    def gather(self, x: torch.Tensor, *, owned: bool = False) -> torch.Tensor:
-        full = k3_sp_collective.prefill_sp_all_gather(
-            x, num_blocks=_PREFILL_SP_AG_BLOCKS
-        )
+    def gather(
+        self, x: torch.Tensor, *, owned: bool = False, geometry: dict = _PREFILL_SP_AG
+    ) -> torch.Tensor:
+        full = k3_sp_collective.prefill_sp_all_gather(x, **geometry)
         if owned:
             return full[: self.num_tokens].clone()
         return full[: self.num_tokens]
@@ -575,11 +578,9 @@ class _PrefillSP:
         out: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         *,
-        num_blocks: int = _PREFILL_SP_RS_BLOCKS,
+        geometry: dict = _PREFILL_SP_RS,
     ) -> torch.Tensor:
-        return k3_sp_collective.prefill_sp_reduce_scatter(
-            x, out, residual, num_blocks=num_blocks
-        )
+        return k3_sp_collective.prefill_sp_reduce_scatter(x, out, residual, **geometry)
 
     def padded_rows(self, x: torch.Tensor, name: str) -> torch.Tensor:
         full = k3_ar_fusion.symm_buffer(name, self.padded, x.shape[1], x.dtype)
@@ -1817,13 +1818,14 @@ class KimiK3MoE(nn.Module):
         _, _, x_q, x_s = _prepare_flashinfer_mxfp8_activations(
             routed_input, self.experts.quant_method.hidden_size
         )
-        weights, ids, x_q, x_s = get_parallel().tp_group.all_gatherv(
+        weights, ids, x_q, x_s = k3_sp_collective.prefill_sp_gather_routed(
             [
                 topk_output.topk_weights,
                 topk_output.topk_ids,
                 x_q.view(torch.uint8),
                 x_s.view(torch.uint8),
-            ]
+            ],
+            **_PREFILL_SP_ROUTED_AG,
         )
         return (
             weights[:num_tokens],
@@ -1891,18 +1893,18 @@ class KimiK3MoE(nn.Module):
         with torch.cuda.stream(side):
             if own_rows:
                 gate_up = _k3_bf16_gemm(
-                    sp.gather(normed),
+                    sp.gather(normed, geometry=_PREFILL_SP_SHARED_AG),
                     self._front_w[: self._front_sizes[0]],
                     out_dtype=torch.float32 if self._front_fp32 else None,
                 )
             self._forward_shared(gate_up, shared_output)
-            sp.reduce_scatter(
-                shared_full, shared_local, num_blocks=_PREFILL_SP_SHARED_RS_BLOCKS
-            )
+            sp.reduce_scatter(shared_full, shared_local, geometry=_PREFILL_SP_SHARED_RS)
         # The latent and shared reduce-scatters share pull semaphores.
         current_stream.wait_stream(side)
         latent_local = sp.reduce_scatter(
-            latent_full, normed.new_empty((sp.local, latent_size))
+            latent_full,
+            normed.new_empty((sp.local, latent_size)),
+            geometry=_PREFILL_SP_LATENT_RS,
         )
         out, _ = self.routed_expert_up_proj(self._latent_norm(latent_local))
         return _add3(out, shared_local, prefix_sum, prefetch_bc=True)

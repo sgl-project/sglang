@@ -335,6 +335,83 @@ def test_attention_residual_direct_all_gather():
     assert handle is not None
 
 
+def _integer_bf16(shape, seed):
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randint(0, 16, shape, generator=generator, dtype=torch.bfloat16).to(
+        _device()
+    )
+
+
+@torch.inference_mode()
+def test_unrolled_direct_gathers():
+    _require_sm100()
+    comm = _init_comm()
+    rank, world_size, rows = dist.get_rank(), comm.world_size, 3
+    _, nccl_group = _init_world()
+    tuning = sp_collective.Tuning(num_blocks=4, block_size=256, unroll=2)
+
+    shard = _integer_bf16((rows, _HIDDEN_SIZE), 60 + rank)
+    expected = torch.empty(
+        world_size * rows, _HIDDEN_SIZE, device=_device(), dtype=torch.bfloat16
+    )
+    dist.all_gather_into_tensor(expected, shard, group=nccl_group)
+    output, _, multicast_ptr = _symmetric_tensor(tuple(expected.shape))
+    sp_collective.all_gather_direct(
+        world_size, shard, output, output_mc_ptr=multicast_ptr, tuning=tuning
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+    segments = [
+        _integer_bf16((rows, width), 70 + rank + width) for width in (64, 8, 3584)
+    ]
+    outputs, mc_ptrs, expected = [], [], []
+    for segment in segments:
+        gathered = torch.empty(
+            world_size * rows, segment.shape[1], device=_device(), dtype=torch.bfloat16
+        )
+        dist.all_gather_into_tensor(gathered, segment, group=nccl_group)
+        expected.append(gathered)
+        out, _, mc_ptr = _symmetric_tensor(tuple(gathered.shape))
+        outputs.append(out)
+        mc_ptrs.append(mc_ptr)
+    sp_collective.all_gather_multi(
+        world_size, segments, outputs, mc_ptrs, tuning=tuning
+    )
+    torch.cuda.synchronize()
+    for out, ref in zip(outputs, expected):
+        torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_unrolled_pull_reduce_scatter():
+    _require_sm100()
+    comm = _init_comm()
+    rank, world_size, rows, width = dist.get_rank(), comm.world_size, 5, 3584
+    _, nccl_group = _init_world()
+    partial = _integer_bf16((world_size * rows, width), 80 + rank)
+    residual = _integer_bf16((rows, width), 90)
+    expected = torch.empty(rows, width, device=_device(), dtype=torch.bfloat16)
+    dist.reduce_scatter_tensor(expected, partial, group=nccl_group)
+    expected += residual
+    symmetric, _, multicast_ptr = _symmetric_tensor(tuple(partial.shape))
+    symmetric.copy_(partial)
+    dist.barrier()
+    torch.cuda.synchronize()
+
+    output = torch.empty_like(expected)
+    sp_collective.reduce_scatter_pull(
+        world_size,
+        symmetric,
+        output,
+        residual,
+        input_mc_ptr=multicast_ptr,
+        tuning=sp_collective.Tuning(num_blocks=4, block_size=256, unroll=4),
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
 def _precompile(num_gpus):
     for world_size in num_gpus:
         all_reduce._jit_module(world_size)
