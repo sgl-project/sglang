@@ -304,5 +304,77 @@ class TestNoHostReadAfterAStreamWait(CustomTestCase):
         self.assertIsNone(error, f"a host read followed a stream wait: {error}")
 
 
+class TestAStateTakeLeavesAFencedOwnerUnread(CustomTestCase):
+    """A state-slot take that reuses slots freed under the running forward
+    waits that forward on the stream. A fence in the owner's span orders only
+    the owner's takes: the state take must not read the owner's free or
+    pending pages on the host, which would park the scheduler until the
+    forward ends."""
+
+    def _take(self, sleep_cycles: int, armed: bool):
+        """Free two state slots and some owner rows under a forward running
+        ``sleep_cycles`` late, fence a page of the owner's span, then take two
+        slots again. Returns the error a host sync raised (with ``armed``),
+        and whether the forward was still running after the take."""
+        setup_allocator_context()
+        allocator = build_unified_bundle(
+            UnifiedGeometry(
+                **CHAINS["full+state"],
+                page_size=PAGE_SIZE,
+                full_tokens=16 * PAGE_SIZE,
+                device="cuda",
+            )
+        ).token_to_kv_pool_allocator
+        owner, state = allocator.full_attn_allocator, allocator.mamba_allocator
+        rows = allocator.alloc(8 * PAGE_SIZE)
+        slots = allocator.alloc_state_slots(2)
+        self.assertIsNotNone(rows)
+        self.assertIsNotNone(slots)
+        done = torch.cuda.Event()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(sleep_cycles)
+            done.record(stream)
+        steps = allocator.forward_steps
+        steps.forward_launched()
+        steps.forward_recorded(done)
+        allocator.set_latest_forward_done_event(done)
+        allocator.set_inflight_forward(done, rows, slots)
+        allocator.free(rows[4 * PAGE_SIZE :])
+        state.free(slots)
+        self.assertTrue(owner._pending_until_retire)
+        self.assertTrue(state._pending_until_retire)
+        page = owner._span_range()[0]
+        owner.usage.vacate(
+            done, [(page, page + 1)], page_bytes=owner.entry_bytes_per_page
+        )
+        self.assertTrue(owner._fence_may_order_takes())
+        self.assertFalse(state._fence_may_order_takes())
+        error = None
+        if armed:
+            torch.cuda.set_sync_debug_mode("error")
+        try:
+            taken = allocator.alloc_state_slots(2)
+        except RuntimeError as exc:
+            error = exc
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        running = not done.query()
+        torch.cuda.synchronize()
+        if error is None:
+            self.assertIsNotNone(taken)
+        return error, running
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_the_take_reads_nothing_of_the_owner(self):
+        # Load every kernel and pinned buffer the path uses first.
+        self.assertIsNone(self._take(0, armed=False)[0])
+        error, running = self._take(2_000_000_000, armed=True)
+        self.assertIsNone(error, f"the state take read the host: {error}")
+        # Sync debug does not see an event wait on the host; this does.
+        self.assertTrue(running, "the state take waited for the forward")
+
+
 if __name__ == "__main__":
     unittest.main()
