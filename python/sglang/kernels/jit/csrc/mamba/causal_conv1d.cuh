@@ -16,6 +16,7 @@
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For CHECK_HOST, div_ceil
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/type.cuh>   // For DTypeTrait, fp16_t / bf16_t / fp32_t
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE
 
@@ -136,9 +137,10 @@ SGL_DEVICE void zero_fill(T (&values)[kN]) {
 /// \tparam kWidth_     Convolution width (2..4).
 /// \tparam kIsVecLoad_ Whether the chunk can be loaded/stored as whole vectors.
 /// \tparam T           Element type: fp16_t | bf16_t | fp32_t.
-template <int kNThreads_, int kWidth_, bool kIsVecLoad_, typename T>
+template <int kNThreads_, int kWidth_, bool kIsVecLoad_, typename T, bool kFastMath_>
 struct CausalConv1dFwdTraits {
   using input_t = T;
+  static constexpr bool kFastMath = kFastMath_;
   static constexpr int kNThreads = kNThreads_;
   static constexpr int kWidth = kWidth_;
   static constexpr int kNBytes = sizeof(T);
@@ -279,7 +281,7 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(M
     if (params.silu_activation) {
 #pragma unroll
       for (int i = 0; i < kNElts; ++i) {
-        out_vals[i] = out_vals[i] / (1 + expf(-out_vals[i]));
+        out_vals[i] = device::activation::silu<Ktraits::kFastMath>(out_vals[i]);
       }
     }
 
@@ -373,7 +375,7 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(M
   }
 }
 
-template <int kNThreads, int kWidth, typename T>
+template <int kNThreads, int kWidth, typename T, bool kFastMath>
 void causal_conv1d_fwd_launch(const MambaConvParams& params, DLDevice device) {
   static constexpr int kNElts = sizeof(T) == 4 ? 4 : 8;
   const bool is_varlen = params.query_start_loc_ptr != nullptr;
@@ -381,27 +383,27 @@ void causal_conv1d_fwd_launch(const MambaConvParams& params, DLDevice device) {
 
   const dim3 grid(params.batch, params.dim);
   if (is_vec_load) {
-    using Ktraits = CausalConv1dFwdTraits<kNThreads, kWidth, true, T>;
+    using Ktraits = CausalConv1dFwdTraits<kNThreads, kWidth, true, T, kFastMath>;
     // The AOT launcher raised the dynamic-smem cap past 48 KB; these traits stay
     // near 4 KB, so the default limit is enough.
     static_assert(Ktraits::kSmemSize < 48 * 1024);
     host::LaunchKernel(grid, kNThreads, device, Ktraits::kSmemSize)(causal_conv1d_fwd_kernel<Ktraits>, params);
   } else {
-    using Ktraits = CausalConv1dFwdTraits<kNThreads, kWidth, false, T>;
+    using Ktraits = CausalConv1dFwdTraits<kNThreads, kWidth, false, T, kFastMath>;
     static_assert(Ktraits::kSmemSize < 48 * 1024);
     host::LaunchKernel(grid, kNThreads, device, Ktraits::kSmemSize)(causal_conv1d_fwd_kernel<Ktraits>, params);
   }
 }
 
-template <typename T>
+template <typename T, bool kFastMath>
 void causal_conv1d_fwd_cuda(const MambaConvParams& params, DLDevice device) {
   switch (params.width) {
     case 2:
-      return causal_conv1d_fwd_launch<128, 2, T>(params, device);
+      return causal_conv1d_fwd_launch<128, 2, T, kFastMath>(params, device);
     case 3:
-      return causal_conv1d_fwd_launch<128, 3, T>(params, device);
+      return causal_conv1d_fwd_launch<128, 3, T, kFastMath>(params, device);
     case 4:
-      return causal_conv1d_fwd_launch<128, 4, T>(params, device);
+      return causal_conv1d_fwd_launch<128, 4, T, kFastMath>(params, device);
     default:
       host::Panic("causal_conv1d_fwd: width must be between 2 and 4, got ", params.width);
   }
@@ -413,7 +415,7 @@ void causal_conv1d_fwd_cuda(const MambaConvParams& params, DLDevice device) {
 
 /// \brief One thread per (sequence, channel): advance the conv state by
 ///        `seqlen` tokens and emit the convolution over the sliding window.
-template <int kNThreads, int kWidth, bool kIsCircularBuffer, typename T>
+template <int kNThreads, int kWidth, bool kIsCircularBuffer, typename T, bool kFastMath>
 __global__ __launch_bounds__(kNThreads) void causal_conv1d_update_kernel(MambaConvParams params) {
   using input_t = T;
 
@@ -496,7 +498,7 @@ __global__ __launch_bounds__(kNThreads) void causal_conv1d_update_kernel(MambaCo
       out_val += weight_vals[j] * x_vals[j];
     }
     if (params.silu_activation) {
-      out_val = out_val / (1 + expf(-out_val));
+      out_val = device::activation::silu<kFastMath>(out_val);
     }
     out[i * params.out_l_stride] = from_float<input_t>(out_val);
     // Shift the input buffer by 1
@@ -507,25 +509,27 @@ __global__ __launch_bounds__(kNThreads) void causal_conv1d_update_kernel(MambaCo
   }
 }
 
-template <int kNThreads, int kWidth, typename T>
+template <int kNThreads, int kWidth, typename T, bool kFastMath>
 void causal_conv1d_update_launch(const MambaConvParams& params, DLDevice device) {
   const dim3 grid(params.batch, host::div_ceil(params.dim, kNThreads));
   if (params.cache_seqlens == nullptr) {
-    host::LaunchKernel(grid, kNThreads, device)(causal_conv1d_update_kernel<kNThreads, kWidth, false, T>, params);
+    host::LaunchKernel(grid, kNThreads, device)(
+        causal_conv1d_update_kernel<kNThreads, kWidth, false, T, kFastMath>, params);
   } else {
-    host::LaunchKernel(grid, kNThreads, device)(causal_conv1d_update_kernel<kNThreads, kWidth, true, T>, params);
+    host::LaunchKernel(grid, kNThreads, device)(
+        causal_conv1d_update_kernel<kNThreads, kWidth, true, T, kFastMath>, params);
   }
 }
 
-template <typename T>
+template <typename T, bool kFastMath>
 void causal_conv1d_update_cuda(const MambaConvParams& params, DLDevice device) {
   switch (params.width) {
     case 2:
-      return causal_conv1d_update_launch<64, 2, T>(params, device);
+      return causal_conv1d_update_launch<64, 2, T, kFastMath>(params, device);
     case 3:
-      return causal_conv1d_update_launch<64, 3, T>(params, device);
+      return causal_conv1d_update_launch<64, 3, T, kFastMath>(params, device);
     case 4:
-      return causal_conv1d_update_launch<64, 4, T>(params, device);
+      return causal_conv1d_update_launch<64, 4, T, kFastMath>(params, device);
     default:
       host::Panic("causal_conv1d_update: width must be between 2 and 4, got ", params.width);
   }
@@ -549,7 +553,7 @@ void causal_conv1d_update_cuda(const MambaConvParams& params, DLDevice device) {
 /// \param has_initial_state  Optional bool `(batch,)`; whether to seed from `conv_states`.
 /// \param silu_activation    Whether to apply SiLU to the output.
 /// \param pad_slot_id        Sequences whose cache index equals this are skipped.
-template <typename T>
+template <typename T, bool kFastMath>
 void causal_conv1d_fwd(
     tvm::ffi::TensorView x,
     tvm::ffi::TensorView weight,
@@ -646,7 +650,7 @@ void causal_conv1d_fwd(
     params.conv_states_ptr = nullptr;
   }
 
-  causal_conv1d_fwd_cuda<T>(params, device_sym.unwrap());
+  causal_conv1d_fwd_cuda<T, kFastMath>(params, device_sym.unwrap());
 }
 
 /// \brief Single-step (decode) depthwise causal conv1d, in place on `x`.
@@ -663,7 +667,7 @@ void causal_conv1d_fwd(
 ///                             `cache_seqlens % state_len`.
 /// \param conv_state_indices   Optional int32 `(batch,)` conv-state slot per sequence.
 /// \param pad_slot_id          Sequences whose state index equals this are skipped.
-template <typename T>
+template <typename T, bool kFastMath>
 void causal_conv1d_update(
     tvm::ffi::TensorView x,
     tvm::ffi::TensorView conv_state,
@@ -756,7 +760,7 @@ void causal_conv1d_update(
   params.conv_state_indices_ptr =
       conv_state_indices.has_value() ? static_cast<const int32_t*>(conv_state_indices.value().data_ptr()) : nullptr;
 
-  causal_conv1d_update_cuda<T>(params, device_sym.unwrap());
+  causal_conv1d_update_cuda<T, kFastMath>(params, device_sym.unwrap());
 }
 
 }  // namespace mamba_conv

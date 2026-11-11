@@ -7,6 +7,8 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from .common import _weight_offset
+
 
 @gluon.constexpr_function
 def _scale_shared_layout(rows, groups):
@@ -169,11 +171,6 @@ def _select_for_projection(L, Bias, Ids, Weights, expert_start, rank, column, M:
     expert = gl.inline_asm_elementwise('v_readfirstlane_b32 $0, $1', constraints='=s,v', args=[expert], dtype=gl.int32, is_pure=True, pack=1)
     local_id, _ = _local_expert(expert, expert_start, LOCAL_EXPERTS)
     return local_id
-
-@gluon.jit
-def _weight_offset(n, k, K: gl.constexpr):
-    byte = k // 2
-    return (((n // 16 * (K // 64) + byte // 32) * 2 + byte // 16 % 2) * 16 + n % 16) * 16 + byte % 16
 
 @gluon.jit
 def _word_bytes(words):

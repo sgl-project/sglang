@@ -31,11 +31,12 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
 )
 from sglang.srt.utils import BumpAllocator
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 HIDDEN, HEADS, KV_LORA, NOPE, ROPE, VDIM, THETA, EPS = 16, 2, 8, 8, 8, 6, 1e4, 1e-6
 Q_LORA = 16
@@ -379,11 +380,18 @@ class TestDFlashMLA(CustomTestCase):
             for param in model.parameters():
                 param.copy_(torch.randn_like(param) * 0.2)
         attn = model.layers[0].self_attn
+        with torch.no_grad():
+            for parameter in attn.parameters():
+                parameter.fill_(0.1)
         attn.rotary_emb = copy.deepcopy(attn.rotary_emb)
         for module in (attn.rotary_emb, attn.kv_a_layernorm):
             module.forward = module.forward_native
         # A real MLA pool also exposes the K/V buffer getters the GQA bundle probes.
+        from sglang.srt.mem_cache.kv.router import PlainPoolRouter
+
         pool = Mock(spec=MLATokenToKVPool)
+        pool.start_layer = 0
+        pool.layer_router = PlainPoolRouter(pool, "full")
         ctx_hidden, positions = torch.randn(4, HIDDEN), torch.tensor([0, 1, 5, 6])
         loc_2d = torch.tensor([[3, 4], [8, 9]])
         commit_lens = torch.tensor([1, 2], dtype=torch.int32)

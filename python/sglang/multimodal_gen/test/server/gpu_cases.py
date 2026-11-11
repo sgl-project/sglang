@@ -26,6 +26,8 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     LINGBOT_VIDEO_T2V_CI_sampling_params,
     LONGLIVE2_I2V_CI_sampling_params,
     LONGLIVE2_T2V_CI_sampling_params,
+    MINIMAX_H3_IMAGE_EDIT_sampling_params,
+    MINIMAX_H3_IMAGE_T2I_sampling_params,
     MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
     MODELOPT_T2V_CI_sampling_params,
@@ -789,6 +791,33 @@ else:
             run_perf_check=True,
         ),
     ]
+
+# MiniMax-H3-Image weights are not public yet, so PR CI cannot download them.
+# Add these cases back to ONE_GPU_B200_CASES together with their B200
+# consistency GT and perf baselines once the checkpoint is published.
+MINIMAX_H3_IMAGE_B200_CASES = [
+    DiffusionTestCase(
+        f"minimax_h3_image_{task}",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3-Image",
+            modality="image",
+            extras=["--component-residency", "all=resident"],
+        ),
+        sampling,
+        perf_warmup_requests=1,
+        perf_repeat_requests=2,
+        # Consistency remains required; pre-release goldens stay private until
+        # the checkpoint and its authorized golden artifacts are published.
+        run_consistency_check=True,
+        # The release provides a native SGLang reference, not a Diffusers pipeline.
+        run_component_accuracy_check=False,
+        run_t2v_input_reference_check=False,
+    )
+    for task, sampling in (
+        ("t2i", MINIMAX_H3_IMAGE_T2I_sampling_params),
+        ("edit", MINIMAX_H3_IMAGE_EDIT_sampling_params),
+    )
+]
 
 ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
@@ -1686,9 +1715,11 @@ STANDALONE_FILES = {
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py",
         "../unit/test_async_output_save.py",
         "../unit/test_kandinsky6_sequence_parallel.py",
+        "../unit/test_kandinsky6_sr_decode_parallel.py",
         "../unit/test_kandinsky6_sr_sequence_parallel.py",
         "../unit/test_nomas_parallel.py",
         "../unit/test_qwen_image21_distributed.py",
+        "../unit/test_text_encoding_cache.py",
     ],
 }
 
@@ -1750,10 +1781,14 @@ STANDALONE_FILE_EST_TIMES = {
         # the unit/ suite runs on one GPU; these files carry its 2-GPU cases
         "../unit/test_async_output_save.py": 20.0,
         "../unit/test_kandinsky6_sequence_parallel.py": 90.0,
+        # 2x GB300: 204 s, six spawned SR decode cases
+        "../unit/test_kandinsky6_sr_decode_parallel.py": 240.0,
         "../unit/test_kandinsky6_sr_sequence_parallel.py": 90.0,
         # H200: TP/SP parity for SDPA and FA3 (55 s each), window decode (22 s)
         "../unit/test_nomas_parallel.py": 140.0,
         "../unit/test_qwen_image21_distributed.py": 40.0,
+        # 2x GB300: 101 s, mostly the spawned DP/FSDP cases
+        "../unit/test_text_encoding_cache.py": 120.0,
     },
 }
 

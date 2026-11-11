@@ -146,7 +146,6 @@ class Scheduler(
         local_rank: int | None = None,
     ):
         self.server_args = server_args
-        self.port_args = port_args
 
         # local_rank is the physical GPU index for torch.cuda.set_device.
         # In non-disagg mode, it equals gpu_id. In disagg mode, it may differ

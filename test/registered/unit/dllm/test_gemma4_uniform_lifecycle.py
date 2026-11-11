@@ -16,11 +16,12 @@ from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-class _Req:
+class _Req(FakeReq):
     def __init__(self, context_len=8, block_size=4, *, prefill=False):
         self.origin_input_ids = array("q", range(context_len))
         self.output_ids = array("q")
@@ -98,6 +99,7 @@ class _Scheduler(SchedulerDllmMixin):
             free_group_end=Mock(),
         )
         self.tree_cache = object()
+        self.request_retirer = release_only_retirer(tree_cache=self.tree_cache)
         self.output_streamer = SimpleNamespace(stream_output=Mock())
         self.model_config = SimpleNamespace(context_len=context_len)
 
@@ -161,7 +163,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         )
         cache = SimpleNamespace(
             full_evictable_size=lambda: 0,
-            swa_evictable_size=lambda: 0,
+            window_evictable_size=lambda name: 0,
         )
         budget = SWAPrefillBudget(allocator, cache)
         adder = object.__new__(PrefillAdder)
@@ -187,7 +189,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder.dllm_block_size = 256
         adder.rem_dllm_tokens = 1024
         adder.can_run_list = []
-        adder._state_slot_reserve_for_req = lambda req: 0
+        adder._state_slots_for_req = lambda req: 0
         adder._replay_len = lambda req, prefix_len: 0
         adder._update_prefill_budget = Mock()
         adder._account_prefill_cache_admission = Mock()
@@ -205,7 +207,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
             req,
             total_tokens=1024,
             host_hit_length=0,
-            swa_host_hit_length=0,
+            window_host_hit_lengths={},
             truncation_align_size=None,
         )
         self.assertEqual((admission.prefix_len, admission.extend_len), (0, 300))
@@ -221,8 +223,9 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder = object.__new__(PrefillAdder)
         adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=True)
         adder.can_run_list = []
-        adder._get_dllm_remain_tokens = lambda req=None: 64
-        adder._state_slot_reserve_for_req = lambda req: 0
+        adder._get_dllm_remain_tokens = lambda req=None, **_: 64
+        adder.memory_budget = SimpleNamespace(prices_by_demand=False)
+        adder._state_slots_for_req = lambda req: 0
         adder._update_prefill_budget = Mock()
 
         req = _Req(context_len=10, block_size=4, prefill=True)
@@ -273,7 +276,9 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         state = {"step": 7}
         next_canvas = torch.tensor([9, 8, 7, 6])
 
-        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache") as release:
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+        ) as release:
             SchedulerDllmMixin.process_batch_result_dllm(
                 scheduler,
                 _Batch([req]),
@@ -315,7 +320,9 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         req.finish_on_update = True
         canvas = torch.tensor([3, 2, 1, 0])
 
-        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache") as release:
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+        ) as release:
             SchedulerDllmMixin.process_batch_result_dllm(
                 scheduler, _Batch([req]), _result([canvas])
             )
@@ -336,7 +343,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
                 )
 
                 with patch(
-                    "sglang.srt.dllm.mixin.scheduler.release_kv_cache"
+                    "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
                 ) as release:
                     SchedulerDllmMixin.process_batch_result_dllm(
                         scheduler, _Batch([req]), result
@@ -389,6 +396,11 @@ class TestGemma4RequestValidation(unittest.TestCase):
         sender = Mock()
         scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=sender)
         scheduler.rust_server = None
+        scheduler.tree_cache = Mock()
+        scheduler.beam_coordinator = Mock()
+        scheduler.hisparse_coordinator = None
+        scheduler.uocr_runtime = None
+        scheduler.init_request_retirer()
         recv_req = MagicMock(
             session_params=None,
             session_id=None,

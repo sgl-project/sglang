@@ -44,7 +44,11 @@ from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    deepgemm_mxfp8_linear_input,
+    deepgemm_pair_takes_flashinfer,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
@@ -75,8 +79,16 @@ def fused_mxfp8_rows(rows: int) -> bool:
     return rows <= FUSED_MXFP8_PRODUCER_MAX_ROWS
 
 
-def empty_deepgemm_mxfp8_scales(rows: int, cols: int, device) -> torch.Tensor:
-    """Empty DeepGEMM-packed UE8M0 scales for ``rows`` x ``cols`` fp8 data."""
+def empty_deepgemm_mxfp8_scales(
+    rows: int, cols: int, device, flashinfer: bool = False
+) -> torch.Tensor:
+    """Empty UE8M0 scales for ``rows`` x ``cols`` fp8 data from a DeepGEMM producer:
+    DeepGEMM-packed, or ``[ceil(rows / 128), cols / 128, 32, 4]`` int32 in
+    FlashInfer's 128x4 layout."""
+    if flashinfer:
+        return torch.empty(
+            (-(-rows // 128), cols // 128, 32, 4), device=device, dtype=torch.int32
+        )
     return create_per_token_group_quant_fp8_output_scale(
         (rows, cols),
         device,
@@ -88,11 +100,11 @@ def empty_deepgemm_mxfp8_scales(rows: int, cols: int, device) -> torch.Tensor:
 
 
 def empty_deepgemm_mxfp8_pair(
-    rows: int, cols: int, device
+    rows: int, cols: int, device, flashinfer: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Empty fp8 rows and DeepGEMM-packed UE8M0 scales for a producer to fill."""
+    """Empty fp8 rows and UE8M0 scales for a DeepGEMM producer to fill."""
     data = torch.empty((rows, cols), device=device, dtype=torch.float8_e4m3fn)
-    return data, empty_deepgemm_mxfp8_scales(rows, cols, device)
+    return data, empty_deepgemm_mxfp8_scales(rows, cols, device, flashinfer=flashinfer)
 
 
 def fused_mhc_tp_ok(tp_size: int) -> bool:
@@ -367,7 +379,9 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
         x.is_cuda
         and x_flat.shape[0] >= 32
         and x_flat.is_contiguous()
-        and (get_platform().is_sm100 or get_platform().is_sm90)
+        and (
+            get_platform().is_sm100 or get_platform().is_sm90 or get_platform().is_sm120
+        )
         and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
         and not is_batch_invariant_mode_enabled()
     ):
@@ -457,9 +471,28 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
 # ---------------------------------------------------------------------------
 
 
+_deferred_attn_fork: Optional[torch.cuda.Stream] = None
+
+
+def defer_attn_stats_fork(stats_stream: torch.cuda.Stream) -> None:
+    """Hold the attention mix's fork until the attention core starts (its idle SMs),
+    instead of beside the full-grid projection GEMMs."""
+    global _deferred_attn_fork
+    assert _deferred_attn_fork is None
+    _deferred_attn_fork = stats_stream
+
+
+def run_deferred_attn_stats_fork() -> None:
+    global _deferred_attn_fork
+    if _deferred_attn_fork is not None:
+        fork_stats_stream(_deferred_attn_fork)
+        _deferred_attn_fork = None
+
+
 def fork_stats_stream(stats_stream: Optional[torch.cuda.Stream]) -> None:
-    """Let the side stream pick up from here; the layers call it right before
-    each combine (fork position measured indistinguishable across batch sizes)."""
+    """Let the side stream pick up from here; reads call it right before the
+    combine, except MegaAttention attention reads, which defer it to the core
+    (``defer_attn_stats_fork``)."""
     if stats_stream is not None:
         stats_stream.wait_stream(torch.cuda.current_stream())
 
@@ -553,8 +586,8 @@ def post(
     if _is_npu:
         if not is_npu_arch35():
             return torch.ops.custom.npu_hc_post(x, residual, post_mix, comb)
-        # The A5 build of npu_hc_post is batched -- it requires a leading batch axis
-        # on every operand.
+        # The Ascend 950 build of npu_hc_post is batched -- it requires a leading
+        # batch axis on every operand.
         return torch.ops.custom.npu_hc_post(
             x.unsqueeze(0),
             residual.unsqueeze(0),
@@ -660,6 +693,7 @@ def _compute_triplet(
 ) -> HcTriplet:
     """Issue the triplet (on the side stream, beside the sublayer) and join before
     the post reads it."""
+    run_deferred_attn_stats_fork()
     if precomputed is not None:
         return precomputed
     coefficients = mix_stats(hc, residual, stats_stream)
@@ -711,7 +745,11 @@ def _post_fusion(
         next_hc = next.hc
         y_fp8 = y_sf = moe_input = None
         if next.accepts_mxfp8_deepgemm and fused_mxfp8_rows(y.shape[0]):
-            y_fp8, y_sf = empty_deepgemm_mxfp8_pair(*y.shape, y.device)
+            y_fp8, y_sf = empty_deepgemm_mxfp8_pair(
+                *y.shape,
+                y.device,
+                flashinfer=deepgemm_pair_takes_flashinfer(),
+            )
         elif next.mega_moe_input is not None:
             moe_input = next.mega_moe_input(y)
         updated, normalized, stats = mhc_mega_boundary(
@@ -733,7 +771,8 @@ def _post_fusion(
             moe_input=None if moe_input is None else moe_input.views(),
         )
         if y_fp8 is not None:
-            return HcState(updated, pre, HcQuantized(normalized, (y_fp8, y_sf)), stats)
+            pair = deepgemm_mxfp8_linear_input(y_fp8, y_sf)
+            return HcState(updated, pre, HcQuantized(normalized, pair), stats)
         if moe_input is not None:
             moe_input.mark(normalized)
         return HcState(updated, pre, HcNormed(normalized), stats)
@@ -743,6 +782,9 @@ def _post_fusion(
         and _can_use_decode_post_combine(cfg, y.shape[0])
     ):
         quant = next.accepts_mxfp8
+        moe_input = None
+        if not quant and next.mega_moe_input is not None:
+            moe_input = next.mega_moe_input(y)
         updated, normalized, q, sf = mhc_post_combine_norm_decode(
             y,
             residual,
@@ -752,11 +794,14 @@ def _post_fusion(
             next.norm.weight,
             next.norm.variance_epsilon,
             quant=quant,
+            moe_input=None if moe_input is None else moe_input.views(),
         )
         if quant:
             return HcState(
                 updated, pre, HcQuantized(normalized, Mxfp8SwizzledInput(q, sf))
             )
+        if moe_input is not None:
+            moe_input.mark(normalized)
         return HcState(updated, pre, HcNormed(normalized))
     if (
         next is not None

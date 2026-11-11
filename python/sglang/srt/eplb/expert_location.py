@@ -644,7 +644,7 @@ def _pad_nested_array(arr, pad_value):
     return padded
 
 
-# TODO optimize performance (rewrite and/or run in separate process with overlap)
+# TODO run off the forward thread, overlapped with decode
 def compute_logical_to_rank_dispatch_physical_map(
     logical_to_all_physical_map: torch.Tensor,
     ep_size: int,
@@ -668,56 +668,92 @@ def compute_logical_to_rank_dispatch_physical_map(
         if num_gpus_per_node is not None
         else None
     )
-    num_layers, num_logical_experts, _ = logical_to_all_physical_map.shape
     dtype = logical_to_all_physical_map.dtype
 
-    result_list = [
-        [[-1] * num_logical_experts for _ in range(num_layers)] for _ in range(ep_size)
-    ]
+    candidates, num_valid = _compact_candidates(logical_to_all_physical_map)
+    # [layer, logical expert, rank]; -1 where no same-GPU / narrowing same-node replica exists.
+    result = _nearest_expert_dispatch(
+        candidates,
+        num_valid,
+        ep_size=ep_size,
+        num_local_gpu_physical_experts=num_local_gpu_physical_experts,
+        num_gpus_per_node=num_gpus_per_node,
+        num_local_node_physical_experts=num_local_node_physical_experts,
+    )
 
-    for layer_id in range(num_layers):
-        for logical_expert_id in range(num_logical_experts):
-            candidate_physical_expert_ids = _logical_to_all_physical_raw(
-                logical_to_all_physical_map, layer_id, logical_expert_id
+    # Row-major order keeps the (layer, expert) order of the draws from ``r``.
+    unresolved = (result == -1).any(dim=-1).nonzero()
+    if unresolved.numel() > 0:
+        layer_ids, expert_ids = unresolved[:, 0], unresolved[:, 1]
+        rows = result[layer_ids, expert_ids].tolist()
+        cand_rows = candidates[layer_ids, expert_ids].tolist()
+        counts = num_valid[layer_ids, expert_ids].tolist()
+        for row, cand_row, count in zip(rows, cand_rows, counts, strict=True):
+            remaining_ranks = [rank for rank, val in enumerate(row) if val == -1]
+            choices = _fair_choices(cand_row[:count], k=len(remaining_ranks), r=r)
+            for rank, choice in zip(remaining_ranks, choices, strict=True):
+                row[rank] = choice
+        result[layer_ids, expert_ids] = torch.tensor(
+            rows, dtype=result.dtype, device=result.device
+        )
+
+    assert torch.all(result != -1)
+    return result[:, :, ep_rank].contiguous().to(dtype=dtype, device=device)
+
+
+def _compact_candidates(
+    logical_to_all_physical_map: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Move each row's valid physical ids to the front in their original order."""
+    valid = logical_to_all_physical_map != -1
+    num_valid = valid.sum(dim=-1)
+    width = max(int(num_valid.max()), 1)
+    slot = torch.where(valid, valid.cumsum(dim=-1) - 1, width)
+    candidates = torch.zeros(
+        (*valid.shape[:-1], width + 1),
+        dtype=torch.int64,
+        device=logical_to_all_physical_map.device,
+    ).scatter_(-1, slot, logical_to_all_physical_map.to(torch.int64))
+    return candidates[..., :width], num_valid
+
+
+def _nearest_expert_dispatch(
+    candidates: torch.Tensor,
+    num_valid: torch.Tensor,
+    ep_size: int,
+    num_local_gpu_physical_experts: int,
+    num_gpus_per_node: Optional[int],
+    num_local_node_physical_experts: Optional[int],
+) -> torch.Tensor:
+    """Vectorized _find_nearest_expert for every (layer, logical expert, rank)."""
+    width = candidates.shape[-1]
+    device = candidates.device
+    valid = torch.arange(width, device=device) < num_valid[..., None]
+    ranks = torch.arange(ep_size, device=device)
+
+    def first_match(owner_of_candidate, owner_of_rank):
+        count = torch.zeros(
+            (*candidates.shape[:-1], ep_size), dtype=torch.int64, device=device
+        )
+        picked = torch.full_like(count, -1)
+        # Walk the slots backwards so the earliest matching replica wins.
+        for k in reversed(range(width)):
+            match = valid[..., k, None] & (
+                owner_of_candidate[..., k, None] == owner_of_rank
             )
+            count += match
+            picked = torch.where(match, candidates[..., k, None], picked)
+        return count, picked
 
-            remaining_ranks = []
-            for moe_ep_rank in range(ep_size):
-                val = _find_nearest_expert(
-                    candidate_physical_expert_ids=candidate_physical_expert_ids,
-                    num_local_gpu_physical_experts=num_local_gpu_physical_experts,
-                    moe_ep_rank=moe_ep_rank,
-                    num_gpus_per_node=num_gpus_per_node,
-                    num_local_node_physical_experts=num_local_node_physical_experts,
-                )
-
-                result_list[moe_ep_rank][layer_id][logical_expert_id] = val
-                if val == -1:
-                    remaining_ranks.append(moe_ep_rank)
-
-            if remaining_ranks:
-                choices = _fair_choices(
-                    candidate_physical_expert_ids, k=len(remaining_ranks), r=r
-                )
-                for moe_ep_rank, choice in zip(remaining_ranks, choices, strict=True):
-                    result_list[moe_ep_rank][layer_id][logical_expert_id] = choice
-
-    logical_to_rank_dispatch_physical_map = torch.tensor(result_list, dtype=dtype)
-    assert torch.all(logical_to_rank_dispatch_physical_map != -1)
-
-    return logical_to_rank_dispatch_physical_map[ep_rank, :, :].to(device)
-
-
-def _logical_to_all_physical_raw(
-    logical_to_all_physical_map, layer_id: int, logical_expert_id: int
-) -> List[int]:
-    return [
-        physical_expert_id
-        for physical_expert_id in logical_to_all_physical_map[
-            layer_id, logical_expert_id
-        ].tolist()
-        if physical_expert_id != -1
-    ]
+    _, result = first_match(candidates // num_local_gpu_physical_experts, ranks)
+    if num_gpus_per_node is not None and num_local_node_physical_experts is not None:
+        node_count, node_pick = first_match(
+            candidates // num_local_node_physical_experts, ranks // num_gpus_per_node
+        )
+        narrows = (node_count > 0) & (node_count < num_valid[..., None])
+        result = torch.where((result == -1) & narrows, node_pick, result)
+    single = (num_valid == 1)[..., None]
+    return torch.where(single, candidates[..., :1].expand_as(result), result)
 
 
 def _compute_gpu_id_of_physical_expert(
