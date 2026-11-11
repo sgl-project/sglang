@@ -799,11 +799,8 @@ class ChatCompletionMessageGenericParam(BaseModel):
 
     @model_validator(mode="after")
     def validate_assistant_tool_call_names(self):
-        # FunctionResponse.name is optional because streaming continuation
-        # chunks carry no name, but a tool call replayed in the conversation
-        # history must name its function: chat encoders look the name up, so a
-        # nameless call otherwise fails while rendering the prompt (HTTP 500)
-        # instead of being rejected as a bad request.
+        # FunctionResponse.name is optional for streaming deltas,
+        # but request history must name each call so the chat template can render it.
         if self.role != "assistant" or not self.tool_calls:
             return self
         for index, tool_call in enumerate(self.tool_calls):
