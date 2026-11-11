@@ -12,14 +12,16 @@ from transformers import (
     Gemma2Config,
     Gemma3TextConfig,
     LlamaConfig,
+    PretrainedConfig,
     Qwen3_5Config,
 )
 
-from sglang.srt.arg_groups.overrides import model_config_of
+from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
+    is_embedding_nemotron3,
     is_hybrid_swa_model,
     is_layer_types_hybrid_swa_model,
     is_multimodal_model,
@@ -29,6 +31,11 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.configs.olmo3 import Olmo3Config
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+from sglang.srt.configs.unlimited_ocr_v2 import (
+    MAX_PAGE_PROMPT_TOKENS,
+    UocrDocumentConfig,
+)
+from sglang.srt.models.unlimited_ocr_v2_support import document_split as doc_split
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -128,6 +135,28 @@ class TestEmbeddingGemmaConfig(CustomTestCase):
             model_type="gemma3_text", use_bidirectional_attention=False
         )
         self.assertFalse(is_embedding_gemma(config))
+
+
+class TestEmbeddingNemotron3Config(CustomTestCase):
+    def test_detects_bidirectional_mean_pooled_ministral3(self):
+        config = PretrainedConfig(
+            architectures=["Ministral3Model"], is_causal=False, pooling="avg"
+        )
+        self.assertTrue(is_embedding_nemotron3(config))
+
+    def test_does_not_misclassify_other_ministral3_checkpoints(self):
+        for fields in (
+            {"architectures": ["Ministral3Model"]},
+            {"architectures": ["Ministral3Model"], "is_causal": False},
+            {"architectures": ["Ministral3Model"], "pooling": "avg"},
+            {
+                "architectures": ["Ministral3ForCausalLM"],
+                "is_causal": False,
+                "pooling": "avg",
+            },
+        ):
+            with self.subTest(fields=fields):
+                self.assertFalse(is_embedding_nemotron3(PretrainedConfig(**fields)))
 
 
 class TestDraftModelConfig(CustomTestCase):
@@ -358,6 +387,108 @@ class TestDecisionCheckpointConfig(CustomTestCase):
                 self._checkpoint(checkpoint, **decision)
                 with self.assertRaisesRegex(ValueError, "is not supported"):
                     load_decision_config(checkpoint, None)
+
+
+class TestAudioUnderstandableFlag(CustomTestCase):
+    """is_audio_understandable_model must key on the value, not attribute
+    presence. Non-audio variants of multimodal families ship audio_config:
+    null in config.json; a presence check (hasattr) reads that as
+    audio-capable and /model_info misreports has_audio_understanding. The
+    flag must be True only when an audio config value is present.
+    """
+
+    def _build(self, **config_kwargs):
+        with TemporaryDirectory() as checkpoint:
+            LlamaConfig(
+                architectures=["LlamaForCausalLM"],
+                hidden_size=16,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_hidden_layers=2,
+                vocab_size=128,
+                **config_kwargs,
+            ).save_pretrained(checkpoint)
+            return ModelConfig.from_server_args(ServerArgs(model_path=checkpoint))
+
+    def test_missing_audio_config_is_not_understandable(self):
+        self.assertFalse(self._build().is_audio_understandable_model)
+
+    def test_null_audio_config_is_not_understandable(self):
+        self.assertFalse(self._build(audio_config=None).is_audio_understandable_model)
+
+    def test_present_audio_config_is_understandable(self):
+        self.assertTrue(
+            self._build(
+                audio_config={"num_mel_bins": 128}
+            ).is_audio_understandable_model
+        )
+
+
+class TestDefaultContextLength(CustomTestCase):
+    """The default context sizes one window, never the document."""
+
+    @staticmethod
+    def _context(window, page_tokens=8000):
+        return UocrDocumentConfig(
+            uocr_doc_split=True,
+            uocr_doc_page_window=window,
+            uocr_max_page_tokens=page_tokens,
+        ).default_context_length()
+
+    def test_longest_window_keeps_its_full_output_budget(self):
+        """A window whose pages all write MAX_PAGE_TOKENS must not be cut short
+        by the derived context (doc_split caps its completion by the context)."""
+        for window in (1, 2, 6, 10):
+            context = self._context(window)
+            capacity = doc_split.completion_capacity(
+                context_length=context, image_mode="gundam", input_pages=window + 1
+            )
+            self.assertGreaterEqual(capacity, window * 8000, window)
+            self.assertLess(context, 131072, window)
+
+    def test_wide_window_is_capped_at_128k(self):
+        """The cap is what saves memory; a wide window must not raise it."""
+        self.assertEqual(self._context(40), 131072)
+
+    def test_window_ask_fits_the_context_with_its_costliest_pages(self):
+        """Input at the per-page worst case plus the asked max_new_tokens must
+        fit the derived context, or the tokenizer truncates the window."""
+        for window in (1, 2, 6, 10):
+            context = self._context(window)
+            capacity = doc_split.completion_capacity(
+                context_length=context, image_mode="gundam", input_pages=window + 1
+            )
+            ask = min(
+                capacity,
+                doc_split.window_output_cap(own_pages=window, max_page_tokens=8000),
+            )
+            worst_input = (window + 1) * MAX_PAGE_PROMPT_TOKENS + 64
+            self.assertLessEqual(ask + worst_input, context, window)
+            self.assertGreaterEqual(ask, window * 8000, window)
+
+    def test_uncapped_pages_fall_back_to_128k(self):
+        """With no per-page cap a window has no bound; the 128K default applies."""
+        self.assertEqual(self._context(1, page_tokens=0), 131072)
+
+    def test_server_args_size_the_widest_window(self):
+        """The model config sizes the context from the launch flags: the unified
+        page window, default lookahead, and no bound when unsplit."""
+
+        def derived(**fields):
+            args = dict(
+                model_path="dummy",
+                uocr_doc_split=True,
+                uocr_doc_page_window=6,
+                uocr_max_page_tokens=8000,
+            )
+            args.update(fields)
+            server_args = ServerArgs(**args)
+            with mock.patch.object(ModelConfig, "__init__", return_value=None) as init:
+                ModelConfig.from_server_args(server_args)
+            return init.call_args.kwargs["uocr_v2_default_context_len"]
+
+        self.assertEqual(derived(), 7 * MAX_PAGE_PROMPT_TOKENS + 6 * 8000 + 1024)
+        self.assertEqual(derived(uocr_doc_split=False), 131072)
 
 
 if __name__ == "__main__":

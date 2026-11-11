@@ -85,7 +85,9 @@ def _static_accept_tail_kernel(
     tl.store(cap_trim_out_ptr + row, 0)
     tl.store(commit_out_ptr + row, commit)
     tl.store(new_seq_out_ptr + row, new_seq)
-    token = tl.where(offs == correct, bonus, tl.where(in_draft, drafts.to(tl.int64), 0))
+    token = tl.where(
+        offs == correct, bonus, tl.where(offs < correct, drafts.to(tl.int64), 0)
+    )
     tl.store(out_tokens_ptr + row * out_tokens_stride + offs, token, mask=in_t)
     if HAS_GATED:
         verify_len = tl.load(verify_lens_ptr + row)
@@ -220,7 +222,8 @@ def static_accept_tail_torch(
     commit_lens_out[:bs].copy_(commit)
     new_seq_lens_out[:bs].copy_(new_seq)
     tokens = torch.zeros((bs, T), dtype=torch.int64, device=candidates.device)
-    tokens[:, :gamma] = candidates[:, 1:]
+    keep = torch.arange(gamma, device=candidates.device)[None, :] < correct[:, None]
+    tokens[:, :gamma] = torch.where(keep, candidates[:, 1:].to(torch.int64), 0)
     tokens.scatter_(1, correct.long()[:, None], bonus[:, None])
     out_tokens_out[:bs].copy_(tokens)
     if gated_commit_lens_out is not None:

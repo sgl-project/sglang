@@ -11,7 +11,7 @@ from sglang.kernels.ops.moe.paged_experts import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 E, K = 64, 16
 
@@ -19,15 +19,16 @@ E, K = 64, 16
 class _State:
     """Residency state on the GPU, slots starting with experts 0..K-1."""
 
-    def __init__(self):
+    def __init__(self, num_experts=E, num_slots=K):
+        self.num_experts, self.num_slots = num_experts, num_slots
         i32 = dict(dtype=torch.int32, device="cuda")
         self.step = torch.zeros(1, **i32)
-        self.slot_expert = torch.arange(K, **i32)
-        self.expert_slot = torch.full((E,), -1, **i32)
-        self.expert_slot[:K] = self.slot_expert
-        self.slot_lastuse = torch.zeros(K, **i32)
-        self.src = torch.zeros(K, **i32)
-        self.dst = torch.zeros(K, **i32)
+        self.slot_expert = torch.arange(num_slots, **i32)
+        self.expert_slot = torch.full((num_experts,), -1, **i32)
+        self.expert_slot[:num_slots] = self.slot_expert
+        self.slot_lastuse = torch.zeros(num_slots, **i32)
+        self.src = torch.zeros(num_slots, **i32)
+        self.dst = torch.zeros(num_slots, **i32)
         self.count = torch.zeros(1, **i32)
 
     def decide(self, topk, weights=None):
@@ -54,10 +55,11 @@ class _State:
 class _Reference:
     """The decision the kernel must make, in Python."""
 
-    def __init__(self):
+    def __init__(self, num_slots=K):
+        self.num_slots = num_slots
         self.step = 0
-        self.slot_expert = list(range(K))
-        self.slot_lastuse = [0] * K
+        self.slot_expert = list(range(num_slots))
+        self.slot_lastuse = [0] * num_slots
 
     def decide(self, topk):
         self.step += 1
@@ -68,7 +70,9 @@ class _Reference:
         for e in topk:
             if e < 0 or e in self.slot_expert:
                 continue
-            free = [s for s in range(K) if self.slot_lastuse[s] != self.step]
+            free = [
+                s for s in range(self.num_slots) if self.slot_lastuse[s] != self.step
+            ]
             victim = min(free, key=lambda s: (self.slot_lastuse[s], s))
             self.slot_expert[victim] = e
             self.slot_lastuse[victim] = self.step
@@ -76,8 +80,10 @@ class _Reference:
         return plan
 
 
-def _random_topk(generator, num_entries):
-    topk = torch.randint(0, E, (num_entries,), generator=generator, dtype=torch.int32)
+def _random_topk(generator, num_entries, num_experts=E):
+    topk = torch.randint(
+        0, num_experts, (num_entries,), generator=generator, dtype=torch.int32
+    )
     topk[torch.rand(num_entries, generator=generator) < 0.1] = -1  # padding
     return topk
 
@@ -90,7 +96,7 @@ class TestPagedExpertsKernels(CustomTestCase):
         self.assertEqual(got_plan, plan)
         self.assertEqual(state.slot_expert.tolist(), ref.slot_expert)
         self.assertEqual(state.slot_lastuse.tolist(), ref.slot_lastuse)
-        expert_slot = [-1] * E
+        expert_slot = [-1] * state.num_experts
         for s, e in enumerate(ref.slot_expert):
             expert_slot[e] = s
         self.assertEqual(state.expert_slot.tolist(), expert_slot)
@@ -124,6 +130,44 @@ class TestPagedExpertsKernels(CustomTestCase):
         with self.assertRaises(Exception):
             _State().decide(torch.zeros(K + 1, dtype=torch.int32, device="cuda"))
 
+    def test_decide_at_model_size(self):
+        """E=512/K=400/T=80, the shapes a decode step runs at: the block-wide staging and the
+        ballot compaction still decide the reference plan, page-in included."""
+        generator = torch.Generator().manual_seed(2)
+        state, ref = _State(512, 400), _Reference(400)
+        for _ in range(3):
+            topk = _random_topk(generator, 80, 512)  # most experts cold, a few padding
+            weights = torch.rand(80, generator=generator)
+            plan = ref.decide(topk.tolist())
+            _, run_w = state.decide(topk.cuda(), weights.cuda())
+            self.assert_state(state, ref, plan)
+            self.assertTrue(
+                torch.equal(run_w.cpu(), weights.masked_fill(topk < 0, 0.0))
+            )
+
+    def test_sum_top_k_falls_back_past_the_grid_y_limit(self):
+        """``moe_topk_sum`` grids over (..., M) and gridDim.y stops at 65,535, so a prefill chunk
+        that large must keep the general reduce instead of failing to launch."""
+        from sglang.srt.layers.moe.paged_experts.runners import MarlinContract
+
+        entries = torch.randn(65536, 1, 2560, device="cuda", dtype=torch.bfloat16)
+        out = torch.empty(65536, 2560, device="cuda", dtype=torch.bfloat16)
+        MarlinContract()._sum_top_k(entries, out, 1.3)
+        self.assertTrue(
+            torch.equal(out, (entries.float().sum(1) * 1.3).to(torch.bfloat16))
+        )
+
+    def test_gather_with_an_empty_plan_touches_nothing(self):
+        """Most decode steps page nothing; count = 0 must leave every slot as it was."""
+        hosts = [torch.randn(E, 8, dtype=torch.bfloat16).pin_memory()]
+        gpu = torch.randn(K, 8, dtype=torch.bfloat16, device="cuda")
+        before = gpu.clone()
+        src = torch.full((K,), 7, dtype=torch.int32, device="cuda")
+        dst = torch.full((K,), 3, dtype=torch.int32, device="cuda")
+        count = torch.zeros(1, dtype=torch.int32, device="cuda")
+        paged_experts_gather(*_gather_args(hosts, [gpu]), src, dst, count)
+        self.assertTrue(torch.equal(gpu, before))
+
     def test_gather_copies_the_plan_for_every_tensor(self):
         hosts = [
             torch.randn(E, 8, 32, dtype=torch.bfloat16).pin_memory(),
@@ -151,12 +195,10 @@ class TestPagedExpertsKernels(CustomTestCase):
     def test_store_pins_its_exact_size_and_the_gather_reads_it(self):
         """The host store pins exactly its size (torch's pinned allocator rounds up to a power
         of two), and the gather kernel reads it through the GPU."""
-        from types import SimpleNamespace
-
         from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 
         gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
-        host = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E).host["w"]
+        host = HostExpertStore({"w": ((3, 1000), torch.bfloat16)}, E).host["w"]
         host.copy_(torch.randn(E, 3, 1000, dtype=torch.bfloat16))
         self.assertTrue(host.is_pinned())
         self.assertEqual(host.untyped_storage().nbytes(), E * 3 * 1000 * 2)
@@ -172,15 +214,10 @@ class TestPagedExpertsKernels(CustomTestCase):
     def test_store_is_on_the_host_under_a_default_cuda_device(self):
         """Models are constructed under ``torch.device("cuda")``; a store created there (by
         a format that pages its loaded rows as they are) is still pinned host memory."""
-        from types import SimpleNamespace
-
         from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 
-        gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
         with torch.device("cuda"):
-            host = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E).host[
-                "w"
-            ]
+            host = HostExpertStore({"w": ((3, 1000), torch.bfloat16)}, E).host["w"]
         self.assertEqual(host.device.type, "cpu")
         self.assertTrue(host.is_pinned())
 
@@ -188,12 +225,11 @@ class TestPagedExpertsKernels(CustomTestCase):
         """The pinned pages stay registered while any tensor on them lives (here a slice that
         outlives the store and its tensor), and are unregistered once the last one is freed."""
         import gc
-        from types import SimpleNamespace
 
         from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 
         gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
-        store = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E)
+        store = HostExpertStore({"w": ((3, 1000), torch.bfloat16)}, E)
         ptr = store.host["w"].data_ptr()
         expert = store.host["w"][5]
         gpu[0].copy_(expert, non_blocking=True)  # a read still queued when it is freed
@@ -206,11 +242,76 @@ class TestPagedExpertsKernels(CustomTestCase):
         # Unregistering again must fail: the pages are no longer registered. In a thread of its
         # own, as CUDA keeps the error as the thread's last error for a later call to report.
         rc = []
-        unregister = lambda: rc.append(int(torch.cuda.cudart().cudaHostUnregister(ptr)))
+
+        def unregister():
+            rc.append(int(torch.cuda.cudart().cudaHostUnregister(ptr)))
+
         thread = threading.Thread(target=unregister)
         thread.start()
         thread.join()
         self.assertNotEqual(rc[0], 0)
+
+    def test_expert_cache_reads_into_the_pinned_store_byte_for_byte(self):
+        """The expert cache reads with direct I/O straight into the pinned store's rows of
+        whole pages and through its bounce buffer for the others, byte for byte. Negative
+        control: a byte changed in the file shows in that expert's row, and only there."""
+        import mmap
+        import os
+        import tempfile
+        from unittest.mock import patch
+
+        from sglang.srt.layers.moe.paged_experts import expert_cache
+        from sglang.srt.layers.moe.paged_experts.store import (
+            HostExpertStore,
+            same_bytes,
+        )
+
+        rows = {"w13": ((2, 2048), torch.bfloat16), "scales": ((3, 5), torch.float32)}
+        source = {
+            "w13": torch.randn(E, 2, 2048).bfloat16(),
+            "scales": torch.randn(E, 3, 5),
+        }
+        opened = []
+        open_direct = expert_cache._open_direct
+
+        def recorded(*args):
+            fd, direct, result = open_direct(*args)
+            opened.append(direct)
+            return fd, direct, result
+
+        expert_cache._write_failed = False
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            patch.object(expert_cache, "_FREE_MARGIN_BYTES", 0),
+            patch.object(expert_cache, "_open_direct", recorded),
+        ):
+            entry = expert_cache.ExpertCache(
+                os.path.join(folder, "layer-0.experts"), {"key": "k"}
+            )
+            entry.write(source)
+            store = HostExpertStore(rows, E)
+            self.assertTrue(entry.read(store.host))
+            host = store.host["w13"]
+            self.assertTrue(host.is_pinned())
+            self.assertEqual(host[1].data_ptr() % mmap.PAGESIZE, 0)  # read straight
+            for name in rows:
+                self.assertTrue(same_bytes(store.host[name], source[name]), name)
+
+            layout = expert_cache.ObjectLayout.of_host(source)
+            with open(entry.path, "r+b") as f:
+                f.seek(expert_cache._HEADER_BYTES + 3 * layout.object_bytes)
+                f.write(b"\x7f\x7f")
+            again = HostExpertStore(rows, E)
+            self.assertTrue(entry.read(again.host))
+            others = [e for e in range(E) if e != 3]
+            self.assertFalse(same_bytes(again.host["w13"][3], source["w13"][3]))
+            self.assertTrue(
+                same_bytes(again.host["w13"][others], source["w13"][others])
+            )
+        if not all(opened):
+            self.skipTest(
+                f"{tempfile.gettempdir()} refuses O_DIRECT: read through the page cache"
+            )
 
     def test_graph_replays_decide_on_new_routing(self):
         """A captured decide + gather plans and pages each replay's routing, not the routing
@@ -244,6 +345,62 @@ class TestPagedExpertsKernels(CustomTestCase):
             self.assert_state(state, ref, plan)
             for s, e in enumerate(ref.slot_expert):
                 self.assertTrue(torch.equal(gpu[s].cpu(), host[e]))
+
+
+class TestPooledSlotTables(CustomTestCase):
+    def test_a_pooled_table_returns_its_memory_once_dropped(self):
+        """``auto`` keeps the K = top_k slot tables in a pool of their own so that freeing them
+        returns their segments. Negative control: while the pool lives, they stay reserved."""
+        from sglang.srt.layers.moe.paged_experts.method import pooled_empty
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        before = torch.cuda.memory_reserved()
+        table, pool = pooled_empty(64 << 20, torch.device("cuda"))
+        self.assertGreaterEqual(torch.cuda.memory_reserved() - before, 64 << 20)
+        del table
+        torch.cuda.empty_cache()
+        self.assertGreaterEqual(torch.cuda.memory_reserved() - before, 64 << 20)
+        del pool
+        torch.cuda.empty_cache()
+        self.assertLess(torch.cuda.memory_reserved() - before, 64 << 20)
+
+    def test_released_slot_tables_return_their_memory(self):
+        """A layer that auto has sized drops its K = top_k tables (``release_slots``) and their
+        memory goes back. Negative control: a view of a table kept elsewhere holds it."""
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.paged_experts.method import (
+            PagedExpertsMoEMethod,
+            _slot_table_bytes,
+            pooled_empty,
+        )
+
+        host = torch.randn(E, 2, 1 << 17)  # 1 MiB per expert
+        nbytes = K * host[0].numel() * host.element_size()
+        for keep_a_view in (False, True):
+            with self.subTest(keep_a_view=keep_a_view):
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                before = torch.cuda.memory_reserved()
+                method = PagedExpertsMoEMethod(None, None, E, K, auto_size=True)
+                method.store = SimpleNamespace(host={"w13_weight": host})
+                layer = torch.nn.Module()
+                layer.w13_weight = torch.nn.Parameter(
+                    torch.empty(0, *host.shape[1:], device="cuda"), requires_grad=False
+                )
+                slab, method._slot_pool = pooled_empty(
+                    _slot_table_bytes(method, K), torch.device("cuda")
+                )
+                method._place(layer, K, slab, 0)
+                self.assertTrue(torch.equal(layer.w13_weight.cpu(), host[:K]))
+                del slab
+                kept = layer.w13_weight.data[0] if keep_a_view else None
+                method.release_slots(layer)
+                torch.cuda.empty_cache()
+                held = torch.cuda.memory_reserved() - before
+                self.assertEqual(held >= nbytes, keep_a_view)
+                del kept
 
 
 def _gather_args(hosts, gpus):

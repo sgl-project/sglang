@@ -5,11 +5,16 @@ a selection back into pool slots."""
 from __future__ import annotations
 
 import itertools
-from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.dsv4.candidate_scores import (
+    can_use_candidate_scores,
+    candidate_scores,
+)
+from sglang.kernels.ops.attention.dsv4.candidate_table import CANDIDATE_BLOCK_SIZE
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
     flat_selection_slots,
@@ -23,9 +28,9 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_paged_v2,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
-from .types import DecodeInputs, PrefillInputs
+from .types import DecodeInputs, PrefillInputs, RowShard
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
@@ -43,19 +48,23 @@ class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
     k_cache: torch.Tensor  # [pages, page_size, 1, 68] uint8, the layer's index-K pool
 
     def paged_logits_args(self, metadata, rows=slice(None)):
-        """``(q, lengths, page_table)`` for ``deep_gemm_fp4_paged_mqa_logits`` over
-        ``rows``, ``metadata.rows_per_request`` consecutive rows per request."""
+        """``(q, lengths, page_table, indices)`` for ``deep_gemm_fp4_paged_mqa_logits``
+        over ``rows``, ``metadata.rows_per_request`` consecutive rows per request:
+        one row per token with ``indices``, else grouped by request."""
         n = metadata.rows_per_request
         q_fp4, q_sf = self.q_fp4[rows], self.q_sf[rows]
         lens = metadata.compressed_seq_lens[rows]
         table = metadata.page_table[rows]
+        indices = metadata.deep_gemm_indices
+        if indices is not None:
+            return (q_fp4, q_sf), lens, table, indices[: lens.shape[0]]
         if n > 1:
             heads = q_fp4.shape[2]
             q_fp4 = q_fp4.view(-1, n, heads, 64)
             q_sf = q_sf.view(-1, n, heads)
             lens = lens.view(-1, n)
             table = table[::n]
-        return (q_fp4, q_sf), lens, table
+        return (q_fp4, q_sf), lens, table, None
 
 
 class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
@@ -74,6 +83,27 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
     @property
     def num_rows(self) -> int:
         return self.q_fp4.shape[0]
+
+    def narrow(self, rows: slice) -> DeepGEMMPrefillData:
+        """A contiguous query-row view, retaining the global flattened-K layout
+        and score width. Projection stays replicated so its GEMM shape is unchanged."""
+        start, stop, step = rows.indices(self.num_rows)
+        if step != 1:
+            raise ValueError("prefill index data requires contiguous query rows")
+        request_offsets = itertools.accumulate(self.rows_per_request, initial=0)
+        local_counts = [
+            max(0, min(offset + count, stop) - max(offset, start))
+            for offset, count in zip(request_offsets, self.rows_per_request)
+        ]
+        return msgspec.structs.replace(
+            self,
+            request_starts=self.request_starts[rows],
+            rows_per_request=local_counts,
+            compress_lens=self.compress_lens[rows],
+            q_fp4=self.q_fp4[rows],
+            q_sf=self.q_sf[rows],
+            weights=self.weights[rows],
+        )
 
     def empty_selection(self, topk: int) -> torch.Tensor:
         return self.request_starts.new_full(
@@ -267,7 +297,11 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil
     )
 
 
-def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]):
+def score_tiles(
+    data: DeepGEMMPrefillData,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+) -> Generator[Tuple[slice, torch.Tensor], None, None]:
+    """Score tiles whose row slices are relative to this data's query-row view."""
     yield from flat_index_logits_tiles(
         q=(data.q_fp4, data.q_sf),
         kv=kv,
@@ -311,15 +345,30 @@ def dense_prefill_topk(
     *,
     out: torch.Tensor,
 ) -> None:
-    """Request-local compressed positions into ``out``, ``-1`` padded, unordered."""
+    """Request-local compressed positions of the data's query rows into
+    ``out``, one ``out`` row per scored row, ``-1`` padded, unordered."""
+    lens = data.compress_lens
     # Score columns are request-relative, so a zero offset emits request-local positions.
-    zero_offsets = torch.zeros_like(data.request_starts)
+    zero_offsets = torch.zeros_like(lens)
     for tile, logits in score_tiles(data, kv):
-        topk_ragged(
-            logits, data.compress_lens[tile], out=out[tile], offsets=zero_offsets[tile]
-        )
+        topk_ragged(logits, lens[tile], out=out[tile], offsets=zero_offsets[tile])
         # Free this tile's logits before the generator scores the next one.
         del logits
+
+
+def sharded_dense_prefill_topk(
+    data: DeepGEMMPrefillData,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+    *,
+    out: torch.Tensor,
+    shard: RowShard,
+) -> None:
+    """``dense_prefill_topk`` over this rank's share of the rows, all-gathered
+    into ``out`` for every row."""
+    num_rows = data.num_rows
+    local = out.new_full((shard.rows_per_rank(num_rows), out.shape[1]), -1)
+    dense_prefill_topk(data.narrow(shard.local_rows(num_rows)), kv, out=local)
+    out.copy_(shard.gather(local, num_rows))
 
 
 # ---------- torch ----------
@@ -342,7 +391,10 @@ class ChunkScores(msgspec.Struct, frozen=True):
     rows: slice  # into the request's rows
     tok: torch.Tensor
     lens: torch.Tensor
-    scores: torch.Tensor  # [rows, lc] bf16, -inf past each row's length
+    # FP32 [rows, lc] position scores or [rows, candidate_width] in block order;
+    # invalid positions or candidate columns are -inf.
+    scores: torch.Tensor
+    candidate_only: bool = False
 
 
 class DecodeScores(msgspec.Struct, frozen=True):
@@ -357,6 +409,8 @@ def prefill_requests(
     *,
     inputs: PrefillInputs,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
+    candidate_blocks: Optional[torch.Tensor] = None,
+    candidate_block_size: int = CANDIDATE_BLOCK_SIZE,
 ) -> Iterator[tuple[RequestScores, Iterator[ChunkScores]]]:
     """Requests with nothing visible yet are skipped."""
     pool = token_to_kv_pool
@@ -410,7 +464,13 @@ def prefill_requests(
         yield (
             request,
             _score_chunks(
-                indexer=indexer, q=q, weights=weights, index_k=index_k, request=request
+                indexer=indexer,
+                q=q,
+                weights=weights,
+                index_k=index_k,
+                request=request,
+                candidate_blocks=candidate_blocks,
+                candidate_block_size=candidate_block_size,
             ),
         )
 
@@ -422,18 +482,37 @@ def _score_chunks(
     weights: torch.Tensor,
     index_k: torch.Tensor,
     request: RequestScores,
+    candidate_blocks: Optional[torch.Tensor] = None,
+    candidate_block_size: int = CANDIDATE_BLOCK_SIZE,
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
-    # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
-    rows_per_chunk = max(
-        1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * index_k.shape[0] * 2)
+    candidate_width = (
+        candidate_blocks.shape[1] * candidate_block_size
+        if candidate_blocks is not None
+        else 0
     )
+    candidate_only = can_use_candidate_scores(q, index_k, weights, candidate_width, lc)
+    score_width = candidate_width if candidate_only else index_k.shape[0]
+    # Chunk rows so the [rows, heads, score_width] BF16 scores stay under budget.
+    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * score_width * 2))
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]
-        s = indexer.scores(q[tok_c], index_k, weights[tok_c])[:, :lc]
-        s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
-        yield ChunkScores(rows=rows, tok=tok_c, lens=lens_c, scores=s)
+        if candidate_only:
+            s = candidate_scores(
+                q[tok_c],
+                index_k,
+                weights[tok_c],
+                candidate_blocks[tok_c],
+                lens_c,
+                candidate_block_size,
+            )
+        else:
+            s = indexer.scores(q[tok_c], index_k, weights[tok_c])[:, :lc]
+            s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+        yield ChunkScores(
+            rows=rows, tok=tok_c, lens=lens_c, scores=s, candidate_only=candidate_only
+        )
 
 
 def write_prefill(
