@@ -39,7 +39,7 @@ FILLER = "The grass is green. The sky is blue. Here we go, there and back again.
 # requires exportable KV buffers from Mooncake's NVLink allocator.
 MOONCAKE_ENV = {
     "MC_FORCE_MNNVL": "true",
-    "SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "NVLINK",
+    "SGLANG_CUSTOM_MEM_POOL": "NVLINK",
     "SGLANG_DISAGG_STAGING_BUFFER": "0",
 }
 COMMON_ARGS = [

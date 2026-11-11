@@ -262,7 +262,7 @@ export const config = {
                 "SGLANG_DISAGGREGATION_WAITING_TIMEOUT=100000",
                 "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=0",
                 "SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S=3600",
-                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+                "SGLANG_CUSTOM_MEM_POOL=True",
                 "SGLANG_DISAGG_STAGING_BUFFER=1"] },
         { id: "nixl", label: "NiXL" },
       ],

@@ -17,7 +17,7 @@ class TestMooncakeEfaAllocator(unittest.TestCase):
         with (
             patch.object(envs.MOONCAKE_PROTOCOL, "get", return_value=protocol),
             patch.object(
-                envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL,
+                envs.SGLANG_CUSTOM_MEM_POOL,
                 "get",
                 return_value=custom_mem_pool,
             ),

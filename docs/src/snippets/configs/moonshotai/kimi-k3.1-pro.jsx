@@ -813,7 +813,7 @@ sgl-router \\
       verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+        "SGLANG_CUSTOM_MEM_POOL=True",
         "MC_FORCE_MNNVL=1",
       ],
       flags: [
@@ -844,7 +844,7 @@ sgl-router \\
       verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+        "SGLANG_CUSTOM_MEM_POOL=True",
         "MC_FORCE_MNNVL=1",
         "SGLANG_PP_LAYER_PARTITION=24,24,24,21",
         "CUDA_MODULE_LOADING=EAGER",
@@ -885,7 +885,7 @@ sgl-router \\
       verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+        "SGLANG_CUSTOM_MEM_POOL=True",
         "MC_FORCE_MNNVL=1",
         "SGLANG_DCP_PUSH_COMBINE_MAX_ROWS=1536",
         "SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB=32768",
@@ -919,7 +919,7 @@ sgl-router \\
       verificationStatus: "in-progress",
       env: [
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True",
+        "SGLANG_CUSTOM_MEM_POOL=True",
         "MC_FORCE_MNNVL=1",
       ],
       flags: [

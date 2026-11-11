@@ -434,7 +434,7 @@ ZE_AFFINITY_MASK=0,1 MC_USE_TENT=1 python -m sglang.launch_server \
 
 Start the router and send a request as shown for NIXL below, using `Qwen/Qwen2.5-1.5B-Instruct` as the model.
 
-`SGLANG_MOONCAKE_CUSTOM_MEM_POOL` (`NVLINK`, `BAREX`, `INTRA_NODE_NVLINK`) selects Mooncake's CUDA allocators and is CUDA-only; do not set it on XPU.
+`SGLANG_CUSTOM_MEM_POOL` (`NVLINK`, `BAREX`, `INTRA_NODE_NVLINK`) selects Mooncake's CUDA allocators and is CUDA-only; do not set it on XPU.
 
 ### NIXL backend
 
