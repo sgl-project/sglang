@@ -36,10 +36,6 @@ class TestQwen35FP4MTPReplaySSMUnifiedMemory(ReasoningTokenUsageMixin, CustomTes
             + [
                 "--enable-linear-replayssm-spec",
                 "--enable-unified-memory",
-                # The draft keeps the bf16 KV it uses on static pools; its
-                # fused region sits in the target's fp8 pages.
-                "--speculative-draft-kv-cache-dtype",
-                "bf16",
             ],
         )
 
