@@ -926,7 +926,8 @@ class MetadataBuffers:
                     raise RuntimeError(
                         f"top_logprobs_num {top_logprobs_len} exceeds "
                         f"disaggregation metadata capacity {max_top_logprobs_len}. "
-                        "Lower top_logprobs_num or increase the metadata buffer."
+                        "Lower top_logprobs_num or raise "
+                        "--disaggregation-max-top-logprobs-num on prefill and decode."
                     )
                 self.output_top_logprobs_val[req.metadata_buffer_index][
                     : len(req.logprob.output_top_logprobs_val[0])

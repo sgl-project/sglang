@@ -1674,6 +1674,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                max_top_logprobs_num=get_disagg().disaggregation_max_top_logprobs_num,
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
@@ -1715,6 +1716,7 @@ class Scheduler(
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                max_top_logprobs_num=get_disagg().disaggregation_max_top_logprobs_num,
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
