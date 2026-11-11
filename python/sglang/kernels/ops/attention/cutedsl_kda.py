@@ -15,6 +15,7 @@ Notes:
 """
 
 import logging
+import math
 from typing import Dict, Optional, Tuple
 
 import cuda.bindings.driver as cuda
@@ -1386,6 +1387,24 @@ def _normalize_kda_a(a, *, is_varlen_decode, N, HV, K):
         raise ValueError(f"Unexpected a shape for dense: {a.shape}")
 
 
+def _check_compiled_constants(
+    *, K, scale, use_qk_l2norm_in_kernel, softplus_beta, softplus_threshold
+):
+    # _get_compiled_kernel bakes these values in; reject any it would ignore.
+    if (
+        (scale is not None and not math.isclose(scale, K**-0.5, rel_tol=1e-6))
+        or not use_qk_l2norm_in_kernel
+        or softplus_beta != 1.0
+        or softplus_threshold != 20.0
+    ):
+        raise ValueError(
+            "CuTe DSL KDA decode only supports scale=K**-0.5, "
+            "use_qk_l2norm_in_kernel=True, softplus_beta=1.0 and "
+            f"softplus_threshold=20.0; got {scale=}, {use_qk_l2norm_in_kernel=}, "
+            f"{softplus_beta=}, {softplus_threshold=}"
+        )
+
+
 def cutedsl_fused_sigmoid_gating_kda_update(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -1443,10 +1462,13 @@ def cutedsl_fused_sigmoid_gating_kda_update(
     )
 
     is_varlen_decode = B_q == 1 and T_q == N and N > 1
-    if scale is None:
-        scale = K**-0.5
-    else:
-        assert scale > 0, f"scale must be positive, got {scale}"
+    _check_compiled_constants(
+        K=K,
+        scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+    )
 
     use_small_batch = N < SMALL_BATCH_THRESHOLD
 

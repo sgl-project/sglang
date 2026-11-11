@@ -12,6 +12,9 @@ OffloadComponentName = Literal["dit", "text_encoder", "image_encoder", "vae"]
 @dataclass(frozen=True)
 class ModelDeploymentConfig:
     dit_layerwise_offload_modes: tuple[Literal["auto", "memory"], ...] = ()
+    # False: auto-tuning never selects layerwise offload for auxiliary components
+    # (encoders, VAE). Explicit choices still go through model validation.
+    auto_auxiliary_layerwise_offload: bool = True
     auto_dit_offload_prefetch_size: float | None = None
     keep_resident_min_available_gb: float | None = None
     # Per-model resident defaults. Auto mode additionally keeps an image DiT
