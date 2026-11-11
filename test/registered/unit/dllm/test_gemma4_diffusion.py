@@ -346,8 +346,12 @@ class TestGemma4DiffusionWeightLoading(unittest.TestCase):
             "model.layers.0.self_attn.qkv_proj.weight_scale": _make_tracked_param(
                 "qkv_weight_scale"
             ),
-            "model.layers.0.self_attn.attn.k_scale": _make_tracked_param("attn_k_scale"),
-            "model.layers.0.self_attn.attn.v_scale": _make_tracked_param("attn_v_scale"),
+            "model.layers.0.self_attn.attn.k_scale": _make_tracked_param(
+                "attn_k_scale"
+            ),
+            "model.layers.0.self_attn.attn.v_scale": _make_tracked_param(
+                "attn_v_scale"
+            ),
             "model.layers.0.self_attn.attn_bidir.k_scale": _make_tracked_param(
                 "bidir_k_scale"
             ),
@@ -357,9 +361,7 @@ class TestGemma4DiffusionWeightLoading(unittest.TestCase):
         }
 
         with (
-            patch.object(
-                model, "named_parameters", return_value=list(params.items())
-            ),
+            patch.object(model, "named_parameters", return_value=list(params.items())),
             patch.object(model, "named_buffers", return_value=[]),
             patch("sglang.srt.models.gemma4_diffusion.logger.warning") as warning,
         ):
