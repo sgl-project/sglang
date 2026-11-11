@@ -1,5 +1,7 @@
-"""
-Minimal HTTP load balancer for prefill and decode servers for testing.
+"""CI-only minimal HTTP load balancer for prefill and decode servers.
+
+The PD test fixtures run it in front of their prefill and decode servers.
+It is not a production router: it supports only random selection.
 """
 
 import argparse
@@ -53,7 +55,7 @@ class MiniLoadBalancer:
 
     def _validate_args(self, args: argparse.Namespace):
         logger.warning(
-            "\x1b[33mMiniLB is only for debugging purposes, it only supports random policy!\033[0m"
+            "\x1b[33mMiniLB is for CI only; it supports only the random policy!\033[0m"
         )
 
         if len(args.prefill) == 0 or len(args.decode) == 0:
@@ -575,7 +577,7 @@ def _prefill_arg(values):
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m sglang.srt.disaggregation.mini_lb",
-        description="Minimal load balancer for one PD deployment, for debugging.",
+        description="CI-only minimal load balancer for one PD deployment.",
     )
     parser.add_argument(
         "--prefill",
