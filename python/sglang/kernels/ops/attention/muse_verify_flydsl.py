@@ -23,7 +23,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, _to_raw
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, _to_raw, buf_base_i64
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import rocdl as _rocdl
@@ -31,8 +31,6 @@ from flydsl.expr import arith
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
-
-from sglang.kernels.jit.utils.flydsl_ptr import create_llvm_ptr, extract_base_index
 
 QL = 8
 GQA = 8
@@ -96,7 +94,7 @@ def _cvt8(lo_word, hi_word):
 
 def _global_load16(addr):
     """16 bytes (vector<4 x i32>) at the 64-bit global byte address ``addr``."""
-    ptr = create_llvm_ptr(addr, address_space=1)
+    ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), _to_raw(addr)).result
     return llvm.LoadOp(T.vec(4, T.i32), _to_raw(ptr), alignment=16).result
 
 
@@ -257,8 +255,8 @@ def _launcher(
         kd_r = buffer_ops.create_buffer_resource(kd, max_size=True)
         q_r = buffer_ops.create_buffer_resource(q, max_size=True)
         if fx.const_expr(addr64):
-            k_addr = fx.Int64(arith.index_cast(T.i64, extract_base_index(k)))
-            v_addr = fx.Int64(arith.index_cast(T.i64, extract_base_index(v)))
+            k_addr = buf_base_i64(k)
+            v_addr = buf_base_i64(v)
         else:
             k_r = buffer_ops.create_buffer_resource(k, max_size=True)
             v_r = buffer_ops.create_buffer_resource(v, max_size=True)
