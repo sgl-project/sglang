@@ -54,6 +54,9 @@ from sglang.srt.speculative.dspark_components.dspark_deferred_draft_kv import (
     DeferredDraftKVStore,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
+from sglang.srt.speculative.dspark_components.dspark_execution import (
+    DSparkExecutionPolicy,
+)
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -144,6 +147,7 @@ class TargetVerifyExecutor:
         model_runner,
         kv_injector: TargetHiddenKvInjector,
         tp_sync: SpecTpSync,
+        execution_policy: Optional[DSparkExecutionPolicy] = None,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
         simulated_correct_len: Optional[torch.Tensor] = None,
@@ -158,6 +162,7 @@ class TargetVerifyExecutor:
         self.model_runner = model_runner
         self.kv_injector = kv_injector
         self._tp_sync = tp_sync
+        self._execution_policy = execution_policy or DSparkExecutionPolicy()
         self.verify_epilogue = verify_epilogue
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
@@ -280,12 +285,12 @@ class TargetVerifyExecutor:
         )
         if idle_layout is not None:
             num_dummy_slots = int(idle_layout.verify_lens.numel())
-            glm_idle = _is_npu and getattr(
-                self.model_runner.attn_backend, "_dspark_dsa_ragged_verify", False
+            idle_seq_len = getattr(
+                self.model_runner.attn_backend, "ragged_verify_idle_seq_len", 1
             )
             batch.seq_lens = torch.full(
                 (num_dummy_slots,),
-                0 if glm_idle else 1,
+                idle_seq_len,
                 dtype=torch.int64,
                 device=device,
             )
@@ -293,20 +298,15 @@ class TargetVerifyExecutor:
                 (num_dummy_slots,), dtype=torch.int64, device=device
             )
             batch.seq_lens_cpu = torch.full(
-                (num_dummy_slots,), 0 if glm_idle else 1, dtype=torch.int64
+                (num_dummy_slots,), idle_seq_len, dtype=torch.int64
             )
-            batch.seq_lens_sum = 0 if glm_idle else num_dummy_slots
+            batch.seq_lens_sum = idle_seq_len * num_dummy_slots
             batch.forward_mode = ForwardMode.TARGET_VERIFY
         verify_input.live_seq_lens_cpu = batch.seq_lens_cpu
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
-        if _is_npu:
-            from sglang.srt.hardware_backend.npu.dspark_dp import (
-                prepare_compact_dp_forward_batch,
-            )
-
-            prepare_compact_dp_forward_batch(verify_forward_batch, self.model_runner)
+        self._execution_policy.prepare_verify_forward_batch(verify_forward_batch)
         self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -386,12 +386,7 @@ class TargetVerifyExecutor:
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
-        if _is_npu:
-            from sglang.srt.hardware_backend.npu.dspark_dp import (
-                prepare_compact_dp_forward_batch,
-            )
-
-            prepare_compact_dp_forward_batch(verify_forward_batch, self.model_runner)
+        self._execution_policy.prepare_verify_forward_batch(verify_forward_batch)
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -474,10 +469,10 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
-        npu_device_metadata = _is_npu and getattr(
-            self.model_runner.attn_backend, "_dspark_dsa_ragged_verify", False
+        requires_cpu_seq_lens = getattr(
+            self.model_runner.attn_backend, "ragged_verify_requires_cpu_seq_lens", True
         )
-        if seq_lens_cpu_backup is not None and not npu_device_metadata:
+        if seq_lens_cpu_backup is not None and requires_cpu_seq_lens:
             verify_lens_cpu = (
                 layout.verify_lens_cpu
                 if layout.verify_lens_cpu is not None

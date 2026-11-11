@@ -13,10 +13,78 @@ import torch
 
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, round_up_grid
+from sglang.srt.speculative.dspark_components.dspark_execution import (
+    DSparkExecutionPolicy,
+)
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
+    round_up_grid,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def make_dspark_execution_policy(model_runner) -> DSparkExecutionPolicy:
+    # The worker is built before attention backends; model identity is available
+    # here, while backend capabilities must be resolved when the budget is used.
+    from sglang.srt.configs.model_config import is_glm_moe_dsa
+
+    config = getattr(model_runner, "model_config", None)
+    if config is None or not is_glm_moe_dsa(config.hf_config):
+        return DSparkExecutionPolicy()
+    coordinates_dp_verify = (
+        get_parallel().attn_dp_enabled
+        and read_ragged_verify_mode() is RaggedVerifyMode.COMPACT
+    )
+    if coordinates_dp_verify and get_parallel().tp_rank == 0:
+        logger.info(
+            "GLM DSpark compact attention DP enabled (attn_dp=%d, attn_tp=%d, "
+            "budget_sync=attention-tp, target_tier_sync=tp-cpu).",
+            get_parallel().attn_dp_size,
+            get_parallel().attn_tp_size,
+        )
+    return NpuDSparkExecutionPolicy(
+        model_runner, coordinates_dp_verify=coordinates_dp_verify
+    )
+
+
+class NpuDSparkExecutionPolicy(DSparkExecutionPolicy):
+    dynamic_verify_tiers_with_dp = True
+
+    def __init__(self, model_runner, *, coordinates_dp_verify: bool = False):
+        self.model_runner = model_runner
+        self.coordinates_dp_verify = coordinates_dp_verify
+
+    def sync_verify_budget(self, budget):
+        # Ring readiness may differ across ranks. Synchronize before choosing
+        # token tiers, only within the attention-TP group owning these requests.
+        # Do not cache the capability before backend initialization.
+        if getattr(
+            getattr(self.model_runner, "attn_backend", None),
+            "_dspark_dsa_ragged_verify",
+            False,
+        ):
+            return get_dp_tp_group().broadcast_object(budget, src=0)
+        return budget
+
+    def coordinate_verify_layout(self, *, batch, layout):
+        if not self.coordinates_dp_verify:
+            return layout
+        # The default scheduler may supply a synthetic idle layout. It is not
+        # local work and must not inflate the collective's packed token tier.
+        return coordinate_compact_dp_layout(
+            batch=batch,
+            layout=layout if batch.batch_size() else None,
+            model_runner=self.model_runner,
+        )
+
+    def prepare_verify_forward_batch(self, forward_batch):
+        if self.coordinates_dp_verify:
+            prepare_compact_dp_forward_batch(forward_batch, self.model_runner)
 
 
 def compact_dp_graph_tokens(contributions, *, attn_tp_size, runner):

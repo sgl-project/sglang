@@ -28,7 +28,6 @@ from sglang.srt.models.dspark import DSparkConfidenceHead, VanillaMarkov
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.dspark_components import (
     dspark_draft_sampler,
-    dspark_planner,
     dspark_verify,
     dspark_worker_v2,
 )
@@ -223,7 +222,6 @@ def test_dense_worker_constructor_to_draft_sampler_warmup(
             create=True,
         ),
         patch.object(dspark_worker_v2, "_is_npu", True),
-        patch.object(dspark_planner, "_is_npu", True),
         patch.object(dspark_draft_sampler, "_is_npu", True),
         patch.object(dspark_verify, "_is_npu", True),
         patch.object(
@@ -245,7 +243,12 @@ def test_dense_worker_constructor_to_draft_sampler_warmup(
         assert dspark_quarot.get_glm_dspark_quarot_config() is None
         assert worker.gamma == 3 and worker.verify_num_draft_tokens == 4
         assert not hasattr(target_runner, "attn_backend")
-        assert not worker._verify_planner._npu_glm_compact
+        assert worker._verify_planner._execution_policy is worker._execution_policy
+        assert worker._verify_executor._execution_policy is worker._execution_policy
+        assert worker._execution_policy.sync_verify_budget(1) == 1
+        assert worker._execution_policy.coordinates_dp_verify == (
+            mode == "compact" and attn_dp_size > 1
+        )
         assert (worker._verify_epilogue is not None) == (graph and mode == "compact")
         assert (worker._simulated_correct_len is not None) == profile
         # Match the scheduler: memory pools precede backend initialization.
@@ -255,7 +258,12 @@ def test_dense_worker_constructor_to_draft_sampler_warmup(
         target_runner.attn_backend = SimpleNamespace(_dspark_dsa_ragged_verify=True)
         draft_runner.attn_backend = SimpleNamespace(_dspark_dsa_ragged_verify=False)
         worker.init_attention_backends()
-        assert worker._verify_planner._npu_glm_compact
+        with patch(
+            "sglang.srt.hardware_backend.npu.dspark_dp.get_dp_tp_group",
+            return_value=SimpleNamespace(broadcast_object=Mock(return_value=3)),
+        ) as get_group:
+            assert worker._execution_policy.sync_verify_budget(1) == 3
+            get_group.return_value.broadcast_object.assert_called_once_with(1, src=0)
         worker.init_cuda_graphs()
         draft_worker.init_cuda_graphs.assert_called_once_with(
             capture_decode_cuda_graph=graph

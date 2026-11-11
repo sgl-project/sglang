@@ -59,6 +59,9 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
 )
+from sglang.srt.speculative.dspark_components.dspark_execution import (
+    DSparkExecutionPolicy,
+)
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -372,6 +375,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         self._target_hidden_projection_enabled = False
 
+        self._execution_policy = DSparkExecutionPolicy()
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.dspark_dp import (
+                make_dspark_execution_policy,
+            )
+
+            self._execution_policy = make_dspark_execution_policy(self.model_runner)
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
             gamma=self.gamma,
@@ -380,25 +390,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=get_parallel().tp_rank,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
+            execution_policy=self._execution_policy,
         )
-        self._npu_glm_compact_dp = (
-            self._verify_planner._npu_glm_target
-            and get_parallel().attn_dp_enabled
-            and self._verify_planner.is_compact_mode
-        )
-        if self._npu_glm_compact_dp and get_parallel().tp_rank == 0:
-            logger.info(
-                "GLM DSpark compact attention DP enabled (attn_dp=%d, attn_tp=%d, "
-                "budget_sync=attention-tp, target_tier_sync=tp-cpu).",
-                get_parallel().attn_dp_size,
-                get_parallel().attn_tp_size,
-            )
         if (
             get_parallel().attn_dp_enabled
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
-            and not self._npu_glm_compact_dp
+            and not self._execution_policy.coordinates_dp_verify
         ):
             raise ValueError(
                 "DSpark dense-draft compact verify under attention DP does not "
@@ -572,6 +571,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             model_runner=self.model_runner,
             kv_injector=self._kv_injector,
             tp_sync=self._tp_sync,
+            execution_policy=self._execution_policy,
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
             simulated_correct_len=self._simulated_correct_len,
@@ -1001,14 +1001,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                         batch, "target", rank, local_only=target_local_only
                     )
                 idle_layout = self._idle_verify_ragged_layout(batch)
-                if self._npu_glm_compact_dp:
-                    from sglang.srt.hardware_backend.npu.dspark_dp import (
-                        coordinate_compact_dp_layout,
-                    )
-
-                    idle_layout = coordinate_compact_dp_layout(
-                        batch=batch, layout=None, model_runner=self.model_runner
-                    )
+                idle_layout = self._execution_policy.coordinate_verify_layout(
+                    batch=batch, layout=idle_layout
+                )
                 self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=idle_layout
                 )
@@ -1114,14 +1109,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
-        if self._npu_glm_compact_dp:
-            from sglang.srt.hardware_backend.npu.dspark_dp import (
-                coordinate_compact_dp_layout,
-            )
-
-            layout = coordinate_compact_dp_layout(
-                batch=batch, layout=layout, model_runner=self.model_runner
-            )
+        layout = self._execution_policy.coordinate_verify_layout(
+            batch=batch, layout=layout
+        )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
         verify_ids_2d = proposal.verify_ids

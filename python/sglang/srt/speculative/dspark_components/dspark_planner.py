@@ -13,7 +13,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.layers.dp_attention import (
-    get_dp_tp_group,
     is_dp_attention_enabled,
     require_mlp_tp_gather,
 )
@@ -27,6 +26,9 @@ from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
+from sglang.srt.speculative.dspark_components.dspark_execution import (
+    DSparkExecutionPolicy,
+)
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
@@ -45,7 +47,6 @@ from sglang.srt.speculative.ragged_verify import (
     round_up_grid,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
-from sglang.srt.utils import is_npu
 from sglang.srt.utils.invariants import (
     Bucket,
     Invariant,
@@ -55,7 +56,6 @@ from sglang.srt.utils.invariants import (
 )
 
 logger = logging.getLogger(__name__)
-_is_npu = is_npu()
 
 # Scheduled verify lengths must not exceed the per-step token budget.
 _VERIFY_LEN_BUDGET = Invariant("dspark.verify_len_budget", Bucket.GUARD, IsTrue())
@@ -91,6 +91,7 @@ class DSparkVerifyPlanner:
         tp_rank: int,
         verify_num_draft_tokens: int,
         tp_sync: SpecTpSync,
+        execution_policy: Optional[DSparkExecutionPolicy] = None,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -98,6 +99,7 @@ class DSparkVerifyPlanner:
         self.device = device
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._tp_sync = tp_sync
+        self._execution_policy = execution_policy or DSparkExecutionPolicy()
         self._align_verify_tokens_to_graph_tier = (
             get_spec().speculative_dspark_align_verify_tokens_to_graph_tier
         )
@@ -179,14 +181,14 @@ class DSparkVerifyPlanner:
                 relay_lag_steps=relay_lag_steps,
             )
             self._dynamic_graph_tier = (
-                not is_dp_attention_enabled() or self._npu_glm_target
+                not is_dp_attention_enabled()
+                or self._execution_policy.dynamic_verify_tiers_with_dp
             )
             self._dp_tier_gather_enabled = (
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
                 and is_dp_attention_enabled()
-                # GLM dense draft agrees on actual packed widths at the
-                # target boundary, including in non-overlap execution.
-                and not self._npu_glm_target
+                # A target-boundary coordinator owns the packed graph tier.
+                and not self._execution_policy.coordinates_dp_verify
                 and get_parallel().attn_tp_size == 1
                 and get_parallel().attn_cp_size == 1
                 and require_mlp_tp_gather()
@@ -222,24 +224,6 @@ class DSparkVerifyPlanner:
                         "budget degenerates to verify-all (zero scheduling gain). "
                         "Pass a profiled --speculative-dspark-sps-table-path."
                     )
-
-    @property
-    def _npu_glm_target(self) -> bool:
-        from sglang.srt.configs.model_config import is_glm_moe_dsa
-
-        config = getattr(self.model_runner, "model_config", None)
-        return _is_npu and config is not None and is_glm_moe_dsa(config.hf_config)
-
-    @property
-    def _npu_glm_compact(self) -> bool:
-        # The scheduler constructs the planner before allocating KV pools and
-        # initializing attention backends. Resolve this at budget-use time;
-        # caching False during construction would silently disable TP sync.
-        return _is_npu and getattr(
-            getattr(self.model_runner, "attn_backend", None),
-            "_dspark_dsa_ragged_verify",
-            False,
-        )
 
     @property
     def carries_confidence(self) -> bool:
@@ -297,12 +281,9 @@ class DSparkVerifyPlanner:
         draft_input.verify_token_budget = self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
         )
-        if self._npu_glm_compact:
-            # Ring event readiness can differ across ranks. Never let that
-            # choose different token tiers / HCCL collective shapes.
-            draft_input.verify_token_budget = get_dp_tp_group().broadcast_object(
-                draft_input.verify_token_budget, src=0
-            )
+        draft_input.verify_token_budget = self._execution_policy.sync_verify_budget(
+            draft_input.verify_token_budget
+        )
         batch.spec_verify_tier_num_tokens = local_verify_tier_num_tokens(
             bs=batch.batch_size(),
             verify_token_budget=draft_input.verify_token_budget,
@@ -358,9 +339,7 @@ class DSparkVerifyPlanner:
         budget = self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=req_pool_indices_cpu
         )
-        if self._npu_glm_compact:
-            budget = get_dp_tp_group().broadcast_object(budget, src=0)
-        return budget
+        return self._execution_policy.sync_verify_budget(budget)
 
     def resolve_verify_token_budget(
         self,
@@ -377,8 +356,6 @@ class DSparkVerifyPlanner:
         if not get_schedule().disable_overlap_schedule:
             return draft_input.verify_token_budget
 
-        # GLM NPU synchronizes readiness/budget within this request's attention
-        # TP group; different attention-DP groups own independent requests.
         draft_input.verify_token_budget = self.compute_budget_sync(
             confidence=confidence,
             prefix_lens=prefix_lens,

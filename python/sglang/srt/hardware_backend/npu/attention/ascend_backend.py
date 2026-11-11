@@ -358,6 +358,8 @@ class AscendAttnBackend(AttentionBackend):
         )
         if self._dspark_dsa_ragged_verify:
             self.supports_ragged_verify_graph = True
+            self.ragged_verify_requires_cpu_seq_lens = False
+            self.ragged_verify_idle_seq_len = 0
         self.model_dtype = model_runner.model_config.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA

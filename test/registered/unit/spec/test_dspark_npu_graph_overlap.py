@@ -9,12 +9,16 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from sglang.srt.hardware_backend.npu import dspark_dp
 from sglang.srt.managers.overlap_utils import (
     CONFIDENCE_RELAY_RING_DEPTH,
     CONFIDENCE_RELAY_RING_LAG,
     ConfidenceRelay,
 )
 from sglang.srt.speculative.dspark_components import dspark_planner
+from sglang.srt.speculative.dspark_components.dspark_execution import (
+    DSparkExecutionPolicy,
+)
 from sglang.srt.speculative.dspark_components.dspark_planner import DSparkScheduleConfig
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -80,6 +84,11 @@ def test_tp_broadcast_budget_precedes_tier_choice(
     planner.model_runner = SimpleNamespace(
         attn_backend=SimpleNamespace(_dspark_dsa_ragged_verify=is_npu)
     )
+    planner._execution_policy = (
+        dspark_dp.NpuDSparkExecutionPolicy(planner.model_runner)
+        if is_npu
+        else DSparkExecutionPolicy()
+    )
     planner._budget_from_resolved = Mock(return_value=local_budget)
     planner._maybe_gather_dp_verify_tier = Mock()
     planner.verify_num_draft_tokens = 8
@@ -93,8 +102,7 @@ def test_tp_broadcast_budget_precedes_tier_choice(
     )
     group = SimpleNamespace(broadcast_object=Mock(return_value=root_budget))
     with (
-        patch.object(dspark_planner, "_is_npu", is_npu),
-        patch.object(dspark_planner, "get_dp_tp_group", return_value=group) as parallel,
+        patch.object(dspark_dp, "get_dp_tp_group", return_value=group) as parallel,
     ):
         planner.prepare_verify_budget(batch, Mock())
     assert batch.spec_info.verify_token_budget == expected_budget
@@ -117,11 +125,15 @@ def test_sync_budget_uses_runtime_tp_group(is_npu, is_glm):
         req_to_token_pool=SimpleNamespace(req_generation=torch.tensor([10, 20, 30])),
         attn_backend=SimpleNamespace(_dspark_dsa_ragged_verify=is_glm),
     )
+    planner._execution_policy = (
+        dspark_dp.NpuDSparkExecutionPolicy(planner.model_runner)
+        if is_npu
+        else DSparkExecutionPolicy()
+    )
     group = SimpleNamespace(broadcast_object=Mock(return_value=6))
     draft_input = SimpleNamespace()
     with (
-        patch.object(dspark_planner, "_is_npu", is_npu),
-        patch.object(dspark_planner, "get_dp_tp_group", return_value=group) as parallel,
+        patch.object(dspark_dp, "get_dp_tp_group", return_value=group) as parallel,
         patch.object(
             dspark_planner,
             "get_schedule",
@@ -152,7 +164,6 @@ def test_planner_constructed_before_backend_detects_glm_after_initialization(mod
     # permanently cache a negative capability result from that startup phase.
     runner = SimpleNamespace()
     with (
-        patch.object(dspark_planner, "_is_npu", True),
         patch.object(dspark_planner, "read_ragged_verify_mode", return_value=mode),
         patch.object(
             dspark_planner,
@@ -186,17 +197,17 @@ def test_planner_constructed_before_backend_detects_glm_after_initialization(mod
             tp_rank=1,
             verify_num_draft_tokens=4,
             tp_sync=Mock(),
+            execution_policy=dspark_dp.NpuDSparkExecutionPolicy(runner),
         )
         assert not hasattr(runner, "attn_backend")
-        assert not planner._npu_glm_compact
+        assert planner._execution_policy.sync_verify_budget(1) == 1
         runner.req_to_token_pool = SimpleNamespace(req_generation=torch.tensor([0, 0]))
         runner.attn_backend = SimpleNamespace(_dspark_dsa_ragged_verify=True)
-        assert planner._npu_glm_compact
         if mode is RaggedVerifyMode.COMPACT:
             planner._budget_from_resolved = Mock(return_value=1)
             group = SimpleNamespace(broadcast_object=Mock(return_value=3))
             with patch.object(
-                dspark_planner,
+                dspark_dp,
                 "get_dp_tp_group",
                 return_value=group,
             ):
@@ -208,7 +219,7 @@ def test_planner_constructed_before_backend_detects_glm_after_initialization(mod
             assert budget == 3
             group.broadcast_object.assert_called_once_with(1, src=0)
         runner.attn_backend = SimpleNamespace(_dspark_dsa_ragged_verify=False)
-        assert not planner._npu_glm_compact
+        assert planner._execution_policy.sync_verify_budget(1) == 1
 
 
 def test_confidence_relay_not_ready_generation_and_source_fence():
@@ -260,7 +271,7 @@ def test_npu_executor_keeps_host_prefix_and_device_only_layout():
     )
     executor.verify_num_draft_tokens = 8
     executor.model_runner = SimpleNamespace(
-        attn_backend=SimpleNamespace(_dspark_dsa_ragged_verify=True)
+        attn_backend=SimpleNamespace(ragged_verify_requires_cpu_seq_lens=False)
     )
     executor._forward_prepared_verify = Mock(return_value="launched")
     prefix = torch.tensor([7, 15])
@@ -299,7 +310,7 @@ def test_dsv4_ragged_verify_keeps_existing_cpu_length_contract():
     executor.verify_num_draft_tokens = 8
     executor.model_runner = SimpleNamespace(
         attn_backend=SimpleNamespace(
-            supports_ragged_verify_graph=True, _dspark_dsa_ragged_verify=False
+            supports_ragged_verify_graph=True, ragged_verify_requires_cpu_seq_lens=True
         )
     )
     executor._forward_prepared_verify = Mock(return_value="launched")
@@ -336,3 +347,44 @@ def test_future_map_accepts_scheduler_string_device():
         "cpu", SpeculativeAlgorithm.DSPARK, pool, needs_confidence_relay=True
     )
     assert future.npu_confidence_stream is None
+
+
+@pytest.mark.parametrize("idle_seq_len", [0, 1])
+def test_idle_executor_uses_backend_prefix_contract_and_execution_policy(idle_seq_len):
+    from sglang.srt.speculative.dspark_components import dspark_verify
+
+    backend = SimpleNamespace(ragged_verify_idle_seq_len=idle_seq_len)
+    runner = SimpleNamespace(device="cpu", attn_backend=backend)
+    executor = dspark_verify.TargetVerifyExecutor.__new__(
+        dspark_verify.TargetVerifyExecutor
+    )
+    executor.model_runner = runner
+    executor.verify_epilogue = None
+    executor.verify_num_draft_tokens = 9
+    executor._execution_policy = Mock()
+    executor.target_worker = Mock()
+    layout = RaggedVerifyLayout.from_verify_lens_device(
+        verify_lens=torch.tensor([0]), graph_num_tokens=8
+    )
+    batch = SimpleNamespace()
+    forward_batch = object()
+
+    def prepare(verify_input, actual_batch, worker):
+        assert actual_batch is batch
+        assert batch.seq_lens.tolist() == [idle_seq_len]
+        assert batch.seq_lens_cpu.tolist() == [idle_seq_len]
+        assert batch.seq_lens_sum == idle_seq_len
+        assert verify_input.live_seq_lens_cpu is batch.seq_lens_cpu
+        assert verify_input.draft_token.numel() == 8
+        return forward_batch, False
+
+    def forward(**kwargs):
+        executor._execution_policy.prepare_verify_forward_batch.assert_called_once_with(
+            forward_batch
+        )
+        assert kwargs["forward_batch"] is forward_batch
+
+    executor.target_worker.forward_batch_generation.side_effect = forward
+    with patch.object(dspark_verify.DFlashVerifyInput, "prepare_for_verify", prepare):
+        executor.run_idle_participation(batch=batch, idle_layout=layout)
+    executor.target_worker.forward_batch_generation.assert_called_once()

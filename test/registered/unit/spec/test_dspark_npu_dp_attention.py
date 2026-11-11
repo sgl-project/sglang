@@ -182,6 +182,9 @@ def _collective_worker(rank, init_path, graph):
         planner = dspark_planner.DSparkVerifyPlanner.__new__(
             dspark_planner.DSparkVerifyPlanner
         )
+        planner._execution_policy = dspark_dp.NpuDSparkExecutionPolicy(
+            runner, coordinates_dp_verify=True
+        )
         planner.model_runner = runner
         planner.model_runner.req_to_token_pool = SimpleNamespace(
             req_generation=torch.zeros(2, dtype=torch.long)
@@ -191,9 +194,8 @@ def _collective_worker(rank, init_path, graph):
             return_value=(2 if rank < 2 else 6) + rank % 2
         )
         with (
-            patch.object(dspark_planner, "_is_npu", True),
             patch.object(
-                dspark_planner,
+                dspark_dp,
                 "get_dp_tp_group",
                 return_value=SimpleNamespace(broadcast_object=broadcast),
             ),
@@ -222,8 +224,8 @@ def _collective_worker(rank, init_path, graph):
             )
             batch = SimpleNamespace(batch_size=lambda: 2 if busy else 0)
             with patch.object(dspark_dp, "get_parallel", return_value=parallel):
-                result = dspark_dp.coordinate_compact_dp_layout(
-                    batch=batch, layout=layout, model_runner=runner
+                result = planner._execution_policy.coordinate_verify_layout(
+                    batch=batch, layout=layout
                 )
             if step in (3, 5):
                 assert result is None
@@ -292,3 +294,89 @@ def test_production_glm_dspark_argument_hook_accepts_attention_dp(graph):
         ),
     ):
         _handle_dspark(args)
+
+
+@pytest.mark.parametrize(
+    "architecture", ["GlmMoeDsaForCausalLM", "DeepseekV4ForCausalLM"]
+)
+@pytest.mark.parametrize("mode", ["static", "compact"])
+@pytest.mark.parametrize("dp", [False, True])
+def test_execution_policy_selection_before_backend_init(architecture, mode, dp):
+    from sglang.srt.speculative.dspark_components.dspark_execution import (
+        DSparkExecutionPolicy,
+    )
+
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture])
+        )
+    )
+    with (
+        patch.object(
+            dspark_dp,
+            "get_parallel",
+            return_value=SimpleNamespace(attn_dp_enabled=dp, tp_rank=1),
+        ),
+        envs.SGLANG_RAGGED_VERIFY_MODE.override(mode),
+    ):
+        policy = dspark_dp.make_dspark_execution_policy(runner)
+    glm = architecture == "GlmMoeDsaForCausalLM"
+    assert policy.dynamic_verify_tiers_with_dp == glm
+    assert policy.coordinates_dp_verify == (glm and dp and mode == "compact")
+    if not glm:
+        assert type(policy) is DSparkExecutionPolicy
+    with patch.object(dspark_dp, "get_dp_tp_group") as group:
+        assert policy.sync_verify_budget(3) == 3
+    group.assert_not_called()
+
+
+def test_default_execution_policy_preserves_inputs_without_collectives():
+    from sglang.srt.speculative.dspark_components.dspark_execution import (
+        DSparkExecutionPolicy,
+    )
+
+    policy = DSparkExecutionPolicy()
+    batch, layout = object(), object()
+    with (
+        patch.object(dspark_dp, "get_dp_tp_group") as group,
+        patch.object(dspark_dp, "coordinate_compact_dp_layout") as coordinate,
+        patch.object(dspark_dp, "prepare_compact_dp_forward_batch") as prepare,
+    ):
+        assert policy.sync_verify_budget(None) is None
+        assert policy.sync_verify_budget(3) == 3
+        assert policy.coordinate_verify_layout(batch=batch, layout=layout) is layout
+        assert policy.coordinate_verify_layout(batch=batch, layout=None) is None
+        policy.prepare_verify_forward_batch(batch)
+    group.assert_not_called()
+    coordinate.assert_not_called()
+    prepare.assert_not_called()
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_execution_policy_publishes_counts_after_target_coordination(busy):
+    runner = _runner()
+    policy = dspark_dp.NpuDSparkExecutionPolicy(runner, coordinates_dp_verify=True)
+    # An idle scheduler may have built a layout using the full uniform window.
+    # Its synthetic width must not affect the actual packed target tier.
+    original = RaggedVerifyLayout.from_verify_lens_device(
+        verify_lens=torch.tensor([0] if not busy else [3]), graph_num_tokens=32
+    )
+    batch = SimpleNamespace(batch_size=lambda: int(busy))
+    result = object()
+    forward_batch = object()
+    calls = Mock()
+    with (
+        patch.object(
+            dspark_dp, "coordinate_compact_dp_layout", return_value=result
+        ) as coordinate,
+        patch.object(dspark_dp, "prepare_compact_dp_forward_batch") as prepare,
+    ):
+        calls.attach_mock(coordinate, "coordinate")
+        calls.attach_mock(prepare, "prepare")
+        assert policy.coordinate_verify_layout(batch=batch, layout=original) is result
+        policy.prepare_verify_forward_batch(forward_batch)
+    coordinate.assert_called_once_with(
+        batch=batch, layout=original if busy else None, model_runner=runner
+    )
+    prepare.assert_called_once_with(forward_batch, runner)
+    assert [call[0] for call in calls.mock_calls] == ["coordinate", "prepare"]

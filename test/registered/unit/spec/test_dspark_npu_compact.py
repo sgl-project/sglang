@@ -128,6 +128,8 @@ class TestNpuCompactMetadata(CustomTestCase):
             page_size=8,
             device="cpu",
             _dspark_dsa_ragged_verify=True,
+            ragged_verify_requires_cpu_seq_lens=False,
+            ragged_verify_idle_seq_len=0,
         )
         _bind_metadata_methods(backend)
         init = _backend_method(
@@ -194,6 +196,8 @@ class TestNpuCompactMetadata(CustomTestCase):
             page_size=8,
             device="cpu",
             _dspark_dsa_ragged_verify=True,
+            ragged_verify_requires_cpu_seq_lens=False,
+            ragged_verify_idle_seq_len=0,
             needs_cpu_seq_lens=True,
         )
         _bind_metadata_methods(backend)
@@ -260,6 +264,8 @@ class TestNpuCompactMetadata(CustomTestCase):
         backend = SimpleNamespace(
             graph_mode=False,
             _dspark_dsa_ragged_verify=True,
+            ragged_verify_requires_cpu_seq_lens=False,
+            ragged_verify_idle_seq_len=0,
             supports_ragged_verify_graph=True,
             req_to_token_pool=SimpleNamespace(req_to_token=table),
             req_to_token=table,
@@ -359,6 +365,8 @@ class TestNpuCompactExecution(CustomTestCase):
         backend = SimpleNamespace(
             graph_mode=False,
             _dspark_dsa_ragged_verify=True,
+            ragged_verify_requires_cpu_seq_lens=False,
+            ragged_verify_idle_seq_len=0,
             supports_ragged_verify_graph=True,
             req_to_token_pool=SimpleNamespace(req_to_token=table),
             req_to_token=table,
