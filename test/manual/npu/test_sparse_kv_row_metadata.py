@@ -127,8 +127,14 @@ def mapping_reference(
             offset += length
     device = plan.source.device
     dst = torch.tensor(dst, device=device)
+    eligible = torch.tensor(eligible, device=device)
     loc = batch.out_cache_loc.long()
-    mask = torch.tensor(eligible, device=device) & valid & (loc >= 0) & (loc < capacity)
+    return mapping_device_reference(plan, loc, valid, capacity, dst, eligible)
+
+
+def mapping_device_reference(plan, loc, valid, capacity, dst, eligible):
+    device = plan.source.device
+    mask = eligible & valid & (loc >= 0) & (loc < capacity)
     safe = loc.clamp(0, capacity - 1)
     counts = torch.zeros(capacity, device=device, dtype=torch.int32)
     counts.scatter_add_(0, safe, mask.int())
@@ -138,16 +144,23 @@ def mapping_reference(
     return torch.arange(loc.numel(), device=device), dst, mask, occupied == 0
 
 
-def measure(reference, candidate, device, repeats):
+def measure(reference, candidate, device, repeats, *, capture=True):
     def sync():
         if device == "npu":
             torch.npu.synchronize()
 
+    warm_start = time.perf_counter_ns()
     for _ in range(5):
         reference()
         candidate()
     sync()
+    warm_pair_us = (time.perf_counter_ns() - warm_start) / 5 / 1000
+    if warm_pair_us > 10000:
+        repeats = min(repeats, 3)
+    elif warm_pair_us > 1000:
+        repeats = min(repeats, 10)
     results = {"reference_us": [], "candidate_us": []}
+    results["eager_calls_per_sample"] = repeats
     for r in range(5):
         pairs = [("reference_us", reference), ("candidate_us", candidate)]
         if r % 2:
@@ -162,9 +175,25 @@ def measure(reference, candidate, device, repeats):
     results["speedup"] = statistics.median(results["reference_us"]) / statistics.median(
         results["candidate_us"]
     )
-    if device == "npu":
-        old_graph, old_outputs = replay(reference, reference)
-        new_graph, new_outputs = replay(candidate, reference)
+    if device == "npu" and capture:
+        unroll = (
+            1
+            if statistics.median(results["reference_us"]) > 10000
+            else 4
+            if statistics.median(results["candidate_us"]) >= 200
+            else 64
+        )
+        old_graph, old_outputs = replay(reference, reference, unroll=unroll)
+        new_graph, new_outputs = replay(candidate, reference, unroll=unroll)
+        graph_repeats = max(2, repeats // unroll)
+        results["graph_calls_per_replay"] = unroll
+        results["graph_timing_scope"] = (
+            f"Device events over {unroll} captured calls, normalized per call."
+        )
+        for _ in range(3):
+            old_graph.replay()
+            new_graph.replay()
+        sync()
         graph_results = {"reference_graph_us": [], "candidate_graph_us": []}
         for r in range(5):
             pairs = [
@@ -177,20 +206,26 @@ def measure(reference, candidate, device, repeats):
                 start = torch.npu.Event(enable_timing=True)
                 end = torch.npu.Event(enable_timing=True)
                 start.record()
-                for _ in range(repeats):
+                for _ in range(graph_repeats):
                     graph.replay()
                 end.record()
                 end.synchronize()
-                graph_results[key].append(start.elapsed_time(end) * 1000 / repeats)
+                graph_results[key].append(
+                    start.elapsed_time(end) * 1000 / (graph_repeats * unroll)
+                )
         exact(old_outputs, new_outputs)
         results.update(graph_results)
         results["graph_speedup"] = statistics.median(
             results["reference_graph_us"]
         ) / statistics.median(results["candidate_graph_us"])
+    elif not capture:
+        results["graph_scope"] = (
+            "Host tensor construction uses synchronous H2D; device substage is measured separately."
+        )
     return results
 
 
-def replay(fn, reference):
+def replay(fn, reference, *, unroll=1):
     # Change tensor contents after capture; replay must read the new values.
     warmup = torch.npu.Stream()
     warmup.wait_stream(torch.npu.current_stream())
@@ -200,7 +235,8 @@ def replay(fn, reference):
     torch.npu.current_stream().wait_stream(warmup)
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
-        outputs = fn()
+        for _ in range(unroll):
+            outputs = fn()
     if outputs is None:
         outputs = ()
     elif hasattr(outputs, "source"):
@@ -515,15 +551,22 @@ def large_prefill_cases(args, kernels, results):
             batch.extend_seq_lens_cpu,
         )
         exact(fused(), ref())
-        graph, output = replay(fused, ref)
+        # Full current-mapping wrappers, including the baseline, construct
+        # synchronous host-to-device tensors and cannot use GLOBAL capture.
         current_valid[::2] = False
-        graph.replay()
-        torch.npu.synchronize()
-        exact(output, ref())
+        exact(fused(), ref())
+        current_valid.fill_(True)
+        graph_stage = prefill_mapping_device_case(
+            kernels, plan, batch, current_valid, lens, width
+        )
+        results["cases"].append(f"prefill-device-graph/B{b}/L{length}/Q{width}")
         results["cases"].append(f"prefill-large/B{b}/L{length}/Q{width}")
         if args.benchmark:
             results["benchmarks"][f"mapping/B{b}L{length}Q{width}"] = measure(
-                ref, fused, d, 30
+                ref, fused, d, 30, capture=False
+            )
+            results["benchmarks"][f"mapping_device_stage/B{b}L{length}Q{width}"] = (
+                measure(graph_stage[0], graph_stage[1], d, 30)
             )
             if reference_module is not None:
                 old = lambda: reference_module.make_fused_prefill_plan(
@@ -540,7 +583,7 @@ def large_prefill_cases(args, kernels, results):
                 exact(new_mapping(), old_mapping())
                 results["benchmarks"][
                     f"fused_prefill_current_mapping/B{b}L{length}Q{width}"
-                ] = measure(old_mapping, new_mapping, d, 30)
+                ] = measure(old_mapping, new_mapping, d, 30, capture=False)
                 results["benchmarks"][f"make_prefill_plan/B{b}L{length}"] = measure(
                     old, new, d, 30
                 )
@@ -580,16 +623,90 @@ def large_prefill_cases(args, kernels, results):
                 )
                 new_forward = forward_method(SOURCE / "fused_manager.py", new_module)
                 manager.budget = SimpleNamespace(prefill_workspace_tokens=total)
-                manager._prefill_workspace_stream = None
+
+                def call_forward(method):
+                    # Each timing graph owns its capture stream independently.
+                    manager._prefill_workspace_stream = None
+                    plan = method(manager, batch, None)
+                    assert plan is not None, "Planner benchmark captured a fallback"
+                    return plan
+
                 results["benchmarks"][f"prepare_forward_kv_plan/B{b}L{length}"] = (
                     measure(
-                        lambda: old_forward(manager, batch, None),
-                        lambda: new_forward(manager, batch, None),
+                        lambda: call_forward(old_forward),
+                        lambda: call_forward(new_forward),
                         d,
                         30,
                     )
                 )
         checkpoint(args, results)
+
+
+def prefill_mapping_device_case(kernels, plan, batch, current_valid, lens, width):
+    """Validate the same three device kernels after CPU metadata upload."""
+    device = plan.source.device
+    b, n, total = len(lens), current_valid.numel(), plan.total_tokens
+    capacity = (b + 1) * max(lens)
+    starts = [sum(lens[:r]) for r in range(b)]
+    ends = [(r + 1) * width for r in range(b)]
+    prefixes = [length - width for length in lens]
+    metadata = torch.tensor(
+        ends + starts + prefixes + ends, device=device, dtype=torch.long
+    )
+    dst = torch.cat(
+        [
+            torch.arange(start + prefix, start + prefix + width, device=device)
+            for start, prefix in zip(starts, prefixes)
+        ]
+    )
+    eligible = torch.ones(n, device=device, dtype=torch.bool)
+    reference = lambda: mapping_device_reference(
+        plan, batch.out_cache_loc, current_valid, capacity, dst, eligible
+    )
+
+    def candidate():
+        source = torch.empty(n, device=device, dtype=torch.long)
+        destination = torch.empty_like(source)
+        valid = torch.empty(n, device=device, dtype=torch.bool)
+        host_mask = torch.empty(total, device=device, dtype=torch.bool)
+        counts = torch.empty(capacity, device=device, dtype=torch.int32)
+        kernels._mapping_init_kernel[(kernels.triton.cdiv(max(capacity, total), 512),)](
+            counts, host_mask, capacity, total, 512
+        )
+        kernels._mapping_count_kernel[(kernels.triton.cdiv(n, 128),)](
+            metadata,
+            batch.out_cache_loc,
+            current_valid,
+            counts,
+            source,
+            destination,
+            valid,
+            n,
+            b,
+            capacity,
+            kernels.triton.next_power_of_2(b),
+            128,
+        )
+        kernels._mapping_finish_kernel[(kernels.triton.cdiv(n, 256),)](
+            plan.source,
+            batch.out_cache_loc,
+            counts,
+            destination,
+            valid,
+            host_mask,
+            n,
+            capacity,
+            256,
+        )
+        return source, destination, valid, host_mask
+
+    graph, output = replay(candidate, reference)
+    current_valid[::2] = False
+    graph.replay()
+    torch.npu.synchronize()
+    exact(output, reference())
+    current_valid.fill_(True)
+    return reference, candidate
 
 
 def mf_case(args, results):

@@ -114,7 +114,7 @@ class MemFabricKVPool:
                 )
         if source_rows.numel() == 0:
             return
-        if source_rows.device.type == "npu":
+        if source_rows.device.type == "npu" and len(sources) == 2:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (
                 copy_rows_metadata,
             )

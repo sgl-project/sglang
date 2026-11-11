@@ -339,9 +339,12 @@ def _copy_rows_metadata_kernel(
     dst,
     lengths,
     count,
-    source_bases,
-    destination_bases,
-    WIDTHS: tl.constexpr,
+    source_base_0,
+    source_base_1,
+    destination_base_0,
+    destination_base_1,
+    WIDTH_0: tl.constexpr,
+    WIDTH_1: tl.constexpr,
     N: tl.constexpr,
     SRC_STRIDE: tl.constexpr,
     DST_STRIDE: tl.constexpr,
@@ -353,16 +356,20 @@ def _copy_rows_metadata_kernel(
     s = tl.load(source_rows + i * SRC_STRIDE, i < N, other=0).to(tl.int64)
     d = tl.load(destination_rows + i * DST_STRIDE, i < N, other=0).to(tl.int64)
     s, d = tl.where(live, s, 0), tl.where(live, d, 0)
-    for c in tl.static_range(len(WIDTHS)):
-        tl.store(src + c * N + i, source_bases[c] + s * WIDTHS[c], i < N)
-        tl.store(dst + c * N + i, destination_bases[c] + d * WIDTHS[c], i < N)
-        tl.store(lengths + c * N + i, tl.where(live, WIDTHS[c], 0), i < N)
+    tl.store(src + i, source_base_0 + s * WIDTH_0, i < N)
+    tl.store(src + N + i, source_base_1 + s * WIDTH_1, i < N)
+    tl.store(dst + i, destination_base_0 + d * WIDTH_0, i < N)
+    tl.store(dst + N + i, destination_base_1 + d * WIDTH_1, i < N)
+    tl.store(lengths + i, tl.where(live, WIDTH_0, 0), i < N)
+    tl.store(lengths + N + i, tl.where(live, WIDTH_1, 0), i < N)
     if tl.program_id(0) == 0:
-        tl.store(count, N * len(WIDTHS))
+        tl.store(count, N * 2)
 
 
 def copy_rows_metadata(sources, destinations, source_rows, destination_rows, valid):
-    """Build component-major MF byte descriptors without touching host KV."""
+    """Build split CKV/KPE byte descriptors without touching host KV."""
+    if len(sources) != 2 or len(destinations) != 2:
+        raise ValueError("Fused MF descriptors require two split KV components")
     n = source_rows.numel()
     device = source_rows.device
     src = torch.empty(n * len(sources), dtype=torch.int64, device=device)
@@ -377,9 +384,12 @@ def copy_rows_metadata(sources, destinations, source_rows, destination_rows, val
         dst,
         lengths,
         count,
-        tuple(s.data_ptr() for s in sources),
-        tuple(d.data_ptr() for d in destinations),
-        tuple(s.shape[-1] * s.element_size() for s in sources),
+        sources[0].data_ptr(),
+        sources[1].data_ptr(),
+        destinations[0].data_ptr(),
+        destinations[1].data_ptr(),
+        sources[0].shape[-1] * sources[0].element_size(),
+        sources[1].shape[-1] * sources[1].element_size(),
         n,
         source_rows.stride(0),
         destination_rows.stride(0),
