@@ -234,6 +234,10 @@ impl TokenizerRegistry {
 
     /// Encode a raw prompt as the engine's `tokenizer(text)` does, special tokens included.
     pub fn encode_prompt(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {
+        crate::off_worker::run(|| self.encode_prompt_now(model_id, text))
+    }
+
+    fn encode_prompt_now(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {
         let affixes = self.prompt_affixes.as_ref()?;
         let tokenizer = self.get(model_id)?;
         // The supported tiktoken models use Kimi's chunked encoding, also used for chat.
@@ -267,6 +271,10 @@ impl TokenizerRegistry {
 
     /// Render with dynamo-render and tokenize; return `None` when unavailable or unsuccessful.
     pub fn encode_chat(&self, model_id: &str, request: &serde_json::Value) -> Option<Vec<u32>> {
+        crate::off_worker::run(|| self.encode_chat_now(model_id, request))
+    }
+
+    fn encode_chat_now(&self, model_id: &str, request: &serde_json::Value) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.
         let entry = Arc::clone(&*self.formatters.get(model_id)?);
@@ -677,6 +685,38 @@ mod tests {
         assert!(
             reg.encode_chat("tiny", &request).is_none(),
             "a failing render must yield None so routing falls back to raw text"
+        );
+    }
+
+    /// A slow chat render keeps the runtime serving: with ONE worker, an
+    /// `encode_chat` from a spawned task must not keep another task's timer
+    /// from firing, whatever task calls it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn slow_chat_encode_leaves_the_runtime_serving() {
+        use crate::off_worker::test_support::{
+            slow_chat_body, slow_template_dir, time_beside_a_timer,
+        };
+        use std::time::Duration;
+
+        let dir = slow_template_dir();
+        let mut config = cfg();
+        config.model.tokenizer_path =
+            Some(dir.path().join("tokenizer.json").to_str().unwrap().into());
+        let registry = Arc::new(TokenizerRegistry::load_from_config(&config).unwrap());
+        let body = slow_chat_body(
+            |b| assert!(registry.encode_chat("tiny", b).is_some()),
+            Duration::from_millis(400),
+        );
+        let (took, ticked_after) = time_beside_a_timer(move || async move {
+            assert!(
+                registry.encode_chat("tiny", &body).is_some(),
+                "rendered nothing"
+            );
+        })
+        .await;
+        assert!(
+            ticked_after < took / 2,
+            "timer task waited {ticked_after:?} while the encode took {took:?}"
         );
     }
 }
