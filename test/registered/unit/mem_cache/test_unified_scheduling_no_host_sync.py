@@ -49,7 +49,8 @@ def _cuda(values):
 
 class _Step:
     """One scheduling step's allocator calls on a two-request batch: extend,
-    decode, a window's tail-only extend, window retirement and release."""
+    decode, a window's tail-only extend, window retirement, a fresh request's
+    state clear and release."""
 
     def __init__(self, allocator):
         self.allocator = allocator
@@ -71,6 +72,10 @@ class _Step:
         self.tail_prefix = torch.zeros(1, dtype=torch.int64)
         self.tail_prefix_d = _cuda([0])
         self.tail_last = _cuda([-1])
+        if self.has_state:
+            name = allocator.mamba_allocator.sub_pool_name
+            first = allocator.arena.first_entry(name)
+            self.state_entries = _cuda([first, first + 1])
 
     def extend(self):
         self.out = self.allocator.alloc_extend(
@@ -126,6 +131,9 @@ class _Step:
         assert slots is not None
         self.allocator.mamba_allocator.free(slots)
 
+    def clear_state(self):
+        self.allocator.state.pool.clear_slots(self.state_entries)
+
 
 class TestUnifiedSchedulingNoHostSync(CustomTestCase):
     def _allocator(self, chain):
@@ -152,6 +160,7 @@ class TestUnifiedSchedulingNoHostSync(CustomTestCase):
             errors["decode"] = check(lambda: decoded.append(decode()))
             if step.has_state:
                 errors["state slots"] = check(step.state_slots)
+                errors["state clear"] = check(step.clear_state)
             if step.has_window:
                 tail = []
                 errors["window tail extend"] = check(
