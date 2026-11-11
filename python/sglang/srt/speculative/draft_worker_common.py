@@ -6,7 +6,10 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
-from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
+from sglang.srt.arg_groups.choices import (
+    DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+    DRAFT_ATTENTION_BACKEND_CHOICES,
+)
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -49,7 +52,7 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
         draft_backend, _ = attention_backends()
     if draft_backend is None:
         return platform_fallback
-    if algo_label == "DFLASH" and draft_backend == "cutedsl_mla":
+    if algo_label == "DFLASH" and draft_backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
         return draft_backend
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
         fallback = platform_fallback
