@@ -155,6 +155,14 @@ class WindowLayers(msgspec.Struct, frozen=True, kw_only=True):
     window: Optional[int] = None
 
 
+class FullLayerParts(msgspec.Struct, frozen=True, kw_only=True):
+    """A part some full-attention layers keep beside their KV, for the whole
+    request: its geometry and the layers that keep it."""
+
+    layer_ids: Tuple[int, ...]
+    geometry: PartGeometry
+
+
 def window_sub_pool_name(window: Optional[int]) -> str:
     """The sub-pool name of a window, from its own length alone: a window the
     model does not state the length of is ``window``."""
@@ -182,11 +190,13 @@ def kv_layer_decls(
     state_layer_ids: Sequence[int] = (),
     state_geometry: Optional[StateGeometry] = None,
     checkpoint_interval: Optional[int] = None,
+    full_layer_parts: Sequence[FullLayerParts] = (),
 ) -> Tuple[KVLayerDecl, ...]:
     """One declaration per layer that stores anything, in layer order. A layer
     may hold an attention part and a state part at once. Window layers come as
     ``windows``, one group per window length, or as one group through the
-    ``window_*`` arguments."""
+    ``window_*`` arguments. ``full_layer_parts`` are further parts full
+    layers keep with their KV, declared after it."""
     windows = list(windows)
     if window_layer_ids:
         assert window_geometry is not None, "window layers need their geometry"
@@ -208,6 +218,12 @@ def kv_layer_decls(
     full = KVPartDecl(lifetime=FullLifetime(), geometry=full_geometry)
     for layer_id in full_layer_ids:
         parts.setdefault(layer_id, []).append(full)
+    for extra in full_layer_parts:
+        stray = set(extra.layer_ids) - set(full_layer_ids)
+        assert not stray, f"layers {sorted(stray)} keep a part beside no full KV"
+        part = KVPartDecl(lifetime=FullLifetime(), geometry=extra.geometry)
+        for layer_id in extra.layer_ids:
+            parts[layer_id].append(part)
     for group in windows:
         part = KVPartDecl(
             lifetime=WindowLifetime(window=group.window), geometry=group.geometry

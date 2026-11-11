@@ -1,9 +1,11 @@
 """The sub-pools a model's declarations need, their layouts and chain order.
 
-Parts with the same lifetime and allocation unit share a sub-pool. In the
-unified buffer the sub-pools form one chain ordered by lifetime rank: the
-first grows up from the buffer's low end, the last grows down from its high
-end, any between float.
+Parts with the same lifetime and allocation unit share a sub-pool. A sub-pool
+whose layers declare one geometry gets that geometry's layout; one whose
+layers declare several (a layer's KV and a part it keeps beside it) gets a
+composite unit holding each, in declaration order. In the unified buffer the
+sub-pools form one chain ordered by lifetime rank: the first grows up from the
+buffer's low end, the last grows down from its high end, any between float.
 """
 
 from typing import Dict, List, Optional, Sequence, Tuple, Type
@@ -31,6 +33,12 @@ from sglang.srt.mem_cache.kv.decl import (
     window_sub_pool_name,
 )
 from sglang.srt.mem_cache.kv.layout.base import SubPoolSpec, _store_dtype_for
+from sglang.srt.mem_cache.kv.layout.composite import (
+    CompositeSubPoolSpec,
+    TokenRows,
+    UnitPart,
+    UnitPartGeometry,
+)
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.request import RequestSubPoolSpec
@@ -179,16 +187,37 @@ class WireEntry(msgspec.Struct, frozen=True, kw_only=True):
     key: Optional[str] = None
 
 
-class PlannedSubPool(msgspec.Struct, frozen=True, kw_only=True):
+class PlannedPart(msgspec.Struct, frozen=True, kw_only=True):
+    """One geometry a composite sub-pool holds: the part name it is routed by,
+    and the layers that declare it."""
+
+    name: str
+    geometry: PartGeometry
+    layer_ids: Tuple[int, ...]
+
+
+class PlannedSubPool(
+    msgspec.Struct, frozen=True, kw_only=True, repr_omit_defaults=True
+):
     name: str
     lifetime: KVLifetime
     # Entries per allocation unit: the page for token sub-pools, one entry (a
     # request's slot or row) for state and request sub-pools.
     unit: int
+    # The sub-pool's first geometry (its token KV) and the layers declaring it.
     layer_ids: Tuple[int, ...]
     geometry: PartGeometry
     spec: SubPoolSpec
     external: SubPoolExternal
+    # Every geometry of a composite sub-pool, the first one included; empty
+    # when the sub-pool's layers declare one geometry.
+    parts: Tuple[PlannedPart, ...] = ()
+
+    def part(self, name: str) -> PlannedPart:
+        for part in self.parts:
+            if part.name == name:
+                return part
+        raise KeyError(f"sub-pool {self.name!r} holds no part {name!r}")
 
 
 class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
@@ -395,45 +424,47 @@ def _sub_pool_name(lifetime: KVLifetime) -> str:
     return _SUB_POOL_NAMES[type(lifetime)]
 
 
-def _group_parts(
-    decls: Sequence[KVLayerDecl], page_size: int
-) -> Dict[Tuple[KVLifetime, int], Tuple[List[int], PartGeometry]]:
-    groups: Dict[Tuple[KVLifetime, int], Tuple[List[int], PartGeometry]] = {}
+# Per (lifetime, unit) group: each geometry its layers declare, in order of
+# first declaration, with the layers declaring it.
+_Groups = Dict[Tuple[KVLifetime, int], List[Tuple[PartGeometry, List[int]]]]
+
+
+def _group_parts(decls: Sequence[KVLayerDecl], page_size: int) -> _Groups:
+    groups: _Groups = {}
     for decl in decls:
         for part in decl.parts:
             key = (part.lifetime, _unit(part.lifetime, page_size))
-            layer_ids, geometry = groups.setdefault(key, ([], part.geometry))
-            if geometry != part.geometry:
-                raise ValueError(
-                    f"layers of one {type(part.lifetime).__name__} sub-pool declare "
-                    f"two geometries ({geometry} and {part.geometry}); the unified "
-                    "pool lays out one geometry per sub-pool"
-                )
-            layer_ids.append(decl.layer_id)
+            entries = groups.setdefault(key, [])
+            for geometry, layer_ids in entries:
+                if geometry == part.geometry:
+                    layer_ids.append(decl.layer_id)
+                    break
+            else:
+                entries.append((part.geometry, [decl.layer_id]))
     request = _request_group(groups)
     if request is not None:
-        groups[(RequestLifetime(), 1)] = request
+        geometry, layer_ids = request
+        groups[(RequestLifetime(), 1)] = [(geometry, layer_ids)]
     return groups
 
 
-def _request_group(
-    groups: Dict[Tuple[KVLifetime, int], Tuple[List[int], PartGeometry]],
-) -> Optional[Tuple[List[int], RequestGeometry]]:
+def _request_group(groups: _Groups) -> Optional[Tuple[RequestGeometry, List[int]]]:
     """The request sub-pool the state sub-pools' request parts form, each part
     named by its state sub-pool; None when no state declares any."""
     parts, layer_ids = [], set()
-    for (lifetime, _), (layers, geometry) in groups.items():
-        if not isinstance(geometry, StateGeometry) or not geometry.request_parts:
-            continue
-        name = _sub_pool_name(lifetime)
-        parts.extend(
-            msgspec.structs.replace(part, name=f"{name}.{part.name}")
-            for part in geometry.request_parts
-        )
-        layer_ids.update(layers)
+    for (lifetime, _), entries in groups.items():
+        for geometry, layers in entries:
+            if not isinstance(geometry, StateGeometry) or not geometry.request_parts:
+                continue
+            name = _sub_pool_name(lifetime)
+            parts.extend(
+                msgspec.structs.replace(part, name=f"{name}.{part.name}")
+                for part in geometry.request_parts
+            )
+            layer_ids.update(layers)
     if not parts:
         return None
-    return sorted(layer_ids), RequestGeometry(parts=tuple(parts))
+    return RequestGeometry(parts=tuple(parts)), sorted(layer_ids)
 
 
 def sub_pool_names(decls: Sequence[KVLayerDecl]) -> Tuple[str, ...]:
@@ -441,6 +472,94 @@ def sub_pool_names(decls: Sequence[KVLayerDecl]) -> Tuple[str, ...]:
     fused-draft placement needs before the plan exists."""
     keys = _group_parts(decls, page_size=1)
     return tuple(_sub_pool_name(lt) for lt, _ in sorted(keys, key=_chain_key))[::-1]
+
+
+def _needs_unit_layout(geometry: PartGeometry) -> bool:
+    """Whether a geometry is laid out only inside a composite unit, even alone."""
+    return isinstance(geometry, UnitPartGeometry) and geometry.requires_unit_layout()
+
+
+def _part_name(geometry: PartGeometry) -> str:
+    """The name a composite sub-pool routes a geometry's layers by."""
+    if isinstance(geometry, UnitPartGeometry):
+        return geometry.part_name
+    return KV_PART
+
+
+def _unit_part(geometry: PartGeometry, *, name: str, layer_num: int) -> UnitPart:
+    """A geometry's bytes in a composite unit."""
+    if isinstance(geometry, UnitPartGeometry):
+        return geometry.unit_part(name=name, layer_num=layer_num)
+    # Token-major rows: their backends read one run at the token entry stride.
+    if isinstance(geometry, MLAGeometry):
+        row_bytes = (
+            geometry.kv_lora_rank + geometry.qk_rope_head_dim
+        ) * geometry.kv_cache_dtype.itemsize
+    else:
+        assert isinstance(geometry, MHAGeometry), geometry
+        row_bytes = (
+            geometry.head_num
+            * (geometry.head_dim + geometry.v_head_dim)
+            * geometry.kv_cache_dtype.itemsize
+        )
+    return TokenRows(name=name, layer_num=layer_num, row_bytes=row_bytes)
+
+
+def _planned_parts(
+    entries: Sequence[Tuple[PartGeometry, Sequence[int]]],
+) -> Tuple[PlannedPart, ...]:
+    for geometry, _ in entries:
+        if isinstance(geometry, (StateGeometry, RequestGeometry)):
+            raise ValueError(
+                f"a {type(geometry).__name__} has no part in a composite unit; "
+                "only token layers' KV and the parts they keep beside it share one"
+            )
+    parts = tuple(
+        PlannedPart(
+            name=_part_name(geometry), geometry=geometry, layer_ids=tuple(layer_ids)
+        )
+        for geometry, layer_ids in entries
+    )
+    names = [p.name for p in parts]
+    if len(set(names)) != len(names) or names[0] != KV_PART:
+        raise ValueError(
+            "layers of one sub-pool declare their KV in more than one geometry "
+            f"({[type(p.geometry).__name__ for p in parts]}); a sub-pool holds "
+            "one KV layout, beside which its layers may keep other parts"
+        )
+    kv_layers = set(parts[0].layer_ids)
+    for part in parts[1:]:
+        stray = set(part.layer_ids) - kv_layers
+        if stray:
+            raise ValueError(
+                f"layers {sorted(stray)} keep a {part.name!r} part without KV in "
+                "the same sub-pool"
+            )
+    return parts
+
+
+def _composite_spec(
+    *,
+    name: str,
+    parts: Tuple[PlannedPart, ...],
+    page_size: int,
+    grow_direction: str,
+    fused_draft: Optional[FusedDraftPlacement],
+) -> CompositeSubPoolSpec:
+    if fused_draft is not None and fused_draft.region(name) is not None:
+        raise ValueError(
+            f"a fused draft cannot ride in composite sub-pool {name!r} yet"
+        )
+    return CompositeSubPoolSpec(
+        name=name,
+        layer_num=len(parts[0].layer_ids),
+        grow_direction=grow_direction,
+        page_size=page_size,
+        parts=tuple(
+            _unit_part(p.geometry, name=p.name, layer_num=len(p.layer_ids))
+            for p in parts
+        ),
+    )
 
 
 def _spec_for(
@@ -548,16 +667,35 @@ def plan_kv_storage(
                 raise ValueError(f"draft band {name!r} duplicates a target lifetime")
             if name in names_by_key.values():
                 raise ValueError(f"draft band {name!r} takes a target sub-pool's name")
-            groups[key] = ([], geometry)
+            groups[key] = [(geometry, [])]
             names_by_key[key] = name
     chain = sorted(groups, key=lambda key: (*_chain_key(key), names_by_key[key]))
 
     sub_pools = []
     for i, key in enumerate(chain):
         lifetime, unit = key
-        layer_ids, geometry = groups[key]
+        entries = groups[key]
+        geometry, layer_ids = entries[0]
         name = names_by_key[key]
         grow_direction = "down" if i == len(chain) - 1 else "up" if i == 0 else "float"
+        parts = ()
+        if len(entries) > 1 or _needs_unit_layout(geometry):
+            parts = _planned_parts(entries)
+            spec = _composite_spec(
+                name=name,
+                parts=parts,
+                page_size=unit,
+                grow_direction=grow_direction,
+                fused_draft=fused_draft,
+            )
+        else:
+            spec = _spec_for(
+                name=name,
+                geometry=geometry,
+                layer_num=len(layer_ids),
+                grow_direction=grow_direction,
+                fused_draft=fused_draft,
+            )
         sub_pools.append(
             PlannedSubPool(
                 name=name,
@@ -565,13 +703,8 @@ def plan_kv_storage(
                 unit=unit,
                 layer_ids=tuple(layer_ids),
                 geometry=geometry,
-                spec=_spec_for(
-                    name=name,
-                    geometry=geometry,
-                    layer_num=len(layer_ids),
-                    grow_direction=grow_direction,
-                    fused_draft=fused_draft,
-                ),
+                spec=spec,
+                parts=parts,
                 external=(
                     _window_external(name)
                     if isinstance(lifetime, WindowLifetime)
