@@ -31,7 +31,7 @@ they can also select and merge in one kernel (``DcpFusedTopK``).
 from __future__ import annotations
 
 from functools import partial
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 import triton
@@ -415,8 +415,6 @@ def dcp_global_topk(
     topk: int,
     page_size: int,
     plan: torch.Tensor,
-    *,
-    all_gather: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Decode: global top-k over the DCP group as widened KV slots, -1 padded.
 
@@ -438,23 +436,22 @@ def dcp_global_topk(
     out = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
     if rows == 0:
         return out
-    if all_gather is None and _TOPK_MERGE is not None and _TOPK_MERGE.usable(rows):
+    if _TOPK_MERGE is not None and _TOPK_MERGE.usable(rows):
         candidates = _local_candidates(logits, local_lens, topk)
         _TOPK_MERGE(candidates, global_lens, page_table, out, span)
         return out
-    workspace = _CANDIDATE_ALL_GATHER if all_gather is None else None
+    workspace = _CANDIDATE_ALL_GATHER
     compact_prefix = (
         workspace is not None
         and workspace.prefix_handle is not None
         and rows <= workspace.max_rows
         and topk == workspace.topk
     )
-    if all_gather is None and workspace is not None:
-        all_gather = partial(
-            workspace, local_lens=local_lens, compact_prefix=compact_prefix
-        )
-    if all_gather is None:
-        all_gather = partial(parallel.dcp_group.all_gather, dim=0)
+    all_gather = (
+        partial(workspace, local_lens=local_lens, compact_prefix=compact_prefix)
+        if workspace is not None
+        else partial(parallel.dcp_group.all_gather, dim=0)
+    )
 
     # Row i of `dense` holds the candidate scores at their global positions.
     # Its -inf fill depends on the lengths only, so it overlaps the local top-k
