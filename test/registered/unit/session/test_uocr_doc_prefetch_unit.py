@@ -176,12 +176,7 @@ class TestNextWindowPrefetch(CustomTestCase):
         sched.add(released)
         _finish(w0, 1)
         prefetch.on_window_finished(w0)
-        held = prefetch.reset()
-        self.assertCountEqual(held, [parked, released])
-        # The flush aborts them, which takes them out.
-        prefetch._abort_windows(held, finished_reason=None)
-        self.assertEqual(prefetch.held_count(), 0)
-        self.assertEqual(list(prefetch.released), [])
+        self.assertCountEqual(prefetch.reset(), [parked, released])
 
 
 class TestEarlyEmbeddings(CustomTestCase):

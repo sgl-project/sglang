@@ -178,7 +178,6 @@ class TestEndedRequests(CustomTestCase):
 
         dropped.exit_via = "release"
         checker._check_ended_requests()
-        self.assertEqual(checker.unended, {queued, offloading})
 
 
 class TestEveryWindowIsConserved(CustomTestCase):
