@@ -127,6 +127,71 @@ residue after killing the server), which poisons the next cell with phantom OOM.
 - The compare report prints per-cell deltas; large deltas on low-concurrency cells are
   often real run-to-run variance, not regressions — check the variance gate before blaming code.
 
+## Usage examples (with results)
+
+All numbers below come from the September 2026 validation sweeps on a single Atlas 800I A3 node
+(2 x 910C die, TP=2), recorded in the run manifests (`manifest.jsonl` carries the full provenance
+and per-cell metrics, so every figure is checkable).
+
+### Example 1 — Baseline a new model spec (MoE, 18-cell grid)
+
+User ask: *"Benchmark Qwen3.6-35B-A3B BF16 on this A3 and pick the best config under p99 TPOT <= 100 ms."*
+
+```bash
+# 1) confirm the grid before spending NPU hours (prints 18 cells)
+python benchmark/ascend_bench/run_sweep.py \
+  --config benchmark/ascend_bench/configs/cookbook/qwen3.6-35b-a3b-bf16.yaml \
+  --workdir /mnt/ascend_bench_runs --dry-run
+# 2) run the sweep; manifest.jsonl makes it resumable with --run-id
+python benchmark/ascend_bench/run_sweep.py \
+  --config benchmark/ascend_bench/configs/cookbook/qwen3.6-35b-a3b-bf16.yaml \
+  --workdir /mnt/ascend_bench_runs
+```
+
+Result: 18/18 cells done, 0 failed. The report ranks `qwen3.6-35b-a3b__s01__w00__r0` first at
+395.1 tok/s (197.5 tok/s/card); concurrency 8/32/64 gives ~393 / ~955 / ~1310 tok/s; p99 TPOT
+<= 44.8 ms at every concurrency (all pass); gsm8k 0.630-0.652 on every cell.
+
+### Example 2 — SLA-driven config selection (dense 8B, 24-cell grid)
+
+User ask: *"Which mem-fraction / concurrency config should we ship for Qwen3-8B under p99 TTFT <= 2000 ms and p99 TPOT <= 100 ms?"*
+
+```bash
+python benchmark/ascend_bench/run_sweep.py \
+  --config benchmark/ascend_bench/configs/cookbook/qwen3-8b-bf16.yaml \
+  --workdir /mnt/ascend_bench_runs
+```
+
+Result: 24/24 done, exactly **one** SLA-clean cell — `qwen3-8b__s01__w02__r0` (mem-fraction 0.85 x
+conc 32): 1720.8 tok/s (860.4 tok/s/card), p99 TTFT 1709 ms, p99 TPOT 18.5 ms. Five cells were
+marked `unrankable` by the variance gate (CV up to 1.68, driven by one 9.8 s TTFT spike);
+high-concurrency cells fail the TTFT SLA by queueing at saturation — they stay in the matrix with
+an explanation rather than being dropped or re-scaled.
+
+### Example 3 — Regression check between two runs
+
+User ask: *"Re-run the 8B grid with identical settings and diff it against the previous run."*
+
+```bash
+python benchmark/ascend_bench/compare.py RUN_A RUN_B \
+  --metrics output_throughput p99_ttft_ms p99_tpot_ms
+```
+
+Result: cells pair up by `cell_hash`; for `012b5d67` the diff shows output throughput 96.4 -> 84.5
+tok/s (-12.4%), p99 TTFT 3329 -> 111 ms (-96.7%), p99 TPOT +14.8%. Reading: the 9.8 s TTFT spike
+was transient (did not reproduce), while low-concurrency throughput genuinely varies run to run —
+which is exactly why the variance gate marks such cells unrankable instead of calling it a
+regression.
+
+### Example 4 — Incompatible config is captured, not lost
+
+User ask: *"Try NEXTN speculative decoding for the 35B MoE."*
+
+Result: both cells end as `failed_health_timeout`; the report's compatibility matrix keeps the
+server-log tail: UB overflow in `sgl_kernel_npu/mamba/mamba_state_update_triton.py` (MTP draft
+path). The base model without speculative flags was 18/18 green in the same sweep, so the
+conclusion recorded is "draft path incompatible", not "the sweep failed".
+
 ## Common Pitfalls on Ascend NPU (all observed in production sweeps)
 
 See [references/ascend-npu-benchmark-pitfalls.md](references/ascend-npu-benchmark-pitfalls.md)
