@@ -7,7 +7,7 @@ from typing import Optional
 import pytest
 import torch
 
-from sglang.srt.utils.common import get_device
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,

@@ -20,7 +20,7 @@ from sglang.kernels.ops.kv_canary.verify import (
 from sglang.kernels.ops.kv_canary.write import (
     launch_canary_write_kernel,
 )
-from sglang.srt.utils.common import get_device, get_device_module
+from sglang.srt.utils import get_device, get_device_module
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,

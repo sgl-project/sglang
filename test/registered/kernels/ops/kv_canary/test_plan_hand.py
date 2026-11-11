@@ -11,7 +11,7 @@ from sglang.kernels.ops.kv_canary.plan_ref import (
 )
 from sglang.kernels.ops.kv_canary.verify import VerifyPlan
 from sglang.kernels.ops.kv_canary.write import WritePlan
-from sglang.srt.utils.common import get_device, get_device_module
+from sglang.srt.utils import get_device, get_device_module
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,

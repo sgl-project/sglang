@@ -9,7 +9,7 @@ from sglang.kernels.ops.kv_canary.scatter_req_token_ids import (
     _SCATTER_BATCH_BLOCK,
     launch_scatter_req_token_ids_kernel,
 )
-from sglang.srt.utils.common import get_device, get_device_module
+from sglang.srt.utils import get_device, get_device_module
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
