@@ -20,6 +20,7 @@ from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.layers.communication.k3_ar_fusion import _SHARDED_UP_MAX_TOKENS
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
@@ -28,7 +29,14 @@ register_cuda_ci(est_time=21, stage="base-c", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=480, stage="nightly", runner_config="8-gpu-b200")
 
 _HIDDEN_SIZE = 7168
-_GEMM_AG_WORLD_SIZE = 8
+# The GEMV table's two ends, the first batch past it (slice GEMM + gather_add3 only),
+# and the model's gather cap, where the consumer reaches its widest block and strides.
+_GEMM_AG_NUM_TOKENS = (
+    1,
+    gemm_ag.GEMV_MAX_TOKENS,
+    gemm_ag.GEMV_MAX_TOKENS + 1,
+    _SHARDED_UP_MAX_TOKENS,
+)
 _MB = 1024 * 1024
 _SP_TUNING = sp_collective.Tuning(num_blocks=1, block_size=256)
 
@@ -200,39 +208,63 @@ def test_sequence_parallel_collectives():
     torch.testing.assert_close(gather_output, expected_gather, rtol=0, atol=0)
 
 
-@torch.inference_mode()
-def test_gemm_all_gather():
-    _require_sm100()
-    if int(os.environ["WORLD_SIZE"]) != _GEMM_AG_WORLD_SIZE:
-        pytest.skip("Kimi K3 gemm_ag is compiled for TP8")
-    comm = _init_comm()
+@cache_once
+def _gemm_ag_operands():
     generator = torch.Generator().manual_seed(30)
-    x = (
-        (torch.randn(1, gemm_ag.K, generator=generator) * 0.05)
-        .to(torch.bfloat16)
-        .to(_device())
+    max_tokens = max(_GEMM_AG_NUM_TOKENS)
+    x = (torch.randn(max_tokens, gemm_ag.K, generator=generator) * 0.05).to(
+        torch.bfloat16
     )
-    weight = (
-        (torch.randn(gemm_ag.N, gemm_ag.K, generator=generator) * 0.05)
-        .to(torch.bfloat16)
-        .to(_device())
+    weight = (torch.randn(gemm_ag.N, gemm_ag.K, generator=generator) * 0.05).to(
+        torch.bfloat16
     )
-    bias = torch.randn(1, gemm_ag.N, generator=generator).to(
-        device=_device(), dtype=torch.bfloat16
-    )
-    output = torch.empty(1, gemm_ag.N, device=_device(), dtype=torch.bfloat16)
-    expected = (x.float() @ weight.float().t() + bias.float()).to(torch.bfloat16)
+    b = torch.randn(max_tokens, gemm_ag.N, generator=generator).to(torch.bfloat16)
+    c = torch.randn(max_tokens, gemm_ag.N, generator=generator).to(torch.bfloat16)
+    return tuple(t.to(_device()) for t in (x, weight, b, c))
 
-    gemm_ag.gemm_ag_up_proj(
-        comm.world_size,
-        x,
-        weight,
-        bias,
-        None,
-        output,
+
+@pytest.mark.parametrize("with_c", [False, True])
+@pytest.mark.parametrize("num_tokens", _GEMM_AG_NUM_TOKENS)
+@torch.inference_mode()
+def test_gemm_all_gather(num_tokens, with_c):
+    _require_sm100()
+    world_size = int(os.environ["WORLD_SIZE"])
+    if world_size not in gemm_ag.WORLD_SIZES:
+        pytest.skip(f"Kimi K3 gemm_ag is built for TP{gemm_ag.WORLD_SIZES}")
+    _init_comm()
+    _, nccl_group = _init_world()
+    x, weight, b, c = _gemm_ag_operands()
+    x, b = x[:num_tokens], b[:num_tokens]
+    c = c[:num_tokens] if with_c else None
+    output = torch.empty(num_tokens, gemm_ag.N, device=_device(), dtype=torch.bfloat16)
+
+    if num_tokens <= gemm_ag.GEMV_MAX_TOKENS:
+        expected = x.float() @ weight.float().t() + b.float()
+        if c is not None:
+            expected += c.float()
+        gemm_ag.gemm_ag_up_proj(world_size, x, weight, b, c, output)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            output, expected.to(torch.bfloat16), rtol=3e-2, atol=3e-2
+        )
+
+    # Slice GEMM + gather: exact against the slices gathered by NCCL, with the
+    # replicated tail's bf16(bf16(up_proj + b) + c) rounding.
+    rows = gemm_ag.N // world_size
+    rank = dist.get_rank()
+    local = torch.nn.functional.linear(x, weight[rank * rows : (rank + 1) * rows])
+    slices = torch.empty(
+        world_size, num_tokens, rows, device=_device(), dtype=torch.bfloat16
     )
-    torch.cuda.synchronize()
-    torch.testing.assert_close(output, expected, rtol=3e-2, atol=3e-2)
+    dist.all_gather_into_tensor(slices, local, group=nccl_group)
+    expected = slices.permute(1, 0, 2).reshape(num_tokens, gemm_ag.N) + b
+    if c is not None:
+        expected = expected + c
+    for _ in range(3):  # each round flips the push-plane phase
+        output.fill_(float("nan"))
+        gemm_ag.gather_add3(world_size, local, b, c, output)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 @torch.inference_mode()
@@ -307,8 +339,8 @@ def _precompile(num_gpus):
     for world_size in num_gpus:
         all_reduce._jit_module(world_size)
         sp_collective._jit_module(world_size)
-    if _GEMM_AG_WORLD_SIZE in num_gpus:
-        gemm_ag._jit_module()
+        if world_size in gemm_ag.WORLD_SIZES:
+            gemm_ag._jit_module(world_size)
     attn_res._jit_fused_tma_module(4, 1, 200)
 
 

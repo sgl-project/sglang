@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.metrics_collector import (
@@ -280,11 +281,10 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             disaggregation_mode=DisaggregationMode.DECODE,
             disagg_decode_transfer_queue=queue,
             disagg_decode_prealloc_queue=SimpleNamespace(
-                queue=[], pre_allocated_token_counts=lambda: (0, 0)
+                queue=[], pre_allocated_token_counts=lambda windows: (0, {})
             ),
             running_batch=SimpleNamespace(reqs=[]),
-            waiting_queue=[],
-            grammar_manager=[],
+            request_lists=lambda: {kind: [] for kind in ListKind},
             enable_fpm=False,
             enable_priority_scheduling=False,
             kv_events_publisher=SimpleNamespace(emit_kv_metrics=MagicMock()),
@@ -292,7 +292,8 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                 get_pool_stats=lambda: SimpleNamespace(
                     update_scheduler_stats=lambda stats: None,
                     full_capacity=1,
-                    is_hybrid_swa=False,
+                    windows=(),
+                    target_window_stats=lambda: None,
                 ),
                 streaming_session_count=lambda: 0,
                 session_held_tokens=lambda: 0,
@@ -363,11 +364,11 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                 queue=[],
                 retracted_queue=[],
                 num_tokens_pre_allocated=0,
-                pre_allocated_token_counts=lambda: (0, 0),
+                pre_allocated_token_counts=lambda windows: (0, {}),
             ),
             running_batch=batch,
             waiting_queue=[],
-            grammar_manager=[],
+            request_lists=lambda: {kind: [] for kind in ListKind},
             enable_priority_scheduling=False,
             max_total_num_tokens=1,
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
@@ -376,7 +377,8 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                     get_decode_usage_msg_parts=lambda: [],
                     update_scheduler_stats=lambda stats: None,
                     full_capacity=1,
-                    is_hybrid_swa=False,
+                    windows=(),
+                    target_window_stats=lambda: None,
                 ),
                 streaming_session_count=lambda: 0,
                 session_held_tokens=lambda: 0,
@@ -576,8 +578,7 @@ class TestHiCacheHostMambaStats(CustomTestCase):
         )
         reporter.scheduler.disaggregation_mode = DisaggregationMode.NULL
         reporter.scheduler.running_batch = SimpleNamespace(reqs=[])
-        reporter.scheduler.waiting_queue = []
-        reporter.scheduler.grammar_manager = []
+        reporter.scheduler.request_lists = lambda: {kind: [] for kind in ListKind}
         reporter.scheduler.enable_fpm = False
         reporter.scheduler.enable_priority_scheduling = False
         reporter.scheduler.pool_stats_observer = SimpleNamespace(
