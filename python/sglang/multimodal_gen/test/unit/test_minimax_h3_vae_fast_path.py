@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.batching imp
     forward_many,
     partitions,
 )
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import (
+    AutoencoderKL,
+)
 from sglang.test.kernels.minimax_h3_vae import _h3_install_gate as _install_gate
 from sglang.test.kernels.minimax_h3_vae import _h3_tiny_vae as _tiny_vae
 
@@ -272,3 +275,41 @@ def test_denorm_kernel_runs_in_place_only_on_owned_frames(
             f"test denorm owned={runtime_owned} fast path is not bit-exact"
             in caplog.text
         )
+
+
+def test_light_tile_rank_hands_one_tile_to_each_other_rank():
+    assert klvae.tile_owners(10, 4) == [0, 1, 2, 3, 0, 1, 2, 3, 0, 1]
+    owners = klvae.tile_owners(56, 8, light_rank=0)
+    counts = [owners.count(rank) for rank in range(8)]
+    assert counts == [1, 8, 8, 8, 8, 8, 8, 7]
+    assert owners[0] == 0  # the light rank keeps its first tile
+    # ranks with fewer round-robin tiles take first; the busiest load is unchanged
+    owners = klvae.tile_owners(28, 8, light_rank=0)
+    assert [owners.count(rank) for rank in range(8)] == [1, 4, 4, 4, 4, 4, 4, 3]
+    assert klvae.tile_owners(56, 2, light_rank=1).count(1) == 27
+    assert klvae.tile_owners(4, 1, light_rank=0) == [0, 0, 0, 0]
+
+
+def test_tile_gather_places_results_by_owner(monkeypatch):
+    owners = klvae.tile_owners(11, 4, light_rank=2)
+    tiles = [torch.full((2,), float(index)) for index in range(11)]
+    gathered = []
+    for rank in range(4):
+        mine = [tiles[i] for i in AutoencoderKL._local_tile_indices(None, owners, rank)]
+        padded = max(owners.count(r) for r in range(4)) - len(mine)
+        gathered.append(torch.stack(mine + [torch.zeros(2)] * padded))
+    coordinator = SimpleNamespace(all_gather=lambda stacked, separate_tensors: gathered)
+    monkeypatch.setattr(klvae, "get_tile_parallel_state", lambda: (2, 4))
+    monkeypatch.setattr(
+        klvae, "get_decode_parallel_group_coordinator", lambda: coordinator
+    )
+    mine = [tiles[i] for i in AutoencoderKL._local_tile_indices(None, owners, 2)]
+    results = AutoencoderKL._all_gather_tiled_results(None, mine, owners)
+    assert [int(t[0]) for t in results] == list(range(11))
+
+
+def test_light_tile_rank_applies_to_one_decode():
+    vae = SimpleNamespace(light_tile_rank=0)
+    first = AutoencoderKL._decode_tile_owners(vae, 56, 8)
+    assert first.count(0) == 1 and vae.light_tile_rank is None
+    assert AutoencoderKL._decode_tile_owners(vae, 56, 8) == klvae.tile_owners(56, 8)
