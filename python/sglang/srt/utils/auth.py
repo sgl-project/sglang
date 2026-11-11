@@ -80,20 +80,6 @@ def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
     return AuthLevel.NORMAL
 
 
-def _build_static_auth_levels(app: Any) -> dict:
-    order = [AuthLevel.NORMAL, AuthLevel.ADMIN_OPTIONAL, AuthLevel.ADMIN_FORCE]
-    levels = {}
-    for prefix, route in _iter_leaf_routes(app.router.routes):
-        path = getattr(route, "path", None)
-        if path is None or getattr(route, "param_convertors", None):
-            continue
-        level = _route_auth_level(route)
-        levels[prefix + path] = max(
-            levels.get(prefix + path, level), level, key=order.index
-        )
-    return levels
-
-
 def decide_request_auth(
     *,
     method: str,
@@ -186,20 +172,6 @@ def add_api_key_middleware(app, *, get_keys: Callable[[], tuple]):
         def __init__(self, app, *, fastapi_app):
             self.app = app
             self.fastapi_app = fastapi_app
-            self.static_levels = None
-
-        def _auth_level(self, scope) -> AuthLevel:
-            if self.static_levels is None:
-                self.static_levels = _build_static_auth_levels(self.fastapi_app)
-            # Under a root path the router strips a prefix first, so only it can resolve the route.
-            level = (
-                None
-                if scope.get("root_path")
-                else self.static_levels.get(scope["path"])
-            )
-            if level is None:
-                level = _get_auth_level_from_app_and_scope(self.fastapi_app, scope)
-            return level
 
         async def __call__(self, scope, receive, send):
             if scope["type"] not in ("http", "websocket"):
@@ -213,7 +185,7 @@ def add_api_key_middleware(app, *, get_keys: Callable[[], tuple]):
                 authorization_header=Headers(scope=scope).get("Authorization"),
                 api_key=api_key,
                 admin_api_key=admin_api_key,
-                auth_level=self._auth_level(scope),
+                auth_level=_get_auth_level_from_app_and_scope(self.fastapi_app, scope),
             )
 
             if decision.allowed:
