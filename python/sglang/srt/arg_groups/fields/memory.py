@@ -36,7 +36,9 @@ class Memory(msgspec.Struct):
                 "shared least-recently-used order on a full/SWA hybrid model with "
                 "--enable-unified-memory, and acts as 'lru' elsewhere. 'gds' evicts "
                 "cached recurrent-state checkpoints on hybrid models by GreedyDual-Size "
-                "over the prefill each one saves, and acts as 'lru' on other models. See "
+                "over the prefill each one saves, and acts as 'lru' on other models. "
+                "Hybrid recurrent models default to 'gds' when this flag is not set, "
+                "unless --enable-session-radix-cache is on. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy "
                 "for what each policy optimizes for."
             ),
