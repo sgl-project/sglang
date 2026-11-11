@@ -398,7 +398,6 @@ class TestAllocationIntegration(CustomTestCase):
             with get_context().override_server_args(
                 disaggregation_decode_allocation_policy="early"
             ):
-                scheduler.waiting_queue._drop_all()
                 move([req], launched)
                 SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
                     scheduler, req

@@ -139,6 +139,20 @@ class RequestRetirer:
             make_abort_req(req, finished_reason=reason.to_json()), req
         )
 
+    def abandon(self, req: Req) -> None:
+        """Take out a request whose release raised before taking it out; frees
+        nothing, and does nothing once the release took it out."""
+        if req.owner_list is None:
+            return
+        _leave_owner_list(req)
+        record_exit(req, "abandon")
+
+    def settle_output(self, req: Req) -> None:
+        """Take a released request out of the list holding its final output
+        once that output is sent or aborted; records no exit, as its release
+        did."""
+        _leave_owner_list(req)
+
     def _detach(self, req: Req) -> None:
         """Drop an aborted request from the components tracking it and free its
         media, but no KV or rows. `release` runs it before the KV goes: uOCR's

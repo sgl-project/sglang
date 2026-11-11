@@ -36,7 +36,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.scheduler_test_utils import empty_request_lists
+from sglang.test.scheduler_test_utils import empty_request_lists, leaving_retirer
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -341,6 +341,8 @@ class TestRunningReqsHooks(CustomTestCase):
 
         def process_batch_result(batch, result):
             _finish(done)
+            # A finished request is released in its step's processing.
+            leaving_retirer().release(done, checkpoint=True)
             s._on_step_processed(batch, result)
 
         s.run_batch = run_batch

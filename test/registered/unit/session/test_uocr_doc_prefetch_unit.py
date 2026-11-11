@@ -68,7 +68,7 @@ class _Sched:
     def ingest(self):
         """The scheduler queues released windows at the top of its next step."""
         released = list(self.prefetch.released)
-        self.prefetch.released._drop_all()
+        self.prefetch.released._leave(released)
         for req in released:
             self.add(req)
 

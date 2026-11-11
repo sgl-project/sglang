@@ -573,7 +573,11 @@ class TestResolveDeferredReleases(CustomTestCase):
         move([entry], queue.queue)
         queue._defer_release(entry)
         self.assertEqual(list(queue._deferred_releases.items())[0][-1], 0)
-        with patch.object(queue.scheduler.request_retirer, "release") as release:
+        with patch.object(
+            queue.scheduler.request_retirer,
+            "release",
+            side_effect=_releasing(lambda req: None),
+        ) as release:
             queue.resolve_deferred_releases()
         release.assert_called_once_with(entry.req, checkpoint=False)
         self.assertEqual(list(queue._deferred_releases.items()), [])
@@ -593,7 +597,11 @@ class TestResolveDeferredReleases(CustomTestCase):
             move([entry], q.queue)
             q._defer_release(entry)
         with (
-            patch.object(q.scheduler.request_retirer, "release") as release,
+            patch.object(
+                q.scheduler.request_retirer,
+                "release",
+                side_effect=_releasing(lambda req: None),
+            ) as release,
             patch("torch.distributed.get_world_size", return_value=2),
             patch("torch.distributed.all_reduce") as reduce,
         ):
@@ -626,7 +634,11 @@ class TestResolveDeferredReleases(CustomTestCase):
         ):
             move([dreq], q.queue)
             q._defer_release(dreq)
-            with patch.object(q.scheduler.request_retirer, "release") as rel:
+            with patch.object(
+                q.scheduler.request_retirer,
+                "release",
+                side_effect=_releasing(lambda req: None),
+            ) as rel:
                 # Not yet acked -> held, not released.
                 q.resolve_deferred_releases()
                 rel.assert_not_called()
@@ -666,7 +678,11 @@ class TestResolveDeferredReleases(CustomTestCase):
 
         with (
             patch.object(decode_mod.time, "monotonic", return_value=42.0),
-            patch.object(q.scheduler.request_retirer, "release") as rel,
+            patch.object(
+                q.scheduler.request_retirer,
+                "release",
+                side_effect=_releasing(lambda req: None),
+            ) as rel,
         ):
             q.resolve_deferred_releases()
             rel.assert_called_once_with(dreq.req, checkpoint=False)
@@ -679,9 +695,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             outcome="timeout",
         )
 
-    def test_failed_release_is_isolated_and_not_retried(self):
-        # A raising _do_release must drop the entry (no double-free on retry) and
-        # not brick resolve for the remaining entries or subsequent calls.
+    def test_failed_release_is_isolated_and_abandoned(self):
         mgr = _make_manager()
         q = _make_queue(enable_metrics=True)
         good = _make_decode_req(700, 1, mgr)
@@ -691,11 +705,13 @@ class TestResolveDeferredReleases(CustomTestCase):
         move([(good, 10.0, float("-inf"), 1, 1)], q._deferred_releases)
 
         calls = []
+        release = _releasing(calls.append)
 
         def fake_release(req, *, checkpoint):
-            calls.append(req)
             if req is bad.req:
+                calls.append(req)
                 raise RuntimeError("boom")
+            release(req, checkpoint=checkpoint)
 
         with (
             patch.object(decode_mod.time, "monotonic", return_value=40.0),
@@ -704,11 +720,10 @@ class TestResolveDeferredReleases(CustomTestCase):
             ),
         ):
             q.resolve_deferred_releases()  # must not raise
-            # The good one still released despite the bad one throwing.
-            self.assertIn(good.req, calls)
-            # Nothing left held, and a second call is a clean no-op (no retry).
+            self.assertEqual(calls, [bad.req, good.req])
             self.assertEqual(list(q._deferred_releases.items()), [])
             q.resolve_deferred_releases()
+            self.assertEqual(calls, [bad.req, good.req])
         q.scheduler.metrics_collector.observe_decode_deferred_kv_release.assert_has_calls(
             [
                 call(duration_seconds=30.0, outcome="error"),
@@ -784,7 +799,11 @@ def _run_release_consensus(rank: int, rendezvous: str) -> None:
                 q._defer_release(ready_req)
             with (
                 patch.object(decode_mod.time, "monotonic", return_value=now) as clock,
-                patch.object(q.scheduler.request_retirer, "release"),
+                patch.object(
+                    q.scheduler.request_retirer,
+                    "release",
+                    side_effect=_releasing(lambda req: None),
+                ),
             ):
                 q.resolve_deferred_releases()
                 observations.append(
@@ -823,7 +842,11 @@ def _run_release_consensus(rank: int, rendezvous: str) -> None:
             move([dreq], q.queue)
             with (
                 patch.object(decode_mod, "prepare_abort"),
-                patch.object(q.scheduler.request_retirer, "release"),
+                patch.object(
+                    q.scheduler.request_retirer,
+                    "release",
+                    side_effect=_releasing(lambda req: None),
+                ),
             ):
                 q.move_transferred(IndexedReqList(ListKind.WAITING))
                 held = len(q._deferred_releases)

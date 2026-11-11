@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import leaving_retirer
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -232,9 +233,9 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
             alloc_for_extend(batch)
 
     def test_dllm_abort_removes_waiting(self):
-        released = []
+        retirer = leaving_retirer()
         manager = DllmManager(
-            SimpleNamespace(max_running_requests=4), abort=released.append
+            SimpleNamespace(max_running_requests=4), abort=retirer.abort
         )
         first, second, keep = (
             Mock(rid=rid, owner_list=None) for rid in ("abort-1", "abort-2", "keep")
@@ -243,7 +244,9 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
 
         manager.waiting_queue.abort(AbortReq(rid="abort"))
 
-        self.assertEqual(released, [first, second])
+        self.assertEqual(
+            [c.args[0] for c in retirer.abort.call_args_list], [first, second]
+        )
         self.assertEqual(list(manager.waiting_queue), [keep])
 
     def test_staged_are_the_last_rounds_requests_still_waiting(self):
@@ -253,7 +256,7 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
             for rid in ("first", "second", "aborted", "unrun")
         )
         move([first, second, aborted, unrun], manager.waiting_queue)
-        manager.take(lambda req: req is aborted)
+        leaving_retirer().release(aborted)
 
         # In the round's order, not the queue's.
         last_batch = SimpleNamespace(reqs=[aborted, second, first])

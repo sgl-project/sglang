@@ -186,6 +186,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.deferred_responses = DeferredResponses(
             disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
+            request_retirer=None,
             send_abort=None,
         )
         self.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
