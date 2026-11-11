@@ -11,7 +11,7 @@ design, policies and bucket configuration are in [ARCHITECTURE.md](ARCHITECTURE.
 - [OpenAI over /generate](#openai-over-generate)
 - [Embeddings](#embeddings), [Classify](#classify), [Completions](#completions), [Rerank](#rerank)
 - [Anthropic Messages](#anthropic-messages)
-- Per-model rendering: [DeepSeek V4 and V4.1](#deepseek-v4-and-v41), [GLM-5.3](#glm-53), [Qwen3.8](#qwen38), [Kimi-K3](#kimi-k3)
+- Per-model rendering: [DeepSeek V4 and V4.1](#deepseek-v4-and-v41), [GLM-5.3](#glm-53), [Qwen3.8](#qwen38), [Kimi-K3](#kimi-k3), [MiniMax-M3](#minimax-m3), [StepFun](#stepfun)
 - [HTTP/2](#http2)
 - [Native gRPC](#native-grpc)
 - [Upgrading from `cache_aware_zmq`](#upgrading-from-cache_aware_zmq)
@@ -99,9 +99,34 @@ is common with parallel sampling, RL rollouts and agent fan-out.
 `--cache-pending-prefix-ttl-ms` credits a worker with a prompt's prefix for that
 long after routing it there, so the burst stays together. It is off by default
 and needs `--policy cache_aware` with the Router-local radix tree.
+
+By default pending depths merge with the confirmed ones by maximum on every
+request. `--cache-pending-prefix-consult-below <ratio>` switches to
+confirmed-first: a pending stake is consulted only when it is strictly deeper
+than the best confirmed match, so a KV-event match that is at least as good
+always wins, and only while the confirmed match covers less than `ratio` of the
+prompt. A turn whose history the events have confirmed then routes on that
+match and neither walks the pending store nor writes a stake, so a warm request
+pays nothing for the tier; a cold prefix (a first turn, or a turn racing its
+predecessor's events) still consults and stakes. 0.5 is a good starting point;
+1 consults on every request but keeps the strictly-deeper rule.
+
+`--cache-pending-prefix-max-followers` caps how many requests one stake may
+attract within its TTL (default unbounded). The confirmed tree is always
+looked up first; past the cap the stake is simply hidden, so the request is
+routed as if it did not exist, by its confirmed matches or else by the load
+policy, instead of a burst piling onto one worker. The cap is charged on the deepest
+block a request matched, so a shared system prompt is never what reaches it,
+and a conversation keeps following its own stake as each turn stakes a new
+tail. Prefill serves a same-prefix burst from cache once the first member has
+landed, so set the cap only as a safety valve against runaway fan-out.
+
 `sgl_router_cache_pending_prefix_hits_total` counts lookups where a pending
-prefix matched deeper than any confirmed one; the policy's candidate and
-admission filters still decide whether that worker is picked.
+prefix matched deeper than any confirmed one,
+`sgl_router_cache_pending_prefix_followed_total` requests routed to a worker
+because of its stake, and `sgl_router_cache_pending_prefix_capped_total` lookups
+the cap left without a pending candidate; the policy's candidate and admission
+filters still decide whether a worker is picked.
 
 ### Peer bootstrap (Kubernetes)
 
@@ -244,16 +269,21 @@ consecutive failures the worker is taken out of routing until a request already
 sent to it succeeds or, once `--cb-cool-down-secs` (default 30) has passed, a
 probe request does. Under `--worker-urls` it is the only thing that takes a
 dead or hung worker out of routing, since there is no active health check.
-`--disable-circuit-breaker` turns it off, for example when one worker serves a
-role and an open breaker would reject all of that role's requests; a worker
-that stops answering then keeps its share of traffic.
+A failure is a transport error, a timeout, or a 5xx other than 500 and 503: a
+500 (an exception raised for that one request) and backpressure (503, 429) mean
+the worker answered, so they never open the breaker. When every eligible
+worker's breaker is open the router fails open: it closes them all and routes
+to the whole pool rather than rejecting every request, and failures reopen
+them. `--disable-circuit-breaker` turns it off; a worker that stops answering
+then keeps its share of traffic.
 
 ### Engines with `--api-key`
 
 The router reads each worker's `/server_info` and `/model_info` to learn its
 model, KV-event publisher, HTTP/2 support and DP size. An engine launched with
 `--api-key` rejects those requests without the key, so pass the same key as
-`--worker-api-key`. Chat requests and `/flush_cache` forward the caller's
+`--worker-api-key`. Chat requests, `/flush_cache`, and the forwarded
+`/server_info`, `/model_info`, and `/health_generate` pass the caller's
 `Authorization` header instead, so callers still need the engine key.
 
 ### Fleet-wide sampling contract
@@ -370,15 +400,17 @@ text, as does any model whose template fails to load or render.
 Some chats additionally forward the rendered tokens to the engine as
 `input_ids`, retaining the original messages, so the engine skips
 re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's, V4.1's
-and Kimi-K3's native encoders and GLM-5.3's and Qwen3.8's templates are
-fixture-verified against SGLang's request normalization, so they forward every
+and Kimi-K3's native encoders and GLM-5.3's, MiniMax-M3's, Qwen3.8's and StepFun's
+templates are fixture-verified against SGLang's request normalization, so they forward every
 chat except multimodal ones and those with caller-provided `input_ids`. Renderers
 without that verification (HF Jinja templates)
 forward only plain text chat requests (string `content`, no tools, no template
 kwargs or reasoning controls or historical `reasoning_content`, no assistant
 continuation, no consecutive users or non-leading system turns) and warn
 `UNVERIFIED` at startup; every other request shape is rendered for routing
-only.
+only. A `continue_final_message` prefix is tokenized on its own with the special
+tokens the tokenizer adds around a text, less one leading BOS, as SGLang's
+`_append_assistant_prefix_to_prompt_ids` does.
 
 Use matching model files on the router and workers, and set
 the same `--default-chat-template-kwargs`, `SGLANG_DEFAULT_THINKING`,
@@ -413,8 +445,11 @@ with `--locked`, so rendered bytes cannot change without a reviewed diff.
 Router tokenization sits on the TTFT path for every chat it renders. Two opt-in
 flags make it cheaper:
 
-- `--tokenizer-backend fast` encodes with fastokens (decoding stays on HF). It
-  needs a `tokenizer.json` and falls back to `hf` when fastokens cannot load it.
+- `--tokenizer-backend fast` encodes with fastokens (decoding stays on HF for a
+  `tokenizer.json`). It falls back to `hf` when fastokens cannot load a
+  `tokenizer.json`, and to `tiktoken` when it cannot load a `tiktoken.model`. On a
+  `tiktoken.model`, text containing U+017F right after an apostrophe still encodes
+  on tiktoken-rs, the one input fastokens tokenizes differently from the engine.
 - `--tokenizer-l1-cache-mb N` caches prefix tokenizations at special-token
   boundaries, so a multi-turn chat encodes only the turns added since the
   previous request. Boundaries are unconditional, non-normalized, non-stripping
@@ -468,7 +503,7 @@ own route as sent: workers that disagree on those args or never
 reported them, `--completion-template`, `return_hidden_states` and other
 `sglext` outputs, `echo` or `logprobs` without a router tokenizer, and bodies
 SGLang would reject. Chat also needs a renderer verified against SGLang (the
-`AllText` scope: DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8 today), router `--default-chat-template-kwargs`
+`AllText` scope: DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3, Qwen3.8 and StepFun today), router `--default-chat-template-kwargs`
 equal to the workers', a reasoning parser the processor reproduces
 (`deepseek-v4`, `deepseek-v41`, `glm45`, `kimi_k3`, `qwen3`) or none, and no media yet. Tools are served with `tool_choice`
 `auto` or `none`, non-strict, with standard JSON-schema types, and a tool
@@ -539,18 +574,15 @@ use `output_config.effort` or `chat_template_kwargs` directly.
 
 ## DeepSeek V4 and V4.1
 
-Native V4 and V4.1 rendering comes from `rust/sglang-processor`, shared with SGLang's Rust
-server, and follows SGLang's serving path (`serving_chat.py`), not Dynamo's
-OpenAI defaults: all declared tools are rendered with SGLang's schema
-defaults, reasoning effort comes from `reasoning` / `reasoning_effort`, and the
-official/preview effort profile is detected from the checkpoint's
-`encoding/encoding_dsv4.py` or overridden by `dsv4_reasoning_effort_profile` in
-`config.json`, as in SGLang. Reference prompts live in `tests/fixtures/deepseek/`
-and are regenerated by `tests/scripts/generate_deepseek_parity.py`.
-
-V4.1 Flash uses Dynamo's V4.1 encoder with SGLang's numeric reasoning budgets
-and tool payloads. Developer messages and media are left to the worker, since
-the encoder renders them differently.
+V4 and V4.1 render through `rust/sglang-processor` with deepseek-recipe, DeepSeek's
+own encoder, as SGLang's serving path does (`serving_deepseek_recipe.py`): SGLang's
+thinking default, request and server-default reasoning effort, V4.1 numeric budgets,
+`task`, and the final-assistant rule wrap recipe's rendering. The processor also
+encodes the prompt ids with the checkpoint's `tokenizer.json`, so text a user writes
+never becomes a control token; the model fails to load without that file. Set
+`SGLANG_DSV4_REASONING_EFFORT` / `SGLANG_DSV41_REASONING_EFFORT` on the router as on
+the workers. Media is left to the worker. Reference prompts are the processor's
+parity fixtures.
 
 ## GLM-5.3
 
@@ -576,10 +608,42 @@ through `/generate`; thinking follows the template's `enable_thinking` (on by de
 Kimi-K3 renders through `rust/sglang-processor` (dynamo-render's XTML formatter
 with SGLang's request semantics) and is tokenized with the checkpoint's chunked
 tiktoken encoding; shapes the formatter renders differently go to the worker.
+`--tokenizer-backend fast` applies to its `tiktoken.model` and encodes about 15x
+faster than the default tiktoken-rs backend.
 `--tokenizer-path` accepts a
 local `tiktoken.model` or an HF repo id, whose `tiktoken.model`, `config.json`
 and `tokenizer_config.json` are downloaded when it has no `tokenizer.json`.
 With the cookbook's `kimi_k3` parsers, text chats are served through `/generate`.
+
+## MiniMax-M3
+
+MiniMax-M3 and M3.1 render with the checkpoint's `chat_template.jinja` through
+`rust/sglang-processor`, which picks them by `config.json`'s `model_type`
+(`minimax_m3_vl`), or by the template when there is no `config.json`, and applies
+SGLang's M3 request rules: the `thinking` type, the `reasoning_effort` enum (low, medium,
+high, xhigh, max) and the `root` message are validated, every tool call must be answered,
+`thinking` maps onto `thinking_mode`, and tool results render in tool-call order. Every text chat
+forwards `input_ids`. Media, `tool_reference` content in tool results, floats in tool
+schemas, `-0` in tool arguments, and a `chat_template` key in `chat_template_kwargs`
+render on the worker. The processor does not reproduce the `minimax-m3` reasoning and
+tool parsers yet, so chats keep the engine's route.
+
+MiniMax-M3.1, whose template has no `thinking_mode` switch, always thinks
+adaptively, and the router enforces that at ingress: `thinking: {"type":
+"disabled"}`, `chat_template_kwargs.thinking_mode: "disabled"` and a
+`reasoning_effort` of `none` are rejected with 400, and `minimal` is sent as `low`.
+MiniMax-M3 can disable thinking, so its requests pass through unchanged.
+
+## StepFun
+
+Step-3.5-Flash, Step-3.7-Flash and Step-5-Preview render with the checkpoint's
+`chat_template.jinja` through `rust/sglang-processor`, which picks them by the template
+(its `tool_response` turn, `<im_patch>` and Qwen3-Coder tool-call tags) and hands it the
+messages, tools and kwargs SGLang's Jinja path builds. Every text chat forwards
+`input_ids`. Media, `-0` in tool arguments or schemas, and a `chat_template`,
+`bos_token`, `eos_token` or `unk_token` key in `chat_template_kwargs` render on the
+worker. With the cookbook's `step3p5` parsers, which the processor does not reproduce
+yet, chats keep the engine's route.
 
 ## HTTP/2
 
@@ -611,6 +675,8 @@ A worker whose `/server_info` does not answer has no readable protocol and
 forwards over HTTP/1.1 for as long as it stays registered — a throughput cost,
 never a correctness one. Admin fan-out (`/flush_cache`) always uses the default
 client, because it addresses every worker at once rather than a selected one.
+The forwarded `/server_info`, `/model_info`, and `/health_generate` use it too:
+they are low-volume GETs, and every engine serves HTTP/1.1.
 
 Two things worth knowing when debugging. h2c is prior-knowledge only — there is
 no negotiation and no fallback — which is why the router requires the engine's

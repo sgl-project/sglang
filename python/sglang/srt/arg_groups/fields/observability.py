@@ -16,8 +16,8 @@ import msgspec
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
+    json_list_type,
 )
-from sglang.srt.utils.common import json_list_type
 
 
 class Observability(msgspec.Struct):
@@ -55,6 +55,10 @@ class Observability(msgspec.Struct):
         Optional[List[str]],
         "Target(s) for request logging: 'stdout' and/or directory path(s) for file output. Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
     ] = None
+    log_schedule_decisions: A[
+        bool,
+        "Log the outcome of every prefill pass that evaluates the waiting queue: picked vs left in queue, running and preempted counts, KV free/evictable tokens, and the picked rids (first 16). Logged on attention TP/CP rank 0 only. Passes that return early (e.g. running batch full, no free request slots) are not logged, and a pass that picks nothing is logged only when its counters differ from the previous empty pass. Verbose, so off by default.",
+    ] = False
     uvicorn_access_log_exclude_prefixes: A[
         List[str],
         Arg(
@@ -132,7 +136,7 @@ class Observability(msgspec.Struct):
     goodput_slo: A[
         Optional[Dict[str, float]],
         Arg(
-            help='Latency SLOs in milliseconds for sglang:num_good_requests_total, as a JSON dict with keys from ttft, tpot and e2el, e.g. \'{"ttft": 500, "tpot": 50}\'. A request is good if it finishes normally and meets every given SLO.',
+            help='Latency SLOs in milliseconds for sglang:num_good_requests_total, as a JSON dict with keys from ttft, tpot and e2el, e.g. \'{"ttft": 500, "tpot": 50}\'. Values must be finite, non-boolean, strictly positive numbers. Null or an empty dict disables goodput accounting. A request is good if it finishes normally and meets every given SLO.',
             type_parser=json.loads,
         ),
     ] = None
@@ -171,7 +175,7 @@ class Observability(msgspec.Struct):
     enable_trace: A[bool, "Enable opentelemetry trace"] = False
     trace_modules: A[
         str,
-        "Select the components to trace. Available options are 'request' and 'mooncake'. Format: <module1 name>,<module2 name>,...",
+        "Select the components to trace. Available options are 'request', 'mooncake', and 'hicache'. Format: <module1 name>,<module2 name>,...",
     ] = "request"
     otlp_traces_endpoint: A[
         str,

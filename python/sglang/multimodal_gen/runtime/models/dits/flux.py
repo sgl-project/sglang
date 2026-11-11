@@ -880,7 +880,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 RowParallelLinear if shard_single_block else ColumnParallelLinear
             )
             proj_out_kwargs = (
-                {"input_is_parallel": True}
+                {"input_is_parallel": True, "input_sizes": [dim, self.mlp_hidden_dim]}
                 if shard_single_block
                 else {"gather_output": True}
             )
@@ -892,8 +892,6 @@ class FluxSingleTransformerBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.proj_out" if prefix else "proj_out",
             )
-            if shard_single_block:
-                self._patch_proj_out_weight_loader()
             self.attn = FluxAttention(
                 query_dim=dim,
                 dim_head=attention_head_dim,
@@ -905,30 +903,6 @@ class FluxSingleTransformerBlock(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.attn" if prefix else "attn",
             )
-
-    def _patch_proj_out_weight_loader(self) -> None:
-        dim, mlp_dim = self.local_dim, self.local_mlp_hidden_dim
-        tp_rank = self.proj_out.tp_rank
-
-        def _loader(param, loaded_weight):
-            input_dim = getattr(param, "input_dim", None)
-            if input_dim is not None:
-                # checkpoint columns are [attn_full | mlp_full], while TP consumes [attn_shard | mlp_shard]
-                attn_cols = loaded_weight.narrow(input_dim, tp_rank * dim, dim)
-                mlp_cols = loaded_weight.narrow(
-                    input_dim,
-                    self.tp_size * dim + tp_rank * mlp_dim,
-                    mlp_dim,
-                )
-                param.data.copy_(torch.cat([attn_cols, mlp_cols], dim=input_dim))
-            else:
-                param.data.copy_(loaded_weight)
-
-        self.proj_out.weight_loader = _loader
-        if hasattr(self.proj_out.weight, "_weight_loader"):
-            self.proj_out.weight._weight_loader = _loader
-        else:
-            self.proj_out.weight.weight_loader = _loader
 
     def forward(
         self,

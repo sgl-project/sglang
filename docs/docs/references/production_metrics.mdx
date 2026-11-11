@@ -143,7 +143,7 @@ Mean TPOT is `rate(..._sum[5m]) / rate(..._count[5m])`. Per-request decode token
 
 ## Goodput and SLO attainment
 
-`--goodput-slo` takes latency SLOs in milliseconds for `ttft` (time to first token), `tpot` (request-level time per output token) and `e2el` (end-to-end latency):
+`--goodput-slo` takes a JSON object containing latency SLOs in milliseconds for `ttft` (time to first token), `tpot` (request-level time per output token) and `e2el` (end-to-end latency). Each threshold must be a finite, non-boolean, strictly positive number. `null` and `{}` disable goodput accounting; other non-object values are rejected:
 
 ```bash
 python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --enable-metrics \
@@ -152,14 +152,16 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --e
 
 `sglang:num_good_requests_total` then counts the requests that finished normally and met every given SLO, with the labels of `sglang:num_requests_total`. A request without a request-level TPOT meets the `tpot` SLO. Aborted requests and PD prefill workers do not contribute.
 
-Request goodput in requests/s, and SLO attainment among the requests the engine finished:
+Request goodput in requests/s, and SLO attainment among the requests each engine role finished:
 
 ```promql
 sum by (model_name) (rate(sglang:num_good_requests_total[5m]))
 
-sum by (model_name) (rate(sglang:num_good_requests_total[5m]))
-  / sum by (model_name) (rate(sglang:num_requests_total[5m]))
+sum by (model_name, engine_type) (rate(sglang:num_good_requests_total[5m]))
+  / sum by (model_name, engine_type) (rate(sglang:num_requests_total[5m]))
 ```
+
+Retaining `engine_type` in the attainment query keeps PD prefill workers out of the decode workers' denominator. Unified engines retain their own ratio.
 
 A request rejected before it runs, for example by `--max-queued-requests`, is in neither counter. To count those as misses, divide by `sglang:http_requests_total` of the serving endpoint instead.
 
@@ -243,7 +245,7 @@ To modify Grafana's port to the other one(like 3090) in your Docker Compose file
 *   **No Data on Dashboard:**
     *   Generate some traffic to your SGLang server to produce metrics. For example, run a benchmark:
         ```bash Command
-        python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 100 --random-input 128 --random-output 128
+        python3 -m sglang.benchmark.serving --backend sglang --dataset-name random --num-prompts 100 --random-input 128 --random-output 128
         ```
     *   Check the Prometheus UI (`http://localhost:9090`) under `Status` -> `Targets` to see if the SGLang endpoint is being scraped successfully.
     *   Verify the `model_name` and `instance` labels in your Prometheus metrics match the variables used in the Grafana dashboard. You might need to adjust the Grafana dashboard variables or the labels in your Prometheus configuration.
@@ -264,7 +266,7 @@ You can customize the setup by modifying these files. For instance, you might ne
 
 Run:
 ```text Output
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --dataset-name random \
   --num-prompts 3000 \
