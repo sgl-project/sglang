@@ -403,6 +403,32 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
                     torch.equal(lane, lse.view(B, N, H_per_rank).permute(1, 0, 2))
                 )
 
+    def test_pack_strided_partials(self):
+        """Partials sliced out of a head-padded kernel output pack without a
+        contiguous copy."""
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_pack_a2a_send
+
+        N, B, H_per_rank, D, H_pad = 8, 3, 12, 512, 128
+        H = H_per_rank * N
+        out_pad = torch.randn(B, 1, H_pad, D, device=self.device, dtype=torch.bfloat16)
+        lse_pad = torch.randn(B, H_pad, 1, device=self.device, dtype=torch.float32)
+        out = out_pad[:, :, :H].view(B, H, D)
+        lse = lse_pad.view(B, H_pad)[:, :H]
+        self.assertFalse(out.is_contiguous() or lse.is_contiguous())
+
+        partial_o = torch.empty(
+            B, H_per_rank, N, D, dtype=torch.bfloat16, device=self.device
+        )
+        stats = torch.empty(B, H_per_rank, N, device=self.device, dtype=torch.float32)
+        dcp_pack_a2a_send(
+            out, lse, partial_o.permute(2, 0, 1, 3), stats.permute(2, 0, 1)
+        )
+
+        self.assertTrue(
+            torch.equal(partial_o, out.view(B, N, H_per_rank, D).permute(0, 2, 1, 3))
+        )
+        self.assertTrue(torch.equal(stats, lse.view(B, N, H_per_rank).permute(0, 2, 1)))
+
     def test_pack_serves_the_split_peer_inside_layout(self):
         from sglang.kernels.ops.attention.dcp_kernels import dcp_pack_a2a_send
 

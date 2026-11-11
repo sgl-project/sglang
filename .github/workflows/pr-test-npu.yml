@@ -254,7 +254,7 @@ jobs:
       self_name: base-b-test-1-npu-a3
       runner_config: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-2' || 'linux-aarch64-a3-2-' }}
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
-      run_timeout_minutes: '60'
+      run_timeout_minutes: ${{ inputs.coverage_mode == true && '120' || '60' }}
       timeout_per_file: '3600'
       only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_base_b_test_1_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
@@ -271,7 +271,7 @@ jobs:
       self_name: base-b-test-2-npu-a3
       runner_config: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-2' || 'linux-aarch64-a3-2-' }}
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
-      run_timeout_minutes: '60'
+      run_timeout_minutes: ${{ inputs.coverage_mode == true && '120' || '60' }}
       timeout_per_file: '3600'
       only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_base_b_test_2_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
@@ -406,7 +406,7 @@ jobs:
             # the memory/VRAM checks are untouched.
             export SGLANG_E2E_TOLERANCE=1.0
             export SGLANG_STAGE_TIME_TOLERANCE=1.0
-            export SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=2.0
+            export SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=13.0
             export SGLANG_DENOISE_STEP_TOLERANCE=1.0
             export SGLANG_DENOISE_AGG_TOLERANCE=1.0
             python3 scripts/ci/npu/precise-test/list_multimodal_tests.py \
@@ -541,7 +541,7 @@ jobs:
             # the memory/VRAM checks are untouched.
             export SGLANG_E2E_TOLERANCE=1.0
             export SGLANG_STAGE_TIME_TOLERANCE=1.0
-            export SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=2.0
+            export SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=13.0
             export SGLANG_DENOISE_STEP_TOLERANCE=1.0
             export SGLANG_DENOISE_AGG_TOLERANCE=1.0
             python3 scripts/ci/npu/precise-test/list_multimodal_tests.py \

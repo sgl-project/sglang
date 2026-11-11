@@ -16,6 +16,10 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
@@ -95,6 +99,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         request_retirer=release_only_retirer(),
         abort_request=lambda *a, **k: None,
         still_in_batch=lambda req: True,
+        prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
     )
 
 

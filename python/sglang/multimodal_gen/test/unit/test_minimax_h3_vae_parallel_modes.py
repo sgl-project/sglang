@@ -119,20 +119,26 @@ def test_vit_qk_norm_supports_affine_free_rmsnorm():
 
 
 @requires_cuda
-def test_vit_fast_path_is_gated_and_matches_reference():
+@pytest.mark.parametrize(
+    "shape,rope_dim,dtype",
+    [((2, 4, 4), 48, torch.float16), ((8, 8), 32, torch.bfloat16)],
+)
+def test_vit_fast_path_is_gated_and_matches_reference(shape, rope_dim, dtype):
     """Gate closed: bit-identical to the original forward. Gate open: the fused
     qk-norm+RoPE kernel and cuDNN SDPA run and match to rounding level."""
     device = torch.device("cuda")
-    dtype = torch.float16
-    heads, dim_head, rope_dim = 4, 64, 48
+    heads, dim_head = 4, 64
     attention = Attention(
         heads=heads, dim_head=dim_head, qk_norm_type="rms_norm", eps=1e-5
     ).to(device=device, dtype=dtype)
     assert _attn_fast_compatible(attention)
 
-    pos_embed = RotaryEmbeddingND(rope_dim, 100.0, n_dim=3, use_angle=True).to(device)
-    ids = create_token_ids((2, 4, 4), device, dtype)
-    ids = torch.cat([ids, torch.zeros((1, 5, 3), device=device, dtype=dtype)], 1)
+    n_dim = len(shape)
+    pos_embed = RotaryEmbeddingND(rope_dim, 100.0, n_dim=n_dim, use_angle=True).to(
+        device
+    )
+    ids = create_token_ids(shape, device, dtype)
+    ids = torch.cat([ids, torch.zeros((1, 5, n_dim), device=device, dtype=dtype)], 1)
     rotary = prepare_rotary_pos_emb(pos_embed(ids), dtype=dtype)
     generator = torch.Generator(device="cpu").manual_seed(0)
     hidden = torch.randn((1, ids.shape[1], heads * dim_head), generator=generator)
@@ -149,20 +155,28 @@ def test_vit_fast_path_is_gated_and_matches_reference():
         assert torch.equal(attention(hidden, rotary), reference)
         gate.enabled = True
         fused = attention(hidden, rotary)
+        gate.enabled = False
+        assert torch.equal(attention(hidden, rotary), reference)
     assert attention._sgl_unit_weight is not None, "fused qk-norm+RoPE did not run"
     assert attention._sgl_cudnn_failed is False, "cuDNN SDPA fell back"
     torch.testing.assert_close(fused, reference, atol=2e-2, rtol=1e-2)
 
 
 @requires_cuda
-def test_vit_rope_batched_tiles_match_per_tile():
+@pytest.mark.parametrize(
+    "shape,rope_dim,dtype",
+    [((2, 4, 4), 48, torch.float16), ((8, 8), 32, torch.bfloat16)],
+)
+def test_vit_rope_batched_tiles_match_per_tile(shape, rope_dim, dtype):
     """Stacked decoder tiles share one RoPE row; the fused (quality) and native
     (exact) RoPE kernels over the flattened batch are bit-identical to one
     tile at a time."""
-    device, dtype = torch.device("cuda"), torch.float16
-    tiles, heads, dim_head, rope_dim = 3, 4, 64, 48
-    pos_embed = RotaryEmbeddingND(rope_dim, 100.0, n_dim=3, use_angle=True).to(device)
-    ids = create_token_ids((2, 4, 4), device, dtype)
+    device = torch.device("cuda")
+    tiles, heads, dim_head = 3, 4, 64
+    pos_embed = RotaryEmbeddingND(rope_dim, 100.0, n_dim=len(shape), use_angle=True).to(
+        device
+    )
+    ids = create_token_ids(shape, device, dtype)
     rotary = prepare_rotary_pos_emb(pos_embed(ids), dtype=dtype)
     batched_rotary = prepare_rotary_pos_emb(pos_embed(ids), dtype=dtype, batch=tiles)
     generator = torch.Generator(device="cpu").manual_seed(0)

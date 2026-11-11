@@ -552,7 +552,7 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
         reference_rng = simulated_acc_len_generator(0)
         graphs = EaglePostVerifyGraphs(
             target_worker=SimpleNamespace(
-                model_runner=SimpleNamespace(watermark_state=None)
+                model_runner=SimpleNamespace(watermark_state=None, model_config=None)
             ),
             simulated_acc_len_rng=worker_rng,
         )
@@ -565,6 +565,10 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
             patch.object(spec_utils, "SIMULATE_ACC_METHOD", "match-expected"),
             patch.object(spec_utils, "SIMULATE_ACC_TOKEN_MODE", "real-draft-token"),
             patch.object(spec_utils, "commit_mamba_states_after_verify"),
+            # a model without recurrent state stages no state slots
+            patch.object(
+                eagle_post_verify_graphs, "mambaish_config", return_value=None
+            ),
             patch(
                 "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
             ),
@@ -656,6 +660,160 @@ def _sampled(batch, *, generator):
     info.top_ks = torch.randint(2, TOP_K + 1, (bs,), device="cuda", generator=generator)
     info.top_ps = torch.full((bs,), 0.95, device="cuda")
     return SimpleNamespace(**{**vars(batch), "sampling_info": info})
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+class TestSideStreamCommitWritesTheForwardSlots(CustomTestCase):
+    """The side-stream mamba commit writes the verify forward's slots even when the
+    request table is rewritten before it runs, eagerly and on graph replay."""
+
+    ROWS, SLOTS, STEPS, WIDTH = 2, 12, 2, 4
+
+    def setUp(self):
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(reset_context)
+
+    def _backend(self, mapping, caches):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+            MambaAttnBackendBase,
+        )
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
+
+        linear = MambaAttnBackendBase.__new__(MambaAttnBackendBase)
+        linear.req_to_token_pool = SimpleNamespace(
+            get_mamba_indices=lambda rows: mapping[rows]
+        )
+        linear._state_ids = IdSpace(key=("mamba", None))
+        linear.state_pool = SimpleNamespace(
+            replayssm_is_kda=False,
+            get_speculative_mamba2_params_all_layers=lambda: caches,
+        )
+        linear.accept_lens_pool = None
+        linear.token_to_kv_pool = SimpleNamespace(
+            layer_router=SimpleNamespace(part_view=lambda part: None)
+        )
+        hybrid = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+        hybrid.linear_attn_backend = linear
+        return hybrid, linear
+
+    def test_held_back_commit_after_row_reuse(self):
+        from sglang.srt.speculative.eagle_post_verify_graphs import _PostVerifyGraphs
+
+        rows, slots, steps, width = self.ROWS, self.SLOTS, self.STEPS, self.WIDTH
+        device = "cuda"
+        caches = SimpleNamespace(
+            temporal=torch.zeros((1, slots, width), device=device),
+            intermediate_ssm=torch.zeros((1, slots, steps, width), device=device),
+            conv=[torch.empty(0, device=device)],
+            intermediate_conv_window=[torch.empty(0, device=device)],
+        )
+        mapping = torch.zeros(slots, dtype=torch.int32, device=device)
+        hybrid, linear = self._backend(mapping, caches)
+        # The verify forward's metadata: a per-forward buffer it refills.
+        forward_slots = torch.zeros(rows, dtype=torch.int32, device=device)
+        linear.forward_metadata = SimpleNamespace(
+            mamba_cache_indices=forward_slots, mamba_track_indices=None
+        )
+        graphs = EaglePostVerifyGraphs(
+            target_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    model_config=None,
+                    model=None,
+                    attn_backend=hybrid,
+                    token_to_kv_pool=SimpleNamespace(
+                        layer_router=SimpleNamespace(
+                            part_view=lambda part: SimpleNamespace(
+                                replayssm_spec_fold=False, replayssm_cache_base=None
+                            )
+                        )
+                    ),
+                )
+            ),
+            simulated_acc_len_rng=simulated_acc_len_generator(0),
+        )
+
+        def body(slot):
+            # Hold the side-stream commit back well past the table rewrite.
+            torch.cuda._sleep(50_000_000)
+            last = torch.full((rows,), steps - 1, dtype=torch.int64, device=device)
+            accept_lens = last + 1
+            accept_index = torch.zeros((rows, steps), dtype=torch.int64, device=device)
+            return (None, accept_lens, accept_index, None, None, None, (last, None))
+
+        post = _PostVerifyGraphs(body=body, commit=graphs._commit, sim_rng=None)
+        schedule = torch.cuda.Stream()
+        request_rows = torch.tensor([3, 7], device=device)
+        stream = torch.cuda.Stream()
+        with (
+            torch.cuda.stream(stream),
+            patch.object(eagle_post_verify_graphs, "mambaish_config", return_value=1),
+            patch.object(spec_utils, "mambaish_config", return_value=1),
+            # The request rows index the verify scratch, as pipeline stages do.
+            patch(
+                "sglang.srt.layers.attention.hybrid_linear_attn_backend."
+                "pp_spec_stable_rows_enabled",
+                return_value=True,
+            ),
+            patch.object(spec_utils, "pp_spec_stable_rows_enabled", return_value=True),
+            patch(
+                "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+            ),
+        ):
+            for i in range(ROUNDS):
+                with self.subTest(round=i):
+                    owner = torch.tensor([1 + i % 5, 6 + i % 5], device=device)
+                    successor = owner + 1
+                    # The verify forward: its rows name `owner`, its metadata
+                    # resolves them, and its scratch holds this round's states.
+                    mapping[request_rows] = owner.int()
+                    forward_slots.copy_(owner)
+                    caches.temporal.zero_()
+                    caches.intermediate_ssm.normal_()
+                    read_done = torch.cuda.Event()
+                    read_done.record()
+                    batch = SimpleNamespace(
+                        forward_mode=ForwardMode.TARGET_VERIFY,
+                        req_pool_indices=request_rows,
+                        seq_lens=torch.tensor([9, 9], device=device),
+                        mamba_track_indices=None,
+                        sampling_info=SimpleNamespace(is_all_greedy=True),
+                        tree_cache=SimpleNamespace(page_size=4),
+                    )
+                    verify_input = SimpleNamespace(
+                        draft_token=torch.zeros(4, dtype=torch.int64, device=device),
+                        retrieve_index=torch.zeros((2, 2), device=device),
+                        retrieve_next_token=torch.zeros((2, 2), device=device),
+                        retrieve_next_sibling=torch.zeros((2, 2), device=device),
+                    )
+                    post.run(
+                        key="round",
+                        inputs=eagle_post_verify_graphs._post_verify_inputs(
+                            batch, verify_input, graphs._verify_state_slots(batch)
+                        ),
+                        make_slot=lambda staged: SimpleNamespace(
+                            num_requests=rows,
+                            staged=staged,
+                            forward_mode=batch.forward_mode,
+                            tree_cache=batch.tree_cache,
+                            tokens_per_request=steps,
+                        ),
+                        sim_max_len=steps,
+                    )
+                    # The scheduler, released at the forward's read end: the
+                    # requests finish and their rows go to new requests.
+                    schedule.wait_event(read_done)
+                    with torch.cuda.stream(schedule):
+                        mapping[request_rows] = successor.int()
+                    post.join()
+                    torch.cuda.synchronize()
+                    expected = torch.zeros_like(caches.temporal)
+                    expected[:, owner] = caches.intermediate_ssm[
+                        :, request_rows, steps - 1
+                    ]
+                    torch.testing.assert_close(
+                        caches.temporal, expected, rtol=0, atol=0
+                    )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
