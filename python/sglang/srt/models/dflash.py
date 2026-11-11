@@ -539,7 +539,6 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
             config, layer_id
         )
         if sliding_window_size > -1 or attn_type != AttentionType.DECODER:
-            # Deferred as on main: draft_worker_common pulls in tp_worker.
             from sglang.srt.speculative.draft_worker_common import (
                 resolve_draft_worker_attention_backend,
             )
@@ -557,8 +556,7 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
                     "--speculative-draft-attention-backend triton, trtllm_mla or "
                     f"cutedsl_mla, got {draft_attention_backend!r}."
                 )
-            # Both verify causally. cutedsl_mla keeps main's behavior for
-            # full_attention layers, which serve the shipped full-attention drafts.
+            # Both verify causally.
             if attn_type != AttentionType.DECODER and (
                 draft_attention_backend == "trtllm_mla"
                 or (

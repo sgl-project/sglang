@@ -112,7 +112,6 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
-# Draft backends that serve only MLA layers; DFLASH takes them for MLA drafts.
 DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("cutedsl_mla", "trtllm_mla")
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [

@@ -1297,7 +1297,6 @@ class KVCacheConfigurator:
                 resolve_draft_worker_attention_backend,
             )
 
-            # As the worker resolves it: DFLASH admits the MLA-only backends.
             draft_backend = resolve_draft_worker_attention_backend(
                 algo_label="DFLASH" if self.spec_algorithm.is_dflash() else None
             )
