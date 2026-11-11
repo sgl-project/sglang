@@ -235,7 +235,7 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
             pending_orphans=[StagedOrphans(7, old_map, new_map)],
             slots_freed=0,
             retired=False,
-            _pending_steps=[],
+            clear_staged=lambda: None,
         )
 
         # retract_decode's sequence: member rows released without the

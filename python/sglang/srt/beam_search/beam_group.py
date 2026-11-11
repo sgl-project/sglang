@@ -167,6 +167,14 @@ class BeamGroup:
         self.num_generated += 1
         self._pending_steps.append((tick, sel))
 
+    def last_staged_selection(self):
+        """The most recently staged selection (SelectResult or FinalSelect)."""
+        return self._pending_steps[-1][1]
+
+    def clear_staged(self) -> None:
+        """Drop every staged selection without committing it."""
+        self._pending_steps.clear()
+
     def commit_pending(self, up_to_tick: Optional[int] = None) -> bool:
         """Deferred half: consume staged selections into the DAG (the D2H sync
         point). Returns True when this commit finishes the group."""

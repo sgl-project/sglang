@@ -40,8 +40,8 @@ from sglang.kernels.ops.sampling.softcap_row_argmax import (
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
 from sglang.srt.beam_search.trie_output_head import (
-    BeamTrieHeadOutput,
     BeamTrieOutputHead,
+    compute_beam_trie_logits,
 )
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
@@ -809,16 +809,19 @@ class LogitsProcessor(nn.Module):
                     mm_input_embeds=logits_metadata.mm_input_embeds,
                 )
             # Compute logits for both input and sampled tokens.
-            beam_output = self._get_beam_trie_logits(
-                pruned_states, lm_head, logits_metadata
+            beam_output = (
+                compute_beam_trie_logits(self, pruned_states, lm_head, logits_metadata)
+                if self.beam_trie_output_head is not None
+                else None
             )
             if beam_output is None:
                 # A trie model keeps LM-head rounding on dense rows too, so they
-                # score like the compact head.
+                # score like the compact head; the logits buffer is bypassed.
                 logits = self._get_logits(
                     pruned_states,
                     lm_head,
                     logits_metadata,
+                    use_logits_buffer=self.beam_trie_output_head is None,
                 )
                 beam_normalizer = None
             else:
@@ -1247,9 +1250,7 @@ class LogitsProcessor(nn.Module):
         )
         logits_buffer = (
             logits_metadata.next_token_logits_buffer
-            if use_logits_buffer
-            and not self.do_tensor_parallel_all_gather
-            and self.beam_trie_output_head is None
+            if use_logits_buffer and not self.do_tensor_parallel_all_gather
             else None
         )
         with get_forward().scoped(lora_batch_layout=lora_batch_layout):
@@ -1326,73 +1327,6 @@ class LogitsProcessor(nn.Module):
                     logits / self.final_logit_softcapping
                 )
 
-        return logits
-
-    def _get_beam_trie_logits(
-        self,
-        hidden_states: torch.Tensor,
-        lm_head: VocabParallelEmbedding,
-        logits_metadata: LogitsMetadata,
-    ) -> Optional[BeamTrieHeadOutput]:
-        """Compact SID logits for trie decode rows; None runs the dense path."""
-        output_head = self.beam_trie_output_head
-        depths = logits_metadata.beam_trie_levels
-        if (
-            output_head is None
-            or depths is None
-            or not isinstance(lm_head, VocabParallelEmbedding)
-            or should_apply_lm_head_quant_method(lm_head, lm_head.quant_method)
-        ):
-            return None
-        if depths.ndim != 1 or depths.shape[0] != hidden_states.shape[0]:
-            raise RuntimeError(
-                "Per-row beam trie depths must match the LM-head input rows"
-            )
-        assert not self.do_tensor_parallel_all_gather
-
-        head_output = output_head.project_mixed(
-            hidden_states,
-            lm_head.weight,
-            depths,
-            self._project_beam_trie_lm_head,
-            self._transform_beam_trie_logits,
-            use_grouped_projection=not self.use_fp32_lm_head,
-        )
-        # Match the dense path: logit_scale runs in the LM-head dtype, then
-        # scoring and softcapping consume FP32 logits.
-        logits = self._transform_beam_trie_logits(head_output.logits).float()
-        return BeamTrieHeadOutput(logits=logits, normalizer=head_output.normalizer)
-
-    def _project_beam_trie_lm_head(
-        self,
-        hidden_states: torch.Tensor,
-        weight: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.use_fp32_lm_head:
-            use_mm_out_dtype = (
-                hidden_states.is_cuda
-                and hidden_states.dtype == weight.dtype
-                and hidden_states.dtype in (torch.float16, torch.bfloat16)
-            )
-            if use_mm_out_dtype:
-                return torch.mm(hidden_states, weight.T, out_dtype=torch.float32)
-            return torch.matmul(
-                hidden_states.to(torch.float32), weight.to(torch.float32).T
-            )
-        return torch.matmul(hidden_states.to(weight.dtype), weight.T)
-
-    def _transform_beam_trie_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        if self.logit_scale is not None:
-            logits.mul_(self.logit_scale)
-        if self.final_logit_softcapping is None:
-            return logits
-        logits = logits.float()
-        if not (_is_npu or _is_cpu):
-            fused_softcap(logits, self.final_logit_softcapping)
-        else:
-            logits = self.final_logit_softcapping * torch.tanh(
-                logits / self.final_logit_softcapping
-            )
         return logits
 
     def _can_gather_softcap_fused(

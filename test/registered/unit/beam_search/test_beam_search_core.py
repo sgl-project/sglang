@@ -19,6 +19,7 @@ from sglang.srt.beam_search import (
     select_final_topk,
 )
 from sglang.srt.beam_search.coordinator import BeamCoordinator
+from sglang.srt.beam_search.joint_select import SelectResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -97,6 +98,22 @@ class TestJointSelectGolden(CustomTestCase):
         self.assert_close(survivors, [(-0.1, 0, 10), (-0.2, 0, 11)])
         self.assertEqual(finished, [])
 
+    def test_no_stop_fast_path_matches_general_path(self):
+        # A stop id that never appears among the tokens forces the general path
+        # without finishing anything.
+        generator = torch.Generator().manual_seed(0)
+        for k in (1, 3, 8):
+            logprobs = torch.randn(k, 2 * k, generator=generator).log_softmax(-1)
+            tokens = torch.arange(k * 2 * k, dtype=torch.int64).reshape(k, 2 * k)
+            cum = torch.randn(k, generator=generator)
+            fast = joint_select(cum, logprobs, tokens, T([], torch.int64), k)
+            general = joint_select(cum, logprobs, tokens, T([10**6], torch.int64), k)
+            for name in SelectResult.__struct_fields__:
+                self.assertTrue(
+                    torch.equal(getattr(fast, name), getattr(general, name)),
+                    f"{name} differs at beam_width {k}",
+                )
+
     def test_stop_routing(self):
         # Sorted walk: 10 survives, 11 is a stop (examined), 12 survives -> stop.
         # 13 and every row-1 candidate fall outside the examined window.
@@ -158,7 +175,7 @@ class TestJointSelectGolden(CustomTestCase):
             future_map=None,
         )
         group = BeamGroup(beam_width=2, stop_token_ids=[99], max_new_tokens=3)
-        tokens, _ = coordinator._select_group(
+        tokens, _ = coordinator.select_group(
             group,
             T([[-0.1, -0.2, -0.3, -0.4]], torch.float32),
             T([[99, 1, 2, 3]], torch.int64),

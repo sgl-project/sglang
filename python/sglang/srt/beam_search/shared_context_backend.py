@@ -33,6 +33,10 @@ if TYPE_CHECKING:
 
 
 class BeamSharedContextFlashInferAttnBackend(FlashInferAttnBackend):
+    def __init__(self, model_runner, *args, **kwargs):
+        super().__init__(model_runner, *args, **kwargs)
+        shared_context_attention.supports_shared_context(model_runner)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.beam_attention_metadata is None:
             return super().init_forward_metadata(forward_batch)

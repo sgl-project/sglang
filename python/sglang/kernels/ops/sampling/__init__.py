@@ -165,3 +165,11 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="sampling.snapshot_selection",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.beam_selection:snapshot_selection",
+        capabilities=CUDA_ONLY,
+    )
+)

@@ -1494,15 +1494,12 @@ class ModelRunner:
             )
 
     def init_beam_trie_output_heads(self) -> None:
-        """Configure model-native trie output heads on compatible processors."""
         self.beam_trie_compact_enabled = configure_model_trie_output_heads(
             model=self.model,
             config=self.model_config.beam_trie_config,
             device=self.device,
-            tp_size=get_parallel().tp_size,
             quantization=self.model_config.quantization,
             lora_enabled=self.lora_manager is not None,
-            rl_on_policy_target=get_exec().deterministic.rl_on_policy_target,
         )
 
     def start_startup_weight_load(self) -> None:

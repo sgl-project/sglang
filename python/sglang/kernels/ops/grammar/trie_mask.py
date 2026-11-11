@@ -48,39 +48,6 @@ def _materialize_mask_kernel(
 
 
 @triton.jit
-def _mask_logits_kernel(
-    logits,
-    pair_rows,
-    offsets,
-    values,
-    output,
-    logits_row_stride: tl.constexpr,
-    output_row_stride: tl.constexpr,
-    block_size: tl.constexpr,
-):
-    row = tl.program_id(0)
-    pair = tl.load(pair_rows + row).to(tl.int64)
-    start = tl.load(offsets + pair).to(tl.int64)
-    end = tl.load(offsets + pair + 1).to(tl.int64)
-    positions = tl.arange(0, block_size)
-    valid = positions < end - start
-    children = tl.load(
-        values + start + positions,
-        mask=valid,
-        other=0,
-    ).to(tl.int64)
-    scores = tl.load(
-        logits + row * logits_row_stride + children,
-        mask=valid,
-    )
-    tl.store(
-        output + row * output_row_stride + children,
-        scores,
-        mask=valid,
-    )
-
-
-@triton.jit
 def _mask_sparse_prefix_logits_kernel(
     logits,
     prefixes,
@@ -196,29 +163,6 @@ def materialize_sparse_mask(
         offsets,
         values,
         output,
-        output_row_stride=output.stride(0),
-        block_size=block_size,
-        num_warps=8,
-    )
-    return output
-
-
-def mask_sparse_logits(
-    logits: torch.Tensor,
-    pair_rows: torch.Tensor,
-    offsets: torch.Tensor,
-    values: torch.Tensor,
-    max_children: int,
-) -> torch.Tensor:
-    output = torch.full_like(logits, -torch.inf)
-    block_size = triton.next_power_of_2(max_children)
-    _mask_logits_kernel[(pair_rows.shape[0],)](
-        logits,
-        pair_rows,
-        offsets,
-        values,
-        output,
-        logits_row_stride=logits.stride(0),
         output_row_stride=output.stride(0),
         block_size=block_size,
         num_warps=8,

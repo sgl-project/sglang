@@ -382,23 +382,18 @@ class BeamTrieConstraint:
             row_masks = None if masks is None else masks[row_start : row_start + rows]
             row_start += rows
             x = piece.float()
-            if x.shape[1] == size:
+            compact = x.shape[1] == size
+            if compact:
                 if normalizers is None:
-                    from sglang.srt.beam_search.trie_output_head import (
-                        use_topk_logprob,
+                    raise ValueError(
+                        "Compact beam trie logits require full-vocabulary "
+                        "normalizer metadata"
                     )
-
-                    if not use_topk_logprob():
-                        raise ValueError(
-                            "Compact beam trie logits require full-vocabulary "
-                            "normalizer metadata"
-                        )
-                else:
-                    normalizer = normalizers[piece_index]
-                    if normalizer.shape != (rows, 2):
-                        raise ValueError(
-                            "Beam trie normalizer rows must match compact logits"
-                        )
+                normalizer = normalizers[piece_index]
+                if normalizer.shape != (rows, 2):
+                    raise ValueError(
+                        "Beam trie normalizer rows must match compact logits"
+                    )
                 codebook_logits = x
             else:
                 token_end = token_start + size
@@ -427,13 +422,8 @@ class BeamTrieConstraint:
             # Wide beams can retain score-dead (-inf) candidates. Keep their
             # token IDs on-trie so a later decode never indexes an empty prefix.
             t = torch.where(torch.isneginf(v), fallback, t)
-            if x.shape[1] == size:
-                if normalizers is None:
-                    vals.append(v - torch.logsumexp(v, dim=-1, keepdim=True))
-                else:
-                    vals.append(
-                        (v - normalizer[:, :1].float()) - normalizer[:, 1:].float()
-                    )
+            if compact:
+                vals.append((v - normalizer[:, :1].float()) - normalizer[:, 1:].float())
             else:
                 vals.append(v - torch.logsumexp(x, dim=-1, keepdim=True))
             toks.append(t + token_start)

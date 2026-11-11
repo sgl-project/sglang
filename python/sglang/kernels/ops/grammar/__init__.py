@@ -13,7 +13,7 @@ _TRITON_KERNELS = [
     ("bitmask_ops", "apply_token_bitmask_inplace_triton"),
     ("token_filter_ops", "set_token_filter_triton"),
     ("trie_mask", "materialize_sparse_mask"),
-    ("trie_mask", "mask_sparse_logits"),
+    ("trie_mask", "mask_sparse_prefix_logits"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

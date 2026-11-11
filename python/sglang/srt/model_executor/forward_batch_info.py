@@ -38,9 +38,6 @@ import torch
 from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.kernels.ops.memory.small_copy import write_host_ints
-from sglang.srt.beam_search import shared_context_attention
-from sglang.srt.beam_search.shared_context_attention import BeamAttentionMetadata
-from sglang.srt.beam_search.trie_output_head import build_trie_row_levels
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
@@ -76,6 +73,7 @@ from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.shared_context_attention import BeamAttentionMetadata
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
@@ -954,10 +952,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
 
-        beam_trie_levels = build_trie_row_levels(batch, model_runner)
-        beam_attention_metadata = shared_context_attention.build_metadata(
-            batch, model_runner
-        )
+        beam_trie_levels = beam_attention_metadata = None
+        if batch.beam_tail is not None:
+            from sglang.srt.beam_search import shared_context_attention
+            from sglang.srt.beam_search.trie_output_head import build_trie_row_levels
+
+            beam_trie_levels = build_trie_row_levels(batch, model_runner)
+            beam_attention_metadata = shared_context_attention.build_metadata(
+                batch, model_runner
+            )
 
         # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
         # (incl. seq_lens_sum) is slated for removal in favor of kv-committed

@@ -16,14 +16,12 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
 from sglang.srt.beam_search.beam_group import BeamGroup
 from sglang.srt.beam_search.joint_select import FinalSelect, SelectResult
-from sglang.srt.beam_search.shared_context_attention import graph_beam_width
-from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
@@ -35,14 +33,12 @@ class _CapturedSelection:
         coordinator: BeamCoordinator,
         group: BeamGroup,
         pieces: Sequence[torch.Tensor],
-        normalizers: Optional[Sequence[torch.Tensor]],
+        normalizers: Sequence[torch.Tensor],
     ):
         self.final = group.next_step_is_final()
         depth = group.num_generated
         self.pieces = [part.clone() for part in pieces]
-        self.normalizers = (
-            None if normalizers is None else [part.clone() for part in normalizers]
-        )
+        self.normalizers = [part.clone() for part in normalizers]
         self.prefix = group.trie_prefix_codes.clone()
         self.cumulative = group.frontier_cum_logprobs.clone()
         scratch = BeamGroup(
@@ -56,12 +52,12 @@ class _CapturedSelection:
             scratch.num_generated = depth
             scratch.frontier_cum_logprobs = self.cumulative
             scratch.trie_prefix_codes = self.prefix
-            scratch._pending_steps.clear()
-            values, tokens = coordinator._group_topk_logprobs(
+            scratch.clear_staged()
+            values, tokens = coordinator.group_topk_logprobs(
                 scratch, self.pieces, self.normalizers
             )
-            coordinator._select_group(scratch, values, tokens, 0)
-            self.selection = scratch._pending_steps[-1][1]
+            coordinator.select_group(scratch, values, tokens, 0)
+            self.selection = scratch.last_staged_selection()
             self.next_prefix = scratch.trie_prefix_codes
 
         caller = torch.cuda.current_stream()
@@ -81,9 +77,8 @@ class _CapturedSelection:
 
         for target, source in zip(self.pieces, pieces, strict=True):
             target.copy_(source)
-        if self.normalizers is not None:
-            for target, source in zip(self.normalizers, normalizers, strict=True):
-                target.copy_(source)
+        for target, source in zip(self.normalizers, normalizers, strict=True):
+            target.copy_(source)
         self.prefix.copy_(group.trie_prefix_codes)
         self.cumulative.copy_(group.frontier_cum_logprobs)
         self.graph.replay()
@@ -119,13 +114,15 @@ class _CapturedSelection:
         return ids[0], ids[1]
 
 
+# Distinct (depth, width, stream, layout) keys a server touches stay well below this.
+_MAX_CAPTURED_GRAPHS = 32
+
+
 class TrieSelectionGraphCache:
     def __init__(self):
         self.graphs = OrderedDict()
-        self.signature = None
         self.captures = 0
         self.replays = 0
-        self.resets = 0
 
     def select(self, coordinator, group, pieces, normalizers, tick):
         constraint = coordinator.trie_constraint
@@ -133,64 +130,32 @@ class TrieSelectionGraphCache:
             constraint is None
             or not group.device_history
             or group.stop_token_ids.numel()
-            or group.beam_width != graph_beam_width()
             or group.num_generated <= 0
-            or group.num_generated >= group.max_new_tokens
             or len(pieces) != 2
             or not all(part.is_cuda for part in pieces)
+            or normalizers is None
             or pieces[0].shape != (1, constraint.config.codebook_size)
             or pieces[1].shape
             != (group.beam_width - 1, constraint.config.codebook_size)
         ):
             return None
-        approximate = envs.SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB.get()
-        if (normalizers is None) != approximate:
-            raise ValueError("Trie score policy changed without recapturing the model")
 
         def layout(tensor):
             return (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
 
-        def table(tensor):
-            return (tensor.data_ptr(), *layout(tensor))
-
-        sparse = constraint.level2_sparse
-        signature = (
-            id(constraint),
-            graph_beam_width(),
-            approximate,
-            constraint.config.token_start,
-            constraint.config.codebook_size,
-            constraint.config.num_codebooks,
-            table(constraint.root_mask),
-            table(constraint.level1_masks),
-            table(constraint.level2_masks)
-            if constraint.level2_masks is not None
-            else None,
-            (
-                sparse.max_children,
-                *(table(part) for part in (sparse.keys, sparse.offsets, sparse.values)),
-            )
-            if sparse is not None
-            else None,
-        )
-        if self.signature != signature:
-            self.graphs.clear()
-            self.signature = signature
-            self.resets += 1
         key = (
             pieces[0].device,
             torch.cuda.current_stream().cuda_stream,
+            group.beam_width,
             group.num_generated,
             group.max_new_tokens,
             tuple(layout(part) for part in pieces),
-            None
-            if normalizers is None
-            else tuple(layout(part) for part in normalizers),
+            tuple(layout(part) for part in normalizers),
             layout(group.trie_prefix_codes),
             layout(group.frontier_cum_logprobs),
         )
         if key not in self.graphs:
-            if len(self.graphs) >= 4:
+            if len(self.graphs) >= _MAX_CAPTURED_GRAPHS:
                 self.graphs.popitem(last=False)
             self.graphs[key] = _CapturedSelection(
                 coordinator, group, pieces, normalizers

@@ -275,6 +275,35 @@ class TestPrefillAdder(CustomTestCase):
         req.beam_group = BeamGroup(beam_width=4, max_new_tokens=3)
         self.assertEqual(running._decode_token_budget_for_admission(req, 3), 3)
 
+    def test_trie_beam_chunked_prefill_defers_decode_budget(self):
+        # Like a normal request, the decode budget waits for the last chunk; then
+        # the group's 4 * 2 slots replace the request's 3-token estimate.
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_token_allocator.available_size.return_value = 100
+        for prefix_len, expected_result, expected_offset in (
+            (0, AddReqResult.OTHER, 5),
+            (8, None, 11),
+        ):
+            with self.subTest(prefix_len=prefix_len):
+                req = self.create_shared_req("beam", max_new_tokens=3)
+                req.full_untruncated_fill_ids = list(range(10))
+                req.prefix_len = prefix_len
+                req.beam_group = BeamGroup(
+                    beam_width=4, max_new_tokens=3, device_history=True
+                )
+                adder = self.create_adder(
+                    self.create_running_batch(), rem_chunk_tokens=4
+                )
+                result = (
+                    adder.add_one_req(
+                        req, has_chunked_req=False, truncation_align_size=None
+                    )
+                    if prefix_len == 0
+                    else adder.add_chunked_req(req)
+                )
+                self.assertIs(result, expected_result)
+                self.assertEqual(adder.memory_budget.total_offset, expected_offset)
+
     def test_normal_chunked_prefill_preserves_decode_budget_timing(self):
         self.mock_tree_cache.supports_mamba.return_value = False
         self.mock_token_allocator.available_size.return_value = 100

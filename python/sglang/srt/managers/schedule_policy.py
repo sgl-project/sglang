@@ -806,26 +806,21 @@ class PrefillAdder:
         )
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
-        beam_budget = self._beam_decode_token_budget(req)
-        if beam_budget is not None:
-            return beam_budget
         # Fixed-length requests cannot benefit from the early-EOS estimate.
         ratio = 1.0 if req.sampling_params.ignore_eos else self.new_token_ratio
-        return (
+        return self._decode_token_budget_for_admission(
+            req,
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
                 CLIP_MAX_NEW_TOKENS,
             )
-            * ratio
+            * ratio,
         )
 
     @staticmethod
-    def _beam_decode_token_budget(req: Req) -> Optional[int]:
+    def _decode_token_budget_for_admission(req: Req, normal_budget: int) -> int:
         group = req.beam_group
-        return None if group is None else group.decode_slot_budget()
-
-    def _decode_token_budget_for_admission(self, req: Req, normal_budget: int) -> int:
-        beam_budget = self._beam_decode_token_budget(req)
+        beam_budget = None if group is None else group.decode_slot_budget()
         return normal_budget if beam_budget is None else beam_budget
 
     @property
@@ -1393,15 +1388,13 @@ class PrefillAdder:
             raise RuntimeError("chunked request exceeds the sharded assembly scratch")
         req.extend_end = req.prefix_len + new_len
         self.can_run_list.append(req)
+        decode_budget = self._decode_token_budget_for_admission(
+            req, min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+        )
         self._update_prefill_budget(
             prefix_tokens,
             req.extend_len,
-            self._decode_token_budget_for_admission(
-                req,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-                if not truncated
-                else 0,
-            ),
+            0 if truncated else decode_budget,
             req.retracted_stain,
             state_slots=self._state_slots_for_req(req),
             request_slot_reserve=request_slot_reserve,
@@ -1410,11 +1403,7 @@ class PrefillAdder:
             # credits them.
             cached_tokens=req.prefix_len,
             unfinished_input_len=cand_extend_input_len - new_len,
-            deferred_max_new_tokens=(
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-                if truncated
-                else 0
-            ),
+            deferred_max_new_tokens=decode_budget if truncated else 0,
             admitted_chunk_limit=_rem_tokens,
         )
 
@@ -1982,10 +1971,16 @@ class PrefillAdder:
         self.can_run_list.append(req)
         if admission.is_chunked:
             self.new_chunked_req = req
+        decode_budget = self._decode_token_budget_for_admission(
+            req,
+            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            if admission.is_chunked
+            else admission.max_new_tokens,
+        )
         self._update_prefill_budget(
             admission.prefix_len,
             admission.extend_len,
-            self._decode_token_budget_for_admission(req, admission.max_new_tokens),
+            0 if admission.is_chunked else decode_budget,
             req.retracted_stain,
             state_slots=state_slots,
             request_slot_reserve=self._request_slot_reserve_for_req(
@@ -1999,11 +1994,7 @@ class PrefillAdder:
                 if admission.is_chunked
                 else 0
             ),
-            deferred_max_new_tokens=(
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-                if admission.is_chunked
-                else 0
-            ),
+            deferred_max_new_tokens=decode_budget if admission.is_chunked else 0,
             admitted_chunk_limit=admission.chunk_limit,
         )
         self._account_prefill_cache_admission(req, admission.prefix_len)
