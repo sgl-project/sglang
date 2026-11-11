@@ -38,7 +38,7 @@ def fused_topk_npu(
             else 1.0
         )
         topk_weights, topk_ids, _ = moe_gating_top_k(
-            router_logits.to(torch.float32),
+            x=router_logits.to(torch.float32),
             k=topk_config.top_k,
             bias=(
                 correction_bias.to(torch.float32)
@@ -74,7 +74,7 @@ def fused_topk_npu(
         or num_token_non_padded is not None
     ):
         topk_weights, topk_ids, _ = moe_gating_top_k(
-            router_logits.to(torch.float32),
+            x=router_logits.to(torch.float32),
             k=topk_config.top_k,
             bias=(
                 correction_bias.to(torch.float32)
