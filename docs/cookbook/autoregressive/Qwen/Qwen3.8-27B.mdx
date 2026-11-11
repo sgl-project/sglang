@@ -56,14 +56,6 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
 
 <Deployment config={config} />
 
-The **XEON / FP8** recipe passed basic text generation on Intel Xeon CPUs at
-TP6 with BF16 execution and checkpoint revision
-`017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`. It uses a bounded 8,192-token
-cache and no calculator or Playground overrides. Use a CPU-enabled SGLang
-environment with its OpenMP and allocator libraries configured. This check
-does not establish image/video support, full-context support, dataset accuracy
-or performance; the GPU measurements below do not describe the CPU recipe.
-
 <Note>
   Every cell above — RTX 5090, RTX PRO 6000 and DGX Spark, across all five
   checkpoints and every Speculative Decoding / Serving Strategy / SSM dtype
