@@ -140,17 +140,20 @@ class TestPluginRuntimeContextContract(CustomTestCase):
         graph_cfg = get_exec().graph.cuda_graph_config
         self.assertIsNotNone(graph_cfg)
         self.assertEqual(graph_cfg.decode.backend, Backend.FULL)
+        self.assertFalse(get_exec().graph.enable_torch_compile)
 
         reset_context()
         # Engine-style dict input: raw stays dict, bag holds structured config.
         self._resolve_and_publish(
-            cuda_graph_config={"decode": {"backend": "disabled", "max_bs": 8}}
+            cuda_graph_config={"decode": {"backend": "disabled", "max_bs": 8}},
+            enable_torch_compile=True,
         )
         self.assertIsInstance(get_server_args().cuda_graph_config, dict)
         self.assertEqual(
             get_exec().graph.cuda_graph_config.decode.backend, Backend.DISABLED
         )
         self.assertEqual(get_exec().graph.cuda_graph_config.decode.max_bs, 8)
+        self.assertTrue(get_exec().graph.enable_torch_compile)
 
     def test_lora_paths_imply_enable_lora_in_context_not_raw_args(self):
         """--lora-paths without --enable-lora resolves enable_lora=True only in get_lora()."""

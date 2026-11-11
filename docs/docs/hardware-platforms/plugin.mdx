@@ -1066,7 +1066,7 @@ Plugins that inspect active runtime settings (for example to validate supported 
 
 - **`get_server_args()` holds raw input only**: `ServerArgs` preserves what the caller passed for diagnostics and provenance. Fields resolved during startup (for example `cuda_graph_config`, which starts as `None` or a `dict`, or `enable_lora` inferred from `--lora-paths`) are projected into namespace bags rather than written back onto `ServerArgs`.
 - **Namespace accessors return resolved values**:
-  - `get_exec()` — execution and kernel settings (e.g. `get_exec().graph.cuda_graph_config.decode.backend`, `get_exec().compile.enable_torch_compile`)
+  - `get_exec()` — execution and kernel settings (e.g. `get_exec().graph.cuda_graph_config.decode.backend`, `get_exec().graph.enable_torch_compile`)
   - `get_model()` — model, dtype, quantization, and load-format settings
   - `get_memory()` — KV cache, HiCache, Mamba state, and memory sizing settings
   - `get_schedule()` — batching and scheduler settings
