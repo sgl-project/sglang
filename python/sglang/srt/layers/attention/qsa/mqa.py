@@ -560,9 +560,11 @@ def tilelang_qsa_mqa_prefill_relative(
 # CTAs per decode row: few enough levels to bound the TileLang specializations, and
 # a grid of about four waves (at least one CTA per row).
 _DECODE_CTAS_PER_ROW_LEVELS = (1, 16, 256)
-# CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires sixteen;
-# the indexer pads Q to this in its fused prep so the wrapper need not copy it.
+# CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires sixteen.
 QSA_DECODE_HEAD_ALIGNMENT = 16 if is_hip() else 8
+# Head padding of the indexer's fused Q prep. On gfx95 it pads to the kernel width so
+# the wrapper need not copy Q; elsewhere it keeps eight and the wrapper pads the rest.
+QSA_DECODE_Q_PREP_ALIGNMENT = QSA_DECODE_HEAD_ALIGNMENT if is_gfx95_supported() else 8
 # Four wavefronts per CTA: about 1.5x faster than 128 threads on MI355X (gfx950).
 _DECODE_THREADS = 256 if is_gfx95_supported() else 128
 # Four consecutive groups per CTA over a page-table-wide grid: 1.2-1.7x faster than
@@ -621,7 +623,11 @@ def tilelang_qsa_mqa_decode(
             device=q.device,
         )
     # An empty page table would give the page-table-wide grid zero CTAs.
-    if not q.shape[0] or not max_model_len or not page_table.shape[1]:
+    if (
+        not q.shape[0]
+        or not max_model_len
+        or (_DECODE_GROUPS_PER_CTA and not page_table.shape[1])
+    ):
         return logits
     # Zero-padding preserves the weight-free head sum.
     query_heads, head_dim = q.shape[1:]
