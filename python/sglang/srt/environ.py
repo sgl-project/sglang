@@ -1202,9 +1202,14 @@ class Envs:
     # import and Triton cga_layout prerequisites hold. Set to 0 to force the
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
-    # Select the AITER MLA kernel for decode, "asm" or "gluon".
+    # Select the AITER MLA kernel for decode: "asm" (aiter.mla.mla_decode_fwd),
+    # "gluon" (aiter mla_gluon where prefer_mla_gluon_decode holds, else ASM) or
+    # "triton" (aiter.ops.triton.attention.mla.mla_decode_fwd, not sglang's
+    # --decode-attention-backend triton; gfx1250 with bf16 activations, no DCP
+    # and qk_rope_head_dim > 0, else startup raises). "auto" is "triton" there,
+    # else "asm". Explicit values are honored as-is.
     SGLANG_AITER_MLA_DECODE_BACKEND = EnvStrWithAlias(
-        "asm", deprecated_name="SGLANG_AITER_MLA_DCP_DECODE_BACKEND"
+        "auto", deprecated_name="SGLANG_AITER_MLA_DCP_DECODE_BACKEND"
     )
     # Select the AITER MLA kernel for target verify, "asm" or "gluon".
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
