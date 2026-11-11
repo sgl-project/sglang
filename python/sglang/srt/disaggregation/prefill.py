@@ -543,22 +543,20 @@ class PrefillBootstrapQueue:
             self.scheduler.token_to_kv_pool_allocator.page_size,
         )
 
-    def add(
-        self, req: Req, num_kv_heads: int, *, src: Optional[ReqList] = None
-    ) -> None:
-        """Queue a request for bootstrap, moving it out of `src` if given; one
-        refused at the door is finished and leaves `src` for no list."""
+    def add(self, req: Req, num_kv_heads: int) -> None:
+        """Queue a request for bootstrap, moving it out of the list it is in;
+        one refused at the door is finished and leaves for no list."""
         # Rejected at intake: `set_finish_with_abort` left the verdict in
         # `to_finish`, which `finished()` does not read, and swapped the prompt
         # for a one-token stub. Bootstrapping it costs a handshake, a metadata
         # buffer and a forward pass before anything unwinds it.
         if is_unadmitted_reject(req):
-            self.scheduler.request_retirer.retire_unadmitted(req, src=src)
+            self.scheduler.request_retirer.retire_unadmitted(req)
             return
-        if self._check_if_req_exceed_kv_capacity(req, src=src):
+        if self._check_if_req_exceed_kv_capacity(req):
             return
         self.create_sender(req, num_kv_heads)
-        move([req], src, self.queue)
+        move([req], self.queue)
 
     def _abort(self, recv_req: AbortReq) -> None:
         for req in self.queue:
@@ -569,14 +567,12 @@ class PrefillBootstrapQueue:
                 if get_parallel().pp_size > 1:
                     prepare_abort(req, "Aborted by AbortReq.")
 
-    def _check_if_req_exceed_kv_capacity(
-        self, req: Req, *, src: Optional[ReqList] = None
-    ) -> bool:
+    def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         if len(req.origin_input_ids) > self.max_input_len:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_input_len}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.request_retirer.retire_unadmitted(req, src=src)
+            self.scheduler.request_retirer.retire_unadmitted(req)
             return True
         return False
 
@@ -652,7 +648,7 @@ class PrefillBootstrapQueue:
                 )
 
         self.queue.leave(failed_reqs)
-        move(bootstrapped_reqs, self.queue, dst)
+        move(bootstrapped_reqs, dst)
 
         return bootstrapped_reqs
 
@@ -1175,7 +1171,7 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # Test hook: exercise the release/requeue retry path.
                 if req.pending_bootstrap and should_force_retry(req):
-                    self.optimistic_release_and_requeue(req, self.prefill_launched_reqs)
+                    self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     continue
 
@@ -1225,7 +1221,6 @@ class SchedulerDisaggregationPrefillMixin:
                 self.checkpoint_disagg_prefill(req)
                 move(
                     [req],
-                    self.prefill_launched_reqs,
                     self.disagg_prefill_transfer_queue,
                 )
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
@@ -1287,7 +1282,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # Only a yield leaves the chunked slot before the final chunk; the
                 # yield is not undone by a bootstrap that completes meanwhile.
                 if not still_chunking:
-                    self.optimistic_release_and_requeue(req, self.prefill_launched_reqs)
+                    self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
@@ -1422,9 +1417,7 @@ class SchedulerDisaggregationPrefillMixin:
                     # Decode may have admitted different requests. Yield one
                     # slot so they can prefill, including peers still waiting
                     # for a metadata buffer in the bootstrap queue.
-                    self.optimistic_release_and_requeue(
-                        req, self.disagg_prefill_transfer_queue
-                    )
+                    self.optimistic_release_and_requeue(req)
                 elif poll != KVPoll.Failed:
                     undone_reqs.append(req)
                 continue
@@ -1611,11 +1604,9 @@ class SchedulerDisaggregationPrefillMixin:
                 ):
                     # optimistic request yields to waiting requests; with a step
                     # in flight, it is requeued once its last step is processed.
-                    move([req], self.chunked_reqs, self.prefill_launched_reqs)
+                    move([req], self.prefill_launched_reqs)
                     if req.inflight_steps == 0:
-                        self.optimistic_release_and_requeue(
-                            req, self.prefill_launched_reqs
-                        )
+                        self.optimistic_release_and_requeue(req)
                 # else: still bootstrapping, keep computing without sending
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
@@ -2002,8 +1993,8 @@ class SchedulerDisaggregationPrefillMixin:
                 )
         req.start_send_idx = end_idx
 
-    def optimistic_release_and_requeue(self: Scheduler, req: Req, src: ReqList) -> None:
-        """Release KV cache and requeue an optimistic prefill request out of `src`."""
+    def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
+        """Release KV cache and requeue an optimistic prefill request."""
         max_attempts = get_disagg().optimistic_prefill_attempts
         # Publish the computed prefix before releasing it. A write-through cache
         # keeps optimistic KV request-owned only to keep the backup off the
@@ -2057,7 +2048,7 @@ class SchedulerDisaggregationPrefillMixin:
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
-            move([req], src, self.disagg_prefill_bootstrap_queue.queue)
+            move([req], self.disagg_prefill_bootstrap_queue.queue)
         else:
             req.prefill_attempt_count += 1
             logger.info(
@@ -2068,4 +2059,4 @@ class SchedulerDisaggregationPrefillMixin:
                 self.metrics_collector.increment_prefill_retries(1)
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
-            move([req], src, self.waiting_queue, at=0)
+            move([req], self.waiting_queue, at=0)

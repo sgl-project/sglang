@@ -383,7 +383,7 @@ class TestAllocationIntegration(CustomTestCase):
         ):
             launched.join([req])
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req, launched
+                scheduler, req
             )
             self.assertEqual(list(scheduler.waiting_queue), [req])
             self.assertEqual(list(launched), [])
@@ -401,7 +401,7 @@ class TestAllocationIntegration(CustomTestCase):
                 scheduler.waiting_queue.clear()
                 launched.join([req])
                 SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                    scheduler, req, launched
+                    scheduler, req
                 )
             self.assertEqual(list(scheduler.waiting_queue), [])
             self.assertEqual(list(launched), [])
@@ -426,6 +426,7 @@ class TestAllocationIntegration(CustomTestCase):
         self.addCleanup(override.restore)
 
         class _Req:
+            owner_list = None
             release_mm_inputs_on_abort = Req.release_mm_inputs_on_abort
 
         req = _Req()
@@ -458,7 +459,7 @@ class TestAllocationIntegration(CustomTestCase):
             patch("sglang.srt.disaggregation.prefill.release_kv_cache"),
         ):
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req, scheduler.prefill_launched_reqs
+                scheduler, req
             )
 
         self.assertEqual(list(scheduler.waiting_queue), [req])
@@ -478,6 +479,7 @@ class TestAllocationIntegration(CustomTestCase):
                     override.install()
                     try:
                         req = Mock(
+                            owner_list=None,
                             finished_reason=None,
                             to_finish=None,
                             inflight_steps=inflight_steps,
@@ -514,7 +516,7 @@ class TestAllocationIntegration(CustomTestCase):
                             launched = scheduler.prefill_launched_reqs
                             self.assertEqual(
                                 scheduler.optimistic_release_and_requeue.call_args_list,
-                                [] if inflight_steps else [call(req, launched)],
+                                [] if inflight_steps else [call(req)],
                             )
                             self.assertEqual(list(launched), [req])
                     finally:
@@ -557,9 +559,7 @@ class TestAllocationIntegration(CustomTestCase):
             scheduler, batch, result
         )
 
-        scheduler.optimistic_release_and_requeue.assert_called_once_with(
-            req, scheduler.prefill_launched_reqs
-        )
+        scheduler.optimistic_release_and_requeue.assert_called_once_with(req)
 
     def inflight_scheduler(self, reqs):
         scheduler = SchedulerDisaggregationPrefillMixin()
@@ -628,7 +628,7 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler.waiting_queue = []
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
         scheduler.optimistic_release_and_requeue = Mock(
-            side_effect=lambda req, src: pool.free(req)
+            side_effect=lambda req: pool.free(req)
         )
         with get_context().override_server_args(
             disaggregation_decode_allocation_policy="early"
@@ -642,9 +642,7 @@ class TestAllocationIntegration(CustomTestCase):
             self.assertEqual(pool.available_size(), 1)
 
             scheduler.process_disagg_prefill_transfer_queue()
-            scheduler.optimistic_release_and_requeue.assert_called_once_with(
-                reqs[0], scheduler.disagg_prefill_transfer_queue
-            )
+            scheduler.optimistic_release_and_requeue.assert_called_once_with(reqs[0])
 
     def test_success_is_sent_once_after_all_sender_state_is_cleared(self):
         sender, receiver = self.sender(), self.receiver()
@@ -854,9 +852,11 @@ class TestAllocationIntegration(CustomTestCase):
                     )
                     self.assertEqual(
                         [event[0] for event in events.mock_calls],
-                        ["metadata", "recompute"]
-                        if policy == "early"
-                        else ["recompute", "metadata"],
+                        (
+                            ["metadata", "recompute"]
+                            if policy == "early"
+                            else ["recompute", "metadata"]
+                        ),
                     )
                     self.assertEqual(queue._num_published_destinations, 1)
                 finally:

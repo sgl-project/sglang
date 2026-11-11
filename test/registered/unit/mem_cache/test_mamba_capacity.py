@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.mem_cache.allocation import alloc_req_slots, ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
@@ -253,7 +254,6 @@ class TestMambaCapacity(unittest.TestCase):
             queue=decode_queue(ListKind.PD_RECEIVING)
         )
         queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
-        queue.retracted_queue.join([req])
         queue.req_to_token_pool = pool
         queue.token_to_kv_pool_allocator = SimpleNamespace(state=pool.state)
         queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
@@ -289,6 +289,7 @@ class TestMambaCapacity(unittest.TestCase):
         queue._pre_alloc.assert_not_called()
         self.assertIsNone(req.kv.req_pool_idx)
 
+        move([req], queue.retracted_queue)
         queue._prealloc_required = MagicMock(return_value=(1, {}))
         queue._admit_preallocation = MagicMock(return_value=True)
         queue.token_to_kv_pool_allocator = SimpleNamespace(state=pool.state)
