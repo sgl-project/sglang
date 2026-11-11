@@ -13,7 +13,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.utils.common import ceil_align, flatten_arrays_to_pinned_cpu
-from sglang.srt.utils.device import async_h2d, is_hip, is_pin_memory_available
+from sglang.srt.utils.device import async_h2d, is_pin_memory_available
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpans,
@@ -123,12 +123,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     TreeLock,
 )
+from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     evict_from_tree_cache,
     match_kv_cache,
 )
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
+from sglang.srt.mem_cache.kv.alloc.demand import windows_retire_by_forward
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
@@ -158,6 +160,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
+    from sglang.srt.managers.scheduler_components.request_list import ReqList
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
     )
@@ -168,8 +171,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
-
-_is_hip = is_hip()
 
 
 def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
@@ -429,6 +430,9 @@ class ReqKvInfo:
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
+    # The scheduler list holding the request; `ReqList` keeps it.
+    owner_list: Optional[ReqList] = None
+
     def __init__(
         self,
         rid: str,
@@ -542,12 +546,14 @@ class Req(ReqDllmMixin):
         self._think_end_match_len = 0
         self._think_start_match_len = 0
 
+        # The request clips its limits in place; the incoming params stay as
+        # received, since pipeline stages relay them onward.
+        sampling_params = copy.copy(sampling_params)
         # Only custom logit processors read "__req__", and the reference is weak
         # so the request still dies by refcount.
         if custom_logit_processor is not None and isinstance(
             sampling_params.custom_params, dict
         ):
-            sampling_params = copy.copy(sampling_params)
             sampling_params.custom_params = sampling_params.custom_params | {
                 "__req__": weakref.proxy(self)
             }
@@ -1139,6 +1145,8 @@ class Req(ReqDllmMixin):
         self,
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
+        *,
+        defer_cow_slot: bool = False,
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
@@ -1182,6 +1190,7 @@ class Req(ReqDllmMixin):
                 tree_cache,
                 token_ids_to_match,
                 cow_mamba=cow_mamba,
+                defer_cow_slot=defer_cow_slot,
                 max_prefix_len=key_limit,
             )
             self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
@@ -1507,7 +1516,6 @@ class Req(ReqDllmMixin):
         self.lock = None
         self.swa_branching_seqlen = None
         self.extend_end = None
-        self.dllm_initialized = False
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
@@ -1532,6 +1540,8 @@ class Req(ReqDllmMixin):
             self.weight_version_events = truncate_weight_version_events(
                 self.weight_version_events, num_kept_tokens=self.send_token_offset
             )
+        # Reads output_ids, which input_embeds discards above.
+        self.reset_dllm_progress()
 
     def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
         if allocator.cpu_copy_carries_mamba:
@@ -1903,6 +1913,36 @@ def _compute_chunked_req_next_prompt_token(
         return None
     if origin_ids[fill_len] < vocab_size:
         return int(origin_ids[fill_len])
+    return None
+
+
+def prefill_checkpoint_boundary(
+    prefix_len: int, extend_len: int, checkpoint_grid: int
+) -> Optional[int]:
+    """Depth a prefill extend checkpoints at without DCP: the last whole
+    ``checkpoint_grid`` multiple past the prefix; None (no checkpoint, so no
+    window row retires behind one) for an extend shorter than the grid."""
+    if extend_len < checkpoint_grid:
+        return None
+    return prefix_len + extend_len // checkpoint_grid * checkpoint_grid
+
+
+def branch_checkpoint(
+    prefix_len: int,
+    branching_seqlen: Optional[int],
+    track_seqlen: int,
+    cache_chunk_size: int,
+) -> Optional[int]:
+    """The branch depth (`branching_checkpoint_depth`) an extend tracks instead
+    of its own checkpoint, when it lies inside the extend before ``track_seqlen``
+    on the state-chunk grid past the prefix; else None."""
+    if branching_seqlen is None:
+        return None
+    if (
+        prefix_len < branching_seqlen < track_seqlen
+        and (branching_seqlen - prefix_len) % cache_chunk_size == 0
+    ):
+        return branching_seqlen
     return None
 
 
@@ -2640,10 +2680,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Chunked prefill can leave an active request off the absolute
             # checkpoint grid. Without DCP, keep tracking snapshots relative to
             # that request prefix so later chunks can continue donating states.
-            mask = req.extend_len >= checkpoint_grid
-            mamba_track_seqlen_aligned = (
-                prefix_len + (req.extend_len // checkpoint_grid) * checkpoint_grid
+            boundary = prefill_checkpoint_boundary(
+                prefix_len, req.extend_len, checkpoint_grid
             )
+            mask = boundary is not None
+            mamba_track_seqlen_aligned = prefix_len if boundary is None else boundary
         track_position = req.kv.mamba_next_track_idx
         mamba_track_seqlen = -1
         if mask:
@@ -2666,22 +2707,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
-            if req.mamba_branching_seqlen is not None:
-                # track branching point in this forward if the branching point
-                # is within the current extend batch.
-                branching_seqlen_aligned_mask = (
-                    req.mamba_branching_seqlen - req.prefix_len
-                ) % cache_chunk_size == 0
-                if (
-                    req.mamba_branching_seqlen > req.prefix_len
-                    and req.mamba_branching_seqlen < mamba_track_seqlen
-                    and branching_seqlen_aligned_mask
-                ):
-                    # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                    # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
-                    # See _force_track_h() for more details.
-                    mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
-                    mamba_track_seqlen_aligned = req.mamba_branching_seqlen
+            # Track the branching point instead, if it lies within this extend.
+            branch = branch_checkpoint(
+                req.prefix_len,
+                req.mamba_branching_seqlen,
+                mamba_track_seqlen,
+                cache_chunk_size,
+            )
+            if branch is not None:
+                # We want to track mamba_track_seqlen_aligned, and it's not the last position,
+                # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
+                # See _force_track_h() for more details.
+                mamba_track_seqlen = _force_track_h(branch)
+                mamba_track_seqlen_aligned = branch
             kv_storage_of(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             ).advance(
@@ -2895,6 +2933,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
         return total
 
+    @capacity_decision
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         """Whether the next decode step fits in the KV pool. The ALLOCATOR owns
         the capacity gate (eviction + any per-step reservations of its own) —
@@ -2907,13 +2946,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if selected_indices is None
             else [self.reqs[i] for i in selected_indices]
         )
-        return self.token_to_kv_pool_allocator.check_decode_capacity(
+        from sglang.srt.mem_cache.capacity import check_decode_capacity
+
+        return check_decode_capacity(
+            self.tree_cache,
+            self.token_to_kv_pool_allocator,
             num_tokens=num_tokens,
-            tree_cache=self.tree_cache,
             requests=requests,
             spec_algorithm=self.spec_algorithm,
         )
 
+    @capacity_decision
     def retract_decode(
         self, request_retirer: RequestRetirer
     ) -> Tuple[List[Req], float, List[Req]]:
@@ -3526,12 +3569,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         per-request token gating synchronizes SWA pressure across DP ranks and
         triggers a retraction / re-prefill storm at high concurrency.
         """
-        if _is_hip:
-            from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
-            if get_moe_a2a_backend().is_megamoe():
-                due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
-                return (lambda req: due_this_forward), 1
+        if windows_retire_by_forward():
+            due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
+            return (lambda req: due_this_forward), 1
         windows = self.tree_cache.window_lengths()
         return (
             lambda req: any(
