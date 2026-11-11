@@ -536,7 +536,8 @@ class _MemoryBackend(StorageBackend):
         pass
 
 
-def _store_batch(B=2, K=3, T=2, D=4, L=5):
+def _store_batch(B=2, T=2, D=4, L=5, latent_steps=(0, 1, 2)):
+    K = len(latent_steps)
     batch = OutputBatch(
         output=torch.randn(B, 1, 8, 8),
         rollout_trajectory_data=RolloutTrajectoryData(
@@ -557,7 +558,7 @@ def _store_batch(B=2, K=3, T=2, D=4, L=5):
                 latents=torch.randn(B, K, D),
                 timesteps=torch.linspace(1.0, 0.0, T),
                 sigmas=torch.linspace(1.0, 0.0, T + 1),
-                latent_step_indices=torch.tensor([0, 1, 2]),
+                latent_step_indices=torch.tensor(latent_steps),
             ),
         ),
     )
@@ -570,6 +571,11 @@ def _assert_same_tensors(test, inline, via_store, stored):
     if isinstance(via_store, dict) and "__store__" in via_store:
         tensor = stored[via_store["__store__"]]
         test.assertTrue(torch.equal(_maybe_deserialize(inline), tensor))
+    elif isinstance(via_store, list) and "__tensor__" in inline:
+        rows = _maybe_deserialize(inline)
+        test.assertEqual(len(rows), len(via_store))
+        for row, marker in zip(rows, via_store):
+            test.assertTrue(torch.equal(row, stored[marker["__store__"]]))
     elif isinstance(via_store, dict):
         test.assertEqual(set(inline), set(via_store))
         for key in via_store:
@@ -583,7 +589,7 @@ def _assert_same_tensors(test, inline, via_store, stored):
 
 
 class TestBuildResponseViaStore(unittest.TestCase):
-    def test_batched_tensors_are_stored_one_field_per_sample(self):
+    def test_batched_tensors_are_stored_one_field_per_sample_and_step(self):
         batch = _store_batch()
         rtd = batch.rollout_trajectory_data
         stored = {}
@@ -591,10 +597,12 @@ class TestBuildResponseViaStore(unittest.TestCase):
         self.assertEqual(
             set(stored),
             {
-                "dit_trajectory.latents.0",
-                "dit_trajectory.latents.1",
-                "rollout_debug_tensors.rollout_model_outputs.0",
-                "rollout_debug_tensors.rollout_model_outputs.1",
+                *(f"dit_trajectory.latents.{b}.{k}" for b in (0, 1) for k in (0, 1, 2)),
+                *(
+                    f"rollout_debug_tensors.rollout_model_outputs.{b}.{t}"
+                    for b in (0, 1)
+                    for t in (0, 1)
+                ),
                 "denoising_env.pos_cond_kwargs.encoder_hidden_states.0.0",
                 "denoising_env.pos_cond_kwargs.encoder_hidden_states.0.1",
                 "denoising_env.pos_cond_kwargs.pooled",
@@ -602,7 +610,7 @@ class TestBuildResponseViaStore(unittest.TestCase):
         )
         self.assertTrue(
             torch.equal(
-                stored["dit_trajectory.latents.1"], rtd.dit_trajectory.latents[1]
+                stored["dit_trajectory.latents.1.2"], rtd.dit_trajectory.latents[1, 2]
             )
         )
         self.assertIs(
@@ -612,7 +620,16 @@ class TestBuildResponseViaStore(unittest.TestCase):
         for row, resp in enumerate(resps):
             self.assertEqual(
                 resp.dit_trajectory["latents"],
-                {"__store__": f"dit_trajectory.latents.{row}"},
+                [{"__store__": f"dit_trajectory.latents.{row}.{k}"} for k in (0, 1, 2)],
+            )
+            self.assertEqual(
+                resp.rollout_debug_tensors["rollout_model_outputs"],
+                [
+                    {
+                        "__store__": f"rollout_debug_tensors.rollout_model_outputs.{row}.{t}"
+                    }
+                    for t in (0, 1)
+                ],
             )
             cond = resp.denoising_env["pos_cond_kwargs"]
             self.assertEqual(
@@ -630,6 +647,24 @@ class TestBuildResponseViaStore(unittest.TestCase):
             self.assertEqual(cond["txt_seq_lens"], [7, 8])
             self.assertIsNone(resp.rollout_debug_tensors["rollout_variance_noises"])
             self.assertIsNone(resp.output_store_ref)
+
+    def test_windowed_latents_are_named_by_their_original_step(self):
+        batch = _store_batch(latent_steps=(2, 3, 7))
+        latents = batch.rollout_trajectory_data.dit_trajectory.latents
+        stored = {}
+        resps = _build_response("r", "p", 0, True, batch, stored=stored)
+        for row, resp in enumerate(resps):
+            self.assertEqual(
+                resp.dit_trajectory["latents"],
+                [{"__store__": f"dit_trajectory.latents.{row}.{s}"} for s in (2, 3, 7)],
+            )
+            for position, step in enumerate((2, 3, 7)):
+                self.assertTrue(
+                    torch.equal(
+                        stored[f"dit_trajectory.latents.{row}.{step}"],
+                        latents[row, position],
+                    )
+                )
 
     def test_small_tensors_stay_inline(self):
         batch = _store_batch(T=2)

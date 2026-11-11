@@ -201,6 +201,27 @@ def _store_leaves(
     return _maybe_serialize(obj)
 
 
+def _store_steps(
+    tensor: torch.Tensor | None,
+    sample_idx: int,
+    *,
+    path: str,
+    stored: dict[str, torch.Tensor],
+    steps: list[int] | None = None,
+) -> list[dict] | None:
+    """One field per step of a ``[B, steps, ...]`` tensor's sample, named by its original step number."""
+    if tensor is None:
+        return None
+    if steps is None:
+        steps = range(tensor.shape[1])
+    markers = []
+    for position, step in enumerate(steps):
+        field = f"{path}.{sample_idx}.{step}"
+        stored[field] = tensor[sample_idx, position]
+        markers.append({"__store__": field})
+    return markers
+
+
 def _serialize_rollout_trajectory_via_store(
     rtd: RolloutTrajectoryData,
     sample_idx: int,
@@ -221,10 +242,9 @@ def _serialize_rollout_trajectory_via_store(
     serialized_debug_tensors = None
     if rtd.rollout_debug_tensors:
         serialized_debug_tensors = {
-            name: _store_leaves(
+            name: _store_steps(
                 tensor,
                 sample_idx,
-                batch_size,
                 path=f"rollout_debug_tensors.{name}",
                 stored=stored,
             )
@@ -262,12 +282,16 @@ def _serialize_rollout_trajectory_via_store(
     if rtd.dit_trajectory:
         dit = rtd.dit_trajectory
         serialized_dit_trajectory = {
-            "latents": _store_leaves(
+            "latents": _store_steps(
                 dit.latents,
                 sample_idx,
-                batch_size,
                 path="dit_trajectory.latents",
                 stored=stored,
+                steps=(
+                    dit.latent_step_indices.tolist()
+                    if dit.latent_step_indices is not None
+                    else None
+                ),
             ),
             "timesteps": serialized_dit_timesteps,
             "sigmas": serialized_dit_sigmas,
@@ -362,9 +386,9 @@ def _build_response(
     peak_memory_mb = result.peak_memory_mb if result.peak_memory_mb > 0 else None
     rollout_trajectory_data = result.rollout_trajectory_data
     if rollout:
-        assert (
-            rollout_trajectory_data is not None
-        ), "rollout_trajectory_data must be present when rollout=True"
+        assert rollout_trajectory_data is not None, (
+            "rollout_trajectory_data must be present when rollout=True"
+        )
 
     serialized_dit_timesteps = None
     serialized_dit_sigmas = None
