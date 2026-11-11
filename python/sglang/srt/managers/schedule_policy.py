@@ -245,7 +245,6 @@ class SchedulePolicy:
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
         bootstrap_queue: Iterable[Req] = (),
-        chunked_req: Optional[Req] = None,
     ) -> List[Req]:
         """The waiting requests in the order the policy admits them."""
         waiting_queue = list(waiting)
@@ -270,7 +269,7 @@ class SchedulePolicy:
                     waiting_queue, self.priority_sign
                 )
         elif policy == CacheAwarePolicy.UNIBOOST:
-            self._sort_by_uniboost(waiting_queue, chunked_req)
+            self._sort_by_uniboost(waiting_queue)
         elif isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
@@ -359,9 +358,7 @@ class SchedulePolicy:
             waiting_queue, processed_tokens=processed_tokens, now_s=now_s
         )
 
-    def _sort_by_uniboost(
-        self, waiting_queue: List[Req], chunked_req: Optional[Req]
-    ) -> None:
+    def _sort_by_uniboost(self, waiting_queue: List[Req]) -> None:
         leader_of: Dict[str, str] = {}
         temporary_deprioritized = self._compute_prefix_matches(
             waiting_queue, CacheAwarePolicy.UNIBOOST, leader_of=leader_of
@@ -380,10 +377,6 @@ class SchedulePolicy:
             leader_of=leader_of,
             enable_priority_scheduling=self.enable_priority_scheduling,
             priority_sign=self.priority_sign,
-        )
-        # Reads the admission order, so it runs after the sort.
-        uniboost.mark_commit_holds(
-            waiting_queue, chunked_req=chunked_req, now_s=time.perf_counter()
         )
 
     def record_completed_requests(self, reqs: List[Req]) -> None:

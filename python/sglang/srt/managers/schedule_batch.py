@@ -870,9 +870,7 @@ class Req(ReqDllmMixin):
         # first sorted; reset_for_retract keeps them (seniority survives).
         self.uniboost_arrival_tokens: Optional[int] = None
         self.uniboost_arrival_s: Optional[float] = None
-        # UniBoost commit gate: held out of the current admission pass, and
-        # when its first hold began (bounds the cumulative hold).
-        self.uniboost_commit_hold = False
+        # When the uniboost commit gate first held it (bounds the cumulative hold).
         self.uniboost_commit_hold_first_s: Optional[float] = None
 
     def get_mm_token_counts(self) -> Tuple[int, int, int]:

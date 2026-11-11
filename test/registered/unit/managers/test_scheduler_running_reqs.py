@@ -371,7 +371,6 @@ class TestRunningReqsHooks(CustomTestCase):
             beam_group=None,
             init_next_round_input=Mock(),
             kv=SimpleNamespace(holds_mamba=False),
-            uniboost_commit_hold=False,
         )
 
         class _Adder(PrefillAdder):

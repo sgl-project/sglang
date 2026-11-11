@@ -16,8 +16,8 @@ from sglang.srt.managers.uniboost import (
     TokenClockRate,
     UniBoostClock,
     boost,
+    commit_held,
     geometric_bin,
-    mark_commit_holds,
     sort_waiting_queue,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -299,8 +299,9 @@ class TestTokenClockRate(CustomTestCase):
 
 
 class TestCommitGate(CustomTestCase):
-    """A request waits while an earlier extender will extend its match by at
-    least one frontier page; the hold is bounded by COMMIT_GATE_MAX_HOLD_S."""
+    """A request waits while an extender (the in-flight chunk or a request
+    admitted before it this pass) will extend its match by at least one
+    frontier page; the hold is bounded by COMMIT_GATE_MAX_HOLD_S."""
 
     @staticmethod
     def _matched(rid, ids, matched):
@@ -312,38 +313,22 @@ class TestCommitGate(CustomTestCase):
         self.trunk = _make_req("trunk", list(range(3_000)))
         self.sibling = self._matched("sib", list(range(1_500)), 1_000)
 
-    def test_holds_behind_the_chunked_prefill(self):
-        mark_commit_holds([self.sibling], chunked_req=self.trunk, now_s=0.0)
-        self.assertTrue(self.sibling.uniboost_commit_hold)
-
-    def test_holds_only_behind_a_waiting_extender_that_sorts_first(self):
-        mark_commit_holds([self.trunk, self.sibling], chunked_req=None, now_s=0.0)
-        self.assertFalse(self.trunk.uniboost_commit_hold)
-        self.assertTrue(self.sibling.uniboost_commit_hold)
-        mark_commit_holds([self.sibling, self.trunk], chunked_req=None, now_s=0.0)
-        self.assertFalse(self.sibling.uniboost_commit_hold)
+    def test_holds_behind_an_extender(self):
+        self.assertTrue(commit_held(self.sibling, extenders=[self.trunk], now_s=0.0))
+        self.assertFalse(commit_held(self.sibling, extenders=[None], now_s=0.0))
 
     def test_cap_releases_a_never_committing_extender(self):
-        mark_commit_holds([self.sibling], chunked_req=self.trunk, now_s=0.0)
+        self.assertTrue(commit_held(self.sibling, extenders=[self.trunk], now_s=0.0))
         later = COMMIT_GATE_MAX_HOLD_S + 1.0
-        mark_commit_holds([self.sibling], chunked_req=self.trunk, now_s=later)
-        self.assertFalse(self.sibling.uniboost_commit_hold)
+        self.assertFalse(commit_held(self.sibling, extenders=[self.trunk], now_s=later))
 
     def test_no_hold_when_the_extension_is_not_shared(self):
         diverging = _make_req("trunk", list(range(1_000)) + list(range(9_000, 12_000)))
-        mark_commit_holds([self.sibling], chunked_req=diverging, now_s=0.0)
-        self.assertFalse(self.sibling.uniboost_commit_hold)
         short = _make_req("trunk", list(range(1_255)))  # 255 < one frontier page
-        mark_commit_holds([self.sibling], chunked_req=short, now_s=0.0)
-        self.assertFalse(self.sibling.uniboost_commit_hold)
+        for extender in (diverging, short):
+            self.assertFalse(commit_held(self.sibling, extenders=[extender], now_s=0.0))
         unmatched = self._matched("fresh", list(range(3_000)), 0)
-        mark_commit_holds([unmatched], chunked_req=self.trunk, now_s=0.0)
-        self.assertFalse(unmatched.uniboost_commit_hold)
-
-    def test_hold_is_cleared_when_the_extender_is_gone(self):
-        mark_commit_holds([self.sibling], chunked_req=self.trunk, now_s=0.0)
-        mark_commit_holds([self.sibling], chunked_req=None, now_s=1.0)
-        self.assertFalse(self.sibling.uniboost_commit_hold)
+        self.assertFalse(commit_held(unmatched, extenders=[self.trunk], now_s=0.0))
 
 
 class TestAdaptiveGamma(CustomTestCase):
