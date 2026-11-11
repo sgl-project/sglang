@@ -39,7 +39,6 @@ class _PerForwardMemo:
 
 # Index-K write slots and paged-logits lengths of this DCP rank.
 _dcp_local_store_loc = _PerForwardMemo()
-_dcp_local_lens = _PerForwardMemo()
 # Target verify on the shared-index-K path: each request's full length and page-table row.
 _verify_request_lens = _PerForwardMemo()
 _verify_request_block_tables = _PerForwardMemo()
@@ -64,18 +63,6 @@ def dcp_local_store_loc(
         key=(id(forward_batch), out_loc.data_ptr(), out_loc.shape),
         layer_id=layer_id,
         compute=lambda: _localize_store_loc(out_loc, dcp_size, dcp_rank),
-    )
-
-
-def dcp_local_lens(
-    forward_batch, layer_id: int, lens: torch.Tensor, dcp_size: int, dcp_rank: int
-) -> torch.Tensor:
-    """This rank's share of each length over its index-K shard (CUDA builds it with
-    the DeepGEMM schedule)."""
-    return _dcp_local_lens.get(
-        key=(id(forward_batch), lens.data_ptr(), lens.shape),
-        layer_id=layer_id,
-        compute=lambda: get_dcp_lens(lens, dcp_size, dcp_rank).to(lens.dtype),
     )
 
 
@@ -364,8 +351,6 @@ def fp4_topk_paged(
     query,
     weights: torch.Tensor,
     metadata,
-    dcp_size: int,
-    dcp_rank: int,
 ) -> torch.Tensor:
     """Decode / verify top-k over the MXFP4 index-K: this rank's local KV slots, with
     their counts in ``metadata.attn_metadata.dcp_topk_length`` (dcp_local_topk)."""
@@ -389,9 +374,8 @@ def fp4_topk_paged(
     q_offset = sum(metadata.get_dsa_extend_len_cpu())
     B = metadata.get_seqlens_int32().shape[0]
     next_n = max(q_offset // B if B > 0 else 1, 1)
-    local_lens = dcp_local_lens(
-        forward_batch, layer_id, seqlens_32.reshape(-1, 1), dcp_size, dcp_rank
-    ).view(-1)[:q_offset]
+    # this rank's share of each row's length, built with the metadata
+    local_lens = metadata.paged_mqa_ctx_lens_2d.view(-1)[:q_offset]
     request_tables, query_starts = fp4_request_rows(
         forward_batch, layer_id, block_tables, q_offset, next_n
     )

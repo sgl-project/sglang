@@ -1458,7 +1458,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
         if self.fp4_index_k:
             return dsa_indexer_hip.fp4_topk_paged(
-                self, forward_batch, layer_id, q_fp8, weights, metadata, *_index_k_dcp()
+                self, forward_batch, layer_id, q_fp8, weights, metadata
             )
 
         page_size = get_token_to_kv_pool().index_page_size
@@ -1506,7 +1506,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
-        dcp_size, dcp_rank = _index_k_dcp()
+        dcp_size, _ = _index_k_dcp()
         assert (
             dcp_size == 1
             or forward_batch.forward_mode.is_decode_or_idle()
@@ -1561,10 +1561,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 seqlens_32_2d = seqlens_32.reshape(-1).contiguous().view(-1, 1)
         else:
             seqlens_32_2d = seqlens_32.contiguous().view(-1, 1)
-        if _use_aiter and dcp_size > 1 and ctx_2d is None:
-            seqlens_32_2d = dsa_indexer_hip.dcp_local_lens(
-                forward_batch, layer_id, seqlens_32_2d, dcp_size, dcp_rank
-            )
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
