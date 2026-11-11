@@ -17,6 +17,11 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.multimodal_gen.runtime.vla import praxis_bimanual
+from sglang.multimodal_gen.runtime.vla.praxis_bimanual import (
+    BimanualChunkInputs,
+    BimanualSession,
+)
 from sglang.multimodal_gen.runtime.vla.praxis_geometry import NormStats
 from sglang.multimodal_gen.runtime.vla.praxis_rig import (
     ChunkInputs,
@@ -38,6 +43,7 @@ CONTROL_MODE = "droid_impedance"
 class PolicyLayout(msgspec.Struct, frozen=True, eq=False):
     """What the policy reads from the checkpoint config."""
 
+    embodiment: str
     stats: NormStats
     dims: np.ndarray
     fps: float
@@ -52,7 +58,12 @@ class PolicyLayout(msgspec.Struct, frozen=True, eq=False):
     @classmethod
     def from_model_config(cls, config: dict[str, Any]) -> PolicyLayout:
         video = config["video"]
+        if config["embodiment"] == "bimanual":
+            praxis_bimanual.canvas_size(config)
+            if not video["antialias"]:
+                raise ValueError("The bimanual rig needs an antialiased canvas")
         return cls(
+            embodiment=str(config["embodiment"]),
             stats=NormStats.from_config(config["normalization"]),
             dims=q99_dims(config),
             fps=float(config["chunking"]["grid_hz"]),
@@ -72,7 +83,7 @@ class StepResult(msgspec.Struct, frozen=True, eq=False):
     commands: list[dict]
     rows: np.ndarray
     video: torch.Tensor
-    inputs: ChunkInputs
+    inputs: ChunkInputs | BimanualChunkInputs
 
 
 def _to_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -112,7 +123,7 @@ class PraxisPolicy:
         *,
         text: torch.Tensor,
         text_uncond: torch.Tensor | None,
-        inputs: ChunkInputs,
+        inputs: ChunkInputs | BimanualChunkInputs,
         seed: int,
         settings: SamplerSettings,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -207,19 +218,26 @@ class PraxisEpisode:
         layout = policy.layout
         self._policy = policy
         self.seed = int(seed)
-        self.session = PraxisSession(
+        shared = dict(
             encode=policy.vae.encode,
             stats=layout.stats,
             device=policy.device,
             max_context_chunks=max_context_chunks,
             fps=layout.fps,
             dims=layout.dims,
-            control_mode=CONTROL_MODE,
             exec_horizon=exec_horizon,
             n_chunks=layout.num_chunks,
             tile_size=layout.tile_size,
-            aspect_tol=layout.aspect_tol,
-            antialias=layout.antialias,
+        )
+        self.session = (
+            BimanualSession(**shared)
+            if layout.embodiment == "bimanual"
+            else PraxisSession(
+                **shared,
+                control_mode=CONTROL_MODE,
+                aspect_tol=layout.aspect_tol,
+                antialias=layout.antialias,
+            )
         )
 
     @torch.no_grad()

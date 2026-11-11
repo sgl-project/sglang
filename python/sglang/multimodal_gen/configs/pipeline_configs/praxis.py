@@ -21,7 +21,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
 )
 
-PRAXIS_HF_PATHS = ["runwayml/praxis-1-droid-lerobot"]
+PRAXIS_HF_PATHS = [
+    "runwayml/praxis-1-droid-lerobot",
+    "runwayml/praxis-1-yam-lerobot",
+]
 
 _CONFIG_FILE = "config.json"
 _WEIGHT_SIDECARS = ("model.safetensors.index.json", "SHA256SUMS")
@@ -30,6 +33,7 @@ _DEFAULT_TEXT_ENCODER_ID = "Qwen/Qwen3.5-2B"
 
 
 class PraxisSettings(msgspec.Struct, frozen=True):
+    embodiment: str
     chunk_size: int
     num_steps: int
     t_shift: float
@@ -85,16 +89,19 @@ def read_praxis_config(package: Path) -> dict[str, Any]:
 
 def praxis_settings(config: dict[str, Any]) -> PraxisSettings:
     model = config["model_config"]
-    if model.get("embodiment") != "single_arm":
+    embodiment = model.get("embodiment")
+    if embodiment not in RIGS:
         raise NotImplementedError(
-            f"Praxis embodiment {model.get('embodiment')!r} is not supported yet"
+            f"Praxis embodiment {embodiment!r} is not supported, only {sorted(RIGS)}"
         )
+    rig = RIGS[embodiment]
     return PraxisSettings(
+        embodiment=embodiment,
         chunk_size=int(config.get("chunk_size", model["chunking"]["action_chunk"])),
         num_steps=int(config.get("num_steps", 2)),
-        t_shift=float(config.get("t_shift", 12.5)),
+        t_shift=float(config.get("t_shift", rig.t_shift)),
         cfg_scale=float(config.get("cfg_scale", 1.0)),
-        cfg_video_scale=float(config.get("cfg_video_scale", 4.0)),
+        cfg_video_scale=float(config.get("cfg_video_scale", rig.cfg_video_scale)),
         seed=int(config.get("seed", 0)),
         max_context_chunks=int(config.get("max_context_chunks", 1)),
         vae_id=str(config.get("vae_id", _DEFAULT_VAE_ID)),
@@ -122,13 +129,51 @@ def native_checkpoint_dir(package: Path) -> Path:
     return target
 
 
-# One command row: target position (3), row-major rotation matrix (9), target grip (1).
-PRAXIS_COMMAND_DIM = 13
+class PraxisRig(msgspec.Struct, frozen=True):
+    """Request-side view of a checkpoint embodiment."""
+
+    image_keys: tuple[str, ...]
+    # Pre-split state entries a client may send instead of ``state``.
+    state_keys: tuple[str, ...]
+    # One command row per arm: target position (3), row-major rotation matrix (9), target grip (1).
+    command_dim: int
+    state_name: str
+    state_layout: str
+    # Sampler recipe of the served checkpoint, for a config that does not set it.
+    t_shift: float
+    cfg_video_scale: float
+
+
+RIGS: dict[str, PraxisRig] = {
+    "single_arm": PraxisRig(
+        image_keys=("exterior", "wrist"),
+        state_keys=("robot_state.ee_pose", "grip"),
+        command_dim=13,
+        state_name="pose8 rows",
+        state_layout="pose8 rows [x, y, z, qw, qx, qy, qz, grip]; a stack of rows carries the executed chunk",
+        t_shift=12.5,
+        cfg_video_scale=4.0,
+    ),
+    "bimanual": PraxisRig(
+        image_keys=("exterior", "wrist_left", "wrist_right"),
+        state_keys=(
+            "robot_state.left.ee_pose",
+            "grip.left",
+            "robot_state.right.ee_pose",
+            "grip.right",
+        ),
+        command_dim=26,
+        state_name="pose16 rows",
+        state_layout="pose16 rows [L: x, y, z, qw, qx, qy, qz, grip | R: same]; a stack of rows carries the executed chunk",
+        t_shift=1.0,
+        cfg_video_scale=1.0,
+    ),
+}
 
 
 @dataclass
 class PraxisPipelineConfig(PipelineConfig):
-    """Praxis-1 DROID: video-action policy."""
+    """Praxis-1: video-action policy of a single-arm (DROID) or bimanual (YAM) checkpoint."""
 
     task_type: ModelTaskType = ModelTaskType.VLA_ACTION
     should_use_guidance: bool = True
@@ -137,9 +182,10 @@ class PraxisPipelineConfig(PipelineConfig):
     vae_precision: str = "bf16"
     dit_config: PraxisDiTConfig = field(default_factory=PraxisDiTConfig)
 
-    image_keys: tuple[str, ...] = ("exterior", "wrist")
-    action_dim: int = PRAXIS_COMMAND_DIM
-    output_action_dim: int = PRAXIS_COMMAND_DIM
+    embodiment: str = "single_arm"
+    image_keys: tuple[str, ...] = RIGS["single_arm"].image_keys
+    action_dim: int = RIGS["single_arm"].command_dim
+    output_action_dim: int = RIGS["single_arm"].command_dim
     action_horizon: int = 24
     default_num_inference_steps: int = 2
     # Text guidance on the video and on the actions (the reference cfg_video_scale and cfg_scale).
@@ -173,6 +219,10 @@ class PraxisPipelineConfig(PipelineConfig):
         )
 
     def _adopt(self, settings: PraxisSettings) -> None:
+        rig = RIGS[settings.embodiment]
+        self.embodiment = settings.embodiment
+        self.image_keys = rig.image_keys
+        self.action_dim = self.output_action_dim = rig.command_dim
         self.action_horizon = settings.chunk_size
         self.default_num_inference_steps = settings.num_steps
         self.guidance_scale = settings.cfg_video_scale
@@ -191,14 +241,18 @@ class PraxisPipelineConfig(PipelineConfig):
             "policy_family": "praxis",
             "input": {
                 "image_keys": list(self.image_keys),
-                "state": "pose8 rows [x, y, z, qw, qx, qy, qz, grip]; a stack of rows carries the executed chunk",
+                "state": RIGS[self.embodiment].state_layout,
                 "session_id": "optional; calls with the same id continue one episode",
             },
             "output": {
                 "action_type": "continuous",
                 "action_horizon": self.action_horizon,
                 "action_dim": self.output_action_dim,
-                "layout": "[xyz(3), rotation matrix row-major(9), grip(1)]",
+                "layout": (
+                    "per arm [xyz(3), rotation matrix row-major(9), grip(1)]"
+                    if self.embodiment == "bimanual"
+                    else "[xyz(3), rotation matrix row-major(9), grip(1)]"
+                ),
                 "dtype": "float32",
             },
             "defaults": {

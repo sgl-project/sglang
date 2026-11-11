@@ -2,6 +2,7 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+from sglang.multimodal_gen.configs.pipeline_configs.praxis import RIGS, PraxisRig
 from sglang.multimodal_gen.configs.sample.action import ActionSamplingParams
 
 
@@ -32,6 +33,8 @@ class PraxisSamplingParams(ActionSamplingParams):
         default=None, metadata={"batch_sig_exclude": True}
     )
 
+    _rig: PraxisRig = field(default=RIGS["single_arm"], init=False, repr=False)
+
     def build_request_extra(self) -> dict[str, Any]:
         extra = super().build_request_extra()
         observation = dict(self.observation or {})
@@ -55,6 +58,10 @@ class PraxisSamplingParams(ActionSamplingParams):
     def _adjust(self, server_args):
         super()._adjust(server_args)
         config = server_args.pipeline_config
+        # The required views and state depend on the checkpoint, which only the server args name.
+        self._rig = RIGS[config.embodiment]
+        if self.observation is not None:
+            self._validate_observation()
         if self.num_inference_steps is None:
             self.num_inference_steps = config.default_num_inference_steps
         if self.seed is None:
@@ -77,8 +84,6 @@ class PraxisSamplingParams(ActionSamplingParams):
             "return_video"
         ) and self.output_format != "numpy":
             raise ValueError("return_video needs output_format 'numpy' (msgpack)")
-        if self.observation is not None:
-            self._validate_observation()
         if self.output_format not in ("list", "numpy"):
             raise ValueError("output_format must be 'list' or 'numpy'")
         for name, value in (
@@ -96,12 +101,12 @@ class PraxisSamplingParams(ActionSamplingParams):
         images = self.images or {}
         missing = [
             f"{view} image"
-            for view in ("exterior", "wrist")
+            for view in self._rig.image_keys
             if images.get(view) is None
             and self.observation.get(f"image.{view}") is None
         ]
-        if self.state is None and "robot_state.ee_pose" not in self.observation:
-            missing.append("state (pose8 rows)")
+        if self.state is None and self._rig.state_keys[0] not in self.observation:
+            missing.append(f"state ({self._rig.state_name})")
         if missing:
             raise ValueError(f"Praxis request is missing: {', '.join(missing)}")
 

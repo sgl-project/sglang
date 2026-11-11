@@ -9,7 +9,10 @@ from typing import Any
 
 import numpy as np
 
-from sglang.multimodal_gen.configs.pipeline_configs.praxis import PraxisPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.praxis import (
+    RIGS,
+    PraxisPipelineConfig,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
@@ -18,11 +21,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
     vla_timings,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.vla import praxis_bimanual
 from sglang.multimodal_gen.runtime.vla.praxis_policy import PraxisEpisode, PraxisPolicy
 from sglang.multimodal_gen.runtime.vla.praxis_sampler import SamplerSettings
 
-# Request and response conversion shared with the reference-wrapper stage.
-_VIEWS = ("exterior", "wrist")
+# Request and response conversion of each embodiment.
 _POSE8_DIM = 8
 _PASSTHROUGH_KEYS = ("descriptor", "robot_state.q", "reset_context")
 MAX_SESSIONS = 32
@@ -36,11 +39,28 @@ def to_uint8(value: Any) -> np.ndarray:
     return array
 
 
-def reference_observation(*, observation: dict[str, Any]) -> dict[str, Any]:
+def _single_arm_state(*, rows: np.ndarray) -> dict[str, np.ndarray]:
+    rows = rows.reshape(-1, _POSE8_DIM)
+    return {"robot_state.ee_pose": rows[:, :7], "grip": rows[:, 7]}
+
+
+def _bimanual_state(*, rows: np.ndarray) -> dict[str, np.ndarray]:
+    rows = rows.reshape(-1, 2 * _POSE8_DIM)
+    state: dict[str, np.ndarray] = {}
+    for index, side in enumerate(("left", "right")):
+        arm = rows[:, index * _POSE8_DIM : (index + 1) * _POSE8_DIM]
+        state[f"robot_state.{side}.ee_pose"] = arm[:, :7]
+        state[f"grip.{side}"] = arm[:, 7]
+    return state
+
+
+def reference_observation(
+    *, observation: dict[str, Any], embodiment: str = "single_arm"
+) -> dict[str, Any]:
     """Request observation -> the observation dict of the reference ``Session.step``."""
     images = observation.get("images") or {}
     reference: dict[str, Any] = {}
-    for view in _VIEWS:
+    for view in RIGS[embodiment].image_keys:
         value = images.get(view)
         if value is None:
             value = observation.get(f"image.{view}")
@@ -48,11 +68,11 @@ def reference_observation(*, observation: dict[str, Any]) -> dict[str, Any]:
             reference[f"image.{view}"] = to_uint8(value)
     state = observation.get("state")
     if state is not None:
-        rows = np.asarray(state, dtype=np.float32).reshape(-1, _POSE8_DIM)
-        reference["robot_state.ee_pose"] = rows[:, :7]
-        reference["grip"] = rows[:, 7]
+        rows = np.asarray(state, dtype=np.float32)
+        convert = _bimanual_state if embodiment == "bimanual" else _single_arm_state
+        reference.update(convert(rows=rows))
     else:
-        for key in ("robot_state.ee_pose", "grip"):
+        for key in RIGS[embodiment].state_keys:
             if key in observation:
                 reference[key] = np.asarray(observation[key], dtype=np.float32)
     prompt = observation.get("prompt")
@@ -64,8 +84,25 @@ def reference_observation(*, observation: dict[str, Any]) -> dict[str, Any]:
     return reference
 
 
-def commands_to_actions(*, commands: list[dict[str, Any]]) -> np.ndarray:
-    """Reference commands -> rows of ``[xyz(3), rotation matrix row-major(9), grip(1)]``."""
+def commands_to_actions(
+    *, commands: list[dict[str, Any]], embodiment: str = "single_arm"
+) -> np.ndarray:
+    """Reference commands -> rows of ``[xyz(3), rotation matrix row-major(9), grip(1)]`` per arm."""
+    if embodiment == "bimanual":
+        return np.asarray(
+            [
+                [
+                    value
+                    for side in ("left", "right")
+                    for value in (
+                        *c[f"robot_command.{side}"]["pose"],
+                        c[f"target_grip.{side}"],
+                    )
+                ]
+                for c in commands
+            ],
+            dtype=np.float32,
+        )
     return np.asarray(
         [[*c["robot_command"]["pose"], c["target_grip"]] for c in commands],
         dtype=np.float32,
@@ -185,10 +222,13 @@ class PraxisPolicyStage(PipelineStage):
     def _warmup(self, *, batch: Req, settings: SamplerSettings):
         """Run both context depths once, so the kernels of each are compiled before the first request."""
         episode = self._new_episode(batch=batch)
+        make_observation = (
+            praxis_bimanual.warmup_obs
+            if self.config.embodiment == "bimanual"
+            else synthetic_observation
+        )
         for step, stack in enumerate(_WARMUP_STACKS):
-            result = episode.step(
-                synthetic_observation(step=step, stack=stack), settings
-            )
+            result = episode.step(make_observation(step=step, stack=stack), settings)
         return result
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -204,7 +244,10 @@ class PraxisPolicyStage(PipelineStage):
         else:
             episode = self._episode(batch=batch, observation=observation)
             result = episode.step(
-                reference_observation(observation=observation), settings
+                reference_observation(
+                    observation=observation, embodiment=self.config.embodiment
+                ),
+                settings,
             )
             timings["step_ms"] = (time.perf_counter() - start) * 1000
             if observation.get("return_video"):
@@ -213,7 +256,9 @@ class PraxisPolicyStage(PipelineStage):
                 frames = frames.permute(0, 2, 3, 1).contiguous().cpu().numpy()
                 timings["decode_ms"] = (time.perf_counter() - decode_start) * 1000
         # The shared postprocess expects a leading batch dimension.
-        state["actions"] = commands_to_actions(commands=result.commands)[None]
+        state["actions"] = commands_to_actions(
+            commands=result.commands, embodiment=self.config.embodiment
+        )[None]
         state["extras"] = response_extras(commands=result.commands, frames=frames)
         timings["policy_ms"] = (time.perf_counter() - start) * 1000
         return batch

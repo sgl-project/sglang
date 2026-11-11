@@ -202,6 +202,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "pi0.5": "Pi05Pipeline",
     "flux-3-action": "Flux3ActionPipeline",
     "praxis-1-droid": "PraxisPipeline",
+    "praxis-1-yam": "PraxisPipeline",
     "herzogenhorn/f3-image-small": "Flux3ImagePipeline",
     **{pattern: "Flux3ImagePipeline" for pattern in FLUX3_IMAGE_NAME_PATTERNS},
     "hunyuan3d": "Hunyuan3D2Pipeline",
