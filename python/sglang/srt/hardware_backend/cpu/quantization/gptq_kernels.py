@@ -193,7 +193,7 @@ class GPTQIntelAMXMoEKernel:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert self.moe_runner_config.activation in ["silu", "relu2"], (
-            f"Only SiLU/ReLU2 activations are supported. "
+            "Only SiLU/ReLU2 activations are supported."
         )
 
         x = dispatch_output.hidden_states

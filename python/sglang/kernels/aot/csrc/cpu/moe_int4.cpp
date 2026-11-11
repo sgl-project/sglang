@@ -318,7 +318,7 @@ void fused_experts_int4_w4a8_kernel_impl(
       int64_t E,                                           \
       int64_t topk,                                        \
       int64_t num_tokens_post_pad,                         \
-      CPUAcMethod act_func)
+      CPUActMethod act_func)
 
 INSTANTIATE_MOE_INT4_W4A8_TEMPLATE(at::BFloat16);
 INSTANTIATE_MOE_INT4_W4A8_TEMPLATE(at::Half);
