@@ -56,6 +56,7 @@ from sglang.srt.disaggregation.utils import (
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
     get_kv_class,
+    get_kv_page_row_head_layout,
     get_kv_transfer_buf_infos,
     get_pd_kv_layout,
     get_qsa_pending_state_indices,
@@ -435,6 +436,9 @@ class PrefillBootstrapQueue:
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
             storage=storage,
+        )
+        kv_args.kv_page_row_head_layout = get_kv_page_row_head_layout(
+            self.token_to_kv_pool
         )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num

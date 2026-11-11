@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
 from sglang.srt.disaggregation.utils import (
     align_window_tails,
     build_dsa_tail_transfer_blocks,
+    build_page_row_head_slice_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     filter_kv_indices_for_shard_rank,
@@ -2043,6 +2044,135 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         return self._await_transfer_futures(futures)
 
+    def send_kvcache_page_row_slice(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+        dst_kv_item_lens: List[int],
+        executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: List[int],
+    ) -> int:
+        """Head-slice head-major page-row KV (kv_args.kv_page_row_head_layout) for
+        a decode rank of another attention TP size.
+
+        A rank's heads are one contiguous run per row component, so a layer-page
+        moves in one copy per component. Draft entries appended after the rows are
+        token-major and go through send_kvcache_slice.
+        """
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+            resolve_total_kv_heads,
+        )
+
+        kv_args = self.kv_args
+        num_rows = len(kv_args.kv_data_ptrs) - kv_args.num_draft_entries
+        src_layer_ids = kv_args.kv_layer_ids
+        if not (src_layer_ids and dst_layer_ids) or len(dst_kv_item_lens) != len(
+            dst_kv_ptrs
+        ):
+            logger.error(
+                f"[{mooncake_session_id}] page-row KV slicing needs the layer ids and "
+                "item lengths of every KV entry on both peers"
+            )
+            return -1
+        total_kv_heads = resolve_total_kv_heads(kv_args, self.attn_tp_size)
+        src_head_start, num_heads, dst_head_start, _ = compute_head_slice_params(
+            self.attn_tp_size,
+            dst_attn_tp_size,
+            kv_args.engine_rank,
+            dst_tp_rank,
+            total_kv_heads,
+        )
+        dst_heads = max(1, total_kv_heads // dst_attn_tp_size)
+        src_segments, src_row_bytes = kv_args.kv_page_row_head_layout(
+            kv_args.kv_head_num
+        )
+        dst_segments, dst_row_bytes = kv_args.kv_page_row_head_layout(dst_heads)
+        pairs = build_transfer_entry_pairs(
+            src_layer_ids[:num_rows], dst_layer_ids, num_rows, len(dst_kv_ptrs)
+        )
+        mismatched = [
+            (i, j)
+            for i, j in pairs
+            if kv_args.kv_item_lens[i] != src_row_bytes
+            or dst_kv_item_lens[j] != dst_row_bytes
+        ]
+        if (
+            mismatched
+            or src_head_start + num_heads > kv_args.kv_head_num
+            or dst_head_start + num_heads > dst_heads
+        ):
+            logger.error(
+                f"[{mooncake_session_id}] page-row KV geometry mismatch: rows of "
+                f"{src_row_bytes}/{dst_row_bytes} bytes for {kv_args.kv_head_num}/"
+                f"{dst_heads} heads, entries {mismatched[:4]}, heads "
+                f"[{src_head_start}, +{num_heads}) -> [{dst_head_start}, +{num_heads})"
+            )
+            return -1
+
+        def process_layer(src_ptr: int, dst_ptr: int) -> int:
+            src_addrs, dst_addrs, lengths = build_page_row_head_slice_blocks(
+                src_ptr=src_ptr,
+                dst_ptr=dst_ptr,
+                src_row_bytes=src_row_bytes,
+                dst_row_bytes=dst_row_bytes,
+                src_pages=prefill_kv_indices,
+                dst_pages=dst_kv_indices,
+                src_segments=src_segments,
+                dst_segments=dst_segments,
+                src_head_start=src_head_start,
+                dst_head_start=dst_head_start,
+                num_heads=num_heads,
+            )
+            if not len(src_addrs):
+                return 0
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id,
+                src_addrs.tolist(),
+                dst_addrs.tolist(),
+                lengths.tolist(),
+            )
+
+        futures = [
+            executor.submit(process_layer, kv_args.kv_data_ptrs[i], dst_kv_ptrs[j])
+            for i, j in pairs
+        ]
+        ret = self._await_transfer_futures(futures)
+        if ret != 0 or kv_args.num_draft_entries == 0:
+            return ret
+
+        draft_layer_ids = src_layer_ids[num_rows:]
+        dst_draft_item_lens = {
+            dst_kv_item_lens[j]
+            for _, j in build_transfer_entry_pairs(
+                draft_layer_ids, dst_layer_ids, len(draft_layer_ids), len(dst_kv_ptrs)
+            )
+        }
+        if len(dst_draft_item_lens) != 1:
+            logger.error(
+                f"[{mooncake_session_id}] draft KV entries have item lengths "
+                f"{dst_draft_item_lens} on the decode peer"
+            )
+            return -1
+        return self.send_kvcache_slice(
+            mooncake_session_id,
+            prefill_kv_indices,
+            dst_kv_ptrs,
+            dst_kv_indices,
+            dst_tp_rank,
+            dst_attn_tp_size,
+            dst_draft_item_lens.pop(),
+            executor,
+            dst_layer_ids=dst_layer_ids,
+            src_data_ptrs=kv_args.kv_data_ptrs[num_rows:],
+            src_layer_ids=draft_layer_ids,
+            src_item_lens=kv_args.kv_item_lens[num_rows:],
+        )
+
     def send_aux(
         self,
         req: TransferInfo,
@@ -3024,6 +3154,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                            )
+                        elif self.kv_args.kv_page_row_head_layout is not None:
+                            if chunked_dst_device_kv_indice is not None:
+                                raise RuntimeError(
+                                    "HiSparse destination device indices are not "
+                                    "supported for page-row KV slicing"
+                                )
+                            ret = self.send_kvcache_page_row_slice(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                target_rank_registration_info.dst_tp_rank,
+                                target_rank_registration_info.dst_attn_tp_size,
+                                target_rank_registration_info.dst_kv_item_lens,
+                                executor,
+                                target_rank_registration_info.dst_kv_layer_ids,
                             )
                         elif (
                             self.enable_staging

@@ -1835,6 +1835,64 @@ def get_kv_transfer_buf_infos(storage: KVStorage | StaticKVStorage):
     return list(region.ptrs), list(region.lens), list(region.item_lens)
 
 
+def get_kv_page_row_head_layout(pool):
+    """KVArgs.kv_page_row_head_layout of a pool whose KV entries are head-major
+    page rows, else None."""
+    from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
+
+    if isinstance(pool, MiniMaxM3Nvfp4KVPool):
+        return pool.page_row_head_layout
+    return None
+
+
+def build_page_row_head_slice_blocks(
+    *,
+    src_ptr: int,
+    dst_ptr: int,
+    src_row_bytes: int,
+    dst_row_bytes: int,
+    src_pages: np.ndarray,
+    dst_pages: np.ndarray,
+    src_segments: Sequence[Tuple[int, int]],
+    dst_segments: Sequence[Tuple[int, int]],
+    src_head_start: int,
+    dst_head_start: int,
+    num_heads: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(src addrs, dst addrs, lengths) moving heads [src_head_start, +num_heads) of
+    every page row in src_pages to heads [dst_head_start, +num_heads) of the paired
+    dst_pages row: one copy per (page, component)."""
+    if len(src_segments) != len(dst_segments) or any(
+        src_per_head != dst_per_head
+        for (_, src_per_head), (_, dst_per_head) in zip(src_segments, dst_segments)
+    ):
+        raise ValueError(
+            f"page-row components differ: src={src_segments} dst={dst_segments}"
+        )
+    if len(src_pages) != len(dst_pages):
+        raise ValueError(
+            f"page counts differ: src={len(src_pages)} dst={len(dst_pages)}"
+        )
+    src_offsets = np.array(
+        [offset + src_head_start * per_head for offset, per_head in src_segments],
+        dtype=np.int64,
+    )
+    dst_offsets = np.array(
+        [offset + dst_head_start * per_head for offset, per_head in dst_segments],
+        dtype=np.int64,
+    )
+    lengths = np.array(
+        [num_heads * per_head for _, per_head in src_segments], dtype=np.int64
+    )
+    src_rows = src_ptr + np.asarray(src_pages, dtype=np.int64)[:, None] * src_row_bytes
+    dst_rows = dst_ptr + np.asarray(dst_pages, dtype=np.int64)[:, None] * dst_row_bytes
+    return (
+        (src_rows + src_offsets).reshape(-1),
+        (dst_rows + dst_offsets).reshape(-1),
+        np.broadcast_to(lengths, (len(src_pages), len(lengths))).reshape(-1),
+    )
+
+
 def _wire_state_type(state_type) -> Enum:
     # A plan names a state type by its wire value; a static pool's
     # hardware-specific component (Ascend's) arrives as its own enum member.

@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -133,6 +133,12 @@ class KVArgs:
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
     num_draft_entries: int = 0
+    # Head-major page-row KV (MiniMax-M3.1 NVFP4): KV heads per rank ->
+    # ([(byte offset, bytes per head)] per row component, row bytes). None for
+    # token-major pools.
+    kv_page_row_head_layout: Optional[
+        Callable[[int], Tuple[List[Tuple[int, int]], int]]
+    ] = None
 
 
 class KVPoll:
