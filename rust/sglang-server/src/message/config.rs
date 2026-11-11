@@ -586,6 +586,9 @@ pub struct DeploymentInfo {
     pub gc_threshold: Option<Vec<i64>>,
     /// `--enable-pd-role-switch`.
     pub enable_pd_role_switch: bool,
+    /// `--enable-streaming-session`, which `/open_session` needs for a
+    /// streaming session.
+    pub enable_streaming_session: bool,
     /// The engine-info bootstrap server (`--engine-info-bootstrap-port`), as
     /// the base URL Python's `ServerArgs.engine_info_bootstrap_url` builds.
     pub engine_info_bootstrap_url: Option<String>,

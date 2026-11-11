@@ -28,7 +28,9 @@ use super::native_api::native_error;
 use crate::api_server::core::{CoreError, FORWARD_PEER_PATH};
 use crate::api_server::handlers::{AbortEnding, ProfileOutcome};
 use crate::message::info::ServerInfo;
-use crate::message::io_struct::{ExpertDistributionAction, PdRoleSwitch, ProfileOptions};
+use crate::message::io_struct::{
+    ExpertDistributionAction, PdRoleSwitch, ProfileOptions, SessionOpen,
+};
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -42,6 +44,8 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         // also needs the server unpaused.
         .route("/ping", get(ping))
         .route("/ready", get(ready))
+        .route("/open_session", get(open_session).post(open_session))
+        .route("/close_session", get(close_session).post(close_session))
         // Static config, no scheduler round-trip. `/get_model_info` (+ `/model_info`
         // alias).
         .route("/get_model_info", get(model_info))
@@ -546,6 +550,58 @@ fn flag_status(ok: bool) -> Response {
         StatusCode::OK.into_response()
     } else {
         StatusCode::SERVICE_UNAVAILABLE.into_response()
+    }
+}
+
+/// Python's `_create_error_response`: `{"error": {"message": ...}}`, 400.
+fn session_error(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": {"message": message}})),
+    )
+        .into_response()
+}
+
+/// `GET|POST /open_session` — the new session's id as a bare JSON string,
+/// or Python's 400 when it could not be opened.
+async fn open_session(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::OpenSessionRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => return session_error(&rejection.body_text()),
+    };
+    let outcome = state
+        .core
+        .open_session(SessionOpen {
+            capacity_of_str_len: body.capacity_of_str_len,
+            session_id: body.session_id,
+            streaming: body.streaming,
+            timeout: body.timeout,
+        })
+        .await;
+    match outcome {
+        Ok(Some(session_id)) => Json(session_id).into_response(),
+        Ok(None) => session_error(
+            "Failed to open the session. Check if a session with the same id is still open.",
+        ),
+        Err(error) => session_error(&error.to_string()),
+    }
+}
+
+/// `GET|POST /close_session` — Python's empty 200.
+async fn close_session(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::CloseSessionRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => return session_error(&rejection.body_text()),
+    };
+    match state.core.close_session(body.session_id).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => session_error(&error.to_string()),
     }
 }
 
@@ -2531,6 +2587,13 @@ mod tests {
         ));
     }
 
+    /// The JSON body whatever the status, for the routes whose refusals
+    /// carry one.
+    async fn any_json(response: Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
     /// `/ping` answers the liveness flag and `/ready` the readiness flag,
     /// both as bare statuses: a pause keeps `/ping` at 200 and turns
     /// `/ready` to 503; a drain turns both.
@@ -2575,5 +2638,105 @@ mod tests {
             probe("/ready").await.status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    /// `/open_session` answers the id as a bare JSON string, a refused open
+    /// as Python's `{"error": {"message"}}` 400, and `/close_session` an
+    /// empty 200; both take GET as Python does.
+    #[tokio::test]
+    async fn session_routes_answer_python_shapes() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let send =
+            |state: Arc<AppState>, method: &'static str, uri: &'static str, body: &'static str| {
+                tokio::spawn(
+                    routes().with_state(state).oneshot(
+                        HttpRequest::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    ),
+                )
+            };
+        let reply = |success: bool| {
+            Bytes::from(
+                rmp_serde::to_vec_named(
+                    &serde_json::json!({"session_id": "s", "success": success}),
+                )
+                .unwrap(),
+            )
+        };
+        let response = send(
+            state.clone(),
+            "GET",
+            "/open_session",
+            r#"{"capacity_of_str_len": 100, "session_id": "s"}"#,
+        );
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("open must submit one control request");
+        };
+        assert!(admission.try_accept());
+        request
+            .sink
+            .try_send(ResponseItem::Control(reply(true)))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await, serde_json::json!("s"));
+
+        let response = send(
+            state.clone(),
+            "POST",
+            "/open_session",
+            r#"{"capacity_of_str_len": 100, "session_id": "s"}"#,
+        );
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("open must submit one control request");
+        };
+        assert!(admission.try_accept());
+        request
+            .sink
+            .try_send(ResponseItem::Control(reply(false)))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            any_json(response).await,
+            serde_json::json!({"error": {"message": "Failed to open the session. Check if a session with the same id is still open."}})
+        );
+
+        let response = send(
+            state.clone(),
+            "POST",
+            "/open_session",
+            r#"{"capacity_of_str_len": 100, "streaming": true}"#,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            any_json(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("--enable-streaming-session")
+        );
+        assert!(intake_rx.try_recv().is_err());
+
+        let response = send(state, "POST", "/close_session", r#"{"session_id": "s"}"#);
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("close must submit one control request");
+        };
+        assert!(admission.try_accept());
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({"rid": "x"})).unwrap(),
+            )))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(to_bytes(response.into_body(), 16).await.unwrap().is_empty());
     }
 }

@@ -22,8 +22,8 @@ use crate::message::config::{
 };
 use crate::message::io_struct::{
     DiskWeightUpdate, DistributedWeightUpdate, ExpertDistributionAction, IpcWeightUpdate,
-    PdRoleSwitch, PluginWeightUpdate, ProfileOptions, TensorWeightUpdate, WeightsSendGroup,
-    WeightsUpdateGroup,
+    PdRoleSwitch, PluginWeightUpdate, ProfileOptions, SessionOpen, TensorWeightUpdate,
+    WeightsSendGroup, WeightsUpdateGroup,
 };
 use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
@@ -805,6 +805,40 @@ impl SglangService for GrpcService {
         _request: Request<api::UnloadLoraAdapterRequest>,
     ) -> Result<Response<api::LoraUpdateResponse>, Status> {
         lora_disabled()
+    }
+
+    async fn open_session(
+        &self,
+        request: Request<api::OpenSessionRequest>,
+    ) -> Result<Response<api::OpenSessionResponse>, Status> {
+        let request = request.into_inner();
+        let opened = self
+            .core
+            .open_session(SessionOpen {
+                capacity_of_str_len: request.capacity_of_str_len,
+                session_id: request.session_id,
+                streaming: request.streaming,
+                timeout: request.timeout,
+            })
+            .await
+            .map_err(native_api::status)?;
+        match opened {
+            Some(session_id) => Ok(Response::new(api::OpenSessionResponse { session_id })),
+            None => Err(Status::already_exists(
+                "Failed to open the session. Check if a session with the same id is still open.",
+            )),
+        }
+    }
+
+    async fn close_session(
+        &self,
+        request: Request<api::CloseSessionRequest>,
+    ) -> Result<Response<api::CloseSessionResponse>, Status> {
+        self.core
+            .close_session(request.into_inner().session_id)
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::CloseSessionResponse {}))
     }
 
     async fn get_remote_instance_transfer_engine_info(

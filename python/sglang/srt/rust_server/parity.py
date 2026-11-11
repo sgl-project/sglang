@@ -99,7 +99,6 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     "enable_mis": "/v1/decisions is not served.",
     "dllm_algorithm": "/v1/decisions is not served.",
     "chunked_prefill_size": "/v1/score is not served.",
-    "enable_streaming_session": "/open_session is not served.",
     # Settings of features Rust-server mode refuses.
     "SGLANG_WAIT_WEIGHTS_READY_TIMEOUT": "Only with --checkpoint-engine-wait-weights-before-ready, which is refused.",
     "max_loaded_loras": "LoRA (--enable-lora, --lora-paths) is refused.",
