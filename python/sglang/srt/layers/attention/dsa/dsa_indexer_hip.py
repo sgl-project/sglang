@@ -66,6 +66,22 @@ def dcp_local_store_loc(
     )
 
 
+def store_fp4_index_k(
+    forward_batch, pool, layer_id: int, key, dcp_size: int, dcp_rank: int
+) -> None:
+    """The MXFP4 index-K store: this DCP rank's rows of the batch's keys."""
+    from sglang.kernels.ops.attention.dsa import fp4_index_hip
+
+    out_loc = forward_batch.out_cache_loc
+    if dcp_size > 1:
+        out_loc = dcp_local_store_loc(
+            forward_batch, layer_id, out_loc, dcp_size, dcp_rank
+        )
+    fp4_index_hip.store_fp4_index_k(
+        key, *pool.get_index_k_fp4_buffers(layer_id), out_loc.contiguous()
+    )
+
+
 def verify_shares_index_k(
     forward_batch,
     q_fp8: torch.Tensor,
@@ -189,6 +205,22 @@ def hist_topk_workspace(indexer, config):
     return workspace
 
 
+def init_indexer_hip(indexer, config) -> None:
+    """Indexer.__init__'s AITER parts, after the gfx950 fused indexer's gate (which
+    hist_topk_workspace reads)."""
+    from sglang.srt.layers.attention.dsa.indexer_prologue_hip import (
+        make_rocm_nope_prologue,
+    )
+    from sglang.srt.runtime_context import get_exec
+
+    # MXFP4 index-K (Kimi-K3.1 on gfx950 under DCP); the pool checks the setup
+    indexer.fp4_index_k = get_exec().kernel.enable_dsa_fp4_indexer
+    # gfx950 decode / verify prologue of the NoPE (Kimi-K3.1) indexer
+    if _is_gfx95:
+        indexer.rocm_nope_prologue = make_rocm_nope_prologue(indexer)
+    indexer._hist_topk = hist_topk_workspace(indexer, config)
+
+
 def hist_topk_paged(
     indexer, ws, forward_batch, layer_id, q_fp8, weights, seqlens, metadata
 ):
@@ -307,11 +339,18 @@ def fuse_index_k_norm(indexer, forward_batch) -> bool:
     )
 
 
-def index_k_norm_store_into(indexer, pool, layer_id, key, out_cache_loc) -> None:
-    """k_norm(key) quantized into the preshuffled FP8 index-K cache, one launch."""
+def store_index_k_prenorm(indexer, forward_batch, layer_id: int, key) -> None:
+    """Indexer._store_index_k_cache for k_norm's input: k_norm(key) quantized into
+    the preshuffled FP8 index-K cache, one launch."""
     from sglang.kernels.ops.attention.dsa.index_k_norm_store import index_k_norm_store
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
+    pool = get_token_to_kv_pool()
+    if hasattr(pool, "invalidate_index_buffer_for_layer"):
+        pool.invalidate_index_buffer_for_layer(layer_id)
+    if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+        return
     kn = indexer.k_norm
     index_k_norm_store(
         key,
@@ -319,7 +358,7 @@ def index_k_norm_store_into(indexer, pool, layer_id, key, out_cache_loc) -> None
         kn.bias,
         kn.variance_epsilon,
         pool.get_index_k_with_scale_buffer(layer_id=layer_id).view(fp8_dtype),
-        out_cache_loc.contiguous(),
+        forward_batch.out_cache_loc.contiguous(),
     )
 
 

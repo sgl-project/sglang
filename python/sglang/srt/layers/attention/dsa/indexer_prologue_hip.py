@@ -88,13 +88,13 @@ class RocmNoPEPrologue:
                     [indexer.head_dim, indexer.n_heads], dim=-1
                 )
             query = indexer.wq_b(q_lora)[0]
-        indexer._store_index_k_cache(
-            forward_batch,
-            layer_id,
-            key if fuse_k_norm else indexer.k_norm(key),
-            act_quant=act_quant,
-            prenorm=fuse_k_norm,
-        )
+        if fuse_k_norm:
+            # key is k_norm's input; the fused store applies k_norm
+            dsa_indexer_hip.store_index_k_prenorm(indexer, forward_batch, layer_id, key)
+        else:
+            indexer._store_index_k_cache(
+                forward_batch, layer_id, indexer.k_norm(key), act_quant=act_quant
+            )
         if indexer.fp4_index_k:
             return indexer_q_fp4_head_gate(
                 query.view(-1, indexer.n_heads, indexer.head_dim),

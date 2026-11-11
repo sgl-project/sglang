@@ -164,9 +164,6 @@ if _use_aiter:
 
     from sglang.kernels.ops.attention.dsa import fp4_index_hip
     from sglang.srt.layers.attention.dsa import dsa_indexer_hip
-    from sglang.srt.layers.attention.dsa.indexer_prologue_hip import (
-        make_rocm_nope_prologue,
-    )
 
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
@@ -304,9 +301,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_MAX_BYTES_ROCM = MQA_LOGITS_MAX_BYTES_ROCM
     # Index-K bytes per token: 128 FP8 values and one FP32 scale.
     _HEAD_DIM_WITH_SF = 132
-    # the gfx950 monokernel's fused histogram top-k workspace; None elsewhere
+    # ROCm (AITER) parts, set by dsa_indexer_hip.init_indexer_hip
     _hist_topk = None
     fp4_index_k = False
+    rocm_nope_prologue = None
     # One measured budget per device for the process lifetime.
     _mqa_logits_budget_bytes: Dict[int, int] = {}
 
@@ -483,14 +481,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.softmax_scale = self.head_dim**-0.5
         # [wk | weights_proj] rows for the merged GEMM, see prepare_merged_k_gate
         self._wk_gate_weight: Optional[torch.Tensor] = None
-        # MXFP4 index-K (Kimi-K3.1 on gfx950 under DCP); the pool checks the setup
-        self.fp4_index_k = _is_hip and get_exec().kernel.enable_dsa_fp4_indexer
-        # gfx950 decode / verify prologue of the NoPE (Kimi-K3.1) indexer
-        self.rocm_nope_prologue = (
-            make_rocm_nope_prologue(self)
-            if _use_aiter and _is_gfx95_supported
-            else None
-        )
         self.num_init_tokens = self.num_local_tokens = 0
         self.tp_split_min_rows: Optional[int] = None
         if config is not None and is_kimi_k31(config):
@@ -619,7 +609,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
 
         if _use_aiter:
-            self._hist_topk = dsa_indexer_hip.hist_topk_workspace(self, config)
+            dsa_indexer_hip.init_indexer_hip(self, config)
 
         # After the gfx950 fused indexer's gate, which may turn the writer off.
         global _FUSED_FP8_WRITER_LOGGED
@@ -1634,34 +1624,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
             return torch.cat(logits_chunks, dim=0)
 
-        if (
-            _use_aiter
-            and _use_aiter_preshuffle
-            and dsa_indexer_hip.verify_shares_index_k(
-                forward_batch,
-                q_fp8,
-                block_tables,
-                page_size,
-                q_offset,
-                B,
-                next_n,
-                dcp_size,
-            )
+        # verify_shares_index_k's 64-key pages imply AITER's preshuffled layout
+        if _use_aiter and dsa_indexer_hip.verify_shares_index_k(
+            forward_batch, q_fp8, block_tables, page_size, q_offset, B, next_n, dcp_size
         ):
             logits = dsa_indexer_hip.verify_paged_mqa_logits(
-                forward_batch,
-                layer_id,
-                q_fp8,
-                kv_cache_fp8,
-                weights,
-                seqlens_32_2d,
-                block_tables,
-                max_seq_len,
-                q_offset,
-                B,
-                next_n,
-                block_kv,
-            )
+                forward_batch, layer_id, q_fp8, kv_cache_fp8, weights, seqlens_32_2d,
+                block_tables, max_seq_len, q_offset, B, next_n, block_kv,
+            )  # fmt: skip
         elif self.paged_mqa_logits_backend.is_aiter():
             if q_offset == 0:
                 # Aiter's SplitKV scheduling divides by the query count.
@@ -2282,7 +2252,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         *,
         act_quant=None,  # fallback only
         out_cache_loc: Optional[torch.Tensor] = None,
-        prenorm: bool = False,
     ) -> None:
         """
         Store DSA indexer K cache for current step.
@@ -2300,12 +2269,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
-            return
-        if prenorm:
-            # key is k_norm's input; the fused store applies k_norm
-            dsa_indexer_hip.index_k_norm_store_into(
-                self, pool, layer_id, key, out_cache_loc
-            )
             return
         self._write_index_k_cache(
             forward_batch, pool, layer_id, key, act_quant, out_cache_loc
@@ -2353,9 +2316,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     )
             return
 
-        # K3.1 shards index-K under DCP; the CUDA fused store and AITER's write only this rank's rows
         assert dcp_size == 1 or _use_aiter, (
-            "DSA index-K writes under DCP need the CUDA fused store or AITER"
+            "DSA index-K writes under DCP need the CUDA fused store"
         )
 
         # Fast path: AITER fused quant + cache store
@@ -2364,6 +2326,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # layout with page_size=1; the same kv_cache.view works for both cases
         # because page_size is 1 there.
         if _use_aiter:
+            if self.fp4_index_k:
+                dsa_indexer_hip.store_fp4_index_k(
+                    forward_batch, pool, layer_id, key, dcp_size, dcp_rank
+                )
+                return
+            page_size = pool.index_page_size
+            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+            kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc
             if dcp_size > 1:
                 out_loc = dsa_indexer_hip.dcp_local_store_loc(
@@ -2371,14 +2341,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
             if not out_loc.is_contiguous():
                 out_loc = out_loc.contiguous()
-            if self.fp4_index_k:
-                fp4_index_hip.store_fp4_index_k(
-                    key, *pool.get_index_k_fp4_buffers(layer_id), out_loc
-                )
-                return
-            page_size = pool.index_page_size
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-            kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
             indexer_k_quant_and_cache(
                 key,
                 kv_cache,
