@@ -12,12 +12,14 @@ from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
     DSV4NPUTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache import memory_pool_host
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
 )
+from sglang.srt.mem_cache.pool_host import npu_host_memory
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
     ComponentType,
@@ -78,7 +80,87 @@ class TestDSV4HostViews(CustomTestCase):
             return buffer[:, layer, :]
         return buffer[:, layer, 0, :]
 
-    def test_paged_and_state_host_views_support_every_layout(self):
+    def test_host_allocations_round_trip_storage_pages(self):
+        def allocate(dims, *, dtype, device, **kwargs):
+            return torch.empty(dims, dtype=dtype, device=device)
+
+        for npu in (False, True):
+            for layout in ("layer_first", "page_first"):
+                with (
+                    self.subTest(npu=npu, layout=layout),
+                    patch.object(memory_pool_host, "_is_npu", npu),
+                    patch.object(memory_pool_host, "_is_xpu", False),
+                    patch.object(
+                        memory_pool_host, "ALLOC_MEMORY_FUNCS", {"cpu": allocate}
+                    ),
+                    patch.object(
+                        memory_pool_host,
+                        "get_allocator_from_storage",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        memory_pool_host, "host_memory_budget_bytes", return_value=2**30
+                    ),
+                    patch.object(
+                        memory_pool_host, "make_kernel_ptr_table", return_value=None
+                    ),
+                    patch.object(
+                        DeepSeekV4PagedHostPool, "_init_write_back_staging_buffers"
+                    ),
+                    patch.object(
+                        DeepSeekV4StateHostPool, "_init_write_back_staging_buffers"
+                    ),
+                ):
+                    paged = DeepSeekV4PagedHostPool(
+                        "c4",
+                        [
+                            torch.empty((4, 2, 1, 3), dtype=torch.uint8)
+                            for _ in range(2)
+                        ],
+                        item_bytes=6,
+                        num_host_pages=4,
+                        slot_page_size=2,
+                        layout=layout,
+                        pin_memory=False,
+                    )
+                    state = DeepSeekV4StateHostPool(
+                        "state",
+                        [
+                            SimpleNamespace(
+                                ring_size=2,
+                                kv_score_buffer=SimpleNamespace(
+                                    kv_score=torch.empty((8, 3))
+                                ),
+                            )
+                            for _ in range(2)
+                        ],
+                        num_host_pages=4,
+                        swa_page_size=2,
+                        layout=layout,
+                        pin_memory=False,
+                    )
+                    for pool in (paged, state):
+                        width = pool.size_per_token
+                        data = torch.arange(2 * width, dtype=torch.uint8)
+                        pool.set_from_flat_data_page(2, data)
+                        self.assertTrue(torch.equal(pool.get_data_page(2), data))
+                        pointers, lengths = pool.get_page_buffer_meta(
+                            torch.tensor([2, 3])
+                        )
+                        self.assertEqual(sum(lengths), data.numel())
+                        self.assertEqual(
+                            len(pointers), 2 if layout == "layer_first" else 1
+                        )
+                        if layout == "layer_first":
+                            self.assertIsInstance(pool.kv_buffer, list)
+                            self.assertEqual(len(pool.kv_buffer), 2)
+                            self.assertEqual(len(pool.data_refs), 2)
+                            for layer, buffer in enumerate(pool.kv_buffer):
+                                self.assertTrue(buffer.is_contiguous())
+                                self.assertEqual(tuple(buffer.shape), (4, width))
+                                self.assertIs(pool.data_refs[layer], buffer)
+
+    def test_paged_and_state_host_views_support_ascend_layouts(self):
         pages, layers, page_slots, last_dim = 2, 2, 2, 3
         item_bytes = page_slots * last_dim
         raw = torch.arange(pages * layers * item_bytes, dtype=torch.uint8).reshape(
@@ -93,7 +175,7 @@ class TestDSV4HostViews(CustomTestCase):
             pages * layers * state_page_bytes, dtype=torch.uint8
         ).reshape(pages, layers, state_page_bytes)
 
-        for layout in ("layer_first", "page_first", "page_first_direct"):
+        for layout in ("page_first", "layer_first"):
             with self.subTest(pool="paged", layout=layout):
                 host = DeepSeekV4PagedHostPool.__new__(DeepSeekV4PagedHostPool)
                 host.pool_name = "c4"
@@ -110,11 +192,17 @@ class TestDSV4HostViews(CustomTestCase):
                 expected = self._selected_layer(host.kv_buffer, layout, 1).view(
                     torch.int8
                 )
-                self.assertEqual(view.shape, (pages, 1, page_slots, 1, last_dim))
+                shape = (
+                    (1, pages, page_slots, 1, last_dim)
+                    if layout == "layer_first"
+                    else (pages, 1, page_slots, 1, last_dim)
+                )
+                self.assertEqual(view.shape, shape)
                 self.assertTrue(
                     torch.equal(view.reshape(pages, -1), expected.reshape(pages, -1))
                 )
 
+        for layout in ("page_first", "layer_first"):
             with self.subTest(pool="state", layout=layout):
                 host = DeepSeekV4StateHostPool.__new__(DeepSeekV4StateHostPool)
                 host.pool_name = "c4_state"
@@ -136,10 +224,294 @@ class TestDSV4HostViews(CustomTestCase):
                 expected = self._selected_layer(host.kv_buffer, layout, 1).view(
                     state_dtype
                 )
-                self.assertEqual(view.shape, (pages, 1, ring_size, 1, state_last_dim))
+                if layout == "layer_first":
+                    shape = (1, pages, ring_size, 1, state_last_dim)
+                else:
+                    shape = (pages, 1, ring_size, 1, state_last_dim)
+                self.assertEqual(view.shape, shape)
                 self.assertTrue(
                     torch.equal(view.reshape(pages, -1), expected.reshape(pages, -1))
                 )
+
+    def test_paged_ascend_copy_uses_matching_split_operator(self):
+        for layout, backup_name, load_name in (
+            (
+                "page_first",
+                "transfer_kv_all_layer_kv_split_lf_pf",
+                "transfer_kv_per_layer_kv_split_pf_lf",
+            ),
+            (
+                "layer_first",
+                "transfer_kv_all_layer_kv_split",
+                "transfer_kv_per_layer_kv_split",
+            ),
+        ):
+            with self.subTest(layout=layout):
+                host = DeepSeekV4PagedHostPool.__new__(DeepSeekV4PagedHostPool)
+                host.layout = layout
+                host.layer_num = 2
+                host.num_host_pages = 4
+                host.slot_page_size = 4
+                host.page_aligned_only = True
+                host.device_buffers = [
+                    torch.empty((4, 2, 1, 3), dtype=torch.uint8) for _ in range(2)
+                ]
+                raw = torch.empty((4, 2, 6), dtype=torch.uint8)
+                host.kv_buffer = self._layout_buffer(raw, layout)
+                device_indices = torch.arange(8, 12)
+                host_indices = torch.arange(4, 8)
+                with (
+                    patch.object(memory_pool_host, backup_name, create=True) as backup,
+                    patch.object(memory_pool_host, load_name, create=True) as load,
+                ):
+                    host.backup_from_device_all_layer(
+                        None, host_indices, device_indices, "kernel_ascend"
+                    )
+                    host.load_to_device_per_layer(
+                        None, host_indices, device_indices, 1, "kernel_ascend"
+                    )
+                self.assertEqual(backup.call_count, 2)
+                self.assertEqual(load.call_count, 1)
+                if layout == "page_first":
+                    self.assertEqual(backup.call_args.kwargs["host_layer_start"], 0)
+                self.assertEqual(backup.call_args.kwargs["page_size"], 2)
+                self.assertEqual(load.call_args.kwargs["page_size"], 2)
+                self.assertEqual(load.call_args.kwargs["device_layer_id"], 0)
+                self.assertEqual(load.call_args.kwargs["host_layer_id"], 0)
+                self.assertEqual(
+                    load.call_args.kwargs["device_k"].shape, (1, 4, 2, 1, 3)
+                )
+                expected_host_shape = (
+                    (4, 1, 2, 1, 3) if layout == "page_first" else (1, 4, 2, 1, 3)
+                )
+                self.assertEqual(
+                    load.call_args.kwargs["host_k"].shape, expected_host_shape
+                )
+                self.assertTrue(
+                    torch.equal(
+                        load.call_args.kwargs["device_indices"], torch.tensor([4, 5])
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        load.call_args.kwargs["host_indices"], torch.tensor([2, 3])
+                    )
+                )
+
+    def test_state_ascend_copy_uses_matching_split_operator(self):
+        for layout, backup_name, load_name in (
+            (
+                "page_first",
+                "transfer_kv_all_layer_kv_split_lf_pf",
+                "transfer_kv_per_layer_kv_split_pf_lf",
+            ),
+            (
+                "layer_first",
+                "transfer_kv_all_layer_kv_split",
+                "transfer_kv_per_layer_kv_split",
+            ),
+        ):
+            with self.subTest(layout=layout):
+                host = DeepSeekV4StateHostPool.__new__(DeepSeekV4StateHostPool)
+                host.layout = layout
+                host.layer_num = 2
+                host.num_host_pages = 4
+                host.swa_page_size = 4
+                host.ring_size = 2
+                host.state_page_bytes = 12
+                host.state_pools = [
+                    SimpleNamespace(
+                        kv_score_buffer=SimpleNamespace(
+                            kv_score=torch.empty(1, dtype=torch.float16)
+                        )
+                    )
+                    for _ in range(2)
+                ]
+                host.device_page_views = [
+                    torch.empty((4, 12), dtype=torch.uint8) for _ in range(2)
+                ]
+                raw = torch.empty((4, 2, 12), dtype=torch.uint8)
+                host.kv_buffer = self._layout_buffer(raw, layout)
+                device_indices = torch.arange(8, 12)
+                host_indices = torch.arange(4, 8)
+                with (
+                    patch.object(memory_pool_host, backup_name, create=True) as backup,
+                    patch.object(memory_pool_host, load_name, create=True) as load,
+                ):
+                    host.backup_from_device_all_layer(
+                        None, host_indices, device_indices, "kernel_ascend"
+                    )
+                    host.load_to_device_per_layer(
+                        None, host_indices, device_indices, 1, "kernel_ascend"
+                    )
+                self.assertEqual(backup.call_count, 2)
+                self.assertEqual(load.call_count, 1)
+                if layout == "page_first":
+                    self.assertEqual(backup.call_args.kwargs["host_layer_start"], 0)
+                self.assertEqual(load.call_args.kwargs["page_size"], 2)
+                self.assertEqual(
+                    load.call_args.kwargs["device_k"].shape, (1, 4, 2, 1, 3)
+                )
+                self.assertEqual(load.call_args.kwargs["device_k"].dtype, torch.float16)
+                expected_host_shape = (
+                    (4, 1, 2, 1, 3) if layout == "page_first" else (1, 4, 2, 1, 3)
+                )
+                self.assertEqual(
+                    load.call_args.kwargs["host_k"].shape, expected_host_shape
+                )
+                self.assertTrue(
+                    torch.equal(
+                        load.call_args.kwargs["device_indices"], torch.tensor([4, 5])
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        load.call_args.kwargs["host_indices"], torch.tensor([2, 3])
+                    )
+                )
+
+    def test_dsv4_acl_capacity_declares_paged_pool_bytes(self):
+        kvcache = SimpleNamespace(
+            swa_kv_pool=SimpleNamespace(
+                kv_buffer=[object(), object()], bytes_per_page_padded=6
+            )
+        )
+        backend = MagicMock()
+        with (
+            patch.object(npu_host_memory, "is_npu", return_value=True),
+            patch.object(
+                npu_host_memory,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_mem_layout="page_first"),
+            ),
+            patch.object(
+                npu_host_memory, "get_host_memory_backend", return_value=backend
+            ),
+            patch.object(
+                torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
+            ),
+        ):
+            npu_host_memory.reserve_dsv4_paged_host_memory(
+                kvcache=kvcache,
+                page_size=4,
+                num_host_pages=4,
+                swa_num_host_pages=4,
+                c128_num_host_pages=0,
+                has_paged_swa=True,
+                mtp_swa_device_buffers=[],
+                c4_layer_mapping={},
+                c4_state_global_layers=[],
+                c128_layer_mapping={},
+                compressed_region_buffers=assembler._dsv4_compressed_region_buffers,
+                indexer_regions=assembler._dsv4_indexer_regions,
+                rope_sibling=assembler._dsv4_rope_sibling,
+            )
+        backend.ensure_capacity.assert_called_once_with(48, 0)
+
+    def test_capacity_declares_actual_paged_and_state_allocations(self):
+        def state_pool(slot_bytes):
+            return SimpleNamespace(
+                ring_size=2,
+                kv_score_buffer=SimpleNamespace(
+                    kv_score=[SimpleNamespace(nbytes=slot_bytes)]
+                ),
+            )
+
+        kvcache = SimpleNamespace(
+            swa_kv_pool=SimpleNamespace(
+                kv_buffer=[object(), object()], bytes_per_page_padded=6
+            ),
+            compress_state_pools=[state_pool(4), state_pool(4)],
+            indexer_compress_state_pools=[state_pool(8), state_pool(8)],
+        )
+        expected_blocks = {
+            "layer_first": [24, 24, 24, 16, 16, 12, 8, 8, 32, 32, 64, 64, 10, 14],
+            "page_first": [72, 32, 12, 16, 64, 128, 10, 14],
+        }
+        for backend_name in ("acl", "memfabric"):
+            for layout, blocks in expected_blocks.items():
+                backend = MagicMock(name=backend_name)
+                with (
+                    self.subTest(backend=backend_name, layout=layout),
+                    patch.object(npu_host_memory, "is_npu", return_value=True),
+                    patch.object(
+                        npu_host_memory,
+                        "get_memory",
+                        return_value=SimpleNamespace(hicache_mem_layout=layout),
+                    ),
+                    patch.object(
+                        npu_host_memory, "get_host_memory_backend", return_value=backend
+                    ),
+                    patch.object(
+                        assembler,
+                        "_dsv4_compressed_region_buffers",
+                        side_effect=[
+                            ([object(), object()], 4),
+                            ([object()], 5),
+                        ],
+                    ),
+                    patch.object(
+                        assembler,
+                        "_dsv4_indexer_regions",
+                        return_value=[
+                            SimpleNamespace(device_buffers=[object()], item_bytes=3)
+                        ],
+                    ),
+                    patch.object(
+                        assembler,
+                        "_dsv4_rope_sibling",
+                        side_effect=[
+                            ("c4_rope", [object(), object()], 2),
+                            ("c128_rope", [object()], 7),
+                        ],
+                    ),
+                    patch.object(
+                        torch,
+                        "npu",
+                        SimpleNamespace(current_device=lambda: 0),
+                        create=True,
+                    ),
+                ):
+                    npu_host_memory.reserve_dsv4_paged_host_memory(
+                        kvcache=kvcache,
+                        page_size=4,
+                        num_host_pages=4,
+                        swa_num_host_pages=4,
+                        c128_num_host_pages=2,
+                        has_paged_swa=True,
+                        mtp_swa_device_buffers=[object()],
+                        c4_layer_mapping={0: 0, 1: 1},
+                        c4_state_global_layers=[0, 1],
+                        c128_layer_mapping={0: 0},
+                        compressed_region_buffers=assembler._dsv4_compressed_region_buffers,
+                        indexer_regions=assembler._dsv4_indexer_regions,
+                        rope_sibling=assembler._dsv4_rope_sibling,
+                    )
+                backend.ensure_capacity.assert_called_once_with(sum(blocks), 0)
+
+    def test_non_npu_skips_host_memory_reservation(self):
+        with (
+            patch.object(npu_host_memory, "is_npu", return_value=False),
+            patch.object(npu_host_memory, "get_memory") as get_memory,
+            patch.object(npu_host_memory, "get_host_memory_backend") as get_backend,
+        ):
+            npu_host_memory.reserve_dsv4_paged_host_memory(
+                kvcache=None,
+                page_size=4,
+                num_host_pages=0,
+                swa_num_host_pages=0,
+                c128_num_host_pages=0,
+                has_paged_swa=False,
+                mtp_swa_device_buffers=[],
+                c4_layer_mapping={},
+                c4_state_global_layers=[],
+                c128_layer_mapping={},
+                compressed_region_buffers=assembler._dsv4_compressed_region_buffers,
+                indexer_regions=assembler._dsv4_indexer_regions,
+                rope_sibling=assembler._dsv4_rope_sibling,
+            )
+        get_memory.assert_not_called()
+        get_backend.assert_not_called()
 
 
 class TestC128L2Ownership(CustomTestCase):
@@ -264,7 +636,7 @@ class TestDSV4PoolAssembly(CustomTestCase):
             c4_state_global_layers=[],
         )
         memory = SimpleNamespace(
-            hicache_mem_layout="page_first_direct",
+            hicache_mem_layout="page_first",
             hicache_write_policy="write_through",
             hicache_io_backend="kernel_ascend",
             hicache_host_memory_mode="cache",

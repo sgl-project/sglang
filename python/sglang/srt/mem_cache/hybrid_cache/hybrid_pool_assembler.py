@@ -33,6 +33,9 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.npu_host_memory import (
+    reserve_dsv4_paged_host_memory,
+)
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -1004,6 +1007,22 @@ def build_deepseek_v4_hicache_stack(
         swa_page_size=kvcache.swa_page_size,
     )
 
+    reserve_dsv4_paged_host_memory(
+        kvcache=kvcache,
+        page_size=page_size,
+        num_host_pages=num_host_pages,
+        swa_num_host_pages=swa_num_host_pages,
+        c128_num_host_pages=c128_num_host_pages,
+        has_paged_swa=has_paged_swa,
+        mtp_swa_device_buffers=mtp_swa_device_buffers,
+        c4_layer_mapping=c4_layer_mapping,
+        c4_state_global_layers=c4_state_global_layers,
+        c128_layer_mapping=c128_layer_mapping,
+        compressed_region_buffers=_dsv4_compressed_region_buffers,
+        indexer_regions=_dsv4_indexer_regions,
+        rope_sibling=_dsv4_rope_sibling,
+    )
+
     logical_host_pool = LogicalHostPool(
         num_host_pages * page_size, page_size, layout=get_memory().hicache_mem_layout
     )
@@ -1334,7 +1353,8 @@ def build_hybrid_mamba_stack(
     # to page_first_direct.
     mamba_layout = (
         "page_first_direct"
-        if get_memory().hicache_mem_layout == "page_first_kv_split"
+        if get_memory().hicache_mem_layout
+        in ("page_first_kv_split", "layer_first_kv_split")
         else get_memory().hicache_mem_layout
     )
     mamba_host_pool = build_mamba_host_pool(
@@ -1581,7 +1601,10 @@ def _build_mha_mla_host_pool(
     # The global layout is page_first_kv_split only when the target model
     # uses MLA; that layout is MLA-specific, so MHA draft pools must use
     # the non-MLA layout (NPU default: page_first_direct).
-    if isinstance(pool, MHATokenToKVPool) and layout == "page_first_kv_split":
+    if isinstance(pool, MHATokenToKVPool) and layout in (
+        "page_first_kv_split",
+        "layer_first_kv_split",
+    ):
         layout = "page_first_direct"
 
     kwargs = dict(
