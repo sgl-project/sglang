@@ -18,11 +18,14 @@
 
 import math
 from dataclasses import dataclass
-from typing import NamedTuple, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.linear.kernels.state_pool_io import PoolStaging
 
 
 class ForwardStateSlots(NamedTuple):
@@ -90,6 +93,9 @@ class ForwardMetadata:
     # a cuda-graph capture then holds one build instead of one per layer.
     fused_accept_state_indices: Optional[torch.Tensor] = None
     fused_accept_num_accepted: Optional[torch.Tensor] = None
+    # GDN prefill on packed copies of a strided state pool: built by the first
+    # layer that stages and shared by the rest of the forward.
+    prefill_state_staging: Optional["PoolStaging"] = None
 
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None

@@ -7,6 +7,7 @@ from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     FlashInferGDNKernel,
 )
 from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
+    PoolStaging,
     stage_pool_states,
     unstage_pool_states,
 )
@@ -72,12 +73,11 @@ class TestLinearStateStaging(CustomTestCase):
         before = pool.clone()
         indices = torch.tensor([5, 2, -1, 0], dtype=torch.int32)
 
-        (conv_copy, ssm_copy), rows, pool_rows = stage_pool_states(
-            (conv, pool), indices
-        )
+        staging = PoolStaging.from_indices(indices)
+        conv_copy, ssm_copy = stage_pool_states((conv, pool), staging)
         self.assertTrue(ssm_copy.is_contiguous())
-        _extend(_kernel(), ssm_copy, rows, num_seqs=4)
-        unstage_pool_states((conv, pool), (conv_copy, ssm_copy), pool_rows)
+        _extend(_kernel(), ssm_copy, staging.kernel_rows, num_seqs=4)
+        unstage_pool_states((conv, pool), (conv_copy, ssm_copy), staging)
 
         torch.testing.assert_close(pool[5], before[5] + 2)
         torch.testing.assert_close(pool[2], before[2] + 2)
