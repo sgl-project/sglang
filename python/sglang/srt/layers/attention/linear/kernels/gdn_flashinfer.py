@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -81,10 +81,31 @@ _flashinfer_gated_delta_rule_decode = None
 _flashinfer_gated_delta_rule_mtp_bf16 = None
 
 
+def _host_track_lens(
+    forward_batch: ForwardBatch, use_host_metadata: bool
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Extend lengths, track mask and tracked lengths past the prefix, on the host;
+    read back from the device only when the batch carries no host copy."""
+    if use_host_metadata:
+        return (
+            torch.tensor(forward_batch.extend_seq_lens_cpu, dtype=torch.int64),
+            torch.tensor(forward_batch.mamba_prefill_track_mask_cpu, dtype=torch.bool),
+            torch.tensor(forward_batch.mamba_track_seqlens_cpu, dtype=torch.int64)
+            - torch.tensor(forward_batch.extend_prefix_lens_cpu, dtype=torch.int64),
+        )
+    return (
+        forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64),
+        forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool),
+        forward_batch.mamba_track_seqlens.to(device="cpu", dtype=torch.int64)
+        - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64),
+    )
+
+
 def maybe_build_flashinfer_checkpoint_plan(
     forward_batch: ForwardBatch,
     forward_metadata: ForwardMetadata,
     device: str,
+    use_host_metadata: bool,
 ) -> None:
     """Populate packed FlashInfer checkpoint metadata when tracking requires it."""
     if (
@@ -94,11 +115,9 @@ def maybe_build_flashinfer_checkpoint_plan(
         return
 
     checkpoint_every_n_tokens = mamba_cache_chunk_size()
-    extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
-    track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
-    relative_track_lens = forward_batch.mamba_track_seqlens.to(
-        device="cpu", dtype=torch.int64
-    ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
+    extend_seq_lens, track_mask, relative_track_lens = _host_track_lens(
+        forward_batch, use_host_metadata=use_host_metadata
+    )
 
     checkpoint_counts = extend_seq_lens // checkpoint_every_n_tokens
     checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)

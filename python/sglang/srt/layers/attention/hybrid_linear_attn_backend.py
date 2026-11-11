@@ -498,7 +498,8 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=start_indices.dtype,
         )
 
-        return indices.clamp(0, query_start_loc[-1] - 1)
+        # A tensor bound: a 0-dim CUDA tensor passed as a Python scalar syncs the host.
+        return torch.minimum(indices.clamp(min=0), query_start_loc[-1] - 1)
 
     def _init_track_ssm_indices(
         self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch
