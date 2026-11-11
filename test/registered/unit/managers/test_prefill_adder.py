@@ -330,6 +330,7 @@ class TestPrefillAdder(CustomTestCase):
         sat at the head of the waiting queue forever."""
         import functools
 
+        from sglang.srt.disaggregation.mode import DisaggregationMode
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.managers.tp_worker import TpModelWorker
         from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
@@ -366,6 +367,10 @@ class TestPrefillAdder(CustomTestCase):
                 req.full_untruncated_fill_ids = list(range(max_req_input_len))
                 scheduler = SimpleNamespace(
                     max_new_tokens_limit=None,
+                    # init_req_max_new_tokens short-circuits on PD prefill and
+                    # never reaches the memory clamps; keep this on the unified
+                    # path, which is the budget this test is about.
+                    disaggregation_mode=DisaggregationMode.NULL,
                     max_req_len=max_req_len,
                     max_total_num_tokens=kv_capacity,
                     kv_shard_widening=1,
@@ -373,6 +378,11 @@ class TestPrefillAdder(CustomTestCase):
                     token_to_kv_pool_allocator=allocator,
                     sliding_window_size=None,
                     chunked_prefill_size=None,
+                    truncation_align_size=None,
+                    tree_cache=SimpleNamespace(
+                        supports_prefix_sharing=lambda: False,
+                        window_checkpoint_interval=lambda: 0,
+                    ),
                 )
                 req.sampling_params.min_new_tokens = 0
                 req.set_finish_with_abort.side_effect = AssertionError(
