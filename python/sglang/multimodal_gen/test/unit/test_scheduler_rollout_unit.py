@@ -39,11 +39,24 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler
     FlowMatchEulerDiscreteScheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+    MINIMAX_H3_SIGMAS_EXTRA_KEY,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
+    minimax_h3_rollout_sigmas,
+    minimax_h3_rollout_update_video_target,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+    minimax_h3_time_shift_sigmas,
+)
 from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
     FlowRolloutController,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     prepare_rollout_if_enabled,
+)
+from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+    truncate_rollout_schedule,
 )
 
 _SIGMAS = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0], dtype=torch.float32)
@@ -692,6 +705,188 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
         self.assertEqual(_recorded_steps([0, 1, 2]), [0, 1, 2])
         # Filter includes only step_index=T -> only the final latent survives.
         self.assertEqual(_recorded_steps([3]), [3])
+
+
+class TestRolloutStopStepUnit(unittest.TestCase):
+    def _run(
+        self, stop_step_index: int | None
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
+        scheduler.set_timesteps(4)
+        if stop_step_index is not None:
+            truncate_rollout_schedule(scheduler, stop_step_index)
+        batch = types.SimpleNamespace(
+            rollout_log_prob_no_const=True,
+            rollout_noise_level=1.0,
+            rollout_sde_type="cps",
+            rollout_debug_mode=False,
+            rollout_sde_step_indices=None,
+            rollout_return_dit_trajectory=False,
+            rollout_return_step_indices=None,
+            latents=torch.randn(1, 4, 8, 8, generator=torch.Generator().manual_seed(0)),
+        )
+        pipeline_config = types.SimpleNamespace(
+            shard_latents_for_sp=lambda batch, latents: (latents, False)
+        )
+        current_rollout_controller = _make_rollout_controller(
+            batch, pipeline_config, generator=torch.Generator().manual_seed(1)
+        )
+        transition = functools.partial(
+            current_rollout_controller.transition, batch=batch
+        )
+        latents, step_inputs = batch.latents, []
+        for t in scheduler.timesteps:
+            step_inputs.append(latents)
+            latents = scheduler.step(
+                torch.tanh(latents), t, latents, transition=transition
+            ).prev_sample
+        return step_inputs, latents
+
+    def test_stopped_rollout_keeps_prefix_and_returns_x0_prediction(self):
+        """Stopping at step i must replay the full rollout's x_i bit for bit, and
+        the last step must land on x_i's x0 prediction instead of re-noising."""
+        full_inputs, _ = self._run(None)
+        stop_step_index = 2
+        stopped_inputs, final = self._run(stop_step_index)
+
+        self.assertEqual(len(stopped_inputs), stop_step_index + 1)
+        for full, stopped in zip(full_inputs, stopped_inputs):
+            self.assertTrue(torch.equal(full, stopped))
+
+        scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
+        scheduler.set_timesteps(4)
+        x_i = stopped_inputs[stop_step_index]
+        x0_pred = x_i - scheduler.sigmas[stop_step_index] * torch.tanh(x_i)
+        torch.testing.assert_close(final, x0_pred, rtol=0, atol=1e-6)
+
+    def test_stop_step_outside_schedule_is_rejected(self):
+        scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
+        scheduler.set_timesteps(4)
+        with self.assertRaises(ValueError):
+            truncate_rollout_schedule(scheduler, 4)
+
+    @staticmethod
+    def _stopped_request(stop_step_index: int | None) -> Req:
+        batch = Req(
+            sampling_params=SamplingParams(
+                prompt="test", rollout=True, rollout_stop_step_index=stop_step_index
+            )
+        )
+        batch.scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
+        batch.scheduler.set_timesteps(4)
+        batch.timesteps = batch.scheduler.timesteps
+        batch.latents = torch.zeros(1, 4, 8, 8)
+        return batch
+
+    def test_rollout_hook_cuts_the_schedule_at_the_stop(self):
+        """The rollout hook, not a timestep stage, stops the schedule: the request's
+        scheduler, timesteps and controller all run steps 0..i and then the
+        terminal sigma, and a later request on the same scheduler runs in full."""
+        full = FlowMatchEulerDiscreteScheduler(shift=3.0)
+        full.set_timesteps(4)
+        stop_step_index = 2
+
+        batch = self._stopped_request(stop_step_index)
+        scheduler = batch.scheduler
+        prepare_rollout_if_enabled(batch=batch, pipeline_config=types.SimpleNamespace())
+
+        expected_sigmas = torch.cat(
+            [full.sigmas[: stop_step_index + 1], full.sigmas[-1:]]
+        )
+        self.assertTrue(torch.equal(scheduler.sigmas, expected_sigmas))
+        self.assertTrue(
+            torch.equal(scheduler.timesteps, full.timesteps[: stop_step_index + 1])
+        )
+        self.assertTrue(torch.equal(batch.timesteps, scheduler.timesteps))
+        controller = batch.rollout_controllers["visual"]
+        self.assertTrue(torch.equal(controller.sigmas, expected_sigmas))
+
+        # The next request's timestep stage rebuilds the schedule; nothing of the
+        # stop survives on the shared scheduler.
+        later = self._stopped_request(None)
+        later.scheduler = scheduler
+        scheduler.set_timesteps(4)
+        later.timesteps = scheduler.timesteps
+        prepare_rollout_if_enabled(batch=later, pipeline_config=types.SimpleNamespace())
+        self.assertTrue(torch.equal(scheduler.sigmas, full.sigmas))
+        self.assertEqual(len(later.rollout_controllers["visual"].sigmas), 5)
+
+    def test_controller_on_an_uncut_schedule_is_rejected(self):
+        """A loop that hands the hook its own controller must build it on the
+        stopped schedule; one on the full grid would return a full rollout as if
+        it had stopped, so the hook rejects it."""
+        batch = self._stopped_request(2)
+        # _make_rollout_controller runs on the full 5-point _SIGMAS grid.
+        with self.assertRaises(ValueError):
+            prepare_rollout_if_enabled(
+                batch=batch,
+                pipeline_config=types.SimpleNamespace(),
+                build_controller=_make_rollout_controller,
+            )
+
+    def _run_minimax_h3(
+        self, stop_step_index: int | None
+    ) -> tuple[dict[str, list[float]], list[torch.Tensor], torch.Tensor]:
+        sigmas = {
+            name: minimax_h3_time_shift_sigmas(num_steps=4, shift_scale=shift)
+            for name, shift in (("video", 12.0), ("audio", 3.0))
+        }
+        batch = types.SimpleNamespace(
+            rollout=True,
+            rollout_stop_step_index=stop_step_index,
+            rollout_sde_type="cps",
+            rollout_noise_level=1.0,
+            rollout_log_prob_no_const=True,
+            rollout_sde_step_indices=None,
+            extra={MINIMAX_H3_SIGMAS_EXTRA_KEY: sigmas},
+        )
+        sigmas = minimax_h3_rollout_sigmas(
+            batch, batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY]
+        )
+        video_sigmas = sigmas["video"]
+        generator = torch.Generator().manual_seed(1)
+        latents = torch.randn(16, 8, generator=torch.Generator().manual_seed(0))
+        step_inputs, noise_buffer = [], None
+        for step in range(len(video_sigmas) - 1):
+            step_inputs.append(latents)
+            latents, _, _, noise_buffer = minimax_h3_rollout_update_video_target(
+                latents,
+                torch.tanh(latents),
+                sigma_curr=video_sigmas[step],
+                sigma_next=video_sigmas[step + 1],
+                batch=batch,
+                generator=generator,
+                loop_step_index=step,
+                noise_buffer=noise_buffer,
+            )
+        return sigmas, step_inputs, latents
+
+    def test_minimax_h3_stopped_rollout_keeps_prefix_and_returns_x0_prediction(self):
+        """H3's loop runs on its own video/audio grids; its rollout helper cuts both
+        alike, so a stop replays the full rollout's x_i bit for bit and lands on
+        x_i's x0 prediction."""
+        full_sigmas, full_inputs, _ = self._run_minimax_h3(None)
+        stop_step_index = 2
+        sigmas, stopped_inputs, final = self._run_minimax_h3(stop_step_index)
+
+        self.assertEqual(
+            sigmas,
+            {
+                name: values[: stop_step_index + 1] + values[-1:]
+                for name, values in full_sigmas.items()
+            },
+        )
+        self.assertEqual(len(stopped_inputs), stop_step_index + 1)
+        for full, stopped in zip(full_inputs, stopped_inputs):
+            self.assertTrue(torch.equal(full, stopped))
+
+        x_i = stopped_inputs[stop_step_index]
+        x0_pred = x_i + sigmas["video"][stop_step_index] * torch.tanh(x_i)
+        # H3's cps floors the predicted-noise weight at sqrt(1e-12).
+        torch.testing.assert_close(final, x0_pred, rtol=0, atol=1e-5)
+
+        with self.assertRaises(ValueError):
+            self._run_minimax_h3(4)
 
 
 if __name__ == "__main__":
