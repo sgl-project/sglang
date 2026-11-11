@@ -1108,7 +1108,7 @@ def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
 
 def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
     """Declare ``speculative_dflash_draft_kv_ring`` once, before any worker
-    starts. Runs after the draft backend and the compact window are final."""
+    starts. Runs after the draft backend is final."""
     from sglang.srt.speculative.dflash_draft_ring import (
         draft_kv_ring_unsupported_reason,
     )
