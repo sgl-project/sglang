@@ -74,13 +74,10 @@ def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
     return f_freqs_cis, h_freqs_cis, w_freqs_cis
 
 
-def precompute_freqs_cis(
-    dim: int, end: int = 1024, theta: float = 10000.0, s: float = 1.0
-):
+def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     # 1d rope precompute
-    # Note: s parameter is used for audio-specific scaling (e.g., tps adjustment)
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].double() / dim))
-    pos = torch.arange(end, dtype=torch.float64, device=freqs.device) * s
+    pos = torch.arange(end, dtype=torch.float64, device=freqs.device)
     freqs = torch.outer(pos, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
