@@ -567,8 +567,6 @@ POSITIONAL_FIELD_ORDER = (
     "media_url_timeout",
     "allow_local_media_files",
     # Kimi-K3.1 additions, appended to keep existing positional slots
-    "pp_min_chunked_prefill_size",
-    "pp_chunk_overhead_tokens",
     "enable_flashmla_prefill_token_packing",
 )
 # fmt: on
