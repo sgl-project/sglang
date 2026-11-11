@@ -1880,13 +1880,6 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
-    # Total seconds to download one media URL (redirects and body included).
-    # Falls back to the legacy REQUEST_TIMEOUT when only that is set.
-    SGLANG_MEDIA_URL_TIMEOUT = EnvFloat(
-        lambda: float(os.getenv("REQUEST_TIMEOUT", "5"))
-    )
-    # Whether client media may name local files (paths or file:// URLs).
-    SGLANG_MEDIA_ALLOW_LOCAL_FILES = EnvBool(True)
 
     # ===================================================================
     # Unlimited-OCR v2
