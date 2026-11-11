@@ -20,7 +20,6 @@ Import torch_npu only when an NPU operation actually needs it.
 
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, NamedTuple
 
 import torch
@@ -381,49 +380,6 @@ class _ExpertWeightAdapter:
             _expert_storage_view(weight, layout)
             for weight, layout in zip(weights, self._layouts, strict=True)
         ]
-
-
-def _expert_ranks_by_logical_id(
-    placement: list[int], num_local_experts: int
-) -> dict[int, list[int]]:
-    """Index each expert's group-local ranks once, keeping placement order."""
-    expert_ranks = defaultdict(list)
-    for location, expert_id in enumerate(placement):
-        rank = location // num_local_experts
-        ranks = expert_ranks[expert_id]
-        if not ranks or ranks[-1] != rank:
-            ranks.append(rank)
-    return expert_ranks
-
-
-def _copy_expert_weight_runs(
-    weights: list[torch.Tensor],
-    buffers: list[torch.Tensor],
-    copy_infos: list[tuple[int, int]],
-    num_local_experts: int,
-    rank: int,
-) -> None:
-    """Coalesce adjacent slot copies after all sources are staged and P2P completes."""
-    local_start = rank * num_local_experts
-    start = 0
-    while start < len(copy_infos):
-        src_slot, dst_slot = copy_infos[start]
-        end = start + 1
-        while end < len(copy_infos) and copy_infos[end] == (
-            src_slot + end - start,
-            dst_slot + end - start,
-        ):
-            end += 1
-        run_length = end - start
-        local_src = src_slot - local_start
-        local_dst = dst_slot - local_start
-        assert 0 <= local_src <= num_local_experts - run_length
-        assert 0 <= local_dst <= num_local_experts - run_length
-        for weight, buffer in zip(weights, buffers, strict=True):
-            weight[local_dst : local_dst + run_length].copy_(
-                buffer[local_src : local_src + run_length]
-            )
-        start = end
 
 
 def prewarm_eplb_communication() -> None:

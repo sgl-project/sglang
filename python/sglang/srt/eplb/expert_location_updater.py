@@ -31,11 +31,7 @@ from sglang.srt.utils import get_bool_env_var, is_npu
 
 _is_npu = is_npu()
 if _is_npu:
-    from sglang.srt.hardware_backend.npu.eplb import (
-        _copy_expert_weight_runs,
-        _expert_ranks_by_logical_id,
-        migrate_expert_weights,
-    )
+    from sglang.srt.hardware_backend.npu.eplb import migrate_expert_weights
 
 
 logger = logging.getLogger(__name__)
@@ -286,15 +282,6 @@ def update_expert_weights_single_layer(
             routed_experts_weights[i], temp_buffers[i], send = views
         send_weights[i] = send.copy_(routed_experts_weights[i])
 
-    if _is_npu:
-        # Keep NPU migration bookkeeping out of the GPU planning path.
-        old_expert_ranks = _expert_ranks_by_logical_id(
-            old_physical_to_logical_map, num_local_physical_experts
-        )
-        new_expert_ranks = _expert_ranks_by_logical_id(
-            new_physical_to_logical_map, num_local_physical_experts
-        )
-
     self_node_id = rank // num_gpu_per_node
 
     local_expert_location_range = (
@@ -489,36 +476,26 @@ def update_expert_weights_single_layer(
         )
 
     def _compute_comm_info(logical_expert_id: int):
-        if _is_npu:
-            all_src_ranks = old_expert_ranks[logical_expert_id]
-        else:
-            all_src_ranks = _deduplicate_ordered(
-                [
-                    x // num_local_physical_experts
-                    for x in range(num_physical_experts)
-                    if old_physical_to_logical_map[x] == logical_expert_id
-                ]
-            )
+        all_src_ranks = _deduplicate_ordered(
+            [
+                x // num_local_physical_experts
+                for x in range(num_physical_experts)
+                if old_physical_to_logical_map[x] == logical_expert_id
+            ]
+        )
         all_src_nodes = [x // num_gpu_per_node for x in all_src_ranks]
         self_node_src_ranks = [
             x for x in all_src_ranks if x // num_gpu_per_node == self_node_id
         ]
 
-        if _is_npu:
-            need_comm_dst_ranks = [
-                rank
-                for rank in new_expert_ranks[logical_expert_id]
-                if rank not in all_src_ranks
+        need_comm_dst_ranks = _deduplicate_ordered(
+            [
+                x // num_local_physical_experts
+                for x in range(num_physical_experts)
+                if new_physical_to_logical_map[x] == logical_expert_id
+                and x // num_local_physical_experts not in all_src_ranks
             ]
-        else:
-            need_comm_dst_ranks = _deduplicate_ordered(
-                [
-                    x // num_local_physical_experts
-                    for x in range(num_physical_experts)
-                    if new_physical_to_logical_map[x] == logical_expert_id
-                    and x // num_local_physical_experts not in all_src_ranks
-                ]
-            )
+        )
         need_comm_self_node_dst_ranks = (
             [x for x in need_comm_dst_ranks if x // num_gpu_per_node == self_node_id]
             if len(self_node_src_ranks) > 0
@@ -566,7 +543,9 @@ def update_expert_weights_single_layer(
                         p2p_op_infos[i] = (logical_expert_id, [])
 
     def _execute_p2p_ops(p2p_op_infos):
-        if not any(ops for _, ops in p2p_op_infos):
+        sorted_infos = sorted(p2p_op_infos, key=lambda info: info[0])
+        p2p_ops = [op for _, ops in sorted_infos for op in ops]
+        if len(p2p_ops) == 0:
             return
 
         # Submit P2P ops in batches to prevent NCCL/RCCL GPU-side accumulation
@@ -574,7 +553,7 @@ def update_expert_weights_single_layer(
         # (based on num_physical_experts) so matching send/recv pairs land in
         # the same batch. Set batch_chunk_size >= num_physical_experts to disable.
         batch_chunk_size = envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get()
-        ops_by_expert = dict(p2p_op_infos)
+        ops_by_expert = {eid: ops for eid, ops in sorted_infos}
         for start in range(0, num_physical_experts, batch_chunk_size):
             batch_ops = []
             for eid in range(
@@ -588,15 +567,6 @@ def update_expert_weights_single_layer(
                     req.wait()
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
-        if _is_npu:
-            _copy_expert_weight_runs(
-                routed_experts_weights,
-                temp_buffers,
-                buffer2weight_copy_infos,
-                num_local_physical_experts,
-                rank,
-            )
-            return
         for (
             temp_buffers_expert_location,
             routed_experts_weights_expert_location,
