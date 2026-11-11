@@ -39,6 +39,9 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+    MooncakeDirectLinker,
+)
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
     MooncakeBaseStore,
     MooncakeStore,
@@ -286,12 +289,11 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         store = self._store()
         store.mem_pool_host = DevicePoolGroup(entries, num_layers=1, page_size=64)
         store.registered_pools = {entry.name: entry for entry in entries}
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.storage = store
         scheduler = self._scheduler(hierarchical=False)
         scheduler.enable_unified_cache_external_linker = True
-        scheduler.tree_cache.cache_controller = None
-        scheduler.tree_cache.linker = SimpleNamespace(
-            cache_linker=SimpleNamespace(storage=store)
-        )
+        scheduler.tree_cache.linker = SimpleNamespace(cache_linker=linker)
         scheduler.tree_cache.components[ComponentType.SWA] = SimpleNamespace(
             full_window_pages=2, pool_name=PoolName.SWA
         )
@@ -317,9 +319,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         )
 
         backend = get_memory().unified_cache_external_linker_backend
-        scheduler.tree_cache.linker = SimpleNamespace(
-            cache_linker=SimpleNamespace(storage=object())
-        )
+        scheduler.tree_cache.linker = SimpleNamespace(cache_linker=object())
         reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
         self.assertFalse(reply.layout["enabled"])
         self.assertEqual(reply.layout["backend"], backend)

@@ -6152,14 +6152,14 @@ class Scheduler(
         from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
             DevicePoolGroup,
         )
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-            MooncakeStore,
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+            MooncakeDirectLinker,
         )
 
         tree_cache = self.tree_cache
-        wrapper = getattr(tree_cache, "linker", None)
-        storage = getattr(getattr(wrapper, "cache_linker", None), "storage", None)
-        if not isinstance(storage, MooncakeStore):
+        wrapper = tree_cache.linker
+        cache_linker = wrapper.cache_linker if wrapper is not None else None
+        if not isinstance(cache_linker, MooncakeDirectLinker):
             return disabled_l3_layout(
                 (
                     "External linker storage is not Mooncake"
@@ -6169,6 +6169,7 @@ class Scheduler(
                 backend=get_memory().unified_cache_external_linker_backend,
                 page_size=self.page_size,
             )
+        storage = cache_linker.storage
         window_trailing_pages = {
             str(window.pool_name): window.full_window_pages
             for window in (
