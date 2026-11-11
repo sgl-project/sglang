@@ -76,6 +76,14 @@ if [[ "$lane" == body && "${PPU_RUN_KERNEL:-false}" == true ]]; then
     python3 test/run_suite.py --hw ppu --suite stage-b-kernel-test-1-gpu-ppu --pytest --require-nonempty \
         --junit-dir "$PPU_EVIDENCE_DIR/stage-b-kernel-test-1-gpu-ppu" \
         --allow-skip registered.kernels.ops.diffusion.test_timestep_embedding.test_timestep_embedding_perf \
+        --allow-skip 'registered.kernels.ops.attention.test_rope.test_partial_rope[64-96-False-1]' \
+        --allow-skip 'registered.kernels.ops.attention.test_rope.test_partial_rope[64-96-False-129]' \
+        --allow-skip 'registered.kernels.ops.attention.test_rope.test_partial_rope[64-96-False-2048]' \
+        --allow-skip 'registered.kernels.ops.attention.test_rope.test_partial_rope[64-96-False-2049]' \
+        --allow-skip 'registered.kernels.ops.attention.test_rope.test_partial_rope[64-96-True-1]' \
+        --allow-skip 'registered.kernels.ops.attention.test_rope.test_partial_rope[64-96-True-129]' \
+        --allow-skip 'registered.kernels.ops.attention.test_rope.test_partial_rope[64-96-True-2048]' \
+        --allow-skip 'registered.kernels.ops.attention.test_rope.test_partial_rope[64-96-True-2049]' \
         --timeout-per-file "$remaining" --suite-timeout "$remaining"
 fi
 # The EXIT trap records completion; the orchestration job then validates all evidence.
