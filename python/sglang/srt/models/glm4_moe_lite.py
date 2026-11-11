@@ -679,8 +679,12 @@ class Glm4MoeLiteModel(nn.Module):
 
 
 class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
-    # for quark model load
-    packed_modules_mapping = {}
+    # Fused sglang module -> checkpoint module names. Quant configs with per-layer
+    # overrides (AutoRound extra_config, Quark exclusions) resolve fused layers through it.
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+    }
 
     def __init__(
         self,
@@ -690,6 +694,10 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     ) -> None:
         super().__init__()
         config.moe_layer_freq = 1
+        # Must run before the layers are built: per-layer quant lookups (AutoRound
+        # extra_config) resolve fused names through this mapping (as DeepseekV2 does).
+        if quant_config is not None:
+            quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
@@ -1023,8 +1031,15 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                         ):
                             q_a_proj_weight = cached_a_proj[q_a_proj_name]
                             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+                            # Packed int4 tensors (GPTQ/AWQ qweight, qzeros, scales) keep the
+                            # output dim last ([K // pack, N]); bf16/fp8 weights are [N, K].
+                            cat_dim = (
+                                1
+                                if name.endswith((".qweight", ".qzeros", ".scales"))
+                                else 0
+                            )
                             fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=0
+                                [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
                             )
                             param_name = (
                                 name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")

@@ -12,6 +12,10 @@ import torch
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.utils import (
+    get_moe_runner_backend,
+    route_dropped_experts_to_local,
+)
 from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -25,7 +29,7 @@ from sglang.srt.layers.quantization.unquant import (
 )
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_device_capability
+from sglang.srt.utils import get_device_capability, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +250,9 @@ def _local_expert_ids(layer, expert_id: int) -> List[int]:
     return [i for i in local if 0 <= i < layer.num_local_experts]
 
 
+_is_xpu = is_xpu()
+
+
 class MoeWNA16Method(FusedMoEMethodBase):
     """Linear method for MOE WNA16 (W8A16/W4A16) quantization.
 
@@ -255,6 +262,14 @@ class MoeWNA16Method(FusedMoEMethodBase):
 
     def __init__(self, quant_config: MoeWNA16Config):
         self.quant_config = quant_config
+        # sgl-kernel-xpu's int4 W4A16 grouped GEMM takes the MoeWNA16 weight layout
+        # as-is; zero-point checkpoints and --moe-runner-backend triton keep Triton.
+        self.use_xpu_int4_kernel = (
+            _is_xpu
+            and quant_config.weight_bits == 4
+            and not quant_config.has_zp
+            and not get_moe_runner_backend().is_triton()
+        )
 
     def create_weights(
         self,
@@ -399,6 +414,14 @@ class MoeWNA16Method(FusedMoEMethodBase):
             block_shape=[0, layer.group_size],
         )
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.use_xpu_int4_kernel:
+            # The XPU kernel reads zero-point-free codes as signed int4, while GPTQ/AWQ
+            # symmetric codes are unsigned with zero point 8: u ^ 0x8 is the 4-bit
+            # two's complement of u - 8, applied to both nibbles of each byte.
+            layer.w13_qweight.data.bitwise_xor_(0x88)
+            layer.w2_qweight.data.bitwise_xor_(0x88)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -407,6 +430,29 @@ class MoeWNA16Method(FusedMoEMethodBase):
         assert self.moe_runner_config.activation == "silu", (
             "Only SiLU activation is supported."
         )
+
+        if self.use_xpu_int4_kernel:
+            from sgl_kernel import fused_experts as sgl_fused_experts
+
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            topk_weights, topk_ids = route_dropped_experts_to_local(
+                topk_weights=topk_weights, topk_ids=topk_ids
+            )
+            output = sgl_fused_experts(
+                dispatch_output.hidden_states,
+                layer.w13_qweight,
+                layer.w2_qweight,
+                topk_weights,
+                topk_ids,
+                use_int4_w4a16=True,
+                w1_scale=layer.w13_scales,
+                w2_scale=layer.w2_scales,
+                activation=self.moe_runner_config.activation,
+                routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+            )
+            return StandardCombineInput(hidden_states=output)
 
         quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)

@@ -199,3 +199,32 @@ def tiny_router_gemm_max_tokens(
     if not can_use_tiny_gemm(num_experts, hidden_size):
         return -1
     return 16
+
+
+def dequantize_gptq_int4(
+    *,
+    qweight: torch.Tensor,
+    qzeros: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    zeros_stored_minus_one: bool,
+) -> torch.Tensor:
+    """Unpack a raw GPTQ int4 linear to a dense [K, N] weight in ``scales.dtype``.
+
+    Layouts: qweight [K // 8, N] int32 (eight 4-bit codes packed along K, low nibble
+    first), qzeros [K // group_size, N // 8] int32 (packed along N), scales
+    [K // group_size, N]. GPTQ v1 checkpoints store each zero point minus one.
+    """
+    shifts = torch.arange(0, 32, 4, device=qweight.device, dtype=torch.int32)
+    codes = ((qweight.unsqueeze(1) >> shifts.view(1, 8, 1)) & 0xF).reshape(
+        -1, qweight.shape[1]
+    )
+    zeros = ((qzeros.unsqueeze(-1) >> shifts.view(1, 1, 8)) & 0xF).reshape(
+        qzeros.shape[0], -1
+    )
+    if zeros_stored_minus_one:
+        zeros = zeros + 1
+    weight = (
+        codes.to(torch.float32) - zeros.repeat_interleave(group_size, 0)
+    ) * scales.to(torch.float32).repeat_interleave(group_size, 0)
+    return weight.to(scales.dtype)

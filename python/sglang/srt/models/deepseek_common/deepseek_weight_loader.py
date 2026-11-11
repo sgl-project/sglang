@@ -38,6 +38,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     quant_weight_ue8m0,
 )
+from sglang.srt.layers.quantization.gptq import GPTQLinearMethod
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
@@ -62,6 +63,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_xpu,
     _use_aiter_gfx95,
     awq_dequantize_func,
+    dequantize_gptq_int4,
     enable_nextn_moe_bf16_cast_to_fp8,
     is_wint4afp8_or_wint4a16_config,
 )
@@ -681,7 +683,18 @@ class DeepseekV2WeightLoaderMixin:
             if not hasattr(self_attn, "kv_b_proj"):
                 continue
 
-            if hasattr(self_attn.kv_b_proj, "qweight"):
+            if isinstance(self_attn.kv_b_proj.quant_method, GPTQLinearMethod):
+                # Still the raw checkpoint layout here: process_weights_after_loading
+                # (which repacks GPTQ for the backend kernel) runs after this hook.
+                gptq_config = self_attn.kv_b_proj.quant_method.quant_config
+                w = dequantize_gptq_int4(
+                    qweight=self_attn.kv_b_proj.qweight.data,
+                    qzeros=self_attn.kv_b_proj.qzeros.data,
+                    scales=self_attn.kv_b_proj.scales.data,
+                    group_size=gptq_config.group_size,
+                    zeros_stored_minus_one=gptq_config.checkpoint_format != "gptq_v2",
+                ).T
+            elif hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
                 awq_dequantize_f = awq_dequantize_func()
                 if awq_dequantize_f is not None:
