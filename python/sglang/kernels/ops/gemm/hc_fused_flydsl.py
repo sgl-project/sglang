@@ -47,6 +47,20 @@ _UP_WAVES = 4
 # Columns per combine wave (64 lanes x 8); HS splits into HS / _INJECT_BLOCK partial
 # sums of squares per branch.
 _INJECT_BLOCK = 512
+# The up kernel stages up to this many rows of its [M, R] operand in LDS.
+_MAX_ROWS = 128
+
+
+def _bucket_rows(m):
+    """M is a Constexpr, so each distinct row count is a compile. Round up to a power of
+    two within the first MFMA tile, then to whole tiles: the kernels already compute
+    whole tiles, so padding adds no MFMA work and M = 1 stays exact."""
+    if m <= _MFMA_M:
+        return 1 << (m - 1).bit_length()
+    return -(-m // _MFMA_M) * _MFMA_M
+
+
+HC_FUSED_ROW_BUCKETS = tuple(sorted({_bucket_rows(m) for m in range(1, _MAX_ROWS + 1)}))
 
 
 def _load(tensor, offset, width, dtype):
@@ -413,8 +427,7 @@ def hc_fused_shapes_supported(k, r):
         k % (32 * _SPLIT_K) == 0
         and k % (_HC * _INJECT_BLOCK) == 0
         and r % 32 == 0
-        # The up kernel stages up to 128 rows of its [M, R] operand in LDS.
-        and 128 * (r + _LDS_ROW_PAD) * 2 <= _LDS_BYTES
+        and _MAX_ROWS * (r + _LDS_ROW_PAD) * 2 <= _LDS_BYTES
     )
 
 
@@ -423,15 +436,17 @@ def hc_fused_mix(h, weights: HcFusedWeights, sumsq=None):
     or None). ``sumsq`` is the [M, HC * NP] partial sums of squares ``hc_apply_inject``
     returned for h; None makes the down kernel compute them."""
     m, k = h.shape
+    # Buffers hold the padded rows; past m, h and sumsq read as zero.
+    mb = _bucket_rows(m)
     dev = h.device
     f32 = torch.float32
-    p = torch.empty((_SPLIT_K, m, weights.rp), device=dev, dtype=f32)
-    t = torch.empty((m, weights.r), device=dev, dtype=h.dtype)
-    g = torch.empty((m, max(weights.ni, 1)), device=dev, dtype=f32)
-    sc = torch.empty((m, _HC), device=dev, dtype=f32)
-    out = torch.empty((m, k // _HC), device=dev, dtype=h.dtype)
+    p = torch.empty((_SPLIT_K, mb, weights.rp), device=dev, dtype=f32)
+    t = torch.empty((mb, weights.r), device=dev, dtype=h.dtype)
+    g = torch.empty((mb, max(weights.ni, 1)), device=dev, dtype=f32)
+    sc = torch.empty((mb, _HC), device=dev, dtype=f32)
+    out = torch.empty((mb, k // _HC), device=dev, dtype=h.dtype)
     if sumsq is None:
-        sumsq = torch.empty((m, _SPLIT_K), device=dev, dtype=f32)
+        sumsq = torch.empty((mb, _SPLIT_K), device=dev, dtype=f32)
         np_, ss_out = _SPLIT_K // _HC, True
     else:
         if sumsq.shape != (m, k // _INJECT_BLOCK) or sumsq.dtype != f32:
@@ -442,10 +457,10 @@ def hc_fused_mix(h, weights: HcFusedWeights, sumsq=None):
         np_, ss_out = sumsq.shape[1] // _HC, False
     _launch(
         h, weights.down, weights.up, weights.w1, p, sumsq, t, g, sc, out,
-        m, k, weights.rp, weights.r, weights.ni, _SPLIT_K, np_, ss_out, weights.eps,
+        mb, k, weights.rp, weights.r, weights.ni, _SPLIT_K, np_, ss_out, weights.eps,
         torch.cuda.current_stream(dev),
     )  # fmt: skip
-    return out, (g if weights.ni else None)
+    return out[:m], (g[:m] if weights.ni else None)
 
 
 @flyc.kernel
@@ -519,9 +534,23 @@ def hc_apply_inject(h, y, g):
     m, k = h.shape
     if k % (_HC * _INJECT_BLOCK) or g.shape != (m, _HC) or y.shape != (m, k // _HC):
         raise ValueError("unsupported fused HC combine shape")
-    out = torch.empty_like(h)
-    ss = torch.empty((m, k // _INJECT_BLOCK), device=h.device, dtype=torch.float32)
+    mb = _bucket_rows(m)
+    out = torch.empty((mb, k), device=h.device, dtype=h.dtype)
+    ss = torch.empty((mb, k // _INJECT_BLOCK), device=h.device, dtype=torch.float32)
     _launch_inject(
-        h, y, g, out, ss, m, k, g.shape[1], torch.cuda.current_stream(h.device)
+        h, y, g, out, ss, mb, k, g.shape[1], torch.cuda.current_stream(h.device)
     )
-    return out, ss
+    return out[:m], ss[:m]
+
+
+def prewarm_hc_fused(weights: HcFusedWeights, k, device):
+    """Compile one weight shape for every row bucket, with both sums-of-squares sources
+    and, given inject rows, the combine. FlyDSL caches the kernels on disk."""
+    f32 = torch.float32
+    for m in HC_FUSED_ROW_BUCKETS:
+        h = torch.zeros((m, k), device=device, dtype=torch.bfloat16)
+        _, g = hc_fused_mix(h, weights)
+        sumsq = torch.zeros((m, k // _INJECT_BLOCK), device=device, dtype=f32)
+        hc_fused_mix(h, weights, sumsq=sumsq)
+        if g is not None:
+            hc_apply_inject(h, h.new_zeros((m, k // _HC)), g)

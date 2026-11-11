@@ -2079,6 +2079,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             else PPMissingLayer()
         )
 
+    def prewarm_fused_hc(self) -> None:
+        # Every layer's HC sites share one kernel specialization; the mixer has no inject.
+        self.layers[self.start_layer].attn_hyper_connection.prewarm_fused_hc()
+        if self.pp_group.is_last_rank:
+            self.hyper_connection_mixer.prewarm_fused_hc()
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2713,6 +2719,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         if precompile_splitk_tactics():
             logger.info("Precompiled BF16 split-K GEMM tactics for Qwen4-Exp")
+        self.model.prewarm_fused_hc()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

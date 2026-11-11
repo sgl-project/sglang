@@ -274,8 +274,8 @@ class GatedResidual(HyperConnectionBase):
             )
         return self._mix_flydsl_ok
 
-    def _fused_mix(self, hyper_input: torch.Tensor, sumsq: Optional[torch.Tensor]):
-        from sglang.kernels.ops.gemm.hc_fused_flydsl import HcFusedWeights, hc_fused_mix
+    def _fused_weights(self):
+        from sglang.kernels.ops.gemm.hc_fused_flydsl import HcFusedWeights
 
         down = self.input_mix_weight_down.weight
         up = self.input_mix_weight_up.weight
@@ -296,8 +296,26 @@ class GatedResidual(HyperConnectionBase):
                 eps=self.hc_norm.variance_epsilon,
             )
             self._fused_hc_weight_key = key
+        return self._fused_hc_weights
+
+    def prewarm_fused_hc(self) -> None:
+        """Compile the fused HC kernels for every row count bucket before serving."""
+        if not self._fused_hc_ok:
+            return
+        from sglang.kernels.ops.gemm.hc_fused_flydsl import prewarm_hc_fused
+
+        with torch.no_grad():
+            prewarm_hc_fused(
+                weights=self._fused_weights(),
+                k=self.hc_count * self.hidden_size,
+                device=self.input_mix_weight_down.weight.device,
+            )
+
+    def _fused_mix(self, hyper_input: torch.Tensor, sumsq: Optional[torch.Tensor]):
+        from sglang.kernels.ops.gemm.hc_fused_flydsl import hc_fused_mix
+
         mixed_input, inject_logits = hc_fused_mix(
-            h=hyper_input, weights=self._fused_hc_weights, sumsq=sumsq
+            h=hyper_input, weights=self._fused_weights(), sumsq=sumsq
         )
         # The fused combine never reads the normed slot.
         return mixed_input, (hyper_input, hyper_input, inject_logits)
