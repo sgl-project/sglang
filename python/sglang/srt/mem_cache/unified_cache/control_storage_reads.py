@@ -253,9 +253,12 @@ class StorageCacheReads:
             job = self._borrow_ordinary(
                 tokens,
                 CacheCompatibility(extra_key=extra_key, cache_salt=cache_salt),
-                exact=True,
+                demand_prefix_length=prefix_length,
             )
             if job is not None:
+                if len(job.tokens) < len(tokens):
+                    resume_tokens = tokens
+                    key = self._demand_key(job.tokens, extra_key, cache_salt)
                 self._joinable[key] = job
         if job is None or job.cancel_requested or job.failure or job.retired:
             return False
@@ -396,63 +399,84 @@ class StorageCacheReads:
             and node.write_through_pending_id is None
         )
 
-    def _borrow_ordinary(self, tokens, compatibility, *, exact=False):
+    def _borrow_ordinary(self, tokens, compatibility, *, demand_prefix_length=None):
         end = len(tokens)
+        for_demand = demand_prefix_length is not None
+        minimum_end = demand_prefix_length or 0
+        selected = None
         for request, info in self.cache.ongoing_prefetch.items():
             op, suffix = info.operation, info.prefetch_key
             prefix = getattr(op, "control_prefix", None)
             start = op.storage_start
             suffix_end = start + len(suffix)
+            match_end = min(end, suffix_end)
             if (
                 prefix is None
-                or not start < end <= suffix_end
-                or (exact and end != suffix_end)
+                or start >= match_end
+                or (not for_demand and suffix_end < end)
+                or (
+                    for_demand
+                    and (
+                        not minimum_end < suffix_end <= end
+                        # A longer request may wait for an already admitted
+                        # ordinary prefix, but should not wait for its query.
+                        or (suffix_end < end and op.host_indices is None)
+                    )
+                )
                 or suffix.cache_salt != compatibility.cache_salt
                 or suffix.extra_key != compatibility.extra_key
                 or op.is_terminated()
-                or suffix.token_ids[end - start - 1] != tokens[-1]
+                or suffix.token_ids[match_end - start - 1] != tokens[match_end - 1]
                 or tuple(prefix) != tokens[:start]
-                or tuple(suffix.token_ids[: end - start]) != tokens[start:]
+                or tuple(suffix.token_ids[: match_end - start])
+                != tokens[start:match_end]
             ):
                 continue
-            if (job := self.jobs.get(request)) is not None:
-                return job
-            if request in self.demands:
+            job = self.jobs.get(request)
+            if job is None and request in self.demands:
                 # An ordinary suffix may still own a shared ancestor. A new
                 # job must not replace its demand and strand the prefix hold.
-                if exact:
+                if for_demand:
                     continue
                 raise ControlError(
                     "unavailable", "Ordinary suffix still owns a shared prefix"
                 )
-            if self.cache.prefetch_stop_policy != "wait_complete":
-                raise ControlError(
-                    "unavailable", "Compatible ordinary restore uses early stop"
-                )
-            if (
-                len(self.demands) >= self.executor.config.max_prepared_prefixes
-                or start + len(suffix)
-                > self.cache.kv_control_service.config.limits.max_scope_tokens
-            ):
-                raise ControlError(
-                    "unavailable", "Ordinary read interest capacity exhausted"
-                )
-            # The existing operation keeps its request handle, allocation and
-            # stop policy. Only its lifetime and publication become shared.
-            job = _Read(
-                request,
-                tokens[:start] + tuple(suffix.token_ids),
-                compatibility,
-                handle=request,
-                operation=op,
-            )
-            self.jobs[request] = job
-            self.demands[request] = _Demand(job, start)
-            job.demands.add(request)
-            self._observe_publication(job)
-            self.stats["ordinary_reads_reused"] += 1
+            selected = request, op, suffix, start, job
+            if match_end == end:
+                break
+            minimum_end = match_end
+        if selected is None:
+            return None
+        request, op, suffix, start, job = selected
+        if job is not None:
             return job
-        return None
+        if self.cache.prefetch_stop_policy != "wait_complete":
+            raise ControlError(
+                "unavailable", "Compatible ordinary restore uses early stop"
+            )
+        if (
+            len(self.demands) >= self.executor.config.max_prepared_prefixes
+            or start + len(suffix)
+            > self.cache.kv_control_service.config.limits.max_scope_tokens
+        ):
+            raise ControlError(
+                "unavailable", "Ordinary read interest capacity exhausted"
+            )
+        # The existing operation keeps its request handle, allocation and
+        # stop policy. Only its lifetime and publication become shared.
+        job = _Read(
+            request,
+            tokens[:start] + tuple(suffix.token_ids),
+            compatibility,
+            handle=request,
+            operation=op,
+        )
+        self.jobs[request] = job
+        self.demands[request] = _Demand(job, start)
+        job.demands.add(request)
+        self._observe_publication(job)
+        self.stats["ordinary_reads_reused"] += 1
+        return job
 
     def _observe_publication(self, job):
         job.operation.native_quiescent = False

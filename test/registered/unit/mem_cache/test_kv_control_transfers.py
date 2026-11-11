@@ -2232,9 +2232,14 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
     def test_tool_resume_shares_issued_prefix_and_fetches_only_its_tail(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
-        for tail_stored in (False, True):
+        for source, tail_stored in (
+            ("hint", False),
+            ("hint", True),
+            ("ordinary", False),
+            ("ordinary", True),
+        ):
             with (
-                self.subTest(tail_stored=tail_stored),
+                self.subTest(source=source, tail_stored=tail_stored),
                 hicache(self, namespace_keys=True) as owner,
             ):
                 _, cache, service, _ = owner
@@ -2248,6 +2253,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 entered, release = threading.Event(), threading.Event()
                 batches = []
                 get = cc.page_get_func
+                ancestor_demand = CacheRequestHandle("ancestor-read", 0)
                 demand = CacheRequestHandle("tool-resume", 0)
                 sibling_demand = CacheRequestHandle("sibling-resume", 0)
 
@@ -2264,13 +2270,27 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         patch.object(cache, "prefetch_threshold", 1),
                         patch.object(cache, "prefetch_stop_policy", "wait_complete"),
                     ):
-                        hint = self._restore(service, ancestor, "ancestor")
-                        wait_for(service, entered.is_set)
+                        hint = None
+                        if source == "hint":
+                            hint = self._restore(service, ancestor, "ancestor")
+                        else:
+                            self._ordinary_prefetch(
+                                cache, service, ancestor, ancestor_demand
+                            )
+
+                        def started():
+                            cache.drain_storage_control_queues()
+                            return entered.is_set()
+
+                        wait_for(service, started)
                         self._ordinary_prefetch(cache, service, resume, demand)
                         self.assertNotIn(demand, cache.ongoing_prefetch)
                         self.assertFalse(cache.check_prefetch_progress(demand))
                         reads = service.control.executor.storage_reads
                         prefix_read = reads.demands[demand].job
+                        if hint is None:
+                            cache.release_aborted_request(ancestor_demand)
+                            self.assertFalse(prefix_read.operation.is_terminated())
                         if tail_stored:
                             self._ordinary_prefetch(
                                 cache, service, sibling, sibling_demand
@@ -2279,7 +2299,12 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                                 reads.demands[sibling_demand].job, prefix_read
                             )
                         release.set()
-                        self.assertEqual(wait(service, hint).status, Status.COMPLETED)
+                        if hint is not None:
+                            self.assertEqual(
+                                wait(service, hint).status, Status.COMPLETED
+                            )
+                        else:
+                            wait_for(service, lambda: prefix_read.retired)
                         if tail_stored:
                             self.assertFalse(cache.check_prefetch_progress(demand))
                             self.assertIn(demand, cache.ongoing_prefetch)
@@ -2310,6 +2335,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         self.assertFalse(prefix_read.host_locks)
                 finally:
                     release.set()
+                    cache.release_aborted_request(ancestor_demand)
                     cache.release_aborted_request(demand)
                     cache.release_aborted_request(sibling_demand)
                 assert_retired(cache, service)
