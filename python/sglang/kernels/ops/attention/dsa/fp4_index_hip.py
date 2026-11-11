@@ -437,3 +437,47 @@ def _fp4_request_runs(
             )
         )
     return runs
+
+
+# ---- the DSA pool's FP4 index-K (DSATokenToKVPool with --enable-dsa-fp4-indexer)
+
+
+def check_pool(dcp_replicated: bool, index_kpool: int, page_size: int) -> None:
+    """Refuse a pool these keys cannot serve."""
+    from sglang.srt.layers.attention.dsa.utils import (
+        aiter_can_use_preshuffle_paged_mqa,
+    )
+    from sglang.srt.layers.dcp.layout import dsa_shards_index_k
+    from sglang.srt.utils import is_hip
+
+    if not (
+        is_hip()
+        and aiter_can_use_preshuffle_paged_mqa()
+        and dsa_shards_index_k()
+        and not dcp_replicated
+        and index_kpool == 1
+        and page_size == 64
+    ):
+        raise ValueError(
+            "--enable-dsa-fp4-indexer needs AITER's FP4 logits (ROCm gfx950) and index-K "
+            "sharded by DCP on 64-key pages, as Kimi-K3.1 runs it"
+        )
+
+
+def scale_pool_info(index_info, scale_buffers):
+    """The INDEXER_SCALE pool: the exponents of index_info's FP4 keys, in their own
+    buffers on the same page ids and model layers."""
+    import msgspec
+
+    from sglang.srt.mem_cache.device_pool_info import IndexKeyLayout
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+
+    return msgspec.structs.replace(
+        index_info,
+        pool_name=PoolName.INDEXER_SCALE,
+        buffer_info=msgspec.structs.replace(
+            index_info.buffer_info,
+            buffers=tuple(scale_buffers),
+            key_layout=IndexKeyLayout.PAGED_FP4_SCALES,
+        ),
+    )
