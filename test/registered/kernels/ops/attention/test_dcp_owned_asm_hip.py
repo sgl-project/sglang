@@ -1,21 +1,19 @@
-"""Owned DSA DCP route on ROCm: the aiter FP8 asm sparse MLA, the decode
+"""Owned DSA DCP route on ROCm: the fused query and KV write, the decode
 indexer row split, and the row-chunked prefill a2a.
 
 Covers:
 1. ``build_dcp_csr`` packs exactly the owned slots of the localized page table.
-2. ``asm_sparse_mla_dcp`` matches the Triton owned-count sparse MLA (output, and
-   its natural-log LSE against the Triton base-2 one), a row that owns no slot
-   drops out of the merge, and CSR row slices match.
-3. The AITER fused RoPE + fp8 query row + KV write at this rank's owned locs
+2. The AITER fused RoPE + fp8 query row + KV write at this rank's owned locs
    writes what the pool's DCP-widened write does.
-4. A row slice of the packed top-k with ``row_to_batch`` gives the same rows as
+3. A row slice of the packed top-k with ``row_to_batch`` gives the same rows as
    the whole batch, which is what the per-rank decode indexer split relies on.
-5. ``DcpA2aChunkPipeline`` over row chunks equals one ``dcp_a2a_lse_reduce``.
-6. ``DcpA2aChunkPlanner`` measures the stage costs on one layer, then plans the
+4. ``DcpA2aChunkPipeline`` over row chunks equals one ``dcp_a2a_lse_reduce``.
+5. ``DcpA2aChunkPlanner`` measures the stage costs on one layer, then plans the
    chunk count its schedule model finishes first with.
+
+``asm_sparse_mla_dcp`` needs gfx950; its test is in test_dcp_owned_asm_gfx95.py.
 """
 
-import math
 from unittest.mock import MagicMock
 
 import pytest
@@ -39,10 +37,6 @@ H, KV_LORA_RANK, ROPE_DIM, TOPK, DCP = 64, 512, 64, 2048, 4
 # The RoPE rounds its own way before the fp8 cast: one e4m3 step (3 mantissa
 # bits), absolute at e4m3fn's smallest normal (fnuz's is a binade lower).
 FP8_RTOL, FP8_ATOL = 2**-3, 2**-6
-
-
-def _rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
-    return ((a.float() - b.float()).norm() / b.float().norm()).item()
 
 
 def _owned_table(rows: int, ctx: int, rank: int):
@@ -73,99 +67,6 @@ def test_build_dcp_csr_packs_owned_slots():
         n = counts[r].item()
         got = indices[indptr[r] : indptr[r] + n]
         torch.testing.assert_close(got, local[r, :n].int())
-
-
-@pytest.mark.parametrize("T", [24, 144, 2304])
-def test_asm_sparse_mla_matches_triton(T):
-    from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
-    from sglang.kernels.ops.attention.dsa.asm_sparse_mla_dcp import (
-        asm_sparse_mla_dcp,
-        asm_sparse_mla_dcp_available,
-        build_dcp_csr,
-        is_asm_q8,
-    )
-    from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
-        triton_sparse_mla_decode_splitk,
-    )
-
-    if not asm_sparse_mla_dcp_available():
-        pytest.skip("aiter has no non-persistent fp8 gqa64 MLA kernel")
-    torch.manual_seed(1)
-    ctx, sm_scale = 60000, 0.1
-    kv = (
-        torch.randn(ctx // DCP + 1000, 1, KV_LORA_RANK + ROPE_DIM, device="cuda") * 0.5
-    ).to(FP8)
-    q_nope = torch.randn(T, H, 192, device="cuda").bfloat16()
-    q_pe = torch.randn(T, H, ROPE_DIM, device="cuda").bfloat16()
-    w_kc = (torch.randn(H, 192, KV_LORA_RANK, device="cuda") * 0.08).bfloat16()
-    local, counts = _owned_table(T, ctx, rank=0)
-    indptr, indices = build_dcp_csr(local, counts)
-    one = torch.ones(1, dtype=torch.float32, device="cuda")
-
-    # The query prepare packs: one fp8 [q_nope | q_pe] row.
-    q_nope_out = torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(0, 1)
-    q8 = torch.cat([q_nope_out, q_pe], -1).to(FP8)
-    assert is_asm_q8(*q8.split([KV_LORA_RANK, ROPE_DIM], -1))
-    out, lse = asm_sparse_mla_dcp(q8, kv, indptr, indices, sm_scale, KV_LORA_RANK, one)
-
-    # The Triton kernel casts q to the fp8 KV dtype on load: feed it the same q.
-    ref_out, ref_lse = triton_sparse_mla_decode_splitk(
-        q_nope=q8[..., :KV_LORA_RANK].to(torch.bfloat16).contiguous(),
-        q_rope=q8[..., KV_LORA_RANK:].to(torch.bfloat16).contiguous(),
-        kv=kv,
-        indices=local.unsqueeze(1),
-        sm_scale=sm_scale,
-        d_v=KV_LORA_RANK,
-        workspace=[],
-        return_lse=True,
-        lengths=counts,
-    )
-    triton_out = ref_out.view(T, H, KV_LORA_RANK)
-    triton_lse = ref_lse.view(T, H)
-    owned = counts > 0
-
-    # Both kernels round on their own way to the same fp32 result: the asm
-    # one must be as close to it as the Triton one.
-    qf, kvf = q8.float(), kv.float()[:, 0]
-    exact_out = torch.zeros(T, H, KV_LORA_RANK, device="cuda")
-    exact_lse = torch.full((T, H), float("-inf"), device="cuda")
-    for t in owned.nonzero().flatten().tolist():
-        sel = kvf[local[t, : counts[t]].long()]
-        s = qf[t] @ sel.T * sm_scale
-        exact_lse[t] = torch.logsumexp(s, -1)
-        exact_out[t] = torch.softmax(s, -1) @ sel[:, :KV_LORA_RANK]
-    asm_err = _rel_err(out[owned], exact_out[owned])
-    triton_err = _rel_err(triton_out[owned], exact_out[owned])
-    assert asm_err < 1.1 * triton_err + 1e-3, (asm_err, triton_err)
-    torch.testing.assert_close(lse[owned], exact_lse[owned], rtol=0, atol=1e-2)
-    torch.testing.assert_close(
-        triton_lse[owned], exact_lse[owned] / math.log(2), rtol=0, atol=1e-2
-    )
-    # A row that owns no slot drops out of the merge with another rank's row.
-    assert counts[0] == 0
-    assert out[0].eq(0).all() and lse[0].eq(float("-inf")).all()
-    other_out = torch.randn(1, H, KV_LORA_RANK, device="cuda").bfloat16()
-    other_lse = torch.randn(1, H, device="cuda")
-    merged, _ = dcp_lse_combine_triton(
-        torch.stack([out[:1], other_out]),
-        torch.stack([lse[:1], other_lse]),
-        is_lse_base_on_e=True,
-    )
-    torch.testing.assert_close(merged, other_out, rtol=0, atol=0)
-
-    # Row chunks of the batch read their slice of the same CSR.
-    lo, hi = T // 3, T
-    out_c, lse_c = asm_sparse_mla_dcp(
-        q8[lo:hi].contiguous(),
-        kv,
-        indptr[lo : hi + 1],
-        indices,
-        sm_scale,
-        KV_LORA_RANK,
-        one,
-    )
-    torch.testing.assert_close(out_c, out[lo:hi], rtol=0, atol=0)
-    torch.testing.assert_close(lse_c, lse[lo:hi], rtol=0, atol=0)
 
 
 def _rope_interleaved(x, cos, sin):
