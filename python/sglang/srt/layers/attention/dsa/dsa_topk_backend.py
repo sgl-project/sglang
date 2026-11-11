@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum, IntEnum, auto
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -28,6 +28,7 @@ class DSATopKBackend(Enum):
     SGL_KERNEL = "sgl-kernel"
     TORCH = "torch"
     FLASHINFER = "flashinfer"
+    FLASHINFER_GVR2 = "flashinfer_gvr2"
 
     @classmethod
     def resolve(cls, model_runner: ModelRunner) -> DSATopKBackend:
@@ -43,14 +44,41 @@ class DSATopKBackend(Enum):
     def is_sgl_kernel(self) -> bool:
         return self == DSATopKBackend.SGL_KERNEL
 
+    def is_gvr2(self) -> bool:
+        return self == DSATopKBackend.FLASHINFER_GVR2
+
     def is_torch(self) -> bool:
         return self == DSATopKBackend.TORCH
 
     def is_flashinfer(self) -> bool:
         return self == DSATopKBackend.FLASHINFER
 
+    def fallback(self) -> DSATopKBackend:
+        if self.is_gvr2():
+            return DSATopKBackend.SGL_KERNEL
+        return self
+
     def should_use_topk_v2(self) -> bool:
-        return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
+        return self.fallback().is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
+
+    def check_config(
+        self,
+        device: Union[str, torch.device],
+        topk: int,
+        deterministic: bool = False,
+    ) -> None:
+        """Raise at startup if this backend cannot serve ``topk`` on ``device``."""
+        if self.is_gvr2():
+            # GVR V2 has no deterministic mode: ties at the K-th score and the
+            # slot order within a row are not fixed.
+            if deterministic:
+                raise ValueError(
+                    "flashinfer_gvr2 does not support "
+                    "--enable-deterministic-inference; use sgl-kernel."
+                )
+            from sglang.kernels.ops.attention.dsa.gvr2_topk import gvr2_check_config
+
+            gvr2_check_config(device, topk)
 
     def topk_func(
         self,
@@ -59,6 +87,20 @@ class DSATopKBackend(Enum):
         topk: int,
         row_starts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.is_gvr2():
+            # GVR V2 takes rows that start at column 0; prefill's per-row
+            # offsets (row_starts) run on the fallback.
+            if row_starts is not None:
+                return self.fallback().topk_func(
+                    score, lengths, topk, row_starts=row_starts
+                )
+            from sglang.kernels.ops.attention.dsa.gvr2_topk import (
+                gvr2_check,
+                gvr2_topk,
+            )
+
+            gvr2_check(score, topk)
+            return gvr2_topk(score, lengths, topk)
         if self.is_sgl_kernel():
             from sgl_kernel import fast_topk_v2
 
@@ -106,6 +148,42 @@ class DSATopKBackend(Enum):
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
+
+        if self.is_gvr2():
+            # GVR V2 takes PAGED rows that start at column 0, one per page-table
+            # row (decode, spec verify, draft extend); other layouts, as prefill
+            # produces, run on the fallback.
+            if (
+                topk_transform_method != TopkTransformMethod.PAGED
+                or row_starts is not None
+                or batch_idx_list is not None
+                or attn_metadata.real_page_table.shape[0] != logits.shape[0]
+            ):
+                return self.fallback().topk_transform(
+                    logits,
+                    lengths,
+                    topk,
+                    topk_transform_method,
+                    attn_metadata,
+                    cu_seqlens_q_topk=cu_seqlens_q_topk,
+                    topk_indices_offset=topk_indices_offset,
+                    row_starts=row_starts,
+                    batch_idx_list=batch_idx_list,
+                    packed_extend_topk=packed_extend_topk,
+                )
+            from sglang.kernels.ops.attention.dsa.gvr2_topk import (
+                gvr2_check,
+                gvr2_topk_transform_paged,
+            )
+
+            gvr2_check(logits, topk)
+            return gvr2_topk_transform_paged(
+                logits,
+                lengths,
+                topk,
+                attn_metadata.real_page_table,
+                attn_metadata.page_size,
+            )
 
         # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
         # verify / draft-extend, whose expanded rows match the same shape) routes

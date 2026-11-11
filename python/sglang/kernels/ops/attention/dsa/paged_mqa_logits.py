@@ -37,6 +37,37 @@ def _restore_row_stride(logits: torch.Tensor) -> torch.Tensor:
     return logits
 
 
+class _RowPitchView:
+    """``__cuda_array_interface__`` for ``[rows, pitch]`` fp32 at ``base``'s pointer."""
+
+    def __init__(self, base: torch.Tensor, rows: int, pitch: int):
+        self._base = base
+        self.__cuda_array_interface__ = {
+            "shape": (rows, pitch),
+            "typestr": "<f4",
+            "data": (base.data_ptr(), False),
+            "strides": None,
+            "version": 3,
+        }
+
+
+def _restore_storage_extent(logits: torch.Tensor) -> torch.Tensor:
+    """Give multi-row DeepGEMM logits a storage that spans the padded last row."""
+    rows, width = logits.shape
+    pitch = logits.stride(0)
+    if (
+        rows <= 1
+        or pitch <= width
+        or logits.stride(1) != 1
+        or logits.dtype != torch.float32
+        or logits.untyped_storage().size() // 4
+        >= logits.storage_offset() + rows * pitch
+    ):
+        return logits
+    full = torch.as_tensor(_RowPitchView(logits, rows, pitch), device=logits.device)
+    return full[:, :width]
+
+
 def deepgemm_paged_mqa_logits_native(
     fp8_paged_mqa_logits_fn: Callable[..., torch.Tensor],
     q_fp8: torch.Tensor,
@@ -63,7 +94,7 @@ def deepgemm_paged_mqa_logits_native(
         max_seq_len,
         clean_logits=False,
     )
-    return _restore_row_stride(logits)
+    return _restore_storage_extent(_restore_row_stride(logits))
 
 
 def deepgemm_paged_mqa_logits_split(
@@ -89,7 +120,7 @@ def deepgemm_paged_mqa_logits_split(
         max_seq_len,
         clean_logits=False,
     )
-    return _restore_row_stride(logits)
+    return _restore_storage_extent(_restore_row_stride(logits))
 
 
 def aiter_paged_mqa_logits(
