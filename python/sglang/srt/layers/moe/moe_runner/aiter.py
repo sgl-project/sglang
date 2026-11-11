@@ -134,12 +134,19 @@ def aiter_swiglu_oai_limit(config: MoeRunnerConfig) -> Optional[float]:
     return float(config.gemm1_clamp_limit)
 
 
-def aiter_runs_swiglu(config: MoeRunnerConfig) -> bool:
-    """Whether AITER runs these experts with its SwiGLU (SwiGLU-OAI) activation."""
-    return (
+def aiter_deterministic_moe_covers(config: MoeRunnerConfig) -> bool:
+    """Whether AITER's fused_moe(deterministic=True) can run these experts: SwiGLU
+    (incl. SwiGLU-OAI) or gated SiLU, with an AITER build that has the option."""
+    if not (
         _AITER_ACTIVATIONS.get(config.activation) == "Swiglu"
         or aiter_swiglu_oai_limit(config) is not None
-    )
+        or (config.activation == "silu" and config.is_gated)
+    ):
+        return False
+    if not _aiter_fused_moe_supports_deterministic():
+        _warn_no_deterministic_moe()
+        return False
+    return True
 
 
 def _aiter_activation(config: MoeRunnerConfig):
@@ -199,20 +206,15 @@ def _use_aiter_deterministic_moe(
     """Whether to run MXFP4 experts with AITER's fused_moe(deterministic=True).
 
     That option uses one fixed configuration with no atomics and no split-K, so a
-    token's result does not depend on its batch. It covers SwiGLU experts without
-    expert-parallel masking; other activations keep the default path.
+    token's result does not depend on its batch. It covers SwiGLU and gated SiLU
+    experts without expert-parallel masking; other experts keep the default path.
     """
-    if not (
+    return (
         w13_weight.element_size() == 1
         and expert_mask is None
-        and aiter_runs_swiglu(config)
         and get_exec().deterministic.enable_deterministic_inference
-    ):
-        return False
-    if not _aiter_fused_moe_supports_deterministic():
-        _warn_no_deterministic_moe()
-        return False
-    return True
+        and aiter_deterministic_moe_covers(config)
+    )
 
 
 class AiterRunnerCore(MoeRunnerCore):

@@ -1038,16 +1038,17 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 )
             return
 
-        # Deterministic mode runs SwiGLU experts through AITER's deterministic fused_moe,
-        # which uses fp8 activations for the GU-interleaved a16w4 layout (fp4 for the
-        # separated one).
-        from sglang.srt.layers.moe.moe_runner.aiter import aiter_runs_swiglu
+        # Deterministic mode runs SwiGLU and gated SiLU experts through AITER's
+        # deterministic fused_moe, which takes gate/up-interleaved weights.
+        from sglang.srt.layers.moe.moe_runner.aiter import (
+            aiter_deterministic_moe_covers,
+        )
 
         if (
             _is_shuffle_moe_mxfp4
             and not _is_gfx1250
             and get_exec().deterministic.enable_deterministic_inference
-            and aiter_runs_swiglu(layer.moe_runner_config)
+            and aiter_deterministic_moe_covers(layer.moe_runner_config)
         ):
             self._shuffle_gu_interleaved(layer)
             layer.w13_gu_interleaved = True

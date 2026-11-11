@@ -91,11 +91,17 @@ def _deterministic_mode(monkeypatch, module, enabled):
 
 
 @pytest.mark.parametrize(
-    "deterministic, swiglu, expected",
-    [(False, True, False), (True, True, True), (True, False, False)],
+    "deterministic, activation, supports_option, expected",
+    [
+        (False, "swiglu_oai", True, False),  # normal mode is unchanged
+        (True, "swiglu_oai", True, True),  # SwiGLU experts
+        (True, "silu", True, True),  # gated SiLU experts (GLM-5.3)
+        (True, "gelu", True, False),  # not covered
+        (True, "swiglu_oai", False, False),  # AITER without the option
+    ],
 )
 def test_deterministic_mode_preshuffles_gate_up_interleaved(
-    monkeypatch, deterministic, swiglu, expected
+    monkeypatch, deterministic, activation, supports_option, expected
 ):
     import sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe as mod
 
@@ -116,12 +122,16 @@ def test_deterministic_mode_preshuffles_gate_up_interleaved(
     monkeypatch.setattr(
         "sglang.srt.layers.moe.moe_runner.aiter.is_gfx95_supported", lambda: True
     )
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.moe_runner.aiter._aiter_fused_moe_supports_deterministic",
+        lambda: supports_option,
+    )
     layer.moe_runner_config = (
         MoeRunnerConfig(
             activation="silu", gemm1_alpha=1.702, gemm1_beta=1.0, gemm1_clamp_limit=7.0
         )
-        if swiglu
-        else MoeRunnerConfig(activation="silu")
+        if activation == "swiglu_oai"
+        else MoeRunnerConfig(activation=activation)
     )
     layer.w13_weight_scale = torch.zeros((1, 2, 2), dtype=torch.uint8)
     layer.w2_weight_scale = torch.zeros((1, 2, 2), dtype=torch.uint8)

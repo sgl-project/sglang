@@ -277,7 +277,8 @@ _SWIGLU_OAI = dict(
         ),  # activation="swiglu" (gpt-oss)
         (False, torch.uint8, True, None, True, False),  # normal mode is unchanged
         (True, torch.bfloat16, True, None, True, False),  # only MXFP4 experts
-        (True, torch.uint8, False, None, True, False),  # plain SiLU: not covered
+        (True, torch.uint8, "silu", None, True, True),  # gated SiLU (GLM-5.3)
+        (True, torch.uint8, False, None, True, False),  # ungated SiLU: not covered
         (True, torch.uint8, True, torch.ones(2), True, False),  # expert parallel
         (True, torch.uint8, True, None, False, False),  # AITER without the option
     ],
@@ -307,8 +308,12 @@ def test_aiter_runner_requests_deterministic_mxfp4_moe(
     monkeypatch.setattr(aiter_runner, "_SMALLM_MOE_ON", False)
     if swiglu == "swiglu":
         config = MoeRunnerConfig(activation="swiglu")
+    elif swiglu == "silu":
+        config = MoeRunnerConfig(activation="silu")
+    elif swiglu:
+        config = MoeRunnerConfig(**_SWIGLU_OAI)
     else:
-        config = MoeRunnerConfig(**(_SWIGLU_OAI if swiglu else dict(activation="silu")))
+        config = MoeRunnerConfig(activation="silu", is_gated=False)
     runner = AiterRunnerCore(config)
 
     runner.run(
