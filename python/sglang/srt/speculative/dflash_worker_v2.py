@@ -735,7 +735,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if mode is RaggedVerifyMode.STATIC:
             return
-        if self.selector is None or not self._selector_sampling_enabled:
+        if (
+            self.selector is None
+            or self._is_domino
+            or not self._selector_sampling_enabled
+        ):
             raise ValueError(
                 f"SGLANG_RAGGED_VERIFY_MODE={mode.value!r} with DFLASH needs a "
                 "selector draft (DFlash2) on a backend with selector sampling: "
@@ -745,12 +749,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise ValueError(
                 f"SGLANG_RAGGED_VERIFY_MODE={mode.value!r} with DFLASH does not "
                 "support attention DP yet; use SGLANG_RAGGED_VERIFY_MODE=static."
-            )
-        if SIMULATE_ACC_LEN > 0 and SIMULATE_ACC_LEN != 1.0:
-            raise ValueError(
-                "SGLANG_SIMULATE_ACC_LEN other than 1.0 can force an acceptance "
-                f"past a planned verify length; got {SIMULATE_ACC_LEN} with "
-                f"SGLANG_RAGGED_VERIFY_MODE={mode.value!r}."
             )
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
@@ -762,6 +760,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             tp_sync=self._tp_sync,
             online_confidence=True,
         )
+        if (
+            SIMULATE_ACC_LEN > 0
+            and SIMULATE_ACC_LEN != 1.0
+            and not self._verify_planner.is_verify_all
+        ):
+            raise ValueError(
+                "SGLANG_SIMULATE_ACC_LEN other than 1.0 can force an acceptance "
+                f"past a planned verify length; got {SIMULATE_ACC_LEN} with "
+                f"SGLANG_RAGGED_VERIFY_MODE={mode.value!r}."
+            )
         self._verify_executor = TargetVerifyExecutor(
             target_worker=self._target_worker,
             gamma=gamma,
@@ -2602,6 +2610,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
+            cap_trim_lens = None
 
         return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, cap_trim_lens
 
@@ -3176,6 +3185,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if run_compact:
             target_out = self._run_compact_verify(
                 batch=batch,
+                draft_input=draft_input,
                 layout=layout,
                 draft_tokens=draft_tokens,
                 verify_window=VerifyWindow(
@@ -3458,6 +3468,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self,
         *,
         batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
         layout: RaggedVerifyLayout,
         draft_tokens: torch.Tensor,
         verify_window: VerifyWindow,
@@ -3465,17 +3476,26 @@ class DFlashWorkerV2(BaseSpecWorker):
         """Verify only verify_lens[i] rows of request i. The logits (still on
         the vocabulary shard when the gather is deferred) and hidden states
         come back in the [bs * block_size] layout."""
-        target_out, _ = self._verify_executor.run_compact(
-            batch=batch,
-            layout=layout,
-            draft_block_ids=draft_tokens,
-            draft_tokens=draft_tokens[:, 1:],
-            bs=int(draft_tokens.shape[0]),
-            device=self.device,
-            # Applied by the caller once the logits are gathered.
-            sampling_info=None,
-            verify_window=verify_window,
-        )
+        seq_lens_cpu_backup = batch.seq_lens_cpu
+        seq_lens_sum_backup = batch.seq_lens_sum
+        if seq_lens_cpu_backup is None and draft_input.nxt_kv_lens_cpu is not None:
+            batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu - int(self.block_size)
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        try:
+            target_out, _ = self._verify_executor.run_compact(
+                batch=batch,
+                layout=layout,
+                draft_block_ids=draft_tokens,
+                draft_tokens=draft_tokens[:, 1:],
+                bs=int(draft_tokens.shape[0]),
+                device=self.device,
+                # Applied by the caller once the logits are gathered.
+                sampling_info=None,
+                verify_window=verify_window,
+            )
+        finally:
+            batch.seq_lens_cpu = seq_lens_cpu_backup
+            batch.seq_lens_sum = seq_lens_sum_backup
         return target_out
 
     def _observe_decode_step(
@@ -3521,7 +3541,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 confidence=confidence,
                 req_pool_indices=batch.req_pool_indices,
                 prefix_lens=prefix_lens,
-                draft_tokens=draft_tokens,
+                draft_tokens=draft_tokens[:, 1:],
                 bonus_tokens=bonus,
                 correct_len=accept_len,
                 cap_trim_lens=(
