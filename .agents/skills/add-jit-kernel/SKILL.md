@@ -6,8 +6,10 @@ description: Step-by-step tutorial for adding a new lightweight JIT CUDA kernel 
 # Tutorial: Adding a New JIT Kernel to SGLang
 
 Apply [kernel-organization](../kernel-organization/SKILL.md) for the public
-operator namespace, logical grouping, lazy registry metadata, and test placement.
-The implementation tutorial below does not replace that API contract.
+operator namespace, logical grouping, lazy registry metadata, test placement,
+and, before writing a kernel, the search for other implementations of the same
+contract ("One implementation per contract"). The implementation tutorial below
+does not replace that API contract.
 
 For performance work beyond the mechanics, read the guide for your platform: [performance-cuda.md](performance-cuda.md) (estimating before implementing, SASS checks, SM100 notes, fair comparisons).
 
@@ -26,8 +28,12 @@ These hold for every step below.
 - **`namespace sglang` is where JIT code lives.** Open it after the include block and close it at the end of the file, with the device kernels, traits and host wrapper inside. The shared `host::` / `device::` helpers are nested in it too, so they resolve unqualified. `load_jit` emits the `TVM_FFI_DLL_EXPORT_TYPED_FUNC` wrapper inside `namespace sglang` as well, so the `kernel_name` you pass from Python needs no `sglang::` prefix.
 - **Tuning policy belongs in Python; C++ gets the answer, not the decision.** For a hyperparameter — split factor, threads per item, block size, vector width, an algorithm variant — prefer (not required) making it a **template parameter** and letting the `@cache_once` module factory choose the value, over a runtime `if`/`switch` in the launcher that picks among pre-instantiated kernels. The kernel then compiles exactly one specialisation and asserts its own preconditions with `static_assert`, while the heuristic that produced the value sits in Python where it is readable, adjustable, and inspectable without recompiling CUDA. `store_cache`'s `num_threads` is the worked example: a `get_kernel(num_split)` ladder guarded by byte-alignment `if constexpr`s became one template argument plus a heuristic in `_jit_kvcache_module`. The exception is a knob that genuinely varies per call with the runtime shape — that has to stay a kernel argument.
 - **Check where the check is cheapest: `static_assert` > C++ host check > cached Python > per-call Python.** Anything fixed at compile time is a `static_assert`. Anything about the tensors is a `TensorMatcher` / `CHECK_HOST` in the C++ launcher, free next to a kernel launch. A check Python cannot delegate goes inside the `@cache_once` module factory, where it runs once per specialisation. What remains in the per-call entry point costs interpreter time on *every* forward, so it should be nothing but picking the module and allocating `out`.
+- **State implicit assumptions as `static_assert` where they are used.** A layout or thread-count assumption the code relies on (a loop's chunks fit in one block, a tile divides the CTA's threads) gets a `static_assert` where the code relies on it, even when no current configuration breaks it.
+- **Keep compile-time and runtime conditions apart.** Write `if constexpr (kFlag) { if (cond) { ... } }`, not `if (kFlag && cond)`, so the body is not instantiated where `kFlag` is false. A single-statement body may stay mixed.
+- **A C++ `enum class` that selects a kernel variant crosses into Python by name.** Declare it once in a header (`enum class Mode { A, B };`) and take it as a template parameter; the integer values never cross the boundary, so they need not be pinned. Mirror it in Python as an `enum.Enum` whose member names equal the enumerators, with a docstring naming the header. Pass `member.name` to `make_cpp_args`, so it becomes the template argument and part of the module name; the `.cuh` brings the enumerators into scope with `using enum <namespace>::Mode;` inside `namespace sglang`. No integer casts on either side.
+- **No device guard in launchers.** Do not add `tvm::ffi::CUDADeviceGuard` or `cudaSetDevice` to a JIT launcher: the engine always calls with its tensors on the current device, so a per-call guard only adds driver calls to every launch.
 - **Fixed-width integer types.** Prefer `int32_t` / `int64_t` / `uint32_t` / `size_t` over `int`, `long`, or `long long`, so an index has the same width on both sides of the FFI boundary. Bare `int` is fine only where the width plainly cannot matter — an unrolled loop counter over a `constexpr` bound, a template `int` parameter. Shapes arrive as `int64_t` (`SymbolicSize::unwrap()`); narrowing to `uint32_t` for in-kernel indexing is a deliberate act, so write the `static_cast` explicitly and only where the range is known.
-- **Doxygen comments in the header library.** Document helpers in `include/sgl_kernel/` with `///` or `/** ... */` blocks using `\brief`, `\param`, `\tparam`, `\return`. Kernel sources under `csrc/` have no requirement: Doxygen or plain comments are both fine. `python -m sglang.kernels.jit` writes `CommentFormat: Doxygen` into `.clangd` when clangd is 21 or newer, so these render on hover in the editor. Plain `//` remains fine for implementation notes inside a function body.
+- **Doxygen comments in the header library.** Document helpers in `include/sgl_kernel/` with `///` or `/** ... */` blocks using `\brief`, `\param`, `\tparam`, `\return`. Inside kernel sources under `csrc/`, use short plain comments; only exported entities take a Doxygen block (`.claude/rules/comment-style.md`). `python -m sglang.kernels.jit` writes `CommentFormat: Doxygen` into `.clangd` when clangd is 21 or newer, so these render on hover in the editor. Plain `//` remains fine for implementation notes inside a function body.
 - **ASCII only in C++ and CUDA sources.** Write `--`, `->`, `<=` instead of `—`, `→`, `≤`, including in comments. `grep -nP '[^\x00-\x7F]' <file>` before committing.
 - **`namespace details` is private.** Anything inside one is an implementation detail of its own header, free to change without notice. Do not name `details::` from another module, and never `using namespace details`. If you find yourself wanting something in there, that is the signal to promote it to a documented name instead.
 - **`const T* __restrict__` for read-only pointers.** This is what `csrc/` does throughout, and it lets the compiler emit non-coherent (`LDG`) loads.
@@ -84,6 +90,7 @@ These hold for every step below.
   - Resolves the CUDA stream from a `DLDevice` via TVM-FFI automatically.
   - Checks the CUDA error with file/line info after launch via `operator()(kernel, args...)`.
   - Supports `.enable_pdl(bool)` for PDL (Programmatic Dependent Launch, SM90+).
+  - Supports `.enable_cooperative(bool)` for grids whose CTAs wait on each other: the launch fails instead of hanging when the grid cannot be co-resident.
 - **`device::PDLWaitPrimary<kUsePDL>()`** / **`device::PDLTriggerSecondary<kUsePDL>()`** — The two halves of PDL, on sm_90+ (no-ops on older archs and ROCm). Their guarantees are **not** symmetric:
   - `PDLTriggerSecondary` (`griddepcontrol.launch_dependents`) only lets the next kernel in the stream *start* early. It carries no memory ordering and publishes nothing — matching that, the header's asm has no `"memory"` clobber.
   - `PDLWaitPrimary` (`griddepcontrol.wait`) is the ordering point: it waits until the preceding kernel has fully finished and its writes are visible.
@@ -523,7 +530,7 @@ def scale(src: torch.Tensor, factor: float, out: torch.Tensor | None = None) -> 
 **Key points:**
 
 - Use `cache_once` — **not** `functools.lru_cache` (incompatible with `torch.compile`)
-- `load_jit` first arg(s) form the unique build marker; same marker = same cached binary
+- `load_jit` first arg(s) form the unique build marker (the module name). The build cache also keys on the contents of the source files and of every header they transitively include, so after editing a `.cuh` a new process recompiles by itself; there is no need to delete the cache. A running process does not notice edits (file hashes are memoized per process, and wrappers are `@cache_once`), so restart it
 - Only include compile-time specialisation knobs in the build marker; runtime values like `factor` should stay runtime unless the kernel truly needs templating
 - `cuda_wrappers`: `(export_name, kernel_symbol)` — `export_name` is called from Python
 - `make_cpp_args(dtype, ...)` converts `torch.dtype` to C++ type alias:
