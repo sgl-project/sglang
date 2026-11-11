@@ -133,6 +133,18 @@ class TestKvBLoraPrefixCacheHook(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "dsa"):
             check_lora_server_args(args)
 
+    def test_two_batch_overlap_is_rejected_with_lora(self):
+        for targets in (_KIMI_TARGETS, ["q_proj", "o_proj"]):
+            with self.subTest(targets=targets):
+                with self.assertRaisesRegex(ValueError, "two-batch-overlap"):
+                    check_lora_server_args(
+                        _args(
+                            attention_backend="fa3",
+                            lora_target_modules=targets,
+                            enable_two_batch_overlap=True,
+                        )
+                    )
+
     def test_kv_cache_sharding_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "kv-cache-sharding"):
             check_lora_server_args(
