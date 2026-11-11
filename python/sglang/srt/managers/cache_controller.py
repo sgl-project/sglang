@@ -1523,6 +1523,8 @@ class HiCacheController:
     def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
         """Rank-reduce a hit query (MIN) so every rank agrees on the usable
         prefix. Runs for every operation, hit or miss."""
+        if not self.prefetch_hits_sync_groups:
+            return storage_hit_count
         hit_count = torch.tensor(storage_hit_count, dtype=torch.int)
         self._all_reduce(
             hit_count,
@@ -1637,7 +1639,7 @@ class HiCacheController:
 
     def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
         """Synchronize all ranks to agree on a PrefetchAck."""
-        if ack.completed_tokens is not None:
+        if ack.completed_tokens is not None and self.prefetch_completion_sync_groups:
             # Determine the minimal successful prefix of tokens.
             completed_tokens_tensor = torch.tensor(
                 ack.completed_tokens, dtype=torch.int

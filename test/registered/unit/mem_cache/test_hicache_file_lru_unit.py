@@ -751,6 +751,9 @@ class TestDcpStorage(unittest.TestCase):
             )
             _, hit = cc._storage_hit_query(op)
             self.assertEqual(hit, checkpoints[-1] * 128)
+            with mock.patch.object(cc, "_all_reduce") as local_reduce:
+                self.assertEqual(cc._sync_prefetch_hit_query(op, hit), hit)
+                local_reduce.assert_not_called()
             controllers.append(cc)
             operations.append(op)
 
@@ -767,6 +770,7 @@ class TestDcpStorage(unittest.TestCase):
                 tensor[: peer.numel()] = torch.minimum(tensor[: peer.numel()], peer)
 
             cc._all_reduce = mock.Mock(side_effect=reduce)
+            cc.prefetch_hits_sync_groups = [object()]
             local = operations[rank]
             self.assertEqual(
                 cc._sync_prefetch_hit_query(

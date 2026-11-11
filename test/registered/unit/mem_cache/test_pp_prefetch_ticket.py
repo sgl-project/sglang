@@ -70,6 +70,12 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.prefetch_buffer = Queue()
         c.storage_stop_event = threading.Event()
         c.prefetch_tokens_occupied = 0
+        c.storage_read_stats = dict(
+            get_batches=0,
+            get_requested_tokens=0,
+            get_completed_tokens=0,
+            get_seconds=0.0,
+        )
         c.mem_pool_host = Mock(page_size=4)
         c.mem_pool_host.available_size.return_value = 1 << 20
         c.mem_pool_host.layout_lease.side_effect = nullcontext

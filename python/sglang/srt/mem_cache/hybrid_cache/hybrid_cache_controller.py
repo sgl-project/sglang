@@ -1503,16 +1503,15 @@ class HybridCacheController(BaseHiCacheController):
             hits = [storage_hit_count]
         pools = list(PoolName)
         local = operation.query_pool_hit_pages
-        packed = torch.tensor(
-            hits + [local.get(pool, _NO_POOL_VERDICT) for pool in pools],
-            dtype=torch.int,
-        )
-        self._all_reduce(
-            packed,
-            torch.distributed.ReduceOp.MIN,
-            self.prefetch_hits_sync_groups,
-        )
-        reduced = packed.tolist()
+        reduced = hits + [local.get(pool, _NO_POOL_VERDICT) for pool in pools]
+        if self.prefetch_hits_sync_groups:
+            packed = torch.tensor(reduced, dtype=torch.int)
+            self._all_reduce(
+                packed,
+                torch.distributed.ReduceOp.MIN,
+                self.prefetch_hits_sync_groups,
+            )
+            reduced = packed.tolist()
         operation.query_pool_hit_pages = {
             pool: pages
             for pool, pages in zip(pools, reduced[len(hits) :], strict=True)
@@ -1933,17 +1932,18 @@ class HybridCacheController(BaseHiCacheController):
         if ack.pool_hits is not None:
             # "for ... in PoolName" ensures the same order across all ranks.
             # On prefetch failure, pool_hits may be empty dict.
-            packed = torch.tensor(
-                [ack.pool_hits.get(pool.value, 0) for pool in PoolName],
-                dtype=torch.int,
-            )
-            self._all_reduce(
-                packed,
-                torch.distributed.ReduceOp.MIN,
-                self.prefetch_completion_sync_groups,
-            )
-            for i, pool in enumerate(PoolName):
-                ack.pool_hits[pool.value] = packed[i].item()
+            pools = list(PoolName)
+            counts = [ack.pool_hits.get(pool.value, 0) for pool in pools]
+            if self.prefetch_completion_sync_groups:
+                packed = torch.tensor(counts, dtype=torch.int)
+                self._all_reduce(
+                    packed,
+                    torch.distributed.ReduceOp.MIN,
+                    self.prefetch_completion_sync_groups,
+                )
+                counts = packed.tolist()
+            for pool, count in zip(pools, counts, strict=True):
+                ack.pool_hits[pool.value] = count
 
     def prefetch_sync_thread_func(self) -> None:
         """Synchronize progressive ACKs and publish PP ticket completion."""

@@ -62,7 +62,7 @@ class TestBufferModeSidecar(unittest.TestCase):
                 controller = SimpleNamespace(
                     page_size=2,
                     storage_backend=SimpleNamespace(batch_exists=lambda *_: 2),
-                    prefetch_hits_sync_groups=[],
+                    prefetch_hits_sync_groups=[object()],
                     _all_reduce=reduce,
                 )
                 operation = PrefetchOperation(
@@ -156,7 +156,7 @@ class TestBufferModeSidecar(unittest.TestCase):
                     controller = SimpleNamespace(
                         storage_backend=backend,
                         page_size=2,
-                        prefetch_hits_sync_groups=[],
+                        prefetch_hits_sync_groups=[object()],
                         _all_reduce=capture,
                     )
                     _, hit_tokens = HybridCacheController._storage_hit_query(
