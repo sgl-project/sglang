@@ -59,15 +59,12 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
-    is_triton_kernels_available,
     is_xpu,
     round_up,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
-
-has_triton_kernels = is_triton_kernels_available()
 
 # Serialized MXFP4 scales use raw UE8M0 bytes. Keep fresh parameters valid for
 # post-load transforms and dummy initialization; 127 is the neutral scale (1.0).
@@ -225,6 +222,50 @@ if _is_hip:
         from aiter.utility.fp4_utils import e8m0_shuffle
     except ImportError as err:
         dynamic_mxfp4_quant = e8m0_shuffle = err
+
+
+def _dequant_mxfp4_to_bf16_torch(
+    packed: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """Eager MXFP4 -> bf16 with the same semantics as the JIT kernel."""
+    *lead, packed_k = packed.shape
+    k = packed_k * 2
+    e2m1 = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+        + [-0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        dtype=torch.float32,
+        device=packed.device,
+    )
+    bf16_max = torch.finfo(torch.bfloat16).max
+    flat_packed = packed.reshape(-1, packed_k)
+    flat_scale = scale.reshape(-1, k // 32)
+    out = torch.empty(
+        (flat_packed.shape[0], k), dtype=torch.bfloat16, device=packed.device
+    )
+    # Chunk rows so the fp32 intermediate stays small for full expert stacks.
+    rows_per_chunk = max(1, (1 << 24) // k)
+    for start in range(0, flat_packed.shape[0], rows_per_chunk):
+        p = flat_packed[start : start + rows_per_chunk].long()
+        s = flat_scale[start : start + rows_per_chunk]
+        values = torch.stack((e2m1[p & 0xF], e2m1[p >> 4]), dim=-1).view(
+            -1, k // 32, 32
+        )
+        block_scale = (s.to(torch.int32) << 23).view(torch.float32).unsqueeze(-1)
+        dq = (values * block_scale).clamp(-bf16_max, bf16_max)
+        dq = torch.where((s == 0xFF).unsqueeze(-1), float("nan"), dq)
+        out[start : start + rows_per_chunk] = dq.view(-1, k).to(torch.bfloat16)
+    return out.view(*lead, k)
+
+
+def _dequant_mxfp4_to_bf16(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """MXFP4 -> bf16 along the last dim for the Triton (bf16) MoE fallback."""
+    packed = packed.contiguous()
+    scale = scale.contiguous()
+    if packed.is_cuda and not _is_hip:
+        from sglang.kernels.ops.quantization.mxfp4_dequant import mxfp4_dequant
+
+        return mxfp4_dequant(packed, scale)
+    return _dequant_mxfp4_to_bf16_torch(packed, scale)
 
 
 def _dequant_mxfp4_fake(
@@ -408,7 +449,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scale_dtype = torch.uint8
         self.with_bias = with_bias
         mxfp4_block = 32
-        triton_kernels_padding_alignment = 64
+        # The bf16-dequant fallback (Triton runner) pads the intermediate to 64,
+        # which also covers gpt_oss.py's whole-block intermediate sharding.
+        dequant_padding_alignment = 64
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
@@ -440,7 +483,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_size = round_up(hidden_size, 128)
             else:
                 intermediate_size_per_partition_after_pad = round_up(
-                    intermediate_size_per_partition, triton_kernels_padding_alignment
+                    intermediate_size_per_partition, dequant_padding_alignment
                 )
         elif self._fi_kernel in ("cutlass_sm90", "cutlass_sm120"):
             # CUTLASS mixed-input GEMM dimensions must be % 128 == 0. The
@@ -485,8 +528,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         elif _is_xpu:
             # The XPU grouped GEMM recovers K/N from the packed weight shapes and
             # the group size from the scale shape, so it takes the checkpoint
-            # dims. Keep this ahead of the triton_kernels branch so an installed
-            # triton_kernels does not pad the XPU layout.
+            # dims. Keep this ahead of the bf16-dequant branch so the XPU layout
+            # is not padded to its alignment.
             #
             # Align to mxfp4_block anyway: gpt_oss.py shards the intermediate by
             # whole mxfp4 blocks (ceil(blocks / tp) * 32), so a rank's slice can
@@ -497,9 +540,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, mxfp4_block
             )
-        elif has_triton_kernels:
+        elif not _is_cpu:
             intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size_per_partition, triton_kernels_padding_alignment
+                intermediate_size_per_partition, dequant_padding_alignment
             )
 
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
@@ -1047,20 +1090,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # the weights -- the whole point of MXFP4 on XPU.
             return
         else:
-            from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
-
-            w13_weight = upcast_from_mxfp(
-                layer.w13_weight,
-                layer.w13_weight_scale,
-                target_dtype=torch.bfloat16,
-                axis=-1,
+            w13_weight = _dequant_mxfp4_to_bf16(
+                layer.w13_weight, layer.w13_weight_scale
             )
-            w2_weight = upcast_from_mxfp(
-                layer.w2_weight,
-                layer.w2_weight_scale,
-                target_dtype=torch.bfloat16,
-                axis=-1,
-            )
+            w2_weight = _dequant_mxfp4_to_bf16(layer.w2_weight, layer.w2_weight_scale)
             del layer.w13_weight
             del layer.w2_weight
             del layer.w13_weight_scale

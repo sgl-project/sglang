@@ -47,7 +47,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq
+from sglang.test.scheduler_test_utils import FakeReq, leaving_retirer
 from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
@@ -128,7 +128,7 @@ def _input(batch):
 
 def _sending(reqs=()):
     sending = IndexedReqList(ListKind.PD_SENDING)
-    sending.join(reqs)
+    move(reqs, sending)
     return sending
 
 
@@ -326,12 +326,15 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         batch = self.ready_batches.popleft() if self.ready_batches else None
         if batch is not None:
             self.actions.append((self.iteration, "prepare_batch", batch.forward_iter))
-            self.waiting_queue.leave(batch.reqs)
+            self.waiting_queue._leave(batch.reqs)
             # The request between two chunks stays in chunked_reqs.
-            self.prefill_launched_reqs.join(
-                req
-                for req in batch.reqs
-                if req is not batch.chunked_req and req is not self.chunked_req
+            move(
+                (
+                    req
+                    for req in batch.reqs
+                    if req is not batch.chunked_req and req is not self.chunked_req
+                ),
+                self.prefill_launched_reqs,
             )
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
@@ -664,7 +667,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     req.disagg_kv_sender = SimpleNamespace(
                         poll=lambda: KVPoll.WaitingForInput
                     )
-                scheduler.waiting_queue.replace([head, paced])
+                move([head, paced], scheduler.waiting_queue)
                 retries.poll_miss(paced.rid)
 
                 with _single_rank_gloo_group():
@@ -1024,7 +1027,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         result = super().run_batch(batch)
                         if batch.forward_iter == 1:
                             self.ready_batches.append(second)
-                            self.waiting_queue.join(second.reqs)
+                            move(second.reqs, self.waiting_queue)
                         return result
 
                     def get_new_batch_prefill(self, running_batch):
@@ -1067,10 +1070,12 @@ class TestPrefillResultPolling(CustomTestCase):
                         poll=lambda: KVPoll.Transferring
                     )
                 released = []
-                scheduler.request_retirer = Mock()
+                scheduler.request_retirer = leaving_retirer()
                 release = scheduler.request_retirer.release
-                release.side_effect = lambda *args, **kwargs: released.append(
-                    scheduler.iteration
+                leave = release.side_effect
+                release.side_effect = lambda req, **kwargs: (
+                    leave(req),
+                    released.append(scheduler.iteration),
                 )
                 with (
                     _single_rank_gloo_group(),
@@ -1287,7 +1292,7 @@ class TestPrefillResultPolling(CustomTestCase):
                             and item.rid == "100"
                             for item in inputs
                         ):
-                            self.waiting_queue.join(other.reqs)
+                            move(other.reqs, self.waiting_queue)
 
                 pause_at = 2 if yield_before_pause else (1 if depth == 1 else 3)
                 ready_at = {**{batch.forward_iter: 20 for batch in chunks}, 100: 7}
