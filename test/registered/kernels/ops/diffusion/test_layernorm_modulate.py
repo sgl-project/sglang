@@ -7,6 +7,7 @@ from torch.nn import functional as F
 
 from sglang.kernels.ops.diffusion import (
     fused_layernorm_modulate,
+    fused_layernorm_modulate_strided_raw,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -46,6 +47,75 @@ def test_scale_only_preserves_signed_zero():
     expected = reference(x, scale, None, 1e-6)
     assert torch.signbit(expected).all()
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize(
+    "batch,seq,hidden",
+    [(2, 17, 128), (1, 32760, 2240)],
+    ids=["small-transposed", "p9-layout"],
+)
+def test_strided_modulation_preserves_bits_and_returns_contiguous(batch, seq, hidden):
+    torch.manual_seed(42)
+    source = torch.randn(batch, hidden, seq, device="cuda", dtype=torch.bfloat16)
+    x = source.transpose(1, 2)
+    if (batch, seq, hidden) == (1, 32760, 2240):
+        assert x.stride() == (73382400, 1, 32760)
+
+    modulation = torch.randn(batch, 6 * hidden, device=x.device, dtype=x.dtype)
+    scale, shift = modulation.split(hidden, dim=1)[:2]
+    if (batch, seq, hidden) == (1, 32760, 2240):
+        assert scale.stride() == shift.stride() == (13440, 1)
+    norm = torch.nn.LayerNorm(
+        hidden, eps=1e-6, elementwise_affine=False, device=x.device, dtype=x.dtype
+    )
+
+    actual = fused_layernorm_modulate_strided_raw(x, scale, shift, norm.eps)
+    expected = norm(x) * (1 + scale[:, None]) + shift[:, None]
+
+    assert actual.is_contiguous()
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize("has_shift", [False, True], ids=["scale-only", "with-shift"])
+def test_strided_graph_replay_reads_updated_values(has_shift):
+    source = torch.randn(1, 128, 17, device="cuda", dtype=torch.bfloat16)
+    x = source.transpose(1, 2)
+    scale = torch.randn(1, 128, device=x.device, dtype=x.dtype)
+    shift = torch.randn_like(scale) if has_shift else None
+    eps = 1e-6
+
+    assert x.shape == (1, 17, 128)
+    assert x.stride() == (2176, 1, 17)
+    assert not x.is_contiguous()
+    actual = fused_layernorm_modulate_strided_raw(x, scale, shift, eps)
+    assert actual.is_contiguous()
+    expected = reference(x, scale, shift, eps)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+    current_stream = torch.cuda.current_stream()
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(current_stream)
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            fused_layernorm_modulate_strided_raw(x, scale, shift, eps)
+    current_stream.wait_stream(warmup_stream)
+    current_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = fused_layernorm_modulate_strided_raw(x, scale, shift, eps)
+    assert replayed.is_contiguous()
+
+    with torch.cuda.stream(current_stream):
+        source.normal_()
+        scale.normal_()
+        if shift is not None:
+            shift.normal_()
+        graph.replay()
+    current_stream.synchronize()
+
+    expected = reference(x, scale, shift, eps)
+    assert torch.equal(replayed.view(torch.int16), expected.view(torch.int16))
 
 
 @pytest.mark.parametrize("has_shift", [False, True])

@@ -5,12 +5,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fused_layernorm_modulate,
     fused_bias_glu,
     fused_bias_silu,
     fused_layernorm_modulate_raw,
+    fused_layernorm_modulate_strided_raw,
     is_plain_layer_norm,
     residual_gate_add,
 )
@@ -45,6 +47,48 @@ def _eager_ln_modulate(
     return norm(x) * (1 + scale) + shift
 
 
+def _can_use_sana_ln_modulate(
+    norm: nn.LayerNorm,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> bool:
+    if not x.is_cuda or x.dtype is not torch.bfloat16 or x.dim() != 3 or x.numel() == 0:
+        return False
+
+    if not (
+        can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
+        and is_plain_layer_norm(norm, x.shape[-1])
+    ):
+        return False
+
+    batch, _, hidden = x.shape
+    if scale.shape != (batch, 1, hidden) or shift.shape != scale.shape:
+        return False
+    if not (
+        scale.dtype is torch.bfloat16
+        and shift.dtype is torch.bfloat16
+        and scale.device == x.device
+        and shift.device == x.device
+        and scale.stride(2) == 1
+        and shift.stride(2) == 1
+        and (batch <= 1 or scale.stride(0) == shift.stride(0))
+    ):
+        return False
+
+    return True
+
+
+def _has_strided_sana_ln_layout(x: torch.Tensor) -> bool:
+    batch, seq_len, hidden = x.shape
+    return (
+        not x.is_contiguous()
+        and x.stride(1) == 1
+        and x.stride(2) == seq_len
+        and (batch <= 1 or x.stride(0) == seq_len * hidden)
+    )
+
+
 def sana_ln_modulate(
     norm: nn.LayerNorm,
     x: torch.Tensor,
@@ -65,9 +109,10 @@ def sana_ln_modulate(
     whole aten chain it replaces (+14% forward wall), so default-stream
     serving keeps the eager chain.
 
-    ``x`` reaches every site transposed (patch-embed / GLUMBConv permute
-    layout); aten's LayerNorm contiguizes internally, and the fast path
-    issues the same copy explicitly.
+    ``x`` may reach the model transposed (patch-embed / GLUMBConv permute
+    layout); aten's LayerNorm contiguizes internally, and the contiguous fast
+    path issues the same copy explicitly. Validated dense-transposed inputs
+    use direct strided reads.
     """
     global _SANA_LN_MOD_DISABLED
 
@@ -78,7 +123,16 @@ def sana_ln_modulate(
     if not capturing and torch.cuda.current_stream() == torch.cuda.default_stream():
         return _eager_ln_modulate(norm, x, scale, shift)
 
+    if not _can_use_sana_ln_modulate(norm, x, scale, shift):
+        return _eager_ln_modulate(norm, x, scale, shift)
+
+    strided_eligible = _has_strided_sana_ln_layout(x)
+    variant = "strided" if strided_eligible else "contiguous"
+    cuda_arch = current_arch().cuda
+    architecture = cuda_arch.capability if cuda_arch is not None else None
     sig = (
+        variant,
+        architecture,
         x.shape,
         x.stride(),
         x.dtype,
@@ -88,6 +142,10 @@ def sana_ln_modulate(
         norm.eps,
     )
     if sig in _SANA_LN_MOD_SIGS:
+        if strided_eligible:
+            return fused_layernorm_modulate_strided_raw(
+                x, scale[:, 0], shift[:, 0], norm.eps
+            )
         return fused_layernorm_modulate_raw(
             x.contiguous(), scale[:, 0], shift[:, 0], norm.eps
         )
@@ -95,31 +153,26 @@ def sana_ln_modulate(
         # unverified signature during capture: cannot sync-verify here
         return _eager_ln_modulate(norm, x, scale, shift)
 
-    if (
-        x.dtype is torch.bfloat16
-        and x.dim() == 3
-        and scale.dim() == 3
-        and scale.shape[1] == 1
-        and shift.shape == scale.shape
-        and is_plain_layer_norm(norm, x.shape[-1])
-    ):
-        x_c = x.contiguous()
-        if not can_use_fused_layernorm_modulate(x_c.dtype, x_c.shape[-1]):
-            return _eager_ln_modulate(norm, x, scale, shift)
-        try:
-            out = fused_layernorm_modulate_raw(x_c, scale[:, 0], shift[:, 0], norm.eps)
-        except Exception as exc:
-            _SANA_LN_MOD.on_exception(exc, logger=logger)
-            _SANA_LN_MOD_DISABLED = True
-        else:
-            result = _SANA_LN_MOD.accept_or_fallback(
-                out,
-                _eager_ln_modulate(norm, x, scale, shift),
-                sig=sig,
-                logger=logger,
-            )
-            _SANA_LN_MOD_DISABLED = _SANA_LN_MOD.disabled
-            return result
+    if strided_eligible:
+        fused_fn = fused_layernorm_modulate_strided_raw
+        fused_x = x
+    else:
+        fused_fn = fused_layernorm_modulate_raw
+        fused_x = x.contiguous()
+    try:
+        out = fused_fn(fused_x, scale[:, 0], shift[:, 0], norm.eps)
+    except Exception as exc:
+        _SANA_LN_MOD.on_exception(exc, logger=logger)
+        _SANA_LN_MOD_DISABLED = True
+    else:
+        result = _SANA_LN_MOD.accept_or_fallback(
+            out,
+            _eager_ln_modulate(norm, x, scale, shift),
+            sig=sig,
+            logger=logger,
+        )
+        _SANA_LN_MOD_DISABLED = _SANA_LN_MOD.disabled
+        return result
 
     return _eager_ln_modulate(norm, x, scale, shift)
 
