@@ -492,6 +492,15 @@ def check_server_args(server_args: Any):
                 "When setting gc_threshold, it must contain 1 to 3 integers."
             )
 
+    if (
+        cfg.freeze_gc_after_startup
+        and not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+    ):
+        raise ValueError(
+            "--freeze-gc-after-startup is a runtime optimization: it requires "
+            "SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1."
+        )
+
     if cfg.kv_canary_sweep_interval > 0 and cfg.kv_canary == "none":
         raise ValueError(
             "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"

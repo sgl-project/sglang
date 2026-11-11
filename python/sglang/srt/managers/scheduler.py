@@ -14,6 +14,7 @@
 
 import dataclasses
 import faulthandler
+import gc
 import logging
 import math
 import operator
@@ -7137,6 +7138,16 @@ def run_scheduler_process(
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
+
+        if (
+            envs.SGLANG_OPT_SCHEDULER_GC_FREEZE.get()
+            or get_device().freeze_gc_after_startup
+        ):
+            # Startup objects (model, kernels, caches) leave the tracked set, so a
+            # full collection walks only what serving allocates.
+            gc.collect()
+            gc.freeze()
+            logger.info(f"Scheduler GC frozen: {gc.get_freeze_count()} objects")
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()

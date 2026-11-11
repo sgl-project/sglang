@@ -1510,6 +1510,40 @@ class TestInt8MambaCheckpointCompatibility(unittest.TestCase):
         )
 
 
+class TestFreezeGcAfterStartupArgs(unittest.TestCase):
+    """--freeze-gc-after-startup: off by default, and a runtime optimization under
+    SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION."""
+
+    @staticmethod
+    def _check(**kwargs):
+        ServerArgs(
+            model_path="dummy",
+            served_model_name="dummy",
+            chunked_prefill_size=-1,
+            **kwargs,
+        ).check_server_args()
+
+    def test_flag_is_off_by_default(self):
+        self.assertFalse(ServerArgs(model_path="dummy").freeze_gc_after_startup)
+
+    def test_cli_flag(self):
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+            args = prepare_server_args(
+                ["--model-path", "dummy", "--freeze-gc-after-startup"]
+            )
+        self.assertTrue(args.freeze_gc_after_startup)
+
+    def test_requires_the_runtime_master(self):
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1"
+            ):
+                self._check(freeze_gc_after_startup=True)
+            self._check()
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+            self._check(freeze_gc_after_startup=True)
+
+
 class TestKV4Compatibility(unittest.TestCase):
     def setUp(self):
         self._use_mla_backend_patcher = patch(

@@ -3093,6 +3093,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int (one or more)</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--freeze-gc-after-startup`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Collect and freeze the garbage collector once startup ends: in the engine (tokenizer manager) process at the end of Engine init, and in each scheduler before its event loop. Later collections then skip the startup objects. Covers the in-process Engine path, where the HTTP server's post-warmup freeze does not run. Requires <code>SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
 </tbody>
 </table>
 

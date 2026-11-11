@@ -458,6 +458,11 @@ class Envs:
     SGLANG_OPT_SPEC_DRAFT_EXTEND_GRAPH_TOP1 = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Each scheduler runs gc.collect() and gc.freeze() right before its event loop, so a
+    # full collection while serving no longer walks the startup objects.
+    SGLANG_OPT_SCHEDULER_GC_FREEZE = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

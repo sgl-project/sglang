@@ -85,3 +85,12 @@ class Device(msgspec.Struct):
         Optional[List[int]],
         "Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
     ] = None
+    freeze_gc_after_startup: A[
+        bool,
+        "Collect and freeze the garbage collector once startup ends: in the engine "
+        "(tokenizer manager) process at the end of Engine init, and in each "
+        "scheduler before its event loop. Later collections then skip the startup "
+        "objects. Covers the in-process Engine path, where the HTTP server's "
+        "post-warmup freeze does not run. Requires "
+        "SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1.",
+    ] = False

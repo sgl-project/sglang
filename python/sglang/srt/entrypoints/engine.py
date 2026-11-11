@@ -412,6 +412,13 @@ class Engine(EngineScoreMixin, EngineBase):
 
         self.loop = self._ensure_event_loop()
 
+        if get_device().freeze_gc_after_startup:
+            # Startup objects leave the tracked set, so later collections in the
+            # tokenizer manager's process walk only what serving allocates.
+            gc.collect()
+            gc.freeze()
+            logger.info(f"Engine GC frozen: {gc.get_freeze_count()} objects")
+
     def get_all_child_pids(self) -> List[int]:
         """Returns a list of all child process PIDs."""
         return self._scheduler_init_result.all_child_pids
