@@ -111,9 +111,11 @@ def bcg_dcp_extend_kv_gather(
         forward_batch = get_forward_batch()
     metadata = forward_batch.attn_dcp_metadata
     if metadata.dcp_extend_prefix_lens_sum == 0:
-        # No prefix KV on any DCP rank: skip the collective.
-        metadata.dcp_kv_buffer[..., :kv_lora_rank] = k_nope
-        metadata.dcp_kv_buffer[..., kv_lora_rank:] = k_pe
+        # No prefix KV on any DCP rank: skip the collective. The buffer holds the
+        # real tokens; a replayed k_nope/k_pe is padded to the bucket.
+        num_tokens = metadata.dcp_kv_buffer.shape[0]
+        metadata.dcp_kv_buffer[..., :kv_lora_rank] = k_nope[:num_tokens]
+        metadata.dcp_kv_buffer[..., kv_lora_rank:] = k_pe[:num_tokens]
         return
     all_gather_kv_cache_for_mla_extend(
         token_to_kv_pool,

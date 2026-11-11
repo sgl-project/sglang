@@ -733,12 +733,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 None,
             )
 
-        # DCP extend attention reads KV through a gather buffer in attn_dcp_metadata;
-        # capture keeps one bucket-sized buffer per shape and replay reuses it.
+        # DCP extend attention reads KV through a gather buffer in attn_dcp_metadata.
         self._dcp_extend_active = get_parallel().attn_dcp_size > 1 and hasattr(
             model_runner.model, "prepare_context_parallel_metadata_for_dcp"
         )
-        self._dcp_kv_buffers: Dict[ShapeKey, torch.Tensor] = {}
 
         # --- aiter chip info pre-warming (AMD) -------------------------
         maybe_pre_warm_aiter_chip_info()
@@ -1312,6 +1310,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             capture_batch, in_capture=False
         )
 
+    def _fill_capture_req_to_token(self, capture_seq_lens: list[int]) -> None:
+        dcp_size = get_parallel().attn_dcp_size
+        if dcp_size <= 1:
+            return
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        span = dcp_size * self.model_runner.page_size
+        start = span
+        for i, seq_len in enumerate(capture_seq_lens):
+            req_to_token[i, :seq_len] = torch.arange(
+                start,
+                start + seq_len,
+                dtype=req_to_token.dtype,
+                device=req_to_token.device,
+            )
+            start += -(-seq_len // span) * span
+
     def _plan_dcp_metadata(self, forward_batch: ForwardBatch):
         """Plan DCP extend metadata as the eager runner does; the planner needs a
         forward context, which capture has not entered yet."""
@@ -1339,11 +1353,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         and stash the returned per-bucket metadata object; otherwise fall
         back to the generic eager init that BCG/TC_PIECEWISE use today."""
         if self._dcp_extend_active:
-            # Zero-prefix capture batch: its gather buffer is bucket-sized, so
-            # it doubles as the replay buffer for this shape.
-            metadata = self._plan_dcp_metadata(forward_batch)
-            forward_batch.attn_dcp_metadata = metadata
-            self._dcp_kv_buffers[shape_key] = metadata.dcp_kv_buffer
+            forward_batch.attn_dcp_metadata = self._plan_dcp_metadata(forward_batch)
         attn_backend = self.model_runner.attn_backend
         with forward_context(
             ForwardContext(attn_backend=attn_backend), forward_batch=forward_batch
@@ -1373,10 +1383,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         real seq_lens / prefix_lens; the captured kernels read the
         updated state at replay."""
         if self._dcp_extend_active:
-            # The gather and the attention are breaks reading the live batch: plan
-            # live indices, but use the bucket-sized buffer (k_nope/k_pe are padded).
+            # The gather and the attention are breaks reading the live batch, so
+            # its plan (live-sized buffer, prefix included) serves any prefix.
             metadata = self._plan_dcp_metadata(forward_batch)
-            metadata.dcp_kv_buffer = self._dcp_kv_buffers[shape_key]
             forward_batch.attn_dcp_metadata = metadata
             static_forward_batch.attn_dcp_metadata = metadata
         attn_backend = self.model_runner.attn_backend
@@ -1503,10 +1512,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # FullCG's chunked-prefix topology covers a bounded prefix. Its capture
         # flag is FullCG-only, so this is inert for the BreakableCG vote path.
         if self._has_uncapturable_chunked_prefix(prefix_lens):
-            return False
-        # Under DCP only fresh prefills replay; a prefix hit needs the cross-rank
-        # prefix KV all-gather with per-batch shapes, which stays eager.
-        if self._dcp_extend_active and prefix_lens is not None and any(prefix_lens):
             return False
         # tc_piecewise captures with ForwardMode.EXTEND and spec_info=None.
         if is_target_verify:
@@ -1658,6 +1663,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             f"Capture batch needs {bs} request slots for {num_tokens} tokens, "
             f"but the request pool has only {self.max_bs}."
         )
+        self._fill_capture_req_to_token(capture_seq_lens)
         capture_start_locs = [0]
         for seq_len in capture_seq_lens[:-1]:
             capture_start_locs.append(capture_start_locs[-1] + seq_len)
