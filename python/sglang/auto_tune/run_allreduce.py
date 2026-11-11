@@ -1,0 +1,258 @@
+"""All-reduce tuner. It does not start a server and does not load weights.
+
+One process cannot all-reduce with itself, so torchrun starts one process per
+GPU. The model's config.json gives the hidden size; the tensors are random.
+
+    torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce \
+        --model-path amd/Qwen3.8-2.4T-A95B-Quark-MXFP4 --tp 8 \
+        --graph 0 --output-dir /tmp/ar-tune
+
+``--graph 0`` (default) times eager calls and writes
+``allreduce_configs_eager.json`` for ``SGLANG_TUNED_EAGER_CONFIG``.
+``--graph 1`` times calls captured into a CUDA graph and writes
+``allreduce_configs_graph.json`` for ``SGLANG_TUNED_GRAPH_CONFIG``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+from sglang.auto_tune.allreduce_tuner import (
+    QR_QUANT_REGIMES,
+    print_allreduce_summary,
+    run_allreduce_tuning,
+)
+from sglang.auto_tune.utils import get_model_config
+
+
+def _bool01(value: str) -> bool:
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y"}:
+        return True
+    if text in {"0", "false", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError("expected 0 or 1")
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Time every all-reduce kernel per message size, eagerly "
+        "or inside a CUDA graph, and write the fastest per size."
+    )
+    parser.add_argument(
+        "--model-path",
+        required=True,
+        help="Hugging Face id or a local directory with config.json.",
+    )
+    parser.add_argument("--tp", "--tp-size", dest="tp_size", type=int, required=True)
+    parser.add_argument("--ep", "--ep-size", dest="ep_size", type=int, default=1)
+    parser.add_argument(
+        "--graph",
+        type=_bool01,
+        default=False,
+        help=(
+            "0 (default): eager calls, for SGLANG_TUNED_EAGER_CONFIG. "
+            "1: calls captured into a CUDA graph inside each communicator's "
+            "capture context and replayed, for SGLANG_TUNED_GRAPH_CONFIG."
+        ),
+    )
+    parser.add_argument(
+        "--graph-calls",
+        type=int,
+        default=10,
+        help=(
+            "Graph mode: all-reduces captured back to back in one graph. "
+            "The time is per call. Default 10."
+        ),
+    )
+    parser.add_argument(
+        "-n",
+        "--num-iters",
+        dest="num_iters",
+        type=int,
+        default=100,
+        help=(
+            "Timed calls per kernel and size in eager mode, timed graph "
+            "replays in graph mode. Warm-up is extra. Default 100."
+        ),
+    )
+    parser.add_argument(
+        "--median",
+        type=_bool01,
+        default=False,
+        help=(
+            "1: winner from the median of per-call (eager) or per-replay "
+            "(graph) times. 0 (default): mean of one timed loop."
+        ),
+    )
+    parser.add_argument(
+        "--preceding-gemm",
+        type=_bool01,
+        default=False,
+        help=(
+            "1: before each all-reduce, a GEMM writes its input on the same "
+            "stream with no sync, and the GEMM-only time is subtracted."
+        ),
+    )
+    parser.add_argument(
+        "--sizes",
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "Message sizes in bytes, replacing the ones derived from the "
+            "model. bf16 [tokens, hidden] is tokens * hidden * 2 bytes."
+        ),
+    )
+    parser.add_argument(
+        "--qr-quant",
+        nargs="+",
+        default=["INT4"],
+        choices=list(QR_QUANT_REGIMES),
+        help="QuickReduce codecs to time. Default INT4.",
+    )
+    parser.add_argument(
+        "--qr-cast-bf16-to-fp16",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help=(
+            "ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16 for QuickReduce. 1 (the "
+            "server default) casts inside the timed kernel."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-acr-max-size",
+        type=_bool01,
+        default=False,
+        help=(
+            "1: time AITER past AITER_CUSTOM_AR_MAX_SIZE, up to half its "
+            "registered pool. The server runs such a row the same way."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-scr-max-size",
+        type=_bool01,
+        default=False,
+        help=(
+            "1: time SGLang's custom all-reduce past its max size, up to "
+            "its buffer. The server runs such a row the same way."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="allreduce_tune_out",
+        help="Rank 0 writes allreduce_configs_<eager|graph>.json here.",
+    )
+    return parser
+
+
+_STACK_DIR = os.environ.get("ALLREDUCE_TUNE_STACK_DIR", "/tmp/ar-tune-stacks")
+_STACK_PERIOD_S = 20
+
+
+def _enable_stack_dumps(rank: int) -> None:
+    """Print every rank's stack into this terminal while the run is hung.
+
+    A rank inside torch.cuda.synchronize is waiting on a kernel. A rank inside
+    broadcast_object_list or barrier is waiting on a peer.
+    """
+    import faulthandler
+    import threading
+
+    os.makedirs(_STACK_DIR, exist_ok=True)
+    stream = open(os.path.join(_STACK_DIR, f"rank{rank}.txt"), "w")
+    faulthandler.enable(file=stream, all_threads=True)
+    faulthandler.dump_traceback_later(_STACK_PERIOD_S, repeat=True, file=stream)
+    if rank != 0:
+        return
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+    def _report() -> None:
+        import time
+
+        time.sleep(_STACK_PERIOD_S + 5)
+        while True:
+            parts = ["\n===== where each rank is ====="]
+            for other in range(world_size):
+                try:
+                    with open(os.path.join(_STACK_DIR, f"rank{other}.txt")) as fh:
+                        lines = fh.readlines()
+                except OSError:
+                    lines = []
+                tail = "".join(lines[-8:]).rstrip() or "(no dump yet)"
+                parts.append(f"--- rank {other} ---\n{tail}")
+            print("\n".join(parts), file=sys.stderr, flush=True)
+            time.sleep(_STACK_PERIOD_S)
+
+    threading.Thread(target=_report, name="stack-report", daemon=True).start()
+
+
+def _init_distributed() -> None:
+    import torch
+    import torch.distributed as dist
+
+    if "LOCAL_RANK" not in os.environ:
+        sys.exit(
+            "All-reduce tuning needs one process per GPU:\n"
+            "torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce "
+            "--model-path <model> --tp 8"
+        )
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    _enable_stack_dumps(int(os.environ.get("RANK", os.environ["LOCAL_RANK"])))
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = create_parser().parse_args(argv)
+    if args.num_iters < 1:
+        sys.exit("-n must be at least 1")
+    if args.graph_calls < 1:
+        sys.exit("--graph-calls must be at least 1")
+    _init_distributed()
+
+    import torch.distributed as dist
+
+    rank = dist.get_rank()
+    try:
+        if args.tp_size != dist.get_world_size():
+            if rank == 0:
+                print(
+                    f"--tp {args.tp_size} does not match the torchrun world "
+                    f"size {dist.get_world_size()}. Use "
+                    f"--nproc_per_node={args.tp_size}.",
+                    file=sys.stderr,
+                )
+            sys.exit(1)
+
+        model_config = get_model_config(args.model_path, args.tp_size, args.ep_size)
+        results = run_allreduce_tuning(
+            model_config,
+            tp_size=args.tp_size,
+            ep_size=args.ep_size,
+            mode="graph" if args.graph else "eager",
+            output_dir=args.output_dir if rank == 0 else None,
+            verbose=(rank == 0),
+            qr_quants=args.qr_quant,
+            num_iters=args.num_iters,
+            graph_calls=args.graph_calls,
+            sizes=args.sizes,
+            ignore_acr_max_size=args.ignore_acr_max_size,
+            ignore_scr_max_size=args.ignore_scr_max_size,
+            qr_cast_bf16_to_fp16=bool(args.qr_cast_bf16_to_fp16),
+            use_median=args.median,
+            preceding_gemm=args.preceding_gemm,
+        )
+        if rank == 0:
+            print_allreduce_summary(results)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
