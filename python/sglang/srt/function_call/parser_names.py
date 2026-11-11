@@ -38,6 +38,7 @@ TOOL_CALL_PARSER_NAMES = [
     "qwen",
     "qwen25",
     "qwen3_coder",
+    "solar_open2",
     "spark25",
     "step3",
     "step3p5",

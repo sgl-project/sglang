@@ -236,6 +236,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     SEPARATE_RING_INDEX: tl.constexpr = False,
     SPLIT_N_HV_GRID: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
+    BETA_SCALE: tl.constexpr = 1.0,
     MATCH_CUTEDSL_DECODE: tl.constexpr = False,
     ROUND_STATE_TO_BF16: tl.constexpr = False,
 ):
@@ -407,7 +408,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         if MATCH_CUTEDSL_DECODE:
             b_beta = b_b
         else:
-            b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+            b_beta = BETA_SCALE / (1.0 + tl.exp(-b_b))
 
         # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
         # into the per-slot ring for the commit fold to replay. Must sit here --
@@ -619,6 +620,7 @@ def fused_sigmoid_gating_delta_rule_update(
     # decays and updates through FMA, and a BF16 state pool is rounded after
     # every token.
     match_cutedsl_decode: bool = False,
+    beta_scale: float = 1.0,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -790,6 +792,7 @@ def fused_sigmoid_gating_delta_rule_update(
         IS_VARLEN=cu_seqlens is not None,
         IS_KDA=is_kda,
         USE_LOWER_BOUND=lower_bound is not None,
+        BETA_SCALE=beta_scale,
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
