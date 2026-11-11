@@ -8,9 +8,9 @@ rules as the GPU implementation:
 * C128A state follows ``req_pool_idx`` and absolute position.
 
 ``NPUCompressStatePool`` adds the contiguous 3-D view and positive dummy
-location required by the Atlas fused compressor operators. A3 uses explicit
-locations; Ascend 950 uses the same ring storage through its request-bank (cycle) ABI.
-There is no paged state allocator or ``cache_mode=1`` compatibility storage.
+location required by the Atlas fused compressor operators. Every arch uses the
+explicit-location ABI (``cache_mode=2``); there is no paged state allocator or
+``cache_mode=1`` compatibility storage.
 """
 
 from __future__ import annotations
@@ -358,12 +358,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
         config = self.compressed_pool_configs[ratio]
         ring_size = self.get_ring_size(ratio)
-        # Ascend 950 cache_mode=2 addresses one ring bank per request.  The A3
-        # explicit-location path can share the smaller flat pool, but the Ascend 950
-        # cycle ABI needs enough physical banks for every req_pool_idx.
         size = config.state_size
-        if is_npu_arch35():
-            size = max(size, self.num_req_slots * ring_size)
         return NPUCompressStatePool(
             size=size,
             ring_size=ring_size,
@@ -421,11 +416,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """GPU-compatible ``StateType.SWA`` component.
 
-        On pre-Ascend 950 (EXPLICIT cache_mode), SWA KV, C4 attention state and C4
-        indexer state retain separate buffers but share the same SWA page/state
-        index.  On Ascend 950 (CYCLE cache_mode) the compressor addresses the C4 state
-        ring by ``req_pool_idx`` instead of SWA page, so C4 state is excluded
-        here and registered separately via :meth:`get_c4_state_buf_infos`.
+        Earlier architectures bundle SWA KV and C4 state by SWA page. On
+        Ascend 950, register C4 state row by row via
+        :meth:`get_c4_state_buf_infos` to support peers with different ring sizes.
         """
         data_ptrs: List[int] = []
         data_lens: List[int] = []
@@ -455,7 +448,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         """C4 compress state ring (attention + indexer).
 
         Register one physical state row as an item.  PD peers can have
-        different request-local ring sizes (for example prefill without MTP
+        different SWA-page ring sizes (for example prefill without MTP
         and decode with MTP), so payload indices map the same logical token
         positions into each peer's local ring independently.
         """

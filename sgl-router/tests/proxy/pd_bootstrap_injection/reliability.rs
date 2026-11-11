@@ -290,3 +290,30 @@ async fn prefill_sse_error_event_is_a_prefill_failure() {
         assert_eq!(outcomes(&ctx, &prefill.url, "prefill"), ["error"]);
     }
 }
+
+/// An SSE error event with a 4xx code is the engine refusing the request, not a prefill fault.
+#[tokio::test]
+async fn prefill_sse_client_error_passes_through() {
+    const EVENT: &str = "data: {\"error\": {\"object\": \"error\", \"message\": \"Invalid grammar\", \"type\": \"BAD_REQUEST\", \"param\": null, \"code\": 400}}\n\n";
+    let error = EVENT.strip_prefix("data: ").unwrap();
+    for reorg in [false, true] {
+        let prefill = MockWorker::start(vec![EVENT, "data: [DONE]\n\n"]).await;
+        let decode = MockWorker::start_hanging(Duration::from_secs(10)).await;
+        let ctx = pd_ctx(&prefill.url, &decode.url, reorg);
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            build_router(ctx.clone()).oneshot(chat(true)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().get("x-router-error-code").is_none());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            serde_json::from_str::<Value>(error).unwrap(),
+        );
+        assert_eq!(outcomes(&ctx, &prefill.url, "prefill"), ["client_error"]);
+    }
+}

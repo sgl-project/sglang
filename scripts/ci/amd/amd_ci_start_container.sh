@@ -1,5 +1,8 @@
 #!/bin/bash
 set -euo pipefail
+# Container the CI steps run in. Spur jobs that share a node give each job its
+# own; everywhere else it stays ci_sglang.
+CI_CONTAINER_NAME="${CI_CONTAINER_NAME:-ci_sglang}"
 
 # Get version from git tags
 SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
@@ -100,8 +103,15 @@ case "${GPU_ARCH}" in
 esac
 
 
-# Set up DEVICE_FLAG based on Kubernetes pod info
-if [[ -f /etc/podinfo/gha-render-devices ]]; then
+# Set up DEVICE_FLAG based on Kubernetes pod info. AMD_CI_RENDER_DEVICES (space-
+# separated /dev/dri/renderD* paths) does the same for Spur jobs that hold only
+# some of a node's GPUs; unset, nothing changes.
+if [[ -n "${AMD_CI_RENDER_DEVICES:-}" ]]; then
+  DEVICE_FLAG=""
+  for dev in ${AMD_CI_RENDER_DEVICES}; do
+    DEVICE_FLAG+=" --device ${dev}"
+  done
+elif [[ -f /etc/podinfo/gha-render-devices ]]; then
   DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
 else
   DEVICE_FLAG="--device /dev/dri"
@@ -299,7 +309,7 @@ case "${ENABLE_CACHE_HOST,,}" in
     ;;
 esac
 
-echo "Launching container: ci_sglang"
+echo "Launching container: $CI_CONTAINER_NAME"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   --ulimit nofile=65536:65536 \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
@@ -316,10 +326,10 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -e PYTHONPATH="/opt/tilelang:${PYTHONPATH:-}" \
   --security-opt seccomp=unconfined \
   -w /sglang-checkout \
-  --name ci_sglang \
+  --name "$CI_CONTAINER_NAME" \
   "${IMAGE}"
 
-docker exec ci_sglang mkdir -p \
+docker exec "$CI_CONTAINER_NAME" mkdir -p \
   /sgl-data/hf-cache/hub \
   /sgl-data/pip-cache \
   /sgl-data/miopen-cache
@@ -327,4 +337,4 @@ docker exec ci_sglang mkdir -p \
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
 # setuptools-scm / vcs_versioning can resolve the package version.
-docker exec ci_sglang git config --global --add safe.directory /sglang-checkout
+docker exec "$CI_CONTAINER_NAME" git config --global --add safe.directory /sglang-checkout

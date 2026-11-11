@@ -3,12 +3,15 @@
 
 use std::collections::HashMap;
 
-use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter};
+use dynamo_renderer::PromptFormatter;
 use serde_json::{Map, Value, json};
 
 use super::glm53::valid_documents;
-use super::pydantic_dump::{continues_final_message, engine_message, split_continuation};
+use super::pydantic_dump::{
+    continues_final_message, engine_message, parse_tool_arguments, split_continuation,
+};
 use super::qwen38::{prints_unlike_python, template_tools};
+use super::template_context::PreservedRequest;
 use crate::py::{py_truthy, python_float, python_json_compact};
 use crate::render::RenderError;
 use crate::render::reasoning::{requested_effort, requested_thinking};
@@ -38,36 +41,6 @@ const THINKING_TYPES: &[&str] = &["adaptive", "enabled", "disabled"];
 const REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 const MEDIA_PARTS: &[&str] = &["image_url", "input_image", "video_url", "audio_url"];
-
-/// Dynamo's HF formatter rewrites message contents (joining text parts or
-/// wrapping strings in lists). SGLang has already normalized them, so restore
-/// that context immediately before evaluating the template. Generic callers
-/// without this private context keep Dynamo's normal rendering path.
-pub(crate) fn preserve_messages(config: &mut Value) -> String {
-    let source = config["chat_template"].to_string();
-    let mut context = "__sglang_minimax_m3_messages".to_owned();
-    while source.contains(&context) {
-        context.push('_');
-    }
-    let wrap = |template: &mut Value| {
-        if let Some(source) = template.as_str() {
-            *template = format!(
-                "{{% if {context} is defined %}}{{% set messages = {context} %}}{{% endif +%}}{source}"
-            )
-            .into();
-        }
-    };
-    match &mut config["chat_template"] {
-        template @ Value::String(_) => wrap(template),
-        Value::Array(templates) => {
-            for templates in templates.iter_mut().filter_map(Value::as_object_mut) {
-                templates.values_mut().for_each(wrap);
-            }
-        }
-        _ => {}
-    }
-    context
-}
 
 /// `template_detection._is_minimax_m3`: M3's think tags or its tool-call namespace token.
 pub(crate) fn is_minimax_m3(template: &str) -> bool {
@@ -142,11 +115,7 @@ pub(crate) fn render(
     let PromptFormatter::OAI(formatter) = formatter;
     args.insert(message_context.into(), Value::Array(messages));
     let prompt = formatter
-        .render(&TemplateRequest {
-            tools,
-            args,
-            message_context,
-        })
+        .render(&PreservedRequest { tools, args })
         .map_err(|error| format!("{error:#}"))?;
     Ok((prompt, prefix))
 }
@@ -331,30 +300,6 @@ fn normalize(kwargs: &mut Map<String, Value>, effort: &mut Option<Value>, thinki
     *effort = current.filter(|e| e.as_str().is_some_and(|e| REASONING_EFFORTS.contains(&e)));
 }
 
-/// `normalize_assistant_tool_call_arguments(strict=True)`: string arguments must
-/// parse to a JSON object.
-fn parse_tool_arguments(message: &mut Value) -> Result<(), String> {
-    if message["role"] != "assistant" {
-        return Ok(());
-    }
-    let calls = message.get_mut("tool_calls").and_then(Value::as_array_mut);
-    for arguments in calls
-        .into_iter()
-        .flatten()
-        .filter_map(|call| call.get_mut("function")?.get_mut("arguments"))
-    {
-        if let Some(text) = arguments.as_str() {
-            let parsed = serde_json::from_str::<Value>(text)
-                .map_err(|_| "Assistant tool call function.arguments must be valid JSON.")?;
-            if !parsed.is_object() {
-                return Err("Assistant tool call function.arguments must be a JSON object.".into());
-            }
-            *arguments = parsed;
-        }
-    }
-    Ok(())
-}
-
 /// Each assistant tool call's parsed `function.arguments`.
 fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
     let is_assistant = message["role"] == "assistant";
@@ -436,7 +381,7 @@ fn canonical_tool_order(messages: Vec<Value>) -> Vec<Value> {
 /// `normalize_tool_content` leave it.
 fn template_message(mut message: Value, content_parts: Option<bool>) -> Result<Value, RenderError> {
     if let Some(fields) = message.as_object_mut() {
-        // Only request tools reach the template; Dynamo rejects message-level ones.
+        // M3's templates read only the request's tools.
         fields.remove("tools");
     }
     let Some(parts) = message["content"].as_array() else {
@@ -472,35 +417,6 @@ fn template_message(mut message: Value, content_parts: Option<bool>) -> Result<V
             .collect()
     };
     Ok(message)
-}
-
-/// The template context SGLang builds, as the request Dynamo renders.
-struct TemplateRequest<'a> {
-    tools: Option<Vec<Value>>,
-    args: HashMap<String, Value>,
-    message_context: &'a str,
-}
-
-impl OAIChatLikeRequest for TemplateRequest<'_> {
-    fn model(&self) -> String {
-        String::new()
-    }
-
-    fn messages(&self) -> minijinja::Value {
-        minijinja::Value::from_serialize(&self.args[self.message_context])
-    }
-
-    fn tools(&self) -> Option<minijinja::Value> {
-        self.tools.as_ref().map(minijinja::Value::from_serialize)
-    }
-
-    fn should_add_generation_prompt(&self) -> bool {
-        true
-    }
-
-    fn chat_template_args(&self) -> Option<&HashMap<String, Value>> {
-        Some(&self.args)
-    }
 }
 
 #[cfg(test)]
