@@ -100,6 +100,9 @@ class TestPrefillReservationBudget(CustomTestCase):
         adder._request_slot_reserve_for_req = lambda req, extend_input_len: 0
         adder._state_slot_reserve_for_req = lambda req: 0
         adder._kv_shard_reserve_scratch = lambda **kwargs: True
+        # Cache-admission accounting is unrelated to the budget arithmetic
+        # under test and needs a full tree cache / Req.
+        adder._account_prefill_cache_admission = lambda req, prefix_len: None
         return adder
 
     def schedule_continuation(
@@ -118,6 +121,7 @@ class TestPrefillReservationBudget(CustomTestCase):
             waiting_queue=waiting,
             page_size=adder.page_size,
             policy=policy,
+            prefill_launched_reqs=[],
         )
         with (
             patch.dict(

@@ -32,6 +32,7 @@ def _backend():
     backend.kv_cache_dtype = torch.float16
     backend.kv_cache_dtype_str = "float8_e4m3fn"
     backend.kv_cache_is_mxfp8 = False
+    backend.fa4_casts_fp8_kv = False
     backend.fa_impl_ver = 3
     backend.num_splits = 4
     return backend
@@ -163,6 +164,61 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
         self.assertEqual(q.dtype, torch.float16)
         self.assertEqual(k_descale.shape, (2, 1))
         self.assertEqual(v_descale.shape, (2, 1))
+
+    def test_prepare_paged_mha_query_leaves_q_unquantized_for_fa4_fp8_kv(self):
+        # On SM90 FA4 casts the fp8 cache in-kernel and takes bf16 Q, while FA3
+        # layers of the same model still need Q in the cache dtype.
+        backend = _backend()
+        backend.kv_cache_dtype = torch.float8_e4m3fn
+        backend.fa4_casts_fp8_kv = True
+        scales = dict(k_scale=torch.tensor(2.0), v_scale=torch.tensor(4.0))
+        cases = (
+            (SimpleNamespace(head_dim=512, **scales), 4, True, torch.bfloat16),
+            (SimpleNamespace(head_dim=512, **scales), 4, False, torch.bfloat16),
+            (SimpleNamespace(head_dim=256, **scales), 3, False, torch.float8_e4m3fn),
+        )
+        for layer, ver, is_prefill, q_dtype in cases:
+            q, _, _, k_descale, v_descale = backend.prepare_paged_mha_query(
+                torch.ones(2, 16, dtype=torch.bfloat16),
+                None,
+                None,
+                layer,
+                logical_batch_size=2,
+                kv_head_num=1,
+                is_prefill=is_prefill,
+                ver=ver,
+            )
+            self.assertEqual(q.dtype, q_dtype, (ver, is_prefill))
+            self.assertTrue(torch.equal(k_descale, torch.full((2, 1), 2.0)))
+            self.assertTrue(torch.equal(v_descale, torch.full((2, 1), 4.0)))
+
+    def test_kvcache_descales_follow_each_calls_batch_layout(self):
+        # topk > 1 target verify: the cascade's suffix call runs every draft
+        # token as its own sequence (B=1, 12 draft tokens -> 12 sequences), while
+        # the descales were built for the request batch.
+        backend = _backend()
+        kernel = Mock(return_value="out")
+        backend._fa_kernels = {4: (None, kernel)}
+        k_descale = torch.full((1, 4), 2.0)
+        v_descale = torch.full((1, 4), 4.0)
+        for num_seqs in (1, 12):
+            out = backend.flash_attn_with_kvcache(
+                q="q",
+                cu_seqlens_q=torch.arange(num_seqs + 1, dtype=torch.int32),
+                k_descale=k_descale,
+                v_descale=v_descale,
+                ver=4,
+            )
+            self.assertEqual(out, "out")
+            sent = kernel.call_args.kwargs
+            self.assertTrue(
+                torch.equal(sent["k_descale"], torch.full((num_seqs, 4), 2.0))
+            )
+            self.assertTrue(
+                torch.equal(sent["v_descale"], torch.full((num_seqs, 4), 4.0))
+            )
+        backend.flash_attn_with_kvcache(q="q", cu_seqlens_q=torch.arange(3), ver=4)
+        self.assertNotIn("k_descale", kernel.call_args.kwargs)
 
 
 def _fa3_backend():
