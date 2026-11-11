@@ -1760,14 +1760,17 @@ impl WorkerPoll {
             job.last_error = None;
             return Ok(());
         }
-        let reply = self
-            .client
-            .command(
-                &job.url,
-                &json!({"kind":"query","context":job.context,"message_id":job.message_id}),
-            )
-            .await?;
-        self.update_result(job, reply)?;
+        // A final PREFETCH receipt is immutable; residency is checked separately.
+        if job.action != "sglang.prefetch" || !job.has_final_receipt() {
+            let reply = self
+                .client
+                .command(
+                    &job.url,
+                    &json!({"kind":"query","context":job.context,"message_id":job.message_id}),
+                )
+                .await?;
+            self.update_result(job, reply)?;
+        }
         job.ready_end = 0;
         job.ready_at = None;
         if job.action == "sglang.pin" {

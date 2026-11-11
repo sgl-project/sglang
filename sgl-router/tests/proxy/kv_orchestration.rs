@@ -486,7 +486,11 @@ async fn completed_prefetch_can_be_acknowledged_during_shared_residency_query() 
     );
 
     let delayed = Arc::new(DelayedQuery::default());
-    engine.state.lock().unwrap().delayed_query = Some(delayed.clone());
+    let before = {
+        let mut state = engine.state.lock().unwrap();
+        state.delayed_query = Some(delayed.clone());
+        state.commands.len()
+    };
     let observation = query(&router, "live", "prepare");
     tokio::pin!(observation);
     tokio::select! {
@@ -509,6 +513,12 @@ async fn completed_prefetch_can_be_acknowledged_during_shared_residency_query() 
         observation.await["operations"][0]["ready_scope"]["end_token"],
         4
     );
+    let state = engine.state.lock().unwrap();
+    let commands = &state.commands[before..];
+    assert!(commands
+        .iter()
+        .any(|command| command["kind"] == "residency"));
+    assert!(commands.iter().all(|command| command["kind"] != "query"));
 }
 
 #[tokio::test]
@@ -652,9 +662,9 @@ async fn a_tick_during_submission_still_observes_the_worker() {
     let mut commands = state
         .commands
         .iter()
-        .filter(|c| c["kind"] == "submit" || c["kind"] == "query");
+        .filter(|c| c["kind"] == "submit" || c["kind"] == "residency");
     assert_eq!(commands.next().unwrap()["kind"], "submit");
-    assert_eq!(commands.next().unwrap()["kind"], "query");
+    assert_eq!(commands.next().unwrap()["kind"], "residency");
     assert_eq!(commands.next().unwrap()["kind"], "submit");
 }
 
