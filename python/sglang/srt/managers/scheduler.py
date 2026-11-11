@@ -739,14 +739,20 @@ class Scheduler(
         # its ingress transport.
         self.maybe_init_rust_server(port_args)
 
-        # Init prefill-decodedisaggregation
-        self.init_disaggregation()
-
         # Init overlap schedule
         self.init_overlap()
 
         # Init Unlimited-OCR document-window hooks and crop transfer
         self.maybe_init_uocr_runtime()
+
+        self.init_output_streamer()
+
+        self.init_beam_coordinator()
+
+        self.init_request_retirer()
+
+        # Init prefill-decodedisaggregation
+        self.init_disaggregation()
 
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
@@ -786,12 +792,6 @@ class Scheduler(
         self.init_load_inquirer()
 
         self.init_kv_weight_version_tracker()
-
-        self.init_output_streamer()
-
-        self.init_beam_coordinator()
-
-        self.init_request_retirer()
 
         self.init_deferred_responses()
 
@@ -1684,6 +1684,7 @@ class Scheduler(
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
+                request_retirer=self.request_retirer,
                 tree_cache=self.tree_cache,
             )
 
@@ -1695,6 +1696,7 @@ class Scheduler(
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
+                request_retirer=self.request_retirer,
                 transfer_queue=self.disagg_decode_transfer_queue,
                 tree_cache=self.tree_cache,
                 gpu_id=get_device().gpu_id,
@@ -1729,6 +1731,7 @@ class Scheduler(
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
                 scheduler=self,
+                request_retirer=self.request_retirer,
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
             )
@@ -2872,7 +2875,7 @@ class Scheduler(
             server_args=self.server_args,
             is_generation=self.is_generation,
             spec_algorithm=self.spec_algorithm,
-            disaggregation_mode=self.disaggregation_mode,
+            disaggregation_mode=DisaggregationMode(get_disagg().disaggregation_mode),
             skip_tokenizer_init=self.skip_tokenizer_init,
             enable_hicache_storage=lambda: (
                 self.enable_hicache_storage or self.enable_lmcache
@@ -4569,7 +4572,6 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
-            request_retirer=self.request_retirer,
             kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
         )
 
@@ -4652,7 +4654,7 @@ class Scheduler(
 
             if running_batch.batch_is_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
+                    req, self.request_retirer
                 ):
                     break
 

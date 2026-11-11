@@ -628,8 +628,8 @@ class TestDecodeCeiling(CustomTestCase):
         queue.scheduler = SimpleNamespace(
             enable_hisparse=False,
             output_streamer=MagicMock(),
-            request_retirer=MagicMock(),
         )
+        queue.request_retirer = MagicMock()
         return queue
 
     def test_ceiling_prices_the_state_slots_a_request_takes(self):

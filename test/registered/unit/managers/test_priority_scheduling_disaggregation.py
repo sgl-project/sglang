@@ -591,7 +591,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         )
         queue.tree_cache = MagicMock()
 
-        scheduler = MagicMock(request_retirer=leaving_retirer())
+        scheduler = MagicMock()
         scheduler.enable_priority_scheduling = True
         scheduler.schedule_low_priority_values_first = low_priority_values_first
         scheduler.running_batch.reqs = []
@@ -602,6 +602,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         scheduler.last_batch = None
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
+        queue.request_retirer = leaving_retirer()
         return queue
 
     def test_hisparse_prealloc_reserves_scratch_for_pending_transfers(self):

@@ -276,7 +276,6 @@ class SchedulerDllmMixin:
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=get_schedule().prefill_max_requests,
             dllm_config=self.dllm_config,
-            request_retirer=self.request_retirer,
         )
 
     def _process_dllm_batches(
@@ -393,7 +392,7 @@ class SchedulerDllmMixin:
             # Try preemption if batch is full
             if running_batch.batch_is_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
+                    req, self.request_retirer
                 ):
                     break
 

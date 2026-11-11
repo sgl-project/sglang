@@ -182,6 +182,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.mem_cache.kv.storage import KVStorage
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
@@ -481,6 +484,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
+        request_retirer: RequestRetirer,
         transfer_queue: DecodeTransferQueue,
         tree_cache: BasePrefixCache,
         gpu_id: int,
@@ -498,6 +502,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.scheduler = scheduler
+        self.request_retirer = request_retirer
         self.transfer_queue = transfer_queue
         self.tree_cache = tree_cache
         self.host_pool = None
@@ -1124,7 +1129,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # this point carries none of the markers `is_unadmitted_reject` reads,
         # so take the caller's word for it rather than sniffing.
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
-            self.scheduler.request_retirer.retire_unadmitted(req)
+            self.request_retirer.retire_unadmitted(req)
             return
         if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
             req.time_stats.set_retract_time()
@@ -1283,7 +1288,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if message is not None:
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.request_retirer.retire_unadmitted(req)
+            self.request_retirer.retire_unadmitted(req)
             return True
         return False
 
@@ -1298,14 +1303,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _abort_retracted(self, recv_req: AbortReq) -> None:
         # Retracted requests hold a KV backup.
         for req in [r for r in self.retracted_queue if recv_req.matches(r.rid)]:
-            self.scheduler.request_retirer.abort(req)
+            self.request_retirer.abort(req)
 
     def _abort_held(self, recv_req: AbortReq) -> None:
         # Held requests hold no KV.
         for req in [r for r in self.held_rebootstrap_reqs if recv_req.matches(r.rid)]:
-            self.scheduler.request_retirer.abort(
-                req, finished_reason=recv_req.finished_reason
-            )
+            self.request_retirer.abort(req, finished_reason=recv_req.finished_reason)
 
     def request_lists(self) -> Dict[ListKind, ReqList]:
         return {
@@ -2007,7 +2010,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 running_loras.add(decode_req.req.lora_id)
 
         for decode_req in failed_reqs:
-            self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
+            self.request_retirer.release(decode_req.req, checkpoint=False)
 
         move(preallocated_reqs, dst)
         self.note_destinations_queued(len(preallocated_reqs))
@@ -3277,6 +3280,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
+        request_retirer: RequestRetirer,
         tree_cache: BasePrefixCache,
     ):
         self.queue = IndexedReqList(
@@ -3289,6 +3293,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.tp_rank = get_parallel().tp_rank
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
+        self.request_retirer = request_retirer
         self.enable_host_receive = (
             get_disagg().disaggregation_decode_host_receive_threshold < 1
         )
@@ -3720,9 +3725,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         self.scheduler.output_streamer.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
                         )
-                        self.scheduler.request_retirer.release(
-                            decode_req.req, checkpoint=False
-                        )
+                        self.request_retirer.release(decode_req.req, checkpoint=False)
                         decode_req.kv_receiver.clear()
                         decode_req.kv_receiver = None
                         indices_to_remove.add(i)
@@ -3756,9 +3759,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         decode_req.req.return_logprob,
                     )
                     self._clean_hicache_prefetch_resources(decode_req)
-                    self.scheduler.request_retirer.release(
-                        decode_req.req, checkpoint=False
-                    )
+                    self.request_retirer.release(decode_req.req, checkpoint=False)
                     self._record_transfer_failure(
                         decode_req.req.finished_reason.message
                     )
@@ -3791,7 +3792,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 # Unregister first: a chunk scattered for a room still registered
                 # would index the row the release clears, i.e. other requests' KV.
                 self._unregister_staging_room(decode_req.req.bootstrap_room)
-                self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
+                self.request_retirer.release(decode_req.req, checkpoint=False)
                 receiver = decode_req.kv_receiver
                 receiver.clear()
                 decode_req.kv_receiver = None
@@ -3928,7 +3929,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         room = decode_req.req.bootstrap_room
         self._unregister_staging_room(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
-        self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
+        self.request_retirer.release(decode_req.req, checkpoint=False)
         self.metadata_buffers.clear_slot(idx)
         self.req_to_metadata_buffer_idx_allocator.free(idx)
         if not self._is_host_destination(decode_req):
@@ -4008,7 +4009,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._do_release(decode_req, idx)
             except Exception as error:
                 # Isolate a failed release so the rest still run.
-                self.scheduler.request_retirer.abandon(decode_req.req, error)
+                self.request_retirer.abandon(decode_req.req, error)
                 outcome = "error"
             self._observe_deferred_kv_release(
                 duration_seconds=max(0.0, now - start_time),

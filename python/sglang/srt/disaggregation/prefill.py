@@ -116,6 +116,9 @@ from sglang.srt.utils.device import async_d2h
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -279,6 +282,7 @@ class PrefillBootstrapQueue:
         bootstrap_port: int,
         max_total_num_tokens: int,
         scheduler: Scheduler,
+        request_retirer: RequestRetirer,
         scheduler_stage_metrics: SchedulerStageMetricsRecorder,
         transfer_backend: TransferBackend,
     ):
@@ -295,6 +299,7 @@ class PrefillBootstrapQueue:
         self.bootstrap_port = bootstrap_port
         self.queue = IndexedReqList(ListKind.PD_BOOTSTRAP, abort=self._abort)
         self.scheduler = scheduler
+        self.request_retirer = request_retirer
         self.scheduler_stage_metrics = scheduler_stage_metrics
         # Each rank owns a subset of logical KV pages, so capacity widens by N.
         self.max_total_num_tokens = (
@@ -551,7 +556,7 @@ class PrefillBootstrapQueue:
         # for a one-token stub. Bootstrapping it costs a handshake, a metadata
         # buffer and a forward pass before anything unwinds it.
         if is_unadmitted_reject(req):
-            self.scheduler.request_retirer.retire_unadmitted(req)
+            self.request_retirer.retire_unadmitted(req)
             return
         if self._check_if_req_exceed_kv_capacity(req):
             return
@@ -572,7 +577,7 @@ class PrefillBootstrapQueue:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_input_len}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.request_retirer.retire_unadmitted(req)
+            self.request_retirer.retire_unadmitted(req)
             return True
         return False
 
