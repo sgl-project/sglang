@@ -19,6 +19,7 @@ from sglang.srt.function_call.muse_glimmer_format import (
     FUNCTION_CALLS_OPEN,
     INVOKE_CLOSE,
     INVOKE_OPEN,
+    MAX_CHANNEL_MARKER,
     MAX_MARKER,
     MESSAGE,
     RECIPIENT_RE,
@@ -80,6 +81,10 @@ class MuseGlimmerDetector(BaseFormatDetector):
         self._at_stream_start = True
         # Name of the invoke whose arguments are still arriving, if any.
         self._open_invoke: Optional[str] = None
+        # Buffer offsets below which no terminator / invoke close can start, so
+        # each streamed delta only scans the new tail instead of the whole body.
+        self._term_from = 0
+        self._close_from = 0
 
     def has_tool_call(self, text: str) -> bool:
         return has_atem_markers(text)
@@ -121,6 +126,7 @@ class MuseGlimmerDetector(BaseFormatDetector):
             if self._in_body:
                 self._consume_body(
                     self._buffer,
+                    len(self._buffer),
                     registered,
                     calls,
                     normal_parts,
@@ -129,9 +135,24 @@ class MuseGlimmerDetector(BaseFormatDetector):
             else:
                 # Truncated header: no body ever arrived, keep it as text.
                 normal_parts.append(self._buffer)
-            self._buffer = ""
+            self._advance(len(self._buffer))
 
         return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+
+    def _advance(self, n: int) -> None:
+        self._buffer = self._buffer[n:]
+        self._term_from = 0
+        self._close_from = 0
+
+    def _find_terminator(self):
+        end_at, end_len = -1, 0
+        for tok in (EOM, EOT):
+            i = self._buffer.find(tok, self._term_from)
+            if i != -1 and (end_at == -1 or i < end_at):
+                end_at, end_len = i, len(tok)
+        if end_at == -1:
+            self._term_from = max(0, len(self._buffer) - MAX_CHANNEL_MARKER + 1)
+        return end_at, end_len
 
     def _held_back(self, text: str) -> int:
         markers = (MESSAGE, EOM, EOT, START, FUNCTION_CALLS_OPEN, INVOKE_OPEN)
@@ -161,7 +182,7 @@ class MuseGlimmerDetector(BaseFormatDetector):
                         continue
                     if ws:
                         normal_parts.append(self._buffer[:ws])
-                        self._buffer = self._buffer[ws:]
+                        self._advance(ws)
                     if len(head) < len(START):
                         break  # Partial "<|start|>", wait for the rest.
 
@@ -171,39 +192,30 @@ class MuseGlimmerDetector(BaseFormatDetector):
                 header = self._buffer[:idx]
                 m = RECIPIENT_RE.search(header)
                 self._recipient = m.group(1) if m else "user"
-                self._buffer = self._buffer[idx + len(MESSAGE) :]
+                self._advance(idx + len(MESSAGE))
                 self._in_body = True
                 self._at_stream_start = False
                 continue
 
             # Inside a body: find the terminator, if it has arrived.
-            end_at, end_len = -1, 0
-            for tok in (EOM, EOT):
-                i = self._buffer.find(tok)
-                if i != -1 and (end_at == -1 or i < end_at):
-                    end_at, end_len = i, len(tok)
+            end_at, end_len = self._find_terminator()
 
             if end_at == -1:
-                keep = self._held_back(self._buffer)
-                chunk = self._buffer[: len(self._buffer) - keep]
-                if not chunk:
+                limit = len(self._buffer) - self._held_back(self._buffer)
+                if limit <= 0:
                     break
                 consumed = self._consume_body(
-                    chunk, registered, calls, normal_parts, final=False
+                    self._buffer, limit, registered, calls, normal_parts, final=False
                 )
                 if consumed == 0:
                     break
-                self._buffer = self._buffer[consumed:]
+                self._advance(consumed)
                 continue
 
             self._consume_body(
-                self._buffer[:end_at],
-                registered,
-                calls,
-                normal_parts,
-                final=True,
+                self._buffer, end_at, registered, calls, normal_parts, final=True
             )
-            self._buffer = self._buffer[end_at + end_len :]
+            self._advance(end_at + end_len)
             self._in_body = False
             self._recipient = None
             self._open_invoke = None
@@ -212,30 +224,33 @@ class MuseGlimmerDetector(BaseFormatDetector):
 
     def _consume_body(
         self,
-        chunk: str,
+        text: str,
+        end: int,
         registered: Set[str],
         calls: List[ToolCallItem],
         normal_parts: List[str],
         final: bool,
     ) -> int:
         if not _is_tool_channel(self._recipient):
-            normal_parts.append(chunk)
-            return len(chunk)
+            normal_parts.append(text[:end])
+            return end
 
         pos = 0
-        while pos < len(chunk):
+        while pos < end:
             if self._open_invoke is None:
-                m = _INVOKE_OPEN_RE.search(chunk, pos)
+                m = _INVOKE_OPEN_RE.search(text, pos, end)
                 if m is None:
-                    return pos if not final else len(chunk)
+                    return pos if not final else end
                 self._open_invoke = m.group("name")
                 pos = m.end()
                 continue
 
-            close_at = chunk.find(INVOKE_CLOSE, pos)
+            close_at = text.find(INVOKE_CLOSE, max(pos, self._close_from), end)
             if close_at == -1:
-                return pos if not final else len(chunk)
-            body = chunk[pos:close_at]
+                self._close_from = max(pos, end - len(INVOKE_CLOSE) + 1)
+                return pos if not final else end
+            self._close_from = 0
+            body = text[pos:close_at]
             args = {
                 pm.group("key"): _decode_value(pm.group("value"))
                 for pm in _PARAM_RE.finditer(body)
@@ -246,7 +261,7 @@ class MuseGlimmerDetector(BaseFormatDetector):
             self._open_invoke = None
             pos = close_at + len(INVOKE_CLOSE)
 
-        return len(chunk)
+        return end
 
     def supports_structural_tag(self) -> bool:
         return False
