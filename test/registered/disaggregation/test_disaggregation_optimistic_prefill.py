@@ -28,6 +28,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
@@ -484,12 +485,13 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             processed_tokens_counter=0,
             prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
         )
+        move([req], scheduler.prefill_launched_reqs)
         with patch(
             "sglang.srt.disaggregation.prefill.get_disagg",
             return_value=SimpleNamespace(optimistic_prefill_attempts=3),
         ):
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req, scheduler.prefill_launched_reqs
+                scheduler, req
             )
 
         self.assertEqual(tree.total_size(), (self.TRACK_SEQLEN, 1))
@@ -571,6 +573,7 @@ class TestOptimisticPrefillWriteThroughRetryPublish(CustomTestCase):
             processed_tokens_counter=0,
             prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
         )
+        move([req], scheduler.prefill_launched_reqs)
         with (
             patch(
                 "sglang.srt.disaggregation.prefill.get_disagg",
@@ -582,7 +585,7 @@ class TestOptimisticPrefillWriteThroughRetryPublish(CustomTestCase):
             ),
         ):
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req, scheduler.prefill_launched_reqs
+                scheduler, req
             )
 
         # The tree keeps the computed prefix (write-through backs it up on
