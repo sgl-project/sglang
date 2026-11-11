@@ -114,7 +114,16 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             if is_attention_backend_not_set(cfg):
                 overrides["attention_backend"] = "fa3"
             return overrides
-        if cfg.moe_runner_backend == "flashinfer_trtllm_routed":
+        if cfg.moe_runner_backend == "flashinfer_cutile":
+            # cuTile W4A4 experts (SM12x) take locally-indexed standard dispatch;
+            # MegaMoE would route around the runner.
+            if cfg.moe_a2a_backend != "none":
+                raise ValueError(
+                    "M3.1 NVFP4 flashinfer_cutile requires --moe-a2a-backend none"
+                )
+            if cfg.ep_size != 1:
+                raise ValueError("M3.1 NVFP4 flashinfer_cutile requires --ep-size 1")
+        elif cfg.moe_runner_backend == "flashinfer_trtllm_routed":
             if cfg.moe_a2a_backend not in ("none", "megamoe"):
                 raise ValueError(
                     "M3.1 NVFP4 flashinfer_trtllm_routed requires "
