@@ -337,10 +337,6 @@ def gemm_ag_up_fits(num_tokens: int) -> bool:
     return (
         0 < num_tokens <= max_tokens
         and num_tokens * (2 * NORM_DIM // state.world_size) * 2 <= comm.max_push_size
-        # The GEMV producer reads a single phase counter, so its grid is not
-        # bound to the counter array; the consumers stride over the output with
-        # at most one block per counter slot plus the cleanup block.
-        and comm.config.num_push_blocks >= 2
     )
 
 
@@ -410,8 +406,7 @@ def gemm_ag_up_proj(
 
 def moe_front_all_gather_fits(num_tokens: int, n_local: int) -> bool:
     """Whether :func:`moe_front_all_gather` covers a ``[num_tokens, n_local]``
-    fp32 block: it fits a push slot, and the plane has a work block plus the
-    counter-update block."""
+    fp32 block: it fits a push slot."""
     state = _get_state()
     assert state is not None
     comm = state.comm
@@ -419,7 +414,6 @@ def moe_front_all_gather_fits(num_tokens: int, n_local: int) -> bool:
         num_tokens > 0
         and n_local % 4 == 0
         and num_tokens * n_local * 4 <= comm.max_push_size
-        and comm.config.num_push_blocks >= 2
     )
 
 

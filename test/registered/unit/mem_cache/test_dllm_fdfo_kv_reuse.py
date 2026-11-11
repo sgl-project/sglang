@@ -13,6 +13,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
+from sglang.srt.managers.scheduler_components.request_list import move
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -230,22 +231,34 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "full block"):
             alloc_for_extend(batch)
 
-    def test_dllm_abort_removes_waiting_and_staging(self):
+    def test_dllm_abort_removes_waiting(self):
         released = []
         manager = DllmManager(
             SimpleNamespace(max_running_requests=4), abort=released.append
         )
-        staged, waiting, keep = (
-            Mock(rid=rid) for rid in ("abort-staged", "abort-waiting", "keep")
+        first, second, keep = (
+            Mock(rid=rid, owner_list=None) for rid in ("abort-1", "abort-2", "keep")
         )
-        manager.waiting_queue.join([staged, waiting, keep])
-        manager.staging_queue = [staged, keep]
+        move([first, second, keep], manager.waiting_queue)
 
         manager.waiting_queue.abort(AbortReq(rid="abort"))
 
-        self.assertEqual(released, [staged, waiting])
+        self.assertEqual(released, [first, second])
         self.assertEqual(list(manager.waiting_queue), [keep])
-        self.assertEqual(manager.staging_queue, [keep])
+
+    def test_staged_are_the_last_rounds_requests_still_waiting(self):
+        manager = DllmManager(SimpleNamespace(max_running_requests=4), abort=None)
+        first, second, aborted, unrun = (
+            Mock(rid=rid, owner_list=None)
+            for rid in ("first", "second", "aborted", "unrun")
+        )
+        move([first, second, aborted, unrun], manager.waiting_queue)
+        manager.take(lambda req: req is aborted)
+
+        # In the round's order, not the queue's.
+        last_batch = SimpleNamespace(reqs=[aborted, second, first])
+        self.assertEqual(manager.staged_reqs(last_batch), [second, first])
+        self.assertEqual(manager.staged_reqs(None), [])
 
 
 class TestDllmFdfoResolvedBlockKeepsRow(unittest.TestCase):
