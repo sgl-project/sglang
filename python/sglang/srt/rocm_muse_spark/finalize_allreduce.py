@@ -18,6 +18,8 @@ import tempfile
 import torch
 import torch.distributed as dist
 
+from sglang.srt.distributed.device_communicators.cuda_wrapper import find_loaded_library
+
 logger = logging.getLogger(__name__)
 
 _SRC = os.path.join(
@@ -66,7 +68,11 @@ _hip = None
 def _hip_lib():
     global _hip
     if _hip is None:
-        h = ctypes.CDLL("libamdhip64.so")
+        # Bind to the HIP runtime torch already mapped: ROCm 10 ships a second libamdhip64, which an
+        # unversioned CDLL("libamdhip64.so") picks, and every launch on a torch stream then fails with
+        # hipErrorContextIsDestroyed (709).
+        torch.cuda.current_device()
+        h = ctypes.CDLL(find_loaded_library("libamdhip64") or "libamdhip64.so")
         h.hipModuleLoad.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         h.hipModuleGetFunction.argtypes = [
             ctypes.c_void_p,
