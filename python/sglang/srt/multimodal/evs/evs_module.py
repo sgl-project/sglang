@@ -13,6 +13,7 @@
 # ==============================================================================
 
 
+import logging
 import typing
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -20,12 +21,13 @@ from dataclasses import dataclass
 import torch
 from transformers import PretrainedConfig
 
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.utils import logger
 
 from .evs_core import compute_retention_mask, replace_offsets_with_tokens_per_frame
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True)

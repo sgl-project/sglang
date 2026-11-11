@@ -3,8 +3,8 @@
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
 from collections import defaultdict
@@ -13,14 +13,15 @@ from unittest import mock
 import torch
 
 from sglang.srt.mem_cache.unified_cache.cache_action import MambaEvictExcessPathStates
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.mamba import (
     MambaComponent,
 )
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedLRUList,
+    UnifiedTreeCore,
+    UnifiedTreeNode,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -49,6 +50,9 @@ class _FakeTreeCore:
         }
         self.evicted = []
         self.cascaded = []
+        # No joint token/window LRU: this tree keeps no window.
+        self.joint_lru = None
+        self.joint_window_type = None
         # The real eviction helper reports unbacked FULL evictions to the
         # write-through drop counter; this fake never tracks a walk.
         self._is_tracking_unbacked_tokens = False
@@ -61,7 +65,7 @@ class _FakeTreeCore:
         )
 
     def _cascade_evict(
-        self, node, component, tracker, device_frees, host_frees, cache_actions
+        self, node, component, tracker, device_frees, host_frees, cache_actions, target
     ):
         self.cascaded.append(node)
 
@@ -76,6 +80,7 @@ def _build_unified_chain(cap, length=3):
     component = object.__new__(MambaComponent)
     component.cache = cache
     component.tree_core = core
+    component.host_only_checkpoint = False
     component.mamba_max_states_per_path = cap
 
     nodes = []

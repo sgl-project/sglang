@@ -21,16 +21,14 @@ from sglang.multimodal_gen.configs.models.vaes.hunyuanvae import HunyuanVAEConfi
 from sglang.multimodal_gen.configs.models.vaes.kandinsky6_audio import (
     Kandinsky6AudioVAEConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.kandinsky6_sr import (
     _is_kandinsky6_sr,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     qwen_image_postprocess_text,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 
 # checkpoint-trained template: preserve its exact bytes, including misspellings

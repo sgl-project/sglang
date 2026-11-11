@@ -580,14 +580,7 @@ def _read_table(name: str) -> dict | None:
 def _load_plans(architecture: str) -> _PlansFileModel:
     raw = _read_table(f"{architecture}.plans.json")
     if raw is None:
-        logger.warning(
-            "no MoE LoRA plan table for architecture %s; serving the "
-            "conservative default plans",
-            architecture,
-        )
-        raw = _read_table("default.plans.json")
-    if raw is None:
-        raise RuntimeError("MoE LoRA plan tables are missing from the package")
+        raise RuntimeError(f"no MoE LoRA plan table for architecture {architecture}")
     table = _PlansFileModel.model_validate(raw)
     for row in (*table.scenarios, *table.fallback):
         layouts = (row.layout,) if row.layout is not None else ("per_expert", "shared")

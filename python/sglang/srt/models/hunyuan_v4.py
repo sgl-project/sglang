@@ -630,7 +630,7 @@ class HYV4DecoderLayer(nn.Module):
                 alt_stream=alt_stream,
                 reduce_results=False,
             )
-            if hasattr(self.mlp, "shared_experts"):
+            if self.mlp.shared_experts is not None:
                 self.mlp.shared_experts.swiglu_limit = None
         self.hc_attn_layer = HYV4HCLayer(config, f"{prefix}.hc_attn_layer")
         self.hc_mlp_layer = HYV4HCLayer(config, f"{prefix}.hc_mlp_layer")
