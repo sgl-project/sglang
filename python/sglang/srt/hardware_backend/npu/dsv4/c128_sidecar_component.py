@@ -6,6 +6,7 @@ radix tree; partial tail pages remain request-owned.
 
 from __future__ import annotations
 
+import heapq
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -513,6 +514,52 @@ class C128SidecarComponent(TreeComponent):
             return
         for host_value in host_values:
             self._c128_kv_pool_host.free(host_value)
+
+    def drive_host_eviction(
+        self,
+        num_tokens: int,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
+    ) -> None:
+        """Evict host leaves until enough C128 host slots are freed."""
+        if num_tokens <= 0 or self._c128_kv_pool_host is None:
+            return
+        ct = self.component_type
+        tree = self.tree_core
+
+        def priority(node):
+            # Preserve session preference for both the token path and C128.
+            refs = max(
+                self.session_ref(node),
+                node.component_data[BASE_COMPONENT_TYPE].session_ref,
+            )
+            return refs > 0, refs, tree.eviction_strategy.get_priority(node), node.id
+
+        heap = [(priority(node), node) for node in tree.evictable_host_leaves]
+        heapq.heapify(heap)
+        while tracker.get(ct, 0) < num_tokens and heap:
+            _, node = heapq.heappop(heap)
+            if node not in tree.evictable_host_leaves or not tree._is_host_leaf(node):
+                continue
+            first_free = len(host_frees.get(ct, ()))
+            tree._evict_host_leaf(
+                node, tracker, device_frees, host_frees, cache_actions=cache_actions
+            )
+            # evict_component deliberately reports zero C128 token counts.
+            # Include pages freed by tombstone-ancestor cleanup as well.
+            tracker[ct] = tracker.get(ct, 0) + sum(
+                indices.numel() for indices in host_frees.get(ct, ())[first_free:]
+            )
+            # Cleanup may have removed several ancestors before exposing the
+            # next host leaf. A tail with no C128 data may need removal first.
+            parent = node.parent
+            while parent is not None:
+                if parent in tree.evictable_host_leaves:
+                    heapq.heappush(heap, (priority(parent), parent))
+                    break
+                parent = parent.parent
 
     # ---- HiCache Hooks ----
 
