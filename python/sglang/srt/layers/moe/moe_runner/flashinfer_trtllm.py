@@ -1709,6 +1709,15 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             )
             routed_top_k = _routing_top_k(routing)
 
+            # The chunk loop slices scales and routing along dim 0, which is
+            # only correct while both stay row-aligned with the activations.
+            if x_scale is not None:
+                assert x_scale.shape[0] == num_tokens
+            if isinstance(routing, tuple):
+                assert all(item.shape[0] == num_tokens for item in routing)
+            else:
+                assert routing.shape[0] == num_tokens
+
             defer_finalize = _deferred_finalize_enabled.get()
             # Deferred finalize carries a global permutation and remains one-shot.
             launch_tokens = _MXFP4_MOE_MAX_TOKENS_PER_LAUNCH
@@ -1748,6 +1757,9 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                     routed_scaling_factor=None,
                     routing_method_type=RoutingMethodType.TopK.value,
                     activation_type=ActivationType.Situ.value,
+                    # Tuner bucket tracks the actual chunk rows: a short tail
+                    # chunk tunes for its own size instead of the full launch
+                    # limit. enable_pdl is per launch, so it uses the same rows.
                     tune_max_num_tokens=next_power_of_2(end - start),
                     output=symm_output[start:end],
                     do_finalize=not defer_finalize,
