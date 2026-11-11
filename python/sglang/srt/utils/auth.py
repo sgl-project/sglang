@@ -8,7 +8,7 @@ from __future__ import annotations
 import secrets
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 @dataclass(frozen=True)
@@ -59,16 +59,18 @@ def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
     return AuthLevel.NORMAL
 
 
-def app_has_admin_force_endpoints(app: Any) -> bool:
-    """Return True if any route endpoint is marked as ADMIN_FORCE."""
-    routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
-        app, "routes", []
-    )
-    for route in routes:
-        endpoint = getattr(route, "endpoint", None)
-        if getattr(endpoint, "_auth_level", None) == AuthLevel.ADMIN_FORCE:
-            return True
-    return False
+def _build_static_auth_levels(app: Any) -> dict:
+    order = [AuthLevel.NORMAL, AuthLevel.ADMIN_OPTIONAL, AuthLevel.ADMIN_FORCE]
+    levels = {}
+    for route in app.router.routes:
+        path = getattr(route, "path", None)
+        if path is None or getattr(route, "param_convertors", None):
+            continue
+        level = getattr(getattr(route, "endpoint", None), "_auth_level", None)
+        if not isinstance(level, AuthLevel):
+            level = AuthLevel.NORMAL
+        levels[path] = max(levels.get(path, level), level, key=order.index)
+    return levels
 
 
 def decide_request_auth(
@@ -151,63 +153,67 @@ def decide_request_auth(
     return AuthDecision(allowed=True)
 
 
-def add_api_key_middleware(
-    app,
-    *,
-    api_key: Optional[str],
-    admin_api_key: Optional[str],
-):
-    """Add middleware for three endpoint auth levels: normal/admin_optional/admin_force."""
+def add_api_key_middleware(app, *, get_keys: Callable[[], tuple]):
+    """Enforce the endpoint auth levels; `get_keys` returns `(api_key, admin_api_key)` per request."""
     # Import lazily so `decide_request_auth()` can be unit-tested without FastAPI installed.
     from fastapi.responses import ORJSONResponse
-    from starlette.requests import Request
+    from starlette.datastructures import Headers
 
     class _ApiKeyASGIMiddleware:
         """ASGI-native middleware to preserve client disconnect events."""
 
-        def __init__(self, app, *, api_key, admin_api_key, fastapi_app):
+        def __init__(self, app, *, fastapi_app):
             self.app = app
-            self.api_key = api_key
-            self.admin_api_key = admin_api_key
             self.fastapi_app = fastapi_app
+            self.static_levels = None
+
+        def _auth_level(self, scope) -> AuthLevel:
+            if self.static_levels is None:
+                self.static_levels = _build_static_auth_levels(self.fastapi_app)
+            # Under a root path the router strips a prefix first, so only it can resolve the route.
+            level = (
+                None
+                if scope.get("root_path")
+                else self.static_levels.get(scope["path"])
+            )
+            if level is None:
+                level = _get_auth_level_from_app_and_scope(self.fastapi_app, scope)
+            return level
 
         async def __call__(self, scope, receive, send):
-            if scope["type"] != "http":
+            if scope["type"] not in ("http", "websocket"):
                 await self.app(scope, receive, send)
                 return
 
-            request = Request(scope, receive=receive)
-            path = request.url.path
-            authz = request.headers.get("Authorization")
-            level = _get_auth_level_from_app_and_scope(self.fastapi_app, scope)
+            api_key, admin_api_key = get_keys()
             decision = decide_request_auth(
-                method=request.method,
-                path=path,
-                authorization_header=authz,
-                api_key=self.api_key,
-                admin_api_key=self.admin_api_key,
-                auth_level=level,
+                method=scope.get("method", "GET"),
+                path=scope["path"],
+                authorization_header=Headers(scope=scope).get("Authorization"),
+                api_key=api_key,
+                admin_api_key=admin_api_key,
+                auth_level=self._auth_level(scope),
             )
 
-            if not decision.allowed:
-                response = ORJSONResponse(
-                    content={
-                        "error": (
-                            "Unauthorized"
-                            if decision.error_status_code == 401
-                            else "Forbidden"
-                        )
-                    },
-                    status_code=decision.error_status_code,
-                )
-                await response(scope, receive, send)
+            if decision.allowed:
+                await self.app(scope, receive, send)
                 return
 
-            await self.app(scope, receive, send)
+            if scope["type"] == "websocket":
+                # Closing before accept makes the server answer the handshake with 403.
+                await send({"type": "websocket.close", "code": 1008})
+                return
 
-    app.add_middleware(
-        _ApiKeyASGIMiddleware,
-        api_key=api_key,
-        admin_api_key=admin_api_key,
-        fastapi_app=app,
-    )
+            response = ORJSONResponse(
+                content={
+                    "error": (
+                        "Unauthorized"
+                        if decision.error_status_code == 401
+                        else "Forbidden"
+                    )
+                },
+                status_code=decision.error_status_code,
+            )
+            await response(scope, receive, send)
+
+    app.add_middleware(_ApiKeyASGIMiddleware, fastapi_app=app)
