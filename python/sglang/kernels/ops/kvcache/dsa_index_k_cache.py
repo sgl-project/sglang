@@ -31,6 +31,18 @@ s: scale, 1 item per token, fp32
 """
 
 
+def _page_stride(buf: torch.Tensor) -> int:
+    """Bytes between consecutive pages of ``buf`` (num_pages, page_bytes), whose
+    pages may be slices of larger per-page entries."""
+    num_pages, page_bytes = buf.shape
+    assert buf.stride(1) == 1, f"{buf.stride()=}"
+    # A single page has no next page; its row stride is arbitrary.
+    page_stride = buf.stride(0) if num_pages > 1 else page_bytes
+    # The fp32 scales stay 4-byte aligned in every page.
+    assert page_stride >= page_bytes and page_stride % 4 == 0, f"{buf.stride()=}"
+    return page_stride
+
+
 class GetKAndS:
     @classmethod
     def execute(cls, *args, **kwargs):
@@ -141,7 +153,8 @@ def _set_k_and_s_triton(
     page_size: int,
 ):
     """
-    :param buf: (num_pages, page_size 64 * (128B data + 4B scale)), uint8
+    :param buf: (num_pages, page_size 64 * (128B data + 4B scale)), uint8, one row
+        per page; rows may be strided (``buf.stride(0)`` bytes apart)
     :param loc: (num_tokens_to_write,), int, element := the token index to write to
     :param index_k: (num_tokens_to_write, 128 elem), fp8
     :param index_k_scale: (num_tokens_to_write, 1 elem), fp32
@@ -186,7 +199,7 @@ def _set_k_and_s_triton(
         assert index_k.dtype == torch.float8_e4m3fn
     assert index_k_scale.dtype == torch.float32
 
-    assert buf.is_contiguous()
+    buf_page_stride = _page_stride(buf)
     assert loc.is_contiguous()
     assert index_k.is_contiguous()
     assert index_k_scale.is_contiguous()
@@ -205,7 +218,7 @@ def _set_k_and_s_triton(
         index_k_scale,
         index_k.stride(0),
         PAGE_SIZE=page_size,
-        BUF_NUMEL_PER_PAGE=buf_numel_per_page,
+        BUF_PAGE_STRIDE=buf_page_stride,
         NUM_K_ELEMS_PER_TOKEN=index_head_dim,
         S_OFFSET_NBYTES_IN_PAGE=page_size * index_head_dim,
         PRESHUFFLE_TILE=INDEXER_K_CACHE_PRESHUFFLE_TILE if _use_aiter_preshuffle else 0,
@@ -221,7 +234,7 @@ def _set_k_and_s_triton_kernel(
     index_k_scale_ptr,
     index_k_ptr_stride_0,
     PAGE_SIZE: tl.constexpr,
-    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    BUF_PAGE_STRIDE: tl.constexpr,
     NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     PRESHUFFLE_TILE: tl.constexpr,
@@ -247,7 +260,7 @@ def _set_k_and_s_triton_kernel(
         col_tile_id = k_range // tile
         col_in_tile = k_range % tile
         out_k_offsets = (
-            loc_page_index * BUF_NUMEL_PER_PAGE
+            loc_page_index * BUF_PAGE_STRIDE
             + token_tile_id * (tile * NUM_K_ELEMS_PER_TOKEN)
             + col_tile_id * (tile * tile)
             + token_in_tile * tile
@@ -255,14 +268,14 @@ def _set_k_and_s_triton_kernel(
         )
     else:
         out_k_offsets = (
-            loc_page_index * BUF_NUMEL_PER_PAGE
+            loc_page_index * BUF_PAGE_STRIDE
             + loc_token_offset_in_page * NUM_K_ELEMS_PER_TOKEN
             + k_range
         )
 
     # "//4" b/c it is fp32 instead of uint8
     out_s_offset = (
-        loc_page_index * BUF_NUMEL_PER_PAGE // 4
+        loc_page_index * (BUF_PAGE_STRIDE // 4)
         + S_OFFSET_NBYTES_IN_PAGE // 4
         + loc_token_offset_in_page
     )
@@ -283,7 +296,8 @@ def _get_k_and_s_triton(
     """
     Fused gather of both K (key) and S (scale) data from paged buffer using Triton.
 
-    :param buf: (num_pages, page_size * 128 + page_size * 4), uint8
+    :param buf: (num_pages, page_size * 128 + page_size * 4), uint8, one row per
+        page; rows may be strided (``buf.stride(0)`` bytes apart)
     :param page_indices: (num_pages,), int32/int64
     :param seq_lens: tensor of sequence lens, int64
     :param seq_len_sum: sum of all sequence len, int32
@@ -300,7 +314,7 @@ def _get_k_and_s_triton(
     )
     s_out = torch.empty((seq_len_sum, 4), dtype=torch.uint8, device=buf.device)
 
-    _, buf_numel_per_page = buf.shape
+    buf_page_stride = _page_stride(buf)
     _, page_indice_batch_offset = page_indices.shape
     s_offset_in_page = page_size * index_head_dim
 
@@ -325,7 +339,7 @@ def _get_k_and_s_triton(
         seq_len_ptr=seq_lens,
         seq_len_num_pow=seq_num_pow2,
         page_size=page_size,
-        buf_numel_per_page=buf_numel_per_page,
+        buf_page_stride=buf_page_stride,
         index_head_dim=index_head_dim,
         s_offset_in_page=s_offset_in_page,
         page_indice_batch_offset=page_indice_batch_offset,
@@ -345,7 +359,7 @@ def _get_k_and_s_triton_kernel(
     seq_len_ptr,
     seq_len_num_pow: tl.constexpr,
     page_size: tl.constexpr,
-    buf_numel_per_page: tl.constexpr,
+    buf_page_stride: tl.constexpr,
     index_head_dim: tl.constexpr,
     s_offset_in_page: tl.constexpr,
     page_indice_batch_offset,
@@ -382,15 +396,16 @@ def _get_k_and_s_triton_kernel(
     token_offset_in_page = token_ids % page_size
     page_indices_base = batch_id * page_indice_batch_offset
     page_idx_valid_mask = page_idx < page_indice_batch_offset
+    # int64: a strided page offset can exceed int32 range.
     page_index = tl.load(
         page_indices_ptr + page_idx + page_indices_base,
         mask=token_valid_mask & page_idx_valid_mask,
-    )
+    ).to(tl.int64)
 
     # ===== Load K data =====
-    # The address calculation logic for K: page_index * total number of elements in a single page + K offset of the token within the page.
+    # The address calculation logic for K: page_index * page stride + K offset of the token within the page.
     k_src_token_offset = token_offset_in_page * index_head_dim
-    k_src_base_offset = page_index * buf_numel_per_page + k_src_token_offset
+    k_src_base_offset = page_index * buf_page_stride + k_src_token_offset
 
     k_load_addr = buf_ptr + k_src_base_offset[:, None] + k_offsets[None, :]
     k_dim_mask = k_offsets[None, :] < index_head_dim
@@ -405,9 +420,9 @@ def _get_k_and_s_triton_kernel(
     tl.store(k_store_addr, k_data, mask=k_mask)
 
     # ===== Load S data =====
-    # The address calculation logic for S: page_index * total number of elements in a single page + starting offset of S within the page + offset of token within S in the page
+    # The address calculation logic for S: page_index * page stride + starting offset of S within the page + offset of token within S in the page
     s_src_token_offset = s_offset_in_page + token_offset_in_page * 4
-    s_src_base_offset = page_index * buf_numel_per_page + s_src_token_offset
+    s_src_base_offset = page_index * buf_page_stride + s_src_token_offset
 
     s_offsets = tl.arange(0, 4)
     s_load_addr = buf_ptr + s_src_base_offset[:, None] + s_offsets[None, :]

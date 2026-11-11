@@ -20,6 +20,9 @@ struct FusedStoreCacheParam {
   const void* __restrict__ input;
   void* __restrict__ cache;
   const void* __restrict__ indices;
+  // bytes between consecutive pages of `cache` (>= the page blob, e.g. when
+  // pages are slices of larger per-page entries)
+  int64_t page_stride;
   uint32_t num_tokens;
   // DCP: indices are widened slots; this rank stores slot / dcp_size of the
   // slots it owns (slot % dcp_size == dcp_rank) and skips the others
@@ -42,11 +45,8 @@ template <typename KeyT, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
 __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCacheParam param) {
   using namespace device;
 
-  /// NOTE: 132 = 128 + 4
-  constexpr int64_t kPageBytes = 132 << kPageBits;
-
   // each warp handles 128 elements, each block handles multiple rows
-  const auto& [input, cache, indices, num_tokens, dcp_size, dcp_rank] = param;
+  const auto& [input, cache, indices, page_stride, num_tokens, dcp_size, dcp_rank] = param;
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   const auto global_wid = global_tid / 32;
   const auto lane_id = threadIdx.x % 32;
@@ -76,7 +76,7 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   if (index >= 0) {
     const int32_t page = index >> kPageBits;
     const int32_t offset = index & ((1 << kPageBits) - 1);
-    const auto page_ptr = pointer::offset(cache, page * kPageBytes);
+    const auto page_ptr = pointer::offset(cache, page * page_stride);
     const auto value_ptr = pointer::offset(page_ptr, offset * 128);
     const auto scale_ptr = pointer::offset(page_ptr, 128 << kPageBits, offset * 4);
     OutStorage result;
@@ -108,14 +108,16 @@ struct FusedStoreCacheIndexerKernel {
     using namespace host;
 
     auto N = SymbolicSize{"num_tokens"};
+    auto page_stride = SymbolicSize{"page_stride"};
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLGPU>();
     TensorMatcher({N, 128})  // input
         .with_dtype<KeyT>()
         .with_device(device_)
         .verify(input);
-    TensorMatcher({-1, -1})  // cache
-        .with_strides({kPageBytes, 1})
+    auto num_pages = SymbolicSize{"num_pages"};
+    TensorMatcher({num_pages, kPageBytes})  // cache: one row per page, rows may be strided
+        .with_strides({page_stride, 1})
         .with_dtype<uint8_t>()
         .with_device(device_)
         .verify(cache);
@@ -125,11 +127,19 @@ struct FusedStoreCacheIndexerKernel {
         .verify(indices);
     RuntimeCheck(
         dcp_size >= 1 && dcp_rank >= 0 && dcp_rank < dcp_size, "invalid dcp_size/dcp_rank: ", dcp_size, ", ", dcp_rank);
+    // A single-page view may report any row stride (DLPack normalizes it).
+    const int64_t cache_page_stride = num_pages.unwrap() > 1 ? page_stride.unwrap() : kPageBytes;
+    // the fp32 scales need 4-byte alignment in every page
+    RuntimeCheck(
+        cache_page_stride >= kPageBytes && cache_page_stride % 4 == 0,
+        "invalid index-K page stride: ",
+        cache_page_stride);
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     const auto params = FusedStoreCacheParam{
         .input = input.data_ptr(),
         .cache = cache.data_ptr(),
         .indices = indices.data_ptr(),
+        .page_stride = cache_page_stride,
         .num_tokens = num_tokens,
         .dcp_size = dcp_size,
         .dcp_rank = dcp_rank,

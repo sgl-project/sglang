@@ -223,10 +223,11 @@ class CuteDSLPagedMQALogitsRunner:
         max_blocks_per_seq = cute.sym_int()
         num_ctas = cute.sym_int()
 
-        kv_fake = cute.runtime.make_fake_compact_tensor(
+        # Rows (physical blocks) may be strided; TMA needs 16-byte strides.
+        kv_fake = cute.runtime.make_fake_tensor(
             cutlass.Uint8,
             (sym_num_phys_blocks, block_bytes),
-            stride_order=(1, 0),
+            stride=(cute.sym_int64(divisibility=16), 1),
         )
 
         q_fake = cute.runtime.make_fake_compact_tensor(
@@ -355,8 +356,9 @@ class CuteDSLPagedMQALogitsRunner:
         else:
             w_2d = weights.reshape(B, N).t()
 
-        # Flatten fused KV to [num_phys_blocks, block_bytes]
-        kv_flat = kv_fused.reshape(num_phys_blocks, -1)
+        # Flatten fused KV to [num_phys_blocks, block_bytes]; a view, so strided
+        # blocks are read in place.
+        kv_flat = kv_fused.view(num_phys_blocks, -1)
 
         # Allocate output with alignment padding
         SPLIT_KV = compute_block_kv * 2  # NUM_MATH_WG = 2

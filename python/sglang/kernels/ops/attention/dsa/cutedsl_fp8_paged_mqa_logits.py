@@ -386,8 +386,10 @@ class FP8MQALogitsKernel:
     ):
         # Derive KV and Scale views from fused buffer using CuTE ops.
         # Fused layout per physical block: [KV data (phys_block_kv*head_dim)] [Scales (phys_block_kv*4)]
+        # Blocks are kv_fused.stride[0] bytes apart, which may exceed the block
+        # (blocks that are slices of larger per-page entries).
         phys_block_kv = self.phys_block_kv
-        phys_block_bytes = phys_block_kv * (self.head_dim + 4)
+        phys_block_bytes = kv_fused.layout.stride[0]
         scale_offset_elems = phys_block_kv * self.head_dim  # in FP8 elements
 
         # Recast fused buffer to FP8 (same 1-byte elements, needed for MMA type inference)
