@@ -1122,6 +1122,12 @@ class Envs:
     SGLANG_OPT_LAGUNA_ROUTER_BF16X3 = EnvBool(False)
     # Laguna decode: one Triton kernel for q/k RMSNorm + RoPE + fp8 KV store (triton backend, MHA pools).
     SGLANG_OPT_LAGUNA_FUSED_QK_NORM_ROPE_KV = EnvBool(False)
+    # Laguna prefill sequence parallel (TP, any EP): for plain EXTEND batches of at least
+    # SGLANG_OPT_LAGUNA_PREFILL_SP_MIN_TOKENS tokens (multiple of tp), the attention all-reduce becomes a
+    # reduce-scatter, the post-attention add+norm, router and topk run on 1/tp of the tokens, the normed bf16
+    # shard and the topk results are all-gathered for the MoE, and one all-reduce per layer sums attn + ffn.
+    SGLANG_OPT_LAGUNA_PREFILL_SP = EnvBool(False)
+    SGLANG_OPT_LAGUNA_PREFILL_SP_MIN_TOKENS = EnvInt(4096)
     # Send Qwen3.8's 512-expert softmax router back to aiter `fused_topk`
     # instead of `topk_gating`.
     SGLANG_ROCM_DISABLE_AITER_TOPK_GATING = EnvBool(False)
