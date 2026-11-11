@@ -119,7 +119,6 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
-from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -652,6 +651,27 @@ def _scale_routed_and_add_shared(
     if not fused_in_topk:
         routed *= routed_scaling_factor
     return routed
+
+
+def _post_moe_needs_routed_scaling(quant_method, fused_in_topk: bool) -> bool:
+    """Whether the routed MoE output still needs the routed scale applied.
+
+    On CPU the epilogue owns the scale unless the top-k already folded it into
+    the routing weights. On CUDA the runner applies it after the GEMM, so the
+    epilogue leaves the output alone. A method that applies the routing weights
+    as given (KT, via `applies_routing_weights_as_given`) is scaled exactly
+    once by this epilogue on every device, so for it the same flag decides:
+    scaling it unconditionally counts the factor twice when the quant method
+    reports `fuse_routed_scaling_factor_in_topk`.
+    """
+    if getattr(quant_method, "applies_routing_weights_as_given", False):
+        return not fused_in_topk
+    return (
+        not _is_cuda
+        and not _is_musa
+        and not _is_xpu
+        and not (_use_aiter and fused_in_topk)
+    )
 
 
 class DeepseekV2MoE(nn.Module):
@@ -1278,11 +1298,8 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)
-        if (
-            not _is_cuda
-            and not _is_musa
-            and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+        if _post_moe_needs_routed_scaling(
+            self.experts.quant_method, self.routed_scaling_factor_fused_in_topk
         ):
             final_hidden_states *= self.routed_scaling_factor
 
@@ -1475,12 +1492,8 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 topk_output,
             )
-        if (
-            not _is_cuda
-            and not _is_musa
-            and not _is_xpu
-            and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+        if _post_moe_needs_routed_scaling(
+            self.experts.quant_method, self.routed_scaling_factor_fused_in_topk
         ):
             final_hidden_states *= self.routed_scaling_factor
 
