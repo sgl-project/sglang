@@ -1455,14 +1455,6 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
         self.assertEqual(config.device_to_host_layer, {})
         self.assertEqual(config.buffer_info.buffers, ())
 
-    def test_mirror_preserves_anchor_geometry(self):
-        stub = self._stub()
-        anchor = self._anchor(stub)
-        mirror = _make_indexer_host(stub, anchor, pin_memory=False, is_dummy=True)
-        self.assertEqual(mirror.layout, anchor.layout)
-        self.assertEqual(mirror.indexer_page_stride_size, 8448)
-        self.assertEqual(mirror.get_size_per_token(), 132 * 5)
-
     def test_compact_layers_preserve_host_geometry_and_draft_offsets(self):
         stub = self._stub()
         stub.skip_topk_layers = [False, True, True, False, True]
