@@ -18,7 +18,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.io_struct import AbortReq, FinishReasonDict
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.managers.scheduler_components.request_list import ReqList
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
         UocrSchedulerRuntime,
@@ -30,8 +29,8 @@ class RequestRetirer:
     step reports (sends the abort output), `retire_unadmitted` for one rejected
     before it was queued (streams its output), `release` for one its caller
     ended and sends. `abort`, `retire_unadmitted` and `abort_retracted` take
-    `src`, the list the request is still in, and take it out: a request ended
-    on its way between lists leaves for none."""
+    the request out of the list it is still in: a request ended on its way
+    between lists leaves for none."""
 
     def __init__(
         self,
@@ -57,13 +56,12 @@ class RequestRetirer:
         reason: Optional[FINISH_ABORT] = None,
         finished_reason: Optional[FinishReasonDict] = None,
         checkpoint: bool = False,
-        src: Optional[ReqList] = None,
     ) -> None:
         """Abort a request no launched step reports: one aborted in a queue or
         the chunked slot, or refused at the waiting-queue door. ``reason`` is the
         request's own finish reason and ``finished_reason`` what the tokenizer
         receives."""
-        _leave(src, req)
+        _leave_owner_list(req)
         # Finished in place, so a later abort in the same intake skips it.
         if req.finished_reason is None:
             req.finish_outside_step(reason or FINISH_ABORT())
@@ -72,11 +70,11 @@ class RequestRetirer:
         )
         self.release(req, checkpoint=checkpoint)
 
-    def retire_unadmitted(self, req: Req, *, src: Optional[ReqList] = None) -> None:
+    def retire_unadmitted(self, req: Req) -> None:
         """Finish a request rejected before it was queued. It holds no device KV,
         but the release still frees its streaming session, its cache prefetch
         retry and a retracted request's host KV backup."""
-        _leave(src, req)
+        _leave_owner_list(req)
         # An already set `finished_reason` is what the client receives.
         reason = req.finished_reason or req.to_finish
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
@@ -130,12 +128,10 @@ class RequestRetirer:
             release_kv_cache(req, self.tree_cache, checkpoint=False)
         return resumable
 
-    def abort_retracted(
-        self, req: Req, *, reason: FINISH_ABORT, src: Optional[ReqList] = None
-    ) -> None:
+    def abort_retracted(self, req: Req, *, reason: FINISH_ABORT) -> None:
         """Abort a retracted request that will not be requeued. Not finished in place:
         a step launched before the retraction may still carry it and report it again."""
-        _leave(src, req)
+        _leave_owner_list(req)
         record_exit(req, "abort_retracted")
         self._detach(req)
         # retract released the KV without a checkpoint.
@@ -158,6 +154,6 @@ class RequestRetirer:
             self.uocr_runtime.on_req_dropped(req)
 
 
-def _leave(src: Optional[ReqList], req: Req) -> None:
-    if src is not None:
-        src.leave([req])
+def _leave_owner_list(req: Req) -> None:
+    if req.owner_list is not None:
+        req.owner_list.leave([req])

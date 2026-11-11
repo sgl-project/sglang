@@ -36,6 +36,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -46,6 +47,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
@@ -325,8 +327,11 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         if batch is not None:
             self.actions.append((self.iteration, "prepare_batch", batch.forward_iter))
             self.waiting_queue.leave(batch.reqs)
+            # The request between two chunks stays in chunked_reqs.
             self.prefill_launched_reqs.join(
-                req for req in batch.reqs if req is not batch.chunked_req
+                req
+                for req in batch.reqs
+                if req is not batch.chunked_req and req is not self.chunked_req
             )
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
@@ -377,9 +382,11 @@ def _run_loop(scheduler, enabled=True, **topology):
     ):
         scheduler.tp_size = get_parallel().tp_size
         scheduler.dp_tp_group = SimpleNamespace(
-            world_size=get_parallel().attn_tp_size
-            if get_parallel().attn_dp_enabled
-            else get_parallel().tp_size
+            world_size=(
+                get_parallel().attn_tp_size
+                if get_parallel().attn_dp_enabled
+                else get_parallel().tp_size
+            )
         )
         if not get_parallel().attn_dp_enabled:
             scheduler.dp_tp_cpu_group = scheduler.tp_cpu_group
@@ -493,7 +500,9 @@ def _rank_consensus_worker(rank, rendezvous):
             )
             scheduler.polls = 0
             scheduler.tp_cpu_group = dist.group.WORLD
-            scheduler.disagg_prefill_transfer_queue = _sending(["transferring"])
+            scheduler.disagg_prefill_transfer_queue = _sending(
+                [FakeReq(rid="transferring")]
+            )
             with envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.override(True):
                 _run_loop(
                     scheduler,
@@ -578,7 +587,9 @@ def _attention_dp_worker(rank, rendezvous, attn_tp_size):
             scheduler.dp_tp_cpu_group = shard_groups[shard]
             _hicache_scheduler(scheduler, storage=hicache)
             if not hicache and shard == 0:
-                scheduler.disagg_prefill_transfer_queue = _sending(["transferring"])
+                scheduler.disagg_prefill_transfer_queue = _sending(
+                    [FakeReq(rid="transferring")]
+                )
             flag = (
                 envs.SGLANG_DISAGG_PREFILL_POLL_HICACHE_WHILE_WAITING
                 if hicache
@@ -783,9 +794,9 @@ class TestPrefillResultPolling(CustomTestCase):
                     self.copy_events[1].ready = True
 
         cases = (
-            (False, ["transferring"], 1, 0),
+            (False, [FakeReq(rid="transferring")], 1, 0),
             (True, [], 1, 0),
-            (True, ["transferring"], 0, 3),
+            (True, [FakeReq(rid="transferring")], 0, 3),
         )
         for poll_transfers, inflight, blocking_syncs, wait_polls in cases:
             with self.subTest(poll_transfers=poll_transfers, inflight=inflight):
@@ -842,7 +853,9 @@ class TestPrefillResultPolling(CustomTestCase):
                     pause_mode=event if pause else "in_place",
                 )
                 scheduler.shutdown_at = None if pause else 2
-                scheduler.disagg_prefill_transfer_queue = _sending(["transferring"])
+                scheduler.disagg_prefill_transfer_queue = _sending(
+                    [FakeReq(rid="transferring")]
+                )
                 with envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.override(
                     True
                 ):
@@ -908,7 +921,9 @@ class TestPrefillResultPolling(CustomTestCase):
                     {1: _result(_Event(ready_after_queries=3))},
                     {1: 4},
                 )
-                scheduler.disagg_prefill_transfer_queue = _sending(["transferring"])
+                scheduler.disagg_prefill_transfer_queue = _sending(
+                    [FakeReq(rid="transferring")]
+                )
                 topology = {}
                 if mode == "independent_dp":
                     topology = {"dp_size": 2}
@@ -1140,7 +1155,9 @@ class TestPrefillResultPolling(CustomTestCase):
                     {1: ready_at, 2: ready_at + 1},
                 )
                 scheduler.war_barrier_is_coarse = coarse
-                scheduler.disagg_prefill_transfer_queue = _sending(["transferring"])
+                scheduler.disagg_prefill_transfer_queue = _sending(
+                    [FakeReq(rid="transferring")]
+                )
                 with envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.override(
                     polling == "transfers"
                 ):
@@ -1176,7 +1193,13 @@ class TestPrefillResultPolling(CustomTestCase):
                     def run_batch(self, batch):
                         end = int(batch.forward_iter)
                         req.extend_end = end
-                        self.chunked_reqs.replace([req] if end < 12 else [])
+                        dst = (
+                            self.chunked_reqs
+                            if end < 12
+                            else self.prefill_launched_reqs
+                        )
+                        if req.owner_list is not dst:
+                            move([req], dst)
                         batch.chunked_req = self.chunked_req
                         batch.chunked_req = req if end < 12 else None
                         return super().run_batch(batch)
@@ -1252,7 +1275,8 @@ class TestPrefillResultPolling(CustomTestCase):
                     def run_batch(self, batch):
                         if req in batch.reqs:
                             req.extend_end = batch.forward_iter
-                            self.chunked_reqs.replace([req])
+                            if req.owner_list is not self.chunked_reqs:
+                                move([req], self.chunked_reqs)
                             batch.chunked_req = req
                         return super().run_batch(batch)
 
