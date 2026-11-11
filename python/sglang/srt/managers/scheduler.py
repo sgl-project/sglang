@@ -401,7 +401,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_sampling_mask import (
     validate_spec_sampling_mask_request,
 )
-from sglang.srt.speculative.ubtree_components.validation import validate_ubtree_request
 from sglang.srt.speculative.uno_validation import validate_uno_request
 from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
@@ -3432,6 +3431,10 @@ class Scheduler(
 
         if self.spec_algorithm.is_dflash_family():
             if self.spec_algorithm.is_ubtree():
+                from sglang.srt.speculative.ubtree_components.validation import (
+                    validate_ubtree_request,
+                )
+
                 error_msg = validate_ubtree_request(req)
                 if error_msg is not None:
                     finished_reason = {

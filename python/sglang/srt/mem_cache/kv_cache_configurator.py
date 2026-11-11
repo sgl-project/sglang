@@ -99,10 +99,6 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveMLATokenToKVPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.ubtree_state import (
-    ubtree_spec_state_bytes_per_req,
-    use_ubtree_factorized_kda,
-)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
 from sglang.srt.platforms.interface import KVPoolKind, reject_out_of_tree_path
@@ -3436,17 +3432,25 @@ class KVCacheConfigurator:
         stage_per_req = int(per_req * pp_layer_scale)
 
         has_spec_dec = not self.spec_algorithm.is_none()
-        ubtree_factorized = has_spec_dec and use_ubtree_factorized_kda(
-            enabled=(
-                get_spec().speculative_algorithm == "UBTREE"
-                and not self.is_draft_worker
-            ),
-            cache_params=config.mamba2_cache_params,
-            spec_state_size=(get_schedule().max_running_requests or 0)
-            // self.attn_dp_size,
-            speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
-            speculative_eagle_topk=get_spec().speculative_eagle_topk,
-        )
+        ubtree_factorized = False
+        if (
+            has_spec_dec
+            and get_spec().speculative_algorithm == "UBTREE"
+            and not self.is_draft_worker
+        ):
+            from sglang.srt.mem_cache.ubtree_state import (
+                ubtree_spec_state_bytes_per_req,
+                use_ubtree_factorized_kda,
+            )
+
+            ubtree_factorized = use_ubtree_factorized_kda(
+                enabled=True,
+                cache_params=config.mamba2_cache_params,
+                spec_state_size=(get_schedule().max_running_requests or 0)
+                // self.attn_dp_size,
+                speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
+                speculative_eagle_topk=get_spec().speculative_eagle_topk,
+            )
         if ubtree_factorized:
             # Fixed request scratch, not one full SSM snapshot per tree node.
             # Charge it before the capacity solve, including the padding row.

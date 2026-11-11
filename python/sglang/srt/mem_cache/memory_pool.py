@@ -83,7 +83,6 @@ from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
     mamba_entry_bytes,
 )
-from sglang.srt.mem_cache.ubtree_state import use_ubtree_factorized_kda
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags, get_parallel, get_platform
@@ -702,13 +701,17 @@ class MambaPool:
         self.replayssm_spec_fold = bool(
             enable_linear_replayssm_spec and cache_params.is_kda
         )
-        self.factorized_kda_tree = use_ubtree_factorized_kda(
-            enabled=enable_ubtree_factorized_kda,
-            cache_params=cache_params,
-            spec_state_size=spec_state_size,
-            speculative_num_draft_tokens=speculative_num_draft_tokens,
-            speculative_eagle_topk=speculative_eagle_topk,
-        )
+        self.factorized_kda_tree = False
+        if enable_ubtree_factorized_kda:
+            from sglang.srt.mem_cache.ubtree_state import use_ubtree_factorized_kda
+
+            self.factorized_kda_tree = use_ubtree_factorized_kda(
+                enabled=True,
+                cache_params=cache_params,
+                spec_state_size=spec_state_size,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                speculative_eagle_topk=speculative_eagle_topk,
+            )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
         self.replayssm_request_ring = False
 
