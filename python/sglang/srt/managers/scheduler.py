@@ -4729,8 +4729,12 @@ class Scheduler(
                 and self.enable_priority_preemption
                 and adder.preempt_to_schedule(req)
             ):
-                # Preemption can evict tree nodes: match the prefix again.
-                req.init_next_round_input(self.tree_cache)
+                # Preemption can evict tree nodes: drop what the first match
+                # staged and match the prefix again.
+                self._drop_unadmitted_match(req)
+                req.init_next_round_input(
+                    self.tree_cache, defer_cow_slot=defer_cow_slot
+                )
                 res = adder.add_one_req(
                     req,
                     has_chunked_req=(self.chunked_req is not None),
