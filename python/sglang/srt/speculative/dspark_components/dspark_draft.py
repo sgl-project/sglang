@@ -346,7 +346,7 @@ class DraftBlockProposer:
     _staged_params_key = None
     num_staged_params_skips = 0
     num_staged_params_calls = 0
-    deferred_commit = None
+    deferred_draft_kv = None
 
     def __init__(
         self,
@@ -390,8 +390,8 @@ class DraftBlockProposer:
                 )
             )
         )
-        # SGLANG_DSPARK_DEFER_CONTEXT_KV's staged commit, set by the worker.
-        self.deferred_commit = None
+        # SGLANG_DSPARK_DEFER_CONTEXT_KV's draft KV store, set by its attach_draft.
+        self.deferred_draft_kv = None
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
@@ -656,22 +656,22 @@ class DraftBlockProposer:
             self._stage_sampling_params(
                 draft_sampler, bs=bs, sampling_info=sampling_info
             )
-        commit = self.deferred_commit
-        if commit is not None:
-            commit.before_draft_forward(
+        deferred_draft_kv = self.deferred_draft_kv
+        if deferred_draft_kv is not None:
+            deferred_draft_kv.before_draft_forward(
                 graph_bs=(
                     graph_runner.capture_bs[
                         bisect.bisect_left(graph_runner.capture_bs, bs)
                     ]
                     if runs_graph
                     else None
-                )
+                ),
+                reqs=batch.reqs,
             )
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
-        if commit is not None:
-            assert draft_out.can_run_graph == runs_graph
-            commit.after_draft_forward(graph_ran=draft_out.can_run_graph)
+        # before_draft_forward took runs_graph as whether the graph writes the staging.
+        assert deferred_draft_kv is None or draft_out.can_run_graph == runs_graph
         logits_output = draft_out.logits_output
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:
