@@ -12,13 +12,14 @@ from unittest.mock import Mock
 import torch
 
 from sglang.srt.managers import mm_schedule
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_precompile_model_kernels_after_loading,
 )
 from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.multimodal.mm_utils import hip_dp_encoder_batches_vit
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_context,
     get_parallel,
