@@ -118,6 +118,7 @@ from sglang.kernels.ops.attention.gqa_verify_splitkv_2kv import (
     pick_splits_v2,
 )
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
+from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_mha_k_triton
 from sglang.kernels.ops.attention.swa_verify_splitkv import swa_verify_splitkv
 from sglang.kernels.ops.attention.verify_reduce_norm_gate import (
     DEFERRAL as _VERIFY_REDUCE_DEFERRAL,
@@ -162,6 +163,17 @@ _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 # Use fp8 prefill only on gfx95
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
+)
+
+# MHA prefill over a cached prefix: gather the latent straight into the compute
+# dtype and build K with one Triton kernel instead of cast + contiguous + torch.cat.
+_use_mla_prefix_fused_k = get_bool_env_var("SGLANG_AITER_MLA_PREFIX_FUSED_K", "False")
+
+# On top of the fused prefix K path: FP8 q/k/v into the gfx1250 ASM FP8 varlen
+# FMHA (hd192x128).
+_use_gfx1250_fp8_prefill_attn = (
+    get_bool_env_var("SGLANG_AITER_GFX1250_FP8_PREFILL_ATTN", "False")
+    and is_gfx1250_supported()
 )
 
 # Max qlen limitation of the asm ps kernels to handle q with bf16 dtype
@@ -2490,6 +2502,65 @@ class AiterAttnBackend(AttentionBackend):
         )
         return merge_state_triton(out_a, lse_a, out_b, lse_b.view(n_rows, num_heads))
 
+    def _use_mla_prefix_fused_k(self, layer: RadixAttention) -> bool:
+        # MXFP4 kv_b_proj + FP8 prefill already fuses split/cat into its GEMM.
+        return _use_mla_prefix_fused_k and not (
+            self.use_fp8_prefill_attn and layer.kv_b_proj.weight.dtype == torch.uint8
+        )
+
+    def _mla_prefix_attn_fused(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        kv_indices: torch.Tensor,
+        K_Buffer: torch.Tensor,
+        kv_lora_rank: int,
+        qk_nope_head_dim: int,
+    ) -> torch.Tensor:
+        """MHA prefill over the cached latent at ``kv_indices`` (prefix + chunk)."""
+        rows = torch.index_select(K_Buffer, 0, kv_indices)
+        kvc = rows[..., :kv_lora_rank].to(q.dtype).contiguous()
+        k_pe = rows[..., kv_lora_rank:].to(q.dtype)
+        kv = layer.kv_b_proj(kvc)[0].view(
+            -1, layer.tp_k_head_num, qk_nope_head_dim + layer.v_head_dim
+        )
+        k_nope, v = torch.split(kv, [qk_nope_head_dim, layer.v_head_dim], dim=-1)
+        k = kv.new_empty(
+            (kv.shape[0], kv.shape[1], layer.qk_head_dim),
+            dtype=fp8_dtype if _use_gfx1250_fp8_prefill_attn else kv.dtype,
+        )
+        concat_and_cast_mha_k_triton(k, k_nope, k_pe)
+        md = self.forward_metadata
+        if _use_gfx1250_fp8_prefill_attn:
+            # Unit scales, as in mla_fp8_prefill_attn on gfx950.
+            return flash_attn_varlen_fp8_pertensor_func(
+                q.to(fp8_dtype),
+                k,
+                v.to(fp8_dtype),
+                self.q_scale,
+                self.k_scale,
+                self.v_scale,
+                md.qo_indptr,
+                md.kv_indptr,
+                md.max_q_len,
+                md.max_kv_len,
+                softmax_scale=layer.scaling,
+                causal=True,
+            )
+        if self.use_fp8_prefill_attn:
+            return self.mla_fp8_prefill_attn(q, k, v, layer)
+        return flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            md.qo_indptr,
+            md.kv_indptr,
+            md.max_q_len,
+            md.max_kv_len,
+            softmax_scale=layer.scaling,
+            causal=True,
+        )
+
     def mla_fp8_prefill_attn(
         self,
         q: torch.Tensor,
@@ -4655,6 +4726,12 @@ class AiterAttnBackend(AttentionBackend):
                             causal=True,
                         )
                     return output
+                elif layer.qk_head_dim != (
+                    kv_lora_rank + qk_rope_head_dim
+                ) and self._use_mla_prefix_fused_k(layer):
+                    return self._mla_prefix_attn_fused(
+                        q, layer, kv_indices, K_Buffer, kv_lora_rank, qk_nope_head_dim
+                    )
                 elif layer.qk_head_dim != (kv_lora_rank + qk_rope_head_dim):
                     K_Buffer = torch.index_select(K_Buffer, 0, kv_indices)
                     kvc, k_pe = torch.split(
