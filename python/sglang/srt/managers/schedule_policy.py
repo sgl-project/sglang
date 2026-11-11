@@ -824,6 +824,10 @@ class PrefillAdder:
     def cur_rem_tokens(self):
         return self.memory_budget.remaining_current
 
+    def grow_chunk_budget(self, tokens: int) -> None:
+        """Add `tokens` to this batch's chunk budget, as if sized with a larger chunk."""
+        self.rem_chunk_tokens += tokens
+
     def _swa_new_tokens(self, req: Req) -> int:
         """Tokens a request may still decode, for SWA headroom sizing. Mirrors
         the remaining-then-clip order of add_one_req's max_new: clip-then-subtract

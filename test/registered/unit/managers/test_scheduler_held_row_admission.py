@@ -77,6 +77,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.processed_tokens_counter = 0
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None
+        s.pp_chunk_sizer = None
         s.tp_worker = SimpleNamespace(
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )

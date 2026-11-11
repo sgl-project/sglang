@@ -3549,6 +3549,32 @@ class TestPipelineParallelCompat(CustomTestCase):
             check_pipeline_parallel_compat(self._cfg(min_free_slots_delay=4))
 
 
+class TestPPChunkSizingArgs(CustomTestCase):
+    @staticmethod
+    def _check(**overrides):
+        ServerArgs(
+            model_path="dummy",
+            served_model_name="dummy",
+            device="cpu",
+            chunked_prefill_size=-1,
+            **overrides,
+        ).check_server_args()
+
+    def test_validation(self):
+        self._check(pp_min_chunked_prefill_size=256, pp_chunk_overhead_tokens=1024)
+        for overrides, message in (
+            ({"pp_min_chunked_prefill_size": 0}, "pp-min-chunked-prefill-size"),
+            (
+                {"pp_min_chunked_prefill_size": 256, "pp_chunk_overhead_tokens": 0},
+                "pp-chunk-overhead-tokens",
+            ),
+            ({"pp_chunk_overhead_tokens": 1024}, "pp-chunk-overhead-tokens"),
+        ):
+            with self.subTest(**overrides):
+                with self.assertRaisesRegex(AssertionError, message):
+                    self._check(**overrides)
+
+
 class TestCudaGraphPrefillMaxContextResolution(CustomTestCase):
     @staticmethod
     def _make_args(max_context_size, model_context_len=4096, page_size=64):

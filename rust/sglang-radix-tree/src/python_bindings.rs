@@ -1046,6 +1046,15 @@ macro_rules! tree_core_methods {
                 py.detach(|| self.core().match_full_device_prefix(key, namespace))
             }
 
+            /// Read-only match length: no split, LRU refresh or access-tick update.
+            fn peek_prefix_len(&self, py: Python<'_>, params: &MatchParamsBinding) -> usize {
+                let key = K::key_from(Cow::Borrowed(&params.key));
+                let key = key.as_ref();
+                let namespace =
+                    KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
+                py.detach(|| self.core().peek_prefix_len(key, namespace))
+            }
+
             fn swa_tombstone_ranges(
                 &self,
                 py: Python<'_>,
@@ -2777,6 +2786,11 @@ macro_rules! tree_core_binding {
                 params: &MatchParamsBinding,
             ) -> PyResult<(usize, NodeId, usize)> {
                 catch_native_panic(|| Ok(self.inner.match_full_device_prefix(py, params)))
+            }
+
+            /// Read-only match length: no split, LRU refresh or access-tick update.
+            fn peek_prefix_len(&self, py: Python<'_>, params: &MatchParamsBinding) -> PyResult<usize> {
+                catch_native_panic(|| Ok(self.inner.peek_prefix_len(py, params)))
             }
 
             fn swa_tombstone_ranges(

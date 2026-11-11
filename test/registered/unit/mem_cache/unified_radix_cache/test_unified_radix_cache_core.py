@@ -19,7 +19,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    available_and_evictable_str,
+    peek_uncached_tokens,
+    release_kv_cache,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -371,8 +375,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self._insert(cache, allocator, req_to_token_pool, seq_a)
         # Diverges inside the inserted node: match_prefix would split it here.
         probe = seq_a[: 2 * page] + self._make_seq(5000, 1)
-        if cache.peek_prefix_len(RadixKey(array("q", probe))) is None:
-            self.skipTest("tree core has no read-only probe")
 
         def snapshot():
             core = cache.tree_core
@@ -409,6 +411,92 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
                 self.assertLessEqual(got, expected)
             else:
                 self.assertEqual(got, expected)
+
+    def test_prefix_cache_version_tracks_peek_changes(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        page = self.cfg.page_size
+        seq_a = self._make_seq(1, 3)
+        split_probe = seq_a[: 2 * page] + self._make_seq(5000, 1)
+        keys = (seq_a, split_probe, seq_a[:page], self._make_seq(9000, 2))
+
+        def state():
+            peeks = [cache.peek_prefix_len(RadixKey(array("q", t))) for t in keys]
+            return cache.prefix_cache_version, peeks
+
+        version, peeks = state()
+        self._insert(cache, allocator, req_to_token_pool, seq_a)
+        after_insert = state()
+        self.assertGreater(after_insert[0], version)
+        self.assertNotEqual(after_insert[1], peeks)
+        self.assertEqual(state(), after_insert)
+
+        match_prefix(cache, split_probe)
+        after_match = state()
+        if len(self.cfg.components) == 1:
+            self.assertEqual(after_match, after_insert)
+        else:
+            self.assertGreater(after_match[0], after_insert[0])
+
+        cache.evict(EvictParams(num_tokens=len(seq_a)))
+        after_evict = state()
+        self.assertGreater(after_evict[0], after_match[0])
+        self.assertEqual(after_evict[1], [0, 0, 0, 0])
+
+    @requires(lambda cfg: not (cfg.has_swa or cfg.has_mamba), "requires FULL only")
+    def test_peek_uncached_tokens_matches_admission(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        page = self.cfg.page_size
+        seq = self._make_seq(1, 3)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        longer = seq + self._make_seq(9000, 2)
+
+        def make_req(tokens, logprob_start_len=None):
+            req = Req(
+                rid="peek",
+                origin_input_text="",
+                origin_input_ids=array("q", tokens),
+                sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+                return_logprob=logprob_start_len is not None,
+            )
+            if logprob_start_len is not None:
+                req.logprob_start_len = logprob_start_len
+            return req
+
+        def admitted(req):
+            req.init_next_round_input(cache)
+            return max(1, req.seqlen - req.num_matched_prefix_tokens)
+
+        cases = (
+            # Fully cached: the match stops before the last token.
+            (seq, None, 0),
+            (seq[: 2 * page] + self._make_seq(9000, 1), None, 0),
+            # Logprobs from inside the cached prefix clamp the match.
+            (longer, page + 1, 0),
+            # A window re-prefill tail limits the key.
+            (longer, None, 2 * page + 1),
+        )
+        for tokens, logprob_start_len, reprefill_tail in cases:
+            with (
+                self.subTest(
+                    tokens=len(tokens),
+                    logprob_start_len=logprob_start_len,
+                    reprefill_tail=reprefill_tail,
+                ),
+                mock.patch.object(
+                    cache, "window_reprefill_tail_tokens", return_value=reprefill_tail
+                ),
+            ):
+                peeked = peek_uncached_tokens(
+                    make_req(tokens, logprob_start_len), cache
+                )
+                self.assertEqual(peeked, admitted(make_req(tokens, logprob_start_len)))
+        # Embed overrides: admission matches nothing.
+        overridden = [make_req(longer), make_req(longer)]
+        for req in overridden:
+            req.positional_embed_overrides = SimpleNamespace()
+        peeked = peek_uncached_tokens(overridden[0], cache)
+        self.assertEqual(peeked, len(longer))
+        self.assertEqual(peeked, admitted(overridden[1]))
 
     def test_insert_and_match_basic(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)

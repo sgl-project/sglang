@@ -1613,6 +1613,136 @@ fn match_full_device_prefix_is_read_only_and_accounts_the_pinned_node() {
     assert_eq!(tc.arena.node(a).device_lock_ref(FULL), 0);
 }
 
+// Everything a match may change, besides the SWA LRU order.
+type ProbeSnapshot = (Vec<(Vec<i64>, i64, i64, u32)>, Vec<NodeIdx_>, usize);
+
+fn probe_snapshot(tc: &UnifiedTreeCore<Vec<i64>>, nodes: &[NodeIdx_]) -> ProbeSnapshot {
+    let node_state = nodes
+        .iter()
+        .map(|&id| {
+            let node = tc.arena.node(id);
+            (
+                node.key.clone(),
+                node.last_access_counter,
+                node.hit_count,
+                node.device_lock_ref(FULL),
+            )
+        })
+        .collect();
+    let lru = tc.device_lru_list(FULL).iter().collect();
+    (node_state, lru, tc.arena.len())
+}
+
+#[test]
+fn peek_prefix_len_is_read_only_and_agrees_with_match_prefix() {
+    let mut tc = core();
+    let (a, b) = matched_chain(&mut tc);
+    let root = tc.arena.root();
+    let namespace = KeyNamespaceRef::new(None, None);
+    // vec![1, 9] stops inside a: FULL alone counts the partial match.
+    let keys = [vec![1, 2, 3], vec![1, 2, 9], vec![1, 9], vec![9], vec![]];
+    let before = probe_snapshot(&tc, &[root, a, b]);
+    let peeked: Vec<usize> = keys
+        .iter()
+        .map(|key| tc.peek_prefix_len(key, namespace))
+        .collect();
+    assert_eq!(peeked, vec![3, 2, 1, 0, 0]);
+    assert_eq!(probe_snapshot(&tc, &[root, a, b]), before);
+
+    for (key, got) in keys.iter().zip(peeked) {
+        assert_eq!(tc.match_prefix(&match_params(key)).device_prefix_len, got);
+    }
+}
+
+#[test]
+fn peek_prefix_len_respects_namespace_and_page_alignment() {
+    let mut tc = core();
+    matched_chain(&mut tc);
+    let lora = KeyNamespaceRef::new(Some("lora-1"), None);
+    assert_eq!(tc.peek_prefix_len(&vec![1, 2, 3], lora), 0);
+
+    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 2,
+            ..Default::default()
+        },
+        vec![FULL],
+    );
+    let root = tc.arena.root();
+    tc.add_new_node_(
+        root,
+        /* key = */ vec![1, 2, 3, 4],
+        &Tensor::from_slice(&[10i64, 11, 12, 13]),
+        /* priority = */ 0,
+        /* extra_key = */ None,
+    );
+    // The trailing partial page is dropped before the walk.
+    assert_eq!(
+        tc.peek_prefix_len(&vec![1, 2, 3], KeyNamespaceRef::new(None, None)),
+        2
+    );
+}
+
+#[test]
+fn peek_prefix_len_stops_at_a_dead_node() {
+    let mut tc = core();
+    let root = tc.arena.root();
+    tc.arena
+        .alloc_child(
+            root,
+            /* key = */ vec![1, 2],
+            /* priority = */ 0,
+            /* extra_key = */ None,
+        )
+        .unwrap();
+    assert_eq!(
+        tc.peek_prefix_len(&vec![1, 2], KeyNamespaceRef::new(None, None)),
+        0
+    );
+}
+
+#[test]
+fn peek_prefix_len_follows_swa_validation_without_partial_matches() {
+    // a(SWA on) -> t(Full on, SWA tombstone) -> c(SWA on, span 1 < window):
+    // match_prefix stops its best match at a, and so does the probe.
+    let mut tc = swa_match_core(/* window = */ 2);
+    let root = tc.arena.root();
+    let a = tc.add_new_node_(
+        root,
+        /* key = */ vec![1, 2],
+        &Tensor::from_slice(&[10i64, 11]),
+        /* priority = */ 0,
+        /* extra_key = */ None,
+    );
+    let t = tc.add_new_node_(
+        a,
+        /* key = */ vec![3],
+        &Tensor::from_slice(&[12i64]),
+        /* priority = */ 0,
+        /* extra_key = */ None,
+    );
+    let c = tc.add_new_node_(
+        t,
+        /* key = */ vec![4],
+        &Tensor::from_slice(&[13i64]),
+        /* priority = */ 0,
+        /* extra_key = */ None,
+    );
+    set_swa_device_and_list(&mut tc, a);
+    set_swa_device_and_list(&mut tc, c);
+    let namespace = KeyNamespaceRef::new(None, None);
+    let swa_lru: Vec<NodeIdx_> = tc.device_lru_list(SWA).iter().collect();
+    let before = probe_snapshot(&tc, &[root, a, t, c]);
+    assert_eq!(tc.peek_prefix_len(&vec![1, 2, 3, 4], namespace), 2);
+    // With an auxiliary component a split point is no match boundary.
+    assert_eq!(tc.peek_prefix_len(&vec![1, 9], namespace), 0);
+    assert_eq!(probe_snapshot(&tc, &[root, a, t, c]), before);
+    assert_eq!(tc.device_lru_list(SWA).iter().collect::<Vec<_>>(), swa_lru);
+
+    let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4]));
+    assert_eq!(result.device_prefix_len, 2);
+}
+
 #[test]
 fn match_prefix_stops_at_a_dead_node() {
     // An evicted, unbackuped child ends the traversal before it.

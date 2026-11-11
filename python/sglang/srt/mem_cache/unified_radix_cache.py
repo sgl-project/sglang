@@ -223,6 +223,9 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether eviction walks every component in one joint LRU order; set from the
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
+    # Bumped by every tree change that can move a peek_prefix_len answer,
+    # including a match's split with auxiliary components (a new node boundary).
+    prefix_cache_version: int = 0
 
     def __init__(
         self,
@@ -494,6 +497,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # In-flight restores still read their host slots; finish them first.
         self._discard_restore_backups()
         self.tree_core.reset()
+        self.prefix_cache_version += 1
         self.session_refs.reset()
 
         # Reset Controller.
@@ -692,6 +696,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return self.tree_core.empty_match_result
         result = self.tree_core.match_prefix(params)
+        if len(self.components) > 1:
+            self.prefix_cache_version += 1
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)
@@ -741,6 +747,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return
         result = self.tree_core.match_prefix(MatchPrefixParams(key=key))
+        if len(self.components) > 1:
+            self.prefix_cache_version += 1
         self._apply_cache_actions(result.cache_actions)
 
     def supports_prefix_sharing(self) -> bool:
@@ -759,6 +767,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.buffer_pipeline.begin_insert_walk()
         # External linker offloads (BackupKV) issued by this insert carry its session.
         self.insert_session_id = params.session_id
+        self.prefix_cache_version += 1
         # Pump the resumable insert, applying each step's actions at its barrier.
         try:
             step = self.tree_core.begin_insert(params)
@@ -1071,6 +1080,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _apply_eviction_result(self, result: BaseEvictionResult) -> None:
         """Drain a tree step before the next allocator-dependent decision."""
+        self.prefix_cache_version += 1
         try:
             self._free_values(result.device_frees, result.host_frees)
         finally:
@@ -2410,6 +2420,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return False
 
         # Commit the loaded KV back onto the node + apply its emitted actions.
+        self.prefix_cache_version += 1
         self._apply_cache_actions(
             self.tree_core.commit_load_back(
                 node_id, device_indices, kv_xfer, comp_xfers
@@ -3035,6 +3046,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         fetched_key = prefetch_key[:completed_tokens]
+        self.prefix_cache_version += 1
         insert_result = self.tree_core.insert_host(
             last_host_node_id,
             fetched_key,

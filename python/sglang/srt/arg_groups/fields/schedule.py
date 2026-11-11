@@ -74,7 +74,7 @@ class Schedule(msgspec.Struct):
     ] = None
     pp_chunk_overhead_tokens: A[
         Optional[int],
-        "With --pp-min-chunked-prefill-size, size each prefill chunk from the total uncached tokens U of the pending requests instead: a chunk C costs a fixed overhead worth this many tokens plus C, so the pending prefill takes about (U / C + pp - 1) * (overhead + C), and the chunk doubles from the small one up to --chunked-prefill-size while the doubled chunk is faster (U * overhead >= 2 * (pp - 1) * C^2).",
+        "With --pp-min-chunked-prefill-size, size each prefill chunk from the total uncached tokens U of the pending requests instead: a chunk C costs a fixed overhead worth this many tokens plus C, so the pending prefill takes about (U / C + pp - 1) * (overhead + C), and the chunk doubles from the small one, the last step only up to --chunked-prefill-size, while the larger chunk is faster (from C to B when U * overhead >= (pp - 1) * C * B, i.e. 2 * (pp - 1) * C^2 for a doubling).",
     ] = None
     max_prefill_tokens: A[
         int,

@@ -633,10 +633,12 @@ class Req(ReqDllmMixin):
         # time and used to estimate uncached tokens / sort by longest prefix for
         # load reporting.
         self.num_matched_prefix_tokens = 0
-        # Uncached tokens seen by the last prefix match, kept while the request
-        # waits so --pp-min-chunked-prefill-size does not re-match it every
-        # step. None until matched; reset on retraction.
+        # Uncached tokens from the last prefix match or read-only probe, for PP
+        # chunk sizing.
         self.pp_uncached_hint: Optional[int] = None
+        # tree_cache.prefix_cache_version the hint was probed at; None when it
+        # came from a match, so the next probe is never skipped.
+        self.pp_uncached_hint_version: Optional[int] = None
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         self.storage_hit_start: Optional[int] = None
@@ -1514,6 +1516,7 @@ class Req(ReqDllmMixin):
         self.kv_rotation_base = None
         self.num_matched_prefix_tokens = 0
         self.pp_uncached_hint = None
+        self.pp_uncached_hint_version = None
         self.lock = None
         self.swa_branching_seqlen = None
         self.extend_end = None

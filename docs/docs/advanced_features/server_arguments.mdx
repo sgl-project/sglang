@@ -503,6 +503,18 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--pp-min-chunked-prefill-size`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Small prefill chunk for pipeline parallelism. When set, a prefill batch uses this chunk unless a pending request has at least --chunked-prefill-size uncached tokens, so batches with few new tokens still fill every stage while long prefills keep the full chunk.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--pp-chunk-overhead-tokens`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With --pp-min-chunked-prefill-size, size each prefill chunk from the total uncached tokens U of the pending requests instead: a chunk C costs a fixed overhead worth this many tokens plus C, so the pending prefill takes about (U / C + pp - 1) * (overhead + C), and the chunk doubles from the small one, the last step only up to --chunked-prefill-size, while the larger chunk is faster (from C to B when U * overhead >= (pp - 1) * C * B, i.e. 2 * (pp - 1) * C^2 for a doubling).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--max-prefill-tokens`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`16384`</td>

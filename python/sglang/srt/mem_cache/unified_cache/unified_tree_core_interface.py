@@ -567,9 +567,8 @@ class UnifiedTreeCoreInterface(ABC):
         return False
 
     def peek_prefix_len(self, key: RadixKey) -> Optional[int]:
-        """Tokens that match_prefix would report as cached for ``key``, computed
-        without changing the tree: no node split, LRU refresh or access-time
-        update. None when the tree core does not support it."""
+        """Tokens match_prefix would report as cached for ``key``, without
+        changing the tree; None when unsupported."""
         return None
 
     @property

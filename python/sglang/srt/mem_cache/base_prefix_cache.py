@@ -484,6 +484,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
+    # Changes whenever a peek_prefix_len answer may change; None when the cache
+    # does not track it, so every probe must be taken again.
+    prefix_cache_version: Optional[int] = None
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled

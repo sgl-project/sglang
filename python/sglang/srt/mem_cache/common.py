@@ -185,12 +185,17 @@ def peek_uncached_tokens(req: Req, tree_cache: BasePrefixCache) -> Optional[int]
     """Uncached tokens req would prefill now, read without changing cache state;
     None when the cache cannot answer read-only."""
     token_ids = req.origin_input_ids + req.output_ids
-    cached = tree_cache.peek_prefix_len(_req_radix_key(tree_cache, req, token_ids))
+    if req.positional_embed_overrides is not None:
+        # Admission matches an empty key for these: nothing is cached.
+        return len(token_ids)
+    # Limit the key as admission does, so the probe page-aligns the same span.
+    max_prefix_len = req._compute_max_prefix_len(len(token_ids))
+    cached = tree_cache.peek_prefix_len(
+        _req_radix_key(tree_cache, req, token_ids, max_prefix_len)
+    )
     if cached is None:
         return None
-    return max(
-        1, len(token_ids) - min(cached, req._compute_max_prefix_len(len(token_ids)))
-    )
+    return max(1, len(token_ids) - cached)
 
 
 def match_kv_cache(

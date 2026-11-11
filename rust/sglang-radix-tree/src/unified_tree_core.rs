@@ -1433,6 +1433,52 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         (offset, self.arena.node(node_id).id, pinned_len)
     }
 
+    /// Read-only twin of `match_prefix_helper_`. A partial match counts only
+    /// when FULL is the sole component: otherwise a split point's validity
+    /// depends on state the split would create, so the probe may undercount.
+    pub fn peek_prefix_len(&self, key: &K, namespace: KeyNamespaceRef<'_>) -> usize {
+        let aligned_key_len = key.atom_len() / self.page_size * self.page_size;
+        let mut validators: Vec<_> = self
+            .components
+            .iter()
+            .map(|component| component.create_match_validator(self, !self.enable_hicache))
+            .collect();
+        let full_only = self.components.len() == 1;
+        let mut node_id = self.arena.root();
+        let mut offset = 0;
+        let mut best_len = 0;
+        while offset < aligned_key_len {
+            let Some(child_id) = self.arena.child_on_page_in_namespace(
+                node_id,
+                namespace,
+                key.page_at(offset, self.page_size),
+            ) else {
+                break;
+            };
+            let child = self.arena.node(child_id);
+            if child.evicted() && !child.backuped() {
+                break;
+            }
+            let prefix_len = key.match_len(offset, &child.key, self.page_size);
+            // Every validator observes every node (stateful validators need the full walk).
+            let matched = validators
+                .iter_mut()
+                .fold(true, |acc, validator| validator(self, child_id) & acc);
+            if prefix_len < child.key.atom_len() {
+                if full_only && matched {
+                    best_len = offset + prefix_len;
+                }
+                break;
+            }
+            node_id = child_id;
+            offset += prefix_len;
+            if matched {
+                best_len = offset;
+            }
+        }
+        best_len
+    }
+
     /// Build default validators in component order, without borrowing the core.
     pub(crate) fn create_match_validators_<'a>(
         &self,

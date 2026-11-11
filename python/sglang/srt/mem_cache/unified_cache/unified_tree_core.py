@@ -1089,11 +1089,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def peek_prefix_len(self, key: RadixKey) -> Optional[int]:
-        """Read-only twin of _match_prefix_helper: the length up to the deepest
-        node every component accepts, host-backed nodes included under HiCache.
-        A partial match into a node counts only when FULL is the sole component;
-        with auxiliary components (Mamba, SWA) the split point would carry no
-        state, so it is not a match boundary."""
+        """Read-only twin of _match_prefix_helper. A partial match counts only
+        when FULL is the sole component: otherwise a split point's validity
+        depends on state the split would create, so the probe may undercount."""
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if len(key) == 0:
             return 0
@@ -1115,12 +1113,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 break
             prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
             if prefix_len < len(child.key):
-                if full_only and all(v(child) for v in validators):
+                if full_only and all([v(child) for v in validators]):
                     best_len = key_offset + prefix_len
                 break
             node = child
             key_offset += prefix_len
-            if all(v(node) for v in validators):
+            # A list, not a generator: stateful validators must see every node.
+            if all([v(node) for v in validators]):
                 best_len = key_offset
             if key_offset < len(key):
                 child_key = key.child_key_at(key_offset, self.page_size)
