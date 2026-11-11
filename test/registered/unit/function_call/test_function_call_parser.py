@@ -447,7 +447,7 @@ class TestInklingDetector(unittest.TestCase):
         )
 
 
-class TestPythonicDetector(unittest.TestCase):
+class TestPythonicDetector(CustomTestCase):
     def setUp(self):
         # Create sample tools for testing
         self.tools = [
@@ -496,6 +496,55 @@ class TestPythonicDetector(unittest.TestCase):
         # detect_and_parse does not exercise in isolation.
         self.assertTrue(self.detector.has_tool_call('[get_weather(location="Tokyo")]'))
         self.assertFalse(self.detector.has_tool_call("plain text only"))
+
+    def test_leading_underscore_identifiers(self):
+        """Underscore-prefixed tool or argument names were returned as text."""
+        cases = (
+            ('[_search(query="room")]', [("_search", {"query": "room"})]),
+            ('[search(_from="NY")]', [("search", {"_from": "NY"})]),
+            (
+                '[__book_meeting_room(_room="A"), _search(query="room")]',
+                [
+                    ("__book_meeting_room", {"_room": "A"}),
+                    ("_search", {"query": "room"}),
+                ],
+            ),
+        )
+        for text, expected in cases:
+            tools = [
+                Tool(
+                    type="function",
+                    function=Function(
+                        name=name,
+                        parameters={
+                            "type": "object",
+                            "properties": {
+                                key: {"type": "string"} for key in arguments
+                            },
+                        },
+                    ),
+                )
+                for name, arguments in expected
+            ]
+            for streaming in (False, True):
+                with self.subTest(text=text, streaming=streaming):
+                    detector = PythonicDetector()
+                    if streaming:
+                        results = [
+                            detector.parse_streaming_increment(char, tools)
+                            for char in text
+                        ]
+                    else:
+                        self.assertTrue(detector.has_tool_call(text))
+                        results = [detector.detect_and_parse(text, tools)]
+                    calls = [call for result in results for call in result.calls]
+                    self.assertEqual(
+                        [(call.name, json.loads(call.parameters)) for call in calls],
+                        expected,
+                    )
+                    self.assertEqual(
+                        "".join(result.normal_text for result in results), ""
+                    )
 
     def test_invalid_escape_sequence_still_parses(self):
         """An invalid Python escape (e.g. "\\d+") must not drop the tool call.
