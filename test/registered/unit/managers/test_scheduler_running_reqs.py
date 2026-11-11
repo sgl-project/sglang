@@ -29,6 +29,7 @@ from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -152,11 +153,11 @@ class TestRequestListsCheck(CustomTestCase):
 
     def _start_running(self, reqs):
         self.s.running_batch = ScheduleBatch(reqs=reqs)
-        self.s.running_reqs.join(reqs)
+        move(reqs, self.s.running_reqs)
 
     def test_fails_a_request_owned_by_another_list(self):
         req = _req("a")
-        self.s.running_reqs.join([req])
+        move([req], self.s.running_reqs)
         req.owner_list = self.s.waiting_queue
 
         with self.assertRaisesRegex(
@@ -175,8 +176,8 @@ class TestRequestListsCheck(CustomTestCase):
         decoding, retracted, chunk = _req("r"), _req("w"), _req("c")
         self._start_running([decoding])
         self.s.running_batch.reqs += [retracted, chunk]
-        self.s.waiting_queue.join([retracted])
-        self.s.chunked_reqs.join([chunk])
+        move([retracted], self.s.waiting_queue)
+        move([chunk], self.s.chunked_reqs)
 
         with self.assertRaisesRegex(
             RuntimeError, r"running batch but not in running: \['w'\]"
@@ -186,7 +187,7 @@ class TestRequestListsCheck(CustomTestCase):
     def test_fails_a_running_request_held_by_nothing(self):
         decoding, lost = _req("r"), _req("l")
         self._start_running([decoding])
-        self.s.running_reqs.join([lost])
+        move([lost], self.s.running_reqs)
 
         with self.assertRaisesRegex(
             RuntimeError, r"in no running batch or step: \['l'\]"
@@ -196,7 +197,7 @@ class TestRequestListsCheck(CustomTestCase):
     def test_fails_a_launched_prefill_in_a_running_batch(self):
         merged = _req("m")
         self.s.running_batch = ScheduleBatch(reqs=[merged])
-        self.s.prefill_launched_reqs.join([merged])
+        move([merged], self.s.prefill_launched_reqs)
 
         with self.assertRaisesRegex(
             RuntimeError, r"prefill_launched but in a running batch: \['m'\]"
@@ -218,8 +219,8 @@ class TestRequestListsCheck(CustomTestCase):
         # running batch.
         new, decoding = _req("n"), _req("d")
         mixed = _batch([new, decoding], ForwardMode.MIXED)
-        self.s.running_reqs.join([decoding])
-        self.s.prefill_launched_reqs.join([new])
+        move([decoding], self.s.running_reqs)
+        move([new], self.s.prefill_launched_reqs)
         _launch(self.s, mixed)
         self.s.invariant_checker.get_pp_mbs = lambda: [mixed, None]
         self.s.invariant_checker.get_running_batches = lambda: (
@@ -240,12 +241,12 @@ class TestRunningReqsHooks(CustomTestCase):
         s = _scheduler()
         a, chunk, new, decoding = (_req(rid) for rid in ("a", "c", "n", "d"))
         s.running_batch = ScheduleBatch(reqs=[decoding])
-        s.running_reqs.join([decoding])
-        s.chunked_reqs.join([chunk])
+        move([decoding], s.running_reqs)
+        move([chunk], s.chunked_reqs)
         # A parked chunk: scheduling has no KV of it to stash.
         chunk.extend_end = chunk.prefix_len
         # As admission leaves them.
-        s.prefill_launched_reqs.join([a, new])
+        move([a, new], s.prefill_launched_reqs)
 
         # A launch moves no request between lists.
         _launch(s, _batch([a, chunk], ForwardMode.EXTEND, chunked_req=chunk))
@@ -267,7 +268,7 @@ class TestRunningReqsHooks(CustomTestCase):
         # dLLM keeps its requests in its own queue.
         s = _scheduler()
         s.dllm_config = object()
-        s.dllm_manager.waiting_queue.join([_req("p")])
+        move([_req("p")], s.dllm_manager.waiting_queue)
         _launch(s, _batch(list(s.dllm_manager.waiting_queue), ForwardMode.EXTEND))
         self.assertEqual(list(s.prefill_launched_reqs), [])
 
@@ -285,7 +286,7 @@ class TestRunningReqsHooks(CustomTestCase):
         empty_request_lists(s)
         s.running_batch = running
         s.last_batch = None
-        s.running_reqs.join(running.reqs)
+        move(running.reqs, s.running_reqs)
         s.disaggregation_mode = DisaggregationMode.NULL
         s.enable_hisparse = False
         s.invariant_checker = _invariant_checker(s)
@@ -364,7 +365,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s = _scheduler()
         victim, other = _req("v"), _req("o")
         running_batch = ScheduleBatch(reqs=[victim, other])
-        s.running_reqs.join(running_batch.reqs)
+        move(running_batch.reqs, s.running_reqs)
         waiting = SimpleNamespace(
             owner_list=None,
             beam_group=None,
@@ -391,7 +392,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = True
         s.is_hybrid_swa = False
-        s.waiting_queue.join([waiting])
+        move([waiting], s.waiting_queue)
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = lambda *args, **kwargs: 0
         s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
@@ -436,7 +437,7 @@ class TestRunningReqsHooks(CustomTestCase):
         first = _batch([a, b], ForwardMode.DECODE)
         second = _batch([a], ForwardMode.DECODE)
         s.running_batch = ScheduleBatch(reqs=[a, b])
-        s.running_reqs.join([a, b])
+        move([a, b], s.running_reqs)
         _launch(s, first)
         _launch(s, second)
         self.assertEqual((a.inflight_steps, b.inflight_steps), (2, 1))

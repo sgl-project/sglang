@@ -71,7 +71,7 @@ class TestPrefillEmbeddingResults(CustomTestCase):
     def test_failed_kv_load_discarded_with_mixed_embedding_formats(self):
         reason = FINISH_ABORT("External KV cache load failed", 503)
         reqs = [
-            SimpleNamespace(
+            FakeReq(
                 encoding_format=encoding_format,
                 discard_output_reason=discard_reason,
                 is_retracted=False,
@@ -82,7 +82,6 @@ class TestPrefillEmbeddingResults(CustomTestCase):
                 time_stats=Mock(),
                 update_finish_state=Mock(),
                 finished_reason=None,
-                exit_via=None,
                 finished=lambda: True,
                 kv=SimpleNamespace(
                     holds_kv=True, holds_mamba=False, retraction_backup=None
