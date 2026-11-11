@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Engine endpoints answered by one worker: `/server_info`, `/model_info`
-//! (and their `/get_` aliases) and `/health_generate`, as SGLang engines and
-//! sgl-model-gateway serve them. Workers come from the pools chat dispatch
-//! uses (healthy only; under P/D a prefill with a decode peer), picked at
-//! random. The worker's status and body pass through; only a transport
-//! failure becomes a router error.
+//! (and their `/get_` aliases) and `/health_generate`, as SGLang engines
+//! serve them. Workers come from the pools chat dispatch uses (healthy only;
+//! under P/D a prefill with a decode peer), picked at random. The worker's
+//! status and body pass through; only a transport failure becomes a router
+//! error.
 
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::PdPoolResolver;

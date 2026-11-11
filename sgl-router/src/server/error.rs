@@ -186,10 +186,10 @@ pub enum ApiError {
         source: anyhow::Error,
     },
 
-    /// An sgl-model-gateway endpoint (`/v1/responses`, `/workers`, ...) that
-    /// this router does not provide; `path` is the request path.
-    #[error("{path} is an sgl-model-gateway endpoint that sgl-router does not provide")]
-    GatewayOnlyEndpoint { path: String },
+    /// A known API path this router does not serve (`/v1/responses`,
+    /// `/workers`, ...); `path` is the request path.
+    #[error("{path} is not supported by sgl-router")]
+    UnsupportedEndpoint { path: String },
 
     /// A non-OK status from an engine's gRPC server, relayed to a gRPC client unchanged.
     #[error("upstream gRPC status: {0}")]
@@ -222,7 +222,7 @@ impl ApiError {
             ApiError::PolicySelectionFailed { .. } => ErrorClass::NoTarget,
             ApiError::BreakerOpen { .. } => ErrorClass::NoTarget,
             ApiError::WorkerMisconfigured { .. } => ErrorClass::NoTarget,
-            ApiError::GatewayOnlyEndpoint { .. } => ErrorClass::NotImplemented,
+            ApiError::UnsupportedEndpoint { .. } => ErrorClass::NotImplemented,
             ApiError::UpstreamGrpc(status) => grpc_error_class(status.code()),
             ApiError::Internal(_) => ErrorClass::Internal,
         }
@@ -255,7 +255,7 @@ impl ApiError {
             ApiError::PolicySelectionFailed { .. } => "policy_selection_failed",
             ApiError::BreakerOpen { .. } => "breaker_open",
             ApiError::WorkerMisconfigured { .. } => "worker_misconfigured",
-            ApiError::GatewayOnlyEndpoint { .. } => "gateway_only_endpoint",
+            ApiError::UnsupportedEndpoint { .. } => "unsupported_endpoint",
             ApiError::UpstreamGrpc(_) => "upstream_grpc_status",
             ApiError::Internal(_) => "internal_error",
         }
@@ -283,7 +283,7 @@ impl ApiError {
             | ApiError::PolicySelectionFailed { .. }
             | ApiError::BreakerOpen { .. }
             | ApiError::WorkerMisconfigured { .. }
-            | ApiError::GatewayOnlyEndpoint { .. }
+            | ApiError::UnsupportedEndpoint { .. }
             | ApiError::UpstreamGrpc(_)
             | ApiError::Internal(_) => None,
         }
@@ -435,7 +435,7 @@ impl ApiError {
             ApiError::BadRequest(_)
             | ApiError::ModelNotFound(_)
             | ApiError::SamplingContract { .. }
-            | ApiError::GatewayOnlyEndpoint { .. } => self.to_string(),
+            | ApiError::UnsupportedEndpoint { .. } => self.to_string(),
             ApiError::UpstreamGrpc(status) => status.message().to_string(),
         }
     }
@@ -818,12 +818,12 @@ mod tests {
                 None,
             ),
             (
-                "gateway-only endpoint",
-                ApiError::GatewayOnlyEndpoint {
+                "unsupported endpoint",
+                ApiError::UnsupportedEndpoint {
                     path: "/v1/responses".into(),
                 },
                 StatusCode::NOT_IMPLEMENTED,
-                "gateway_only_endpoint",
+                "unsupported_endpoint",
                 None,
             ),
             (
