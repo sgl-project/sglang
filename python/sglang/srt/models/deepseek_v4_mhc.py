@@ -390,6 +390,7 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     bf16_decode_grid = (
         bf16_parts is not None
         and get_platform().is_blackwell
+        and get_platform().device_sm != 107
         and x_flat.shape[0] < 4096
     )
     use_bf16_projection = bf16_parts is not None and (

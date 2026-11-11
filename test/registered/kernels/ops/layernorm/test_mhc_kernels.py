@@ -315,17 +315,19 @@ def test_deepgemm_prenorm_dual_matches_two_calls(num_tokens):
 
 @pytest.mark.parametrize("num_tokens", [32, 33, 257, 4095, 4096])
 def test_blackwell_compensated_mhc(num_tokens):
-    """Blackwell decode and prefill rows up to 65536 must take the BF16x3
-    projection; the TF32 DeepGEMM projection lost GSM8K accuracy on DSv4.1."""
+    """Blackwell rows up to 65536 must take the BF16x3 projection, except
+    SM107 below 4096 rows, which keeps the DeepGEMM projection."""
     from unittest.mock import patch
 
     from sglang.srt.environ import envs
     from sglang.srt.models import deepseek_v4_mhc as model_mhc
     from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
-    from sglang.srt.utils import is_sm100_supported
+    from sglang.srt.utils import get_device_sm, is_sm100_supported
 
     if not is_sm100_supported():
         pytest.skip("Blackwell compensated mHC dispatch")
+    if get_device_sm() == 107 and num_tokens < 4096:
+        pytest.skip("SM107 keeps the DeepGEMM projection below 4096 rows")
     x, w, scale, base = _mhc_mix_inputs(num_tokens)
     norm = SimpleNamespace(weight=torch.ones(5120, device="cuda", dtype=torch.bfloat16))
     layer = _hopper_mhc_layer(norm, w, scale, base)
