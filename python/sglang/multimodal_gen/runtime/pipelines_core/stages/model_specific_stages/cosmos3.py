@@ -26,10 +26,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels import get_kernel
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    quality_allows,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.cache.conditioning import _inference_cache
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
@@ -37,7 +35,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
-    cfg_model_parallel_all_reduce,
+    cfg_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
@@ -98,7 +96,7 @@ from sglang.multimodal_gen.runtime.utils.vision import (
     preprocess_image,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import get_compiler_backend
+from sglang.srt.utils.device import get_compiler_backend
 
 logger = init_logger(__name__)
 
@@ -1930,6 +1928,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                         action_noisy_mask=action_velocity_mask,
                         action_fps=action_fps,
                         action_start_frame_offset=action_start_frame_offset,
+                        combine_as_text_cfg=control_latents is None,
                     )
             else:
                 # No CFG this step (guidance off or outside the CFG window): a
@@ -2074,6 +2073,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         action_noisy_mask: torch.Tensor | None = None,
         action_fps: float | None = None,
         action_start_frame_offset: int = 1,
+        combine_as_text_cfg: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Combine CFG branches as the weighted sum ``sum_b coeff_b * f(branch_b)``.
 
@@ -2083,11 +2083,18 @@ class Cosmos3DenoisingStage(PipelineStage):
         identical on every CFG rank.
 
         Branches are distributed round-robin across the ``cfg_world_size`` CFG
-        ranks. A rank runs its branches sequentially and a final sum all-reduce
-        combines ranks. Forwards are never batched, which preserves each text
-        branch's native length and bounds activation memory with control inputs.
+        ranks. A rank runs its branches sequentially. Forwards are never batched,
+        which preserves each text branch's native length and bounds activation
+        memory with control inputs.
+
+        Under CFG parallel the raw branch predictions are all-gathered and every
+        rank combines them in branch order, so the BF16 result is the one a
+        single rank computes; a sum all-reduce of per-rank partials adds the
+        branches in a different order. ``combine_as_text_cfg`` combines the
+        ``[cond, uncond]`` pair as ``uncond + g * (cond - uncond)``, the order
+        of the single-GPU control-free text CFG paths.
         """
-        acc = None
+        local_preds: dict[int, tuple[torch.Tensor, ...]] = {}
         for i, branch in enumerate(branches):
             if i % cfg_world_size != cfg_rank:
                 continue
@@ -2110,32 +2117,70 @@ class Cosmos3DenoisingStage(PipelineStage):
                 action_start_frame_offset=action_start_frame_offset,
                 control_latents=branch["control_latents"],
             )
-            coeff = branch["coeff"]
-            if isinstance(out, tuple):
-                scaled = tuple(coeff * prediction for prediction in out)
-                acc = (
-                    scaled
-                    if acc is None
-                    else tuple(
-                        total + contribution
-                        for total, contribution in zip(acc, scaled, strict=True)
-                    )
-                )
-            else:
-                scaled = coeff * out
-                acc = scaled if acc is None else acc + scaled
-
-        if acc is None:
-            # More ranks than branches: contribute zeros to the all-reduce.
-            acc = self._zero_like_output(latents, action_latents, sound_latents)
+            local_preds[i] = out if isinstance(out, tuple) else (out,)
 
         if cfg_world_size > 1:
-            if isinstance(acc, tuple):
-                return tuple(
-                    cfg_model_parallel_all_reduce(prediction) for prediction in acc
+            zeros = self._zero_like_output(latents, action_latents, sound_latents)
+            preds = self._all_gather_cfg_branches(
+                local_preds,
+                num_branches=len(branches),
+                cfg_rank=cfg_rank,
+                cfg_world_size=cfg_world_size,
+                zeros=zeros if isinstance(zeros, tuple) else (zeros,),
+            )
+        else:
+            preds = [local_preds[i] for i in range(len(branches))]
+
+        if combine_as_text_cfg:
+            g = branches[0]["coeff"]
+            combined = tuple(
+                u + g * (c - u) for c, u in zip(preds[0], preds[1], strict=True)
+            )
+        else:
+            combined = None
+            for branch, pred in zip(branches, preds, strict=True):
+                scaled = tuple(branch["coeff"] * p for p in pred)
+                combined = (
+                    scaled
+                    if combined is None
+                    else tuple(
+                        total + contribution
+                        for total, contribution in zip(combined, scaled, strict=True)
+                    )
                 )
-            return cfg_model_parallel_all_reduce(acc)
-        return acc
+        return combined if len(combined) > 1 else combined[0]
+
+    @staticmethod
+    def _all_gather_cfg_branches(
+        local_preds: dict[int, tuple[torch.Tensor, ...]],
+        *,
+        num_branches: int,
+        cfg_rank: int,
+        cfg_world_size: int,
+        zeros: tuple[torch.Tensor, ...],
+    ) -> list[tuple[torch.Tensor, ...]]:
+        """All-gather round-robin branch predictions back into branch order.
+
+        Slot ``s`` of rank ``r`` holds branch ``s * cfg_world_size + r``; ranks
+        with fewer branches send zeros for the empty slots.
+        """
+        num_slots = -(-num_branches // cfg_world_size)
+        gathered = []
+        for slot in range(num_slots):
+            pred = local_preds.get(slot * cfg_world_size + cfg_rank, zeros)
+            gathered.append(
+                [
+                    cfg_model_parallel_all_gather(p, dim=0, separate_tensors=True)
+                    for p in pred
+                ]
+            )
+        return [
+            tuple(
+                per_rank[bid % cfg_world_size]
+                for per_rank in gathered[bid // cfg_world_size]
+            )
+            for bid in range(num_branches)
+        ]
 
     def _predict_noise_text_cfg_serial(
         self,

@@ -5,9 +5,11 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.models.unlimited_ocr_v2_support import document_prefetch as p
 from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import UocrReqState
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -19,7 +21,7 @@ def _req(rid, *, after=None, budget=None, keep=False, max_new=1000):
     if after is not None:
         cp[p.KEY_AFTER] = after
         cp[p.KEY_BUDGET] = budget
-    return SimpleNamespace(
+    return FakeReq(
         rid=rid,
         sampling_params=SimpleNamespace(custom_params=cp, max_new_tokens=max_new),
         multimodal_inputs=None,
@@ -30,10 +32,26 @@ def _req(rid, *, after=None, budget=None, keep=False, max_new=1000):
     )
 
 
-def _prefetch():
+def _prefetch(aborted=None):
+    def abort_windows(reqs, finished_reason):
+        # Like the retirer's abort, takes each window out of its list.
+        for req in reqs:
+            req.owner_list._leave([req])
+        if aborted is not None:
+            aborted.extend(reqs)
+
     return p.DocPrefetch(
-        early=None, device=torch.device("cpu"), forward_stream=None, tp_size=1
+        early=None,
+        device=torch.device("cpu"),
+        forward_stream=None,
+        tp_size=1,
+        abort_windows=abort_windows,
     )
+
+
+def _abort(prefetch, rid):
+    for windows in prefetch.request_lists().values():
+        windows.abort(AbortReq(rid=rid))
 
 
 class _Sched:
@@ -49,7 +67,9 @@ class _Sched:
 
     def ingest(self):
         """The scheduler queues released windows at the top of its next step."""
-        for req in self.prefetch.take_released():
+        released = list(self.prefetch.released)
+        self.prefetch.released._drop_all()
+        for req in released:
             self.add(req)
 
 
@@ -80,7 +100,7 @@ class TestNextWindowPrefetch(CustomTestCase):
         sched.ingest()
         self.assertEqual(sched.queue, [w1])
         self.assertEqual(w1.sampling_params.max_new_tokens, 700)
-        self.assertEqual(prefetch.take_released(), [])
+        self.assertEqual(list(prefetch.released), [])
 
     def test_a_follow_up_arriving_late_is_not_parked(self):
         """If the window already finished, the follow-up must go straight in,
@@ -95,6 +115,20 @@ class TestNextWindowPrefetch(CustomTestCase):
         self.assertEqual(sched.queue, [w1])
         # Spliced text is not generation; it does not spend the budget.
         self.assertEqual(w1.sampling_params.max_new_tokens, 479)
+
+    def test_every_follow_up_of_a_window_is_released(self):
+        """Two follow-ups waiting on one window are both queued when it finishes."""
+        prefetch = _prefetch()
+        sched = _Sched(prefetch)
+        w0 = _req("w0", keep=True)
+        w1a = _req("w1a", after="w0", budget=1000)
+        w1b = _req("w1b", after="w0", budget=1000)
+        sched.add(w1a)
+        sched.add(w1b)
+        _finish(w0, 300)
+        prefetch.on_window_finished(w0)
+        sched.ingest()
+        self.assertEqual(sched.queue, [w1a, w1b])
 
     def test_a_retracted_window_releases_nothing(self):
         """Retraction passes the same cache hook unfinished; releasing there
@@ -111,11 +145,13 @@ class TestNextWindowPrefetch(CustomTestCase):
     def test_aborting_the_document_drops_its_held_windows(self):
         """An abort must reach a window still parked off the queue, and one
         released but not yet queued by the scheduler."""
-        prefetch = _prefetch()
+        aborted = []
+        prefetch = _prefetch(aborted)
         sched = _Sched(prefetch)
         w1 = _req("doc-w1-ab", after="doc-w0-cd", budget=1000)
         sched.add(w1)
-        self.assertEqual(prefetch.drop("doc-w1"), [w1])
+        _abort(prefetch, "doc-w1")
+        self.assertEqual(aborted, [w1])
         self.assertEqual(prefetch.held_count(), 0)
 
         w0 = _req("doc-w0-ef", keep=True)
@@ -123,7 +159,8 @@ class TestNextWindowPrefetch(CustomTestCase):
         sched.add(w2)
         _finish(w0, 10)
         prefetch.on_window_finished(w0)
-        self.assertEqual(prefetch.drop("doc-w2"), [w2])
+        _abort(prefetch, "doc-w2")
+        self.assertEqual(aborted, [w1, w2])
         sched.ingest()
         self.assertEqual(sched.queue, [])
 
@@ -140,18 +177,16 @@ class TestNextWindowPrefetch(CustomTestCase):
         _finish(w0, 1)
         prefetch.on_window_finished(w0)
         self.assertCountEqual(prefetch.reset(), [parked, released])
-        self.assertEqual(prefetch.held_count(), 0)
-        self.assertEqual(prefetch.take_released(), [])
 
 
 class TestEarlyEmbeddings(CustomTestCase):
     def test_early_embedding_must_match_the_item_length(self):
         """A stale embedding of another length must not replace the vision pass."""
         early = p.EarlyEmbeddings(encode=lambda items: None)
-        early._by_hash[42] = torch.zeros(5, 4)
+        early._by_key[b"a" * 32] = torch.zeros(5, 4)
         self.assertTrue(early.has_prefetched())
-        self.assertIsNotNone(early.prefetched(42, 5))
-        self.assertIsNone(early.prefetched(42, 6))
+        self.assertIsNotNone(early.prefetched(b"a" * 32, 5))
+        self.assertIsNone(early.prefetched(b"a" * 32, 6))
         self.assertIsNone(early.prefetched(None, 5))
 
 

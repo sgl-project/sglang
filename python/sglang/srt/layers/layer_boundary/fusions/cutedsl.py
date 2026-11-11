@@ -14,6 +14,7 @@ from typing import Callable, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     FfnInputFusion,
@@ -25,7 +26,8 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.fusions.norm import fused_norm_gamma
 from sglang.srt.layers.moe import get_moe_a2a_backend
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
     get_exec,
@@ -248,8 +250,9 @@ class CuteDSLFusion:
         )
 
     def _finalize_eligible(self, plan, forward_batch: ForwardBatch, m: int) -> bool:
-        return (
-            self._eligible(plan, forward_batch, m) and get_parallel().moe_ep_size == 1
+        return self._eligible(plan, forward_batch, m) and (
+            get_parallel().moe_ep_size == 1
+            or envs.SGLANG_OPT_CUTEDSL_EP_DEFERRED_FINALIZE.get()
         )
 
     def _all_reduce_eligible(self, plan, forward_batch: ForwardBatch, m: int) -> bool:

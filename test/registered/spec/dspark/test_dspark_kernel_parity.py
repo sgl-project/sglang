@@ -25,9 +25,9 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kernels import dspark as dspark_kernels
-from sglang.test.test_utils import CustomTestCase, get_device
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
@@ -107,14 +107,21 @@ def _case_build_out_tokens(tc):
     for cl_dtype in (torch.int32, torch.int64):
         # Bonus insertion swept through every position 0..gamma.
         cl = (torch.arange(bs, device=DEVICE) % (gamma + 1)).to(cl_dtype)
-        tc._parity(
+        # Rejected drafts (id beyond the target vocab) must not reach out_tokens.
+        draft_tokens = _ri(0, VOCAB, (bs, gamma))
+        draft_tokens[:, -1] = VOCAB + 10_000
+        got, _ = tc._parity(
             dspark_verify_window.BuildOutTokens,
-            draft_tokens=_ri(0, VOCAB, (bs, gamma)),
+            draft_tokens=draft_tokens,
             correct_len=cl,
             bonus=_ri(0, VOCAB, (bs,)),
             verify_num_draft_tokens=gamma + 1,
             gamma=gamma,
         )
+        # Slots past the bonus position (rejected drafts / tail) must be 0.
+        pos = torch.arange(gamma + 1, device=DEVICE)[None, :]
+        rejected = pos > cl.to(torch.int64)[:, None]
+        tc.assertTrue((got[rejected] == 0).all().item())
 
 
 def _case_build_ragged_verify_window(tc):
@@ -147,10 +154,14 @@ def _case_build_ragged_verify_window(tc):
 def _case_cap_correct_len(tc):
     torch.manual_seed(6)
     bs, nd = 64, 6
-    verify_lens = _ri(1, nd + 1, (bs,), torch.int32)
+    # verify_lens == 0 (padded graph rows) must clamp to 0, never -1.
+    verify_lens = _ri(0, nd + 1, (bs,), torch.int32)
     for cl_dtype in (torch.int32, torch.int64):
         cl = (torch.arange(bs, device=DEVICE) % (nd + 1)).to(cl_dtype)
-        tc._parity(dspark_accept.CapCorrectLen, correct_len=cl, verify_lens=verify_lens)
+        (capped, _trim), _ = tc._parity(
+            dspark_accept.CapCorrectLen, correct_len=cl, verify_lens=verify_lens
+        )
+        tc.assertGreaterEqual(int(capped.min().item()), 0)
 
 
 def _case_causal_swa_page_indices(tc):
@@ -240,27 +251,6 @@ def _case_commit_kv_proj(tc):
     expected = (w8.to(torch.float32) * sf).to(torch.bfloat16)
     stub = types.SimpleNamespace(weight=w8, weight_scale_inv=scale)
     tc._eq(dspark_draft_model._dequant_linear_weight(stub), expected)
-
-
-def _case_compact_layout(tc):
-    torch.manual_seed(10)
-    gamma, t, bs = 5, 6, 64
-    verify_lens = _ri(1, t + 1, (bs,), torch.int32)
-    total = int(verify_lens.sum().item())
-    for padded_total in (total, bs * t):  # exact and bucket padding
-        tc._parity(
-            dspark_kernels.CompactRowIndex,
-            verify_lens=verify_lens,
-            padded_total=padded_total,
-            device=DEVICE,
-        )
-        tc._parity(
-            dspark_kernels.CompactVerifyIds,
-            draft_block_ids=_ri(0, VOCAB, (bs, gamma)),
-            draft_tokens=_ri(0, VOCAB, (bs, gamma)),
-            layout=_layout(verify_lens, padded_total),
-            device=DEVICE,
-        )
 
 
 def _case_swa_page_indices(tc):
@@ -374,21 +364,50 @@ def _case_mixed_accept_select(tc):
 
 def _case_padded_to_bucket(tc):
     torch.manual_seed(15)
-    for bs, padded_bs, graph_num_tokens in ((3, 6, 16), (2, 8, 16), (8, 128, 768)):
+    for bs, padded_bs, graph_num_tokens in (
+        (3, 6, 16),
+        (2, 8, 16),
+        (8, 128, 768),
+        (8, 8, 48),
+    ):
         verify_lens = _ri(1, 7, (bs,), torch.int32)
         if int(verify_lens.sum()) > graph_num_tokens:
             verify_lens = torch.ones(bs, dtype=torch.int32, device=DEVICE)
-        got, _ = tc._parity(
-            ragged_verify_kernels.PaddedToBucket,
-            verify_lens=verify_lens,
-            graph_num_tokens=graph_num_tokens,
-            bs=bs,
-            padded_bs=padded_bs,
-        )
-        # Padding rows must absorb exactly the leftover budget.
-        tc.assertEqual(int(got.to(torch.int64).sum()), graph_num_tokens)
-        if padded_bs > bs:
-            tc.assertTrue(torch.equal(got[:bs], verify_lens))
+        for cap in (None, 6):
+            got, _ = tc._parity(
+                ragged_verify_kernels.PadVerifyLayout,
+                verify_lens=verify_lens,
+                graph_num_tokens=graph_num_tokens,
+                padded_bs=padded_bs,
+                cap=cap,
+            )
+            if cap is None:
+                # Padding rows must absorb exactly the leftover budget.
+                tc.assertEqual(
+                    int(got.verify_lens.to(torch.int64).sum()), graph_num_tokens
+                )
+            if padded_bs > bs:
+                tc.assertTrue(torch.equal(got.verify_lens[:bs], verify_lens))
+            out = ragged_verify_kernels.PaddedLayout(
+                verify_lens=torch.full(
+                    (padded_bs,), -1, dtype=torch.int32, device=DEVICE
+                ),
+                qo_indptr=torch.full(
+                    (padded_bs + 1,), -1, dtype=torch.int32, device=DEVICE
+                ),
+                extend_start_loc=torch.full(
+                    (padded_bs,), -1, dtype=torch.int32, device=DEVICE
+                ),
+            )
+            staged = ragged_verify_kernels.PadVerifyLayout.triton(
+                verify_lens=verify_lens,
+                graph_num_tokens=graph_num_tokens,
+                padded_bs=padded_bs,
+                cap=cap,
+                out=out,
+            )
+            tc.assertIs(staged, out)
+            tc._eq(out, got)
 
 
 def _case_page_table_positions(tc):
@@ -412,10 +431,11 @@ def _case_qo_indptr(tc):
     torch.manual_seed(17)
     cls = ragged_verify_kernels.BuildQoIndptr
     for dtype in (torch.int32, torch.int64):
-        verify_lens = _ri(1, 8, (129,), dtype)  # straddles the 128 block
-        ref = cls.torch(verify_lens=verify_lens)
-        got = cls.triton(verify_lens=verify_lens.to(torch.int32))
-        tc._eq(got, ref)
+        for bs in (129, 600):
+            verify_lens = _ri(1, 8, (bs,), dtype)
+            ref = cls.torch(verify_lens=verify_lens)
+            got = cls.triton(verify_lens=verify_lens.to(torch.int32))
+            tc._eq(got, ref)
     # Aliasing regression: the two outputs must not share storage.
     vl = torch.tensor([3, 1, 5], device=DEVICE, dtype=torch.int32)
     got = cls.triton(verify_lens=vl)
@@ -432,13 +452,15 @@ def _case_scatter_compact_to_strided(tc):
         compact = torch.randn(
             graph_num_tokens, dim, dtype=torch.bfloat16, device=DEVICE
         )
-        tc._parity(
-            dspark_verify_window.ScatterCompactToStrided,
-            compact=compact,
-            layout=_layout(verify_lens, graph_num_tokens),
-            fill_value=0.0,
-            verify_num_draft_tokens=t,
-        )
+        for fill_value, point_mass_fill in ((0.0, False), (-1.0e4, True)):
+            tc._parity(
+                dspark_verify_window.ScatterCompactToStrided,
+                compact=compact,
+                layout=_layout(verify_lens, graph_num_tokens),
+                fill_value=fill_value,
+                verify_num_draft_tokens=t,
+                point_mass_fill=point_mass_fill,
+            )
 
 
 def _case_schedule_verify_lens_topk(tc):
@@ -490,7 +512,6 @@ _CASES = [
     ("causal_swa_page_indices", _case_causal_swa_page_indices),
     ("commit_inject_layout", _case_commit_inject_layout),
     ("commit_kv_proj", _case_commit_kv_proj),
-    ("compact_layout", _case_compact_layout),
     ("swa_page_indices", _case_swa_page_indices),
     ("expand_prefill_causally", _case_expand_prefill_causally),
     ("finalize_accept_lens", _case_finalize_accept_lens),

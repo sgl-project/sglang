@@ -29,9 +29,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_graph_backend import (
+    BaseGraphBackend,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import empty_context, get_bool_env_var, get_compiler_backend
@@ -47,7 +48,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class NPUCudaGraphBackend(BaseCudaGraphBackend):
+class NPUCudaGraphBackend(BaseGraphBackend):
     """One torch.npu.NPUGraph per shape; attention metadata captured
     inside the graph. replay_with_input_update substitutes fresh
     seq_lens without re-recording."""
@@ -108,6 +109,12 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             MultiLayerEagleDraftExtendCudaGraphRunner,
         )
 
+        if (
+            self._decode_runner.model_runner.kv_cache_configurator.modelslim_cache_layout
+            is not None
+        ):
+            return "actual_seq_kvlen"
+
         # FIA V1 uses actual_seq_lengths_kv; FIA V2 uses actual_seq_kvlen.
         # Check specialized runners before their common decode base class.
         runner_update_attrs = (
@@ -135,11 +142,22 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             envs.SGLANG_NPU_USE_FIAS_V2_BSND.get()
             and runner.model_runner.spec_algorithm.is_dspark()
             and runner.capture_forward_mode.is_target_verify()
+            and not getattr(
+                get_mla_dcp_backend(getattr(runner, "attn_backend", None)),
+                "dense_mla_dcp_target",
+                False,
+            )
         )
         return "actual_seq_kvlen" if use_v2 else "actual_seq_lengths_kv"
 
     def _decode_update_lengths(self, forward_batch):
         runner = self._decode_runner
+        mla_backend = get_mla_dcp_backend(getattr(runner, "attn_backend", None))
+        if getattr(mla_backend, "dense_mla_dcp_target", False):
+            seq_lens = list(
+                mla_backend.forward_metadata.seq_lens_cpu_list[: runner.raw_bs]
+            )
+            return seq_lens + [0] * (runner.bs - len(seq_lens))
         if forward_batch.forward_mode.is_target_verify():
             # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
             # replay; other algorithms keep the capture-time list, so
@@ -461,10 +479,17 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                     "CPU sequence lengths."
                 )
             hf_config = runner.model_runner.model_config.hf_config
+            attn_backend = getattr(runner, "attn_backend", None)
+            full_attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+            needs_cpu_seq_lens = getattr(attn_backend, "needs_cpu_seq_lens", True)
+            # QFA needs no FIA host rebinding even when GDN needs CPU lengths.
+            if getattr(full_attn_backend, "use_quant_flash_attn", False):
+                needs_cpu_seq_lens = False
             # The old multi-layer runner always updated Host lengths. Preserve
             # that contract independently of the generic DSA/V4 opt-out.
-            if is_multi_layer_draft_extend or not (
-                is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
+            if is_multi_layer_draft_extend or (
+                needs_cpu_seq_lens
+                and not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config))
             ):
                 # The EAGLE draft check must precede the decode fallback:
                 # EAGLEDraftCudaGraphRunner also subclasses

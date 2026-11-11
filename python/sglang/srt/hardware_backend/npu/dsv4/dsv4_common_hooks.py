@@ -81,16 +81,13 @@ def dsv4_state_payloads(
     * ``DSV4_C4_STATE`` — live C4 compress-state rows.  Prefill
       and decode derive physical rows using their own local ring sizes, so
       decode-only MTP can safely transfer from an 8-row ring to a 16-row ring.
-      A3 derives rows from its local SWA pages; A5 uses request-local banks.
+      Both A3 and Ascend 950 derive rows from their local SWA pages.
     """
 
     import numpy as np
 
     from sglang.srt.disaggregation.ascend.conn import AscendStateType
     from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-    from sglang.srt.mem_cache.deepseek_v4_compress_state import (
-        c4_state_transfer_indices,
-    )
 
     seq_len = max(0, int(seq_len))
     prefix_len = max(0, min(int(prefix_len), seq_len))
@@ -110,9 +107,13 @@ def dsv4_state_payloads(
         return pages[pages > 0]
 
     def c4_state_indices():
-        ring_size = req_to_token_pool.get_dsv4_c4_state_ring_size()
         if is_npu_arch35():
-            return c4_state_transfer_indices(req_pool_idx, seq_len, ring_size=ring_size)
+            return (
+                req_to_token_pool.get_dsv4_c4_state_transfer_rows(req_pool_idx, seq_len)
+                .to(torch.int32)
+                .cpu()
+                .numpy()
+            )
 
         # A3's explicit compressor table follows full -> SWA -> state. Pair
         # the last coff * ratio (2 * 4) positions in logical token order,
@@ -121,6 +122,7 @@ def dsv4_state_payloads(
             req_pool_idx, max(0, seq_len - 8) : seq_len
         ]
         kv_pool = req_to_token_pool._dsv4_allocator.get_kvcache()
+        ring_size = kv_pool.get_ring_size(4)
         swa_locs = kv_pool.translate_loc_from_full_to_swa(full_locs).to(torch.int64)
         swa_pages = swa_locs // kv_pool.swa_page_size
         rows = swa_pages * ring_size + swa_locs % ring_size
@@ -283,7 +285,18 @@ def maybe_build_dsv4_verify_bundle(
         live_seq_lens_cpu = batch.seq_lens[: len(req_indices)].cpu()
     live_seq_lens = live_seq_lens_cpu[: len(req_indices)].tolist()
 
-    verify_lens = [int(draft_token_num)] * len(req_indices)
+    ragged_layout = getattr(
+        getattr(batch, "spec_info", None), "ragged_verify_layout", None
+    )
+    if ragged_layout is None:
+        verify_lens = [int(draft_token_num)] * len(req_indices)
+    elif ragged_layout.verify_lens_cpu is not None:
+        verify_lens = [int(v) for v in ragged_layout.verify_lens_cpu]
+    else:
+        # This helper only runs while preparing eager NPU verify metadata. A
+        # device layout is allowed here; compact graph replay has its own
+        # static metadata buffers and must not take this host path.
+        verify_lens = [int(v) for v in ragged_layout.verify_lens.cpu().tolist()]
 
     def flatten_interval(table: torch.Tensor, ratio: int) -> torch.Tensor:
         page_size = pool.c128_page_size
