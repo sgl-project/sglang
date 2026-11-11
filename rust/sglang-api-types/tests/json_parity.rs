@@ -65,6 +65,14 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "DetokenizeResponse" => check::<api::DetokenizeResponse>(&name, input, canonical),
             "AbortRequest" => check::<api::AbortRequest>(&name, input, canonical),
             "AbortResponse" => check::<api::AbortResponse>(&name, input, canonical),
+            "SetInternalStateRequest" => {
+                check::<api::SetInternalStateRequest>(&name, input, canonical)
+            }
+            "StartProfileRequest" => check::<api::StartProfileRequest>(&name, input, canonical),
+            "SlowDownRequest" => check::<api::SlowDownRequest>(&name, input, canonical),
+            "ReleaseMemoryOccupationRequest" => {
+                check::<api::ReleaseMemoryOccupationRequest>(&name, input, canonical)
+            }
             "PauseGenerationRequest" => {
                 check::<api::PauseGenerationRequest>(&name, input, canonical)
             }

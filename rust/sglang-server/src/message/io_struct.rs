@@ -112,6 +112,13 @@ control_messages! {
         gc_threshold: Option<Vec<i64>>,
     }
 
+    /// `/set_internal_state`'s control request: the numeric knobs to
+    /// override, as the JSON object the client sent (`Dict[str, int | float]`
+    /// on the Python side; the scheduler validates the keys).
+    SetInternalStateReq {
+        server_args: serde_json::Map<String, serde_json::Value>,
+    }
+
     /// `/start_profile` and `/stop_profile`'s control request, Python's
     /// `ProfileReq`. `req_type` is the `ProfileReqType` enum's value on the
     /// wire: 1 starts, 2 stops.
@@ -129,6 +136,27 @@ control_messages! {
         profile_prefix: Option<String>,
         profile_stages: Option<Vec<String>>,
         detailed_annotations: bool,
+    }
+
+    /// The expert-distribution recorder; `action` is `ExpertDistributionReqType`'s
+    /// value: 1 start, 2 stop, 3 dump.
+    ExpertDistributionReq {
+        action: u8,
+    }
+
+    /// `/slow_down`: Python's `SlowDownReqInput`.
+    SlowDownReqInput {
+        forward_sleep_time: Option<f64>,
+    }
+
+    /// `/release_memory_occupation`: Python's `ReleaseMemoryOccupationReqInput`.
+    ReleaseMemoryOccupationReqInput {
+        tags: Option<Vec<String>>,
+    }
+
+    /// `/resume_memory_occupation`: Python's `ResumeMemoryOccupationReqInput`.
+    ResumeMemoryOccupationReqInput {
+        tags: Option<Vec<String>>,
     }
 
     /// `/pause_generation`: Python's `PauseGenerationReqInput`. The scheduler
@@ -240,6 +268,12 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
     }
 }
 
+impl SetInternalStateReq {
+    pub fn new(rid: String, server_args: serde_json::Map<String, serde_json::Value>) -> Self {
+        Self { rid, server_args }
+    }
+}
+
 impl FreezeGCReq {
     pub fn new(rid: String, gc_threshold: Option<Vec<i64>>) -> Self {
         Self { rid, gc_threshold }
@@ -260,6 +294,48 @@ impl ContinueGenerationReqInput {
         }
     }
 }
+
+/// `ExpertDistributionReqType` on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertDistributionAction {
+    Start = 1,
+    Stop = 2,
+    Dump = 3,
+}
+
+impl ExpertDistributionReq {
+    pub fn new(rid: String, action: ExpertDistributionAction) -> Self {
+        Self {
+            rid,
+            action: action as u8,
+        }
+    }
+}
+
+impl SlowDownReqInput {
+    pub fn new(rid: String, forward_sleep_time: Option<f64>) -> Self {
+        Self {
+            rid,
+            forward_sleep_time,
+        }
+    }
+}
+
+impl ReleaseMemoryOccupationReqInput {
+    pub fn new(rid: String, tags: Option<Vec<String>>) -> Self {
+        Self { rid, tags }
+    }
+}
+
+impl ResumeMemoryOccupationReqInput {
+    pub fn new(rid: String, tags: Option<Vec<String>>) -> Self {
+        Self { rid, tags }
+    }
+}
+
+/// `ProfileReqType.START_PROFILE` / `STOP_PROFILE` on the wire.
+pub const PROFILE_REQ_START: u8 = 1;
+pub const PROFILE_REQ_STOP: u8 = 2;
 
 impl ClearHiCacheReqInput {
     pub fn new(rid: String) -> Self {
@@ -342,7 +418,7 @@ impl ProfileReq {
         } = options;
         Self {
             rid,
-            req_type: 1,
+            req_type: PROFILE_REQ_START,
             output_dir,
             start_step,
             num_steps,
@@ -362,7 +438,7 @@ impl ProfileReq {
     /// other field at its default.
     pub fn stop(rid: String) -> Self {
         Self {
-            req_type: 2,
+            req_type: PROFILE_REQ_STOP,
             ..Self::start(rid, ProfileOptions::default())
         }
     }
