@@ -475,9 +475,76 @@ class MistralLarge4ForCausalLM(DeepseekV3ForCausalLM):
         super().__init__(config, quant_config, prefix=prefix)
         self.logits_processor.final_logit_softcapping = config.softmax_tanh_gating
 
+    # Params a correct checkpoint legitimately does not carry: KV-cache
+    # quantisation scales, which default to 1.0 unless kv_cache_dtype is fp8.
+    _LOAD_CHECK_EXEMPT_SUFFIXES = (".k_scale", ".v_scale")
+
+    def _stamp_params_for_load_check(self) -> tuple[dict[str, str], dict]:
+        # Poison every parameter so anything the loader never writes stays
+        # recognisable afterwards. Float tensors get NaN; uint8 (MXFP4 weights
+        # and their e8m0 scales) gets a byte a real checkpoint is vanishingly
+        # unlikely to fill an entire tensor with. Small tensors are backed up
+        # first so a legitimately-unwritten default can be restored -- without
+        # that, poisoning k_scale trips `assert layer.k_scale > 0.0`.
+        stamped: dict[str, str] = {}
+        backup: dict = {}
+        for name, param in self.named_parameters():
+            if name.endswith(self._LOAD_CHECK_EXEMPT_SUFFIXES):
+                continue
+            if param.numel() <= 1 << 20:
+                backup[name] = param.data.clone()
+            if param.dtype.is_floating_point:
+                param.data.fill_(float("nan"))
+                stamped[name] = "nan"
+            elif param.dtype == torch.uint8:
+                param.data.fill_(0xCD)
+                stamped[name] = "0xCD"
+        return stamped, backup
+
+    @staticmethod
+    def _probe_rank() -> object:
+        # Label only. Never let a diagnostic's cosmetics abort a real run.
+        try:
+            return get_parallel().tp_group.rank_in_group
+        except Exception:
+            import os
+
+            return os.environ.get("RANK", "?")
+
+    def _report_unloaded_params(self, stamped: dict[str, str], backup: dict) -> None:
+        rank = self._probe_rank()
+        params = dict(self.named_parameters())
+        unloaded = [
+            name
+            for name, param in params.items()
+            if (stamped.get(name) == "nan" and bool(torch.isnan(param.data).all()))
+            or (stamped.get(name) == "0xCD" and bool((param.data == 0xCD).all()))
+        ]
+        print(
+            f"[WEIGHTCHECK rank={rank}] stamped={len(stamped)} "
+            f"never_written={len(unloaded)}",
+            flush=True,
+        )
+        for name in unloaded[:40]:
+            restored = " (default restored)" if name in backup else " (STILL POISONED)"
+            print(f"[WEIGHTCHECK rank={rank}] UNLOADED {name}{restored}", flush=True)
+        # Put the poison back only where the loader wrote nothing; everything
+        # else now holds real checkpoint data we must not clobber.
+        for name in unloaded:
+            if name in backup:
+                params[name].data.copy_(backup[name])
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        import os
+
+        check_loaded = os.environ.get("SGLANG_CHECK_WEIGHTS_LOADED") == "1"
+        stamped, backup = (
+            self._stamp_params_for_load_check() if check_loaded else ({}, {})
+        )
         loaded_names: set[str] = set()
         super().load_weights(self._remap_weights(weights, loaded_names))
+        if check_loaded:
+            self._report_unloaded_params(stamped, backup)
         if self.model.lerope_alpha is not None:
             if _LEROPE_ALPHA not in loaded_names:
                 raise ValueError(
