@@ -339,7 +339,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kernel backend for convrot_int8 (online or serialized ConvRot INT8):
     # "auto" prefers SGLang's JIT-compiled convrot_int8 ops where they build
     # and run (CC 9.0, 10.0, 12.0, 12.1 with nvcc) and falls back to
-    # comfy_kitchen; "jit" or "comfy_kitchen" forces one backend.
+    # comfy_kitchen on CUDA. On XPU, auto selects the native sgl-kernel-xpu
+    # backend (BMG, BF16, group 256), with no eager/comfy_kitchen fallback.
+    # "jit", "comfy_kitchen" or "xpu" forces one backend.
     "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND", "auto"
     ),

@@ -175,6 +175,16 @@ def _make_quant_config(name: str, **attrs):
 
 
 class TestTransformerQuantHelpers(unittest.TestCase):
+    def setUp(self):
+        # These legacy loader cases pin CUDA/comfy dispatch independent of host.
+        self.enterContext(
+            patch(
+                "sglang.multimodal_gen.runtime.layers.quantization.configs."
+                "convrot_int8_config.current_platform",
+                SimpleNamespace(is_xpu=lambda: False),
+            )
+        )
+
     def test_modelopt_fp8_packed_cutlass_preserves_checkpoint_shard_scales(self):
         for fnuz in (False, True):
             with (

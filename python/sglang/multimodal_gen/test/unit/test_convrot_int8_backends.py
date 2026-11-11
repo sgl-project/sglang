@@ -43,6 +43,16 @@ _LOAD_JIT_KERNEL = (
 )
 _LOAD_COMFY_KITCHEN = "sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen._load_comfy_kitchen"
 
+
+@pytest.fixture(autouse=True)
+def cuda_backend_selection():
+    # These tests describe CUDA dispatch, including when run on an XPU host.
+    with patch(
+        f"{_CONFIG_MODULE}.current_platform", SimpleNamespace(is_xpu=lambda: False)
+    ):
+        yield
+
+
 QWEN_IMAGE_IGNORED_LAYERS = ["img_mod", "txt_mod", "txt_mlp.net.2"]
 
 

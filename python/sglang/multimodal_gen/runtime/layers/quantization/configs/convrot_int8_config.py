@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Config for convrot_int8: online or serialized ConvRot INT8 on the JIT ops or comfy_kitchen.
+"""Config for online or serialized ConvRot INT8 on native XPU, JIT or comfy_kitchen.
 
-Both backends implement the same quantization (arXiv:2512.03673): group-wise
+The backends implement the same quantization scheme (arXiv:2512.03673): group-wise
 regular Hadamard rotation, per-row dynamic INT8 activations and per-output-
 channel INT8 weights, with interchangeable weight and scale tensors. ``auto``
 picks SGLang's JIT-compiled fused ``convrot_int8`` ops where they build and run
@@ -10,6 +10,12 @@ picks SGLang's JIT-compiled fused ``convrot_int8`` ops where they build and run
 (Turing and later; group size 16, 64 or 256; the load fails with an install hint
 when the package is missing). Only a layer whose output width the JIT epilogue
 cannot store falls to comfy_kitchen or, without it, stays BF16.
+
+On XPU, ``auto`` selects sgl-kernel-xpu's two native kernels (BMG, BF16,
+group 256, per-shard K in [256, 8192] and per-shard N divisible by 32). As on
+CUDA, an online layer outside that range stays BF16; a serialized one fails,
+since there is no comfy_kitchen or eager fallback. The native butterfly
+rotation is not bit-exact with dense-matmul rotation.
 """
 
 from __future__ import annotations
@@ -37,6 +43,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 
@@ -44,12 +51,38 @@ logger = init_logger(__name__)
 
 COMFY_KITCHEN = "comfy_kitchen"
 JIT = "jit"
-BACKENDS = ("auto", COMFY_KITCHEN, JIT)
+XPU = "xpu"
+BACKENDS = ("auto", COMFY_KITCHEN, JIT, XPU)
+# Per-shard GEMM shapes the sgl-kernel-xpu ConvRot ops accept.
+XPU_GROUP_SIZE = 256
+XPU_MAX_INPUT_SIZE = 8192
+XPU_OUTPUT_ALIGNMENT = 32
 # Group widths each backend's kernels are instantiated for.
-BACKEND_GROUP_SIZES = {COMFY_KITCHEN: (16, 64, 256), JIT: JIT_GROUP_SIZES}
+BACKEND_GROUP_SIZES = {
+    COMFY_KITCHEN: (16, 64, 256),
+    JIT: JIT_GROUP_SIZES,
+    XPU: (XPU_GROUP_SIZE,),
+}
 _SUPPORTED_GROUP_SIZES = tuple(
     sorted({*BACKEND_GROUP_SIZES[COMFY_KITCHEN], *JIT_GROUP_SIZES})
 )
+
+
+def xpu_supports_input_size(input_size: int) -> bool:
+    """Whether the XPU ops accept a per-shard input (K) width."""
+    return (
+        XPU_GROUP_SIZE <= input_size <= XPU_MAX_INPUT_SIZE
+        and input_size % XPU_GROUP_SIZE == 0
+    )
+
+
+def xpu_supports_shape(*, input_size: int, output_size: int) -> bool:
+    """Whether the XPU ops accept a per-shard ``[output_size, input_size]`` weight."""
+    return (
+        xpu_supports_input_size(input_size)
+        and output_size > 0
+        and output_size % XPU_OUTPUT_ALIGNMENT == 0
+    )
 
 
 def _jit_available() -> bool:
@@ -104,6 +137,12 @@ class ConvRotInt8Config(QuantizationConfig):
             raise ValueError(
                 f"convrot_int8 backend must be one of {BACKENDS}, got {backend!r}"
             )
+        on_xpu = current_platform.is_xpu()
+        if on_xpu and backend not in ("auto", XPU):
+            raise ValueError(
+                "convrot_int8 on XPU requires backend auto or xpu; "
+                "CUDA JIT and comfy_kitchen fallback are not supported"
+            )
         if backend != "auto" and group_size not in BACKEND_GROUP_SIZES[backend]:
             raise ValueError(
                 f"convrot_int8 backend {backend} has kernels for group sizes "
@@ -111,6 +150,9 @@ class ConvRotInt8Config(QuantizationConfig):
             )
         self.group_size = group_size
         self.backend = backend
+        # Every layer runs on the native XPU ops; decided once, so the
+        # per-layer dispatch below never re-probes the platform.
+        self.uses_xpu = backend == XPU or (backend == "auto" and on_xpu)
         self.ignored_layers = ignored_layers or []
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.layer_markers = layer_markers
@@ -140,6 +182,12 @@ class ConvRotInt8Config(QuantizationConfig):
                     )
                 self._serialized_group_sizes[prefix] = marker_group_size
         elif backend == "auto" and self.resolve_backend() is None:
+            if self.uses_xpu:
+                raise ValueError(
+                    f"convrot_int8 backend xpu supports only group size "
+                    f"{XPU_GROUP_SIZE}; got {group_size}. No comfy_kitchen/eager "
+                    "fallback is used"
+                )
             raise ValueError(
                 f"convrot_int8: no backend on this machine serves group size "
                 f"{group_size} (the JIT backend needs CC 9.0/10.0/12.0/12.1, a CUDA "
@@ -155,6 +203,7 @@ class ConvRotInt8Config(QuantizationConfig):
         self.selected_by_backend: dict[str, list[str]] = {
             COMFY_KITCHEN: [],
             JIT: [],
+            XPU: [],
         }
         self.skipped: list[str] = []
         self._processed = 0
@@ -166,6 +215,8 @@ class ConvRotInt8Config(QuantizationConfig):
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
+        if current_platform.is_xpu():
+            return [torch.bfloat16]
         return [torch.bfloat16, torch.float16]
 
     @classmethod
@@ -188,11 +239,13 @@ class ConvRotInt8Config(QuantizationConfig):
 
     def resolve_backend(self, group_size: int | None = None) -> str | None:
         """Backend serving ``group_size`` (default: the online group size), or
-        None when the requested backend has no kernel for it. ``auto`` prefers
-        the JIT ops where they build and run on this GPU; an explicit backend
-        is never substituted."""
+        None when the requested backend has no kernel for it. ``auto`` selects
+        native XPU ops on XPU, or prefers JIT on supported CUDA GPUs.
+        An explicit backend is never substituted."""
         group_size = self.group_size if group_size is None else group_size
         if self.backend == "auto":
+            if self.uses_xpu:
+                return XPU if group_size in BACKEND_GROUP_SIZES[XPU] else None
             if group_size in BACKEND_GROUP_SIZES[JIT] and _jit_available():
                 return JIT
             if group_size in BACKEND_GROUP_SIZES[COMFY_KITCHEN]:
@@ -201,7 +254,12 @@ class ConvRotInt8Config(QuantizationConfig):
         return self.backend if group_size in BACKEND_GROUP_SIZES[self.backend] else None
 
     def require_comfy_kitchen(self, reason: str) -> None:
-        """Serve every layer with comfy_kitchen; an explicit jit request is refused."""
+        """Pin comfy_kitchen on CUDA; refuse native XPU and explicit JIT."""
+        if self.uses_xpu:
+            raise ValueError(
+                f"convrot_int8 backend xpu {reason}; use TP and/or sequence "
+                "parallelism instead. No comfy_kitchen fallback is used"
+            )
         if self.backend == JIT:
             raise ValueError(
                 f"convrot_int8 backend jit {reason}; use backend "
@@ -218,8 +276,14 @@ class ConvRotInt8Config(QuantizationConfig):
             )
         self.backend = COMFY_KITCHEN
 
-    def _backend_for(self, *, group_size: int, out_size: int) -> str | None:
+    def _backend_for(
+        self, *, group_size: int, in_size: int, out_size: int
+    ) -> str | None:
         backend = self.resolve_backend(group_size)
+        if backend == XPU and not xpu_supports_shape(
+            input_size=in_size, output_size=out_size
+        ):
+            return None
         if backend == JIT and out_size % 8:
             # The JIT GEMM epilogue stores 8 BF16 outputs at a time.
             if (
@@ -231,7 +295,16 @@ class ConvRotInt8Config(QuantizationConfig):
             return None
         return backend
 
-    def _no_kernel_reason(self, *, group_size: int, out_size: int) -> str:
+    def _no_kernel_reason(self, *, group_size: int, in_size: int, out_size: int) -> str:
+        if self.uses_xpu:
+            return (
+                f"XPU requires ConvRot group {XPU_GROUP_SIZE}, a per-shard input "
+                f"width in [{XPU_GROUP_SIZE}, {XPU_MAX_INPUT_SIZE}] divisible by "
+                f"{XPU_GROUP_SIZE} and a positive per-shard output width "
+                f"divisible by {XPU_OUTPUT_ALIGNMENT}; got group {group_size}, "
+                f"{in_size} inputs, {out_size} outputs. No comfy_kitchen/eager "
+                "fallback is used"
+            )
         comfy = (
             "installed"
             if _comfy_kitchen_available()
@@ -249,6 +322,14 @@ class ConvRotInt8Config(QuantizationConfig):
     ) -> QuantizeMethodBase:
         self.selected.append(prefix)
         self.selected_by_backend[backend].append(prefix)
+        if backend == XPU:
+            from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_xpu import (
+                ConvRotInt8XpuLinearMethod,
+            )
+
+            return ConvRotInt8XpuLinearMethod(
+                self, group_size=group_size, is_checkpoint_serialized=serialized
+            )
         if backend == JIT:
             from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
                 ConvRotInt8JitLinearMethod,
@@ -278,13 +359,15 @@ class ConvRotInt8Config(QuantizationConfig):
             )
         if not isinstance(layer, LinearBase):
             return None
-        # A column-parallel layer shards its output; every rank sees the same
-        # per-shard width, so the decision below is rank-consistent.
+        # A column-parallel layer shards its output and a row-parallel one its
+        # input; every rank sees the same per-shard widths, so the decisions
+        # below are rank-consistent.
         out_size = (
             layer.output_size_per_partition
             if isinstance(layer, ColumnParallelLinear)
             else layer.output_size
         )
+        in_size = getattr(layer, "input_size_per_partition", layer.input_size)
         if self.layer_markers is not None:
             marker_group_size = self._serialized_group_sizes.get(prefix)
             if marker_group_size is None:
@@ -295,12 +378,16 @@ class ConvRotInt8Config(QuantizationConfig):
                     f"{layer.input_size}, which is not divisible by its "
                     f"ConvRot group size {marker_group_size}"
                 )
-            backend = self._backend_for(group_size=marker_group_size, out_size=out_size)
+            backend = self._backend_for(
+                group_size=marker_group_size, in_size=in_size, out_size=out_size
+            )
             if backend is None:
                 raise ValueError(
                     f"Serialized convrot_int8 layer {prefix!r} has no kernel: "
                     + self._no_kernel_reason(
-                        group_size=marker_group_size, out_size=out_size
+                        group_size=marker_group_size,
+                        in_size=in_size,
+                        out_size=out_size,
                     )
                 )
             return self._select(
@@ -321,9 +408,23 @@ class ConvRotInt8Config(QuantizationConfig):
         if layer.input_size % self.group_size:
             self.skipped.append(f"{prefix}(in={layer.input_size})")
             return UnquantizedLinearMethod()
-        backend = self._backend_for(group_size=self.group_size, out_size=out_size)
+        backend = self._backend_for(
+            group_size=self.group_size, in_size=in_size, out_size=out_size
+        )
         if backend is None:
-            self.skipped.append(f"{prefix}(out={out_size})")
+            if self.uses_xpu:
+                logger.warning(
+                    "convrot_int8: the XPU ops do not serve %s (per-shard in=%d, "
+                    "out=%d); keeping it in BF16",
+                    prefix,
+                    in_size,
+                    out_size,
+                )
+            self.skipped.append(
+                f"{prefix}(in={in_size}, out={out_size})"
+                if self.uses_xpu
+                else f"{prefix}(out={out_size})"
+            )
             return UnquantizedLinearMethod()
         return self._select(
             prefix=prefix, backend=backend, group_size=self.group_size, serialized=False
@@ -335,12 +436,14 @@ class ConvRotInt8Config(QuantizationConfig):
         if self._processed == len(self.selected) - len(self.selected_embeddings):
             logger.info(
                 "convrot_int8: quantized %d linear layers (%.2f GiB of BF16 weights "
-                "-> %.2f GiB INT8; jit %d, comfy_kitchen %d), left %d in BF16",
+                "-> %.2f GiB INT8; jit %d, comfy_kitchen %d, xpu %d), "
+                "left %d in BF16",
                 self._processed,
                 self._quantized_bytes / 1024**3,
                 self._quantized_bytes / 2 / 1024**3,
                 len(self.selected_by_backend[JIT]),
                 len(self.selected_by_backend[COMFY_KITCHEN]),
+                len(self.selected_by_backend[XPU]),
                 len(self.skipped),
             )
             logger.debug("convrot_int8: layers left in BF16: %s", self.skipped)
@@ -351,10 +454,11 @@ class ConvRotInt8Config(QuantizationConfig):
         if self._processed == len(self.selected) - len(self.selected_embeddings):
             logger.info(
                 "convrot_int8: loaded %d serialized INT8 linear layers "
-                "(jit %d, comfy_kitchen %d)",
+                "(jit %d, comfy_kitchen %d, xpu %d)",
                 self._processed,
                 len(self.selected_by_backend[JIT]),
                 len(self.selected_by_backend[COMFY_KITCHEN]),
+                len(self.selected_by_backend[XPU]),
             )
 
     def quantizes_embedding(self, prefix: str) -> bool:
@@ -371,4 +475,8 @@ class ConvRotInt8Config(QuantizationConfig):
             if marker_group_size is None:
                 return True
             group_size = marker_group_size
+        if self.uses_xpu:
+            return group_size == XPU_GROUP_SIZE and xpu_supports_input_size(
+                input_size_per_partition
+            )
         return input_size_per_partition % group_size == 0
