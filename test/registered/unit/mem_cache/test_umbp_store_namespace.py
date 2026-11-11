@@ -290,6 +290,63 @@ class TestUMBPStoreNamespace(CustomTestCase):
         for index in (0, 1):
             self._assert_page(host, index, 11, 22)
 
+    def test_anchor_key_byte_limit_preserves_component_suffixes(self):
+        page_hash = "a" * 64
+        indices = torch.tensor([0], dtype=torch.int64)
+        for prefix in ("x" * 186, "é" * 93):
+            with self.subTest(prefix_bytes=len(prefix.encode("utf-8"))):
+                objects = {}
+                host = self._host()
+                store = self._store(host, objects, model=prefix, tag=None)
+                host.k_buffer.fill_(11)
+                host.v_buffer.fill_(22)
+                self.assertEqual(store.batch_set_v1([page_hash], indices), [True])
+                self.assertEqual(len(objects), 2)
+                self.assertTrue(all(len(key.encode("utf-8")) == 255 for key in objects))
+                host.kv_buffer.zero_()
+                self.assertEqual(store.batch_get_v1([page_hash], indices), [True])
+                self._assert_page(host, 0, 11, 22)
+
+                too_long = self._store(self._host(), {}, model=prefix + "x", tag=None)
+                with self.assertRaisesRegex(ValueError, "255 UTF-8 bytes"):
+                    too_long.batch_set_v1([page_hash], indices)
+
+        # The envelope suffix is one byte longer than an ordinary K/V suffix.
+        envelope = self._store(
+            _ProtocolPool(1, envelope=True), {}, model="x" * 186, tag=None
+        )
+        with self.assertRaisesRegex(ValueError, "255 UTF-8 bytes"):
+            envelope.batch_set_v1([page_hash], indices)
+
+    def test_overlong_anchor_batch_is_rejected_before_client_io(self):
+        objects = {}
+        host = self._host()
+        store = self._store(host, objects, model="x" * 187, tag=None)
+        host.k_buffer.fill_(-7)
+        host.v_buffer.fill_(-9)
+        # The first page fits; the second would lose its K/V suffix on the wire.
+        keys = ["short", "a" * 64]
+        indices = torch.tensor([0, 1], dtype=torch.int64)
+        operations = {
+            "put": lambda: store.batch_set_v1(keys, indices),
+            "put_with_depth": lambda: store.batch_set_v1(
+                keys, indices, HiCacheStorageExtraInfo(prefix_keys=["parent"])
+            ),
+            "get": lambda: store.batch_get_v1(keys, indices),
+            "exists": lambda: store.batch_exists(keys),
+            "exists_v2": lambda: store.batch_exists_v2(keys, []),
+        }
+        with mock.patch.object(store, "client", wraps=store.client) as client:
+            for name, operation in operations.items():
+                with self.subTest(operation=name):
+                    with self.assertRaisesRegex(ValueError, "255 UTF-8 bytes"):
+                        operation()
+                    self.assertEqual(client.mock_calls, [])
+        self.assertEqual(objects, {})
+        self.assertEqual(store.client.depths, {})
+        for index in (0, 1):
+            self._assert_page(host, index, -7, -9)
+
     def test_protocol_layouts_keep_namespace_and_component_order(self):
         cases = (
             ("mla", 1, {"is_mla_model": True}, {}, ("_k",)),
