@@ -1228,11 +1228,16 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             else config.unified_full_cap_tokens
             * (owner.page_size // owner.pool_page_size)
         )
+        requests = set(self.request_allocators.values())
         for band in self.members:
             band._set_capacity(
                 self.arena.num_entries(band.sub_pool_name),
+                # A request band's virtual ids are the request table's rows,
+                # which resizing keeps; a window binds the owner's.
                 virtual_num_pages=None
                 if band.is_id_owner
+                else band.ids.num_virtual_ids
+                if band in requests
                 else owner.ids.num_virtual_ids,
             )
         self._set_token_shares(
@@ -1253,6 +1258,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             else owner.max_slots - 1
         )
         for band in self.members:
+            if band in requests:
+                # Read through the views of the parts it holds, which span the
+                # whole arena: nothing to update.
+                continue
             view = self.views[band.sub_pool_name]
             view.size = band.max_slots - band.pool_page_size
             if band.sub_pool_name == self.roles.state:
