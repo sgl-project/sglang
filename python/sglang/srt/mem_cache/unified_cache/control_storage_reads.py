@@ -296,16 +296,9 @@ class StorageCacheReads:
 
     def _rows(self, job):
         path = self.executor._walk(job.tokens, job.compatibility)
-        if job.borrowed:
-            return [(node, start, matched) for node, start, _, matched in path]
-        if any(end > len(job.tokens) or matched != end for _, _, end, matched in path):
-            raise ControlError(
-                "unsupported", "Resident prefix must end at an existing radix boundary"
-            )
-        return [(node, start, end) for node, start, end, _ in path]
+        return [(node, start, matched) for node, start, _, matched in path]
 
-    def _hold(self, job):
-        rows = self._rows(job)
+    def _hold(self, job, rows):
         if rows and rows[-1][0].id != job.anchor:
             new = self.cache.lock(rows[-1][0].id)
             self._release_anchor(job)
@@ -317,7 +310,7 @@ class StorageCacheReads:
         # Called on the owner thread inside actual host publication, before
         # ordinary admissions/eviction can consume the newly inserted prefix.
         try:
-            self._hold(job)
+            self._hold(job, self._rows(job))
             job.published_host_node = inserted_host_node
         except Exception as error:
             job.failure = ("publication_error", str(error)[:512])
@@ -332,9 +325,9 @@ class StorageCacheReads:
         self._release_anchor(job)
         job.anchor = None
 
-    def _host_length(self, job):
+    def _host_length(self, job, rows=None):
         length = 0
-        for node, _, end in self._rows(job):
+        for node, _, end in self._rows(job) if rows is None else rows:
             if (
                 node.component_data[FULL].host_value is None
                 or node.write_through_pending_id is not None
@@ -444,11 +437,18 @@ class StorageCacheReads:
             ):
                 job.waiting = "source_pending"
                 return
-            self._hold(job)
-            host_length = self._host_length(job)
+            host_length = self._host_length(job, rows)
             if host_length == len(job.tokens):
                 self._retire(job)
                 return
+            if rows:
+                node, start, end = rows[-1]
+                if end - start < len(node.key):
+                    # A matched slice of a compressed sibling is readable,
+                    # but only a full node can anchor a storage suffix.
+                    rows.pop()
+                    host_length = min(host_length, start)
+            self._hold(job, rows)
             waiting = self._admission_wait(job)
             if waiting is not None:
                 job.waiting = waiting

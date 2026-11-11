@@ -673,9 +673,9 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 hicache(self, namespace_keys=True) as owner,
             ):
                 _, cache, service, _ = owner
-                # Same-salt jobs serialize independently of the global bound.
+                # The two reads share the first radix page.
                 scopes = [
-                    cache_fixtures.target((5, 6, 7, 8), cache_salt="queued"),
+                    cache_fixtures.target((1, 6, 7, 8), cache_salt="queued"),
                     cache_fixtures.target(cache_salt="queued"),
                 ]
                 self._cold_scopes(owner, scopes)
@@ -780,7 +780,8 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                             )
                         self.assertIn(demand, job.demands)
                         release.set()
-                        self.assertEqual(wait(service, first).status, Status.COMPLETED)
+                        first = wait(service, first)
+                        self.assertEqual(first.status, Status.COMPLETED, first.update)
                         self.assertEqual(
                             wait(service, queued).status,
                             (
@@ -791,7 +792,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         )
                         self.assertEqual(
                             self._consume_ordinary_prefetch(cache, service, demand),
-                            (4, 0),
+                            (3, 1),  # The sibling already published the first token.
                         )
                         self.assertEqual((len(queries), len(gets)), (2, 2))
                 finally:
@@ -1214,12 +1215,12 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 assert_retired(cache, service)
                 cache.sanity_check()
 
-    def test_same_salt_serializes_while_resident_other_host_scope_finishes(self):
+    def test_shared_root_serializes_while_resident_other_host_scope_finishes(self):
         with hicache(self, namespace_keys=True) as owner:
             _, cache, service, _ = owner
             scopes = [
                 cache_fixtures.target(cache_salt="shared"),
-                cache_fixtures.target((10, 11, 12, 13), cache_salt="shared"),
+                cache_fixtures.target((1, 11, 12, 13), cache_salt="shared"),
                 cache_fixtures.target(cache_salt="resident"),
             ]
             self._cold_scopes(owner, scopes)
