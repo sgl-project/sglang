@@ -170,7 +170,6 @@ struct StoreKVCacheKernel {
     const auto total_warps = batch_size * kNumSplit;
     const auto num_warps = [&] {
       const auto sm_count = runtime::get_sm_count(device.device_id);
-#pragma unroll
       for (uint32_t n : {1, 2, 4}) {
         if (total_warps <= sm_count * n) return n;
       }
