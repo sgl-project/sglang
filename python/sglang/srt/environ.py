@@ -2470,8 +2470,6 @@ class Envs:
     # and the latent up_proj tail above the fused-GEMV range (k3_ar_fusion
     # gemm_ag_up_fits). Online weight updates are rejected while on.
     SGLANG_K3_SHARDED_MOE = EnvBool(True)
-    # Use the ROCm radix-4 router for covered K3 top-k workloads.
-    SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

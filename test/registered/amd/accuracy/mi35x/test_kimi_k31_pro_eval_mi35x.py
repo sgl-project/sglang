@@ -108,11 +108,11 @@ COOKBOOK_ARGS = [
 ]
 
 COOKBOOK_ENV = {
-    # SGLANG_AITER_K3_OPT is gated behind SGLANG_USE_AITER, so both must be
-    # set. AITER_SITUV2_A8W4 selects the W4A8 SiTU expert kernels.
+    # SGLANG_OPT_HIP_K3_AITER's MoE layout change needs SGLANG_USE_AITER, so
+    # both are set. AITER_SITUV2_A8W4 selects the W4A8 SiTU expert kernels.
     # AITER_FLYDSL_FORCE is read by AITER itself, not by sglang.
     "SGLANG_USE_AITER": "1",
-    "SGLANG_AITER_K3_OPT": "1",
+    "SGLANG_OPT_HIP_K3_AITER": "1",
     "AITER_FLYDSL_FORCE": "1",
     "AITER_SITUV2_A8W4": "1",
     "PYTORCH_HIP_ALLOC_CONF": "garbage_collection_threshold:0.95",
