@@ -2,8 +2,12 @@
 
 Run this file in an installed SGLang GPU development environment. Set
 SGLANG_TEST_MINIMAX_LAYER30_DIR to a directory containing config.json,
-model.safetensors.index.json and the layer-30 checkpoint shard to enable
-the optional real-weight case. No model server or downloads are started.
+model.safetensors.index.json and the shards holding layer-30 experts 0-31
+to enable the optional real-weight case. This exercises the issue's expert
+subset, not the full model. No model server or downloads are started.
+
+The printed graph timing is a smoke measurement, not a Marlin/cuTile
+benchmark comparison or an end-to-end serving measurement.
 """
 
 import json
@@ -28,6 +32,7 @@ E2M1 = (0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6)
 
 
 def _dequantize(packed, block_scale, global_scale):
+    """Unpack two E2M1 values per byte; each E4M3 scale covers 16 values."""
     lut = torch.tensor(E2M1, device=packed.device)
     values = torch.stack((lut[(packed & 15).long()], lut[(packed >> 4).long()]), -1)
     values = values.reshape(packed.shape[0], -1)
@@ -44,7 +49,12 @@ def _quantize_weight(weight):
 
 
 def _activation_reference(values):
-    """Use the kernel's global scale of one, not per-token global scales."""
+    """Round-trip through NVFP4 with the kernel's unit global scale.
+
+    Both the input and the SwiGLU intermediate are quantized in W4A4. A
+    BF16-only reference would also measure this intentional quantization
+    loss, rather than isolating differences in the MoE computation.
+    """
     from flashinfer import fp4_quantize
 
     values = values.bfloat16().contiguous()
@@ -119,6 +129,7 @@ def _synthetic_layer(*, experts=4, hidden_size=256, intermediate_size=256, top_k
 
 
 def _direct_flashinfer(layer, *, capacity):
+    """Build a public-API reference without the SGLang adapter helpers."""
     from flashinfer.fused_moe import (
         BackendOptions,
         CuTileNvfp4Config,
@@ -165,6 +176,12 @@ def _direct_flashinfer(layer, *, capacity):
 
 
 def _reference(layer, x, ids, weights):
+    """Use FP32 matmuls after NVFP4 round-trips to check numerical error.
+
+    This intentionally follows MiniMax's clamped SwiGLU and output-side
+    routing weights. Accumulation differs from the fused GPU kernel, so
+    this reference uses a tolerance rather than bitwise equality.
+    """
     xq = _activation_reference(x)
     output = torch.zeros_like(x, dtype=torch.float32)
     for expert in range(layer.num_experts):
@@ -273,11 +290,15 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
                 direct_weights,
             ).clone()
             actual = run().clone()
+            # The adapter and direct public API run the same cuTile kernel;
+            # any difference here is an integration error, not W4A4 loss.
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             relative = (actual.float() - reference).norm() / reference.norm().clamp_min(
                 1e-8
             )
             self.assertLess(relative.item(), 0.15)
+            # Bit identity is required across cuTile runs with fixed input;
+            # it is not a claim of equality with Marlin's W4A16 arithmetic.
             repeats = [run().clone() for _ in range(4)]
             self.assertTrue(
                 all(
@@ -286,6 +307,8 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
                 )
             )
             stream.synchronize()
+            # Eager calls above initialize JIT kernels and workspaces before
+            # capture; the replay timing below excludes that startup work.
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
                 captured = run()
@@ -345,6 +368,8 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
         expected = full_runner.run_from_dispatch(
             dispatch, full_weights, cfg
         ).hidden_states.clone()
+        # TP retains all experts and splits their intermediate dimension:
+        # matching gate/up rows and down-projection input columns.
         partition_size = cfg.intermediate_size_per_partition // 2
         runners, results = [], []
         for rank in range(2):
@@ -368,6 +393,8 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
                 .to(torch.float8_e4m3fn)
                 .contiguous()
             )
+            # Packed FP4 stores two columns per byte; block scales cover
+            # 16 columns. Slice both in their respective storage units.
             params["w2_weight_packed"] = full.w2_weight_packed[
                 :, :, start // 2 : end // 2
             ].contiguous()
@@ -405,6 +432,8 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
         # Keep one configured ceiling: 8193 must be allowed to use bucket 16384.
         self.enterContext(get_schedule().override(max_prefill_tokens=16384))
         self.assertEqual(self.adapter._get_max_num_tokens(), 16384)
+        # Retain one runtime context and runner across every bucket/stream.
+        # Resetting the context per step would hide cumulative allocations.
         runner = self.adapter.FlashInferCuTileRunnerCore(cfg)
         dispatch = _dispatch(layer, 8193)
         # Inputs are allocated once, so differences below include accumulated
@@ -486,6 +515,7 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
         "set SGLANG_TEST_MINIMAX_LAYER30_DIR to test checkpoint weights",
     )
     def test_real_layer30_checkpoint(self):
+        """Check the issue's first 32 real experts, not the full MoE layer."""
         from safetensors import safe_open
 
         directory = Path(envs.SGLANG_TEST_MINIMAX_LAYER30_DIR.get())
@@ -497,6 +527,8 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
         prefix = next(name for name in weight_map if suffix in name).rsplit(
             ".0.w1.", 1
         )[0]
+        # Keep the issue's expert subset for comparable layer geometry.
+        # Routing below is synthetic over these experts, not model routing.
         tensors = {}
         for expert in range(32):
             for projection in ("w1", "w2", "w3"):

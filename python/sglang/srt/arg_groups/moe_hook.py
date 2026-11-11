@@ -202,12 +202,19 @@ def _validate_flashinfer_cutile_config(cfg: Any) -> None:
             "does not yet support speculative decoding",
         ),
         (not cfg.enable_paged_experts, "does not support paged experts"),
+        # Prepared tensors live in FlashInfer's weight pack, outside the
+        # registered parameters traversed by SGLang's CPU offload mechanisms.
         (cfg.cpu_offload_gb <= 0, "does not support --cpu-offload-gb"),
         (cfg.offload_group_size <= 0, "does not support --offload-group-size"),
+        # Without a backup, memory saver can discard weight contents and
+        # require a reload on resume. cuTile rejects that reload, so require
+        # allocation-level CPU backup before permitting memory saver at all.
         (
             not cfg.enable_memory_saver or cfg.enable_weights_cpu_backup,
             "requires --enable-weights-cpu-backup with --enable-memory-saver",
         ),
+        # Presharded files are an export/reload format. This version cannot
+        # serialize a complete checkpoint from the prepared execution pack.
         (
             cfg.load_format != "presharded",
             "does not support --load-format presharded because prepared weights "

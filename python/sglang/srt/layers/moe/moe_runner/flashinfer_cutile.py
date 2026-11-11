@@ -23,7 +23,11 @@ if TYPE_CHECKING:
 
 
 class FlashInferCuTileMoeQuantInfo(MoeQuantInfo):
-    """One layer's prepared weights; execution workspaces are shared separately."""
+    """One layer's prepared weights, separate from shared execution workspaces.
+
+    This is not an nn.Module: the quantization scheme owns the pack and rejects
+    parameter-based offload, online updates and checkpoint export.
+    """
 
     def __init__(self, *, weight_pack: Any, device: torch.device):
         self.weight_pack = weight_pack
@@ -45,6 +49,8 @@ class _CuTileExecution:
     def __call__(self, act_pack: Any, weight_pack: Any) -> torch.Tensor:
         num_tokens = act_pack.hidden_states_q.shape[0]
         capturing = _is_capturing(self.device)
+        # Track successful eager calls, not just allocated workspace buckets:
+        # capture must not be the first call that needs a compiled shape.
         if capturing and num_tokens not in self.warmed_token_counts:
             raise RuntimeError(
                 "flashinfer_cutile requires an eager warmup of this token count "
@@ -88,6 +94,9 @@ class FlashInferCuTileRunnerCore(DispatchMoeRunnerCore):
                 f"flashinfer_cutile received {num_tokens} tokens, exceeding "
                 f"the configured capacity {max_num_tokens}."
             )
+        # Weights are supplied per call, so equal geometries can share an
+        # execution across layers. A separate execution per thread/stream avoids
+        # concurrent calls overwriting the same temporary buffers.
         key = (
             threading.get_ident(),
             device,
@@ -171,8 +180,10 @@ class FlashInferCuTileRunnerCore(DispatchMoeRunnerCore):
         if x.shape[0] == 0:
             return StandardCombineInput(hidden_states=torch.empty_like(x))
 
-        # Graph padding can contain unrouted slots. cuTile does not promise
-        # negative-id handling, so neutralize padding without a host synchronization.
+        # Graph padding can contain unrouted slots (expert id -1). Replace
+        # each with an in-range id AND zero weight: changing only the id would
+        # add expert 0's output. Keep this on-device to avoid a capture-breaking
+        # host synchronization; routing normalization already happened upstream.
         valid = ids >= 0
         ids = torch.where(valid, ids, 0).to(dtype=torch.int32).contiguous()
         weights = torch.where(valid, weights, 0).to(dtype=torch.float32).contiguous()
@@ -185,8 +196,9 @@ class FlashInferCuTileRunnerCore(DispatchMoeRunnerCore):
         )
         execution = self._get_execution(device=x.device, num_tokens=x.shape[0])
         output = execution(act_pack, quant_info.weight_pack)
-        # MiniMax already scales its TopK output. Only honor an additional
-        # factor explicitly carried by the runner contract; never normalize it.
+        # MiniMaxM3MoE configures TopK to include model scaling in its weights.
+        # Preserve those weights and apply only an additional factor carried by
+        # the runner contract, at the same output-side boundary as Marlin.
         if runner_config.routed_scaling_factor is not None:
             output = output * runner_config.routed_scaling_factor
         return StandardCombineInput(hidden_states=output)
@@ -241,11 +253,23 @@ def validate_flashinfer_cutile_config(config: MoeRunnerConfig) -> None:
 def prepare_flashinfer_cutile_nvfp4_weights(
     layer: torch.nn.Module, config: MoeRunnerConfig
 ) -> FlashInferCuTileMoeQuantInfo:
+    """Adapt loaded MiniMax experts to FlashInfer's canonical NVFP4 layout.
+
+    With E experts, hidden size H and local intermediate size I, the loader's
+    packed w13 has shape [E, 2*I, H/2]: two FP4 values share each byte, and
+    output rows are [gate, up]. FlashInfer's w1 argument is this fused first
+    projection (not the checkpoint's gate-only w1) and expects [up, gate].
+    Reorder the matching scales with the rows; w2 is the down projection and
+    keeps its order. FlashInfer then owns the backend-specific preparation.
+    """
     from flashinfer.fused_moe import CuTileNvfp4Config, MoEWeightPack, SwiGLU
 
     validate_flashinfer_cutile_config(config)
     device = layer.w13_weight_packed.device
     _check_device_support(device)
+    # cuTile quantizes both GEMM inputs dynamically. This adapter does not pass
+    # checkpoint activation global scales, so accepting a non-unit value would
+    # silently change the checkpoint's arithmetic.
     for name in ("w13_input_global_scale", "w2_input_global_scale"):
         scale = getattr(layer, name)
         if not torch.equal(scale, torch.ones_like(scale)):
@@ -257,8 +281,9 @@ def prepare_flashinfer_cutile_nvfp4_weights(
         scale = getattr(layer, name)
         if not torch.isfinite(scale).all() or not (scale > 0).all():
             raise ValueError(f"flashinfer_cutile requires finite positive {name}.")
-    # MiniMax's loader stores [gate, up]. The public FlashInfer API takes
-    # [up, gate], including the branch-specific global scale columns.
+    # Block scales are row-major E4M3, one per 16 values along the input
+    # dimension. They follow the output rows, so swapping only packed weights
+    # would pair each branch with the other branch's quantization scales.
     gate, up = layer.w13_weight_packed.chunk(2, dim=1)
     gate_scale, up_scale = layer.w13_weight_scale.chunk(2, dim=1)
     global_scale = layer.w13_weight_global_scale
@@ -270,9 +295,15 @@ def prepare_flashinfer_cutile_nvfp4_weights(
             "flashinfer_cutile w13_weight_global_scale must have shape "
             "[num_experts] or [num_experts, 2]."
         )
+    # A single global scale per expert is shared by both branches. With
+    # two columns, [gate, up] must become [up, gate] just like the weight rows.
     if global_scale.ndim == 2:
         global_scale = global_scale[:, [1, 0]].contiguous()
     alpha, beta, limit = _activation_parameters(config)
+    # Pass checkpoint scales unchanged apart from branch order. The
+    # compressed_tensors source format handles their global-scale convention
+    # and swizzles the row-major block scales; do not apply the Marlin reciprocal
+    # conversion or pre-swizzle them here.
     view = CuTileNvfp4Config.prepare_weights(
         w1_fp4=torch.cat((up, gate), dim=1),
         w1_block_scale=torch.cat((up_scale, gate_scale), dim=1),
@@ -293,6 +324,10 @@ def prepare_flashinfer_cutile_nvfp4_weights(
 
 
 def _activation_parameters(config: MoeRunnerConfig) -> tuple[float, float, float]:
+    # Share one activation mapping between weight preparation and execution.
+    # MiniMax forwards its configured alpha/limit through gemm1_alpha and
+    # gemm1_clamp_limit, and sets gemm1_beta=1.0. Preserve these values instead
+    # of relying on FlashInfer's default activation parameters.
     limit = (
         config.gemm1_clamp_limit
         if config.gemm1_clamp_limit is not None
@@ -326,7 +361,8 @@ def _is_capturing(device: torch.device) -> bool:
 def _get_max_num_tokens() -> int:
     from sglang.srt.runtime_context import cutedsl_moe_max_num_tokens
 
-    # This published bound covers prefill, decode and speculative verification.
+    # Reuse the scheduler's published capacity for both prefill and decode.
+    # This is an input bound, not a byte budget for cached workspaces.
     capacity = cutedsl_moe_max_num_tokens()
     if capacity <= 0:
         raise ValueError("flashinfer_cutile requires a positive token capacity.")
