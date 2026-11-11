@@ -1786,20 +1786,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result = torch.cat([topk_result, padding], dim=0)
         return topk_result
 
-    def _hip_mqa_logits(self, q, index_k, weights, ks, ke, plans=None) -> torch.Tensor:
-        if self.fp4_index_k:
-            return fp4_index_hip.fp4_ragged_mqa_logits(
-                q, weights, self.softmax_scale, index_k, ks, ke, plans
-            )
-        from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
-        kv, scale = index_k
-        # Match the CUDA deep_gemm path (clean_logits=False): the topk transform
-        # masks invalid positions via ks/ke/lengths, so the -inf pre-fill of the
-        # [tokens x seq_len_kv] logits buffer is redundant and grows quadratically
-        # with context length.
-        return fp8_mqa_logits(q, kv, scale, weights, ks, ke, clean_logits=False)
-
     def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
         cached_budget = self._mqa_logits_budget_bytes.get(device_index)
         if cached_budget is not None:
@@ -1890,35 +1876,37 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
-        if dsa_shards_index_k():
-            index_k = self._dcp_gather_index_k(
+        if self.fp4_index_k:
+            # MXFP4 keys of every DCP rank, staged into pages, in kv_fp8's place
+            kv_fp8 = dsa_indexer_hip.fp4_dcp_gather_index_k(
+                layer_id, metadata, block_tables, indexer_seq_lens_cpu
+            )
+        elif dsa_shards_index_k():
+            k_fp8, k_scale = self._dcp_gather_index_k(
                 layer_id, metadata, block_tables, indexer_seq_lens_cpu
             )
         else:
-            index_k = get_token_to_kv_pool().get_index_k_scale_buffer(
+            k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
                 layer_id,
                 metadata.get_indexer_seq_len(),
                 block_tables,
                 seq_len_sum,
                 max_seq_len,
             )
-        if self.fp4_index_k:
-            k_offset = index_k.num_keys
-        else:
-            k_fp8, k_scale = index_k
+        if not self.fp4_index_k:
             if _is_fp8_fnuz:
                 k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
             else:
                 k_fp8 = k_fp8.view(torch.float8_e4m3fn)
 
             k_scale = k_scale.view(torch.float32).squeeze(-1)
-            index_k = (k_fp8, k_scale)
-            k_offset = k_fp8.shape[0]
+            kv_fp8 = (k_fp8, k_scale)
 
         # Check if we need to chunk to avoid OOM
         seq_lens_expanded = metadata.get_seqlens_expanded()
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
+        k_offset = kv_fp8.num_keys if self.fp4_index_k else k_fp8.shape[0]
         # Every DCP rank holds the whole index K: score 1/W of the rows each, then
         # all-gather the top-k.
         split = _is_hip and getattr(metadata, "dcp_size", 1) > 1
@@ -1950,14 +1938,36 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if not need_chunk and not split and tp_split is None:
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
-                if _is_hip:
-                    logits = self._hip_mqa_logits(
-                        q_fp8[:q_offset], index_k, weights[:q_offset], ks, ke
+                if self.fp4_index_k:
+                    logits = fp4_index_hip.fp4_ragged_mqa_logits(
+                        q_fp8[:q_offset],
+                        weights[:q_offset],
+                        self.softmax_scale,
+                        kv_fp8,
+                        ks,
+                        ke,
+                    )
+                elif _is_hip:
+                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+                    kv, scale = kv_fp8
+                    # Match the CUDA deep_gemm path (clean_logits=False): the topk
+                    # transform masks invalid positions via ks/ke/lengths, so the
+                    # -inf pre-fill of the [tokens x seq_len_kv] logits buffer is
+                    # redundant and grows quadratically with context length.
+                    logits = fp8_mqa_logits(
+                        q_fp8[:q_offset],
+                        kv,
+                        scale,
+                        weights[:q_offset],
+                        ks,
+                        ke,
+                        clean_logits=False,
                     )
                 elif _is_xpu:
                     logits = sgl_fp8_mqa_logits(
                         q_fp8[:q_offset],
-                        index_k,
+                        kv_fp8,
                         weights[:q_offset],
                         ks,
                         ke,
@@ -1965,7 +1975,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     )
                 else:
                     logits = self._mqa_logits(
-                        q_fp8[:q_offset], index_k, weights[:q_offset], ks, ke
+                        q_fp8[:q_offset], kv_fp8, weights[:q_offset], ks, ke
                     )
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
@@ -2004,35 +2014,39 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             dst_base = row_lo
 
-        # every layer of an eager batch scores the same row chunks over the same key
-        # table, so the first keeps the FP4 schedules (and their host read of ks)
-        fp4_plans = None
-        if (
-            _is_hip
-            and self.fp4_index_k
-            and not torch.cuda.is_current_stream_capturing()
-            and not is_in_breakable_cuda_graph()
-        ):
-            fp4_plans = getattr(metadata.attn_metadata, "fp4_logits_plans", None)
-
         start = row_lo
         while start < row_hi:
             end = min(start + max_rows, row_hi)
 
             with self._with_real_sm_count():
-                if _is_hip:
-                    logits_chunk = self._hip_mqa_logits(
+                if self.fp4_index_k:
+                    logits_chunk = fp4_index_hip.fp4_ragged_mqa_logits(
                         q_fp8[start:end],
-                        index_k,
+                        weights[start:end],
+                        self.softmax_scale,
+                        kv_fp8,
+                        ks[start:end],
+                        ke[start:end],
+                        dsa_indexer_hip.fp4_logits_plans(metadata),
+                    )
+                elif _is_hip:
+                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+                    kv, scale = kv_fp8
+                    # clean_logits=False: topk transform handles masking (see above)
+                    logits_chunk = fp8_mqa_logits(
+                        q_fp8[start:end],
+                        kv,
+                        scale,
                         weights[start:end],
                         ks[start:end],
                         ke[start:end],
-                        fp4_plans,
+                        clean_logits=False,
                     )
                 elif _is_xpu:
                     logits_chunk = sgl_fp8_mqa_logits(
                         q_fp8[start:end],
-                        index_k,
+                        kv_fp8,
                         weights[start:end],
                         ks[start:end],
                         ke[start:end],
@@ -2041,7 +2055,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 else:
                     logits_chunk = self._mqa_logits(
                         q_fp8[start:end],
-                        index_k,
+                        kv_fp8,
                         weights[start:end],
                         ks[start:end],
                         ke[start:end],
@@ -2092,25 +2106,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         metadata: BaseIndexerMetadata,
         block_tables: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-    ) -> Union[Tuple[torch.Tensor, torch.Tensor], fp4_index_hip.Fp4IndexKeys]:
-        # Prefill under DCP: every request's index-K from all ranks, in DCP1's
-        # get_index_k_scale_buffer layout, so the ragged indexer runs unchanged.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         parallel = get_parallel()
         dcp_size, dcp_rank = parallel.attn_dcp_size, parallel.attn_dcp_rank
         local_lens_cpu = get_dcp_lens(seq_lens_cpu, dcp_size, dcp_rank)
-        if get_exec().kernel.enable_dsa_fp4_indexer:
-            # FP4 keys gather as 68-byte rows and are staged back into pages
-            rows = fp4_index_hip.gather_fp4_index_k_rows(
-                *get_token_to_kv_pool().get_index_k_fp4_buffers(layer_id),
-                block_tables.contiguous(),
-                get_dcp_lens(metadata.get_indexer_seq_len(), dcp_size, dcp_rank),
-                int(local_lens_cpu.sum()),
-                max(int(local_lens_cpu.max()), 1),
-            )
-            return fp4_index_hip.stage_fp4_index_k_rows(
-                dcp_gather_request_rows(rows, seq_lens_cpu)
-            )
-        # block_tables holds this rank's page ids of each request
         k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
             layer_id,
             get_dcp_lens(metadata.get_indexer_seq_len(), dcp_size, dcp_rank),

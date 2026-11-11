@@ -396,3 +396,43 @@ def fp4_topk_paged(
         metadata.attn_metadata.topk_v2_plan,
         metadata.attn_metadata.dcp_topk_length,
     )
+
+
+def fp4_dcp_gather_index_k(
+    layer_id: int, metadata, block_tables: torch.Tensor, seq_lens_cpu: torch.Tensor
+):
+    """Prefill under DCP: every request's MXFP4 index-K from all ranks, gathered as
+    68-byte rows and staged back into pages (fp4_index_hip.Fp4IndexKeys)."""
+    from sglang.kernels.ops.attention.dsa import fp4_index_hip
+    from sglang.srt.layers.attention.dsa.dsa_dcp_sharded_hip import (
+        dcp_gather_request_rows,
+    )
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    dcp_size, dcp_rank = parallel.attn_dcp_size, parallel.attn_dcp_rank
+    local_lens_cpu = get_dcp_lens(seq_lens_cpu, dcp_size, dcp_rank)
+    rows = fp4_index_hip.gather_fp4_index_k_rows(
+        *get_token_to_kv_pool().get_index_k_fp4_buffers(layer_id),
+        block_tables.contiguous(),
+        get_dcp_lens(metadata.get_indexer_seq_len(), dcp_size, dcp_rank),
+        int(local_lens_cpu.sum()),
+        max(int(local_lens_cpu.max()), 1),
+    )
+    return fp4_index_hip.stage_fp4_index_k_rows(
+        dcp_gather_request_rows(rows, seq_lens_cpu)
+    )
+
+
+def fp4_logits_plans(metadata) -> Optional[dict]:
+    """The FP4 prefill logits schedules of an eager batch: every layer scores the same
+    row chunks over the same key table, so the first keeps them (and their host read
+    of ks) for the rest. None under graph capture."""
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+        is_in_breakable_cuda_graph,
+    )
+
+    if torch.cuda.is_current_stream_capturing() or is_in_breakable_cuda_graph():
+        return None
+    return getattr(metadata.attn_metadata, "fp4_logits_plans", None)
