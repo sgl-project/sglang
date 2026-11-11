@@ -2774,6 +2774,10 @@ class Envs:
     # Build a missing Rust extension from source (auto), require a bundled or
     # cached extension (never), or rebuild the local cache entry (force).
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
+    # A prebuilt TreeCore extension loaded in place of the bundled or locally built
+    # one; its SHA-256 is required and must match the file.
+    SGLANG_RUST_TREE_CORE_EXTENSION = EnvStr(None)
+    SGLANG_RUST_TREE_CORE_EXTENSION_SHA256 = EnvStr(None)
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 

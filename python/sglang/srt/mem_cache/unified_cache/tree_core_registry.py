@@ -94,6 +94,11 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
     )
     if device.type not in ("cpu", "cuda"):
         return f"the Rust TreeCore does not support device {device.type}"
+    if envs.SGLANG_RUST_TREE_CORE_EXTENSION.get():
+        # A prebuilt extension registers itself when its package imports (and
+        # raises on a missing file or a sha256 mismatch), so a source checkout
+        # without a toolchain still selects it.
+        importlib.import_module(_RUST_TREE_CORE_MODULE.rpartition(".")[0])
     mode = envs.SGLANG_RUST_BUILD_MODE.get()
     if sys.modules.get(_RUST_TREE_CORE_MODULE) is not None or mode not in (
         "auto",

@@ -413,6 +413,49 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
         self.assertEqual(select_tree_core_backend(_cache_init_params()), "rust")
         tree_core_registry.subprocess.run.assert_not_called()
 
+    def test_prebuilt_extension_needs_no_toolchain_in_a_source_checkout(self):
+        """SGLANG_RUST_TREE_CORE_EXTENSION: the package import registers the prebuilt
+        module before the loaded-module check, so no toolchain probe runs."""
+        module = tree_core_registry._RUST_TREE_CORE_MODULE
+
+        def register(name):
+            self.assertEqual(name, module.rpartition(".")[0])
+            tree_core_registry.sys.modules[module] = SimpleNamespace()
+
+        self.addCleanup(tree_core_registry.sys.modules.pop, module, None)
+        with (
+            envs.SGLANG_RUST_TREE_CORE_EXTENSION.override("/prebuilt/mem_cache.so"),
+            mock.patch.object(
+                tree_core_registry.importlib, "import_module", side_effect=register
+            ) as imported,
+        ):
+            self.assertEqual(select_tree_core_backend(_cache_init_params()), "rust")
+        imported.assert_called_once()
+        tree_core_registry.subprocess.run.assert_not_called()
+
+    def test_prebuilt_extension_load_errors_propagate(self):
+        with (
+            envs.SGLANG_RUST_TREE_CORE_EXTENSION.override("/prebuilt/mem_cache.so"),
+            mock.patch.object(
+                tree_core_registry.importlib,
+                "import_module",
+                side_effect=ImportError("sha256 mismatch"),
+            ),
+            self.assertRaisesRegex(ImportError, "sha256 mismatch"),
+        ):
+            select_tree_core_backend(_cache_init_params())
+
+    def test_without_a_prebuilt_extension_the_package_is_not_imported(self):
+        with (
+            envs.SGLANG_RUST_TREE_CORE_EXTENSION.override(""),
+            mock.patch.object(
+                tree_core_registry.importlib, "import_module"
+            ) as imported,
+        ):
+            tree_core_registry.subprocess.run.side_effect = FileNotFoundError("cargo")
+            self.assertEqual(select_tree_core_backend(_cache_init_params()), "python")
+        imported.assert_not_called()
+
     def test_never_mode_trusts_bundled_extension_in_a_source_checkout(self):
         tree_core_registry.importlib.util.find_spec.return_value = object()
         with envs.SGLANG_RUST_BUILD_MODE.override("never"):
@@ -609,6 +652,48 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "extension load failed"):
                 create_tree_core("rust", _cache_init_params(), {})
         python_factory.assert_not_called()
+
+
+class PrebuiltTreeCoreExtensionTest(CustomTestCase):
+    """SGLANG_RUST_TREE_CORE_EXTENSION loads a prebuilt TreeCore under the bundled
+    module's name, only when SGLANG_RUST_TREE_CORE_EXTENSION_SHA256 matches it."""
+
+    def _load(self, source: str, sha: str | None):
+        import hashlib
+        import sys
+
+        from sglang.srt.mem_cache import rust_tree_core
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "prebuilt_tree_core.py"
+            path.write_text(source)
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            saved = sys.modules.pop(rust_tree_core._MODULE, None)
+            self.addCleanup(
+                lambda: (
+                    sys.modules.pop(rust_tree_core._MODULE, None)
+                    if saved is None
+                    else sys.modules.__setitem__(rust_tree_core._MODULE, saved)
+                )
+            )
+            with envs.SGLANG_RUST_TREE_CORE_EXTENSION_SHA256.override(
+                digest if sha == "match" else sha
+            ):
+                rust_tree_core._load_prebuilt_extension(str(path))
+            return sys.modules[rust_tree_core._MODULE]
+
+    def test_loads_only_with_the_files_sha256(self):
+        module = self._load(
+            "def cache_residency_features():\n    return ('host_evict_first',)\n",
+            "match",
+        )
+        self.assertEqual(module.cache_residency_features(), ("host_evict_first",))
+        stock = self._load("VALUE = 1\n", "match")
+        self.assertEqual(stock.VALUE, 1)
+        with self.assertRaisesRegex(ImportError, "needs SGLANG_RUST_TREE_CORE"):
+            self._load("VALUE = 1\n", None)
+        with self.assertRaisesRegex(ImportError, "has sha256"):
+            self._load("VALUE = 1\n", "0" * 64)
 
 
 if __name__ == "__main__":
