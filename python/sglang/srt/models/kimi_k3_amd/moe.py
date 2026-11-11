@@ -385,8 +385,12 @@ class KimiK3MoEHipMixin:
         return stream[:num_tokens]
 
     def _build_row_sharded_front(self) -> None:
-        """Post-load on gfx950: turn on shard_front and, for the full front, have
-        every rank gather the full shared-expert weights from the TP shards."""
+        """Post-load on gfx950: turn on shard_front, which runs the MoE front (router
+        top-k, latent down-proj) and the shared experts on this rank's rows on top of
+        the row-sharded tail. SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT has every rank
+        gather the full shared-expert weights from the TP shards (+264 MB a layer);
+        SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT keeps them TP-sharded on the
+        all-gathered normed input (no extra memory). The first takes precedence."""
         full = envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT.get()
         if not (
             (full or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT.get())
