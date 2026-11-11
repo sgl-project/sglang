@@ -28,9 +28,8 @@ class RequestRetirer:
     """Ends requests and releases what they hold: `abort` for one no launched
     step reports (sends the abort output), `retire_unadmitted` for one rejected
     before it was queued (streams its output), `release` for one its caller
-    ended and sends. `abort`, `retire_unadmitted` and `abort_retracted` take
-    the request out of the list it is still in: a request ended on its way
-    between lists leaves for none."""
+    ended and sends. Each takes the request out of the list it is still in: a
+    request ended on its way between lists leaves for none."""
 
     def __init__(
         self,
@@ -61,7 +60,6 @@ class RequestRetirer:
         the chunked slot, or refused at the waiting-queue door. ``reason`` is the
         request's own finish reason and ``finished_reason`` what the tokenizer
         receives."""
-        _leave_owner_list(req)
         # Finished in place, so a later abort in the same intake skips it.
         if req.finished_reason is None:
             req.finish_outside_step(reason or FINISH_ABORT())
@@ -74,7 +72,6 @@ class RequestRetirer:
         """Finish a request rejected before it was queued. It holds no device KV,
         but the release still frees its streaming session, its cache prefetch
         retry and a retracted request's host KV backup."""
-        _leave_owner_list(req)
         # An already set `finished_reason` is what the client receives.
         reason = req.finished_reason or req.to_finish
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
@@ -87,6 +84,7 @@ class RequestRetirer:
 
     def release(self, req: Req, *, checkpoint: bool) -> None:
         """Give back what an ended request holds; the caller finishes and streams it."""
+        _leave_owner_list(req)
         record_exit(req, "release")
         if isinstance(req.finished_reason, FINISH_ABORT):
             self._detach(req)
@@ -156,4 +154,4 @@ class RequestRetirer:
 
 def _leave_owner_list(req: Req) -> None:
     if req.owner_list is not None:
-        req.owner_list.leave([req])
+        req.owner_list._leave([req])
