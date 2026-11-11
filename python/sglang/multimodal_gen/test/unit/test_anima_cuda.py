@@ -2,6 +2,7 @@
 """Small, checkpoint-free numerical contracts against the Cosmos reference."""
 
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -19,7 +20,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
     maybe_init_distributed_environment_and_model_parallel,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    DENOISING_LOOP_STATE,
+    set_forward_context,
+)
 from sglang.multimodal_gen.runtime.models.adapter.anima import AnimaTextConditioner
 from sglang.multimodal_gen.runtime.models.dits.anima import AnimaTransformer3DModel
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, server_args
@@ -98,6 +102,88 @@ def test_transformer_matches_cosmos(dtype, batch_size, monkeypatch):
     torch.testing.assert_close(after_graph, actual, atol=0, rtol=0)
     tolerance = 2e-5 if dtype == torch.float32 else 2e-2
     torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+
+    project = anima.AnimaAdaLayerNorm.project_modulation
+    calls = []
+
+    def counted(norm, embedded_timestep, temb):
+        calls.append(norm)
+        return project(norm, embedded_timestep, temb)
+
+    req = SimpleNamespace(extra={}, do_classifier_free_guidance=True)
+    next_t = t / 2
+    norms_per_forward = 3 * kwargs["num_layers"] + 1
+    with patch.object(anima.AnimaAdaLayerNorm, "project_modulation", counted):
+        for i, (conditioning, timestep) in enumerate(
+            ((context, t), (-context, t), (context, next_t), (-context, next_t))
+        ):
+            expected = reference(
+                x, timestep.to(dtype) / 1000, conditioning, padding_mask=padding
+            ).sample
+            with set_forward_context(i // 2, None, forward_batch=req):
+                actual = model(x, conditioning, timestep)
+            torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+            assert len(calls) == norms_per_forward * (i // 2 + 1)
+
+        with (
+            set_forward_context(1, None, forward_batch=req),
+            enable_breakable_cuda_graph(),
+        ):
+            graph_path = model(x, conditioning, timestep)
+        torch.testing.assert_close(graph_path, actual, atol=0, rtol=0)
+        assert len(calls) == 3 * norms_per_forward
+
+        # A new loop, a new request, or a different step cannot reuse old values.
+        req.extra.pop(DENOISING_LOOP_STATE)
+        other_req = SimpleNamespace(extra={}, do_classifier_free_guidance=True)
+        for count, (request, step) in enumerate(
+            ((req, 1), (other_req, 1), (other_req, 2)), start=4
+        ):
+            with set_forward_context(step, None, forward_batch=request):
+                fresh = model(x, conditioning, timestep)
+            torch.testing.assert_close(fresh, actual, atol=0, rtol=0)
+            assert len(calls) == count * norms_per_forward
+
+        no_cfg = SimpleNamespace(extra={}, do_classifier_free_guidance=False)
+        with set_forward_context(1, None, forward_batch=no_cfg):
+            unguided = model(x, conditioning, timestep)
+        torch.testing.assert_close(unguided, actual, atol=0, rtol=0)
+        assert len(calls) == 7 * norms_per_forward
+        assert DENOISING_LOOP_STATE not in no_cfg.extra
+
+        with (
+            patch.object(model, "layerwise_offload_managers", [object()]),
+            set_forward_context(2, None, forward_batch=other_req),
+        ):
+            offloaded = model(x, conditioning, timestep)
+        torch.testing.assert_close(offloaded, actual, atol=0, rtol=0)
+        assert len(calls) == 8 * norms_per_forward
+
+        # Existing wrappers need neither the new keyword nor cached time values.
+        norm_forward = model.norm_out.forward
+        time_forward = model.time_embed.forward
+        wrappers = (
+            (model.norm_out, lambda x, emb, temb: norm_forward(x, emb, temb)),
+            (model.time_embed, lambda t, dtype: time_forward(t, dtype)),
+        )
+        for count, (module, forward) in enumerate(wrappers, start=9):
+            with (
+                patch.object(module, "forward", side_effect=forward),
+                set_forward_context(2, None, forward_batch=other_req),
+            ):
+                wrapped = model(x, conditioning, timestep)
+            torch.testing.assert_close(wrapped, actual, atol=0, rtol=0)
+            assert len(calls) == count * norms_per_forward
+
+        with (
+            patch.object(
+                anima, "get_classifier_free_guidance_world_size", return_value=2
+            ),
+            set_forward_context(2, None, forward_batch=other_req),
+        ):
+            cfg_parallel = model(x, conditioning, timestep)
+        torch.testing.assert_close(cfg_parallel, actual, atol=0, rtol=0)
+        assert len(calls) == 11 * norms_per_forward
 
 
 @torch.no_grad()
