@@ -29,6 +29,8 @@ Each kind of memory a model's layers declare becomes one sub-pool:
 | Sliding window | `window_<length>`, for example `window_4096` (`window` when the model does not state the length) | The KV of layers that attend through one window length | A page |
 | Recurrent state | `mamba` | One state entry per slot (conv and SSM state of every state layer) | One slot |
 
+With DSA sparse attention, each page of the `full` sub-pool holds its tokens' FP8 latent rows (with block scales) layer by layer, then each indexer layer's keys for those tokens, as the paged indexer kernels read them. A layer's rows form a paged buffer whose pages lie one page entry apart; the sparse attention kernels and the latent row writers and gathers address a token's row through that buffer's page and row strides.
+
 Sub-pools are laid out in the arena by retention: the state sub-pool takes the low end and grows up, the full-attention sub-pool takes the high end and grows down, and window sub-pools sit between them. With no state sub-pool, the longest window takes the low end. A sub-pool between the two ends is a *float*: it occupies a span between its neighbours and is relocated when the layout needs it.
 
 ```text
@@ -51,7 +53,8 @@ Unified memory replaces the pools of hybrid models only. At startup, `KVCacheCon
 | Full attention only (plain MHA or MLA) | No: refused at startup |
 | MLA full attention with sliding-window layers | No |
 | DeepSeek-V4 (compressed-KV attention) | No |
-| Qwen4-Exp, Kimi-K3.1, Unlimited-OCR v2, MiniCPM with its sparse attention backends | No: refused by their model overrides |
+| MLA with DSA sparse attention and recurrent state (Kimi-K3.1) | Yes, with the `flashmla_kv` DSA backends; not yet with speculative decoding, `--dcp-size`, PD disaggregation, hierarchical cache or `--enable-return-indexer-topk` |
+| Qwen4-Exp, Unlimited-OCR v2, MiniCPM with its sparse attention backends | No: refused by their model overrides |
 
 The target model's sliding-window layers form one window sub-pool. A fused draft model whose window has a different length adds a second one. Only the Triton attention backend serves several window sub-pools per runner; another backend bound to more windows than it supports raises at startup, naming itself.
 
@@ -63,7 +66,7 @@ Page-major entries make each layer's rows strided, so only backends audited for 
 |---|---|
 | MHA full and sliding-window attention | `triton`, `fa3`, `fa4`, `flashinfer`, `trtllm_mha` |
 | MHA with asymmetric K/V head dims | `triton`, `fa3`, `fa4` |
-| MLA full attention | `triton`, `fa3`, `trtllm_mla`, `flashinfer`, `cutedsl_mla`, `flashmla` |
+| MLA full attention | `triton`, `fa3`, `trtllm_mla`, `flashinfer`, `cutedsl_mla`, `flashmla`; `dsa` for sparse-attention models, with the `flashmla_kv` prefill and decode backends |
 | Linear attention, decode | `triton`, `flashinfer`; also `cutedsl` and `helion` on MLA (KDA) hybrids |
 | Linear attention, prefill | `triton`, `flashkda`, `flashinfer`; also `cutedsl` and `helion` on MLA (KDA) hybrids |
 | Mamba (`--mamba-backend`) | `triton` |

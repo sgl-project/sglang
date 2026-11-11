@@ -790,6 +790,41 @@ def draft_rows_refusal(
     )
 
 
+def _validate_unified_sparse_attention(cfg, model_config) -> bool:
+    """Whether the model attends sparsely (DSA); refuses what the unified pool
+    does not serve for it yet."""
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    if not is_deepseek_dsa(model_config.hf_config):
+        return False
+    # The unified pages hold FP8 latent rows with block scales, which the
+    # flashmla_kv kernels read; the trtllm kernels read raw rows.
+    backends = {cfg.dsa_prefill_backend, cfg.dsa_decode_backend}
+    if backends != {"flashmla_kv"}:
+        raise ValueError(
+            "--enable-unified-memory serves sparse attention with the flashmla_kv "
+            f"DSA backends only; got prefill {cfg.dsa_prefill_backend!r} and "
+            f"decode {cfg.dsa_decode_backend!r}."
+        )
+    unsupported = [
+        flag
+        for flag, on in (
+            ("speculative decoding", cfg.speculative_algorithm is not None),
+            ("--dcp-size > 1", cfg.dcp_size > 1),
+            ("PD disaggregation", cfg.disaggregation_mode != "null"),
+            ("--enable-hierarchical-cache", cfg.enable_hierarchical_cache),
+            ("--enable-return-indexer-topk", cfg.enable_return_indexer_topk),
+        )
+        if on
+    ]
+    if unsupported:
+        raise ValueError(
+            "--enable-unified-memory does not serve sparse attention with "
+            f"{', '.join(unsupported)} yet; drop it or --enable-unified-memory."
+        )
+    return True
+
+
 def handle_page_major_kv_layout(server_args: Any):
     # --enable-unified-memory implies --enable-page-major-kv-layout, so the
     # unified pool goes through this one gate (declared before the guard).
@@ -839,6 +874,8 @@ def handle_page_major_kv_layout(server_args: Any):
             "cutedsl_mla",
             "flashmla",
         }
+        if _validate_unified_sparse_attention(cfg, model_config):
+            allowed_full.add("dsa")
     elif model_config.has_asymmetric_kv:
         allowed_full = set(ASYMMETRIC_KV_BACKENDS)
     else:
