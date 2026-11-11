@@ -20,10 +20,13 @@ Import torch_npu only when an NPU operation actually needs it.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, NamedTuple
 
 import torch
 import torch.distributed as dist
+
+from sglang.srt.eplb.expert_location import get_eplb_group, get_num_nodes_per_tp_group
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -52,8 +55,9 @@ def update_expert_weights_with_staging(
     if not changed_layer_ids:
         return {}
 
-    _validate_migration_topology()
-    world_size = dist.get_world_size()
+    group = get_eplb_group()
+    world_size = dist.get_world_size(group)
+    _validate_migration_topology(world_size)
     staging = _ExpertWeightStaging(weights_by_layer, changed_layer_ids, rank)
     temp_buffers = []
     missing_experts_by_layer = {}
@@ -70,11 +74,12 @@ def update_expert_weights_with_staging(
             old_physical_to_logical_map=old_placement,
             new_physical_to_logical_map=new_placement,
             num_local_physical_experts=old_metadata.num_local_physical_experts,
-            num_gpu_per_node=world_size // nnodes,
+            num_gpu_per_node=world_size // get_num_nodes_per_tp_group(nnodes),
             rank=rank,
             world_size=world_size,
             missing_logical_experts_info=missing_experts,
             log_metrics=log_metrics,
+            group=group,
         )
         # Release this layer's migration views before preparing the next layer.
         del migration_weights
@@ -83,15 +88,14 @@ def update_expert_weights_with_staging(
     return missing_experts_by_layer
 
 
-def _validate_migration_topology() -> None:
+def _validate_migration_topology(group_size: int) -> None:
     from sglang.srt.runtime_context import get_parallel
 
     parallel = get_parallel()
-    if (
-        parallel.tp_size != parallel.moe_ep_size
-        or parallel.moe_ep_size != dist.get_world_size()
-    ):
-        raise ValueError("NPU EPLB migration requires TP size = EP size = WORLD size.")
+    if parallel.tp_size != parallel.moe_ep_size or parallel.moe_ep_size != group_size:
+        raise ValueError(
+            "NPU EPLB migration requires TP size = EP size = EPLB group size."
+        )
 
 
 def _select_expert_weight_updates(old_metadata, new_metadata, layer_ids, rank):
@@ -340,3 +344,77 @@ class _ExpertWeightStaging:
             _expert_storage_view(weight, layout)
             for weight, layout in zip(weights, self._layouts, strict=True)
         ]
+
+
+def _expert_ranks_by_logical_id(
+    placement: list[int], num_local_experts: int
+) -> dict[int, list[int]]:
+    """Index each expert's group-local ranks once, keeping placement order."""
+    expert_ranks = defaultdict(list)
+    for location, expert_id in enumerate(placement):
+        rank = location // num_local_experts
+        ranks = expert_ranks[expert_id]
+        if not ranks or ranks[-1] != rank:
+            ranks.append(rank)
+    return expert_ranks
+
+
+def _copy_expert_weight_runs(
+    weights: list[torch.Tensor],
+    buffers: list[torch.Tensor],
+    copy_infos: list[tuple[int, int]],
+    num_local_experts: int,
+    rank: int,
+) -> None:
+    """Coalesce adjacent slot copies after all sources are staged and P2P completes."""
+    local_start = rank * num_local_experts
+    start = 0
+    while start < len(copy_infos):
+        src, dst = copy_infos[start]
+        end = start + 1
+        while end < len(copy_infos) and copy_infos[end] == (
+            src + end - start,
+            dst + end - start,
+        ):
+            end += 1
+        count = end - start
+        src -= local_start
+        dst -= local_start
+        assert 0 <= src <= num_local_experts - count
+        assert 0 <= dst <= num_local_experts - count
+        for weight, buffer in zip(weights, buffers, strict=True):
+            weight[dst : dst + count].copy_(buffer[src : src + count])
+        start = end
+
+
+def prewarm_eplb_communication() -> None:
+    """Materialize the NPU stage's existing TP transports before KV-cache sizing."""
+    from sglang.srt.runtime_context import get_exec, get_parallel
+
+    parallel = get_parallel()
+    if (
+        not get_exec().moe.enable_eplb
+        or get_exec().moe.elastic_ep_backend is not None
+        or not parallel.moe_ep_size == parallel.tp_size > 1
+    ):
+        return
+    tp = parallel.tp_group
+    group = tp.device_group
+    send = torch.empty(4 << 20, dtype=torch.uint8, device="npu")
+    recv = torch.empty(
+        (tp.world_size - 1, send.numel()), dtype=send.dtype, device=send.device
+    )
+    ops = []
+    for slot, peer in enumerate(p for p in tp.ranks if p != tp.rank):
+        ops.extend(
+            [
+                dist.P2POp(dist.isend, send, peer, group=group),
+                dist.P2POp(dist.irecv, recv[slot], peer, group=group),
+            ]
+        )
+    for work in dist.batch_isend_irecv(ops):
+        work.wait()
+    dist.all_reduce(send.view(torch.int32), group=group)
+    torch.npu.synchronize()
+    del ops, send, recv
+    torch.npu.empty_cache()

@@ -185,6 +185,11 @@ def init_parallel_runtime(
     ):
         _prewarm_eplb_p2p()
 
+    if device == "npu":
+        from sglang.srt.hardware_backend.npu.eplb import prewarm_eplb_communication
+
+        prewarm_eplb_communication()
+
     logger.info(f"Init parallel ends. elapsed={time.perf_counter() - tic:.2f} s")
 
 

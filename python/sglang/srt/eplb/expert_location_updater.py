@@ -32,6 +32,8 @@ from sglang.srt.utils import get_bool_env_var, is_npu
 _is_npu = is_npu()
 if _is_npu:
     from sglang.srt.hardware_backend.npu.eplb import (
+        _copy_expert_weight_runs,
+        _expert_ranks_by_logical_id,
         update_expert_weights_with_staging,
     )
 
@@ -243,6 +245,7 @@ def update_expert_weights_single_layer(
     missing_logical_experts_info: Optional[List[int]] = None,
     debug: bool = False,
     log_metrics: bool = False,
+    group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     assert all(
         tensor.shape[0] == num_local_physical_experts
@@ -282,6 +285,15 @@ def update_expert_weights_single_layer(
         if all(v is not None for v in views):
             routed_experts_weights[i], temp_buffers[i], send = views
         send_weights[i] = send.copy_(routed_experts_weights[i])
+
+    if _is_npu:
+        # Keep NPU migration bookkeeping out of the GPU planning path.
+        old_expert_ranks = _expert_ranks_by_logical_id(
+            old_physical_to_logical_map, num_local_physical_experts
+        )
+        new_expert_ranks = _expert_ranks_by_logical_id(
+            new_physical_to_logical_map, num_local_physical_experts
+        )
 
     self_node_id = rank // num_gpu_per_node
 
@@ -418,7 +430,12 @@ def update_expert_weights_single_layer(
                     P2POp(
                         op=torch.distributed.irecv,
                         tensor=_get_tensor(temp_buffers, i, dst_expert_location),
-                        peer=src_rank,
+                        peer=(
+                            torch.distributed.get_global_rank(group, src_rank)
+                            if group is not None
+                            else src_rank
+                        ),
+                        group=group,
                     )
                     for i in range(num_tensors)
                 ],
@@ -466,7 +483,12 @@ def update_expert_weights_single_layer(
                     P2POp(
                         op=torch.distributed.isend,
                         tensor=_get_tensor(send_weights, i, src_expert_location),
-                        peer=dst_rank,
+                        peer=(
+                            torch.distributed.get_global_rank(group, dst_rank)
+                            if group is not None
+                            else dst_rank
+                        ),
+                        group=group,
                     )
                     for dst_rank in all_dst_ranks
                     for i in range(num_tensors)
@@ -475,26 +497,36 @@ def update_expert_weights_single_layer(
         )
 
     def _compute_comm_info(logical_expert_id: int):
-        all_src_ranks = _deduplicate_ordered(
-            [
-                x // num_local_physical_experts
-                for x in range(num_physical_experts)
-                if old_physical_to_logical_map[x] == logical_expert_id
-            ]
-        )
+        if _is_npu:
+            all_src_ranks = old_expert_ranks[logical_expert_id]
+        else:
+            all_src_ranks = _deduplicate_ordered(
+                [
+                    x // num_local_physical_experts
+                    for x in range(num_physical_experts)
+                    if old_physical_to_logical_map[x] == logical_expert_id
+                ]
+            )
         all_src_nodes = [x // num_gpu_per_node for x in all_src_ranks]
         self_node_src_ranks = [
             x for x in all_src_ranks if x // num_gpu_per_node == self_node_id
         ]
 
-        need_comm_dst_ranks = _deduplicate_ordered(
-            [
-                x // num_local_physical_experts
-                for x in range(num_physical_experts)
-                if new_physical_to_logical_map[x] == logical_expert_id
-                and x // num_local_physical_experts not in all_src_ranks
+        if _is_npu:
+            need_comm_dst_ranks = [
+                rank
+                for rank in new_expert_ranks[logical_expert_id]
+                if rank not in all_src_ranks
             ]
-        )
+        else:
+            need_comm_dst_ranks = _deduplicate_ordered(
+                [
+                    x // num_local_physical_experts
+                    for x in range(num_physical_experts)
+                    if new_physical_to_logical_map[x] == logical_expert_id
+                    and x // num_local_physical_experts not in all_src_ranks
+                ]
+            )
         need_comm_self_node_dst_ranks = (
             [x for x in need_comm_dst_ranks if x // num_gpu_per_node == self_node_id]
             if len(self_node_src_ranks) > 0
@@ -566,6 +598,15 @@ def update_expert_weights_single_layer(
                     req.wait()
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
+        if _is_npu:
+            _copy_expert_weight_runs(
+                routed_experts_weights,
+                temp_buffers,
+                buffer2weight_copy_infos,
+                num_local_physical_experts,
+                rank,
+            )
+            return
         for (
             temp_buffers_expert_location,
             routed_experts_weights_expert_location,
@@ -658,7 +699,12 @@ def _log_p2p_op_metrics(
     for direction, ops in _group_by(all_ops, _get_direction_from_op).items():
         nbytes_of_gpu = [0] * world_size
         for op in ops:
-            nbytes_of_gpu[op.peer] += op.tensor.nbytes
+            peer = (
+                op.peer
+                if op.group is None
+                else torch.distributed.get_group_rank(op.group, op.peer)
+            )
+            nbytes_of_gpu[peer] += op.tensor.nbytes
         nbytes_of_gpu = torch.tensor(nbytes_of_gpu, dtype=torch.int64)
 
         nbytes_of_node = einops.reduce(
