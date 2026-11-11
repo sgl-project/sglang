@@ -26,10 +26,13 @@ from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
     DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO,
     DSV4_PAGE_SIZE,
 )
-from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
+
+# Same value as sglang.srt.configs.ernie55.ERNIE5_5_MOE_ARCH. Spelled out here so
+# importing server_args does not pull in transformers via that config module.
+ERNIE5_5_MOE_ARCH = "Ernie5_5_MoeForCausalLM"
 
 # The MLA latent sub-pool is allocated as e4m3 or bf16,
 # and the memory budget follows the same choice, so no other KV dtype is servable.
