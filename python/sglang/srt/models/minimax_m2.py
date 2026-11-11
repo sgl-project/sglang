@@ -61,6 +61,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -89,7 +91,6 @@ from sglang.srt.runtime_context import (
 # transformers wrapper then crashes on config.rope_parameters (transformers v5 issue).
 # Other files (custom_all_reduce.py, hf_transformers/) also use sglang.srt.utils.
 from sglang.srt.utils import (
-    add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
@@ -97,7 +98,6 @@ from sglang.srt.utils import (
     is_cuda,
     is_npu,
     is_xpu,
-    make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 

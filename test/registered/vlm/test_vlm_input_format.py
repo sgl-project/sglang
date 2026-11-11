@@ -38,7 +38,7 @@ from sglang import Engine
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.hf_transformers import _fix_added_tokens_encoding
 from sglang.srt.parser.conversation import generate_chat_conv
-from sglang.srt.utils.common import is_cuda, is_xpu
+from sglang.srt.utils.device import is_cuda, is_xpu
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
 register_cuda_ci(est_time=213, stage="extra-a", runner_config="1-gpu-large")
