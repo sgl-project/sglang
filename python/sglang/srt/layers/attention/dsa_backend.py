@@ -1288,10 +1288,9 @@ class DeepseekSparseAttnBackend(
                 forward_batch.seq_lens_cpu.max().item() + draft_token_num
             )
         else:
-            # needs_cpu_seq_lens=False nulls the host mirror for spec-v2 relay
-            # batches; graph replay uses the static page-table width, so only this
-            # eager (e.g. over-capture-bs) fallback needs a length here.
-            max_seqlen_k = int(forward_batch.seq_lens.max().item()) + draft_token_num
+            # Use the static width to avoid rank-divergent D2H syncs.
+            # Top-k masks unused columns by cache_seqlens.
+            max_seqlen_k = self.req_to_token.shape[1]
         # [b, max_seqlen_k]
         page_table = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
@@ -1366,19 +1365,12 @@ class DeepseekSparseAttnBackend(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
             )
         elif forward_batch.forward_mode.is_draft_extend_v2():
-            if forward_batch.extend_prefix_lens_cpu is None:
-                assert forward_batch.extend_prefix_lens is not None
-                forward_batch.extend_prefix_lens_cpu = (
-                    forward_batch.extend_prefix_lens.cpu().tolist()
-                )
-            if forward_batch.seq_lens_cpu is None:
-                forward_batch.seq_lens_cpu = forward_batch.seq_lens.cpu()
-                forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
+            # Avoid unused host mirrors and their rank-divergent D2H syncs.
+            # prepare_for_draft_extend already supplies extend_seq_lens_cpu.
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens is not None
-                and forward_batch.extend_prefix_lens_cpu is not None
-            ), "All of them must not be None"
+            ), "extend_seq_lens{,_cpu} must not be None for DRAFT_EXTEND_V2"
 
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             assert forward_batch.extend_seq_lens is not None

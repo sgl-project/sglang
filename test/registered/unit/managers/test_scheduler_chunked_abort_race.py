@@ -34,6 +34,7 @@ from sglang.srt.managers.scheduler_components import (  # noqa: E402
 from sglang.srt.managers.scheduler_components.pause_state import (  # noqa: E402
     PauseState,
 )
+from sglang.srt.managers.scheduler_components.request_list import move  # noqa: E402
 from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -72,7 +73,7 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.enable_continuous_input_polling = False
     sched.result_queue = deque()
     if chunked_req is not None:
-        sched.chunked_reqs.join([chunked_req])
+        move([chunked_req], sched.chunked_reqs)
     sched._pending_chunked_abort_req = pending_req
     sched.disaggregation_mode = None
     sched.enable_hicache_storage = False
