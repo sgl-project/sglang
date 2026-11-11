@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use sglang_api_types::api::v1 as api;
 use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
@@ -17,7 +17,9 @@ use crate::api_server::handlers::{
     HiCacheManager, LORA_DISABLED, ToolSpec, WeightGroupOutcome, WeightUpdateOutcome,
     parse_function_call, separate_reasoning,
 };
+use crate::api_server::http::openai::{ChatFormatter, load_chat_support};
 use crate::api_server::http::weights::{decode_payloads, json_object};
+use crate::api_server::ollama::Ollama;
 use crate::message::config::{
     DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS, PreferredSamplingParams, ServerArgs,
 };
@@ -53,12 +55,16 @@ pub(crate) struct GrpcService {
     core: CoreHandle,
     config: AdapterConfig,
     hicache_manager: Arc<HiCacheManager>,
+    /// The launch args the data-plane adapters (Ollama, Anthropic) read.
+    server_args: Arc<ServerArgs>,
+    /// The served chat template, for the chat-shaped data planes.
+    chat_formatter: Option<ChatFormatter>,
 }
 
 impl GrpcService {
     pub(crate) fn new(
         core: CoreHandle,
-        server_args: &ServerArgs,
+        server_args: Arc<ServerArgs>,
         hicache_manager: Arc<HiCacheManager>,
     ) -> Self {
         Self {
@@ -71,9 +77,11 @@ impl GrpcService {
                     environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
                 ),
                 has_tokenizer: !server_args.skip_tokenizer_init,
-                generation_policy: server_args.into(),
+                generation_policy: server_args.as_ref().into(),
             },
             hicache_manager,
+            chat_formatter: load_chat_support(&server_args),
+            server_args,
         }
     }
 
@@ -100,6 +108,15 @@ impl GrpcService {
                 has_tokenizer: true,
                 generation_policy: GenerationPolicy::default(),
             },
+            server_args: Arc::new(ServerArgs {
+                model_config: crate::message::config::ModelConfig {
+                    context_len: 4096,
+                    vocab_size: 32_000,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            chat_formatter: None,
         }
     }
 }
@@ -152,6 +169,14 @@ fn lora_disabled() -> Result<Response<api::LoraUpdateResponse>, Status> {
 }
 
 impl GrpcService {
+    fn ollama(&self) -> Ollama<'_> {
+        Ollama {
+            core: &self.core,
+            chat_formatter: self.chat_formatter.as_ref(),
+            server_args: &self.server_args,
+        }
+    }
+
     async fn expert_distribution_record(
         &self,
         action: ExpertDistributionAction,
@@ -1045,6 +1070,57 @@ impl SglangService for GrpcService {
         }))
     }
 
+    type OllamaChatStream = ResponseStream<api::OllamaChatResponse>;
+
+    /// `/api/chat` over gRPC: the adapter's frames, errors as statuses.
+    async fn ollama_chat(
+        &self,
+        request: Request<api::OllamaChatRequest>,
+    ) -> Result<Response<Self::OllamaChatStream>, Status> {
+        let mut request = request.into_inner();
+        request.apply_absent_defaults();
+        let frames = self
+            .ollama()
+            .chat(request)
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(Box::pin(
+            frames.map(|frame| frame.map_err(native_api::status)),
+        )))
+    }
+
+    type OllamaGenerateStream = ResponseStream<api::OllamaGenerateResponse>;
+
+    async fn ollama_generate(
+        &self,
+        request: Request<api::OllamaGenerateRequest>,
+    ) -> Result<Response<Self::OllamaGenerateStream>, Status> {
+        let mut request = request.into_inner();
+        request.apply_absent_defaults();
+        let frames = self
+            .ollama()
+            .generate(request)
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(Box::pin(
+            frames.map(|frame| frame.map_err(native_api::status)),
+        )))
+    }
+
+    async fn ollama_tags(
+        &self,
+        _request: Request<api::OllamaTagsRequest>,
+    ) -> Result<Response<api::OllamaTagsResponse>, Status> {
+        Ok(Response::new(self.ollama().tags().await))
+    }
+
+    async fn ollama_show(
+        &self,
+        request: Request<api::OllamaShowRequest>,
+    ) -> Result<Response<api::OllamaShowResponse>, Status> {
+        Ok(Response::new(self.ollama().show(request.into_inner())))
+    }
+
     // The OpenAI interface: the schema is in place for the adapter
     // refactor; the gRPC methods answer UNIMPLEMENTED until it lands.
 }
@@ -1494,7 +1570,7 @@ mod tests {
             };
             GrpcService::new(
                 harness.service.core.clone(),
-                &server_args,
+                Arc::new(server_args),
                 harness.service.hicache_manager.clone(),
             )
             .config
@@ -1787,6 +1863,8 @@ mod tests {
                 service.core.clone(),
                 &ServerArgs::default(),
             )),
+            server_args: service.server_args.clone(),
+            chat_formatter: None,
         };
         let attach = refusing
             .attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest {
@@ -1950,6 +2028,66 @@ mod tests {
         assert!(info.allow_auto_truncate);
         assert!(info.skip_tokenizer_init);
         assert_eq!(info.num_reserved_tokens, 4);
+    }
+
+    /// `OllamaChat` renders the messages with the served template and streams
+    /// the adapter's frames, counts on the done frame; `OllamaShow` needs no
+    /// intake.
+    #[tokio::test]
+    async fn ollama_chat_streams_frames_and_show_is_static() {
+        let mut harness = Harness::new(2, true, Duration::from_secs(1));
+        harness.service.chat_formatter =
+            Some(crate::api_server::http::openai::test_utils::chatml_formatter());
+        let request = api::OllamaChatRequest {
+            model: "m".into(),
+            messages: vec![api::OllamaMessage {
+                role: "user".into(),
+                content: "hi".into(),
+                images: None,
+            }],
+            ..Default::default()
+        };
+        let rpc = harness.service.ollama_chat(Request::new(request));
+        let runtime = async {
+            let intake = harness.next_generation().await;
+            assert!(intake.admission.try_accept());
+            let chat = intake.request.chat_prompt.as_ref().unwrap();
+            assert!(chat.prompt.as_str().contains("hi"));
+            assert_eq!(intake.request.sampling_params.max_new_tokens, Some(2048));
+            intake
+                .sink
+                .try_send(ResponseItem::Frame(chunk(&intake.rid, "o", 7, false)))
+                .unwrap();
+            intake
+                .sink
+                .try_send(ResponseItem::Done(chunk(&intake.rid, "k", 8, true)))
+                .unwrap();
+        };
+        let (response, ()) = tokio::join!(rpc, runtime);
+        let mut stream = response.unwrap().into_inner();
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.message.as_ref().unwrap().content, "o");
+        assert!(!first.done && first.eval_count.is_none());
+        let second = stream.next().await.unwrap().unwrap();
+        assert_eq!(second.message.as_ref().unwrap().content, "k");
+        let done = stream.next().await.unwrap().unwrap();
+        assert!(done.done);
+        assert_eq!(done.done_reason.as_deref(), Some("stop"));
+        assert_eq!(done.message.as_ref().unwrap().content, "");
+        assert_eq!(done.prompt_eval_count, Some(3));
+        assert_eq!(done.eval_count, Some(2));
+        assert!(stream.next().await.is_none());
+
+        let card = harness
+            .service
+            .ollama_show(Request::new(api::OllamaShowRequest {
+                model: "org/Qwen-Chat".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(card.details.unwrap().family, "Qwen");
+        assert_eq!(card.parameters, "num_ctx 4096");
     }
 
     #[tokio::test]

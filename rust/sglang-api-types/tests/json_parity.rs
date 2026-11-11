@@ -88,6 +88,15 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "SendWeightsToRemoteInstanceRequest" => {
                 check::<api::SendWeightsToRemoteInstanceRequest>(&name, input, canonical)
             }
+            "OllamaChatRequest" => check::<api::OllamaChatRequest>(&name, input, canonical),
+            "OllamaChatResponse" => check::<api::OllamaChatResponse>(&name, input, canonical),
+            "OllamaGenerateRequest" => check::<api::OllamaGenerateRequest>(&name, input, canonical),
+            "OllamaGenerateResponse" => {
+                check::<api::OllamaGenerateResponse>(&name, input, canonical)
+            }
+            "OllamaTagsResponse" => check::<api::OllamaTagsResponse>(&name, input, canonical),
+            "OllamaShowRequest" => check::<api::OllamaShowRequest>(&name, input, canonical),
+            "OllamaShowResponse" => check::<api::OllamaShowResponse>(&name, input, canonical),
             "ParseFunctionCallRequest" => {
                 check::<api::ParseFunctionCallRequest>(&name, input, canonical)
             }

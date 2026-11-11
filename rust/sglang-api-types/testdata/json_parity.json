@@ -815,6 +815,156 @@
       "canonical": "{\"new_version\":\"v2\",\"abort_all_requests\":true}"
     },
     {
+      "type": "OllamaChatRequest",
+      "name": "stream defaults to true and the ignored open fields pass through as raw JSON",
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi",
+            "images": [
+              "aGk="
+            ]
+          }
+        ],
+        "format": {
+          "type": "object"
+        },
+        "options": {
+          "temperature": 0.5,
+          "num_predict": 7,
+          "stop": [
+            "x"
+          ],
+          "num_ctx": 4096
+        },
+        "keep_alive": "5m",
+        "think": "low"
+      },
+      "canonical": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\",\"images\":[\"aGk=\"]}],\"stream\":true,\"format\":{\"type\":\"object\"},\"options\":{\"temperature\":0.5,\"num_predict\":7,\"stop\":[\"x\"]},\"keep_alive\":\"5m\",\"think\":\"low\"}"
+    },
+    {
+      "type": "OllamaChatRequest",
+      "name": "an explicit null stream resets to the default",
+      "input": {
+        "model": "m",
+        "messages": [],
+        "stream": null,
+        "options": {
+          "stop": "x",
+          "seed": 3
+        }
+      },
+      "canonical": "{\"model\":\"m\",\"stream\":true,\"options\":{\"stop\":\"x\",\"seed\":3}}"
+    },
+    {
+      "type": "OllamaChatResponse",
+      "name": "a streamed delta carries no counters; a done frame carries the ones it knows",
+      "input": {
+        "model": "m",
+        "created_at": "2026-10-25T00:00:00.000Z",
+        "message": {
+          "role": "assistant",
+          "content": "ok"
+        },
+        "done": true,
+        "done_reason": "stop",
+        "total_duration": 12,
+        "prompt_eval_count": 5,
+        "eval_count": 1
+      },
+      "canonical": "{\"model\":\"m\",\"created_at\":\"2026-10-25T00:00:00.000Z\",\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"done\":true,\"done_reason\":\"stop\",\"total_duration\":12,\"prompt_eval_count\":5,\"eval_count\":1}"
+    },
+    {
+      "type": "OllamaGenerateRequest",
+      "name": "raw defaults to false and the ignored fields are kept",
+      "input": {
+        "model": "m",
+        "prompt": "hi",
+        "system": "be brief",
+        "context": [
+          1,
+          2
+        ],
+        "images": [
+          "aGk="
+        ],
+        "think": true
+      },
+      "canonical": "{\"model\":\"m\",\"prompt\":\"hi\",\"system\":\"be brief\",\"context\":[1,2],\"stream\":true,\"raw\":false,\"images\":[\"aGk=\"],\"think\":true}"
+    },
+    {
+      "type": "OllamaGenerateResponse",
+      "name": "an empty-prompt done frame has no counters",
+      "input": {
+        "model": "m",
+        "created_at": "2026-10-25T00:00:00.000Z",
+        "response": "",
+        "done": true,
+        "done_reason": "stop"
+      },
+      "canonical": "{\"model\":\"m\",\"created_at\":\"2026-10-25T00:00:00.000Z\",\"response\":\"\",\"done\":true,\"done_reason\":\"stop\"}"
+    },
+    {
+      "type": "OllamaTagsResponse",
+      "name": "tags fill the three details Python fills",
+      "input": {
+        "models": [
+          {
+            "name": "m",
+            "model": "m",
+            "modified_at": "2026-10-25T00:00:00.000Z",
+            "size": 0,
+            "digest": "sha256:0",
+            "details": {
+              "format": "sglang",
+              "family": "m",
+              "parameter_size": "unknown"
+            }
+          }
+        ]
+      },
+      "canonical": "{\"models\":[{\"name\":\"m\",\"model\":\"m\",\"modified_at\":\"2026-10-25T00:00:00.000Z\",\"size\":0,\"digest\":\"sha256:0\",\"details\":{\"format\":\"sglang\",\"family\":\"m\",\"parameter_size\":\"unknown\"}}]}"
+    },
+    {
+      "type": "OllamaShowResponse",
+      "name": "model_info is an open object carried as raw JSON",
+      "input": {
+        "license": "",
+        "modelfile": "FROM m\nPARAMETER num_ctx 8\n",
+        "parameters": "num_ctx 8",
+        "template": "",
+        "modified_at": "2026-10-25T00:00:00.000Z",
+        "details": {
+          "parent_model": "",
+          "format": "sglang",
+          "family": "m",
+          "families": [
+            "m"
+          ],
+          "parameter_size": "unknown",
+          "quantization_level": ""
+        },
+        "model_info": {
+          "general.architecture": "m",
+          "m.context_length": 8
+        },
+        "capabilities": [
+          "completion"
+        ]
+      },
+      "canonical": "{\"license\":\"\",\"modelfile\":\"FROM m\\nPARAMETER num_ctx 8\\n\",\"parameters\":\"num_ctx 8\",\"template\":\"\",\"modified_at\":\"2026-10-25T00:00:00.000Z\",\"details\":{\"parent_model\":\"\",\"format\":\"sglang\",\"family\":\"m\",\"families\":[\"m\"],\"parameter_size\":\"unknown\",\"quantization_level\":\"\"},\"model_info\":{\"general.architecture\":\"m\",\"m.context_length\":8},\"capabilities\":[\"completion\"]}"
+    },
+    {
+      "type": "OllamaShowRequest",
+      "name": "the model name",
+      "input": {
+        "model": "m"
+      },
+      "canonical": "{\"model\":\"m\"}"
+    },
+    {
       "type": "UpdateWeightsFromDiskRequest",
       "name": "flush_cache defaults on and null resets it; unread fields keep Python's defaults",
       "input": {

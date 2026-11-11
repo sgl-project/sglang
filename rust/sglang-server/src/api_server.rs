@@ -9,3 +9,4 @@ pub(crate) mod grpc;
 pub(crate) mod handlers;
 pub(crate) mod http;
 mod log;
+pub(crate) mod ollama;

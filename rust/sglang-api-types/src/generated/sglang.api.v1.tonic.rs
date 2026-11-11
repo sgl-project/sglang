@@ -1114,6 +1114,79 @@ pub mod sglang_service_client {
             ));
             self.inner.unary(req, path, codec).await
         }
+        /// Ollama data plane. Chat and generate are server-streaming like Generate:
+        /// a unary request is a one-frame stream, and the final frame carries the
+        /// counters. Chat renders the messages with the served chat template.
+        pub async fn ollama_chat(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OllamaChatRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::OllamaChatResponse>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/OllamaChat");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sglang.api.v1.SglangService", "OllamaChat"));
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn ollama_generate(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OllamaGenerateRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::OllamaGenerateResponse>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/OllamaGenerate");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OllamaGenerate",
+            ));
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn ollama_tags(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OllamaTagsRequest>,
+        ) -> std::result::Result<tonic::Response<super::OllamaTagsResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/OllamaTags");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sglang.api.v1.SglangService", "OllamaTags"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn ollama_show(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OllamaShowRequest>,
+        ) -> std::result::Result<tonic::Response<super::OllamaShowResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/OllamaShow");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sglang.api.v1.SglangService", "OllamaShow"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1403,6 +1476,35 @@ pub mod sglang_service_server {
             &self,
             request: tonic::Request<super::ElasticEpStateRequest>,
         ) -> std::result::Result<tonic::Response<super::ElasticEpStateResponse>, tonic::Status>;
+        /// Server streaming response type for the OllamaChat method.
+        type OllamaChatStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::OllamaChatResponse, tonic::Status>,
+            > + std::marker::Send
+            + 'static;
+        /// Ollama data plane. Chat and generate are server-streaming like Generate:
+        /// a unary request is a one-frame stream, and the final frame carries the
+        /// counters. Chat renders the messages with the served chat template.
+        async fn ollama_chat(
+            &self,
+            request: tonic::Request<super::OllamaChatRequest>,
+        ) -> std::result::Result<tonic::Response<Self::OllamaChatStream>, tonic::Status>;
+        /// Server streaming response type for the OllamaGenerate method.
+        type OllamaGenerateStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::OllamaGenerateResponse, tonic::Status>,
+            > + std::marker::Send
+            + 'static;
+        async fn ollama_generate(
+            &self,
+            request: tonic::Request<super::OllamaGenerateRequest>,
+        ) -> std::result::Result<tonic::Response<Self::OllamaGenerateStream>, tonic::Status>;
+        async fn ollama_tags(
+            &self,
+            request: tonic::Request<super::OllamaTagsRequest>,
+        ) -> std::result::Result<tonic::Response<super::OllamaTagsResponse>, tonic::Status>;
+        async fn ollama_show(
+            &self,
+            request: tonic::Request<super::OllamaShowRequest>,
+        ) -> std::result::Result<tonic::Response<super::OllamaShowResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct SglangServiceServer<T> {
@@ -3697,6 +3799,172 @@ pub mod sglang_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetElasticEpStateSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OllamaChat" => {
+                    #[allow(non_camel_case_types)]
+                    struct OllamaChatSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::ServerStreamingService<super::OllamaChatRequest>
+                        for OllamaChatSvc<T>
+                    {
+                        type Response = super::OllamaChatResponse;
+                        type ResponseStream = T::OllamaChatStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OllamaChatRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::ollama_chat(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OllamaChatSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OllamaGenerate" => {
+                    #[allow(non_camel_case_types)]
+                    struct OllamaGenerateSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::ServerStreamingService<super::OllamaGenerateRequest>
+                        for OllamaGenerateSvc<T>
+                    {
+                        type Response = super::OllamaGenerateResponse;
+                        type ResponseStream = T::OllamaGenerateStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OllamaGenerateRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::ollama_generate(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OllamaGenerateSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OllamaTags" => {
+                    #[allow(non_camel_case_types)]
+                    struct OllamaTagsSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::OllamaTagsRequest> for OllamaTagsSvc<T> {
+                        type Response = super::OllamaTagsResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OllamaTagsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::ollama_tags(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OllamaTagsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OllamaShow" => {
+                    #[allow(non_camel_case_types)]
+                    struct OllamaShowSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::OllamaShowRequest> for OllamaShowSvc<T> {
+                        type Response = super::OllamaShowResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OllamaShowRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::ollama_show(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OllamaShowSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
