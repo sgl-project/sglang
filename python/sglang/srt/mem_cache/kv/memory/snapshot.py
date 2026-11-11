@@ -26,6 +26,13 @@ def _physical(band, indices, *, by_unit):
     return band.ids.translate(indices) if by_unit else band.ids.translate_write(indices)
 
 
+def _whole_pages(indices, page_size):
+    """Every token id of the pages ``indices`` touch, page by page in order."""
+    pages = torch.unique_consecutive(indices.reshape(-1) // page_size)
+    slots = torch.arange(page_size, dtype=indices.dtype, device=indices.device)
+    return (pages[:, None] * page_size + slots).reshape(-1)
+
+
 def _band_ids(allocator, band, indices, state_indices, request_row):
     """The ids ``band`` names the request's entries by, and whether they are
     units (a state slot, a request row) rather than token ids."""
@@ -35,6 +42,9 @@ def _band_ids(allocator, band, indices, state_indices, request_row):
         if request_row is None:
             return None, True
         return torch.tensor([int(request_row)], device=band.device), True
+    if allocator.arena.band(band.sub_pool_name).copies_whole_units:
+        # The page's per-page parts sit past its tokens' rows.
+        return _whole_pages(indices, band.page_size), False
     return indices, False
 
 

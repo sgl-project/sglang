@@ -44,6 +44,9 @@ class ArenaBand(msgspec.Struct, frozen=True, kw_only=True):
     grow_direction: str  # "up" | "down" | "float"
     # Units handed out zeroed, for layouts whose readers load whole pages.
     zero_on_handout: bool
+    # Units whose entries are not one token each (a page with per-page parts):
+    # copies of a request's tokens take their whole units.
+    copies_whole_units: bool = False
 
     @property
     def unit_bytes(self) -> int:
@@ -59,6 +62,7 @@ def plan_bands(plan: KVStoragePlan) -> Tuple[ArenaBand, ...]:
             unit_entries=s.unit,
             grow_direction=s.spec.grow_direction,
             zero_on_handout=s.spec.zero_units_on_handout,
+            copies_whole_units=s.spec.copies_whole_units,
         )
         for s in plan.sub_pools
     )
