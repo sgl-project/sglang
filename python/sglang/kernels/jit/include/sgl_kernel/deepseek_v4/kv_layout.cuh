@@ -16,8 +16,8 @@
 #endif
 
 // Paged fp8 / fp4 KV cache layouts read by the d_qk = 512 sparse MLA decode
-// kernels. A page block is `page_size` data rows followed by `page_size` scale
-// rows, so the scale region starts at byte `page_size * kDataBytes`:
+// kernels. A block-split page is `page_size` data rows followed by `page_size`
+// scale rows, so the scale region starts at byte `page_size * kDataBytes`:
 //
 //   V4       584 B/token: 448 e4m3 + 64 bf16 (RoPE) data, 7 ue8m0 scales + 1 pad,
 //            one scale per 64 e4m3 values.
@@ -26,16 +26,27 @@
 //   V41_FP4  288 B/token: 512 e2m1 data packed two per byte (even index in the
 //            low nibble), 32 e4m3 scales, one per 16 values.
 //
-// The reader requires the rows of a page to be contiguous and the page stride
-// to be a multiple of kPageAlign (its TMA row stride), which is what
-// kv_page_bytes pads to. The pure-torch reference of the V41 (fp8) quantizer is
-// `sglang.test.kernels.deepseek_v4.k_cache_reference`.
+// V41_NEW / V41_FP4_NEW (FlashMLA's 2026.09.30 kernels) store the V41 / V41_FP4
+// bytes interleaved: each token is its data immediately followed by its scales,
+// 528 / 288 B apart, with no page padding.
+//
+// The block-split reader requires the rows of a page to be contiguous and the
+// page stride to be a multiple of kPageAlign (its TMA row stride), which is what
+// kv_page_bytes pads to. The pure-torch reference of the V41 quantizers is
+// `sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference`.
 
 namespace sglang {
 
 namespace deepseek_v4 {
 
-enum class KVLayout : int32_t { V4 = 0, V41 = 1, V41_FP4 = 2, UNIFORM_FP8 = 3 };
+enum class KVLayout : int32_t { V4 = 0, V41 = 1, V41_FP4 = 2, UNIFORM_FP8 = 3, V41_NEW = 4, V41_FP4_NEW = 5 };
+
+/// The token encoding of a layout: V41_NEW / V41_FP4_NEW store the V41 / V41_FP4 bytes.
+constexpr KVLayout kv_encoding(KVLayout layout) {
+  if (layout == KVLayout::V41_NEW) return KVLayout::V41;
+  if (layout == KVLayout::V41_FP4_NEW) return KVLayout::V41_FP4;
+  return layout;
+}
 
 template <KVLayout kLayout>
 struct KVLayoutTraits;
@@ -46,6 +57,7 @@ struct KVLayoutTraits<KVLayout::V4> {
   static constexpr int64_t kScaleBytes = 8;
   static constexpr int64_t kTileSize = 64;
   static constexpr int64_t kPageAlign = 576;
+  static constexpr bool kInterleaved = false;
   static constexpr int64_t kBytesPerToken = kDataBytes + kScaleBytes;
 };
 
@@ -55,6 +67,7 @@ struct KVLayoutTraits<KVLayout::V41> {
   static constexpr int64_t kScaleBytes = 16;
   static constexpr int64_t kTileSize = 32;
   static constexpr int64_t kPageAlign = 512;
+  static constexpr bool kInterleaved = false;
   static constexpr int64_t kBytesPerToken = kDataBytes + kScaleBytes;
 };
 
@@ -64,6 +77,7 @@ struct KVLayoutTraits<KVLayout::V41_FP4> {
   static constexpr int64_t kScaleBytes = 32;
   static constexpr int64_t kTileSize = 16;
   static constexpr int64_t kPageAlign = 256;
+  static constexpr bool kInterleaved = false;
   static constexpr int64_t kBytesPerToken = kDataBytes + kScaleBytes;
 };
 
@@ -73,8 +87,21 @@ struct KVLayoutTraits<KVLayout::UNIFORM_FP8> {
   static constexpr int64_t kScaleBytes = 0;
   static constexpr int64_t kTileSize = 512;
   static constexpr int64_t kPageAlign = 512;
+  static constexpr bool kInterleaved = false;
   static constexpr int64_t kBytesPerToken = kDataBytes;
 };
+
+template <KVLayout kLayout>
+struct InterleavedKVLayoutTraits : KVLayoutTraits<kv_encoding(kLayout)> {
+  static constexpr bool kInterleaved = true;
+  static constexpr int64_t kPageAlign = KVLayoutTraits<kv_encoding(kLayout)>::kBytesPerToken;
+};
+
+template <>
+struct KVLayoutTraits<KVLayout::V41_NEW> : InterleavedKVLayoutTraits<KVLayout::V41_NEW> {};
+
+template <>
+struct KVLayoutTraits<KVLayout::V41_FP4_NEW> : InterleavedKVLayoutTraits<KVLayout::V41_FP4_NEW> {};
 
 /// Bytes of one page block: `page_size` tokens, padded up to the reader's row stride.
 template <KVLayout kLayout>
@@ -83,14 +110,16 @@ constexpr int64_t kv_page_bytes(int64_t page_size) {
   return (page_size * Traits::kBytesPerToken + Traits::kPageAlign - 1) / Traits::kPageAlign * Traits::kPageAlign;
 }
 
-/// Addressing of a paged cache: `1 << kPageBits` data rows then as many scale rows, padded to kPageAlign.
+/// Addressing of a paged cache of `1 << kPageBits` tokens per page, padded to kPageAlign:
+/// slot `i`'s data at `i * kDataStride`, its scales at `kScaleBase + i * kScaleStride`.
 template <KVLayout kLayout, uint32_t kPageBits>
 struct PagedKV {
   using Traits = KVLayoutTraits<kLayout>;
   static constexpr int64_t kPageSize = int64_t{1} << kPageBits;
   static constexpr int64_t kPageBytes = kv_page_bytes<kLayout>(kPageSize);
-  /// Byte offset of the scale rows inside a page.
-  static constexpr int64_t kScaleBase = Traits::kDataBytes << kPageBits;
+  static constexpr int64_t kDataStride = Traits::kInterleaved ? Traits::kBytesPerToken : Traits::kDataBytes;
+  static constexpr int64_t kScaleBase = Traits::kInterleaved ? Traits::kDataBytes : Traits::kDataBytes << kPageBits;
+  static constexpr int64_t kScaleStride = Traits::kInterleaved ? Traits::kBytesPerToken : Traits::kScaleBytes;
 
   template <typename LocT>
   static constexpr LocT page_of(LocT loc) {
@@ -103,11 +132,11 @@ struct PagedKV {
   /// Byte offsets of token `loc`'s data row and scale row from the cache base.
   template <typename LocT>
   static constexpr int64_t data_offset(LocT loc) {
-    return page_of(loc) * kPageBytes + slot_of(loc) * Traits::kDataBytes;
+    return page_of(loc) * kPageBytes + slot_of(loc) * kDataStride;
   }
   template <typename LocT>
   static constexpr int64_t scale_offset(LocT loc) {
-    return page_of(loc) * kPageBytes + kScaleBase + slot_of(loc) * Traits::kScaleBytes;
+    return page_of(loc) * kPageBytes + kScaleBase + slot_of(loc) * kScaleStride;
   }
 
   struct Row {
@@ -118,7 +147,7 @@ struct PagedKV {
   template <typename LocT>
   SGL_DEVICE static Row row(uint8_t* cache, LocT loc) {
     uint8_t* page = cache + page_of(loc) * kPageBytes;
-    return {page + slot_of(loc) * Traits::kDataBytes, page + kScaleBase + slot_of(loc) * Traits::kScaleBytes};
+    return {page + slot_of(loc) * kDataStride, page + kScaleBase + slot_of(loc) * kScaleStride};
   }
 };
 
@@ -213,7 +242,7 @@ SGL_DEVICE void store_row_fp4(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
 template <KVLayout kLayout, uint32_t kVecSize>
 SGL_DEVICE void store_row(uint8_t* data_row, uint8_t* scale_row, uint32_t tx, const float (&v)[kVecSize]) {
   static_assert(kLayout != KVLayout::V4, "V4 rows are written by the caller");
-  if constexpr (kLayout == KVLayout::V41) {
+  if constexpr (kv_encoding(kLayout) == KVLayout::V41) {
     store_row_fp8(data_row, scale_row, tx, v);
   } else if constexpr (kLayout == KVLayout::UNIFORM_FP8) {
     device::AlignedVector<fp8x2_e4m3_t, kVecSize / 2> out;

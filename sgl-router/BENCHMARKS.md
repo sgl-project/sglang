@@ -76,5 +76,4 @@ Before deleting SMG, every routing-latency metric in the slim-design
 spec needs a real-cluster measurement. The bench-harness here is the
 small-scale, CPU-only complement; it catches algorithmic regressions in
 the routing primitives without burning GPU time. Pair both: this file
-in pre-commit / CI tier-2, the real-cluster e2e in the
-`pr-test-rust.yml` matrix entry.
+in pre-commit / CI tier-2, and the real-cluster e2e.
