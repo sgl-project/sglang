@@ -29,6 +29,7 @@ from sglang.srt.utils.custom_op import direct_register_custom_op
 from sglang.srt.utils.device import is_gfx95_supported, is_gfx1250_supported
 
 NVFP4_BLOCK_SIZE = 16
+OCP_MX_BLOCK_SIZE = 32
 
 _is_hip = is_hip()
 
@@ -38,6 +39,8 @@ _ASM_FP4_SCALE_COL_MULTIPLE = 8
 # N <= 128 at 2 <= M <= 64 (measured on ROCm/aiter@e7d2453f2, MI355X).
 # TODO(vorapolsiloai): link the AITER issue; drop once the heuristic is fixed.
 _ASM_FP4_UNSAFE_MAX_N = 128
+_aiter_fp4x2_dtype = torch.uint8
+_aiter_e8m0_dtype = torch.uint8
 
 # Keep this path opt-in while the AITER ASM integration is validated across the
 # Quark model matrix. Unlike the Triton fallback, it consumes AITER's
@@ -224,6 +227,10 @@ if _is_hip:
         gemm_afp4wfp4_pre_quant as _gemm_afp4wfp4_pre_quant_orig,
     )
     from aiter.ops.triton.quant import dynamic_mxfp4_quant as _dynamic_mxfp4_quant_orig
+    from aiter.utility import dtypes as aiter_dtypes
+
+    _aiter_fp4x2_dtype = aiter_dtypes.fp4x2
+    _aiter_e8m0_dtype = aiter_dtypes.fp8_e8m0
 
     def _aiter_gemm_afp4wfp4(
         x: torch.Tensor,
@@ -424,7 +431,49 @@ if _is_hip:
 __all__ = ["QuarkW4A4MXFP4", "AiterMxfp4OnlineLinearMethod"]
 logger = logging.getLogger(__name__)
 
-OCP_MX_BLOCK_SIZE = 32
+
+class _AsmShuffledMxfp4Input(tuple):
+    """``(x_fp4, x_scales)`` whose scales are already padded and shuffled for gemm_a4w4."""
+
+
+def _validate_asm_prequantized_input(
+    layer: torch.nn.Module, x: tuple[torch.Tensor, torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Validate the packed tuple consumed by AITER's pre-shuffled A4W4 GEMM."""
+    if len(x) != 2 or not all(isinstance(tensor, torch.Tensor) for tensor in x):
+        raise TypeError("AITER ASM FP4 GEMM expects (packed_fp4, shuffled_e8m0_scales)")
+    x_q, x_scales = x
+    if x_q.ndim != 2 or x_scales.ndim != 2:
+        raise ValueError("prequantized MXFP4 payload and scales must both be 2D")
+    if x_q.dtype != _aiter_fp4x2_dtype or x_scales.dtype != _aiter_e8m0_dtype:
+        raise ValueError(
+            "AITER ASM prequantized input must use native FP4x2 and E8M0 dtypes"
+        )
+    if not x_q.is_contiguous() or not x_scales.is_contiguous():
+        raise ValueError("AITER ASM prequantized input must be contiguous")
+    if x_q.device != x_scales.device or x_q.device != layer.weight.device:
+        raise ValueError("AITER ASM prequantized input and weight devices must match")
+
+    expected_k_packed = layer.weight.shape[1]
+    if x_q.shape[1] != expected_k_packed:
+        raise ValueError(
+            f"prequantized MXFP4 K/2 mismatch: {x_q.shape[1]} != {expected_k_packed}"
+        )
+    num_scale_groups = expected_k_packed * 2 // OCP_MX_BLOCK_SIZE
+    if num_scale_groups % _ASM_FP4_SCALE_COL_MULTIPLE != 0:
+        raise ValueError(
+            "AITER ASM prequantized MXFP4 K must be divisible by 256 elements"
+        )
+    expected_scale_shape = (
+        (x_q.shape[0] + 255) // 256 * 256,
+        num_scale_groups,
+    )
+    if x_scales.shape != expected_scale_shape:
+        raise ValueError(
+            "AITER ASM prequantized MXFP4 scales must use the padded, shuffled "
+            f"layout {expected_scale_shape}; got {tuple(x_scales.shape)}"
+        )
+    return x_q, x_scales
 
 
 class QuarkW4A4MXFP4(QuarkLinearScheme):
@@ -928,7 +977,10 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         if getattr(layer, "use_aiter_asm_fp4_gemm", False):
             output_shape = None
             if isinstance(x, tuple):
-                x_q, x_scales = _asm_fp4_prequantized_input(x)
+                if isinstance(x, _AsmShuffledMxfp4Input):
+                    x_q, x_scales = _validate_asm_prequantized_input(layer, x)
+                else:
+                    x_q, x_scales = _asm_fp4_prequantized_input(x)
             else:
                 if x.dim() == 3:
                     output_shape = [*x.shape[:-1], layer.weight.shape[0]]
