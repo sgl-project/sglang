@@ -1273,6 +1273,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # The always-present strategy returns captured top-1 or invokes this
         # unchanged selected-row stock sampler.
         def stock_extend_tokens():
+            # SGLANG_OPT_SPEC_DRAFT_EXTEND_GRAPH_TOP1: the replayed graph took this top-1
+            if can_run_decode_cuda_graph and (
+                replayed := self.cuda_graph_runner_for_draft_extend.replayed_top1
+            ):
+                return None, *replayed
             if get_spec().speculative_use_rejection_sampling:
                 return sample_draft_proposal(
                     draft_logits_output.next_token_logits,

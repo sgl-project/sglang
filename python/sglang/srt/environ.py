@@ -453,6 +453,11 @@ class Envs:
     SGLANG_OPT_TRTLLM_MHA_METADATA_ROW_SPLIT = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # A top-1 chain's draft-extend graph takes the next draft's top-1 itself (the eager
+    # path's argmax, captured), so the replay is not followed by an argmax and a fill.
+    SGLANG_OPT_SPEC_DRAFT_EXTEND_GRAPH_TOP1 = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

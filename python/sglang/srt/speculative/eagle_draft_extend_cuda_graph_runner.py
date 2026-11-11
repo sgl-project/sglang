@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Callable, Mapping, Optional
 
 import torch
 
@@ -50,6 +51,7 @@ from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
+from sglang.srt.utils.device import is_cuda
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
@@ -89,6 +91,18 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
 
 
+def draft_top1_into(logits: torch.Tensor, index: torch.Tensor) -> None:
+    """The draft extend's eager top-1 of ``logits`` (stock_extend_tokens) into ``index``
+    ([rows, 1] int64): the sampler's argmax under SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX, picked
+    as sampling.argmax picks it on CUDA, torch.argmax otherwise."""
+    from sglang.kernels.ops.sampling import argmax_jit
+
+    if envs.SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX.get() and argmax_jit.can_argmax(logits):
+        argmax_jit.argmax(logits, out=index.view(-1))
+    else:
+        torch.argmax(logits, dim=-1, keepdim=True, out=index)
+
+
 class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     """EAGLE draft-extend cuda-graph runner.
 
@@ -103,6 +117,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     _runtime_optimization: bool = False
     kv_reuse_guard = None
     _pd_reuse_needs_full_replay: bool = False
+    # SGLANG_OPT_SPEC_DRAFT_EXTEND_GRAPH_TOP1: graph key -> (top-1 p, top-1 index) the
+    # graph writes, and the last replay's rows of them (None: not taken in the graph)
+    _graph_top1: Mapping = MappingProxyType({})
+    replayed_top1: Optional[tuple] = None
 
     def __init__(
         self,
@@ -314,6 +332,15 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.attention_variant_sizes = self.specialized_batches
 
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
+        self._graph_top1 = {}
+        # the eager top-1 that stock_extend_tokens would take, inside a stock graph
+        self._takes_graph_top1 = (
+            envs.SGLANG_OPT_SPEC_DRAFT_EXTEND_GRAPH_TOP1.get()
+            and is_cuda()
+            and eagle_worker.topk == 1
+            and getattr(eagle_worker, "hot_token_id", None) is None
+            and not get_spec().speculative_use_rejection_sampling
+        )
         self._runtime_optimization = (
             envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
             and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
@@ -523,6 +550,15 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 :num_tokens
             ]
 
+        top1 = None
+        if self._takes_graph_top1 and bs not in self.specialized_batches:
+            top1 = (
+                torch.ones((bs, 1), dtype=torch.float32, device=self.device),
+                torch.empty((bs, 1), dtype=torch.int64, device=self.device),
+            )
+            key = self._make_graph_key(bs, attention_variant=attention_variant)
+            self._graph_top1[key] = top1
+
         def run_stock():
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
@@ -532,6 +568,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 forward_batch.positions,
                 forward_batch,
             )
+            if top1 is not None:
+                draft_top1_into(ret.next_token_logits, top1[1])
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -759,6 +797,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(shape_key, forward_batch)
+        top1 = self._graph_top1.get(shape_key)
+        self.replayed_top1 = (
+            None if top1 is None else (top1[0][:raw_bs], top1[1][:raw_bs])
+        )
 
         # The backend declaration covers every child, including hybrid linear
         # attention. UNKNOWN keeps the scheduler's whole-forward fallback.

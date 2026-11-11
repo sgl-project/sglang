@@ -140,6 +140,75 @@ class TestEagleDraftSamplingPosition(CustomTestCase):
                 )
                 torch.testing.assert_close(draft_input.topk_p, torch.ones(2, 1))
 
+    def test_a_replay_that_took_the_top1_skips_the_eager_argmax(self):
+        """SGLANG_OPT_SPEC_DRAFT_EXTEND_GRAPH_TOP1: when the replayed draft-extend graph
+        took the top-1 itself, the next draft input holds its rows and no argmax runs
+        after the replay; a replay that did not, or an eager extend, takes it as before."""
+        logits = torch.randn(2, 16)
+        logits[:, 7] = logits.max() + 1
+        graph_top1 = (torch.ones(2, 1), torch.full((2, 1), 7, dtype=torch.int64))
+        for graphed, replayed in ((True, graph_top1), (True, None), (False, None)):
+            worker = EagleDraftWorker.__new__(EagleDraftWorker)
+            worker.speculative_num_draft_tokens = 4
+            worker.plan_stream = None
+            worker.plan_stream_ctx = nullcontext()
+            worker.seed_dsa_topk_from_draft_extend = False
+            worker.topk = 1
+            worker.device = torch.device("cpu")
+            # a replay returns the selected rows; an eager extend all four of each
+            out = SimpleNamespace(
+                next_token_logits=logits if graphed else logits.repeat_interleave(4, 0),
+                hidden_states=None,
+            )
+            worker.cuda_graph_runner_for_draft_extend = SimpleNamespace(
+                can_run_graph=lambda fb, graphed=graphed: graphed,
+                execute=lambda fb, select_index, out=out: out,
+                replayed_top1=replayed,
+            )
+            worker.draft_runner = SimpleNamespace(
+                canary_manager=None,
+                forward=lambda _, out=out: SimpleNamespace(logits_output=out),
+            )
+            batch = SimpleNamespace(
+                seq_lens=torch.tensor([10, 20], dtype=torch.int64),
+                sampling_info=SimpleNamespace(),
+            )
+            batch_result = SimpleNamespace(
+                logits_output=SimpleNamespace(hidden_states=None),
+                next_token_ids=torch.tensor([1, 2], dtype=torch.int64),
+                accept_lens=torch.tensor([1, 1], dtype=torch.int64),
+                new_seq_lens=torch.tensor([12, 24], dtype=torch.int64),
+                next_draft_input=SimpleNamespace(),
+                prepared_draft_extend_inputs=None,
+            )
+            with (
+                self.subTest(graphed=graphed, replayed=replayed is not None),
+                patch(
+                    "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft_extend",
+                    return_value=SimpleNamespace(sampling_info=None),
+                ),
+                patch(
+                    "sglang.srt.speculative.eagle_worker_v2.get_spec",
+                    return_value=SimpleNamespace(
+                        speculative_use_rejection_sampling=False
+                    ),
+                ),
+                patch(
+                    "sglang.srt.speculative.eagle_worker_v2.torch.argmax",
+                    wraps=torch.argmax,
+                ) as argmax,
+            ):
+                worker._draft_extend_for_decode(batch, batch_result)
+                draft_input = batch_result.next_draft_input
+                taken = graphed and replayed is not None
+                self.assertEqual(argmax.called, not taken)
+                if taken:
+                    self.assertIs(draft_input.topk_p, graph_top1[0])
+                    self.assertIs(draft_input.topk_index, graph_top1[1])
+                torch.testing.assert_close(
+                    draft_input.topk_index, torch.full((2, 1), 7, dtype=torch.int64)
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

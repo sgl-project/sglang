@@ -27,6 +27,9 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import eagle_draft_cuda_graph_runner as draft_graph
+from sglang.srt.speculative import (
+    eagle_draft_extend_cuda_graph_runner as draft_extend_graph,
+)
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -301,6 +304,40 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                 forward_batch.attention_kv_len_lower_bound = bound
                 runner.execute(forward_batch, select_index)
                 self.assertEqual(keys[0].attention_variant, label)
+
+    def test_draft_extend_replay_hands_on_the_top1_its_graph_took(self):
+        """SGLANG_OPT_SPEC_DRAFT_EXTEND_GRAPH_TOP1: after a replay of a graph that took
+        the top-1, the runner holds its rows for the replayed requests; after any other
+        replay, none. The graph's top-1 is the eager path's argmax."""
+        for raw_bs, captured in ((1, True), (1, False), (2, True)):
+            runner, forward_batch, select_index = _extend_runner(raw_bs)
+            out = SimpleNamespace(
+                next_token_logits=torch.zeros((2, 4)),
+                hidden_states=torch.zeros((2, 2)),
+            )
+            keys = []
+            runner._replay_graph = lambda key, fb: keys.append(key) or out
+            top1 = (torch.ones(2, 1), torch.arange(2).view(2, 1))
+            runner.execute(forward_batch, select_index)
+            if captured:
+                runner._graph_top1 = {keys[0]: top1}
+                runner.execute(forward_batch, select_index)
+            with self.subTest(raw_bs=raw_bs, captured=captured):
+                if captured:
+                    for got, buf in zip(runner.replayed_top1, top1):
+                        self.assertEqual(got.data_ptr(), buf.data_ptr())
+                        self.assertEqual(got.shape[0], raw_bs)
+                else:
+                    self.assertIsNone(runner.replayed_top1)
+        logits = torch.randn(3, 33)
+        logits[1, 4] = logits[1, 20] = logits.max() + 1  # tie: lowest index
+        index = torch.empty((3, 1), dtype=torch.int64)
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX.override(True),
+        ):
+            draft_extend_graph.draft_top1_into(logits, index)
+        self.assertTrue(torch.equal(index, torch.argmax(logits, -1, keepdim=True)))
 
     def test_draft_extend_shared_read_fence_and_kv_reuse(self):
         cases = (
