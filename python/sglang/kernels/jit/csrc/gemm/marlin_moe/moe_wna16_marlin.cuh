@@ -328,6 +328,7 @@ bool is_valid_config(
 // ACT: cases for act order case (group_blocks == 0)
 // NVFP4: cases for nvfp4(e2m1) (group_blocks == 1)
 // MXFP4: cases for mxfp4(e2m1) (group_blocks == 2)
+// MXFP8: cases for e4m3 weights with 32-wide groups (group_blocks == 2)
 #define COMMON_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)       \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, -1, NUM_THREADS, false)  \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, false)   \
@@ -411,6 +412,14 @@ bool is_valid_config(
   MXFP4_GET_IF_M234(W_TYPE, 16, 4, 256) \
   MXFP4_GET_IF_M234(W_TYPE, 8, 4, 128)
 
+// MXFP8 served W8A16: e4m3 weights whose E8M0 scales became 32-wide groups in
+// the activation dtype; the MXFP4 group-2 bodies over the BIGGROUP tile set.
+#define MXFP8_GET_IF(W_TYPE)            \
+  MXFP4_GET_IF_M1(W_TYPE, 8, 8, 256)    \
+  MXFP4_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+  MXFP4_GET_IF_M234(W_TYPE, 16, 4, 256) \
+  MXFP4_GET_IF_M234(W_TYPE, 8, 4, 128)
+
 // We currently have 4-bit models only with group_blocks == 4
 #define FZP_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)       \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 4, NUM_THREADS, true) \
@@ -473,6 +482,7 @@ MarlinFuncPtr get_marlin_kernel(
   NVFP4_GET_IF(host::kFE2M1f)
 
   BIGGROUP_GET_IF(host::kFE4M3fn)
+  MXFP8_GET_IF(host::kFE4M3fn)
 
   ACT_GET_IF(host::kU4B8)
   ACT_GET_IF(host::kU8B128)

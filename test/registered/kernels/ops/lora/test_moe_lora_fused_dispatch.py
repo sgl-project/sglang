@@ -141,9 +141,10 @@ def test_sentinel_pairs_are_skipped() -> None:
 
 
 @pytest.mark.parametrize("hidden", [128, 1536, 7168])
-@pytest.mark.parametrize("domain", ["masked", "contiguous"])
+@pytest.mark.parametrize("domain", ["masked", "contiguous", "contiguous_fold"])
 @pytest.mark.parametrize("captured", [False, True])
 def test_fp8_row_movers_match_upstream_quant(hidden, domain, captured) -> None:
+    # contiguous_fold: the layout leaves slots in the map and the fill finalizes it.
     from sglang.kernels.ops.lora.moe.dispatch_contiguous import (
         contiguous_m_pad_ceiling,
         dispatch_fill_rows_contiguous_fp8,
@@ -186,6 +187,7 @@ def test_fp8_row_movers_match_upstream_quant(hidden, domain, captured) -> None:
                 scale_out=scales,
             )
         else:
+            fold = domain == "contiguous_fold"
             dispatch_layout_contiguous(
                 x,
                 ids,
@@ -195,9 +197,15 @@ def test_fp8_row_movers_match_upstream_quant(hidden, domain, captured) -> None:
                 seg_counts_out=counts,
                 seg_offsets_out=offsets,
                 pair_to_row_out=mapping,
+                finalize=not fold,
             )
             dispatch_fill_rows_contiguous_fp8(
-                x, ids, mapping, rows_fp8_out=rows, scale_out=scales
+                x,
+                ids,
+                mapping,
+                rows_fp8_out=rows,
+                scale_out=scales,
+                seg_offsets=offsets if fold else None,
             )
 
     if captured:
@@ -244,17 +252,72 @@ def test_fp8_row_movers_match_upstream_quant(hidden, domain, captured) -> None:
         assert bool(torch.all(flat_scales[unused] == -777))
 
 
+@pytest.mark.parametrize("k", [384, 640, 2048])
+@pytest.mark.parametrize("layout", ["flat", "masked"])
+def test_per_token_row_quantizer_matches_upstream(k, layout) -> None:
+    """Several rows per program; rows past the live bound stay untouched."""
+    from sglang.kernels.ops.lora.moe.fp8_quant import quantize_rows_per_token_fp8
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    device = torch.device("cuda")
+    num_slabs, m_max = 6, 40  # 240 rows: whole programs of rows, a partial last one
+    num_rows = num_slabs * m_max
+    x = _rand_hidden(num_rows, k, seed=9).to(device)
+    x[2].zero_()
+    x[3, ::64] = 32
+    q = torch.empty(num_rows, k, dtype=torch.float8_e4m3fn, device=device)
+    q.fill_(0.25)
+    s = torch.full((num_rows,), -777.0, dtype=torch.float32, device=device)
+    row = torch.arange(num_rows, device=device)
+    if layout == "masked":
+        masked_m = torch.tensor([40, 0, 7, 33, 1, 40], dtype=torch.int32, device=device)
+        quantize_rows_per_token_fp8(
+            x.view(num_slabs, m_max, k),
+            q_out=q.view(num_slabs, m_max, k),
+            scale_out=s.view(num_slabs, m_max),
+            masked_m=masked_m,
+        )
+        live = row % m_max < masked_m.repeat_interleave(m_max)
+    else:
+        live_rows = torch.tensor([131], dtype=torch.int32, device=device)
+        quantize_rows_per_token_fp8(x, q_out=q, scale_out=s, live_rows=live_rows)
+        live = row < 131
+    ref_q, ref_s = sglang_per_token_group_quant_fp8(x, k)
+    ref_s = ref_s.view(-1)
+    # Upstream's per-token kernel saturates the codes of an all-zero row; the
+    # row quantizer writes zero codes for it (its scale is zero either way).
+    nonzero = live & ref_s.ne(0)
+    assert torch.equal(q[nonzero].view(torch.uint8), ref_q[nonzero].view(torch.uint8))
+    assert torch.equal(s[live], ref_s[live])
+    assert bool(torch.all(q[live & ~nonzero].float() == 0))
+    assert bool(torch.all(q[~live].float() == 0.25))
+    assert bool(torch.all(s[~live] == -777))
+
+
 @pytest.mark.parametrize(
-    "inter,with_delta", [(128, False), (128, True), (384, True), (1152, False)]
+    "inter,group,with_delta",
+    [
+        (128, 128, False),
+        (128, 128, True),
+        (384, 128, True),
+        (1152, 128, False),
+        # Whole rows: one scale per row, including rows narrower or wider than
+        # the kernel's 512-wide block.
+        (384, 384, True),
+        (640, 640, False),
+    ],
 )
-def test_fused_act_quant_matches_unfused(inter, with_delta):
+def test_fused_act_quant_matches_unfused(inter, group, with_delta):
+    from sglang.kernels.ops.lora.moe.fp8_quant import quantize_rows_per_token_fp8
     from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
     )
 
     torch.manual_seed(0)
     device = torch.device("cuda")
-    num_tokens, top_k, num_experts, group = 7, 3, 8, 128
+    num_tokens, top_k, num_experts = 7, 3, 8
     num_pairs = num_tokens * top_k
     gateup = torch.randn(num_pairs, 2 * inter, dtype=torch.bfloat16, device=device)
     delta = (
@@ -293,7 +356,13 @@ def test_fused_act_quant_matches_unfused(inter, with_delta):
     assert torch.equal(fused_act, ref_act)
     assert torch.equal(fused_pairs, ref_pairs)
 
-    ref_q, ref_s = sglang_per_token_group_quant_fp8(ref_act, group)
+    if group == inter:
+        ref_q = torch.empty_like(act_q)
+        ref_s = torch.empty(num_pairs, dtype=torch.float32, device=device)
+        quantize_rows_per_token_fp8(ref_act, q_out=ref_q, scale_out=ref_s)
+        ref_s = ref_s.view(num_pairs, 1)
+    else:
+        ref_q, ref_s = sglang_per_token_group_quant_fp8(ref_act, group)
     valid_rows = (topk_ids.flatten() >= 0).nonzero(as_tuple=True)[0]
     assert torch.equal(act_s[valid_rows], ref_s[valid_rows])
     assert torch.equal(
