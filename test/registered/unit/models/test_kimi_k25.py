@@ -1103,7 +1103,7 @@ def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
 
     processor._run_preprocess_and_build_artifact_batch = prepare
     try:
-        with pytest.raises(ValueError, match="feature hash changed"):
+        with pytest.raises(RuntimeError, match="feature hash changed"):
             asyncio.run(processor.prepare_media_artifacts([image]))
     finally:
         processor.io_executor.shutdown()

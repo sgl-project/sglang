@@ -146,6 +146,7 @@ from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
     is_health_check_generate_req,
 )
+from sglang.srt.mem_cache.events import attach_mm_routing_labels
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
@@ -1327,6 +1328,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             if mm_inputs and mm_inputs.mm_items:
                 self.mm_processor.finalize_cache_identities(mm_inputs)
+            if mm_inputs and isinstance(obj, GenerateReqInput):
+                attach_mm_routing_labels(
+                    mm_inputs.mm_items, obj.mm_routing_labels_by_modality()
+                )
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
@@ -1459,6 +1464,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
+            self._validate_top_logprobs_num(obj)
             requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
             )
@@ -1599,6 +1605,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"{token_id}; valid range is [0, {vocab_size})."
                 )
 
+    def _validate_top_logprobs_num(self, obj: GenerateReqInput) -> None:
+        # Invalid counts can corrupt the batch or fail torch.topk past the vocab size.
+        top_logprobs_num = obj.top_logprobs_num
+        if not obj.return_logprob or top_logprobs_num is None:
+            return
+        vocab_size = self.model_config.vocab_size
+        if type(top_logprobs_num) is not int or not 0 <= top_logprobs_num <= vocab_size:
+            raise ValueError(
+                f"top_logprobs must be an integer in [0, {vocab_size}], "
+                f"got {top_logprobs_num!r}."
+            )
+
     def _create_tokenized_object(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1663,7 +1681,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 sampling_params=sampling_params,
                 return_logprob=obj.return_logprob,
                 logprob_start_len=obj.logprob_start_len,
-                top_logprobs_num=obj.top_logprobs_num,
+                # A logprob batch gathers every request's count, including disabled ones.
+                top_logprobs_num=obj.top_logprobs_num if obj.return_logprob else 0,
                 token_ids_logprob=obj.token_ids_logprob,
                 return_sampling_mask=obj.return_sampling_mask,
                 sampling_logprobs_mode=obj.sampling_logprobs_mode or "selected",
@@ -1699,6 +1718,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 token_indices_to_pool=obj.token_indices_to_pool,
                 encoder_urls=obj.encoder_urls,
+                mm_routing_labels=obj.mm_routing_labels_by_modality(),
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available

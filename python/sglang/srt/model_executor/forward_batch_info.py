@@ -1218,6 +1218,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if model_runner.ngram_embedding_manager.enabled:
             ret._init_ngram_embedding_info(batch, device)
+            if _is_npu and ret.forward_mode.is_target_verify():
+                # Stage verify tokens before NPU ngram lookup reads the token table.
+                model_runner.ngram_embedding_manager.prepare_for_verify(ret)
 
         if model_runner.model_config.model_is_mrope:
             if spec_mrope_positions is not None:
@@ -1471,6 +1474,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _init_ngram_embedding_info(self, batch: ScheduleBatch, device: torch.device):
         if self.forward_mode.is_decode():
             column_starts, req_lens = self.seq_lens - 1, 1
+        elif _is_npu and self.forward_mode.is_target_verify():
+            # Verify seq_lens excludes the window of draft_token_num input tokens.
+            column_starts = self.seq_lens
+            req_lens = self.spec_info.draft_token_num
         else:
             column_starts, req_lens = self.extend_prefix_lens, self.extend_seq_lens
         self.ngram_embedding_info = NgramEmbeddingInfo.create(

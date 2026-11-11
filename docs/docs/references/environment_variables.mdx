@@ -343,7 +343,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The maximum number of dispatched tokens on each GPU for --moe-a2a-backend=flashinfer</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The maximum number of dispatched tokens on each GPU for --moe-a2a-backend=flashinfer_nvlink_one_sided</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"1024"`</td>
     </tr>
     <tr>
@@ -1466,7 +1466,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_WAR_BARRIER</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force-enable the write-after-read barrier for the overlap scheduler even when CUDA is not detected (e.g. AMD/ROCm). On CUDA the barrier is always enabled.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force-enable the write-after-read barrier for the overlap and pipeline-parallel schedulers even when CUDA is not detected (e.g. AMD/ROCm). On CUDA, and with <code>--enable-unified-memory</code> on any device, the barrier is always enabled.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
