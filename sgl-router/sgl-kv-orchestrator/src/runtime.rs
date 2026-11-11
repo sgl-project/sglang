@@ -1735,7 +1735,6 @@ impl WorkerPoll {
                 "owner epoch/compatibility changed; reconcile old operation separately".into(),
             );
         }
-        self.poll_feedback(&job.url, &live).await?;
         job.caps.generation = live.generation;
         if !job.submitted {
             if !job.attempted && !job.releasing_pin && Instant::now() >= job.deadline {
@@ -1773,6 +1772,11 @@ impl WorkerPoll {
         }
         job.ready_end = 0;
         job.ready_at = None;
+        let observe_residency = job.action == "sglang.prefetch" && !cancel && !request_only;
+        // Cancellation and operation receipts do not depend on residency feedback.
+        if job.action == "sglang.pin" || observe_residency {
+            self.poll_feedback(&job.url, &live).await?;
+        }
         if job.action == "sglang.pin" {
             let ticket = self.feedback.ticket(&job.url)?;
             let claim=self.client.command(&job.url,&json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?;
@@ -1785,7 +1789,7 @@ impl WorkerPoll {
             }
             job.observe_claim(claim, cancel);
         }
-        if job.action == "sglang.prefetch" && !cancel && !request_only {
+        if observe_residency {
             // A terminal result alone cannot establish current location.
             let tier = job.payload["destination"]["tier"]
                 .as_str()

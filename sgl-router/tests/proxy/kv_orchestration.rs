@@ -1253,6 +1253,49 @@ async fn explicit_prepare_freezes_scope_and_progresses_without_another_event() {
 }
 
 #[tokio::test]
+async fn released_prefetch_drains_when_residency_feedback_is_unavailable() {
+    let engine = Engine::start().await;
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.running = true;
+        state.feedback = true;
+    }
+    let mut cfg = orchestration();
+    cfg.poll_ms = cfg.operation_ttl_ms;
+    let router = router_with(&[&engine], false, Some(cfg)).await;
+    start(&router, "task").await;
+    api(
+        &router,
+        json!({"kind":"submit","task":task("task"),"message_id":"read","action":"sglang.prefetch",
+        "target":prefix(vec![1,2,3,4]),"source":{"tier":"storage"},"destination":{"tier":"host"}}),
+    )
+    .await;
+    let view = query(&router, "task", "read").await;
+    assert_eq!(
+        view["operations"][0]["result"]["update"]["status"],
+        "running"
+    );
+
+    engine.state.lock().unwrap().fail_feedback = true;
+    event(&router, "task", "task_finished", 1, "finish").await;
+    let view = query(&router, "task", "read").await;
+    assert_eq!(
+        view["operations"][0]["result"]["update"]["status"],
+        "cancelled"
+    );
+    assert_eq!(view["quiescent"], true);
+    assert!(view["operations"][0]["ready_scope"].is_null());
+    assert_eq!(
+        api(
+            &router,
+            json!({"kind":"ack","task":task("task"),"message_id":"read"})
+        )
+        .await["acknowledged"],
+        true
+    );
+}
+
+#[tokio::test]
 async fn physically_quiescent_demote_keeps_polling_until_terminal() {
     let engine = Engine::start().await;
     let router = router(&[&engine], false, true).await;
