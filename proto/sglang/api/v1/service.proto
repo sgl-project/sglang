@@ -112,6 +112,9 @@ message GetModelInfoResponse {
   optional string load_format = 7 [(sglang.json.v1.field_json).emit_null_when_absent = true];
   optional string reasoning_parser = 8 [(sglang.json.v1.field_json).emit_null_when_absent = true];
   optional string tool_call_parser = 9 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  // The HF config's `model_type` and `architectures`.
+  optional string model_type = 10 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  repeated string architectures = 11;
 }
 
 message GetServerInfoRequest {}
@@ -122,6 +125,9 @@ message GetServerInfoResponse {
   string tokenizer_path = 3;
   uint32 max_context_length = 4;
   optional uint64 max_total_num_tokens = 5;
+  // Output-token slots each request reserves for speculative draft tokens;
+  // the server counts them as input when checking a request against max_context_length.
+  uint64 num_reserved_tokens = 15;
   string version = 6;
   // The allowlisted runtime metrics (last_gen_throughput, memory_usage,
   // effective_max_running_requests_per_dp, avg_spec_accept_length,
@@ -134,6 +140,9 @@ message GetServerInfoResponse {
   uint32 port = 9;
   bool incremental_streaming_output = 10;
   string disaggregation_mode = 11;
+  // True: an over-long request is truncated to fit instead of rejected.
+  bool allow_auto_truncate = 13;
+  bool skip_tokenizer_init = 14;
 
   // Distributed deployment metadata required by out-of-process orchestrators.
   DeploymentInfo deployment_info = 12;
