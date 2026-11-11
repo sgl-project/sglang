@@ -105,8 +105,14 @@ every flag.
 | `POST /v1/tokenize`, `/v1/detokenize` | Tokenize with the router's tokenizer |
 | `GET /v1/models` | The served model |
 | `POST /flush_cache` | Fan out a cache flush to every worker |
-| `GET /healthz`, `/readyz` | Liveness and readiness |
+| `GET /server_info`, `/model_info`, `/health_generate` | Answered by one healthy worker (a prefill worker under P/D; `/health_generate` also checks one of its decode peers); `/get_server_info` and `/get_model_info` are aliases |
+| `GET /healthz`, `/readyz` | Liveness and readiness; `/health`, `/liveness`, and `/readiness` are aliases kept from sgl-model-gateway |
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
+
+sgl-model-gateway endpoints for features the router does not provide (the
+Responses and Conversations APIs, `/parse/*`, `/workers`, `/v1/tokenizers`,
+`/wasm`, `/ha/*`, `/v1/loads`, `/get_loads`, `/engine_metrics`) answer `501`
+with error code `gateway_only_endpoint`.
 
 Both edges speak cleartext HTTP/2 where the peer does; see
 [operations](#operations). With `--grpc-port`, the router also serves the

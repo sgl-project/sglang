@@ -282,7 +282,8 @@ then keeps its share of traffic.
 The router reads each worker's `/server_info` and `/model_info` to learn its
 model, KV-event publisher, HTTP/2 support and DP size. An engine launched with
 `--api-key` rejects those requests without the key, so pass the same key as
-`--worker-api-key`. Chat requests and `/flush_cache` forward the caller's
+`--worker-api-key`. Chat requests, `/flush_cache`, and the forwarded
+`/server_info`, `/model_info`, and `/health_generate` pass the caller's
 `Authorization` header instead, so callers still need the engine key.
 
 ### Fleet-wide sampling contract

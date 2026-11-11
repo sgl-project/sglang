@@ -3,8 +3,10 @@
 
 pub mod cache;
 pub mod chat;
+pub mod gateway_only;
 pub mod health;
 pub mod messages;
 pub mod metrics;
 pub mod models;
 pub mod tokenize;
+pub mod worker_info;
