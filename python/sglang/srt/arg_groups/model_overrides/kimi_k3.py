@@ -202,19 +202,21 @@ def _kimi_k31_lossless_defaults(cfg: Any) -> dict:
 
 def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
     """DCP shards the MLA KV and the index-K cache by token; the indexer merges
-    a global top-k and the DSA attention merges partials by LSE."""
+    a global top-k and the DSA attention (flashmla_kv or trtllm) merges partials
+    by LSE."""
     dcp = cfg.dcp_size
     if dcp & (dcp - 1) or cfg.tp_size % dcp:
         raise ValueError(
             f"Kimi-K3.1 DCP needs a power-of-two --dcp-size dividing --tp-size, "
             f"got dcp_size={dcp}, tp_size={cfg.tp_size}."
         )
+    # ROCm serves the DFLASH MLA draft with the Triton backend's rank-local MLA verify.
     dflash_draft_backend = "triton" if get_platform().is_hip else "cutedsl_mla"
     unsupported = {
         "speculative decoding other than DSPARK and DFLASH": cfg.speculative_algorithm
         not in (None, "DSPARK", "DFLASH"),
         # A DFLASH MLA draft attends over DCP owner rows on the draft-verify
-        # path; each platform's selected backend applies the global causal bound.
+        # path, which only cute-dsl MLA serves with a global causal bound.
         f"a DFLASH draft attention backend other than {dflash_draft_backend}": (
             cfg.speculative_algorithm == "DFLASH"
             and cfg.speculative_draft_attention_backend
