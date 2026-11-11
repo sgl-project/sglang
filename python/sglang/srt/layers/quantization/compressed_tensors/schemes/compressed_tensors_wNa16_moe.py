@@ -57,6 +57,16 @@ if _use_aiter:
 
 logger = logging.getLogger(__name__)
 
+# compressed-tensors keeps the actorder string as written, so its alias-aware
+# enum equality never runs here; map the aliases to the forms compared below.
+_ACTORDER_ALIASES = {"weight": "static", "dynamic": "group"}
+
+
+def _normalize_actorder(actorder: str | None) -> str | None:
+    if actorder is None:
+        return None
+    return _ACTORDER_ALIASES.get(actorder, actorder)
+
 
 class GPTQMarlinState(Enum):
     REPACK = enum.auto()
@@ -78,7 +88,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         self.packed_factor = 32 // config.num_bits
         self.strategy = config.strategy
         self.group_size = config.group_size
-        self.actorder = config.actorder
+        self.actorder = _normalize_actorder(config.actorder)
         self.sym = config.symmetric
 
         if not (
