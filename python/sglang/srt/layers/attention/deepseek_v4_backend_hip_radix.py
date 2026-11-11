@@ -3461,10 +3461,18 @@ class DeepseekV4HipRadixBackend(
 
         if isinstance(q, OpusPackedQ):
             # opus_fp8_takes_packed_q said yes for this layer; nothing else reads this q
-            assert isinstance(core_attn_metadata, DSV4AttnMetadata) and not save_kv_cache
+            assert (
+                isinstance(core_attn_metadata, DSV4AttnMetadata) and not save_kv_cache
+            )
             assert self.opus_fp8_takes_packed_q(
-                q.q_nope.shape[0], q.q_nope.shape[1], layer_id, forward_batch, compress_ratio
-            ), "a packed OPUS query reached a layer that does not run the fp8 OPUS kernel"
+                q.q_nope.shape[0],
+                q.q_nope.shape[1],
+                layer_id,
+                forward_batch,
+                compress_ratio,
+            ), (
+                "a packed OPUS query reached a layer that does not run the fp8 OPUS kernel"
+            )
             return self._forward_prefill_opus(
                 q,
                 layer_id,

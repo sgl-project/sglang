@@ -275,7 +275,9 @@ class TestMxfp8NativePackedQGfx95(CustomTestCase):
                 ):
                     out = fp8_hip.apply_dense(method, layer, operand, None)
                     ref_nope, ref_rope = quantize_q_opus_fp8(out.view(m, n // 512, 512))
-                    q_nope, q_rope = fp8_hip.apply_dense_packed_q(method, layer, operand)
+                    q_nope, q_rope = fp8_hip.apply_dense_packed_q(
+                        method, layer, operand
+                    )
                     self.assertTrue(
                         torch.equal(
                             q_nope.view(torch.uint8)[..., :464],
