@@ -25,7 +25,11 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
-from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_prob
+from sglang.srt.layers.sampling_renorm import (
+    renorm_max_keep_kwargs,
+    top_k_renorm_prob,
+    top_p_renorm_prob,
+)
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
@@ -598,6 +602,9 @@ def _apply_joint_top_k_top_p(
         probs = top_k_renorm_prob(
             probs,
             torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+            # Only the leading top_k columns survive the mask, so platforms that
+            # support it can skip writing back the rest of the vocabulary.
+            **renorm_max_keep_kwargs(sampling_info.max_top_k),
         )
         maybe_detect_nan(probs, "verify: target_probs after top_k_renorm")
     return probs
