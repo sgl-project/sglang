@@ -671,6 +671,8 @@ class Req(ReqDllmMixin):
 
         # For retraction
         self.is_retracted = False
+        # Whether the last retraction checkpointed the KV into the tree.
+        self.kv_kept_on_retract = False
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 

@@ -129,6 +129,7 @@ class RequestRetirer:
             and get_schedule().preempt_keep_kv
             and not self.tree_cache.supports_mamba()
         )
+        req.kv_kept_on_retract = keep_kv
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=keep_kv)
         return resumable
@@ -139,8 +140,10 @@ class RequestRetirer:
         _leave_owner_list(req)
         record_exit(req, "abort_retracted")
         self._detach(req)
-        # retract released the KV without a checkpoint.
-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+        # A checkpointed retract handed the KV to the cache, whose store settles
+        # the attempt, as in `release`; an uncheckpointed one settles it here.
+        if not req.kv_kept_on_retract:
+            self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         self.beam_coordinator.retire_group(req)
         self.send_abort_output(
             make_abort_req(req, finished_reason=reason.to_json()), req
