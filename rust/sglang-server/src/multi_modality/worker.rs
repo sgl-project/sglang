@@ -56,6 +56,9 @@ pub struct MmProcessOutput {
     /// The final placeholder-expanded prompt ids.
     pub input_ids: TokenIds,
     pub result: MmEncodedEntry,
+    /// Whatever the processor hands itself from [`MmProcessor::process`] to
+    /// [`MmProcessor::processed`]; dropped before the request is queued.
+    pub extension: Option<Box<dyn std::any::Any + Send>>,
 }
 
 /// The request a multimodal result belongs to (see [`MmProcessor::processed`]).
@@ -64,6 +67,9 @@ pub struct MmRequestInfo<'a> {
     /// The rid the client sent (or the minted one), not the scheduler's
     /// uniquified rid.
     pub rid: &'a str,
+    /// The uniquified rid, unique among the process's requests: the
+    /// [`crate::GenerateRequest::rid`] a [`crate::GenerateHook`] saw.
+    pub runtime_rid: &'a str,
     pub bootstrap_room: Option<i64>,
 }
 
@@ -206,6 +212,7 @@ fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
             token_ids: None,
             mrope,
         },
+        extension: None,
     })
 }
 
@@ -446,6 +453,7 @@ impl Runnable for MmWorker {
                 let mm = g.mm.take().map(|m| *m).unwrap_or_default();
                 let request = MmRequestInfo {
                     rid: req.rid.client_facing(),
+                    runtime_rid: req.rid.as_str(),
                     bootstrap_room: g.bootstrap_room,
                 };
                 match process(&self.ctx, request, input_ids, mm) {
@@ -513,6 +521,7 @@ mod tests {
                     token_ids: None,
                     mrope: None,
                 },
+                extension: None,
             })
         }
     }
@@ -808,6 +817,7 @@ mod tests {
 
     const NO_REQUEST: MmRequestInfo<'static> = MmRequestInfo {
         rid: "r",
+        runtime_rid: "r",
         bootstrap_room: None,
     };
 
@@ -1029,31 +1039,44 @@ mod tests {
     }
 
     /// `processed` sees the result the scheduler gets -- the caller's hash
-    /// applied -- under the client's rid and the request's bootstrap room.
+    /// applied -- under the client's rid, the uniquified rid and the request's
+    /// bootstrap room, with what `process` handed it.
     #[test]
     fn processed_observes_the_final_result_with_request_identity() {
         use std::sync::Mutex;
 
-        /// What `processed` saw, as `rid room ids hashes`.
+        /// What `processed` saw, as `rid room ids hashes extension`, and the
+        /// uniquified rid.
         #[derive(Default)]
-        struct Observing(Mutex<Vec<String>>);
+        struct Observing(Mutex<Vec<(String, String)>>);
         impl MmProcessor for Observing {
             fn process(
                 &self,
                 input_ids: TokenIds,
                 mm: MmData,
             ) -> Result<MmProcessOutput, MediaError> {
-                ExternalProcessor {
+                let output = ExternalProcessor {
                     shape: vec![1],
                     offsets: vec![(1, 1)],
                 }
-                .process(input_ids, mm)
+                .process(input_ids, mm)?;
+                Ok(MmProcessOutput {
+                    extension: Some(Box::new("handed on")),
+                    ..output
+                })
             }
             fn processed(&self, request: MmRequestInfo<'_>, output: &MmProcessOutput) {
                 let hashes: Vec<u64> = output.result.items.iter().map(|item| item.hash).collect();
-                self.0.lock().unwrap().push(format!(
-                    "{} {:?} {:?} {hashes:?}",
-                    request.rid, request.bootstrap_room, output.input_ids
+                let extension = output
+                    .extension
+                    .as_ref()
+                    .and_then(|extension| extension.downcast_ref::<&str>());
+                self.0.lock().unwrap().push((
+                    format!(
+                        "{} {:?} {:?} {hashes:?} {extension:?}",
+                        request.rid, request.bootstrap_room, output.input_ids
+                    ),
+                    request.runtime_rid.to_owned(),
                 ));
             }
         }
@@ -1065,6 +1088,8 @@ mod tests {
         let worker = std::thread::spawn(move || MmWorker::new(mm_rx, tm_tx, ctx).run());
         let mut req = encoding_req("unused", vec![1, 2]);
         req.rid = crate::message::ids::Rid::from_client("client");
+        let runtime_rid = req.rid.as_str().to_owned();
+        assert_ne!(runtime_rid, "client");
         let RequestKind::Generate(g) = &mut req.kind else {
             panic!("generate")
         };
@@ -1076,7 +1101,13 @@ mod tests {
         mm_tx.send(req).unwrap();
         drop(mm_tx);
         worker.join().unwrap();
-        assert_eq!(*processor.0.lock().unwrap(), ["client Some(9) [1, 2] [42]"]);
+        assert_eq!(
+            *processor.0.lock().unwrap(),
+            [(
+                r#"client Some(9) [1, 2] [42] Some("handed on")"#.to_owned(),
+                runtime_rid
+            )]
+        );
     }
 
     /// `processed` sees the ids intake forwards, fitted to the context as
