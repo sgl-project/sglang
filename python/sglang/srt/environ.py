@@ -463,6 +463,11 @@ class Envs:
     SGLANG_OPT_SCHEDULER_GC_FREEZE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # A text-only extend batch's mrope rows repeat self.positions on the device instead
+    # of a per-request host loop and a pageable copy (same values, no host stall).
+    SGLANG_OPT_MROPE_TEXT_DEVICE_POSITIONS = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # The EAGLE post-verify graph pool's first capture takes the sampling scratch of the
     # largest decode-graph batch and frees it, so later batch sizes split that segment
     # instead of each adding one the private pool keeps.
