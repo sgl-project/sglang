@@ -47,7 +47,7 @@ class Glm5NextTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
     )
     mm_feature_fields = frozenset({"pixel_values"})
     # As legacy Glm4vImageProcessor.
-    smart_rgb_conversion = True
+    rgb_conversion = "smart"
     video_preprocessing_device = "cpu"
 
     def __init__(self, hf_config, processor, *, mm_process_config=None):

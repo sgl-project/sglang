@@ -4329,6 +4329,20 @@ class TestLayerwiseResidencyLifetime(unittest.TestCase):
         )
 
 
+class TestOutputStoreArgs(unittest.TestCase):
+    def test_extra_config_needs_a_backend(self):
+        with self.assertRaisesRegex(ValueError, "needs --output-store-backend"):
+            _from_dict_without_model_resolution(
+                {"model_path": "test/model", "output_store_backend_extra_config": "{}"}
+            )
+
+    def test_unknown_backend_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown --output-store-backend"):
+            _from_dict_without_model_resolution(
+                {"model_path": "test/model", "output_store_backend": "nope"}
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
 

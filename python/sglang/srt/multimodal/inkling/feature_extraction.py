@@ -227,8 +227,15 @@ class InklingAudioFeatureExtractor(FeatureExtractionMixin):
         self.params = merged
 
     def _encode_one(self, audio) -> torch.Tensor:
-        raw_audio = _decode_audio(_load_audio_bytes(audio), self.params.sample_rate)
-        return _dmel_bins(raw_audio, self.params)
+        return self.waveform_dmel_bins(self.decode(audio))
+
+    def decode(self, audio) -> torch.Tensor:
+        """The mono float32 waveform of raw bytes, a path or a file-like, at ``params.sample_rate``."""
+        return _decode_audio(_load_audio_bytes(audio), self.params.sample_rate)
+
+    def waveform_dmel_bins(self, waveform: torch.Tensor) -> torch.Tensor:
+        """dMel bins [T, n_mels] int32 of a waveform ``decode`` returned."""
+        return _dmel_bins(waveform, self.params)
 
     def __call__(
         self,

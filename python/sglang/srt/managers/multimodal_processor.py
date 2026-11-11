@@ -68,6 +68,18 @@ def get_mm_processor_cls(hf_config, model_config=None):
             return TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
                 strategy_class, serving_spec_for(hf_config)
             )
+    if get_mm().enable_token_space_processor:
+        # The legacy processors below never read the token-space loader keys.
+        unread = [
+            key
+            for key in ("image_decoder", "image_rgb_conversion")
+            if key in (get_mm().mm_process_config or {})
+        ]
+        if unread:
+            raise ValueError(
+                f"mm_process_config {unread} are read by the token-space processor only, "
+                f"and {hf_config.architectures} is served by a legacy processor"
+            )
 
     for model_cls, processor_cls in PROCESSOR_MAPPING.items():
         if model_cls.__name__ not in hf_config.architectures:

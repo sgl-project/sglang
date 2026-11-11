@@ -6,12 +6,20 @@ from __future__ import annotations
 import logging
 from typing import Any, List
 
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    use_mla_backend,
+)
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolving_view,
 )
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.lora.utils import (
+    get_normalized_target_modules,
+    kv_b_lora_prefix_cache_error,
+)
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -106,6 +114,11 @@ def check_lora_server_args(server_args: Any):
             )
 
     if cfg.enable_lora:
+        if cfg.enable_two_batch_overlap:
+            # TBO children are sliced from the parent ForwardBatch without a
+            # LoRA batch of their own, so the adapter segments outrun their rows.
+            raise ValueError("LoRA does not support --enable-two-batch-overlap")
+
         if cfg.lora_backend == "triton_v2" and not cfg.moe_runner_backend.startswith(
             "lora"
         ):
@@ -178,7 +191,50 @@ def check_lora_server_args(server_args: Any):
             "--lora-drain-wait-threshold must be non-negative."
         )
 
+        check_kv_b_lora_prefix_cache(server_args)
+
     check_lora_moe_runner_args(server_args)
+
+
+def _lora_targets_kv_b_proj(server_args: Any) -> bool:
+    """Whether the CLI LoRA targets name ``kv_b_proj``.
+
+    Adapters that only come with --lora-paths resolve their targets in
+    LoRAManager.init_lora_shapes, which re-checks there.
+    """
+    cfg = resolving_view(server_args)
+    targets = cfg.lora_target_modules
+    if not targets:
+        return False
+    if set(targets) == {"all"}:
+        return use_mla_backend(server_args)
+    return "kv_b_proj" in get_normalized_target_modules(targets)
+
+
+def check_kv_b_lora_prefix_cache(server_args: Any):
+    """Keep cached prefixes off the MHA paths when an adapter targets kv_b_proj."""
+    if not _lora_targets_kv_b_proj(server_args):
+        return
+    cfg = resolving_view(server_args)
+    prefill_backend, _ = attention_backends_of(cfg)
+    error = kv_b_lora_prefix_cache_error(
+        prefill_backend,
+        disable_chunked_prefix_cache=True,
+        enable_kv_cache_sharding=cfg.enable_kv_cache_sharding,
+        fa4_absorbed_mla=get_platform().is_sm100_or_sm110,
+    )
+    if error is not None:
+        raise ValueError(error)
+    if not cfg.disable_chunked_prefix_cache:
+        declare_resolution(
+            server_args,
+            "check_kv_b_lora_prefix_cache",
+            disable_chunked_prefix_cache=True,
+        )
+        logger.info(
+            "LoRA targets kv_b_proj: chunked prefix cache disabled so cached "
+            "prefixes take the absorbed MLA path, which applies the adapter."
+        )
 
 
 def check_lora_moe_runner_args(server_args: Any):
