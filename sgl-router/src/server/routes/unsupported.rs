@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Known API paths this router does not serve. They answer 501 naming the
-//! path, rather than a bare 404, so a client learns the endpoint is
-//! unsupported rather than mistyped.
+//! Paths sgl-model-gateway serves for features this router does not provide.
+//! They answer 501 rather than a bare 404, so a client moved from the gateway
+//! learns the endpoint is unsupported rather than mistyped.
 
 use crate::server::error::ApiError;
 use axum::http::Uri;
