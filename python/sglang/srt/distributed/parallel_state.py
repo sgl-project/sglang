@@ -1188,10 +1188,13 @@ class GroupCoordinator:
             if comm is not None and comm.should_quick_allreduce(input_):
                 return method
             comm = None
+        if method == "car_v2" and comm is not None and not comm.disabled:
+            return method
         if (
-            method in ("sglang_ca", "aiter_ca", "car_v2")
+            method in ("sglang_ca", "aiter_ca")
             and comm is not None
             and not comm.disabled
+            and self._tuned_custom_ar_fits(comm, method, input_)
         ):
             return method
         if not self._tune_fallback_logged:
@@ -1279,6 +1282,37 @@ class GroupCoordinator:
         return _flashinfer_allreduce_impl(
             input_, use_attn_tp_group=(self._fi_workspace_hint == "attn_tp")
         )
+
+    @staticmethod
+    def _tuned_custom_ar_fits(comm, method: str, input_: torch.Tensor) -> bool:
+        """Whether the SGLang or AITER class can run this tensor, past its size cap too.
+
+        A row holds for every size above it up to the next row, so a size the
+        tuner never measured can land past the class's cap. The tuner lifts
+        the cap only up to the buffer: half the pool for AITER's two-stage
+        kernel, the whole buffer for SGLang's.
+        """
+        if comm.should_custom_ar(input_):
+            return True
+        from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+            is_weak_contiguous,
+        )
+
+        nbytes = input_.numel() * input_.element_size()
+        if nbytes % 16 != 0 or not is_weak_contiguous(input_):
+            return False
+        if method == "aiter_ca":
+            topology_ok = comm.world_size == 2 or getattr(comm, "fully_connected", False)
+            limit = int(getattr(comm, "max_size", 0)) // 2
+        else:
+            if input_.dtype not in comm._SUPPORTED_DTYPES:
+                return False
+            topology_ok = bool(
+                getattr(comm, "use_amd_deterministic_impl", False)
+                or getattr(comm, "full_nvlink", False)
+            )
+            limit = int(getattr(comm, "max_size", 0))
+        return topology_ok and nbytes <= limit
 
     def _tuned_custom_all_reduce(self, comm, method: str, input_: torch.Tensor):
         """Run the custom all-reduce class the tune table named.
