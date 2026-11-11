@@ -3171,6 +3171,211 @@ pub struct OpenAiDetokenizeResponse {
     #[prost(message, optional, tag = "1")]
     pub text: ::core::option::Option<StringOrList>,
 }
+/// `reasoning`: `effort` is a tier (see OpenAiReasoningEffort), `summary` is
+/// "auto" | "concise" | "detailed".
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiResponseReasoning {
+    #[prost(string, optional, tag = "1")]
+    pub effort: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub summary: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `ResponseTool`: `type` is one of function, web_search, web_search_preview,
+/// code_interpreter, file_search, image_generation, computer_use_preview,
+/// local_shell, mcp, custom, namespace, tool_search; a function tool needs a
+/// `name`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiResponseTool {
+    #[prost(string, tag = "1")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub parameters: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "5")]
+    pub strict: bool,
+    /// Inner schemas of a `namespace` tool.
+    #[prost(string, repeated, tag = "6")]
+    pub tools: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "7")]
+    pub defer_loading: ::core::option::Option<bool>,
+    /// A `custom` tool's input format: `{"type": "text"}` or a grammar.
+    #[prost(string, optional, tag = "8")]
+    pub format: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `POST /v1/responses`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiResponsesRequest {
+    #[prost(bool, optional, tag = "1")]
+    pub background: ::core::option::Option<bool>,
+    /// "code_interpreter_call.outputs" | "computer_call_output.output.image_url"
+    /// \| "file_search_call.results" | "message.input_image.image_url" |
+    /// "message.output_text.logprobs" | "reasoning.encrypted_content".
+    #[prost(string, repeated, tag = "2")]
+    pub include: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// A string, or the SDK input item list.
+    #[prost(string, optional, tag = "3")]
+    pub input: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub instructions: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "5")]
+    pub max_output_tokens: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "6")]
+    pub max_tool_calls: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "7")]
+    pub metadata: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "8")]
+    pub model: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "9")]
+    pub parallel_tool_calls: ::core::option::Option<bool>,
+    #[prost(string, optional, tag = "10")]
+    pub previous_response_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "11")]
+    pub reasoning: ::core::option::Option<OpenAiResponseReasoning>,
+    /// "auto" | "default" | "flex" | "scale" | "priority".
+    #[prost(string, optional, tag = "12")]
+    pub service_tier: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "13")]
+    pub store: ::core::option::Option<bool>,
+    #[prost(bool, optional, tag = "14")]
+    pub stream: ::core::option::Option<bool>,
+    #[prost(double, optional, tag = "15")]
+    pub temperature: ::core::option::Option<f64>,
+    /// The SDK `ResponseTextConfig` (`{"format": {...}}`).
+    #[prost(string, optional, tag = "16")]
+    pub text: ::core::option::Option<::prost::alloc::string::String>,
+    /// "auto" | "required" | "none", or a tool object.
+    #[prost(string, optional, tag = "17")]
+    pub tool_choice: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "18")]
+    pub tools: ::prost::alloc::vec::Vec<OpenAiResponseTool>,
+    #[prost(int64, optional, tag = "19")]
+    pub top_logprobs: ::core::option::Option<i64>,
+    #[prost(double, optional, tag = "20")]
+    pub top_p: ::core::option::Option<f64>,
+    /// "auto" | "disabled".
+    #[prost(string, optional, tag = "21")]
+    pub truncation: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "22")]
+    pub user: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "23")]
+    pub chat_template_kwargs: ::core::option::Option<::prost::alloc::string::String>,
+    /// Minted as `resp_<uuid>` when absent.
+    #[prost(string, optional, tag = "24")]
+    pub request_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "25")]
+    pub session_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, tag = "26")]
+    pub priority: i64,
+    #[prost(string, optional, tag = "27")]
+    pub extra_key: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "28")]
+    pub cache_salt: ::core::option::Option<::prost::alloc::string::String>,
+    /// Deprecated alias of `routed_dp_rank`.
+    #[prost(int64, optional, tag = "29")]
+    pub data_parallel_rank: ::core::option::Option<i64>,
+    #[prost(double, tag = "30")]
+    pub frequency_penalty: f64,
+    #[prost(double, tag = "31")]
+    pub presence_penalty: f64,
+    #[prost(message, optional, tag = "32")]
+    pub stop: ::core::option::Option<StringOrList>,
+    #[prost(int64, optional, tag = "33")]
+    pub top_k: ::core::option::Option<i64>,
+    #[prost(double, optional, tag = "34")]
+    pub min_p: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "35")]
+    pub repetition_penalty: ::core::option::Option<f64>,
+    #[prost(message, optional, tag = "36")]
+    pub bootstrap_host: ::core::option::Option<StringOrList>,
+    #[prost(message, optional, tag = "37")]
+    pub bootstrap_port: ::core::option::Option<OptionalInt64OrList>,
+    #[prost(message, optional, tag = "38")]
+    pub bootstrap_room: ::core::option::Option<Int64OrList>,
+    #[prost(int64, optional, tag = "39")]
+    pub routed_dp_rank: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "40")]
+    pub disagg_prefill_dp_rank: ::core::option::Option<i64>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiResponsesInputTokensDetails {
+    #[prost(int64, tag = "1")]
+    pub cached_tokens: i64,
+    #[prost(int64, tag = "2")]
+    pub cache_write_tokens: i64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiResponsesOutputTokensDetails {
+    #[prost(int64, tag = "1")]
+    pub reasoning_tokens: i64,
+}
+/// The Responses usage shape (not the chat `UsageInfo`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenAiResponsesUsage {
+    #[prost(int64, tag = "1")]
+    pub input_tokens: i64,
+    #[prost(message, optional, tag = "2")]
+    pub input_tokens_details: ::core::option::Option<OpenAiResponsesInputTokensDetails>,
+    #[prost(int64, tag = "3")]
+    pub output_tokens: i64,
+    #[prost(message, optional, tag = "4")]
+    pub output_tokens_details: ::core::option::Option<OpenAiResponsesOutputTokensDetails>,
+    #[prost(int64, tag = "5")]
+    pub total_tokens: i64,
+}
+/// `status` is "queued" | "in_progress" | "completed" | "incomplete" |
+/// "failed" | "cancelled". `output` items are SDK output items.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenAiResponsesResponse {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub created_at: i64,
+    #[prost(string, tag = "4")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "5")]
+    pub output: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "6")]
+    pub status: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "7")]
+    pub usage: ::core::option::Option<OpenAiResponsesUsage>,
+    #[prost(bool, tag = "8")]
+    pub parallel_tool_calls: bool,
+    #[prost(string, optional, tag = "9")]
+    pub tool_choice: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "10")]
+    pub tools: ::prost::alloc::vec::Vec<OpenAiResponseTool>,
+    #[prost(string, optional, tag = "11")]
+    pub error: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "12")]
+    pub incomplete_details: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "13")]
+    pub instructions: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "14")]
+    pub max_output_tokens: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "15")]
+    pub previous_response_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "16")]
+    pub reasoning: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "17")]
+    pub store: ::core::option::Option<bool>,
+    #[prost(double, optional, tag = "18")]
+    pub temperature: ::core::option::Option<f64>,
+    #[prost(string, optional, tag = "19")]
+    pub text: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(double, optional, tag = "20")]
+    pub top_p: ::core::option::Option<f64>,
+    #[prost(string, optional, tag = "21")]
+    pub truncation: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "22")]
+    pub user: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "23")]
+    pub metadata: ::core::option::Option<::prost::alloc::string::String>,
+}
 /// `GET /v1/models` and `GET /v1/models/{model}`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OpenAiModelCard {

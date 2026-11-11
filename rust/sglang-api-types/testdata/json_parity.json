@@ -1697,6 +1697,37 @@
       "canonical": "{\"tokens\":[[1,2],[3]],\"count\":[2,1],\"max_model_len\":4096}"
     },
     {
+      "type": "OpenAiResponsesRequest",
+      "name": "the envelope with SDK items carried as JSON",
+      "input": {
+        "input": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "model": "m",
+        "tools": [
+          {
+            "type": "function",
+            "name": "f",
+            "parameters": {
+              "type": "object"
+            }
+          }
+        ],
+        "text": {
+          "format": {
+            "type": "text"
+          }
+        },
+        "reasoning": {
+          "effort": "high"
+        }
+      },
+      "canonical": "{\"background\":false,\"input\":[{\"role\":\"user\",\"content\":\"hi\"}],\"model\":\"m\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"high\"},\"service_tier\":\"auto\",\"store\":true,\"stream\":false,\"text\":{\"format\":{\"type\":\"text\"}},\"tools\":[{\"type\":\"function\",\"name\":\"f\",\"parameters\":{\"type\":\"object\"},\"strict\":false}],\"top_logprobs\":0,\"truncation\":\"disabled\",\"priority\":0,\"frequency_penalty\":0.0,\"presence_penalty\":0.0}"
+    },
+    {
       "type": "OpenAiModelList",
       "name": "the OpenAI model list",
       "input": {

@@ -1258,6 +1258,26 @@ impl SglangService for GrpcService {
         Err(openai_unimplemented())
     }
 
+    /// The unary Responses API; a streamed response has no RPC yet.
+    async fn open_ai_responses(
+        &self,
+        request: Request<api::OpenAiResponsesRequest>,
+    ) -> Result<Response<api::OpenAiResponsesResponse>, Status> {
+        let request = request.into_inner();
+        let adapter = crate::api_server::responses::Responses {
+            core: &self.core,
+            chat_formatter: self.chat_formatter.as_ref(),
+            server_args: &self.server_args,
+        };
+        let value = adapter
+            .create(&request)
+            .await
+            .map_err(|failure| failure.grpc_status())?;
+        serde_json::from_value::<api::OpenAiResponsesResponse>(value)
+            .map(Response::new)
+            .map_err(|error| Status::internal(format!("responses: {error}")))
+    }
+
     async fn open_ai_list_models(
         &self,
         _request: Request<api::OpenAiListModelsRequest>,

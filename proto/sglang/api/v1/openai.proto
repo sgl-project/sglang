@@ -958,6 +958,176 @@ message OpenAiDetokenizeResponse {
   StringOrList text = 1;
 }
 
+// ---- Responses API -----------------------------------------------------------------
+//
+// The envelope is typed; the input and output items and `text.format` are
+// OpenAI SDK unions (ResponseInputItemParam, ResponseOutputItem, ...) carried
+// as JSON until they are modeled. The streamed form and the response store
+// are deferred with them.
+
+// `reasoning`: `effort` is a tier (see OpenAiReasoningEffort), `summary` is
+// "auto" | "concise" | "detailed".
+message OpenAiResponseReasoning {
+  optional string effort = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "medium"
+  ];
+  optional string summary = 2;
+}
+
+// `ResponseTool`: `type` is one of function, web_search, web_search_preview,
+// code_interpreter, file_search, image_generation, computer_use_preview,
+// local_shell, mcp, custom, namespace, tool_search; a function tool needs a
+// `name`.
+message OpenAiResponseTool {
+  string type = 1;
+  optional string name = 2;
+  optional string description = 3;
+  optional string parameters = 4 [(sglang.json.v1.field_json).raw_json = true];
+  bool strict = 5;
+  // Inner schemas of a `namespace` tool.
+  repeated string tools = 6 [(sglang.json.v1.field_json).raw_json = true];
+  optional bool defer_loading = 7;
+  // A `custom` tool's input format: `{"type": "text"}` or a grammar.
+  optional string format = 8 [(sglang.json.v1.field_json).raw_json = true];
+}
+
+// `POST /v1/responses`.
+message OpenAiResponsesRequest {
+  optional bool background = 1 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = false
+  ];
+  // "code_interpreter_call.outputs" | "computer_call_output.output.image_url"
+  // | "file_search_call.results" | "message.input_image.image_url" |
+  // "message.output_text.logprobs" | "reasoning.encrypted_content".
+  repeated string include = 2;
+  // A string, or the SDK input item list.
+  optional string input = 3 [(sglang.json.v1.field_json).raw_json = true];
+  optional string instructions = 4;
+  optional int64 max_output_tokens = 5;
+  optional int64 max_tool_calls = 6;
+  optional string metadata = 7 [(sglang.json.v1.field_json).raw_json = true];
+  optional string model = 8;
+  optional bool parallel_tool_calls = 9 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+  optional string previous_response_id = 10;
+  optional OpenAiResponseReasoning reasoning = 11;
+  // "auto" | "default" | "flex" | "scale" | "priority".
+  optional string service_tier = 12 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "auto"
+  ];
+  optional bool store = 13 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = true
+  ];
+  optional bool stream = 14 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_bool = false
+  ];
+  optional double temperature = 15;
+  // The SDK `ResponseTextConfig` (`{"format": {...}}`).
+  optional string text = 16 [(sglang.json.v1.field_json).raw_json = true];
+  // "auto" | "required" | "none", or a tool object.
+  optional string tool_choice = 17 [(sglang.json.v1.field_json).raw_json = true];
+  repeated OpenAiResponseTool tools = 18;
+  optional int64 top_logprobs = 19 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_i64 = 0
+  ];
+  optional double top_p = 20;
+  // "auto" | "disabled".
+  optional string truncation = 21 [
+    (sglang.json.v1.field_json).null_policy = NULL_POLICY_RESETS_DEFAULT,
+    (sglang.json.v1.field_json).default_string = "disabled"
+  ];
+  optional string user = 22;
+  optional string chat_template_kwargs = 23 [(sglang.json.v1.field_json).raw_json = true];
+  // Minted as `resp_<uuid>` when absent.
+  optional string request_id = 24;
+  optional string session_id = 25;
+  int64 priority = 26;
+  optional string extra_key = 27;
+  optional string cache_salt = 28;
+  // Deprecated alias of `routed_dp_rank`.
+  optional int64 data_parallel_rank = 29;
+  double frequency_penalty = 30;
+  double presence_penalty = 31;
+  optional StringOrList stop = 32;
+  optional int64 top_k = 33;
+  optional double min_p = 34;
+  optional double repetition_penalty = 35;
+  optional StringOrList bootstrap_host = 36;
+  optional OptionalInt64OrList bootstrap_port = 37;
+  optional Int64OrList bootstrap_room = 38;
+  optional int64 routed_dp_rank = 39;
+  optional int64 disagg_prefill_dp_rank = 40;
+}
+
+message OpenAiResponsesInputTokensDetails {
+  int64 cached_tokens = 1;
+  int64 cache_write_tokens = 2;
+}
+
+message OpenAiResponsesOutputTokensDetails {
+  int64 reasoning_tokens = 1;
+}
+
+// The Responses usage shape (not the chat `UsageInfo`).
+message OpenAiResponsesUsage {
+  int64 input_tokens = 1;
+  OpenAiResponsesInputTokensDetails input_tokens_details = 2;
+  int64 output_tokens = 3;
+  OpenAiResponsesOutputTokensDetails output_tokens_details = 4;
+  int64 total_tokens = 5;
+}
+
+// `status` is "queued" | "in_progress" | "completed" | "incomplete" |
+// "failed" | "cancelled". `output` items are SDK output items.
+message OpenAiResponsesResponse {
+  string id = 1;
+  string object = 2;
+  int64 created_at = 3;
+  string model = 4;
+  repeated string output = 5 [(sglang.json.v1.field_json).raw_json = true];
+  string status = 6;
+  optional OpenAiResponsesUsage usage = 7 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  bool parallel_tool_calls = 8;
+  optional string tool_choice = 9 [(sglang.json.v1.field_json).raw_json = true];
+  repeated OpenAiResponseTool tools = 10;
+  optional string error = 11 [
+    (sglang.json.v1.field_json).raw_json = true,
+    (sglang.json.v1.field_json).emit_null_when_absent = true
+  ];
+  optional string incomplete_details = 12 [
+    (sglang.json.v1.field_json).raw_json = true,
+    (sglang.json.v1.field_json).emit_null_when_absent = true
+  ];
+  optional string instructions = 13 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional int64 max_output_tokens = 14 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional string previous_response_id = 15 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional string reasoning = 16 [
+    (sglang.json.v1.field_json).raw_json = true,
+    (sglang.json.v1.field_json).emit_null_when_absent = true
+  ];
+  optional bool store = 17 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional double temperature = 18 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional string text = 19 [
+    (sglang.json.v1.field_json).raw_json = true,
+    (sglang.json.v1.field_json).emit_null_when_absent = true
+  ];
+  optional double top_p = 20 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional string truncation = 21 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional string user = 22 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional string metadata = 23 [
+    (sglang.json.v1.field_json).raw_json = true,
+    (sglang.json.v1.field_json).emit_null_when_absent = true
+  ];
+}
+
 // ---- Models --------------------------------------------------------------------------
 
 // `GET /v1/models` and `GET /v1/models/{model}`.
