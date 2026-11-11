@@ -191,27 +191,11 @@ _K3_GB300_BFA_SIDE_TGV_M_RANGES = {
 }
 
 
-def _k3_gb300_tuning() -> bool:
-    return get_platform().device_sm == 103
-
-
 def _k3_side_stream_max_tokens() -> int:
     """Largest graphed batch whose attention side-stream GEMMs overlap."""
     if not get_platform().is_blackwell:
         return 64
-    return 288 if _k3_gb300_tuning() else 128
-
-
-def _k3_bfa_side_gemm(
-    x: torch.Tensor, w: torch.Tensor, tgv_tactic: Optional[int]
-) -> torch.Tensor:
-    if tgv_tactic is None:
-        from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
-
-        return kimi_k3_tiny_gemm(x, w)
-    from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import cutedsl_bf16_gemm
-
-    return cutedsl_bf16_gemm(x, w, tactic=tgv_tactic)
+    return 288 if get_platform().device_sm == 103 else 128
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -2144,7 +2128,7 @@ class KimiK3DeltaAttention(nn.Module):
         self._bfa_fa_size, self._bfa_b_size = sizes
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 
-        if _k3_gb300_tuning() and get_bf16_gemm_backend().is_cutedsl():
+        if get_platform().device_sm == 103 and get_bf16_gemm_backend().is_cutedsl():
             from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import TGVMRanges
 
             m_ranges = TGVMRanges()
@@ -2379,7 +2363,14 @@ class KimiK3DeltaAttention(nn.Module):
                         None if m_ranges is None else m_ranges(hidden_states.shape[0])
                     )
                     with torch.cuda.stream(alt):
-                        bfa = _k3_bfa_side_gemm(hidden_states, w, tgv_tactic=tgv_tactic)
+                        if tgv_tactic is None:
+                            bfa = gemm(hidden_states, w)
+                        else:
+                            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                                cutedsl_bf16_gemm,
+                            )
+
+                            bfa = cutedsl_bf16_gemm(hidden_states, w, tactic=tgv_tactic)
                         forget_gate = (
                             bfa[..., :n_fa]
                             if defer_f_b
@@ -3433,7 +3424,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import register_tgv_m_ranges
 
         register_tgv_m_ranges(_K3_TGV_M_RANGES)
-        if _k3_gb300_tuning():
+        if get_platform().device_sm == 103:
             register_tgv_m_ranges(_K3_GB300_TGV_M_RANGES)
         if quant_config is not None:
             if isinstance(quant_config, ModelSlimConfig):
