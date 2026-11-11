@@ -165,7 +165,7 @@ class TestToolArgumentIntegrity(CustomTestCase):
                 )
 
                 class Backend(_FakeNonStreamingErrorOpenAI):
-                    async def _handle_non_streaming_request(self, *args):
+                    async def _chat_completion_response(self, *args):
                         return response
 
                 serving = AnthropicServing(Backend())
