@@ -55,6 +55,11 @@ class HybridAttnBackend(AttentionBackend):
             prefill_backend, "extend_dummy_seqs_capped_by_req_pool", False
         )
 
+    def on_after_weight_load(self) -> None:
+        self.prefill_backend.on_after_weight_load()
+        if self.decode_backend is not self.prefill_backend:
+            self.decode_backend.on_after_weight_load()
+
     def window_capacity_children(self) -> list:
         return [self.prefill_backend, self.decode_backend]
 
