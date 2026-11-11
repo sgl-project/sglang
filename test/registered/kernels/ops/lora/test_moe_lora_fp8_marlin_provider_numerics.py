@@ -175,7 +175,7 @@ def _marlin_layer(family: str, w13: torch.Tensor, w2: torch.Tensor, gated=True):
             activation="silu" if gated else "relu2",
             apply_router_weight_on_input=False,
         ),
-        num_local_experts=_E,
+        num_local_experts=w13.shape[0],
         intermediate_size_per_partition=w2.shape[2],
         hidden_size=w2.shape[1],
     )
@@ -268,6 +268,112 @@ def test_fp8_marlin_gateup_and_down_match_reference(family):
         marlin_err,
         native_err,
     )
+
+
+@pytest.mark.parametrize("tokens, block", ((12, 8), (13, 16)))
+def test_fp8_marlin_block_16_at_the_measured_shape(tokens: int, block: int) -> None:
+    """128-wide scale groups at the 2048 x 512 routed-expert shape leave block 8
+    at 6.5 pairs per expert on compute capability 9.0 (13 tokens put 6.5 on each
+    expert here); other architectures keep block 8 there. Eager, then a graph
+    replayed with changed routing and inputs, against the FP32 GEMM on the
+    dequantized weights; the block size is read back from the row state.
+    """
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    g = torch.Generator(device="cpu").manual_seed(17)
+    hidden_size, intermediate = 2048, 512
+
+    def rand(*shape, scale=0.05):
+        return (
+            (torch.randn(*shape, generator=g, device="cpu") * scale)
+            .to(torch.bfloat16)
+            .to(device)
+        )
+
+    quant_info, _, w13_eff, w2_eff = _marlin_layer(
+        "fp8",
+        rand(_E, 2 * intermediate, hidden_size),
+        rand(_E, hidden_size, intermediate),
+    )
+    assert quant_info.group_size == 128
+    if torch.cuda.get_device_capability(quant_info.w13_qweight.device) != (9, 0):
+        block = 8
+    provider = select_provider_cls("route_major", "fp8", "marlin")(quant_info)
+    pair_idx = torch.arange(tokens * _TOPK, device=device)
+    pair_tokens = pair_idx // _TOPK
+
+    def draw_ids():
+        return torch.stack(
+            [
+                torch.randperm(_E, generator=g, device="cpu")[:_TOPK]
+                for _ in range(tokens)
+            ]
+        ).to(device=device, dtype=torch.int32)
+
+    hidden, topk_ids = rand(tokens, hidden_size), draw_ids()
+    act_pairs = rand(tokens * _TOPK, intermediate, scale=0.1)
+
+    def reference():
+        experts = topk_ids.flatten().long()
+        return (
+            torch.einsum("ph,pnh->pn", hidden[pair_tokens].float(), w13_eff[experts]),
+            torch.einsum("pi,phi->ph", act_pairs.float(), w2_eff[experts]),
+        )
+
+    def forward():
+        with get_context().override_server_args():
+            state = provider.prepare(hidden, topk_ids, _TOPK)
+            gateup = torch.zeros(
+                provider.gateup_out_shape(state), dtype=torch.bfloat16, device=device
+            )
+            provider.gateup(state, gateup)
+            act = torch.zeros(
+                provider.act_out_shape(state), dtype=torch.bfloat16, device=device
+            )
+            act.reshape(-1, intermediate)[state.pair_to_row[pair_idx].long()] = (
+                act_pairs
+            )
+            down = torch.zeros(
+                provider.down_out_shape(state), dtype=torch.bfloat16, device=device
+            )
+            provider.down(state, act, down)
+        return (
+            state.block_size_m,
+            _gather_pairs(gateup, state.pair_to_row, pair_idx),
+            _gather_pairs(down, state.pair_to_row, pair_idx),
+        )
+
+    def check(got_gateup, got_down):
+        ref_gateup, ref_down = reference()
+        assert rel_l2(got_gateup.float(), ref_gateup) < _MARLIN_TOL
+        assert rel_l2(got_down.float(), ref_down) < _MARLIN_TOL
+
+    got_block, got_gateup, got_down = forward()
+    torch.cuda.synchronize()
+    assert got_block == block
+    check(got_gateup, got_down)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            forward()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured_block, captured_gateup, captured_down = forward()
+    assert captured_block == block
+    graph.replay()
+    torch.cuda.synchronize()
+    check(captured_gateup, captured_down)
+
+    # Replay over new routing and inputs in the captured buffers.
+    topk_ids.copy_(draw_ids())
+    hidden.copy_(rand(tokens, hidden_size))
+    act_pairs.copy_(rand(tokens * _TOPK, intermediate, scale=0.1))
+    graph.replay()
+    torch.cuda.synchronize()
+    check(captured_gateup, captured_down)
 
 
 @pytest.mark.parametrize("family", _FAMILIES)
@@ -678,6 +784,84 @@ def test_fp8_marlin_provider_serves_64_aligned_intermediates(family, intermediat
         provider.down(state, act, down)
     got_gateup = _gather_pairs(gateup, state.pair_to_row, pair_idx).float()
     got_down = _gather_pairs(down, state.pair_to_row, pair_idx).float()
+    assert rel_l2(got_gateup, ref_gateup) < _MARLIN_TOL
+    assert rel_l2(got_down, ref_down) < _MARLIN_TOL
+
+
+def _expert_gemm_reference(
+    rows: torch.Tensor, experts: torch.Tensor, weights: torch.Tensor
+) -> torch.Tensor:
+    """rows[p] @ weights[experts[p]].T in FP32, one expert at a time: at serving
+    sizes the gathered weights of the einsum reference would not fit."""
+    out = torch.empty(
+        rows.shape[0], weights.shape[1], dtype=torch.float32, device=rows.device
+    )
+    for expert in torch.unique(experts).tolist():
+        mask = experts == expert
+        out[mask] = rows[mask].float() @ weights[expert].T
+    return out
+
+
+def test_fp8_marlin_block_size_at_the_measured_layer() -> None:
+    """MXFP8 experts at the layer the 48-row rule was measured on (256 experts,
+    hidden 2048, intermediate 512) with 4096 tokens: 128 pairs per expert.
+    On SM103 devices with 152 SMs the provider aligns the rows in blocks of 48,
+    elsewhere in blocks of 64 as the shared rule does; both GEMMs match the
+    dequantized reference either way."""
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    experts, hidden_size, intermediate, top_k, tokens = 256, 2048, 512, 8, 4096
+    g = torch.Generator(device="cpu").manual_seed(29)
+
+    def rand(*shape, scale=0.05):
+        return (
+            (torch.randn(*shape, generator=g, device="cpu") * scale)
+            .to(torch.bfloat16)
+            .to(device)
+        )
+
+    quant_info, _, w13_eff, w2_eff = _marlin_layer(
+        "mxfp8",
+        rand(experts, 2 * intermediate, hidden_size),
+        rand(experts, hidden_size, intermediate),
+    )
+    assert quant_info.group_size == 32
+    hidden = rand(tokens, hidden_size, scale=0.5)
+    topk_ids = torch.stack(
+        [
+            torch.randperm(experts, generator=g, device="cpu")[:top_k]
+            for _ in range(tokens)
+        ]
+    ).to(device=device, dtype=torch.int32)
+    pair_idx = torch.arange(topk_ids.numel(), device=device)
+    pair_experts = topk_ids.flatten().long()
+    act_pairs = rand(tokens * top_k, intermediate, scale=0.1)
+    provider = select_provider_cls("route_major", "mxfp8", "marlin")(quant_info)
+    with get_context().override_server_args():
+        state = provider.prepare(hidden, topk_ids, top_k)
+        measured_device = (
+            torch.cuda.get_device_capability(device) == (10, 3)
+            and torch.cuda.get_device_properties(device).multi_processor_count == 152
+        )
+        assert state.block_size_m == (48 if measured_device else 64)
+        gateup = torch.zeros(
+            provider.gateup_out_shape(state), dtype=torch.bfloat16, device=device
+        )
+        provider.gateup(state, gateup)
+        act = torch.zeros(
+            provider.act_out_shape(state), dtype=torch.bfloat16, device=device
+        )
+        act.reshape(-1, intermediate)[state.pair_to_row[pair_idx].long()] = act_pairs
+        down = torch.zeros(
+            provider.down_out_shape(state), dtype=torch.bfloat16, device=device
+        )
+        provider.down(state, act, down)
+    got_gateup = _gather_pairs(gateup, state.pair_to_row, pair_idx).float()
+    got_down = _gather_pairs(down, state.pair_to_row, pair_idx).float()
+    ref_gateup = _expert_gemm_reference(
+        hidden[pair_idx // top_k], pair_experts, w13_eff
+    )
+    ref_down = _expert_gemm_reference(act_pairs, pair_experts, w2_eff)
     assert rel_l2(got_gateup, ref_gateup) < _MARLIN_TOL
     assert rel_l2(got_down, ref_down) < _MARLIN_TOL
 

@@ -280,6 +280,121 @@ class TestFp8MarlinFamilyBinding(CustomTestCase):
                     self.assertEqual(W8A8FP8MoEMethod(None).use_marlin, expected)
 
 
+class TestMarlinBlockSize(CustomTestCase):
+    """The Marlin providers' M block size: the shared rule, and the one case in
+    which the FP8 provider leaves it."""
+
+    @staticmethod
+    def _shared_rule(num_tokens, top_k, num_experts):
+        for block_size_m in (8, 16, 32, 48, 64):
+            if num_tokens * top_k / num_experts / block_size_m < 0.9:
+                break
+        return block_size_m
+
+    @staticmethod
+    def _cases():
+        return [
+            (tokens, top_k, experts)
+            for experts in (4, 60, 128, 256, 384)
+            for top_k in (1, 2, 6, 8)
+            for tokens in (*range(1, 600), *range(600, 40000, 37))
+        ]
+
+    def test_providers_keep_the_shared_rule(self):
+        from sglang.srt.lora.moe.base_gemm_provider.marlin_common import (
+            MarlinContiguousProvider,
+        )
+        from sglang.srt.lora.moe.base_gemm_provider.marlin_fp8 import (
+            MarlinFp8ContiguousProvider,
+        )
+        from sglang.srt.lora.moe.base_gemm_provider.marlin_mxfp4 import (
+            MarlinMxfp4ContiguousProvider,
+        )
+        from sglang.srt.lora.moe.base_gemm_provider.marlin_nvfp4 import (
+            MarlinNvFp4ContiguousProvider,
+        )
+
+        for cls in (
+            MarlinContiguousProvider,
+            MarlinMxfp4ContiguousProvider,
+            MarlinNvFp4ContiguousProvider,
+            MarlinFp8ContiguousProvider,
+        ):
+            provider = object.__new__(cls)
+            provider._blocks_of_48 = False
+            provider._layer_block_fill = cls._block_fill
+            for case in self._cases():
+                self.assertEqual(
+                    provider._block_size_m(*case), self._shared_rule(*case), case
+                )
+
+    def test_fp8_provider_takes_blocks_of_48_only_in_the_measured_case(self):
+        from sglang.srt.lora.moe.base_gemm_provider.marlin_fp8 import (
+            MarlinFp8ContiguousProvider,
+        )
+
+        provider = object.__new__(MarlinFp8ContiguousProvider)
+        provider._blocks_of_48 = True
+        provider._layer_block_fill = MarlinFp8ContiguousProvider._block_fill
+        changed = 0
+        for tokens, top_k, experts in self._cases():
+            got = provider._block_size_m(tokens, top_k, experts)
+            shared = self._shared_rule(tokens, top_k, experts)
+            if 128 <= tokens * top_k / experts <= 512:
+                self.assertEqual((shared, got), (64, 48), (tokens, top_k, experts))
+                changed += 1
+            else:
+                self.assertEqual(got, shared, (tokens, top_k, experts))
+        self.assertGreater(changed, 0)
+
+    def test_blocks_of_48_need_sm103_with_152_sms_group_32_and_the_measured_layer(
+        self,
+    ):
+        from sglang.srt.lora.moe.base_gemm_provider import marlin_fp8
+
+        def provider(capability=(10, 3), sms=152, device_type="cuda", **overrides):
+            fields = dict(
+                group_size=32,
+                hidden_size=2048,
+                intermediate_size=512,
+                num_local_experts=256,
+            )
+            fields.update(overrides)
+            quant_info = SimpleNamespace(
+                w13_qweight=SimpleNamespace(device=SimpleNamespace(type=device_type)),
+                **fields,
+            )
+            with (
+                mock.patch.object(
+                    marlin_fp8.MarlinContiguousProvider, "__init__", return_value=None
+                ),
+                mock.patch.object(
+                    marlin_fp8.torch.cuda,
+                    "get_device_capability",
+                    return_value=capability,
+                ),
+                mock.patch.object(
+                    marlin_fp8.torch.cuda,
+                    "get_device_properties",
+                    return_value=SimpleNamespace(multi_processor_count=sms),
+                ),
+            ):
+                return marlin_fp8.MarlinFp8ContiguousProvider(quant_info)
+
+        self.assertTrue(provider()._blocks_of_48)
+        for other in (
+            dict(capability=(10, 0)),
+            dict(capability=(9, 0)),
+            dict(sms=148),
+            dict(device_type="cpu"),
+            dict(group_size=128),
+            dict(hidden_size=3072),
+            dict(intermediate_size=1024),
+            dict(num_local_experts=128),
+        ):
+            self.assertFalse(provider(**other)._blocks_of_48, other)
+
+
 class TestMxfp4ScaleStorage(CustomTestCase):
     """Under a lora_* backend the FP8 method stores FP4-expert scales as E8M0 bytes."""
 
@@ -737,6 +852,62 @@ class TestFamilyRecognizersAgree(CustomTestCase):
 
 
 class TestProviderGeometry(CustomTestCase):
+    def test_marlin_fp8_leaves_block_8_earlier_at_the_measured_shape(self):
+        from sglang.srt.lora.moe.base_gemm_provider.marlin_common import (
+            MarlinContiguousProvider,
+        )
+        from sglang.srt.lora.moe.base_gemm_provider.marlin_fp8 import (
+            MarlinFp8ContiguousProvider,
+        )
+
+        # 256 experts at top-k 8: 32 tokens put one pair on each expert.
+        tokens = (1, 179, 180, 207, 208, 230, 231, 460, 461, 921, 922, 1382, 1383, 8192)
+
+        def blocks(
+            provider_cls,
+            group_size=128,
+            hidden=2048,
+            intermediate=512,
+            capability=(9, 0),
+        ):
+            # The fill table is chosen once, from the layer's shape and the
+            # capability of its weights' device; the rule asks no device.
+            quant_info = SimpleNamespace(
+                group_size=group_size,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                w13_qweight=SimpleNamespace(device=torch.device("cuda", 1)),
+            )
+            with mock.patch.object(
+                torch.cuda, "get_device_capability", return_value=capability
+            ) as device_capability:
+                block_fill = provider_cls._block_fill_for(quant_info)
+            if device_capability.called:
+                device_capability.assert_called_once_with(torch.device("cuda", 1))
+            return [
+                provider_cls._block_from_fill(block_fill, t, 8, 256) for t in tokens
+            ]
+
+        # fused_marlin_moe's 0.9 fill for every block.
+        shared = [8, 8, 8, 8, 8, 8, 16, 16, 32, 32, 48, 48, 64, 64]
+        self.assertEqual(blocks(MarlinContiguousProvider), shared)
+        # W8A16, 128-wide groups at the 2048 x 512 shape on compute capability
+        # 9.0: block 16 from 6.5 pairs per expert on.
+        self.assertEqual(
+            blocks(MarlinFp8ContiguousProvider),
+            [8, 8, 8, 8, 16, 16, 16, 16, 32, 32, 48, 48, 64, 64],
+        )
+        # Other architectures, scale-group widths and shapes keep the shared rule.
+        for capability in ((10, 0), (10, 3), (12, 0)):
+            self.assertEqual(
+                blocks(MarlinFp8ContiguousProvider, capability=capability), shared
+            )
+        self.assertEqual(blocks(MarlinFp8ContiguousProvider, group_size=32), shared)
+        self.assertEqual(
+            blocks(MarlinFp8ContiguousProvider, hidden=4096, intermediate=1024),
+            shared,
+        )
+
     def test_triton_fp8_k_tiles_stay_within_scale_groups(self):
         from sglang.srt.lora.moe.base_gemm_provider.triton_bf16 import (
             TritonBf16ContiguousProvider,

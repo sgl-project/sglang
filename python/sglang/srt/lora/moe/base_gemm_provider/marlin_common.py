@@ -29,6 +29,9 @@ class MarlinContiguousProvider(PairRowDomainProvider):
     # The packed weight format: 4-bit FP4 pairs unless a vendor sets FP8 bytes.
     _weight_bits = 4
     _is_fp8 = False
+    # fused_marlin_moe's M block size rule: the first block that the average
+    # pairs per expert fill to less than its fraction, 64 beyond the last.
+    _block_fill = ((8, 0.9), (16, 0.9), (32, 0.9), (48, 0.9))
     # A reload replaces the repacked parameters these bind.
     derived_base_weights = "the Marlin-repacked expert weights"
 
@@ -65,6 +68,31 @@ class MarlinContiguousProvider(PairRowDomainProvider):
             self._is_fp8,
         )
 
+        # Chosen once per layer: prepare runs in every forward.
+        self._layer_block_fill = self._block_fill_for(quant_info)
+
+    @classmethod
+    def _block_fill_for(cls, quant_info) -> tuple[tuple[int, float], ...]:
+        return cls._block_fill
+
+    @staticmethod
+    def _block_from_fill(
+        block_fill: tuple[tuple[int, float], ...],
+        num_tokens: int,
+        top_k: int,
+        num_experts: int,
+    ) -> int:
+        pairs_per_expert = num_tokens * top_k / num_experts
+        for block, fill in block_fill:
+            if pairs_per_expert / block < fill:
+                return block
+        return 64
+
+    def _block_size_m(self, num_tokens: int, top_k: int, num_experts: int) -> int:
+        return self._block_from_fill(
+            self._layer_block_fill, num_tokens, top_k, num_experts
+        )
+
     def prepare(
         self,
         hidden_states: torch.Tensor,
@@ -74,12 +102,9 @@ class MarlinContiguousProvider(PairRowDomainProvider):
     ) -> MarlinRowState:
         from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
-        num_tokens = hidden_states.shape[0]
-        num_experts = self.quant_info.num_local_experts
-        # fused_marlin_moe's M block size rule.
-        for block_size_m in (8, 16, 32, 48, 64):
-            if num_tokens * top_k / num_experts / block_size_m < 0.9:
-                break
+        block_size_m = self._block_size_m(
+            hidden_states.shape[0], top_k, self.quant_info.num_local_experts
+        )
         rows = self._sorted_rows(
             hidden_states, topk_ids, top_k, block_size_m, workspace
         )
