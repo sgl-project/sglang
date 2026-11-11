@@ -144,10 +144,22 @@ class OffloaderV1(BaseOffloader):
         submodule_accessor: Optional[_SubmoduleAccessor] = None,
         whitelist_param_names_creator: Optional[_WhitelistParamNamesCreator] = None,
     ):
-        return [self.maybe_offload_to_cpu(module) for module in all_modules_generator]
+        return [
+            self.maybe_offload_to_cpu(
+                module, submodule_accessor(module) if submodule_accessor else None
+            )
+            for module in all_modules_generator
+        ]
 
-    def maybe_offload_to_cpu(self, module: torch.nn.Module) -> torch.nn.Module:
-        if (params := next(module.parameters(), None)) is None:
+    def maybe_offload_to_cpu(
+        self,
+        module: torch.nn.Module,
+        offloaded_submodule: Optional[torch.nn.Module] = None,
+    ) -> torch.nn.Module:
+        # Only offloaded_submodule's parameters move to CPU; the wrapper stays on
+        # module.forward, so code that bypasses the submodule's forward still works.
+        source = module if offloaded_submodule is None else offloaded_submodule
+        if (params := next(source.parameters(), None)) is None:
             return module
 
         device = params.device
@@ -163,7 +175,7 @@ class OffloaderV1(BaseOffloader):
         # use pin_memory if possible, which helps cudagraph capture speed
         offloaded_parameters = False
         resident_parameter_ids = _get_resident_parameter_ids(module)
-        for p in module.parameters():
+        for p in source.parameters():
             if id(p) in resident_parameter_ids:
                 continue
             if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
