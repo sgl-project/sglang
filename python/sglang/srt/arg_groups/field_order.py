@@ -564,6 +564,8 @@ POSITIONAL_FIELD_ORDER = (
     "disable_normalize_embedding",
     "log_schedule_decisions",
     "speculative_dspark_lm_head_dtype",
+    "media_url_timeout",
+    "allow_local_media_files",
     "pp_min_chunked_prefill_size",
     "pp_chunk_overhead_tokens",
 )

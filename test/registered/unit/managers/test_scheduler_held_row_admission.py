@@ -26,6 +26,8 @@ NUM_ROWS = 4
 
 
 class _Req:
+    owner_list = None
+
     def __init__(self, holds_row):
         self.kv = SimpleNamespace(holds_kv=holds_row)
         self.beam_group = None

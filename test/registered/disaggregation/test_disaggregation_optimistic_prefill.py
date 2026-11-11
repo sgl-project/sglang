@@ -490,7 +490,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             return_value=SimpleNamespace(optimistic_prefill_attempts=3),
         ):
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req, scheduler.prefill_launched_reqs
+                scheduler, req
             )
 
         self.assertEqual(tree.total_size(), (self.TRACK_SEQLEN, 1))
@@ -584,7 +584,7 @@ class TestOptimisticPrefillWriteThroughRetryPublish(CustomTestCase):
             ),
         ):
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req, scheduler.prefill_launched_reqs
+                scheduler, req
             )
 
         # The tree keeps the computed prefix (write-through backs it up on
