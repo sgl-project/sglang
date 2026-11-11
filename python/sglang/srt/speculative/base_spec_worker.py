@@ -295,6 +295,19 @@ class BaseSpecWorker(ABC):
                 mode=HiCacheDraftMode.FUSED, device_pools=draft_pools
             )
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+            # A packed host page has one physical layout for target and draft KV.
+            layout = target_model_runner.kv_cache_configurator.modelslim_cache_layout
+            if any(
+                runner.kv_cache_configurator.modelslim_cache_layout != layout
+                for runner in draft_runners
+            ):
+                if len(draft_pools) > 1:
+                    raise NotImplementedError(
+                        "Mixed ModelSlim KV layouts require a single HiCache draft sidecar."
+                    )
+                return HiCacheDraftPlan(
+                    mode=HiCacheDraftMode.SIDECAR, device_pools=draft_pools
+                )
             target_model_runner.mtp_draft_device_pools = draft_pools
             target_mamba_pool = (
                 target_model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)

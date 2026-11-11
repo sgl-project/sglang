@@ -532,10 +532,12 @@ class HybridCacheController(BaseHiCacheController):
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
         storage_attached = self.enable_storage and self.storage_backend is not None
-        if storage_attached and getattr(self.storage_host_pool, "dcp_size", 1) > 1:
-            # Sidecars added after attach (e.g. the DFLASH draft) miss the
-            # attach-time DCP check.
-            check_dcp_l3_extra_pool(entry, self.storage_host_pool)
+        if storage_attached:
+            self._check_storage_pool(entry.host_pool)
+            if getattr(self.storage_host_pool, "dcp_size", 1) > 1:
+                # Sidecars added after attach (e.g. the DFLASH draft) miss the
+                # attach-time DCP check.
+                check_dcp_l3_extra_pool(entry, self.storage_host_pool)
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())

@@ -199,12 +199,14 @@ class KVBuffers(msgspec.Struct, frozen=True, kw_only=True):
 class KVScaleLayout(Enum):
     TOKEN = "token"
     MXFP8_INTERLEAVED = "mxfp8_interleaved"
+    MODELSLIM_MXFP8 = "modelslim_mxfp8"
 
 
 class KVScaleBuffers(msgspec.Struct, frozen=True, kw_only=True):
     k: tuple[torch.Tensor, ...]
     v: tuple[torch.Tensor, ...]
     layout: KVScaleLayout
+    k_transfer_buffer: Callable[[], torch.Tensor] | None = None
 
 
 class PageEnvelopeBufferInfo(msgspec.Struct, frozen=True, kw_only=True):

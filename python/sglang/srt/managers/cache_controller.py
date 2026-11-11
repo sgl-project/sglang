@@ -656,6 +656,13 @@ class HiCacheController:
     # returns fires on_host_pools_registered() itself, once.
     _registers_host_pools_after_super_attach = False
 
+    @staticmethod
+    def _check_storage_pool(pool) -> None:
+        if not getattr(pool, "supports_l3", True):
+            raise ValueError(
+                f"{type(pool).__name__} supports only L2 HiCache for this KV format."
+            )
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -670,6 +677,11 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+        if self.mem_pool_host is self.storage_host_pool:
+            self._check_storage_pool(self.storage_host_pool)
+        else:
+            for entry in self.mem_pool_host.entries:
+                self._check_storage_pool(entry.host_pool)
         key_scheme = get_memory().hicache_storage_key_scheme
         if key_scheme != "unified" and self.storage_host_pool.layout == "page_unified":
             raise ValueError(

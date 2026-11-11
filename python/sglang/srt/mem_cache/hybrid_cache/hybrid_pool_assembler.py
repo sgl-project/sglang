@@ -5,11 +5,15 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+import torch
+
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyLayout,
+    KVScaleLayout,
     MHABufferInfo,
     MLABufferInfo,
+    MLASplitBuffers,
     PageRowBufferInfo,
 )
 from sglang.srt.mem_cache.hicache_storage import (
@@ -41,7 +45,8 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     get_mha_host_pool_cls,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost, _split_row_bytes
+from sglang.srt.mem_cache.pool_host.npu_memfabric import memfabric_host_memory_enabled
 from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
 )
@@ -140,12 +145,37 @@ def _mha_host_inputs(pool, info, drafts=()):
     )
 
 
+def _is_modelslim_host_kv(info):
+    if isinstance(info, MHABufferInfo):
+        return (
+            info.scales is not None
+            and info.scales.layout is KVScaleLayout.MODELSLIM_MXFP8
+        )
+    return (
+        isinstance(info, MLABufferInfo)
+        and isinstance(info.buffers, MLASplitBuffers)
+        and not info.packed_fp8
+        and info.dtype == torch.float8_e4m3fn
+        and info.buffers.v is not None
+        and info.buffers.v.dtype == torch.bfloat16
+    )
+
+
+def _npu_host_row_bytes(pool, info, layers):
+    if isinstance(info, MLABufferInfo):
+        return sum(_split_row_bytes(info, layers))
+    key, value = info.transfer_buffers()
+    host_bytes = pool.host_capacity_bytes or (key.nbytes + value.nbytes)
+    return host_bytes // (key.shape[1] * info.page_size)
+
+
 def build_kv_host_pool(
     *,
     kv_pool: Any,
     page_size: int,
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
+    sidecar_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
 ):
     host_input = kv_pool.get_device_pool_infos()[0].buffer_info
@@ -195,6 +225,51 @@ def build_kv_host_pool(
         )
     else:
         kwargs.update(mha_kwargs)
+    host_size = get_memory().hicache_size if host_size is None else host_size
+    split_mla = (
+        use_mla
+        and isinstance(host_input.buffers, MLASplitBuffers)
+        and get_memory().hicache_mem_layout == "page_first_kv_split"
+    )
+    memfabric = split_mla and memfabric_host_memory_enabled()
+    # The sidecar plan owns one draft pool, as in build_hicache_draft_sidecars().
+    draft = (
+        _full_draft_kv_pool(sidecar_draft_device_pools[0])
+        if sidecar_draft_device_pools
+        and (memfabric or host_size > 0)
+        and (split_mla or (not use_mla and host_input.transfer_buffers is not None))
+        else None
+    )
+    if draft is not None and draft.layer_num:
+        info = draft.get_device_pool_infos()[0].buffer_info
+        mixed = _is_modelslim_host_kv(host_input) or _is_modelslim_host_kv(info)
+        reserve = (
+            memfabric
+            and isinstance(info, MLABufferInfo)
+            and isinstance(info.buffers, MLASplitBuffers)
+        )
+        if reserve or (mixed and host_size > 0):
+            # Replicated drafts span logical target slots, sharded MLA spans local slots.
+            dcp_size = parallel.attn_dcp_size if parallel.dcp_enabled else 1
+            replicas = (
+                1
+                if isinstance(info, MLABufferInfo) and not draft.dcp_replicated
+                else dcp_size
+            )
+            draft_bytes = replicas * _npu_host_row_bytes(draft, info, draft.layer_num)
+            if reserve:
+                kwargs["memfabric_sidecar_bytes_per_token"] = draft_bytes
+            if mixed and host_size > 0:
+                target_bytes = _npu_host_row_bytes(
+                    kv_pool, host_input, geometry.target_layer_num
+                )
+                billed_bytes = target_bytes
+                if use_mla and not _is_modelslim_host_kv(host_input):
+                    # Ordinary split MLA's existing capacity formula excludes the RoPE mirror.
+                    billed_bytes -= _split_row_bytes(
+                        host_input, geometry.target_layer_num
+                    )[1]
+                host_size *= billed_bytes / (target_bytes + draft_bytes)
     if parallel.dcp_enabled:
         assert use_mla, (
             "HiCache + DCP is only wired for the MLA host pool; the MHA host "
@@ -205,7 +280,7 @@ def build_kv_host_pool(
     host_pool = kv_host_pool_cls(
         host_input,
         get_memory().hicache_ratio,
-        get_memory().hicache_size if host_size is None else host_size,
+        host_size,
         page_size,
         get_memory().hicache_mem_layout,
         allocator_type=_get_allocator_type(),
@@ -1218,6 +1293,7 @@ def build_hybrid_mamba_stack(
         page_size=params.page_size,
         host_size=kv_host_size,
         mtp_draft_device_pools=config.packed_draft_device_pools,
+        sidecar_draft_device_pools=params.sidecar_draft_device_pools,
     )
     entries = _build_pool_entries(config=config, root_host_pool=kv_host_pool) + [
         _mamba_entry(
@@ -1565,11 +1641,14 @@ def build_unified_host_stack(
     )
 
 
-def build_host_pool_group(*, config: HostPoolGroupConfig) -> HostPoolGroup:
+def build_host_pool_group(
+    *, config: HostPoolGroupConfig, sidecar_draft_device_pools: tuple[Any, ...] = ()
+) -> HostPoolGroup:
     root_host_pool = build_kv_host_pool(
         kv_pool=config.root,
         page_size=config.transfer_page_size,
         mtp_draft_device_pools=config.packed_draft_device_pools,
+        sidecar_draft_device_pools=sidecar_draft_device_pools,
     )
     return HostPoolGroup(
         _build_pool_entries(config=config, root_host_pool=root_host_pool)
@@ -1724,6 +1803,11 @@ def _build_mha_mla_host_pool(
     )
 
 
+def _full_draft_kv_pool(pool):
+    # Hybrid draft runners keep their full attention layers in this sub-pool.
+    return pool.layer_router.wrapped_view() or pool
+
+
 def build_full_draft_pools(
     *,
     draft_kv_pool: Any,
@@ -1732,11 +1816,7 @@ def build_full_draft_pools(
     """Build draft KV and its sidecars, whose indices follow target full KV."""
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
-    pool = draft_kv_pool
-    inner = pool.layer_router.wrapped_view()
-    if inner is not None:
-        # Hybrid draft runners keep their sole attention layer in this sub-pool.
-        pool = inner
+    pool = _full_draft_kv_pool(draft_kv_pool)
     if pool.layer_num == 0:
         return [], []
 
@@ -1773,6 +1853,10 @@ def build_full_draft_pools(
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
             pool_label="draft",
+            # Match the physical anchor exactly for the pre-reserved Memfabric arena.
+            host_token_capacity=(
+                host_pool_group.size if memfabric_host_memory_enabled() else None
+            ),
             dcp_size=parallel.attn_dcp_size,
             dcp_rank=parallel.attn_dcp_rank,
         )
@@ -2443,7 +2527,9 @@ class _KvStrategy(StackStrategy):
             transfer_page_size=params.page_size,
             packed_draft_device_pools=params.mtp_draft_device_pools,
         )
-        host_pool_group = build_host_pool_group(config=config)
+        host_pool_group = build_host_pool_group(
+            config=config, sidecar_draft_device_pools=params.sidecar_draft_device_pools
+        )
         cache_controller = _build_cache_controller(
             params=params,
             host_pool_group=host_pool_group,
