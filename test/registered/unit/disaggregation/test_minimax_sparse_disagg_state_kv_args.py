@@ -12,6 +12,7 @@ from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
+    build_staging_slot_metadata,
     build_transfer_entry_pairs,
     setup_state_kv_args,
 )
@@ -312,6 +313,84 @@ class TestMiniMaxPPStagesPairByLayerId(unittest.TestCase):
                     [len(p) for p in stage.state_data_ptrs],
                     [len(index_ids), len(dense_ids)],
                 )
+
+
+class TestMiniMaxFp8Staging(unittest.TestCase):
+    """SGLANG_DISAGG_STAGING_BUFFER on the token-major FP8 MiniMax KV: the
+    sparse layers' K/V (and a DSpark draft of the same geometry) are staged, with
+    slot ids that pair a PP stage against the full decode layout."""
+
+    def _staging(self, pool, *, draft_dtype=None):
+        draft = None
+        if draft_dtype is not None:
+            draft = MHATokenToKVPool(
+                size=256,
+                page_size=128,
+                dtype=draft_dtype,
+                head_num=pool.head_num,
+                head_dim=128,
+                layer_num=M31_DRAFT_LAYERS,
+                device="cpu",
+                enable_memory_saver=False,
+            )
+        return build_staging_slot_metadata(
+            kv_layer_ids=_kv_ids(pool, draft=draft),
+            num_draft_entries=2 * M31_DRAFT_LAYERS if draft is not None else 0,
+            kv_pool=pool,
+            draft_kv_pool=draft,
+        )
+
+    def _pool(self, start, end, kv_heads):
+        layers = list(range(M31_LAYERS))
+        return MiniMaxSparseKVPool(
+            size=256,
+            page_size=128,
+            dtype=torch.float8_e4m3fn,
+            head_num=kv_heads,
+            head_dim=128,
+            idx_head_dim=128,
+            dense_layer_ids=[],
+            sparse_layer_ids=layers,
+            disable_value_sparse_layer_ids=layers,
+            device="cpu",
+            start_layer=start,
+            end_layer=end,
+        )
+
+    def test_stage_slots_pair_with_the_full_decode(self):
+        draft_ids = list(range(M31_LAYERS, M31_LAYERS + M31_DRAFT_LAYERS))
+        decode = self._staging(
+            self._pool(0, M31_LAYERS, 1), draft_dtype=torch.float8_e4m3fn
+        )
+        for start, end in PP4_STAGES:
+            with self.subTest(start=start):
+                draft = end == M31_LAYERS
+                stage = self._pool(start, end, 4)
+                k_buffers, v_buffers, slot_ids = self._staging(
+                    stage, draft_dtype=torch.float8_e4m3fn if draft else None
+                )
+                local = list(range(start, end)) + (draft_ids if draft else [])
+                # Gather order: every K buffer, then every V buffer.
+                self.assertEqual(slot_ids, local + local)
+                self.assertEqual(
+                    k_buffers[0].data_ptr(), stage.get_key_buffer(start).data_ptr()
+                )
+                self.assertEqual(
+                    v_buffers[end - start - 1].data_ptr(),
+                    stage.get_value_buffer(end - 1).data_ptr(),
+                )
+                pairs = build_transfer_entry_pairs(
+                    slot_ids, decode[2], len(slot_ids), len(decode[2])
+                )
+                self.assertEqual(
+                    [slot_ids[i] for i, _ in pairs], [decode[2][j] for _, j in pairs]
+                )
+
+    def test_bf16_draft_is_rejected(self):
+        # Slots are sized by the first buffer: a bf16 draft behind FP8 target K/V
+        # would be gathered and scattered at half its size.
+        with self.assertRaisesRegex(RuntimeError, "cannot stage this draft KV"):
+            self._staging(self._pool(45, 60, 4), draft_dtype=torch.bfloat16)
 
 
 class _MemcpyEngine:
