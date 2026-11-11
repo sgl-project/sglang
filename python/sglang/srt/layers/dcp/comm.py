@@ -421,18 +421,13 @@ def all_gather_kv_cache_for_dcp(
 
     padded_kv_cache_arr = []
     prefix_kv_cache = torch.cat([prefix_kv_a, prefix_k_pe], dim=-1)
-    padded_list = padded_lens.tolist()
-    left_list = left_pads.tolist()
-    local_list = local_kv_lens.tolist()
-    local_cu_list = local_kv_lens_cu.tolist()
-    for req_idx in range(len(padded_list)):
+    for req_idx in range(len(prefix_kv_lens_cpu)):
         padded_tensor = prefix_kv_cache.new_empty(
-            (padded_list[req_idx],) + prefix_kv_cache.size()[1:]
+            (padded_lens[req_idx].item(),) + prefix_kv_cache.size()[1:]
         )
-        left = left_list[req_idx]
-        padded_tensor[left : left + local_list[req_idx]] = prefix_kv_cache[
-            local_cu_list[req_idx] : local_cu_list[req_idx + 1]
-        ]
+        padded_tensor[
+            left_pads[req_idx] : left_pads[req_idx] + local_kv_lens[req_idx]
+        ] = prefix_kv_cache[local_kv_lens_cu[req_idx] : local_kv_lens_cu[req_idx + 1]]
         padded_kv_cache_arr.append(padded_tensor)
 
     padded_kv_cache = torch.cat(padded_kv_cache_arr, dim=0)
@@ -452,14 +447,12 @@ def all_gather_kv_cache_for_dcp(
     )
     padded_lens_cu[1:] = torch.cumsum(padded_lens, dim=0)
     kv_cache_tuple = ()
-    padded_cu_list = padded_lens_cu.tolist()
-    start_list = (prefix_starts_cpu % cycle_size).tolist()
-    kv_len_list = prefix_kv_lens_cpu.tolist()
-    for req_idx in range(len(kv_len_list)):
+    for req_idx in range(len(prefix_kv_lens_cpu)):
         kv_cache_tuple += (
             gatherd_kv_cache[
-                padded_cu_list[req_idx] * dcp_world_size + start_list[req_idx] :
-            ][: kv_len_list[req_idx]],
+                padded_lens_cu[req_idx] * dcp_world_size
+                + (prefix_starts_cpu[req_idx] % cycle_size) :
+            ][: prefix_kv_lens_cpu[req_idx]],
         )
     gatherd_kv_cache = torch.cat(kv_cache_tuple, dim=0)
 
