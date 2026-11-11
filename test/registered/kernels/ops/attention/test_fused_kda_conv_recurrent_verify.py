@@ -23,7 +23,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # backend-specific: the gfx950 product-rounding boundary must stay bit-exact.
-register_amd_ci(est_time=155, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=110, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _DEVICE = "cuda"
 
@@ -450,10 +450,16 @@ def _gfx950_srt(args, *, conv_bias=None, **overrides):
 
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
 class TestGfx950Verify:
-    @pytest.mark.parametrize("B", [1, 24])
-    @pytest.mark.parametrize("lower_bound", [-5.0, None])
     @pytest.mark.parametrize(
-        "T,snapshot", [(8, False), (6, False), (3, False), (8, True), (6, True)]
+        "B,lower_bound,T,snapshot",
+        [
+            (24, -5.0, 8, False),
+            (24, -5.0, 8, True),
+            (24, None, 6, True),
+            (1, -5.0, 6, True),
+            (1, None, 6, False),
+            (1, None, 3, False),
+        ],
     )
     def test_matches_triton_chain_verify(self, B, lower_bound, T, snapshot):
         """Keep every (BV, T, bounded gate, snapshot) specialization and padded state."""

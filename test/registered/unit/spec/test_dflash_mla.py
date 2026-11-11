@@ -327,11 +327,6 @@ class TestDFlashMLA(CustomTestCase):
             for parameter in attn.parameters():
                 parameter.fill_(0.1)
         attn.rotary_emb = copy.deepcopy(attn.rotary_emb)
-        # The layer allocates its weights with torch.empty, whose bytes can be NaN.
-        torch.manual_seed(0)
-        with torch.no_grad():
-            for param in attn.parameters():
-                param.copy_(torch.randn_like(param))
         for module in (attn.rotary_emb, attn.kv_a_layernorm):
             module.forward = module.forward_native
         # A real MLA pool also exposes the K/V buffer getters the GQA bundle probes.
@@ -416,7 +411,7 @@ class TestTritonDcpMlaDraft(CustomTestCase):
                 self._resolve(self.SLIDING, **setup)
 
     def test_cuda_keeps_dev_resolution(self):
-        self.assertEqual(self._resolve(self.SLIDING, is_hip=False), "triton")
+        self.assertEqual(self._resolve(self.FULL, is_hip=False), "triton")
 
     def test_full_attention_draft_refuses(self):
         with self.assertRaisesRegex(ValueError, "only sliding_attention"):

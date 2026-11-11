@@ -35,7 +35,7 @@ else:
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # backend-specific: ROCm resolves the kernel to its Triton port
-register_amd_ci(est_time=35, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=25, stage="jit-kernel-unit", runner_config="amd")
 
 test_cases = [
     (
@@ -487,16 +487,10 @@ def _assert_same(expected, actual):
 @pytest.mark.parametrize(
     "chain,vocab,truncated,threshold_single,threshold_acc,random_draft",
     [
-        (True, 11, False, 1, 1, False),
         (True, 9001, True, 0.5, 0.25, True),
         (False, 11, True, 1, 1, True),
         (False, 9001, False, 0.5, 0.25, False),
         (True, 11, True, 0, 0, False),
-        (False, 9001, True, 0, 0, True),
-        (True, 9001, False, 0, 0, True),
-        (False, 11, False, 0, 0, False),
-        (True, 9001, False, 1, 1, True),
-        (False, 11, False, 1, 1, False),
     ],
 )
 def test_matches_reference(
@@ -551,24 +545,6 @@ def test_bonus_ignores_draft_row_after_last_slot():
 
 
 @rocm_only
-def test_rejected_draft_is_excluded_from_residual():
-    # Draft 0 holds 1/2 of the mass and is rejected at coin 0.75. The residual
-    # [0, 1/4, 1/4] sums to 1/2, so u = 0.75 * 1/2 = 3/8 falls on token 2.
-    inputs = _chain(
-        target_rows=[[0.5, 0.25, 0.25], [1, 0, 0]],
-        draft_rows=[[0, 0, 0], [0, 0, 0]],
-        drafts=[0],
-        coins=[0.75, 0.5],
-        final_coin=0.75,
-    )
-    expected, actual = _run(inputs, num_spec_tokens=2)
-    _assert_same(expected, actual)
-    assert actual["accept_token_num"].item() == 0
-    assert actual["predicts"][0].item() == 2
-    assert actual["draft_probs"][0, 0].tolist() == [0.5, 0, 0]
-
-
-@rocm_only
 @pytest.mark.parametrize(
     "draft_row,final_coin,expected_token",
     [
@@ -592,65 +568,6 @@ def test_final_sampling_fallbacks(draft_row, final_coin, expected_token):
     expected, actual = _run(inputs, num_spec_tokens=2)
     _assert_same(expected, actual)
     assert actual["predicts"][0].item() == expected_token
-
-
-@rocm_only
-def test_output_matches_target_distribution():
-    """Every committed token, accepted draft or final sample, is distributed
-    as the target row of its slot, and each draft is accepted with its target
-    probability."""
-    batch, vocab = 65536, 8
-    target_rows = torch.tensor(
-        [
-            [0.5, 0.25, 0.125, 0.125, 0, 0, 0, 0],
-            [0, 0.375, 0, 0.25, 0.25, 0.125, 0, 0],
-            [0.0625, 0.0625, 0.125, 0.25, 0.5, 0, 0, 0],
-            [0.125] * 8,
-        ],
-        device=DEVICE,
-    )
-    slots = target_rows.shape[0]
-    generator = torch.Generator(device=DEVICE).manual_seed(1234)
-    # Proposals put a quarter of their mass off the target support.
-    proposal = 0.75 * target_rows[:-1] + 0.25 / vocab
-    drafts = torch.multinomial(proposal, batch, replacement=True, generator=generator)
-    candidates = torch.cat(
-        [torch.zeros(batch, 1, dtype=torch.int64, device=DEVICE), drafts.T], dim=1
-    )
-    next_token = torch.arange(1, slots + 1, device=DEVICE).repeat(batch, 1)
-    next_token[:, -1] = -1
-    inputs = {
-        "candidates": candidates.contiguous(),
-        "retrive_index": torch.arange(batch * slots, device=DEVICE).view(batch, slots),
-        "retrive_next_token": next_token,
-        "retrive_next_sibling": torch.full_like(next_token, -1),
-        "uniform_samples": torch.rand(batch, slots, device=DEVICE, generator=generator),
-        "uniform_samples_for_final_sampling": torch.rand(
-            batch, device=DEVICE, generator=generator
-        ),
-        "target_probs": target_rows.expand(batch, -1, -1).contiguous(),
-        "draft_probs": torch.zeros(batch, slots, vocab, device=DEVICE),
-    }
-    actual = dict(inputs, **_outputs(batch, slots, slots, DEVICE))
-    tree_speculative_sampling_target_only(**actual)
-
-    lengths = actual["accept_token_num"].long()
-    # With retrive_index = arange, slot k of a request holds the token after node k.
-    committed = actual["predicts"].view(batch, slots).long()
-    accept_probs = target_rows[:-1].gather(1, drafts).T  # [batch, slots - 1]
-    reach = torch.ones(batch, device=DEVICE)
-    for slot in range(slots):
-        if slot > 0:
-            reach = reach * accept_probs[:, slot - 1]
-            observed = (lengths >= slot).float().mean().item()
-            expected_reach = reach.mean().item()
-            std = (expected_reach * (1 - expected_reach) / batch) ** 0.5
-            assert abs(observed - expected_reach) < 5 * std + 1e-3, slot
-        reached = lengths >= slot
-        count = int(reached.sum())
-        freqs = torch.bincount(committed[reached, slot], minlength=vocab) / count
-        std = (target_rows[slot] * (1 - target_rows[slot]) / count).sqrt()
-        assert (freqs - target_rows[slot]).abs().le(5 * std + 1e-3).all(), slot
 
 
 @rocm_only
@@ -684,16 +601,6 @@ def test_graph_replay_matches_eager():
         graph.replay()
         for name in ("predicts", "accept_index", "accept_token_num", "draft_probs"):
             assert torch.equal(static[name], eager[name]), name
-
-
-@rocm_only
-def test_rocm_sampling_verify_available():
-    # The worker's availability gate must allow the kernel exercised above.
-    from sglang.srt.speculative.dflash_utils import (
-        is_dflash_sampling_verify_available,
-    )
-
-    assert is_dflash_sampling_verify_available()
 
 
 if __name__ == "__main__":

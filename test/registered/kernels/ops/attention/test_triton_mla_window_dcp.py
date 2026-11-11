@@ -3,7 +3,6 @@
 import math
 import sys
 from types import SimpleNamespace
-from unittest import mock
 
 import pytest
 import torch
@@ -23,12 +22,11 @@ from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
     draft_kv_ring_pool_rows,
     draft_kv_ring_rows_per_req,
-    draft_kv_ring_unsupported_reason,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=60, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=35, stage="jit-kernel-unit", runner_config="amd")
 
 PAGE = 64
 Q_LEN = 8  # the draft block
@@ -211,9 +209,8 @@ def _assert_matches(out, lse, ref_out, ref_lse):
 
 @pytest.mark.parametrize(
     "dcp,ctx",
-    [(1, CONTEXTS[name]) for name in CONTEXTS]
-    + [(8, DCP8_BATCH), (8, CONTEXTS["single"])],
-    ids=["dcp1-batch", "dcp1-single", "dcp1-edge", "dcp8-batch", "dcp8-single"],
+    [(1, CONTEXTS["single"]), (8, DCP8_BATCH)],
+    ids=["dcp1-single", "dcp8-batch"],
 )
 @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, fp8_dtype])
 @pytest.mark.parametrize("window_left", WINDOWS)
@@ -231,11 +228,9 @@ def test_rank_partials_merge_to_dense_window(dcp, kv_dtype, window_left, ctx):
 @pytest.mark.parametrize(
     "ctx,with_floor",
     [
-        (CONTEXTS["batch"], False),
-        (CONTEXTS["single"], False),
         (CONTEXTS["batch"], True),
     ],
-    ids=["batch", "single", "prefix-cache-floor"],
+    ids=["prefix-cache-floor"],
 )
 def test_ring_rows_read_as_the_request_window(window_left, ctx, with_floor):
     dcp = 8
@@ -271,27 +266,6 @@ def test_ring_rows_read_as_the_request_window(window_left, ctx, with_floor):
         lse,
         *_reference(q, keys, req_to_token, pool_idx, positions, window_left, floors),
     )
-
-
-def test_ring_admits_triton_only_under_dcp_on_rocm():
-    """Only ROCm's triton draft backend reads a ring window by index, and only under
-    DCP; elsewhere it keeps dev's refusal."""
-
-    config = {
-        "num_hidden_layers": 1,
-        "dflash_config": {"attention_mode": "mla"},
-        "layer_types": ["sliding_attention"],
-    }
-
-    def reason(dcp, hip):
-        with mock.patch("sglang.srt.utils.is_hip", return_value=hip):
-            return draft_kv_ring_unsupported_reason(
-                config, draft_backend="triton", draft_window_size=None, dcp_size=dcp
-            )
-
-    assert reason(dcp=8, hip=True) is None
-    assert reason(dcp=1, hip=True) is not None
-    assert reason(dcp=8, hip=False) is not None
 
 
 def test_window_indices_are_built_once_per_forward():

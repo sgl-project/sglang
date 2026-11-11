@@ -4,6 +4,7 @@ ring mode, the window floor holds, and an extend keeps only the tail a later
 window can read."""
 
 import sys
+from unittest import mock
 
 import pytest
 import torch
@@ -163,6 +164,27 @@ def test_decode_floor_reset_and_unsupported_drafts():
     assert reason(layers=("sliding_attention", "full_attention")) is not None
     assert reason(backend="flashinfer") is not None
     assert reason(window=4096) is not None
+
+
+def test_ring_admits_triton_only_under_dcp_on_rocm():
+    """Only ROCm's triton draft backend reads a ring window by index, and only under
+    DCP; elsewhere it keeps dev's refusal."""
+
+    config = {
+        "num_hidden_layers": 1,
+        "dflash_config": {"attention_mode": "mla"},
+        "layer_types": ["sliding_attention"],
+    }
+
+    def reason(dcp, hip):
+        with mock.patch("sglang.srt.utils.is_hip", return_value=hip):
+            return draft_kv_ring_unsupported_reason(
+                config, draft_backend="triton", draft_window_size=None, dcp_size=dcp
+            )
+
+    assert reason(dcp=8, hip=True) is None
+    assert reason(dcp=1, hip=True) is not None
+    assert reason(dcp=8, hip=False) is not None
 
 
 if __name__ == "__main__":

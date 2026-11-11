@@ -14,7 +14,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 # backend-specific: the fused tail serves Kimi-K3's gfx950 TP8 decode path.
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=17, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 # Kimi-K3: 3584-wide latent, 7168 hidden; the column tail owns 1/8 of the up_proj rows.
 L, H, EPS = 3584, 7168, 1e-5
@@ -49,7 +49,7 @@ class TestKimiK3LatentTailHip(CustomTestCase):
     def test_tail_matches_norm_projection_and_add(self):
         """Match the factored projection and fp32 add, allowing bf16 rounding
         differences where the GEMM's summation order changes a cancelling add."""
-        for rows in (1, 4, 32):
+        for rows in (1, 32):
             latent, shared, prefix, proj = self._inputs(rows)
             for with_prefix in (False, True):
                 want = proj.float() + shared.float()

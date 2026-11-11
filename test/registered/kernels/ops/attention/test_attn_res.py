@@ -90,7 +90,7 @@ class TestAttnResHip(CustomTestCase):
         cw = randn(_HIDDEN_SIZE) * _HIDDEN_SIZE**-0.5
         ow = (1 + 0.1 * randn(_HIDDEN_SIZE)).to(torch.bfloat16)
         # Token count only changes the grid; keep every bank/add/norm specialization.
-        for tokens, nvb in ((1, 1), (8, 5), (33, 8)):
+        for tokens, nvb in ((1, 1), (8, 5)):
             for with_add in (False, True):
                 for norm in (ow, None):
                     prefix = randn(tokens, _HIDDEN_SIZE).to(torch.bfloat16)

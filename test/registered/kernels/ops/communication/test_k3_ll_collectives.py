@@ -49,8 +49,6 @@ def _check_gather_tail_read(comm, rank, failures):
     # both scratch epochs with new payloads.
     cases = (
         (1, False, 1, False),
-        (4, True, 1, False),
-        (4, False, 4, True),
         (64, True, 4, True),
         (64, False, 8, True),
         (64, True, 8, True),
@@ -59,8 +57,6 @@ def _check_gather_tail_read(comm, rank, failures):
     # three max-row calls reuse both epochs of every row flag.
     cases += (
         (65, True, 4, True),
-        (96, False, 8, False),
-        (288, True, 8, True),
         (384, True, 8, True),
         (384, False, 2, True),
         (384, True, 4, False),

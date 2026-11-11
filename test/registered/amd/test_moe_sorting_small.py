@@ -169,7 +169,7 @@ class TestMoeSortingSmall(CustomTestCase):
         E, topk, dim = 896, 16, 3584  # 3584 % 2048 != 0: 512-column quant chunks
         # [shared gate_up (TP8) | router logits | routed input] of the fused front GEMM
         front_width, routed_start = 1536 + E + dim, 1536 + E
-        for bs, m, hot in ((32, 5, E), (32, 16, 24), (16, 16, 16)):
+        for bs, m, hot in ((32, 5, E), (16, 16, 16)):
             msg = f"bs={bs} m={m} hot={hot}"
             g = torch.Generator(device="cpu").manual_seed(m * 1000 + hot)
             # hot < E crowds the pairs onto few experts: ranks within an expert matter

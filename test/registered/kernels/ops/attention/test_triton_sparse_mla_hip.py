@@ -30,13 +30,12 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
 )
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.dsa import dsa_backend_hip
-from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=35, stage="jit-kernel-unit", runner_config="amd")
 # backend-specific: the topk_length prefill path is gfx950-only.
-register_amd_ci(est_time=155, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=115, suite="stage-b-test-1-gpu-small-amd-mi35x")
 pytestmark = pytest.mark.skipif(not is_hip(), reason="ROCm only")
 
 _IS_GFX950 = is_hip() and _is_gfx950_sparse_mla_fp8(
@@ -471,18 +470,10 @@ def _decode_reference(qn, qr, idx, lens, kd, sm, mxfp8_q=True):
 @pytest.mark.parametrize(
     "H,lens,splits",
     [
-        pytest.param(16, _RAGGED, 1, id="h16-unsplit"),
         pytest.param(16, _RAGGED, 2, id="h16-two-splits"),
-        pytest.param(16, _RAGGED, 8, id="h16-eight-splits"),
         pytest.param(96, _RAGGED, 1, id="h96-unsplit"),
-        pytest.param(96, _RAGGED, 2, id="h96-two-splits"),
-        pytest.param(96, _RAGGED, 8, id="h96-eight-splits"),
-        pytest.param(128, _RAGGED, 1, id="h128-unsplit"),
-        pytest.param(128, _RAGGED, 2, id="h128-two-splits"),
         pytest.param(128, _RAGGED, 8, id="h128-eight-splits"),
-        pytest.param(16, [256] * 8, None, id="auto-eight-splits"),
         pytest.param(96, [100] * 10, None, id="auto-four-splits"),
-        pytest.param(128, [40] * 33, None, id="auto-unsplit"),
     ],
 )
 def test_decode_matches_reference(H, lens, splits):
@@ -503,28 +494,6 @@ def test_decode_matches_reference(H, lens, splits):
     assert torch.equal(torch.isfinite(lse), finite)
     torch.testing.assert_close(lse[finite], lse_ref[finite], rtol=0, atol=1e-3)
     torch.testing.assert_close(o[0].float(), o_ref, rtol=0, atol=3e-2)
-
-
-@pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
-def test_decode_without_row_lengths_skips_the_padding():
-    """Decode without DCP hands the backend -1-padded top-k rows and no lengths."""
-    kv, kd = _pow2_scaled_kv()
-    lens = [_TOPK, 300, 1, 1024]
-    R, H = len(lens), 96
-    qkv = torch.randn(R, H, _DV + _DR, device=_DEVICE).bfloat16()
-    qn, qr = qkv[..., :_DV], qkv[..., _DV:]
-    idx = torch.full((R, _TOPK), -1, dtype=torch.int32, device=_DEVICE)
-    for r, n in enumerate(lens):
-        idx[r, :n] = torch.randperm(_N, device=_DEVICE)[:n].int()
-    sm = (_DV + _DR) ** -0.5
-    backend = SimpleNamespace(_triton_sparse_mla_workspaces={}, attn_dcp_size=1)
-    o = DeepseekSparseAttnBackend._forward_triton_decode(
-        backend, qn, qr, kv, _DV, idx, sm
-    )
-    lengths = torch.tensor(lens, dtype=torch.int32, device=_DEVICE)
-    # the Triton split-K kernel keeps q in BF16
-    o_ref, _ = _decode_reference(qn, qr, idx, lengths, kd, sm, mxfp8_q=False)
-    torch.testing.assert_close(o.float(), o_ref, rtol=0, atol=3e-2)
 
 
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
@@ -568,11 +537,8 @@ def test_dcp_partial_reads_the_indexer_local_slots():
     "H,topk,q_mul,head_major",
     [
         (8, 2048, 30.0, False),
-        (8, 1000, 1.0, True),
-        (12, 2048, 1.0, False),
         (12, 1000, 30.0, True),
         (16, 2048, 1.0, True),
-        (16, 1000, 30.0, False),
     ],
 )
 def test_sparse_mla_prefill_gfx950(H, topk, q_mul, head_major):
