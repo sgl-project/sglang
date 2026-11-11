@@ -1229,7 +1229,7 @@ class Scheduler(
         # Match run_batch / _pp_launch_batch so warmup allocations stay reusable.
         forward_stream = (
             model_runner.forward_stream
-            if self.enable_overlap or get_parallel().pp_size > 1 or use_mlx()
+            if self.forward_on_own_stream or use_mlx()
             else self.schedule_stream
         )
         with device_module.stream(forward_stream):
@@ -1746,6 +1746,11 @@ class Scheduler(
                 scheduler=self,
             )
 
+    @property
+    def forward_on_own_stream(self) -> bool:
+        """Whether forwards run on forward_stream rather than schedule_stream."""
+        return self.enable_overlap or get_parallel().pp_size > 1
+
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
 
@@ -2094,9 +2099,7 @@ class Scheduler(
 
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        elif (is_cuda() or _is_hip) and (
-            self.enable_overlap or get_parallel().pp_size > 1
-        ):
+        elif (is_cuda() or _is_hip) and self.forward_on_own_stream:
             # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
             # stream aliases forward_stream, which would eliminate scheduler
             # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
@@ -6639,7 +6642,7 @@ class Scheduler(
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
-        if self.enable_overlap or get_parallel().pp_size > 1:
+        if self.forward_on_own_stream:
             # The unload zeroes the adapter's pool slot on this stream; a step
             # launched before this request may still run that adapter.
             self.schedule_stream.wait_stream(self.forward_stream)

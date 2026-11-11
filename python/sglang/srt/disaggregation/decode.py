@@ -4145,7 +4145,7 @@ class SchedulerDisaggregationDecodeMixin:
         if handler is not None and handler._defer_scatter:
             stream = (
                 self.forward_stream
-                if self.enable_overlap or get_parallel().pp_size > 1
+                if self.forward_on_own_stream
                 else self.schedule_stream
             )
             handler.flush_pending_scatters(stream)
@@ -4436,12 +4436,8 @@ class SchedulerDisaggregationDecodeMixin:
         # copy is recorded by are built on the schedule stream, where page moves
         # read them: on the forward stream they would not exist yet.
         on_forward = get_memory().hicache_io_backend == "kernel"
-        # As in run_batch: without overlap or PP, forwards run on the schedule
-        # stream.
         forward_stream = (
-            self.forward_stream
-            if self.enable_overlap or get_parallel().pp_size > 1
-            else self.schedule_stream
+            self.forward_stream if self.forward_on_own_stream else self.schedule_stream
         )
         if not on_forward and self.enable_overlap:
             # A finished request can still have one redundant forward in flight,
