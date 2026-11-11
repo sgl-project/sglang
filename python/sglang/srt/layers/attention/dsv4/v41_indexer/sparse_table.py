@@ -33,7 +33,7 @@ from sglang.srt.layers.attention.dsv4.indexer import (
     topk_transform_paged_from_metadata,
 )
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 from .scoring import (
     DeepGEMMDecodeData,
@@ -50,6 +50,7 @@ from .types import (
     CapturedPrefillInputs,
     DecodeInputs,
     PrefillInputs,
+    RowShard,
     get_tail_row_indices,
 )
 
@@ -120,26 +121,24 @@ class SparseTableBackend:
         self,
         *,
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
-        req_to_token: torch.Tensor,
         page_size: int,
         candidate_topk_blocks: int,
         candidate_block_size: int,
     ) -> None:
         assert candidate_block_size == CANDIDATE_BLOCK_SIZE
         self.token_to_kv_pool = token_to_kv_pool
-        self.req_to_token = req_to_token
         self.page_size = page_size
         self.topk_blocks = candidate_topk_blocks
         self.alt_stream = torch.cuda.Stream()
         self._cached_row_ids: Optional[torch.Tensor] = None
         # captured graphs keep reading the buffers they saw
         self._retired_cached_row_ids: list = []
-        # per layer: the table tensors every captured prefill bucket reads
-        self._graph_table_bufs: dict = {}
+        # per layer, newest first; graphs captured on older ones keep reading them
+        self._graph_tables: dict = {}
 
     def publish_prefill(self, inputs: PrefillInputs):
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
+        data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return None
         index_page_size = self.token_to_kv_pool.get_index_k_page_size(
@@ -159,6 +158,7 @@ class SparseTableBackend:
             index_page_size=index_page_size,
             topk_blocks=self.topk_blocks,
             out_positions=inputs.out_raw_indices[: data.num_rows],
+            row_shard=inputs.row_shard,
         )
         data.write_page_indices(inputs)
         return table
@@ -169,7 +169,7 @@ class SparseTableBackend:
         published: Optional[_SparsePrefillTable],
     ) -> None:
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
+        data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return
         assert published is not None
@@ -202,7 +202,7 @@ class SparseTableBackend:
         k_cache = get_index_k_cache(
             token_to_kv_pool=self.token_to_kv_pool,
             layer_id=inputs.layer_id,
-            page_size=inputs.paged_metadata.compressed_page_size,
+            page_size=inputs.index_page_size,
         )
         logits = _prefill_table_logits(published, q_fp4, q_sf, inputs.weights, k_cache)
         topk = min(indexer.index_topk, published.blocks.shape[1] * CANDIDATE_BLOCK_SIZE)
@@ -220,21 +220,45 @@ class SparseTableBackend:
             transform(published.phys_blocks, inputs.out_page_indices)
         transform(published.blocks, inputs.out_raw_indices)
 
+    def prefill_graph_table(self, layer_id: int, num_rows: int) -> Optional[tuple]:
+        """The layer's newest table buffers cut to ``num_rows`` rows, or None when it
+        has none yet or they are too small. Buckets share the buffers, since graphs
+        replay one at a time; the schedule is not cut, as DeepGEMM reads its length
+        from the header."""
+        tables = self._graph_tables.get(layer_id)
+        if not tables or tables[0][0].shape[0] < num_rows:
+            return None
+        blocks, schedule, phys_blocks, valid_lens = tables[0]
+        return (
+            blocks[:num_rows],
+            schedule,
+            phys_blocks[:num_rows],
+            valid_lens[:num_rows],
+        )
+
     def publish_prefill_graph(
-        self, inputs: PrefillInputs, num_rows: int, *, shared: bool
-    ) -> tuple:
-        """The candidate source's table over the graph's ``num_rows`` rows. Buckets may
-        share one buffer: graphs replay one at a time, and the shapes, DeepGEMM's
-        schedule included, depend only on the row and block counts."""
+        self, inputs: PrefillInputs, num_rows: int, table: Optional[tuple]
+    ) -> None:
+        """Writes the candidate source's table into ``table``, padded to ``num_rows``
+        rows by repeating the last live row; allocates new buffers for the layer when
+        ``table`` is None."""
         published = self.publish_prefill(inputs)
         assert published is not None, "candidate source published no sparse table"
         live = published.blocks.shape[0]
         rows = torch.arange(num_rows, device=published.blocks.device).clamp_max(
             live - 1
         )
-        table = published.gather_rows(rows)
-        out = (table.blocks, table.schedule, table.phys_blocks, table.valid_lens)
-        return self._shared_graph_table(inputs.layer_id, out) if shared else out
+        out = published.gather_rows(rows)
+        fields = (out.blocks, out.schedule, out.phys_blocks, out.valid_lens)
+        if table is None:
+            table = tuple(torch.empty_like(t) for t in fields)
+            self._graph_tables.setdefault(inputs.layer_id, []).insert(0, table)
+        for buf, t in zip(table, fields, strict=True):
+            assert buf.dtype == t.dtype and buf.numel() >= t.numel(), (
+                (buf.dtype, buf.shape),
+                (t.dtype, t.shape),
+            )
+            buf[: t.shape[0]].copy_(t)
 
     def bind_prefill_graph_table(self, tensors: tuple) -> _SparseTable:
         """Capture time: the table the captured consumers read, over the tensors the
@@ -250,24 +274,13 @@ class SparseTableBackend:
             ready=ready,
         )
 
-    def _shared_graph_table(self, layer_id: int, tensors: tuple) -> tuple:
-        bufs = self._graph_table_bufs.setdefault(layer_id, [None] * len(tensors))
-        views = []
-        for i, t in enumerate(tensors):
-            buf = bufs[i]
-            if buf is None or buf.dtype != t.dtype or buf.numel() < t.numel():
-                # Graphs captured on a smaller buffer keep it alive themselves.
-                buf = bufs[i] = torch.empty(t.numel(), dtype=t.dtype, device=t.device)
-            views.append(buf[: t.numel()].view(t.shape).copy_(t))
-        return tuple(views)
-
     def publish_decode(self, inputs: DecodeInputs):
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
         metadata = inputs.paged_metadata
         seq_lens = metadata.compressed_seq_lens.reshape(-1)
         if isinstance(metadata.deep_gemm_metadata, list):
             return self._publish_decode_chunked(inputs, data, seq_lens)
-        q, lens, table = data.paged_logits_args(metadata)
+        q, lens, table, indices = data.paged_logits_args(metadata)
         logits = deep_gemm_fp4_paged_mqa_logits(
             q,
             data.k_cache,
@@ -276,6 +289,7 @@ class SparseTableBackend:
             table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
+            indices=indices,
         )
         main_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(main_stream)
@@ -345,7 +359,7 @@ class SparseTableBackend:
         topk_plans = metadata.topk_metadata_chunks
         assert not metadata.use_topk_v2 or topk_plans is not None
         for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):
-            q, lens, table = data.paged_logits_args(metadata, rows)
+            q, lens, table, indices = data.paged_logits_args(metadata, rows)
             logits = deep_gemm_fp4_paged_mqa_logits(
                 q,
                 data.k_cache,
@@ -354,6 +368,7 @@ class SparseTableBackend:
                 table,
                 plan,
                 metadata.max_compressed_seq_len,
+                indices=indices,
             )
             topk_transform_paged_from_metadata(
                 logits,
@@ -488,27 +503,22 @@ def _row_pair_ids(rows_per_request: List[int], *, device: torch.device) -> torch
     return (row - ((row - first_row[request]) & 1)).to(torch.int32)
 
 
-# TODO(dark): support fusion of publish + topk of publish layer
-def publish_prefill_table(
+def select_prefill_rows(
     *,
     data: DeepGEMMPrefillData,
     kv: Tuple[torch.Tensor, torch.Tensor],
-    index_page_table: torch.Tensor,
-    index_page_size: int,
-    topk_blocks: int,
+    nblocks: torch.Tensor,
     out_positions: torch.Tensor,
-) -> _SparsePrefillTable:
-    """The source's own top-k into ``out_positions`` (request-local compressed
-    positions) and the chunk's table, from one pass over its dense scores;
-    ``index_page_table`` is at ``index_page_size`` slots."""
-    rows = data.num_rows
-    device = data.q_fp4.device
-    nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)
-    blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)
-    zero_offsets = torch.zeros(rows, dtype=torch.int32, device=device)
+    out_blocks: torch.Tensor,
+) -> None:
+    """The source's own top-k (request-local compressed positions) and its top
+    blocks from one pass over this query-row view's dense scores; one row of
+    each output per scored row, with ``nblocks`` matching the view."""
+    lens_all = data.compress_lens
+    zero_offsets = torch.zeros_like(lens_all)
     # the block keys read the score rows through 32-byte vectors
     for tile, logits in score_tiles(data, kv):
-        lens = data.compress_lens[tile]
+        lens = lens_all[tile]
         topk_ragged(logits, lens, out=out_positions[tile], offsets=zero_offsets[tile])
         # keys past a row's block count stay unset; the top-k reads a row
         # up to its block count only (v2 wants the stride a multiple of 4)
@@ -523,8 +533,52 @@ def publish_prefill_table(
             keys,
             nblocks[tile],
             out_offsets=zero_offsets[: logits.shape[0]],
-            out_indices=blocks[tile],
+            out_indices=out_blocks[tile],
         )
+
+
+# TODO(dark): support fusion of publish + topk of publish layer
+def publish_prefill_table(
+    *,
+    data: DeepGEMMPrefillData,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+    index_page_table: torch.Tensor,
+    index_page_size: int,
+    topk_blocks: int,
+    out_positions: torch.Tensor,
+    row_shard: Optional[RowShard] = None,
+) -> _SparsePrefillTable:
+    """The source's own top-k into ``out_positions`` (request-local compressed
+    positions) and the chunk's table, from one pass over its dense scores;
+    ``index_page_table`` is at ``index_page_size`` slots. With ``row_shard`` the
+    scores are this rank's share and the selections are all-gathered; the table
+    is then built over every row, because its schedule cannot be sliced."""
+    rows = data.num_rows
+    device = data.q_fp4.device
+    nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)
+    if row_shard is None:
+        blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)
+        select_prefill_rows(
+            data=data,
+            kv=kv,
+            nblocks=nblocks,
+            out_positions=out_positions,
+            out_blocks=blocks,
+        )
+    else:
+        local = row_shard.local_rows(rows)
+        per = row_shard.rows_per_rank(rows)
+        local_positions = out_positions.new_full((per, out_positions.shape[1]), -1)
+        local_blocks = torch.empty(per, topk_blocks, dtype=torch.int32, device=device)
+        select_prefill_rows(
+            data=data.narrow(local),
+            kv=kv,
+            nblocks=nblocks[local],
+            out_positions=local_positions,
+            out_blocks=local_blocks,
+        )
+        out_positions.copy_(row_shard.gather(local_positions, rows))
+        blocks = row_shard.gather(local_blocks, rows).contiguous()
     return _build_prefill_table(
         blocks=blocks,
         compress_lens=data.compress_lens,

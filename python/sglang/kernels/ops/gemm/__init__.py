@@ -27,6 +27,44 @@ _SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
 
+for _name in ("npu_w8a8_block_fp8_linear", "npu_w8a8_block_fp8_grouped_matmul"):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.{_name}",
+            backend=KernelBackend.TORCH_NPU,
+            target=f"sglang.kernels.ops.gemm.npu_block_fp8:{_name}",
+            capabilities=frozenset({CapabilityRequirement.NPU}),
+        )
+    )
+del _name
+
+
+def npu_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Ascend arch35 BF16/FP16 Linear with 128x128 FP8 weights and FP32 scales."""
+    return get_kernel("gemm.npu_w8a8_block_fp8_linear", KernelBackend.TORCH_NPU)(
+        input, weight, weight_scale, bias
+    )
+
+
+def npu_w8a8_block_fp8_grouped_matmul(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_list: torch.Tensor,
+    group_list_type: int,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Ascend arch35 grouped BF16/FP16 input and checkpoint-layout FP8 weights."""
+    return get_kernel(
+        "gemm.npu_w8a8_block_fp8_grouped_matmul", KernelBackend.TORCH_NPU
+    )(input, weight, weight_scale, group_list, group_list_type, output_dtype)
+
+
 def _prefer_torch_rowwise_fp8(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
@@ -186,13 +224,6 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="gemm.dsv3_fused_a_gemm",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel:dsv3_fused_a_gemm",
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="gemm.dsv3_fused_a_gemm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.dsv3_fused_a_gemm:dsv3_fused_a_gemm",
         capabilities=CUDA_ONLY,
@@ -203,22 +234,6 @@ register_kernel(
         op="gemm.tiny_gemm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.tiny_gemm:tiny_gemm_bf16",
-        capabilities=CUDA_ONLY,
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="gemm.n128k512",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.small_gemm_bf16:n128k512_gemm_bf16",
-        capabilities=CUDA_ONLY,
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="gemm.n32k5120",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.small_gemm_bf16:n32k5120_gemm_bf16",
         capabilities=CUDA_ONLY,
     )
 )
@@ -258,7 +273,7 @@ def dual_gemm_swiglu_fp8(
     x_scale: torch.Tensor,
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor] = None,
-    quant_mode: Optional["DualGemmQuantMode"] = None,
+    quant_mode: Optional[DualGemmQuantMode] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse FP8 gate/up projections, SwiGLU, and activation quantization."""
     if quant_mode is None:
@@ -345,6 +360,8 @@ __all__ = [
     "dual_gemm_swiglu_fp8",
     "fp8_scaled_mm",
     "kimi_k3_tiny_gemm",
+    "npu_w8a8_block_fp8_grouped_matmul",
+    "npu_w8a8_block_fp8_linear",
     "try_qwen3x_nvfp4_gemm",
     "try_sm120_fp8_linear",
 ]
@@ -519,9 +536,86 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
-        op="gemm.muse_spark_router_gemm",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.muse_spark_router_gemm:router_gemm",
+        op="gemm.muse_spark_router_gemv",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl:router_gemv_cute",
+        capabilities=_SM10X,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.router_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.router_gemv:router_gemv",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.router_gemm_bf16x3_cublas",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.gemm.router_gemv:router_gemm_bf16x3_cublas",
         capabilities=CUDA_ONLY,
+    )
+)
+
+
+# Muse Spark on gfx950 (MI355X): Triton kernels the ROCm Muse Spark model and the aiter /
+# Triton attention backends dispatch to by shape; registered for inventory.
+_MUSE_SPARK_GFX950_KERNELS = [
+    (
+        "bf16_splitk_gemm",
+        "bf16_splitk_gemm_partials",
+        "BF16 small-M split-K GEMM partials in FP32",
+    ),
+    (
+        "bf16_tiled_small_m_gemm",
+        "tiled_gemm",
+        "BF16 17..64-row GEMM from a tile-contiguous weight copy",
+    ),
+    ("router_gemm_fp32", "router_gemv_fp32", "bf16 x fp32 router logits GEMV, M <= 64"),
+    (
+        "router_gemm_fp32",
+        "router_gemm_tuned",
+        "bf16 x fp32 router logits, tuned split-K at verify widths",
+    ),
+    (
+        "unpool_gemm_norm_residual",
+        "unpool_gemm_norm_residual",
+        "MoE unpooler GEMM + boundary norms + gated residual",
+    ),
+]
+for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.gemm.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _mod, _fn, _desc
+register_kernel(
+    KernelSpec(
+        op="gemm.hopper_fp8_block_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.hopper_fp8_block_gemv:hopper_fp8_block_gemv",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.hopper_bf16_tiny_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.hopper_bf16_tiny_gemv:hopper_bf16_tiny_gemv",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.router_gate_matvec_cuda",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.router_gate_matvec_cuda:router_gate_matvec_cuda",
+        capabilities=_SM90,
     )
 )

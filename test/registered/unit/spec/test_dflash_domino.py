@@ -42,6 +42,7 @@ def _projector_model(projector_type="domino"):
     nn.Module.__init__(model)
     model.projector_type = projector_type
     model.config = SimpleNamespace(hidden_size=8)
+    model.layers = nn.ModuleList()
     if projector_type == "domino":
         model.prefix_gru = nn.GRU(8, 4, batch_first=True, bias=False)
         model.embed_proj = nn.Sequential(

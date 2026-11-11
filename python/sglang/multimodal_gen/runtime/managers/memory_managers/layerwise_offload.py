@@ -12,7 +12,7 @@ import time
 import weakref
 from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from time import perf_counter
 from typing import (
     Any,
@@ -161,6 +161,14 @@ def _host_resident_tables(model: torch.nn.Module) -> List[torch.nn.Module]:
             # A sharded table is already divided by the world size, and its
             # output feeds an all-reduce that expects a device tensor.
             if getattr(table, "tp_size", 1) != 1:
+                continue
+            # A tied output head shares this weight and needs it on the device.
+            if any(
+                param is weight
+                for other in model.modules()
+                if other is not table
+                for param in other.parameters(recurse=False)
+            ):
                 continue
             if weight.numel() * weight.element_size() < HOST_RESIDENT_TABLE_MIN_BYTES:
                 continue
@@ -1150,6 +1158,7 @@ class LayerwiseOffloadManager:
         self._courier_inflight: Set[int] = set()
         # layer_idx -> torch.get_device_module().Event for fine-grained sync, to make sure the weight is resident in pre-hook
         self._prefetch_events: Dict[int, torch.get_device_module().Event] = {}
+        self._graph_capture_keepalive: list[Any] | None = None
 
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
@@ -1738,6 +1747,8 @@ class LayerwiseOffloadManager:
         """
         Prepare for the next round of denoising loop with prefetching the necessary layers
         """
+        if getattr(self, "_graph_capture_keepalive", None) is not None:
+            non_blocking = True
         self._last_forwarded_layer = None
         self._release_unneeded_streamed_layers(keep=set(self._head_of_stream()))
 
@@ -2181,6 +2192,9 @@ class LayerwiseOffloadManager:
         """
         if not self.enabled or self.device is None:
             return
+        capture_keepalive = getattr(self, "_graph_capture_keepalive", None)
+        if capture_keepalive is not None:
+            non_blocking = True
         if layer_idx < 0 or layer_idx >= self.num_layers:
             return
         finish_offload_writeback()
@@ -2218,8 +2232,11 @@ class LayerwiseOffloadManager:
             non_blocking = False
             stream_context = nullcontext()
 
+        # Graph capture records every copy on the capturing thread, so the
+        # producer thread stays out of it.
         use_coordinated_prefetch = (
             self._coordinated_prefetch_active
+            and capture_keepalive is None
             and self.copy_stream is not None
             and layer_idx in self._consolidated_cpu_weights
             and all(
@@ -2329,7 +2346,11 @@ class LayerwiseOffloadManager:
             # The producer records this event after every chunk has been
             # submitted. The consumer joins the producer before waiting on it,
             # so CUDA never waits on an event that has not been recorded yet.
-            event = torch.get_device_module().Event()
+            event = torch.get_device_module().Event(
+                **({"external": True} if capture_keepalive is not None else {})
+            )
+            if capture_keepalive is not None:
+                capture_keepalive.append(event)
             self._prefetch_events[layer_idx] = event
             if use_coordinated_prefetch:
                 if not self._coordinated_prefetch_logged:
@@ -3432,6 +3453,68 @@ class LayerwiseOffloadableModuleMixin:
                 manager.release_all()
                 manager._initialize_coordinated_prefetch()
                 manager.register_forward_hooks()
+
+
+@contextmanager
+def capture_layerwise_offload(model: torch.nn.Module, stream):
+    """Capture pinned weight copies and retain their graph-owned lifetimes."""
+    if not isinstance(model, torch.nn.Module):
+        yield []
+        return
+    managers = list(
+        dict.fromkeys(
+            manager
+            for module in model.modules()
+            for manager in getattr(module, "layerwise_offload_managers", ()) or ()
+            if manager.enabled
+        )
+    )
+    keepalive = []
+    if not managers:
+        yield keepalive
+        return
+    for manager in managers:
+        stores = (
+            manager._consolidated_cpu_weights,
+            manager._strided_cpu_weights,
+            manager._mapped_cpu_weights,
+        )
+        sources = [
+            tensor
+            for store in stores
+            for layer in store.values()
+            for tensor in layer.values()
+        ]
+        if manager.device.type != "cuda" or any(
+            tensor.numel() and not tensor.is_pinned() for tensor in sources
+        ):
+            raise ValueError(
+                "Layerwise graph capture requires pinned CUDA weight sources"
+            )
+        keepalive.extend(sources)
+
+    previous = []
+    try:
+        for manager in managers:
+            # Include the first layer's copy in every replay; a prefetch from
+            # the eager warmup must not become an uncaptured dependency.
+            manager.release_all()
+            previous.append((manager, manager.copy_stream))
+            manager.copy_stream = stream
+            manager._graph_capture_keepalive = keepalive
+        # Component residency may rebind non-layer weights after capture.
+        # Keep the original storage alive until the graph itself is dropped.
+        keepalive.extend(
+            tensor.detach()
+            for tensor in (*model.parameters(), *model.buffers())
+            if tensor.device.type == "cuda" and tensor.numel()
+        )
+        yield keepalive
+    finally:
+        for manager, copy_stream in reversed(previous):
+            manager.release_all()
+            manager._graph_capture_keepalive = None
+            manager.copy_stream = copy_stream
 
 
 def is_offload_placeholder(tensor: torch.Tensor) -> bool:

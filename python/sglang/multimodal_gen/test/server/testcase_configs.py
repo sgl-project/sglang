@@ -28,8 +28,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Sequence
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.sample.sampling_params import normalize_quality
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.registry import (
     get_model_info,
     get_pipeline_config_classes,
@@ -136,9 +136,11 @@ class ScenarioConfig:
     # Anonymous-host budget caps; None skips the check (older baselines).
     load_peak_host_anon_mb: float | None = None
     runtime_peak_host_anon_mb: float | None = None
+    # sampled process memory includes dependency/allocator overhead as well as weights
+    host_anon_tolerance: float | None = None
     # Per-case override for the wall-clock tolerances (e2e, denoise and stage
     # timings) when a case's runtime is dominated by shared-runner host I/O
-    # rather than by the code under test. Memory guards keep the profile
+    # rather than by the code under test. VRAM guards keep the profile
     # tolerance -- they are what such a case actually protects.
     timing_tolerance: float | None = None
 
@@ -163,6 +165,7 @@ class ScenarioConfig:
             runtime_peak_allocated_mb=optional_float("runtime_peak_allocated_mb"),
             load_peak_host_anon_mb=optional_float("load_peak_host_anon_mb"),
             runtime_peak_host_anon_mb=optional_float("runtime_peak_host_anon_mb"),
+            host_anon_tolerance=optional_float("host_anon_tolerance"),
             timing_tolerance=optional_float("timing_tolerance"),
         )
 
@@ -187,7 +190,13 @@ class BaselineConfig:
         for prefix, overrides in data.get("runner_overrides", {}).items():
             if runner_name.startswith(prefix):
                 for name, metrics in overrides.items():
-                    data["scenarios"][name].update(metrics)
+                    scenario = data["scenarios"][name]
+                    for key, value in metrics.items():
+                        # merge per-stage/per-step maps so unlisted entries keep their guard
+                        if isinstance(value, dict):
+                            scenario[key] = {**scenario[key], **value}
+                        else:
+                            scenario[key] = value
                 print(f"--- Performance Runner Baseline: {prefix} ---")
                 break
 
@@ -341,6 +350,9 @@ class DiffusionTestCase:
     perf_repeat_requests: int = 1
     perf_warmup_requests: int = 0
     run_consistency_check: bool = True
+    # Sent first after the server warmup and checked against its own golden: the
+    # request that inherits whatever state the warmup leaves behind.
+    lead_sampling_params: DiffusionSamplingParams | None = None
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
     expected_model_id: str | None = None
@@ -351,6 +363,20 @@ class DiffusionTestCase:
     run_multi_lora_api_check: bool = False
     # Cached MiniMax goldens require its implicit-quality cache mode.
     pin_consistency_quality: bool = True
+    # GT-free checks against other requests to the same server, same seed: the
+    # output must match the request at this quality level ...
+    reference_quality: str | None = None
+    # ... and must change once the server's LoRA adapter is deactivated
+    run_lora_effect_check: bool = False
+
+    def lead_case(self) -> DiffusionTestCase:
+        """The lead request as a case named "<id>_lead" (its golden's name)."""
+        return replace(
+            self,
+            id=f"{self.id}_lead",
+            sampling_params=self.lead_sampling_params,
+            lead_sampling_params=None,
+        )
 
     def __post_init__(self) -> None:
         if self.perf_repeat_requests < 1:
@@ -441,6 +467,17 @@ class DiffusionTestCase:
                 f"{self.id}: run_multi_lora_api_check requires lora_path and second_lora_path"
             )
 
+        if self.run_lora_effect_check and not (has_startup_lora or has_dynamic_lora):
+            raise ValueError(
+                f"{self.id}: run_lora_effect_check requires lora_path or dynamic_lora_path"
+            )
+
+
+# per-key-frame bounds in 0-255 levels: lossless-tier drift is ~1 level, a
+# full-strength LoRA moves tens; the 4x gap keeps a dropped delta out of "match"
+OUTPUT_MATCH_MAX_MEAN_ABS_DIFF = 3.0
+OUTPUT_MATCH_MIN_PSNR = 30.0
+OUTPUT_CHANGE_MIN_MEAN_ABS_DIFF = 12.0
 
 _REALTIME_MODEL_COMMON_EXTRAS = {
     "seed": 42,
@@ -747,6 +784,19 @@ TI2I_sampling_params = DiffusionSamplingParams(
     image_path=TI2I_QWEN_IMAGE_EDIT_INPUT,
 )
 
+MINIMAX_H3_IMAGE_T2I_sampling_params = DiffusionSamplingParams(
+    prompt="A quiet London street after rain, warm shop lights reflected on the pavement, detailed photograph",
+    output_size="2048x2048",
+    output_format="png",
+    extras={"num_inference_steps": 6, "seed": 42, "generator_device": "cpu"},
+)
+
+MINIMAX_H3_IMAGE_EDIT_sampling_params = replace(
+    MINIMAX_H3_IMAGE_T2I_sampling_params,
+    prompt="Keep the composition of <Picture 1> and convert it to a watercolor painting.",
+    image_path=TI2I_QWEN_IMAGE_EDIT_INPUT,
+)
+
 MULTI_IMAGE_TI2I_sampling_params = DiffusionSamplingParams(
     prompt="The magician bear is on the left, the alchemist bear is on the right, facing each other in the central park square.",
     image_path=[
@@ -939,6 +989,17 @@ WAN_2_2_ANIMATE_2_14B_sampling_params = DiffusionSamplingParams(
     },
 )
 
+# Distilled checkpoint: guidance is folded into the weights, so the request runs the
+# model's 10-step, guidance-1.0 recipe over the same inputs, canvas and clip length.
+WAN_2_2_ANIMATE_2_14B_DISTILLED_sampling_params = replace(
+    WAN_2_2_ANIMATE_2_14B_sampling_params,
+    extras={
+        **WAN_2_2_ANIMATE_2_14B_sampling_params.extras,
+        "num_inference_steps": 10,
+        "guidance_scale": 1.0,
+    },
+)
+
 HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
     prompt="",
     image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
@@ -1033,7 +1094,6 @@ def get_default_sampling_params_for_server_args(
     return get_default_sampling_params_for_model_task(task_type)
 
 
-MODELOPT_FLUX1_FP8_TRANSFORMER = "lmsys/flux1-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_FLUX2_FP8_TRANSFORMER = "lmsys/flux2-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_WAN22_FP8_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-FP8"
 MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER = (
@@ -1043,7 +1103,6 @@ MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER = "lmsys/qwen-image-modelopt-fp8-sglang-tran
 MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER = (
     "lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer"
 )
-MODELOPT_FLUX1_NVFP4_TRANSFORMER = "lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer"
 MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
 MODELOPT_QWEN_IMAGE_2512_NVFP4_MODEL = "lmsys/qwen-image-2512-modelopt-nvfp4-sglang"
 MODELOPT_WAN22_NVFP4_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4"

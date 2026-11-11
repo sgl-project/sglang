@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.utils.external_model_package import (
     load_external_model_package,
 )
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    load_dict,
     maybe_download_model_index,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -189,7 +190,9 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
     "fastvideo/fastvideo-fasth3-8-step-v2": "FastH3Pipeline",
+    "fastvideo/fastvideo-fasth3-omni-8-step-v1": "FastH3Pipeline",
     "openvdn/vdn-minimax-h3": "VDNH3Pipeline",
+    "pika-labs/pika-h3-flex": "PikaH3FlexPipeline",
     "lerobot/pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",
     "pi0.5": "Pi05Pipeline",
@@ -202,6 +205,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+    "hidream-ai/hidream-o1-image": "HiDreamO1ImagePipeline",
 }
 
 
@@ -361,11 +365,21 @@ def get_model_short_name(model_id: str) -> str:
 
 
 def _normalize_hf_cache_path(path: str) -> str:
-    """Normalize a local HuggingFace cache path before substring matching.
+    """Normalize a local HuggingFace cache path before matching repo directories.
 
-    We match registered repo ids like ``org/repo`` against cache fragments like ``models--org--repo`` that appear in snapshot/blob paths.
+    We match registered repo ids like ``org/repo`` against cache directories like ``models--org--repo`` that appear in snapshot/blob paths.
     """
     return os.path.normpath(path).lower().replace("\\", "/")
+
+
+def _in_hf_cache_repo(normalized_path: str, repo_id: str) -> bool:
+    """Whether a normalized path lies in the HF cache directory of ``repo_id``.
+
+    The cache directory must be a whole path component, so the cache of
+    ``org/repo`` does not claim the cache of ``org/repo-image``.
+    """
+    cache_repo_dir = f"models--{repo_id.lower().replace('/', '--')}"
+    return cache_repo_dir in normalized_path.split("/")
 
 
 def _match_registered_hf_path(model_path: str) -> Optional[str]:
@@ -397,15 +411,12 @@ def _match_registered_hf_path(model_path: str) -> Optional[str]:
     # when its basename is only the snapshot hash.
     # Example:
     #    /xxx/models--black-forest-labs--FLUX.2-dev-NVFP4/snapshots/142b87e70bc3006937b7093d89ff287b5f59f071
-    # -> models--black-forest-labs--flux.2-dev-nvfp4 (to match with cache_repo_fragment)
+    # -> models--black-forest-labs--flux.2-dev-nvfp4 (a whole path component)
     normalized_model_path = _normalize_hf_cache_path(model_path)
     for registered_model_hf_id in all_model_hf_paths:
         if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
             continue
-        cache_repo_fragment = (
-            f"models--{registered_model_hf_id.lower().replace('/', '--')}"
-        )
-        if cache_repo_fragment in normalized_model_path:
+        if _in_hf_cache_repo(normalized_model_path, registered_model_hf_id):
             logger.debug(
                 "Resolved HuggingFace cache path '%s' to registered model '%s'.",
                 model_path,
@@ -472,10 +483,22 @@ def _get_config_info(
         config = maybe_download_model_index(model_path)
         pipeline_name = config.get("_class_name", "")
     pipeline_name = pipeline_name.lower()
+    # A local checkpoint that ships modular_model_index.json next to model_index.json
+    # may name a finer-grained pipeline there (the Wan-Animate-2 variants);
+    # maybe_download_model_index reads the modular file only when model_index.json is
+    # absent, so probe the detectors with its class as well.
+    modular_pipeline_name = (
+        load_dict(os.path.join(model_path, "modular_model_index.json"))
+        .get("_class_name", "")
+        .lower()
+    )
+    probes = [model_path.lower(), pipeline_name]
+    if modular_pipeline_name and modular_pipeline_name != pipeline_name:
+        probes.append(modular_pipeline_name)
 
     matched_model_names = []
     for model_id, detector in _MODEL_NAME_DETECTORS:
-        if detector(model_path.lower()) or detector(pipeline_name):
+        if any(detector(probe) for probe in probes):
             logger.debug(
                 f"Matched model name '{model_id}' using a registered detector."
             )
@@ -702,10 +725,6 @@ def get_model_info(
 _discover_and_register_configs()
 
 
-def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
-    return get_non_diffusers_pipeline_name(model_path) is not None
-
-
 def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     """Get the pipeline name for a known non-diffusers model."""
     if is_sensenova_u1_model(model_path):
@@ -724,7 +743,7 @@ def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
         if "/" in pattern and (
             normalized_model_path == pattern
             or model_short_name == get_model_short_name(pattern)
-            or f"models--{pattern.replace('/', '--')}" in normalized_model_path
+            or _in_hf_cache_repo(normalized_model_path, pattern)
         ):
             return pipeline_name
     return None

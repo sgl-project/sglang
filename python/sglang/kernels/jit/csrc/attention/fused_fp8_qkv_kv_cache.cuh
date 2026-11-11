@@ -134,7 +134,7 @@ struct FusedFp8QkvKvCache {
     auto SVC = SymbolicSize{"v_cache_stride"};
     auto device = SymbolicDevice{};
     auto idx_dtype = SymbolicDType{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N, Dkv}).with_strides({SK, 1}).with_dtype<T>().with_device(device).verify(k);
     TensorMatcher({N, Dkv}).with_strides({SV, 1}).with_dtype<T>().with_device(device).verify(v);

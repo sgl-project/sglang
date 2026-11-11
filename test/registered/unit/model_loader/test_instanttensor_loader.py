@@ -19,7 +19,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _Backend(Enum):
@@ -200,7 +200,17 @@ class TestInstantTensorLoader(CustomTestCase):
     def test_iterator_uses_initialized_world_group(self):
         self.is_initialized.return_value = True
         device_group = object()
-        with patch.object(weight_utils.torch.distributed, "get_rank", return_value=0):
+        load_comm_group = object()
+        with (
+            patch.object(weight_utils.torch.distributed, "get_rank", return_value=0),
+            patch.object(
+                weight_utils.torch.distributed,
+                "new_group",
+                return_value=load_comm_group,
+            ),
+            patch.object(weight_utils.torch.distributed, "destroy_process_group"),
+            patch.object(weight_utils.torch.cuda, "current_stream"),
+        ):
             for world_size in (1, 2):
                 with self.subTest(world_size=world_size):
                     self.safe_open.reset_mock()
@@ -220,7 +230,7 @@ class TestInstantTensorLoader(CustomTestCase):
                         ["model.safetensors"],
                         framework="pt",
                         device=torch.device("cuda:1"),
-                        process_group=device_group if world_size > 1 else None,
+                        process_group=load_comm_group if world_size > 1 else None,
                         copy=True,
                     )
 
