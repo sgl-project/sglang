@@ -19,6 +19,7 @@ _TRITON_KERNELS = [
     ("virtual_slot", "free_unbind_inplace"),
     ("virtual_slot", "bind_inplace"),
     ("virtual_slot", "translate_token_ids"),
+    ("page_pack", "remap_packed_pages"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

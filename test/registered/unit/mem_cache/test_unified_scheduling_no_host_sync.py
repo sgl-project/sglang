@@ -376,5 +376,79 @@ class TestAStateTakeLeavesAFencedOwnerUnread(CustomTestCase):
         self.assertTrue(running, "the state take waited for the forward")
 
 
+class TestAReliefReadsNothing(CustomTestCase):
+    """A state slot that needs the owner packed first, with the owner's freed
+    rows still pending under the running forward: the owner is packed on the
+    device behind that forward, so the relief neither reads a page id on the
+    host nor waits for the forward there."""
+
+    def _relieve(self, sleep_cycles: int, armed: bool):
+        """Fill the owner up to the state end, free its rows but the first
+        and last page under a forward running ``sleep_cycles`` late, then take
+        one state slot. Returns the error a host sync raised (with
+        ``armed``), whether the forward was still running after the take, and
+        the bands packed on the device."""
+        setup_allocator_context()
+        allocator = build_unified_bundle(
+            UnifiedGeometry(
+                **CHAINS["full+state"],
+                page_size=PAGE_SIZE,
+                full_tokens=64 * PAGE_SIZE,
+                device="cuda",
+            )
+        ).token_to_kv_pool_allocator
+        owner, state = allocator.full_attn_allocator, allocator.mamba_allocator
+        rows = allocator.alloc(owner.available_size())
+        self.assertIsNotNone(rows)
+        self.assertFalse(allocator.state_slots_fit(1))
+        done = torch.cuda.Event()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(sleep_cycles)
+            done.record(stream)
+        steps = allocator.forward_steps
+        steps.forward_launched()
+        steps.forward_recorded(done)
+        allocator.set_latest_forward_done_event(done)
+        allocator.set_inflight_forward(done, rows, None)
+        allocator.free(rows[PAGE_SIZE:-PAGE_SIZE])
+        self.assertTrue(owner._pending_until_retire)
+        packed = []
+        real = band_module.Band.pack_on_device
+
+        def counting(band):
+            packed.append(band.sub_pool_name)
+            real(band)
+
+        error = None
+        if armed:
+            torch.cuda.set_sync_debug_mode("error")
+        try:
+            with mock.patch.object(band_module.Band, "pack_on_device", counting):
+                slot = allocator.alloc_state_slots(1)
+        except RuntimeError as exc:
+            error = exc
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        running = not done.query()
+        torch.cuda.synchronize()
+        if error is None:
+            self.assertIsNotNone(slot)
+            self.assertEqual(allocator.verify_byte_accounting(), [])
+        return error, running, packed, owner.sub_pool_name
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_the_owner_packs_on_the_device(self):
+        # Load every kernel and pinned buffer the path uses first.
+        error, _, packed, owner = self._relieve(0, armed=False)
+        self.assertIsNone(error)
+        self.assertEqual(packed, [owner])
+        error, running, _, _ = self._relieve(2_000_000_000, armed=True)
+        self.assertIsNone(error, f"the relief read the host: {error}")
+        # Sync debug does not see an event wait on the host; this does.
+        self.assertTrue(running, "the relief waited for the forward")
+
+
 if __name__ == "__main__":
     unittest.main()

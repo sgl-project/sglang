@@ -50,6 +50,7 @@ import numpy as np
 import torch
 from torch.profiler import record_function
 
+from sglang.kernels.ops.memory.page_pack import pack_pairs, remap_packed_pages
 from sglang.kernels.ops.memory.virtual_slot import (
     alloc_bind_inplace,
     free_unbind_inplace,
@@ -701,11 +702,12 @@ class Band:
         """Whether the free list's host copy matches it."""
         return self._host_free is not None
 
-    def _assert_ready_for_geometry(self, where: str) -> None:
+    def _assert_ready_for_geometry(self, where: str, *, on_host: bool = True) -> None:
         """Layout-changing geometry decides on holes and live pages only: the
-        band holds no pending page and, inside an urgent recovery, its free
-        list's host copy matches it (the recovery's entry made both true).
-        Signalled at invariant level WARN (logged) and STRICT (raises)."""
+        band holds no pending page and, inside an urgent recovery that decides
+        ``on_host``, its free list's host copy matches it (the recovery's entry
+        made both true; a device pack reads no copy). Signalled at invariant
+        level WARN (logged) and STRICT (raises)."""
         level = resolve_level()
         if level < InvariantCheckLevel.WARN:
             return
@@ -719,7 +721,9 @@ class Band:
         )
         expect_host(
             GEOMETRY_READY,
-            not (self._recovery_depth and not self._free_pages_host_known()),
+            not (
+                on_host and self._recovery_depth and not self._free_pages_host_known()
+            ),
             msg=f"{self.sub_pool_name}: {where} with no host copy of its free list",
             level=level,
         )
@@ -905,6 +909,10 @@ class Band:
     # Waits on the host for network transfers a move cannot avoid; shared by
     # every band of a chain (`ChainAllocator.set_network_waiter`).
     network_waiter: Optional[NetworkWaiter] = None
+
+    # Whether a transfer was ever recorded on this band (`record_transfer`): a
+    # host copy or a network engine, whose pages only a host read names.
+    records_transfers: bool = False
 
     def cap_available(self, tokens: int) -> int:
         if self.max_live_tokens is None:
@@ -1963,12 +1971,21 @@ class Band:
             f"Band({self.sub_pool_name!r}).prewarm_compaction needs "
             "the reserved sink page 0"
         )
-        # The sink page copied onto itself, listed twice: every byte written is
-        # the byte read, so the coinciding src/dst are harmless, and two entries
-        # make `.all()` launch the reduction kernel a real commit uses (it skips
-        # the kernel for one element).
+        # The sink page as both ends of two pairs, which copy nothing, and two
+        # entries make `.all()` launch the reduction kernel a real commit uses
+        # (it skips the kernel for one element).
         sink = torch.zeros(2, dtype=torch.int64, device=self.device)
         self._move_pages(sink, sink)
+        # A device pack's pair selection and remap (`pack_on_device`) over a
+        # span already packed: every pair is padded, and no entry changes.
+        grow_up = self.grow_direction == "up"
+        packed = torch.tensor(
+            [0, 0, -1, -1] if grow_up else [-1, -1, 0, 0], device=self.device
+        )
+        src, dst = pack_pairs(packed, first=0, end=4, packed_end=2, grow_up=grow_up)
+        remap_packed_pages(
+            src, dst, self.ids.virtual_to_physical, self.ids.physical_to_virtual
+        )
         # The commit's p2v check; its page-table gather and writes are the ones
         # alloc and free run, so they are warm before any compaction can exist.
         torch._assert_async((sink >= 0).all(), "prewarm_compaction")
@@ -2080,6 +2097,7 @@ class Band:
         not ``copy``."""
         if ids is None or len(ids) == 0:
             return
+        self.records_transfers = True
         self.usage.record_transfer(
             signal,
             ids,
@@ -2844,6 +2862,76 @@ class Band:
         with record_function("Band.flush_for_allocation"):
             with settle_pending_for_recovery((self,)):
                 return self._flush(urgent=True)
+
+    def can_pack_on_device(self) -> bool:
+        """Whether `pack_on_device` may pack this band, decided from logical
+        state alone: an end that compacts lazily, with no fixed page, no
+        transfer ever recorded, and every unfinished forward ended by the
+        latest one."""
+        return (
+            self.grow_direction != "float"
+            and self.lazy_compaction
+            and self.min_page_index >= 1
+            and not self.usage.fixed
+            and not self.records_transfers
+            and (self.usage.latest_forward is not None or not self.usage.forwards())
+        )
+
+    def pack_on_device(self) -> None:
+        """Pack the live pages against the band's base, as an urgent flush
+        does, but with no page id read on the host: the pairs and the remap
+        are fixed-shape device work sized from the live count, and the
+        frontier moves to the packed end that count gives. The stream first
+        waits the latest forward, so no copy races a forward and no vacated
+        page needs a fence; it then settles the pending pages. The pairs are
+        the ones a host flush makes, so every rank lays the band out alike.
+        Only for a band that `can_pack_on_device`."""
+        with record_function("Band.pack_on_device"):
+            assert self.can_pack_on_device(), (
+                f"{self.sub_pool_name}: a device pack needs a lazy end with no "
+                "fixed page and no recorded transfer"
+            )
+            self._settle_inflight_forward()
+            self.settle_pending()
+            self._assert_ready_for_geometry("a device pack", on_host=False)
+            # Pages vacated under a forward that has now ended: free like any
+            # page the physical-to-virtual table leaves unbound.
+            self.usage.take_ready_vacated(urgent=True)
+            first, end = self._span_range()
+            live = self.live_page_count
+            grow_up = self.grow_direction == "up"
+            packed_end = first + live if grow_up else end - live
+            if live and end - first > live:
+                self._move_packed_pages(first, end, packed_end, grow_up)
+            # A host copy of the pages a use names was taken before the move.
+            for use in self.usage.uses:
+                if use.unit_tokens is None:
+                    use.host_pages = None
+            self.watermark_physical = packed_end if grow_up else packed_end - 1
+            self._set_free_pages(
+                torch.empty(0, dtype=torch.int64, device=self.device), host=[]
+            )
+            self._pending_host = []
+            self._stats_n_flush_calls += 1
+            self._maybe_emit_stats()
+
+    def _move_packed_pages(
+        self, first: int, end: int, packed_end: int, grow_up: bool
+    ) -> None:
+        """Copy the live pages of span ``[first, end)`` past ``packed_end``
+        into its free pages before it (`pack_pairs`), and rebind them."""
+        p2v = self.ids.physical_to_virtual
+        src, dst = pack_pairs(
+            p2v, first=first, end=end, packed_end=packed_end, grow_up=grow_up
+        )
+        # The free pages may still meet fences of earlier moves.
+        self._wait_clearance(
+            self._range_clearance(first, end, (Consumer.SCHEDULE_COPY,))
+        )
+        self._count_move_batch()
+        self._move_pages(src, dst)
+        moved = remap_packed_pages(src, dst, self.ids.virtual_to_physical, p2v)
+        self._inverse_history.append((src, dst, moved))
 
     def flush_opportunistic(self) -> int:
         """Public, non-urgent flush at quiescent points; never blocks

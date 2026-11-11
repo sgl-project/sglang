@@ -14,6 +14,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache.kv.alloc import band as band_module
+from sglang.srt.mem_cache.kv.alloc.band import allocator_operation
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.pricing import feasible, first_plan
 from sglang.srt.mem_cache.kv.alloc.signals import NetworkTransfer
@@ -738,6 +739,210 @@ class TestFrontierTakesBindInOneKernel(CustomTestCase):
         # The owner extends its frontier; the window reuses its holes.
         self.assertEqual(calls, [4])
         self._assert_bound(allocator, taken.to(torch.int64))
+
+
+class _FiredEvent:
+    """A forward's event that has fired: nothing waits on it, while the
+    ledger keeps the forward unretired until it is processed."""
+
+    def query(self):
+        return True
+
+
+def _layout(allocator):
+    """Every band's tables, extent, and free pages (pending ones included)."""
+    out = {}
+    for band in allocator.bands:
+        free = band._free_phys_pages.cpu().tolist()
+        free += [
+            p for part in band._pending_until_retire.pages() for p in part.tolist()
+        ]
+        out[band.sub_pool_name] = (
+            band.ids.virtual_to_physical.cpu().tolist(),
+            band.ids.physical_to_virtual.cpu().tolist(),
+            band._span_range(),
+            sorted(free + sorted(band.usage.pending_pages)),
+        )
+    return out
+
+
+class TestEndsPackOnTheDevice(CustomTestCase):
+    """An end packed on the device (`Band.pack_on_device`) is laid out as an
+    urgent host flush lays it out, whatever its holes, the pages pending
+    under an unfinished forward and those a move vacated under it: the same
+    tables and frontier, every live page's bytes under its virtual id, and
+    byte accounting kept. A relief takes that route only when no page is
+    fixed and no transfer was recorded, and its takes match a host relief's.
+    Every rank must lay its bands out alike, and a device pack is chosen from
+    logical state alone, so any difference from the host route would split
+    them."""
+
+    def _build(self, device, seed, *, fixed: bool):
+        """A chain with a seeded history: holes, a forward still in flight
+        (writing some live pages), pages a move vacated under it, pages
+        freed under it, and with ``fixed`` some fixed pages."""
+        rng = random.Random(seed)
+        setup_allocator_context()
+        allocator = _allocator(device, rng.choice(("swa", "tri")), lazy=True)
+        raw = allocator.arena.raw
+        generator = torch.Generator().manual_seed(seed)
+        raw.copy_(
+            torch.randint(0, 256, raw.shape, dtype=torch.uint8, generator=generator)
+        )
+        held, slots = [], []
+        state = allocator.mamba_allocator
+        for _ in range(rng.randint(4, 12)):
+            got = allocator.alloc(rng.randint(1, 6))
+            if got is not None:
+                held.append(got)
+            if state is not None and rng.random() < 0.5:
+                got = allocator.alloc_state_slots(1)
+                if got is not None:
+                    slots.append(got)
+        rng.shuffle(held)
+        for ids in held[: len(held) // 3]:
+            allocator.free(ids)
+        held = held[len(held) // 3 :]
+        if device == "cuda":
+            done = torch.cuda.Event()
+            done.record()
+        else:
+            done = _FiredEvent()
+        steps = allocator.forward_steps
+        steps.forward_launched()
+        steps.forward_recorded(done)
+        allocator.set_latest_forward_done_event(done)
+        written = [ids for ids in held if rng.random() < 0.3]
+        allocator.set_inflight_forward(
+            done,
+            torch.cat(written) if written else None,
+            torch.cat(slots) if slots and rng.random() < 0.5 else None,
+        )
+        if rng.random() < 0.7:
+            # Survivors move into the holes while the forward may read them.
+            allocator.flush_opportunistic()
+        for ids in held:
+            if rng.random() < 0.3:
+                allocator.free(ids)
+        for slot in slots:
+            if rng.random() < 0.4:
+                state.free(slot)
+        if fixed:
+            for band in allocator.bands:
+                live = _live_pages(band)
+                if live:
+                    band.fix_pages("held", rng.sample(live, 1))
+                    break
+        return allocator, rng
+
+    def _assert_same(self, device_route, host_route, *, bound=True):
+        """The same layout and live bytes; with every taken page ``bound``,
+        byte accounting kept too."""
+        self.assertEqual(_layout(device_route), _layout(host_route))
+        before, after = _live_bytes(device_route), _live_bytes(host_route)
+        self.assertEqual(before.keys(), after.keys())
+        for key, payload in before.items():
+            self.assertTrue(torch.equal(payload, after[key]), key)
+        if bound:
+            self.assertEqual(device_route.verify_byte_accounting(), [])
+            self.assertEqual(host_route.verify_byte_accounting(), [])
+
+    def _check_packs(self, device, seed, count):
+        packed = refused = 0
+        for case in range(count):
+            fixed = case % 4 == 0
+            device_route, _ = self._build(device, seed + case, fixed=fixed)
+            host_route, _ = self._build(device, seed + case, fixed=fixed)
+            self.assertEqual(
+                _live_bytes(device_route).keys(), _live_bytes(host_route).keys()
+            )
+            ends = [b for b in device_route.bands if b.grow_direction != "float"]
+            for band in ends:
+                twin = next(
+                    b for b in host_route.bands if b.sub_pool_name == band.sub_pool_name
+                )
+                if not band.can_pack_on_device():
+                    self.assertTrue(band.usage.fixed)
+                    refused += 1
+                    continue
+                with allocator_operation(device_route.members):
+                    band.pack_on_device()
+                with allocator_operation(host_route.members):
+                    twin.flush_for_allocation()
+                packed += 1
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                self._assert_same(device_route, host_route)
+        self.assertGreater(packed, 0)
+        self.assertGreater(refused, 0)
+
+    @staticmethod
+    def _relief_demands(rng, allocator):
+        """A feasible demand that does not fit in place, or None."""
+        snapshot = allocator.pricing_snapshot()
+        for _ in range(20):
+            demands = {
+                b.name: rng.randint(0, b.num_pages - b.min_page - b.live) // 2
+                for b in snapshot.bands
+            }
+            if feasible(snapshot, demands) and allocator.plan_in_place(demands) is None:
+                return demands
+        return None
+
+    def _check_reliefs(self, device, seed, count):
+        on_device = on_host = 0
+        for case in range(count):
+            fixed = case % 4 == 0
+            device_route, rng = self._build(device, seed + case, fixed=fixed)
+            host_route, _ = self._build(device, seed + case, fixed=fixed)
+            demands = self._relief_demands(rng, device_route)
+            if demands is None:
+                continue
+            packs = []
+            real = band_module.Band.pack_on_device
+
+            def counting(band):
+                packs.append(band.sub_pool_name)
+                real(band)
+
+            with patch.object(band_module.Band, "pack_on_device", counting):
+                taken = device_route._plan_and_take(demands)
+            with patch.object(
+                type(host_route), "_pack_ends_on_device", return_value=None
+            ):
+                expected = host_route._plan_and_take(demands)
+            if device == "cuda":
+                torch.cuda.synchronize()
+            if packs:
+                on_device += 1
+                self.assertFalse(fixed)
+            else:
+                on_host += 1
+            self.assertEqual(taken.keys(), expected.keys())
+            for name, pages in taken.items():
+                self.assertEqual(
+                    None if pages is None else pages.tolist(),
+                    None if expected[name] is None else expected[name].tolist(),
+                    name,
+                )
+            # The takes are not bound to virtual pages yet.
+            self._assert_same(device_route, host_route, bound=False)
+        self.assertGreater(on_device, 0)
+        self.assertGreater(on_host, 0)
+
+    def test_packs_match_host_flushes_on_cpu(self):
+        self._check_packs("cpu", seed=1000, count=200)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_packs_match_host_flushes_on_cuda(self):
+        self._check_packs("cuda", seed=2000, count=60)
+
+    def test_reliefs_match_host_reliefs_on_cpu(self):
+        self._check_reliefs("cpu", seed=3000, count=400)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_reliefs_match_host_reliefs_on_cuda(self):
+        self._check_reliefs("cuda", seed=4000, count=100)
 
 
 class TestAdmissionIsATake(CustomTestCase):
