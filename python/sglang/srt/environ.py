@@ -291,6 +291,9 @@ class Envs:
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
     # Master switch of the runtime optimizations below; off, all of them keep main's paths.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
+    # GDN ReplaySSM verify commit as the tiled Triton kernel (bitwise the stock commit,
+    # supported shapes only). Opt-in.
+    SGLANG_OPT_GDN_REPLAYSSM_TILED_COMMIT = EnvRuntimeBool(False)
     # EAGLE verify tree sampling as multi-CTA kernels (bitwise; fp32, <= 64 rows).
     SGLANG_OPT_MULTI_CTA_VERIFY_TREE_SAMPLING = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
