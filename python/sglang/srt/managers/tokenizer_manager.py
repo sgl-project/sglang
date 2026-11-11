@@ -3816,10 +3816,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         output_ids = state.output_ids
         meta_info["completion_tokens"] = len(output_ids)
-        if is_stream and self.incremental_streaming_output:
+        incremental = is_stream and self.incremental_streaming_output
+        if incremental:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
         out = {
-            "text": state.get_text(),
+            # AbortReq supplies no new text. Any queued deltas are coalesced
+            # by the stream consumer before it yields the final chunk.
+            "text": "" if incremental else state.get_text(),
             "output_ids": output_ids,
             "meta_info": meta_info,
         }

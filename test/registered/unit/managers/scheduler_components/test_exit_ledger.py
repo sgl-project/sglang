@@ -42,11 +42,34 @@ class TestRetireOnce(CustomTestCase):
             finished_output=False,
             finished=lambda: True,
         )
+        req.detokenize_output_held = False
         scheduler = MagicMock(rust_server=None)
         with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
             Scheduler.send_abort_output(scheduler, AbortReq(rid="r0"), req)
             with self.assertRaisesRegex(RuntimeError, "r0 sent its final output"):
                 _accumulator().accept(req=req)
+
+    def test_held_stream_is_finished_through_the_output_streamer(self):
+        req = FakeReq(
+            rid="held",
+            beam_group=None,
+            finished_output=False,
+            finished=lambda: False,
+            output_ids=[3, 4],
+            return_logprob=False,
+            detokenize_output_held=True,
+        )
+
+        def finish_outside_step(reason):
+            req.finished_reason = reason
+
+        req.finish_outside_step = finish_outside_step
+        scheduler = MagicMock(rust_server=None)
+
+        Scheduler.send_abort_output(scheduler, AbortReq(rid="held"), req)
+
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+        self.assertEqual(req.finished_reason.to_json()["type"], "abort")
 
 
 if __name__ == "__main__":

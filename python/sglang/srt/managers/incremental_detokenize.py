@@ -1,12 +1,11 @@
 """The detokenizer's incremental decoding: the DetokenizeHeader the scheduler
-builds and sends on a request's first output, and the per-request state, kept
-by rid, that turns each row's output ids into text."""
+builds and sends on a request's first output, and the state that turns each row's
+output ids into text, keyed by request ID and tokenizer worker."""
 
 from __future__ import annotations
 
 import logging
 from array import array
-from collections import OrderedDict
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import msgspec
@@ -211,6 +210,7 @@ class DetokenizeState(msgspec.Struct):
         surr_text: str,
         finished_reason: Optional[Dict],
         trim_matched_stop: Callable,
+        stop_suffix: Optional[str] = None,
     ) -> str:
         """Advance by one row's decoded texts; return the text to send."""
         new_text = read_text[len(surr_text) :]
@@ -236,11 +236,13 @@ class DetokenizeState(msgspec.Struct):
                 return printable[pending:] if pending else printable
 
         # Finished: materialize once, trim the matched stop, emit the tail.
-        output_str = trim_matched_stop(
-            self.get_decoded_text() + new_text,
-            finished_reason,
-            self.header.no_stop_trim,
-        )
+        output_str = self.get_decoded_text() + new_text
+        if stop_suffix is None:
+            output_str = trim_matched_stop(
+                output_str, finished_reason, self.header.no_stop_trim
+            )
+        elif stop_suffix and output_str.endswith(stop_suffix):
+            output_str = output_str[: -len(stop_suffix)]
         incremental_output = output_str[self.sent_offset :]
         self.sent_offset = len(output_str)
         return incremental_output
@@ -257,38 +259,26 @@ class DetokenizeState(msgspec.Struct):
         return self.decoded_text
 
 
-class LimitedCapacityDict(OrderedDict):
-    def __init__(self, capacity: int, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.capacity = capacity
-
-    def __setitem__(self, key, value):
-        if len(self) >= self.capacity:
-            # Remove the oldest element (first item in the dict)
-            self.popitem(last=False)
-        # Set the new item
-        super().__setitem__(key, value)
-
-
 class DetokenizeStateTable:
-    """The detokenizer's DetokenizeState by rid: started by a request's
-    DetokenizeHeader, released by its finished row or a DetokenizeReleaseReq;
-    past capacity, the oldest is evicted."""
+    """Keep a bounded number of active streams, keyed by request and worker."""
 
     def __init__(self, capacity: int):
-        self._states = LimitedCapacityDict(capacity=capacity)
+        self._capacity = capacity
+        self._states: Dict[Tuple[str, Optional[str]], DetokenizeState] = {}
 
     def start(
         self, *, rid: str, header: DetokenizeHeader, vocab_size: Optional[int]
-    ) -> DetokenizeState:
-        # A request's first output; it replaces any stale state of a reused rid.
-        self._states.pop(rid, None)
+    ) -> Optional[DetokenizeState]:
+        key = (rid, header.http_worker_ipc)
+        if len(self._states) >= self._capacity and key not in self._states:
+            return None
+        # A new header replaces any stale state under the same key.
         s = DetokenizeState.from_header(header=header, vocab_size=vocab_size)
-        self._states[rid] = s
+        self._states[key] = s
         return s
 
-    def get(self, rid: str) -> Optional[DetokenizeState]:
-        return self._states.get(rid)
+    def get(self, rid: str, worker_ipc: Optional[str]) -> Optional[DetokenizeState]:
+        return self._states.get((rid, worker_ipc))
 
-    def release(self, rid: str) -> None:
-        self._states.pop(rid, None)
+    def release(self, rid: str, worker_ipc: Optional[str]) -> Optional[DetokenizeState]:
+        return self._states.pop((rid, worker_ipc), None)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+import zlib
 from array import array
 from dataclasses import InitVar, dataclass, field
 from enum import Enum, auto
@@ -23,8 +24,16 @@ from sglang.srt.beam_search.output import (
     pack_beam_search_output,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.elastic_ep.topology import (
+    attn_replica_size,
+    physical_ep_rank_to_dp_rank,
+    physical_ep_size_to_dp_size,
+)
 from sglang.srt.environ import envs
-from sglang.srt.managers.incremental_detokenize import build_detokenize_header
+from sglang.srt.managers.incremental_detokenize import (
+    DETOKENIZER_MAX_STATES,
+    build_detokenize_header,
+)
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
@@ -107,6 +116,8 @@ class SchedulerOutputStreamer:
     _test_stream_output_count: int = 0
     output_sink: OutputSink = field(init=False)
     enable_metrics: bool = field(init=False)
+    _detokenize_stream_counts: list[int] = field(init=False, default_factory=list)
+    _detokenize_stream_capacity: int = field(init=False, default=0)
 
     def __post_init__(self, skip_tokenizer_init: bool) -> None:
         if self.rust_server is not None:
@@ -115,6 +126,33 @@ class SchedulerOutputStreamer:
             self.output_sink = OutputSink.TOKENIZER
         else:
             self.output_sink = OutputSink.DETOKENIZER
+            if self.is_generation:
+                parallel = get_parallel()
+                num_senders = parallel.num_dp_ranks
+                num_workers = get_serving().detokenizer_worker_num
+                sender_rank = parallel.dp_rank
+                if sender_rank is None:
+                    sender_rank = parallel.attn_dp_rank
+                if (
+                    parallel.max_ep_size is not None
+                    and parallel.max_ep_size > parallel.tp_size
+                ):
+                    replica_size = attn_replica_size()
+                    num_senders = max(
+                        num_senders,
+                        physical_ep_size_to_dp_size(parallel.max_ep_size, replica_size),
+                    )
+                    sender_rank += physical_ep_rank_to_dp_rank(
+                        parallel.ep_join_rank_offset, replica_size
+                    )
+                    # Joiners can use a different local detokenizer topology.
+                    # Use one bucket to bound their total sends to the primary.
+                    num_workers = 1
+                # Each sender's ZMQ messages arrive in order. Partition each
+                # worker's slots across all senders, including elastic joiners.
+                share, remainder = divmod(DETOKENIZER_MAX_STATES, num_senders)
+                self._detokenize_stream_capacity = share + (sender_rank < remainder)
+                self._detokenize_stream_counts = [0] * num_workers
         if self.has_additional_customized_info and self.output_sink is OutputSink.RUST:
             raise ValueError(
                 "a streamer's additional customized_info needs TokenizerManager "
@@ -199,8 +237,13 @@ class SchedulerOutputStreamer:
         )
 
     def release_detokenize_state(self, req: Req) -> None:
-        if req.detokenize_header_sent:
-            self.send_to_detokenizer.send_output(DetokenizeReleaseReq(rid=req.rid))
+        worker = req.detokenize_worker_slot
+        if worker is not None:
+            self.send_to_detokenizer.send_output(
+                DetokenizeReleaseReq(rid=req.rid, http_worker_ipc=req.http_worker_ipc)
+            )
+            self._detokenize_stream_counts[worker] -= 1
+            req.detokenize_worker_slot = None
 
     def get_request_stats(self, req: Req, completion_tokens: int) -> Dict[str, Any]:
         """A finished request's ``meta_info`` keys that Python's
@@ -305,12 +348,38 @@ class SchedulerOutputStreamer:
         for req in reqs:
             if req is skip_req:
                 continue
+            finished = req.finished()
             # Kept for the PD decode queue paths, which stream requests that are
             # not in any step's batch yet.
-            if req.finished() and req.finished_output:
+            if finished and req.finished_output:
                 continue
 
-            acc.accept(req=req)
+            worker = None
+            has_detokenize_slot = True
+            if (
+                self._detokenize_stream_counts
+                and not finished
+                and not req.detokenize_header_sent
+            ):
+                # Match MultiDetokenizerRouter's request-to-worker assignment.
+                worker = (
+                    zlib.crc32(req.rid.encode()) % len(self._detokenize_stream_counts)
+                    if len(self._detokenize_stream_counts) > 1
+                    else 0
+                )
+                has_detokenize_slot = (
+                    self._detokenize_stream_counts[worker]
+                    < self._detokenize_stream_capacity
+                )
+            acc.accept(req=req, has_detokenize_slot=has_detokenize_slot)
+            if worker is not None and req.detokenize_header_sent:
+                req.detokenize_worker_slot = worker
+                self._detokenize_stream_counts[worker] += 1
+            elif finished and self._detokenize_stream_counts:
+                worker = req.detokenize_worker_slot
+                if worker is not None:
+                    self._detokenize_stream_counts[worker] -= 1
+                    req.detokenize_worker_slot = None
             self._maybe_log_time_stats(req=req)
 
         if (
@@ -573,7 +642,7 @@ class _GenerationStreamAccumulator:
         # Only the leader is ever streamed, and only at group finish.
         return req.is_beam_leader and req.finished()
 
-    def accept(self, *, req: Req) -> None:
+    def accept(self, *, req: Req, has_detokenize_slot: bool = True) -> None:
         if req.beam_group is not None and not self._beam_admits(req=req):
             return
         if req.finished():
@@ -611,6 +680,11 @@ class _GenerationStreamAccumulator:
 
         if not should_output:
             return
+        if not has_detokenize_slot:
+            # Leave the offsets untouched so the next eligible row still
+            # carries these IDs, including if a held stream is aborted.
+            req.detokenize_output_held = req.stream
+            return
 
         send_token_offset = req.send_token_offset
         send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
@@ -636,15 +710,15 @@ class _GenerationStreamAccumulator:
 
         if self.output_sink is OutputSink.DETOKENIZER:
             if req.take_detokenize_header_due():
+                req.detokenize_output_held = False
                 self.detokenize_headers.append(
                     build_detokenize_header(req, output_prefix_len=send_token_offset)
                 )
                 self.has_detokenize_header = True
             else:
                 self.detokenize_headers.append(None)
-            # A finished row carries its http_worker_ipc, so it reaches its
-            # tokenizer worker even with no stored state.
-            ipc = req.http_worker_ipc if req.finished() else None
+            # Different tokenizer workers can have requests with the same rid.
+            ipc = req.http_worker_ipc
             self.http_worker_ipcs.append(ipc)
             self.has_http_worker_ipc = self.has_http_worker_ipc or ipc is not None
         elif self.output_sink is OutputSink.TOKENIZER:
