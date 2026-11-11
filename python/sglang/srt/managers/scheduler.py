@@ -6360,6 +6360,10 @@ class Scheduler(
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")
+        if self._pp_spec_decode and recv_req.mode == "retract":
+            raise ValueError(
+                "PD decode PP speculative decoding does not support pause/retract"
+            )
         self.pause_state.pause()
 
         if recv_req.mode == "in_place":

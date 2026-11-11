@@ -146,6 +146,15 @@ class PPSpecRelayInput(SpecInput):
             top_scores=None if self.top_scores is None else self.top_scores[take],
         )
 
+    def to(self, device: torch.device | str) -> PPSpecRelayInput:
+        """Move an owned proposal between the retraction backup and the batch."""
+        return PPSpecRelayInput(
+            rids=list(self.rids),
+            tokens=self.tokens.to(device),
+            parents=None if self.parents is None else self.parents.to(device),
+            top_scores=None if self.top_scores is None else self.top_scores.to(device),
+        )
+
     def topology(self, *, fallback):
         """The rows' tree shape, as a rectangular pair. ``fallback`` supplies
         chain constants for the case where no request has been drafted for

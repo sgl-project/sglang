@@ -168,6 +168,7 @@ if TYPE_CHECKING:
     from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import UocrReqState
     from sglang.srt.sampling.custom_logit_processor import PageGuardState
     from sglang.srt.session.session_controller import Session
+    from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
@@ -1550,7 +1551,14 @@ class Req(ReqDllmMixin):
             return None
         return allocator.state.pool
 
-    def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+    def offload_kv_cache(
+        self,
+        req_to_token_pool,
+        token_to_kv_pool_allocator,
+        *,
+        draft_token_to_kv_pool=None,
+        pp_spec_relay: Optional[PPSpecRelayInput] = None,
+    ):
         token_indices = req_to_token_pool.req_to_token[
             self.kv.req_pool_idx, : self.seqlen - 1
         ]
@@ -1558,6 +1566,11 @@ class Req(ReqDllmMixin):
         mamba_pool = self._mamba_pool_needing_backup(
             req_to_token_pool, token_to_kv_pool_allocator
         )
+        if pp_spec_relay is not None:
+            assert pp_spec_relay.rids == [self.rid]
+            assert pp_spec_relay.tokens[0, 0].item() == self.output_ids[-1], (
+                "PP proposal must be committed before retracting a request"
+            )
         self.kv.retraction_backup = RetractionBackup(
             cpu_tensors=token_to_kv_pool_allocator.get_cpu_copy(
                 token_indices,
@@ -1569,26 +1582,61 @@ class Req(ReqDllmMixin):
                 if mamba_pool is not None and self.kv.holds_mamba
                 else None
             ),
+            draft_cpu_tensors=(
+                draft_token_to_kv_pool.get_cpu_copy(token_indices)
+                if draft_token_to_kv_pool is not None
+                else None
+            ),
+            pp_spec_relay=(
+                pp_spec_relay.to("cpu") if pp_spec_relay is not None else None
+            ),
+            pp_spec_seq_len=self.seqlen - 1 if pp_spec_relay is not None else None,
         )
 
-    def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+    def load_kv_cache(
+        self,
+        req_to_token_pool,
+        token_to_kv_pool_allocator,
+        *,
+        draft_token_to_kv_pool=None,
+    ):
         assert self.kv.retraction_backup is not None
+        backup = self.kv.retraction_backup
+        if backup.pp_spec_relay is not None:
+            assert backup.pp_spec_seq_len == self.seqlen - 1
+            assert backup.pp_spec_relay.rids == [self.rid]
+            assert backup.pp_spec_relay.tokens[0, 0].item() == self.output_ids[-1]
+        if backup.draft_cpu_tensors is not None:
+            assert draft_token_to_kv_pool is not None, "Missing draft pool for restore"
         token_indices = req_to_token_pool.req_to_token[
             self.kv.req_pool_idx, : self.seqlen - 1
         ]
         # Loads both the kv cache and mamba state if exists
-        mamba_cpu = self.kv.retraction_backup.mamba_cpu
+        mamba_cpu = backup.mamba_cpu
         if mamba_cpu is not None and self.kv.holds_mamba:
             token_to_kv_pool_allocator.state.pool.load_cpu_copy(
                 mamba_cpu, self.kv.mamba_pool_idx.unsqueeze(0)
             )
         token_to_kv_pool_allocator.load_cpu_copy(
-            self.kv.retraction_backup.cpu_tensors,
+            backup.cpu_tensors,
             token_indices,
             mamba_indices=self.kv.mamba_pool_idx,
             req_pool_index=self.kv.req_pool_idx,
         )
-        self.kv.retraction_backup = None
+        if backup.draft_cpu_tensors is not None:
+            draft_token_to_kv_pool.load_cpu_copy(
+                backup.draft_cpu_tensors, token_indices
+            )
+        # PREBUILT consumes the saved proposal after KV is restored. Seeding it
+        # from the original prefill hidden states would restart an outdated draft.
+        self.kv.retraction_backup = (
+            RetractionBackup(
+                pp_spec_relay=backup.pp_spec_relay,
+                pp_spec_seq_len=backup.pp_spec_seq_len,
+            )
+            if backup.pp_spec_relay is not None
+            else None
+        )
 
     def build_rebootstrap_payload(self) -> dict:
         """Build the prefill ``/generate`` payload that asks the original prefill
@@ -1810,9 +1858,12 @@ def release_req(
     tree_cache: BasePrefixCache,
     request_retirer: RequestRetirer,
     offload_kv: bool = True,
+    pp_spec_relay: Optional[PPSpecRelayInput] = None,
 ) -> bool:
     """Returns whether the request can be resumed."""
-    resumable = request_retirer.retract(req, offload_kv=offload_kv)
+    resumable = request_retirer.retract(
+        req, offload_kv=offload_kv, pp_spec_relay=pp_spec_relay
+    )
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
@@ -3101,12 +3152,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         request_retirer: RequestRetirer,
         offload_kv: bool = True,
     ) -> bool:
+        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+
+        pp_spec_relay = None
+        if (
+            offload_kv
+            and get_disagg().disaggregation_mode == "decode"
+            and isinstance(self.spec_info, PPSpecRelayInput)
+        ):
+            # Own the row before filtering or merging mutates the live batch.
+            pp_spec_relay = self.spec_info.reindex([self.reqs[idx].rid])
         return release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
             tree_cache=self.tree_cache,
             request_retirer=request_retirer,
             offload_kv=offload_kv,
+            pp_spec_relay=pp_spec_relay,
         )
 
     def prepare_encoder_info_decode(self):

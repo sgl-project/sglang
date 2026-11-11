@@ -15,6 +15,7 @@ import unittest
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -26,13 +27,27 @@ from sglang.test.test_utils import (
 maybe_stub_sgl_kernel()
 
 from sglang.srt.environ import envs  # noqa: E402
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
+from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
+    SchedulerPPMixin,
+    _pp_exchange_outputs_before_forward,
+)
 from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg, **server_args):
+def _posted_output_ops(
+    pp_rank,
+    spec_relay,
+    send_msg,
+    recv_msg,
+    *,
+    mode=ForwardMode.EXTEND,
+    pd_spec=False,
+    has_output=True,
+    npu=False,
+    **server_args,
+):
     """Device p2p ops one PP2 rank posts for one output exchange, in stream order.
 
     Fences on this rank's own forward show up as ("wait", "own-forward").
@@ -40,7 +55,11 @@ def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg, **server_args):
     ops = []
     scheduler = SchedulerPPMixin()
     scheduler._pp_spec_relay = spec_relay
-    scheduler.pp_group = SimpleNamespace(is_first_rank=pp_rank == 0)
+    scheduler._pp_spec_decode = pd_spec
+    scheduler.pp_group = SimpleNamespace(
+        is_first_rank=pp_rank == 0, is_last_rank=pp_rank == 1
+    )
+    scheduler.attn_tp_group = None
     scheduler.launch_event = "own-forward"
     scheduler.pp_comm_stream_ctx = nullcontext()
     scheduler.schedule_stream = None
@@ -56,32 +75,235 @@ def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg, **server_args):
     )
     scheduler._pp_prep_batch_result = lambda *args: SimpleNamespace(logits_output=None)
 
-    def send(*args):
-        ops.append(("send", send_msg))
+    def send(tensor_dict, **kwargs):
+        ops.append(("send", tensor_dict["payload"]))
         return []
 
     def recv():
         ops.append(("recv", recv_msg))
-        return {}, None
+        return {"payload": recv_msg}, None
 
-    scheduler._pp_send_output_to_next_stage = send
+    def send_recv(*, send_tensor_dict, **kwargs):
+        ops.append(("send_recv", (send_tensor_dict["payload"], recv_msg)))
+        return {"payload": recv_msg}
+
+    scheduler._pp_send_dict_to_next_stage = send
     scheduler._pp_recv_dict_from_prev_stage = recv
-    target = SimpleNamespace(
-        forward_mode=ForwardMode.EXTEND,
-        reqs=[object(), object()],
-        contains_last_prefill_chunk=True,
-        return_logprob=True,
+    scheduler.pp_group.send_recv_tensor_dict = send_recv
+    target = (
+        SimpleNamespace(
+            forward_mode=mode,
+            reqs=[object(), object()],
+            contains_last_prefill_chunk=True,
+            return_logprob=True,
+        )
+        if mode is not None
+        else None
     )
-    with published_topology(
-        role="scheduler", ranks={"world_rank": pp_rank}, pp_size=2, **server_args
+    payload = SimpleNamespace(tensors={"payload": send_msg})
+    tail_outputs = deque([(None, payload)]) if target is not None else deque()
+    with (
+        patch("sglang.srt.managers.scheduler_pp_mixin._is_npu", npu),
+        published_topology(
+            role="scheduler", ranks={"world_rank": pp_rank}, pp_size=2, **server_args
+        ),
     ):
         scheduler._pp_send_recv_and_preprocess_output_tensors(
-            0, 1, [None, target], [None, None], deque(), None
+            0,
+            1,
+            [target, target],
+            [None, None],
+            tail_outputs,
+            payload if has_output else None,
         )
     return ops
 
 
 class TestPPOutputExchangeOrder(CustomTestCase):
+    def test_other_modes_do_not_initialize_pd_spec_resources(self):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        for gate, pp_size, algorithm, mode, expected_relay in (
+            (True, 2, SpeculativeAlgorithm.NONE, "decode", False),
+            (True, 1, SpeculativeAlgorithm.EAGLE, "decode", False),
+            (True, 2, SpeculativeAlgorithm.EAGLE, "null", True),
+            (False, 2, SpeculativeAlgorithm.EAGLE, "decode", False),
+        ):
+            with self.subTest(
+                gate=gate, pp_size=pp_size, algorithm=algorithm, mode=mode
+            ):
+                scheduler = SchedulerPPMixin()
+                scheduler.spec_algorithm = algorithm
+                # Stage-capacity initialization always inspects the allocator.
+                # No draft worker or retirer: touching PD-only resources in
+                # any of these modes must fail this test.
+                scheduler.token_to_kv_pool_allocator = object()
+                with (
+                    envs.SGLANG_ENABLE_PP_SPEC.override(gate),
+                    envs.SGLANG_PP_COMM_OVERLAP.override(False),
+                    patch(
+                        "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+                        return_value=SimpleNamespace(
+                            pp_size=pp_size, pp_async_batch_depth=0
+                        ),
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler_pp_mixin.get_disagg",
+                        return_value=SimpleNamespace(disaggregation_mode=mode),
+                    ),
+                ):
+                    scheduler.init_pp_loop_state()
+                self.assertFalse(scheduler._pp_spec_decode)
+                self.assertEqual(scheduler._pp_spec_relay, expected_relay)
+                self.assertEqual(len(scheduler.running_mbs), pp_size)
+                self.assertTrue(
+                    all(batch.reqs == [] for batch in scheduler.running_mbs)
+                )
+
+    def test_prebuilt_proposals_participate_in_output_ring(self):
+        """A bootstrap proposal must be sent and received on every rank;
+        ordinary prebuilt batches still have no output-ring traffic."""
+        cases = (
+            (False, ForwardMode.PREBUILT, False),
+            (True, ForwardMode.PREBUILT, True),
+            (False, ForwardMode.DECODE, True),
+            (True, ForwardMode.DECODE, True),
+            (False, ForwardMode.EXTEND, True),
+            (True, ForwardMode.EXTEND, True),
+            (False, None, False),
+            (True, None, False),
+        )
+        for pd_spec, mode, has_output in cases:
+            for pp_rank in (0, 1):
+                for npu in (False, True):
+                    with self.subTest(
+                        pd_spec=pd_spec, mode=mode, rank=pp_rank, npu=npu
+                    ):
+                        ops = _posted_output_ops(
+                            pp_rank,
+                            pd_spec,
+                            "proposal-out",
+                            "proposal-in",
+                            mode=mode,
+                            pd_spec=pd_spec,
+                            has_output=has_output,
+                            npu=npu,
+                        )
+                        if not has_output:
+                            self.assertEqual(ops, [])
+                        elif npu:
+                            self.assertEqual(
+                                [op for op in ops if op[0] != "wait"],
+                                [("send_recv", ("proposal-out", "proposal-in"))],
+                            )
+                        else:
+                            expected = [
+                                ("send", "proposal-out"),
+                                ("recv", "proposal-in"),
+                            ]
+                            self.assertEqual(
+                                ops, expected if pp_rank == 0 else expected[::-1]
+                            )
+
+    def test_bootstrap_launches_first_but_verify_waits_for_proposal(self):
+        for depth in (0, 1):
+            for spec_relay in (False, True):
+                for last_rank in (False, True):
+                    for mode in (ForwardMode.PREBUILT, ForwardMode.DECODE):
+                        with self.subTest(
+                            depth=depth, spec=spec_relay, last=last_rank, mode=mode
+                        ):
+                            actual = _pp_exchange_outputs_before_forward(
+                                SimpleNamespace(
+                                    forward_mode=mode, is_extend_in_batch=False
+                                ),
+                                spec_relay,
+                                last_rank,
+                                depth,
+                            )
+                            self.assertEqual(
+                                actual,
+                                depth > 0
+                                or (
+                                    spec_relay
+                                    and not last_rank
+                                    and mode == ForwardMode.DECODE
+                                ),
+                            )
+
+    def test_bootstrap_payload_contains_only_the_proposal(self):
+        scheduler = SchedulerPPMixin()
+        scheduler._pp_spec_decode = scheduler._pp_spec_relay = True
+        result = SimpleNamespace(
+            accept_lens=None,
+            next_verify_chain=object(),
+            next_verify_parent_list=object(),
+            next_verify_top_scores_index=object(),
+        )
+        payload = scheduler._pp_prepare_tensor_dict(
+            result, SimpleNamespace(forward_mode=ForwardMode.PREBUILT)
+        )
+        self.assertEqual(
+            payload,
+            {
+                "spec_next_chain": result.next_verify_chain,
+                "spec_next_parents": result.next_verify_parent_list,
+                "spec_next_top_scores": result.next_verify_top_scores_index,
+            },
+        )
+
+    def test_bootstrap_result_retires_its_forward(self):
+        """A proposal-only result retires the local allocation and request
+        launch without a generated token or target verification result."""
+        import torch
+
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.scheduler_components.request_list import (
+            KeyedReqList,
+            ListKind,
+        )
+        from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata
+        from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardSteps
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+        scheduler = SchedulerPPMixin()
+        scheduler._pp_spec_decode = True
+        req = SimpleNamespace(rid="bootstrap", inflight_steps=0)
+        batch = ScheduleBatch(reqs=[req], forward_mode=ForwardMode.PREBUILT)
+        batch.add_inflight_step()
+        steps = ForwardSteps([])
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(forward_steps=steps)
+        scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
+        scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
+        scheduler.invariant_checker = SimpleNamespace(run=lambda *args: None)
+        launch = steps.forward_launched()
+        forward_done = object()
+        steps.forward_recorded(forward_done)
+        metadata = PPBatchMetadata(
+            can_run_cuda_graph=False,
+            fwd_batch=batch,
+            forward_launch=launch,
+            unified_forward_done=forward_done,
+        )
+        proposal = torch.tensor([[1, 2, 3]])
+        with patch(
+            "sglang.srt.managers.scheduler_pp_mixin.get_spec",
+            return_value=SimpleNamespace(speculative_num_draft_tokens=3),
+        ):
+            result = scheduler._pp_prep_batch_result(
+                batch, metadata, PPProxyTensors({"spec_next_chain": proposal})
+            )
+
+        self.assertTrue(steps.in_flight())
+        self.assertEqual(req.inflight_steps, 1)
+        Scheduler._on_step_processed(scheduler, batch, result)
+        self.assertFalse(steps.in_flight())
+        self.assertEqual(req.inflight_steps, 0)
+        self.assertIs(result.unified_forward_done, forward_done)
+        self.assertIsNone(result.next_token_ids)
+        torch.testing.assert_close(batch.spec_info.tokens, proposal)
+
     def test_two_in_flight_output_exchange_does_not_cross_deadlock(self):
         for spec_relay in (False, True):
             with self.subTest(spec_relay=spec_relay):

@@ -19,9 +19,11 @@ if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq, FinishReasonDict
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+    from sglang.srt.mem_cache.memory_pool import KVCache
     from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
         UocrSchedulerRuntime,
     )
+    from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
 
 
 class RequestRetirer:
@@ -47,6 +49,7 @@ class RequestRetirer:
         self.uocr_runtime = uocr_runtime
         self.send_abort_output = send_abort_output
         self.stream_output = stream_output
+        self.draft_token_to_kv_pool: Optional[KVCache] = None
 
     def abort(
         self,
@@ -102,7 +105,13 @@ class RequestRetirer:
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
-    def retract(self, req: Req, *, offload_kv: bool) -> bool:
+    def retract(
+        self,
+        req: Req,
+        *,
+        offload_kv: bool,
+        pp_spec_relay: Optional[PPSpecRelayInput] = None,
+    ) -> bool:
         """Release a retracted request's memory uncheckpointed; return whether it can resume."""
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
             self.hisparse_coordinator.release_request(req)
@@ -118,6 +127,10 @@ class RequestRetirer:
                 self.tree_cache.req_to_token_pool,
                 self.tree_cache.token_to_kv_pool_allocator,
                 get_disagg().disaggregation_decode_retraction_backup,
+                draft_token_to_kv_pool=(
+                    self.draft_token_to_kv_pool if pp_spec_relay is not None else None
+                ),
+                pp_spec_relay=pp_spec_relay,
             )
         else:
             resumable = req.resumable_by_rebootstrap

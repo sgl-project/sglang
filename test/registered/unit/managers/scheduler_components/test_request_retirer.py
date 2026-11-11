@@ -139,5 +139,27 @@ class TestRelease(CustomTestCase):
         self.assertEqual(calls, [False])
 
 
+class TestRetraction(CustomTestCase):
+    def test_reprefill_and_rebootstrap_do_not_copy_draft_state(self):
+        retirer = release_only_retirer()
+        retirer.draft_token_to_kv_pool = object()
+        # No copy methods or allocator: these paths must not need a host backup.
+        req = _req(None, [])
+        req.resumable_by_reprefill = True
+        req.resumable_by_rebootstrap = True
+        for mode, offload in (("null", True), ("decode", False)):
+            with (
+                self.subTest(mode=mode, offload=offload),
+                patch.object(
+                    request_retirer,
+                    "get_disagg",
+                    return_value=SimpleNamespace(disaggregation_mode=mode),
+                ),
+                patch.object(request_retirer, "release_kv_cache"),
+            ):
+                self.assertTrue(retirer.retract(req, offload_kv=offload))
+                self.assertIsNone(req.kv.retraction_backup)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -339,6 +339,22 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         # The window still opens at 0.125.
         self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 1.125), 1.0)
 
+    def test_pp_spec_retract_rejected_before_pause_state_changes(self):
+        scheduler = self._new_scheduler()
+        scheduler._pp_spec_decode = True
+
+        with self.assertRaisesRegex(ValueError, "does not support pause/retract"):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertFalse(scheduler.pause_state.paused)
+        self.assertTrue(scheduler.pause_state.may_launch())
+        self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 1.0), 0.0)
+
+        # In-place pause still uses the shared state consumed by the event loop.
+        scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+        self.assertTrue(scheduler.pause_state.paused)
+        self.assertFalse(scheduler.pause_state.may_launch())
+
     def test_inplace_only_sets_flag(self):
         """An in-place pause sets the flag and starts the pause window; it leaves the
         batches and the chunked request alone."""

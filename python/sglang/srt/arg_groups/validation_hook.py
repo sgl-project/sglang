@@ -14,7 +14,11 @@ from sglang.srt.arg_groups.arg_utils import (
     record_fields,
 )
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
-from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
+from sglang.srt.arg_groups.model_override_base import (
+    model_config_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
     declare_resolution,
@@ -33,6 +37,15 @@ from sglang.srt.sampling.watermarking.config import (
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
+
+_PD_PP_EAGLE_SUPPORTED_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+    }
+)
 
 
 def check_watermark_server_args(server_args: Any) -> None:
@@ -244,13 +257,11 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
             "(non-multi-layer) speculative decoding"
         )
         if envs.SGLANG_ENABLE_PP_SPEC.get():
-            # The aggregate relay carries an EAGLE-shaped tree and only
-            # EAGLEWorkerV2 tail-drafts. PD prefill relays topk_p /
-            # topk_index / hidden states through RelayPayload; the gated
-            # flow replaces that relay with its own and does not carry
-            # those fields.
-            assert cfg.disaggregation_mode == "null", (
-                "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
+            # PD prefill keeps its existing draft prefill and auxiliary relay;
+            # only decode uses the proposal-only PREBUILT bootstrap.
+            assert cfg.disaggregation_mode in ("null", "decode"), (
+                "SGLANG_ENABLE_PP_SPEC supports aggregate or PD decode nodes; "
+                "leave it disabled on PD prefill nodes"
             )
             # The PP relay slices spec results with the configured
             # num_draft_tokens; adaptive spec changes it at runtime.
@@ -264,6 +275,55 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
                 "SGLANG_ENABLE_PP_SPEC is not compatible with attention DP "
                 "(--attn-dp-size)"
             )
+            if cfg.disaggregation_mode == "decode":
+                # These restrictions apply only to the new PD decode path.
+                assert cfg.disaggregation_transfer_backend in (
+                    "mooncake",
+                    "ascend",
+                ), (
+                    "PD decode PP speculative decoding requires Mooncake or Ascend transfer"
+                )
+                architecture = model_config_of(cfg).hf_config.architectures[0]
+                assert architecture in _PD_PP_EAGLE_SUPPORTED_ARCHITECTURES, (
+                    "PD decode PP speculative decoding requires a supported "
+                    f"attention-only DeepSeek/GLM architecture, got {architecture}"
+                )
+                assert cfg.speculative_eagle_topk == 1, (
+                    "PD decode PP speculative decoding requires "
+                    "--speculative-eagle-topk=1"
+                )
+                assert (
+                    cfg.speculative_num_steps > 0
+                    and cfg.speculative_num_draft_tokens > 1
+                ), "PD decode PP speculative decoding requires a non-empty draft"
+                assert not cfg.speculative_use_rejection_sampling, (
+                    "PD decode PP relay does not carry draft probabilities for "
+                    "--speculative-use-rejection-sampling"
+                )
+                assert (
+                    num_dp_ranks_of(cfg) == 1
+                    and cfg.attn_cp_size == 1
+                    and cfg.dcp_size == 1
+                    and not cfg.enable_prefill_cp
+                ), "PD decode PP speculative decoding does not support DP/CP/DCP"
+                assert not cfg.enable_hisparse, (
+                    "PD decode PP speculative decoding does not support HiSparse: "
+                    "rebootstrap cannot restore the current draft proposal"
+                )
+                assert not cfg.enable_pd_role_switch, (
+                    "PD decode PP speculative decoding does not support PD role "
+                    "switching: prefill and decode use different draft scheduling"
+                )
+                assert (
+                    cfg.disaggregation_decode_retraction_backup in (None, "cpu_tensor")
+                    and not cfg.enable_hierarchical_cache
+                    and not cfg.disaggregation_decode_enable_offload_kvcache
+                    and cfg.disaggregation_decode_host_receive_threshold == 1
+                ), (
+                    "PD decode PP speculative decoding requires cpu_tensor "
+                    "retraction backup without HiCache, decode KV offload, or "
+                    "host receive: these paths do not preserve the draft proposal"
+                )
         else:
             assert cfg.disaggregation_mode == "prefill", (
                 "PP + speculative decoding (MTP) is only supported on prefill nodes "

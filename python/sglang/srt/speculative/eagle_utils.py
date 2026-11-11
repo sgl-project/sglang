@@ -1321,13 +1321,15 @@ def _verify_outputs(
     return predict, accept_index, out[rows + bs * depth :], out
 
 
-def eagle_prepare_for_decode(batch: ScheduleBatch):
-    batch.maybe_evict_swa()
+def eagle_prepare_for_decode(batch: ScheduleBatch, *, is_bootstrap: bool = False):
+    # PD bootstrap reserves the first proposal's KV without advancing decode.
+    if not is_bootstrap:
+        batch.maybe_evict_swa()
 
-    # Accumulate penalty
-    # This is a relaxed version of penalties for speculative decoding.
-    if batch.sampling_info.penalizer_orchestrator.is_required:
-        batch.cumulate_penalty_output_tokens()
+        # Accumulate penalty
+        # This is a relaxed version of penalties for speculative decoding.
+        if batch.sampling_info.penalizer_orchestrator.is_required:
+            batch.cumulate_penalty_output_tokens()
 
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
@@ -1337,8 +1339,9 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         reserve=double_alloc,
         page_size=page_size,
     )
-    for r in batch.reqs:
-        r.decode_batch_idx += 1
+    if not is_bootstrap:
+        for r in batch.reqs:
+            r.decode_batch_idx += 1
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
     nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")

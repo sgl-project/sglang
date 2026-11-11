@@ -1887,7 +1887,10 @@ async def pause_generation(
     obj: Annotated[PauseGenerationReqInput, Body()], request: Request
 ):
     """Pause generation."""
-    await _global_state.tokenizer_manager.pause_generation(obj)
+    try:
+        await _global_state.tokenizer_manager.pause_generation(obj)
+    except ValueError as e:
+        return _create_error_response(e)
     return ORJSONResponse(
         content={"message": "Generation paused successfully.", "status": "ok"},
         status_code=200,

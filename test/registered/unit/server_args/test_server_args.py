@@ -3519,7 +3519,7 @@ class TestPipelineParallelCompat(CustomTestCase):
                         )
                     )
 
-    def test_pp_spec_env_gate_allows_aggregate_and_rejects_pd(self):
+    def test_pp_spec_env_gate_allows_aggregate_and_rejects_prefill(self):
         cfg = self._cfg(
             speculative_algorithm="EAGLE",
             disaggregation_mode="null",
@@ -3533,6 +3533,108 @@ class TestPipelineParallelCompat(CustomTestCase):
             check_pipeline_parallel_compat(cfg)
             with self.assertRaisesRegex(AssertionError, "SGLANG_ENABLE_PP_SPEC"):
                 check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE"))
+
+    def _pd_cfg(self, **overrides):
+        return self._cfg(
+            **{
+                "speculative_algorithm": "EAGLE",
+                "disaggregation_mode": "decode",
+                "speculative_adaptive": False,
+                "attn_dp_size": 1,
+                "ep_join_mode": None,
+                "disaggregation_transfer_backend": "mooncake",
+                "speculative_eagle_topk": 1,
+                "speculative_num_steps": 2,
+                "speculative_num_draft_tokens": 3,
+                "speculative_use_rejection_sampling": False,
+                "dp_size": 1,
+                "attn_cp_size": 1,
+                "dcp_size": 1,
+                "enable_prefill_cp": False,
+                "enable_hisparse": False,
+                "enable_pd_role_switch": False,
+                "disaggregation_decode_retraction_backup": None,
+                "enable_hierarchical_cache": False,
+                "disaggregation_decode_enable_offload_kvcache": False,
+                "disaggregation_decode_host_receive_threshold": 1.0,
+                **overrides,
+            }
+        )
+
+    def test_pd_pp_spec_accepts_supported_architectures_and_transfer_backends(self):
+        with (
+            validation_hook.envs.SGLANG_ENABLE_PP_SPEC.override(True),
+            patch.object(validation_hook, "model_config_of") as model_config,
+        ):
+            for architecture in (
+                "DeepseekV2ForCausalLM",
+                "DeepseekV3ForCausalLM",
+                "DeepseekV32ForCausalLM",
+                "GlmMoeDsaForCausalLM",
+            ):
+                model_config.return_value.hf_config.architectures = [architecture]
+                for backend in ("mooncake", "ascend"):
+                    for backup in (None, "cpu_tensor"):
+                        with self.subTest(
+                            architecture=architecture, backend=backend, backup=backup
+                        ):
+                            check_pipeline_parallel_compat(
+                                self._pd_cfg(
+                                    disaggregation_transfer_backend=backend,
+                                    disaggregation_decode_retraction_backup=backup,
+                                )
+                            )
+
+    def test_pd_pp_spec_rejects_unsupported_combinations(self):
+        cases = (
+            ({"disaggregation_transfer_backend": "nixl"}, "Mooncake or Ascend"),
+            ({"speculative_eagle_topk": 2}, "topk=1"),
+            ({"speculative_num_steps": 0}, "non-empty draft"),
+            ({"speculative_num_draft_tokens": 1}, "non-empty draft"),
+            ({"speculative_use_rejection_sampling": True}, "draft probabilities"),
+            ({"dp_size": 2}, "DP/CP/DCP"),
+            ({"attn_dp_size": 2}, "attention DP"),
+            ({"attn_cp_size": 2}, "DP/CP/DCP"),
+            ({"dcp_size": 2}, "DP/CP/DCP"),
+            ({"enable_prefill_cp": True}, "DP/CP/DCP"),
+            ({"enable_hisparse": True}, "HiSparse"),
+            ({"enable_pd_role_switch": True}, "role switching"),
+            ({"disaggregation_decode_retraction_backup": "host_pool"}, "cpu_tensor"),
+            ({"disaggregation_decode_retraction_backup": "none"}, "cpu_tensor"),
+            ({"enable_hierarchical_cache": True}, "cpu_tensor"),
+            ({"disaggregation_decode_enable_offload_kvcache": True}, "cpu_tensor"),
+            ({"disaggregation_decode_host_receive_threshold": 0.5}, "host receive"),
+            ({"speculative_adaptive": True}, "speculative-adaptive"),
+        )
+        with (
+            validation_hook.envs.SGLANG_ENABLE_PP_SPEC.override(True),
+            patch.object(validation_hook, "model_config_of") as model_config,
+        ):
+            model_config.return_value.hf_config.architectures = [
+                "DeepseekV3ForCausalLM"
+            ]
+            for overrides, message in cases:
+                with self.subTest(**overrides):
+                    with self.assertRaisesRegex(AssertionError, message):
+                        check_pipeline_parallel_compat(self._pd_cfg(**overrides))
+            model_config.return_value.hf_config.architectures = ["Qwen3_5ForCausalLM"]
+            with self.assertRaisesRegex(AssertionError, "attention-only DeepSeek/GLM"):
+                check_pipeline_parallel_compat(self._pd_cfg())
+
+    def test_aggregate_pp_spec_does_not_load_model_or_apply_pd_limits(self):
+        with (
+            validation_hook.envs.SGLANG_ENABLE_PP_SPEC.override(True),
+            patch.object(validation_hook, "model_config_of") as model_config,
+        ):
+            check_pipeline_parallel_compat(
+                self._pd_cfg(
+                    disaggregation_mode="null",
+                    speculative_eagle_topk=2,
+                    disaggregation_transfer_backend="nixl",
+                    enable_hierarchical_cache=True,
+                )
+            )
+            model_config.assert_not_called()
 
     def test_nextn_resolves_to_eagle_and_is_allowed(self):
         """`--speculative-algorithm NEXTN` has collapsed to EAGLE by the time the
