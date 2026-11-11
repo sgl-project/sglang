@@ -62,6 +62,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
     default_belief_policy,
 )
+from sglang.srt.mem_cache.cache_residency import CacheResidency
 from sglang.srt.mem_cache.capacity import owner_rows_ready
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
@@ -220,6 +221,8 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    # Opt-in residency switch (cache_residency.py); init_hicache sets it.
+    _residency: Optional[CacheResidency] = None
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
     # Whether eviction walks every component in one joint LRU order; set from the
@@ -646,6 +649,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+        self._residency = CacheResidency(
+            tree_core=self.tree_core, is_write_back=self.is_write_back
+        )
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
@@ -685,6 +691,12 @@ class UnifiedRadixCache(BasePrefixCache):
         ],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        if (
+            self._residency is not None
+            and self._residency.subagents is not None
+            and params.req is not None
+        ):
+            self._residency.subagents.on_admit(params.req)
         result = self.session.try_match_prefix(params)
         if result is not None:
             return result
@@ -1052,6 +1064,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Report full-layer tokens only
         self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
+        if self._residency is not None:
+            self._residency.maybe_log()
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             mamba_num_evicted=tracker.get(self.slot_id(TREE_STATE), 0),
@@ -1600,6 +1614,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if self._residency is not None and self._residency.subagents is not None:
+            self._residency.subagents.on_release(req)
         if checkpointed:
             return
         for comp in self._components_tuple:

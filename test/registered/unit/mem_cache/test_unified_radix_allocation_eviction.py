@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache import cache_residency
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache
@@ -345,6 +346,98 @@ class TestUnifiedRadixGroupedDeviceFrees(CustomTestCase):
                     self.assertEqual(len(got), 1 if enabled else len(want))
                     want_cat = torch.cat([segs[i] for i in want])
                     self.assertTrue(torch.equal(torch.cat(got), want_cat))
+
+
+class _ResidencyCore:
+    """A Rust TreeCore stand-in with the cache-residency bindings."""
+
+    def __init__(self):
+        self._binding = SimpleNamespace(
+            configure_cache_residency=None,
+            mark_host_evict_first=None,
+            cache_residency_stats=None,
+        )
+        self.configured = None
+        self.marked = []
+
+    def configure_cache_residency(self, **kwargs):
+        self.configured = kwargs
+
+    def mark_host_evict_first(self, node_ids):
+        self.marked.append(list(node_ids))
+        return len(node_ids)
+
+    def cache_residency_stats(self):
+        return {"host_evict_first_nodes": len(self.marked)}
+
+
+def _req(rid, session, parent=None, last_node=None):
+    return SimpleNamespace(
+        rid=rid, session_id=session, parent_session_id=parent, last_node=last_node
+    )
+
+
+class TestSubagentHostEvictFirst(CustomTestCase):
+    """SGLANG_OPT_HICACHE_SUBAGENT_HOST_EVICT_FIRST: a parent session's next request
+    ranks its finished sub-agents' last nodes first for host eviction."""
+
+    def _residency(self, *, on=True, write_back=True, core=None):
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_HICACHE_SUBAGENT_HOST_EVICT_FIRST.override(on),
+        ):
+            return cache_residency.CacheResidency(
+                tree_core=core or _ResidencyCore(), is_write_back=write_back
+            )
+
+    def test_off_by_default_and_checked_when_on(self):
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+            self.assertFalse(envs.SGLANG_OPT_HICACHE_SUBAGENT_HOST_EVICT_FIRST.get())
+        self.assertIsNone(self._residency(on=False).subagents)
+        with self.assertRaisesRegex(ValueError, "write_back"):
+            self._residency(write_back=False)
+        with self.assertRaisesRegex(RuntimeError, "cache-residency bindings"):
+            self._residency(core=SimpleNamespace(_binding=SimpleNamespace()))
+        core = _ResidencyCore()
+        residency = self._residency(core=core)
+        self.assertEqual(
+            core.configured,
+            {"keep_backed_mamba_states": False, "host_evict_first": True},
+        )
+        self.assertIsNotNone(residency.subagents)
+
+    def test_finished_children_are_marked_at_the_parents_next_request(self):
+        core = _ResidencyCore()
+        tracker = self._residency(core=core).subagents
+        tracker.on_admit(_req("p1", "parent"))
+        tracker.on_admit(_req("c1", "child-a", parent="parent"))
+        tracker.on_admit(_req("c2", "child-b", parent="parent"))
+        tracker.on_release(_req("c1", "child-a", parent="parent", last_node=11))
+        tracker.on_release(_req("p1", "parent", last_node=3))
+        # child-b is still in flight: only child-a is finished
+        tracker.on_admit(_req("p2", "parent"))
+        self.assertEqual(core.marked, [[11]])
+        tracker.on_release(_req("c2", "child-b", parent="parent", last_node=12))
+        tracker.on_admit(_req("p3", "parent"))
+        self.assertEqual(core.marked, [[11], [12]])
+        # a request outside any session, and a parent without sub-agents, mark nothing
+        tracker.on_admit(_req("x", None))
+        tracker.on_admit(_req("p4", "other"))
+        self.assertEqual(len(core.marked), 2)
+
+    def test_radix_cache_hooks_reach_the_tracker(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache._residency = SimpleNamespace(subagents=MagicMock())
+        cache.session = SimpleNamespace(try_match_prefix=lambda params: "matched")
+        cache._components_tuple = ()
+        req = _req("r", "s")
+        self.assertEqual(
+            cache.match_prefix(SimpleNamespace(req=req)),
+            "matched",
+        )
+        cache.on_release(req, checkpointed=True)
+        cache._residency.subagents.on_admit.assert_called_once_with(req)
+        cache._residency.subagents.on_release.assert_called_once_with(req)
 
 
 if __name__ == "__main__":
