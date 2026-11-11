@@ -66,11 +66,7 @@ def _shared_pool_suffix(
     dcp_rank: int,
 ) -> str:
     """Key suffix for a pool whose pages are byte-identical across attention TP.
-
-    Dropping the TP axis makes one object serve every attention-TP rank, so
-    the store holds one copy instead of one per rank. The dropped axis adds its
-    own namespace term so a shared object can never alias an older per-rank one.
-    """
+    The versioned shared term keeps it from aliasing an older per-rank object."""
     parts = ["tpshared_v1" if tp_shared else f"tp{tp_rank}"]
     if dcp_sharded:
         parts.append(f"dcp{dcp_size}r{dcp_rank}")
@@ -90,15 +86,8 @@ def _storage_sharing(
     dcp_size: int,
     dcp_rank: int,
 ):
-    """Per-pool key suffixes and the pools this rank offloads.
-
-    A pool replicated across attention TP is written by attention-TP rank 0
-    only; every rank still reads it, with its own indices, under the shared key.
-    A rank-replicated group has no sharded pool, so its group-level suffix
-    already drops the tp term and nothing is overridden here.
-    A DCP-sharded pool is written by the first DCP block of the TP group,
-    one object per DCP rank.
-    """
+    """Per-pool key suffixes and the pools this rank offloads. A pool replicated
+    across attention TP is written by TP rank 0 (or the first DCP block) only."""
     dcp_sharded = {name for name, pool in pools.items() if pool.dcp_sharded}
     tp_shared = {
         name
@@ -203,8 +192,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
-        # An MLA-family pool holds identical pages on every attention-TP rank.
-        # KDA state stays in its own rank namespace.
         self.storage.pool_suffixes, self.offload_pools, tp_shared = _storage_sharing(
             self.pools,
             rank_replicated=rank_replicated,
@@ -213,13 +200,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             attn_cp_rank=params.attn_cp_rank,
             pp_rank=params.pp_rank,
             offload_owner=self.offload_owner,
-            dcp_size=parallel.attn_dcp_size,
-            dcp_rank=parallel.attn_dcp_rank,
+            dcp_size=get_parallel().attn_dcp_size,
+            dcp_rank=get_parallel().attn_dcp_rank,
         )
         logger.info(
             "Mooncake direct linker storage topology: "
             "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s, "
-            "tp_shared=%s, offload_pools=%s, pool_suffixes=%s",
+            "tp_shared=%s, offload_pools=%s",
             rank_replicated,
             tp_rank,
             tp_size,
@@ -227,7 +214,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             storage_suffix,
             sorted(tp_shared),
             sorted(self.offload_pools),
-            dict(sorted(self.storage.pool_suffixes.items())),
         )
 
         self.register_buffers()
