@@ -11,7 +11,7 @@ import re
 from array import array
 from collections.abc import Iterable
 from dataclasses import replace
-from functools import cached_property
+from functools import cache, cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -519,6 +519,12 @@ def _uses_ep_a2a() -> bool:
 _PREFILL_SP_RS_BLOCKS = 96
 _PREFILL_SP_AG_BLOCKS = 32
 _PREFILL_SP_SHARED_RS_BLOCKS = 16
+
+
+@cache
+def _prefill_sp_shared_stream() -> torch.cuda.Stream:
+    """Shared-expert stream for the SP tail, prioritized over the routed experts."""
+    return torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])
 
 
 class _PrefillSP:
@@ -1770,7 +1776,6 @@ class KimiK3MoE(nn.Module):
         return (
             self._eligible_for_fused_front
             and self.fuse_ar_norm
-            and self.alt_stream is not None
             and self.routed_expert_up_proj is not None
             and not self._use_mega_moe
             and k3_ar_fusion.enabled()
@@ -1845,9 +1850,7 @@ class KimiK3MoE(nn.Module):
         )
 
         if TYPE_CHECKING:
-            assert (
-                self.routed_expert_up_proj is not None and self.alt_stream is not None
-            )
+            assert self.routed_expert_up_proj is not None
         hidden_size = normed.shape[1]
         latent_size = self.moe_hidden_size
         num_tokens, padded = sp.num_tokens, sp.padded
@@ -1874,12 +1877,13 @@ class KimiK3MoE(nn.Module):
         shared_local = normed.new_empty((sp.local, hidden_size))
 
         current_stream = torch.cuda.current_stream()
-        self.alt_stream.wait_stream(current_stream)
+        side = _prefill_sp_shared_stream()
+        side.wait_stream(current_stream)
         if own_rows:
             self._forward_routed_gathered(*routed, latent)
         else:
             self._forward_routed(hidden_states, router_logits, routed_input, latent)
-        with torch.cuda.stream(self.alt_stream):
+        with torch.cuda.stream(side):
             if own_rows:
                 gate_up = _k3_bf16_gemm(
                     sp.gather(normed),
@@ -1891,7 +1895,7 @@ class KimiK3MoE(nn.Module):
                 shared_full, shared_local, num_blocks=_PREFILL_SP_SHARED_RS_BLOCKS
             )
         # The latent and shared reduce-scatters share pull semaphores.
-        current_stream.wait_stream(self.alt_stream)
+        current_stream.wait_stream(side)
         latent_local = sp.reduce_scatter(
             latent_full, normed.new_empty((sp.local, latent_size))
         )
