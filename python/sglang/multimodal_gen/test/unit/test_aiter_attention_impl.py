@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """AITer attention impl construction guards (ROCm-only; skipped elsewhere)."""
 
+import sys
+import types
 import unittest
 from unittest.mock import patch
 
@@ -88,11 +90,34 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
 
 
+@pytest.mark.parametrize("racy", [True, False])
+def test_mha_v4_needs_the_aiter_race_fix(racy):
+    """aiter#6841 fixed the BF16 kernel's races and dropped ``sparse`` here."""
+    _impl_cls()
+    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
+
+    fake = types.ModuleType("aiter.ops.mha_v4")
+    if racy:
+        fake._check_lse_capable = lambda q_format, v_format, sparse: None
+    else:
+        fake._check_lse_capable = lambda q_format, v_format: None
+    with (
+        patch.object(backend, "USE_AITER_GFX95", True),
+        patch.dict(sys.modules, {"aiter.ops.mha_v4": fake}),
+        patch.object(sys.modules["aiter.ops"], "mha_v4", fake, create=True),
+    ):
+        assert (backend._load_mha_v4() is None) == racy
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a ROCm GPU")
 @pytest.mark.parametrize("pad", [0, 24])
 def test_one_live_sequence_matches_the_varlen_kernel(pad):
-    """A packed single sequence (plus trailing padding) runs the batch kernel:
-    its live rows get the varlen kernel's bytes and the padding rows are zero."""
+    """A packed single sequence (plus trailing padding) runs the batch kernel
+    on strided q/k/v: its live rows get the bytes of the same kernel on
+    contiguous inputs, match the varlen kernel (its bytes under fmha v3), and
+    the padding rows are zero."""
+    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
+
     impl = _impl_cls()(
         num_heads=4,
         head_size=HEAD_SIZE,
@@ -110,9 +135,13 @@ def test_one_live_sequence_matches_the_varlen_kernel(pad):
     out = impl.forward_varlen(
         q, k, v, cu_seqlens=cu_seqlens, max_seqlen=used, cu_seqlens_host=bounds
     )
+    live = (t[None, :used].contiguous() for t in (q, k, v))
+    assert torch.equal(out[:used], backend._flash(*live, HEAD_SIZE**-0.5)[0])
     # without host bounds the call keeps the varlen kernel
     ref = impl.forward_varlen(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=used)
-    assert torch.equal(out[:used], ref[:used])
+    if backend._MHA_V4 is None:
+        assert torch.equal(out[:used], ref[:used])
+    torch.testing.assert_close(out[:used], ref[:used], atol=2e-2, rtol=2e-2)
     assert not out[used:].any()
 
 
