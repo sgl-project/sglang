@@ -2720,3 +2720,6 @@ fn release_after_a_restore_and_relock_keeps_the_other_lock() {
     assert_eq!(tc.evictable_size_(MAMBA), 1);
     assert_eq!(tc.protected_size_(MAMBA), 0);
 }
+
+#[path = "mamba_residency.rs"]
+mod residency;

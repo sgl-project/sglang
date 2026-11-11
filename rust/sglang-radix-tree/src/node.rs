@@ -191,6 +191,10 @@ pub struct Node<K: ChildKeyType> {
     pub write_through_pending_id: Option<usize>,
     /// Queued for its demote by the running write-back eviction walk.
     pub write_back_queued: bool,
+    /// The access tick at which the controller marked the node host
+    /// evict-first; the mark holds while `last_access_counter` still equals it,
+    /// so any later access (match, insert, split) clears it.
+    pub host_evict_first_at: Option<i64>,
     /// Load-back anchor currently reading this node's Full host slots.
     /// Auxiliary transfers are protected by their component locks.
     pub load_back_pending_id: Option<NodeId>,
@@ -429,6 +433,7 @@ impl<K: ChildKeyType> Node<K> {
             rotation_base: None,
             write_through_pending_id: None,
             write_back_queued: false,
+            host_evict_first_at: None,
             load_back_pending_id: None,
             last_access_counter: 0,
             creation_counter: 0,
@@ -457,6 +462,7 @@ impl<K: ChildKeyType> Node<K> {
             rotation_base: None,
             write_through_pending_id: None,
             write_back_queued: false,
+            host_evict_first_at: None,
             load_back_pending_id: None,
             last_access_counter: 0,
             creation_counter: 0,

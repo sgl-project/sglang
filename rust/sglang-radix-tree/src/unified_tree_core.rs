@@ -592,6 +592,35 @@ impl Default for CacheInitParams {
     }
 }
 
+/// Cache-residency switches the controller sets after construction; all off
+/// by default, which keeps every eviction and demotion decision unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheResidencyOptions {
+    /// Under write_back, back up a device-only Mamba state before its device
+    /// slot is dropped even when the node's Full KV already has a host copy.
+    pub keep_backed_mamba_states: bool,
+    /// Rank nodes marked by `mark_host_evict_first` ahead of every other
+    /// host-eviction candidate (Full host leaves and the Mamba host LRU).
+    pub host_evict_first: bool,
+}
+
+/// Cumulative counts of the residency switches' decisions, for engagement logs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheResidencyStats {
+    /// Internal Mamba states on backed-up nodes sent to the controller for a
+    /// host backup instead of a device tombstone.
+    pub backed_node_state_backups: u64,
+    /// Device leaves with Full KV on host whose Mamba state needed a host copy
+    /// before the demote.
+    pub state_backups_before_demote: u64,
+    /// Nodes newly marked host evict-first.
+    pub host_evict_first_marked: u64,
+    /// Full host tokens evicted from nodes still marked evict-first.
+    pub host_evict_first_full_tokens: u64,
+    /// Mamba host states evicted from nodes still marked evict-first.
+    pub host_evict_first_mamba_states: u64,
+}
+
 /// Radix tree of cached token prefixes; each node carries its KV per component.
 /// A single eviction step's outputs: this step's per-component evicted
 /// counts (deltas, for the Controller to accumulate) and freed tensors.
@@ -683,6 +712,10 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) joint_lru: Option<JointLRU>,
     /// The running joint eviction walk, if any.
     pub(crate) joint_walk: Option<JointEvictionWalk>,
+    /// Controller-set residency switches; survive `reset()`.
+    pub(crate) residency: CacheResidencyOptions,
+    /// Cumulative residency counters; survive `reset()`.
+    pub(crate) residency_stats: CacheResidencyStats,
 }
 
 impl<K: ChildKeyType> UnifiedTreeCore<K> {
@@ -1048,6 +1081,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             ongoing_insert_walk_state: None,
             joint_lru: params.joint_lru.then(JointLRU::default),
             joint_walk: None,
+            residency: CacheResidencyOptions::default(),
+            residency_stats: CacheResidencyStats::default(),
         };
         for component in components {
             tree_core.register_component_(component);
@@ -3069,6 +3104,130 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.full_coexisting_host_nodes.add(node_idx);
         }
         Ok(device_len)
+    }
+
+    // ==== Cache-residency switches ====
+
+    /// Set the residency switches; see `CacheResidencyOptions`.
+    pub fn configure_cache_residency(&mut self, options: CacheResidencyOptions) {
+        self.residency = options;
+    }
+
+    pub fn cache_residency_options(&self) -> CacheResidencyOptions {
+        self.residency
+    }
+
+    pub fn cache_residency_stats(&self) -> CacheResidencyStats {
+        self.residency_stats
+    }
+
+    /// Whether a backed-up device leaf still holds its only copy of a Mamba
+    /// state, which its demote would drop; the controller copies it first.
+    pub fn needs_state_backup_before_demote(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<bool, NodeAccessError> {
+        let node_idx = self.arena.resolve(node_id)?;
+        if !(self.residency.keep_backed_mamba_states && self.enable_hicache && self.is_write_back) {
+            return Ok(false);
+        }
+        let Some(state) = self.slot_of_family(Family::State) else {
+            return Ok(false);
+        };
+        let node = self.arena.node(node_idx);
+        let needs = !node.is_root()
+            && !node.evicted()
+            && node.backuped()
+            && node.has_device_value(state)
+            && !node.has_host_value(state);
+        if needs {
+            self.residency_stats.state_backups_before_demote += 1;
+        }
+        Ok(needs)
+    }
+
+    /// The mark holds until the node's next access re-stamps its tick.
+    pub(crate) fn is_host_evict_first_(&self, node: &Node<K>) -> bool {
+        self.residency.host_evict_first
+            && node.host_evict_first_at == Some(node.last_access_counter)
+    }
+
+    /// Host-eviction rank: marked nodes before every unmarked one.
+    pub(crate) fn host_eviction_priority_(&self, node: &Node<K>) -> PriorityKey {
+        if self.is_host_evict_first_(node) {
+            PriorityKey(i64::MIN, node.last_access_counter)
+        } else {
+            self.eviction_strategy.get_priority(node)
+        }
+    }
+
+    /// Move a marked node's host-only Mamba state to its host LRU's eviction end.
+    pub(crate) fn place_host_evict_first_state_(&mut self, node_id: NodeIdx_) {
+        if !self.is_host_evict_first_(self.arena.node(node_id)) {
+            return;
+        }
+        let Some(state) = self.slot_of_family(Family::State) else {
+            return;
+        };
+        let lru = self.host_lru_list_mut(state);
+        if lru.in_list(Some(node_id)) {
+            lru.move_to_lru(node_id);
+        }
+    }
+
+    /// Mark finished nodes host evict-first: each given node, then each
+    /// ancestor whose children are all marked, stopping at a locked node or the
+    /// root; a node with an unmarked child is left alone. Stale ids are skipped.
+    /// Only the host-eviction order changes: nothing is freed here, and a device
+    /// node is still written back before its demote. Returns the nodes newly marked.
+    pub fn mark_host_evict_first(&mut self, node_ids: Vec<NodeId>) -> usize {
+        if !self.residency.host_evict_first {
+            return 0;
+        }
+        let mut marked = 0;
+        for node_id in node_ids {
+            let Ok(mut cur) = self.arena.resolve(node_id) else {
+                continue;
+            };
+            loop {
+                let node = self.arena.node(cur);
+                if node.is_root() || node.is_device_locked() || node.is_host_locked() {
+                    break;
+                }
+                if !node
+                    .children
+                    .values()
+                    .all(|&child| self.is_host_evict_first_(self.arena.node(child)))
+                {
+                    break;
+                }
+                if !self.is_host_evict_first_(node) {
+                    let tick = node.last_access_counter;
+                    self.arena.node_mut(cur).host_evict_first_at = Some(tick);
+                    self.place_host_evict_first_state_(cur);
+                    marked += 1;
+                }
+                cur = self.arena.node(cur).parent();
+            }
+        }
+        self.residency_stats.host_evict_first_marked += marked as u64;
+        marked
+    }
+
+    pub(crate) fn note_backed_node_state_backup_(&mut self) {
+        self.residency_stats.backed_node_state_backups += 1;
+    }
+
+    pub(crate) fn note_host_evict_first_eviction_(
+        &mut self,
+        component_type: ComponentType,
+        amount: usize,
+    ) {
+        if component_type == FULL {
+            self.residency_stats.host_evict_first_full_tokens += amount as u64;
+        } else {
+            self.residency_stats.host_evict_first_mamba_states += amount as u64;
+        }
     }
 
     /// Evict one device leaf (demote if backuped, delete if write-through);

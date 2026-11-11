@@ -19,9 +19,9 @@ use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
     BufferBackupSnapshot, BufferBackupState, CacheAction, CacheActions, CacheInitParams,
-    CacheTransferPhase, DecLockRefParams, EvictLayer, EvictionStepResult, InsertParams,
-    InsertResult, InsertStepResult, MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName,
-    PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
+    CacheResidencyOptions, CacheTransferPhase, DecLockRefParams, EvictLayer, EvictionStepResult,
+    InsertParams, InsertResult, InsertStepResult, MatchPrefixParams, MatchResult, PoolHitPolicy,
+    PoolName, PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
 };
 
 /// Translate only Rust panics; ordinary Python errors pass through unchanged.
@@ -1998,6 +1998,47 @@ macro_rules! tree_core_methods {
                     .map_err(node_access_error)
             }
 
+            /// Set the cache-residency switches (all off by default).
+            fn configure_cache_residency(
+                &self,
+                py: Python<'_>,
+                keep_backed_mamba_states: bool,
+                host_evict_first: bool,
+            ) {
+                let options = CacheResidencyOptions {
+                    keep_backed_mamba_states,
+                    host_evict_first,
+                };
+                py.detach(|| self.core().configure_cache_residency(options));
+            }
+
+            /// Cumulative residency counters, by name.
+            fn cache_residency_stats(&self, py: Python<'_>) -> HashMap<&'static str, u64> {
+                let stats = py.detach(|| self.core().cache_residency_stats());
+                HashMap::from([
+                    ("backed_node_state_backups", stats.backed_node_state_backups),
+                    ("state_backups_before_demote", stats.state_backups_before_demote),
+                    ("host_evict_first_marked", stats.host_evict_first_marked),
+                    ("host_evict_first_full_tokens", stats.host_evict_first_full_tokens),
+                    ("host_evict_first_mamba_states", stats.host_evict_first_mamba_states),
+                ])
+            }
+
+            /// Whether a backed-up device leaf's Mamba state needs a host copy before its demote.
+            fn needs_state_backup_before_demote(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<bool> {
+                py.detach(|| self.core().needs_state_backup_before_demote(node_id))
+                    .map_err(node_access_error)
+            }
+
+            /// Mark finished nodes host evict-first; returns the nodes newly marked.
+            fn mark_host_evict_first(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> usize {
+                py.detach(|| self.core().mark_host_evict_first(node_ids))
+            }
+
             /// Release a node's device KV once its host copy exists.
             fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
                 let result = py
@@ -3378,6 +3419,39 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| self.inner.mark_write_back_queued(py, node_id, copied))
             }
 
+            /// Set the cache-residency switches (all off by default).
+            fn configure_cache_residency(
+                &self,
+                py: Python<'_>,
+                keep_backed_mamba_states: bool,
+                host_evict_first: bool,
+            ) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner
+                        .configure_cache_residency(py, keep_backed_mamba_states, host_evict_first);
+                    Ok(())
+                })
+            }
+
+            /// Cumulative residency counters, by name.
+            fn cache_residency_stats(&self, py: Python<'_>) -> PyResult<HashMap<&'static str, u64>> {
+                catch_native_panic(|| Ok(self.inner.cache_residency_stats(py)))
+            }
+
+            /// Whether a backed-up device leaf's Mamba state needs a host copy before its demote.
+            fn needs_state_backup_before_demote(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<bool> {
+                catch_native_panic(|| self.inner.needs_state_backup_before_demote(py, node_id))
+            }
+
+            /// Mark finished nodes host evict-first; returns the nodes newly marked.
+            fn mark_host_evict_first(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<usize> {
+                catch_native_panic(|| Ok(self.inner.mark_host_evict_first(py, node_ids)))
+            }
+
             /// Release a node's device KV once its host copy exists.
             fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
                 catch_native_panic(|| self.inner.demote(py, node_id))
@@ -4077,7 +4151,18 @@ fn get_hash_str(
     })
 }
 
+/// Residency switches this build carries; a loader checks it before enabling one.
+#[pyfunction]
+fn cache_residency_features() -> Vec<&'static str> {
+    vec![
+        "keep_backed_mamba_states",
+        "write_back_batched_eviction",
+        "host_evict_first",
+    ]
+}
+
 fn register_mem_cache_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(cache_residency_features, m)?)?;
     m.add_class::<TlruFloatConfigBinding>()?;
     m.add_function(wrap_pyfunction!(get_hash_str, m)?)?;
     m.add_class::<TreeCoreInitParamsBinding>()?;

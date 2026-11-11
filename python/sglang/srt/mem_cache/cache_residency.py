@@ -2,9 +2,9 @@
 sub-agent host evict-first (SGLANG_OPT_HICACHE_SUBAGENT_HOST_EVICT_FIRST).
 
 It changes only the order in which host entries are evicted; no KV or state
-value changes. It needs the Rust TreeCore built with the cache-residency
-bindings (configure_cache_residency, mark_host_evict_first,
-cache_residency_stats), which the stock extension does not have.
+value changes. It needs the Rust TreeCore's cache-residency bindings
+(configure_cache_residency, mark_host_evict_first, cache_residency_stats;
+rust/sglang-radix-tree, listed by cache_residency_features()).
 """
 
 from __future__ import annotations
