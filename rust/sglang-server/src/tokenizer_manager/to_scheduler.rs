@@ -112,6 +112,10 @@ impl Runnable for Intake {
                 Some(Lane::Event(TmEvent::Tokenized(req) | TmEvent::Encoded(req))) => {
                     self.drive(req)
                 }
+                Some(Lane::Event(TmEvent::OneWay { control, queued })) => {
+                    // The caller may have stopped waiting; the push stands.
+                    let _ = queued.send(self.push_one_way(&control));
+                }
                 None => {
                     // Shutdown, or the inbox closed. Drain whatever is still queued
                     // on the abort lane first: those requests are in flight on the
@@ -263,6 +267,11 @@ impl Intake {
                 // is recorded in `request_states` and honored when it returns.
                 RequestState::Encoding => {
                     let rid = req.rid.clone();
+                    if let RequestKind::Generate(g) = &mut req.kind
+                        && let Some(mm) = g.mm.as_mut()
+                    {
+                        mm.admission.queued_at = Some(std::time::Instant::now());
+                    }
                     // Full = the pool can't keep up, so back-pressure like a full
                     // to_scheduler channel. Disconnected = pool gone. Either way
                     // flume hands the request back.
@@ -464,6 +473,21 @@ impl Intake {
             buffers: Vec::new(),
         }) {
             self.fail(&mut req, Error::QueueFull, true); // registered
+        }
+    }
+
+    /// Push a control message the scheduler does not answer. Nothing would
+    /// retry it, so it takes the reserved lane: a full request ring cannot
+    /// drop it.
+    fn push_one_way(&self, control: &ControlRequest) -> Result<(), Error> {
+        let header = control.encode()?;
+        if self.to_scheduler_tx.push_priority(SchedulerRequest {
+            header,
+            buffers: Vec::new(),
+        }) {
+            Ok(())
+        } else {
+            Err(Error::Internal("to_scheduler channel closed".into()))
         }
     }
 

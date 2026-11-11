@@ -15,8 +15,9 @@ from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObjec
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    _RequestList,
+    move,
 )
 from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.sampling.sampling_params import (
@@ -36,7 +37,7 @@ class GrammarManager:
     def __init__(self, scheduler: Scheduler):
         self.scheduler = scheduler
         self.server_args = scheduler.server_args
-        self.grammar_queue = _RequestList(ListKind.GRAMMAR, abort=self._abort)
+        self.grammar_queue = IndexedReqList(ListKind.GRAMMAR, abort=self._abort)
         if not get_serving().skip_tokenizer_init:
             self.grammar_backend = create_grammar_backend(
                 self.server_args,
@@ -210,13 +211,14 @@ class GrammarManager:
                 self._apply_request_reasoning_config(req)
 
         if add_to_grammar_queue:
-            self.grammar_queue.join([req])
+            move([req], self.grammar_queue)
 
         return add_to_grammar_queue
 
     def get_ready_grammar_requests(self) -> List[Req]:
         """
-        Move requests whose grammar objects are ready from grammar_queue to waiting_queue.
+        Return the requests whose grammar is ready, then those that timed out.
+        They stay in grammar_queue for the caller to move into their queue.
 
         For PP0, DP/TP group rank i returns two sets ready_reqs_i,
         failed_reqs_i. ready_reqs_all = all_gather(ready_reqs_i) within
@@ -331,12 +333,9 @@ class GrammarManager:
 
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
             req.grammar.cancel()
-            self.grammar_backend.set_cache(
-                req.grammar_key, InvalidGrammarObject("Grammar preprocessing timed out")
-            )
+            # Not cached: the poll budget includes executor queueing,
+            # so a timeout does not prove the grammar invalid.
             error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
             req.set_finish_with_abort(error_msg)
 
-        # Remove finished requests from grammar_queue
-        self.grammar_queue.leave(return_reqs)
         return return_reqs
