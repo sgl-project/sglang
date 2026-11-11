@@ -54,31 +54,36 @@ def test_draft_sampler_capture_query_is_device_specific(device_type, capturing):
     sampler.model = SimpleNamespace(
         lm_head=SimpleNamespace(org_vocab_size=4), markov_head=sampler.markov_head
     )
-    base_logits = SimpleNamespace(device=device_type, dtype=torch.float32)
-    buffer = torch.zeros(2, 3, 4)
-    query = Mock(return_value=capturing)
+    base_logits = torch.zeros(2, 3, 4)
     with (
+        patch.object(dspark_draft_sampler, "_is_npu", device_type == "npu"),
+        patch.object(dspark_draft_sampler, "_is_xpu", device_type == "xpu"),
+        patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=capturing
+        ) as cuda_query,
+        patch.object(
+            torch.xpu, "is_current_stream_capturing", return_value=capturing
+        ) as xpu_query,
         patch.object(
             torch,
-            "get_device_module",
-            return_value=SimpleNamespace(is_current_stream_capturing=query),
-        ) as device_module,
-        patch.object(torch, "empty", return_value=buffer) as allocate,
+            "npu",
+            SimpleNamespace(is_current_stream_capturing=Mock(return_value=capturing)),
+            create=True,
+        ) as npu_module,
     ):
         if capturing:
             with pytest.raises(AssertionError):
                 sampler._step_logits(base_logits)
             assert sampler.step_logits is None
-            allocate.assert_not_called()
         else:
             output = sampler._step_logits(base_logits)
-            assert output is buffer
+            assert output.shape == (2, 3, 4)
             assert sampler._step_logits(base_logits) is output
-            allocate.assert_called_once_with(
-                (2, 3, 4), dtype=torch.float32, device=device_type
-            )
-        device_module.assert_called_once_with(device_type)
-        query.assert_called_once_with()
+        assert cuda_query.call_count == int(device_type == "cuda")
+        assert xpu_query.call_count == int(device_type == "xpu")
+        assert npu_module.is_current_stream_capturing.call_count == int(
+            device_type == "npu"
+        )
 
 
 def _cpu_scatter_into(*, compact, verify_lens, out, stride, fill_value):
@@ -212,13 +217,14 @@ def test_dense_worker_constructor_to_draft_sampler_warmup(
         envs.SGLANG_DSPARK_ENABLE_SPS_RECORD.override(profile),
         envs.SGLANG_SIMULATE_ACC_LEN.override(1.0 if profile else 0.0),
         patch.object(
-            torch.cpu,
-            "is_current_stream_capturing",
-            return_value=False,
+            torch,
+            "npu",
+            SimpleNamespace(is_current_stream_capturing=Mock(return_value=False)),
             create=True,
         ),
         patch.object(dspark_worker_v2, "_is_npu", True),
         patch.object(dspark_planner, "_is_npu", True),
+        patch.object(dspark_draft_sampler, "_is_npu", True),
         patch.object(dspark_verify, "_is_npu", True),
         patch.object(
             dspark_worker_v2, "draft_uses_compressed_kv_attention", return_value=False
