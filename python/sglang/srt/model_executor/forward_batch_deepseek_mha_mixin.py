@@ -83,7 +83,7 @@ class ForwardBatchDeepSeekMHAMixin:
     ):
         self.prefix_chunk_kv_indices = []
         req_to_token = get_req_to_token_pool().req_to_token
-        translator = get_attn_backend().kv_index_translator
+        runner_ids = get_attn_backend().runner_ids
         for idx in range(self.num_prefix_chunks):
             chunk_starts = self.prefix_chunk_starts[idx]
             chunk_seq_lens = self.prefix_chunk_seq_lens[idx]
@@ -94,10 +94,10 @@ class ForwardBatchDeepSeekMHAMixin:
                 num_chunk_tokens, dtype=torch.int32, device=device
             )
 
-            if translator.reads_are_translated:
+            if runner_ids.reads_are_translated:
                 # The plan's table already holds the chunk's physical ids.
-                translator.pack_read_stream(
-                    self.kv_loc_plan,
+                runner_ids.pack_read_stream(
+                    self.iteration_ids,
                     req_pool_indices=self.req_pool_indices,
                     seq_lens=chunk_seq_lens,
                     indptr=chunk_cu_seq_lens,
@@ -120,7 +120,7 @@ class ForwardBatchDeepSeekMHAMixin:
                 self.prefix_chunk_starts_cpu[idx],
                 self.prefix_chunk_seq_lens_cpu[idx],
             )
-            chunk_kv_indices = translator.translate_dcp_read_ids(chunk_kv_indices)
+            chunk_kv_indices = runner_ids.translate_dcp_read_ids(chunk_kv_indices)
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
 
         if not (pack_all_prefix_chunks or dense_metadata):
@@ -179,15 +179,13 @@ class ForwardBatchDeepSeekMHAMixin:
         dense_metadata: bool = False,
     ):
 
-        from sglang.srt.mem_cache.memory_pool import (
-            HybridLinearKVPool,
-            MLATokenToKVPool,
-        )
+        from sglang.srt.mem_cache.kv.memory.views import MLAKVView
 
-        token_to_kv_pool = get_token_to_kv_pool()
-        assert isinstance(token_to_kv_pool, MLATokenToKVPool) or (
-            isinstance(token_to_kv_pool, HybridLinearKVPool)
-            and isinstance(token_to_kv_pool.full_kv_pool, MLATokenToKVPool)
+        # The prefix chunks gather one KV sub-pool's ids, which must be MLA.
+        router = get_token_to_kv_pool().layer_router
+        sub_pools = router.sub_pools()
+        assert len(sub_pools) == 1 and isinstance(
+            router.view(sub_pools[0].name), MLAKVView
         ), "Currently chunked prefix cache can only be used by Deepseek models"
 
         if not any(self.extend_prefix_lens_cpu):
@@ -278,10 +276,10 @@ class ForwardBatchDeepSeekMHAMixin:
             device=self.req_pool_indices.device,
         )
         kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
-        # None on a backend that never bound a translator, which reads virtual
+        # None on a backend that never bound a `RunnerIds`, which reads virtual
         # ids; otherwise one gather from the iteration's plan (DCP takes its
         # own branch upstream).
-        src = get_attn_backend().kv_index_translator
+        src = get_attn_backend().runner_ids
         if src is None:
             req_to_token = get_req_to_token_pool().req_to_token
             create_flashinfer_kv_indices_triton[(self.batch_size,)](
@@ -295,7 +293,7 @@ class ForwardBatchDeepSeekMHAMixin:
             )
         else:
             src.pack_read_stream(
-                self.kv_loc_plan,
+                self.iteration_ids,
                 req_pool_indices=self.req_pool_indices,
                 seq_lens=self.seq_lens,
                 indptr=kv_indptr,
