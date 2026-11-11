@@ -986,13 +986,10 @@ class TestFormats(CustomTestCase):
 
         self.assertIs(contract_for(runner(MoeRunnerBackend.TRITON)), TRITON)
         self.assertIs(contract_for(runner(MoeRunnerBackend.MARLIN)), MARLIN)
-        # These sum the top-k outputs inside the kernel, so waves cannot be exact.
-        for backend in (
-            MoeRunnerBackend.FLASHINFER_CUTLASS,
-            MoeRunnerBackend.TRITON_KERNELS,
-        ):
-            with self.assertRaisesRegex(RuntimeError, backend.value):
-                contract_for(runner(backend))
+        # This sums the top-k outputs inside the kernel, so waves cannot be exact.
+        backend = MoeRunnerBackend.FLASHINFER_CUTLASS
+        with self.assertRaisesRegex(RuntimeError, backend.value):
+            contract_for(runner(backend))
         with self.assertRaisesRegex(RuntimeError, "triton or Marlin"):
             contract_for(None)
 

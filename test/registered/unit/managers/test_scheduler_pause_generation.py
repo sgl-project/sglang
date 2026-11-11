@@ -65,6 +65,7 @@ register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 class _FakeReq(SimpleNamespace):
     """A request stand-in compared and hashed by identity, like Req."""
 
+    owner_list = None
     __eq__ = object.__eq__
     __hash__ = object.__hash__
 
@@ -201,11 +202,11 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def _spy_requeue(self, scheduler: Scheduler) -> List[dict]:
         requeue_log: List[dict] = []
 
-        def record(req, *, src=None):
+        def record(req, is_retracted=False):
             requeue_log.append({"req": req, "is_retracted": req.is_retracted})
-            # The queue door takes every request out of its source.
-            if src is not None:
-                src.leave([req])
+            # The queue door takes every request out of its list.
+            if req.owner_list is not None:
+                req.owner_list._leave([req])
 
         scheduler._add_request_to_queue = MagicMock(side_effect=record)
         return requeue_log
@@ -344,7 +345,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.last_batch = MagicMock()
         scheduler.cur_batch_for_debug = MagicMock()
-        scheduler.chunked_reqs.join([MagicMock()])
+        move([MagicMock(owner_list=None)], scheduler.chunked_reqs)
 
         original_last_batch = scheduler.last_batch
         original_cur_batch = scheduler.cur_batch_for_debug
@@ -387,7 +388,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         scheduler.grammar_manager = MagicMock(grammar_queue=[])
         scheduler.dllm_manager = MagicMock()
-        scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_lmcache = False
@@ -446,8 +446,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             forward_mode=ForwardMode.EXTEND,
             with_tensors=True,
         )
-        scheduler.chunked_reqs.join([MagicMock()])
-        scheduler.running_reqs.join([run_req_a, run_req_b, last_req])
+        move([MagicMock(owner_list=None)], scheduler.chunked_reqs)
+        move([run_req_a, run_req_b, last_req], scheduler.running_reqs)
         requeue_log = self._spy_requeue(scheduler)
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
@@ -544,7 +544,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             req.kv.req_pool_idx = slot
             req.extend_end = 3
             req.hisparse_staging = True
-            coordinator.ack_staging_queue.join([HiSparseAct(None, MagicMock(), req)])
+            move([HiSparseAct(None, MagicMock(), req)], coordinator.ack_staging_queue)
         scheduler.hisparse_coordinator = coordinator
         scheduler.init_request_retirer()
         scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
@@ -624,7 +624,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         """retract with nothing to retract still clears chunked_req and batch_is_full."""
         scheduler = self._new_scheduler()
         scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
-        scheduler.chunked_reqs.join([MagicMock()])
+        move([MagicMock(owner_list=None)], scheduler.chunked_reqs)
         requeue_log = self._spy_requeue(scheduler)
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
@@ -671,9 +671,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler._add_request_to_queue = MagicMock()
         scheduler.last_batch = None
 
-        chunked_req = MagicMock()
+        chunked_req = MagicMock(owner_list=None)
         chunked_req.finished.return_value = False
-        scheduler.chunked_reqs.join([chunked_req])
+        move([chunked_req], scheduler.chunked_reqs)
 
         with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
@@ -714,7 +714,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue = MagicMock()
         held = IndexedReqList(ListKind.PD_HELD)
         scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.side_effect = (
-            lambda req, *, src=None: move([req], src, held)
+            lambda req: move([req], held)
         )
 
         def _req(rid, req_pool_idx):
@@ -730,7 +730,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         staged = _req("staged", 1)
         unstaged = _req("unstaged", None)
         scheduler.running_batch.reqs = [running]
-        scheduler.waiting_queue.join([staged, unstaged])
+        move([staged, unstaged], scheduler.waiting_queue)
 
         with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
@@ -940,9 +940,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.continue_generation(
             ContinueGenerationReqInput(torch_empty_cache=False)
         )
-        prealloc_queue.add.assert_called_once_with(
-            kept, is_rebootstrap=True, src=prealloc_queue.held_rebootstrap_reqs
-        )
+        prealloc_queue.add.assert_called_once_with(kept, is_rebootstrap=True)
 
     def test_pd_decode_abort_finishes_a_retracted_request(self):
         """A retracted request aborted while queued must leave finished, with its
@@ -958,7 +956,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         req = self._make_req("aborted")
         req.kv.retraction_backup = RetractionBackup(cpu_tensors=object())
-        prealloc_queue.retracted_queue.join([req])
+        move([req], prealloc_queue.retracted_queue)
 
         prealloc_queue.retracted_queue.abort(AbortReq(rid="aborted"))
 
@@ -982,7 +980,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         mb_b = self._make_batch(
             scheduler, [req_b], forward_mode=ForwardMode.DECODE, with_tensors=True
         )
-        scheduler.running_reqs.join([req_a, req_b])
+        move([req_a, req_b], scheduler.running_reqs)
         requeue_log = self._spy_requeue(scheduler)
         # Micro-batch a's result is processed; b's is still in flight.
         scheduler.pp_loop_size = 2
@@ -1075,7 +1073,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         chunked = self._make_req("chunked")
         chunked.kv.req_pool_idx = 0
         # The chunked request's last chunk ran in the second micro-batch.
-        scheduler.chunked_reqs.join([chunked])
+        move([chunked], scheduler.chunked_reqs)
         scheduler.pp_loop_size = 2
         scheduler.running_mbs = [
             self._make_batch(
@@ -1089,7 +1087,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 scheduler, [chunked], forward_mode=ForwardMode.EXTEND, with_tensors=True
             ),
         ]
-        scheduler.running_reqs.join([running])
+        move([running], scheduler.running_reqs)
         requeue_log = self._spy_requeue(scheduler)
 
         with patch(
@@ -1137,8 +1135,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         # Finished and released by the last round's result.
         done.finished_reason = FINISH_LENGTH(length=0)
         done.dllm_phase = DllmReqPhase.STAGING_PREFILL
-        scheduler.dllm_manager.waiting_queue.join([decoding, prefilling, done])
-        scheduler.dllm_manager.add_staging_reqs([prefilling, done])
+        move([decoding, prefilling, done], scheduler.dllm_manager.waiting_queue)
         scheduler.running_batch = self._make_batch(scheduler, [])
         scheduler.last_batch = self._make_batch(
             scheduler, [prefilling, done], forward_mode=ForwardMode.DLLM_EXTEND
@@ -1155,7 +1152,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             [entry["req"] for entry in requeue_log], [prefilling, decoding]
         )
         self.assertEqual(len(scheduler.dllm_manager.waiting_queue), 0)
-        self.assertFalse(scheduler.dllm_manager.any_staging_reqs())
         self.assertFalse(decoding.kv.holds_kv)
         self.assertEqual(decoding.dllm_phase, DllmReqPhase.INCOMING_PREFILL)
         self.assertFalse(decoding.dllm_initialized)

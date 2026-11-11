@@ -208,9 +208,8 @@ class DocPrefetch:
             ListKind.UOCR_RELEASED, abort=lambda r: self._abort(self._released, r)
         )
 
-    def park(self, req: Req, *, src: Optional[ReqList] = None) -> bool:
-        """Hold a follow-up until its predecessor finishes, moving it out of `src`
-        if given; True if it was parked."""
+    def park(self, req: Req) -> bool:
+        """Hold a follow-up until its predecessor finishes; True if it was parked."""
         after = _after(req)
         if after is None or req.finished():
             return False
@@ -223,7 +222,7 @@ class DocPrefetch:
             return False
         if not envs.SGLANG_ENABLE_UOCR_DOC_PREFETCH.get():
             return False
-        move([req], src, self._parked)
+        move([req], self._parked)
         mm = req.multimodal_inputs
         if self._encode_ahead and mm is not None and mm.mm_items:
             self._early.encode_ahead(
@@ -256,7 +255,7 @@ class DocPrefetch:
             return
         for follow in follows:
             _apply_budget(follow, used)
-        move(follows, self._parked, self._released)
+        move(follows, self._released)
 
     @property
     def released(self) -> IndexedReqList:
@@ -270,7 +269,7 @@ class DocPrefetch:
         }
 
     def _abort(self, windows: ReqList, recv_req: AbortReq) -> None:
-        aborted = windows.take(lambda r: recv_req.matches(r.rid))
+        aborted = [r for r in windows if recv_req.matches(r.rid)]
         for r in aborted:
             self.release_early(r.rid)
         self._abort_windows(aborted, finished_reason=recv_req.finished_reason)
@@ -290,10 +289,9 @@ class DocPrefetch:
             self._early.release(rid)
 
     def reset(self) -> List[Req]:
-        """Forget everything; returns the held follow-ups for the caller to abort."""
+        """Forget everything; returns the held follow-ups for the caller to
+        abort, which takes them out of their lists."""
         held = [*self._parked, *self._released]
-        self._parked.clear()
-        self._released.clear()
         self._finished.clear()
         if self._early is not None:
             self._early.clear()
