@@ -1044,6 +1044,41 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(units[request.name], 2)
         self.assertEqual(reclaim[request.name], 0)
 
+    def test_reclaim_guard_prices_request_rows(self):
+        """The prefix tree evicts only for a demand that fits once everything
+        evictable is gone: that check prices the request rows the demand binds,
+        as the fit checks that stop the eviction do. Without them, a demand
+        whose state alone fits but whose request units do not evicts every
+        cached entry and still fails."""
+        from unittest.mock import MagicMock, patch
+
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        allocator = storage.allocator
+        (request,) = plan.requests()
+        cache = object.__new__(UnifiedRadixCache)
+        cache.token_to_kv_pool_allocator = allocator
+        cache.full_evictable_size = lambda: 0
+        cache.window_evictable_size = lambda name: 0
+        cache.mamba_evictable_size = lambda: 0
+        cache.supports_mamba = lambda: True
+        cache.evict_until = MagicMock()
+        demand = cache._units_demand({"mamba": 1, request.name: 1})
+        self.assertEqual((demand.state_slots, demand.request_rows), (1, 1))
+        priced = []
+        with (
+            patch.object(allocator, "fits_after_frees", return_value=False),
+            patch.object(
+                allocator,
+                "admits",
+                side_effect=lambda d, **kw: priced.append(d) or False,
+            ),
+        ):
+            cache._reclaim({"mamba": 1, request.name: 1})
+        self.assertEqual(priced[0].request_rows, 1)
+        cache.evict_until.assert_not_called()
+
     def test_total_budget_charges_fixed_storage_once(self):
         storage, plan, _ = _build(state=True, gamma=3)
         inp = KVSizingInputs(
