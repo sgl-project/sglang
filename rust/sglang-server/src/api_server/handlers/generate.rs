@@ -17,8 +17,8 @@ use super::handle::{
     CoreHandle, ExpectedResponse, LastOutput, RuntimeCall, translate_runtime_error,
 };
 use crate::api_server::core::{
-    BodySnapshot, CoreError, CoreEvent, InFlight, LoggedHeaders, RawBody, ReceivedAs,
-    RequestMetrics, RequestRecord, prefetch,
+    BodySnapshot, CoreError, CoreEvent, InFlight, LoggedHeaders, OpenAiRequest, RawBody,
+    ReceivedAs, RequestMetrics, RequestRecord, prefetch,
 };
 
 impl CoreHandle {
@@ -59,6 +59,26 @@ impl CoreHandle {
         match &self.inner.request_log {
             Some(log) => log.logged_headers(headers),
             None => LoggedHeaders::default(),
+        }
+    }
+
+    /// Whether OpenAI requests get their own request-log line.
+    pub(crate) fn logs_openai_requests(&self) -> bool {
+        self.inner
+            .request_log
+            .as_ref()
+            .is_some_and(|log| log.logs_openai_requests())
+    }
+
+    /// Log an OpenAI request's raw `body` as received (from level 2).
+    pub(crate) fn log_openai_request(
+        &self,
+        request: OpenAiRequest,
+        body: &[u8],
+        headers: &http::HeaderMap,
+    ) {
+        if let Some(log) = &self.inner.request_log {
+            log.openai_received(request, body, headers);
         }
     }
 

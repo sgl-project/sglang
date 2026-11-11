@@ -11,6 +11,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch, sentinel
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
@@ -55,7 +56,7 @@ NO_EXTRAS = dict.fromkeys(
 )
 
 
-class _StreamedReq:
+class _StreamedReq(FakeReq):
     """A request as `SchedulerOutputStreamer` reads it, in either egress mode:
     retracted, waiting on the cache and verifying drafts as the arguments say."""
 
@@ -722,6 +723,7 @@ class TestRustServerExtension(CustomTestCase):
             default_max_new_tokens=128,
             request_class=GenerateReqInput,
             server_added_custom_params=(),
+            port_offset=1,
         )
         # What a crash dump carries.
         self.assertIs(instance.server_args, sentinel.server_args)
@@ -1081,9 +1083,7 @@ class TestRustServerExtension(CustomTestCase):
         from sglang.srt.managers.io_struct import AbortReq
         from sglang.srt.managers.scheduler import Scheduler
 
-        req = SimpleNamespace(
-            origin_input_ids=[1, 2, 3], cached_tokens=2, reasoning_tokens=1
-        )
+        req = FakeReq(origin_input_ids=[1, 2, 3], cached_tokens=2, reasoning_tokens=1)
         abort = AbortReq(rid="r#1", abort_message="gone")
         server = RustServer(Mock(), http_port=30000)
         scheduler = SimpleNamespace(
@@ -1102,6 +1102,7 @@ class TestRustServerExtension(CustomTestCase):
         scheduler.output_streamer.release_detokenize_state.assert_not_called()
 
         scheduler.rust_server = None
+        req.send_via = None  # The same request, sent again by the other path.
         Scheduler.send_abort_output(scheduler, abort, req)
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once_with(
             abort, req

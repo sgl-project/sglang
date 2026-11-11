@@ -53,6 +53,10 @@ class _RecordingAllocator(SWATokenToKVPoolAllocator):
 class _Sender:
     """Transfers remain in flight until the test explicitly retires them."""
 
+    # No transfer engine: a page move waits for nothing of these sends.
+    kv_mgr = None
+    bootstrap_room = 0
+
     def __init__(self):
         self.in_flight = set()
         self.sends = []
@@ -79,7 +83,9 @@ def _scheduler(cache, allocator, pool):
     scheduler.kv_checksum_computer = None
     scheduler.disagg_metadata_buffers = SimpleNamespace(set_buf=lambda req: None)
     scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
-        kv_manager=SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        kv_manager=SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=[], state_sub_pools=[])
+        )
     )
     scheduler.disagg_prefill_pending_chunk_rids = set()
     return scheduler
@@ -137,7 +143,7 @@ def _drive(backend, chunk_ends, *, sibling, swa_size=128):
         MatchPrefixParams(key=RadixKey(array("q", prefix)))
     ).last_device_node
     held = cache.lock(base)
-    cache.evict(EvictParams(swa_num_tokens=len(old_suffix)))
+    cache.evict(EvictParams(window_num_tokens={"swa": len(old_suffix)}))
     cache.unlock(held)
 
     tokens = prefix + old_suffix[:8] + list(range(200, 208))
@@ -165,11 +171,11 @@ def _drive(backend, chunk_ends, *, sibling, swa_size=128):
             insert(tokens[:20])
         need = end - req.extend_end
         available = allocator.swa_available_size()
-        assert available + cache.swa_evictable_size() >= need, (
+        assert available + cache.window_evictable_size("swa") >= need, (
             f"prefill stalled at {req.extend_end}, protected={req.kv.cache_protected_len}"
         )
         if available < need:
-            cache.evict(EvictParams(swa_num_tokens=need - available))
+            cache.evict(EvictParams(window_num_tokens={"swa": need - available}))
         sent_before = req.start_send_idx
         row_before = row[:sent_before].clone()
         in_flight = set(sender.in_flight)
@@ -191,7 +197,7 @@ def _drive(backend, chunk_ends, *, sibling, swa_size=128):
                 remapped=not torch.equal(row[:sent_before], row_before),
                 protected=req.kv.cache_protected_len,
                 sent=req.start_send_idx,
-                swa_evicted=req.kv.get_evicted_seqlen(ComponentType.SWA),
+                swa_evicted=req.kv.get_evicted_seqlen("swa"),
             )
         )
 
@@ -267,7 +273,12 @@ class TestPrefillSendProtection(CustomTestCase):
                 scheduler = _scheduler(
                     SimpleNamespace(supports_prefix_sharing=lambda: sharing),
                     SimpleNamespace(
-                        page_size=4, translate_kv_indices_for_transfer=lambda x: x
+                        page_size=4,
+                        translate_kv_indices_for_transfer=lambda x: x,
+                        # A pool whose rows never move records no transfer.
+                        storage=SimpleNamespace(
+                            record_network_transfer=lambda *args, **kwargs: None
+                        ),
                     ),
                     SimpleNamespace(req_to_token=torch.arange(32).reshape(1, -1)),
                 )
