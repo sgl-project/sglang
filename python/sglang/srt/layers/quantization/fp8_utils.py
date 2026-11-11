@@ -75,9 +75,6 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
 
-if _is_xpu:
-    import sgl_kernel
-
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
 # pure-triton block-fp8 path on gfx1250.
@@ -836,9 +833,6 @@ def can_use_xpu_fp8_moe(
     use_mxfp8: bool = False,
 ) -> bool:
     """Check FP8 layouts and runner options supported by native XPU MoE."""
-    if not get_platform().is_xpu:
-        return False
-
     valid_block_size = (
         weight_block_size in (None, [1, 32])
         if use_mxfp8
@@ -866,7 +860,16 @@ def can_use_xpu_fp8_moe(
     except (RuntimeError, ValueError):
         pass
 
-    return sgl_kernel.is_xe2_arch()
+    try:
+        import sgl_kernel
+
+        is_xe2 = getattr(sgl_kernel, "is_xe2_arch", None)
+        if is_xe2 is not None and not is_xe2():
+            return False
+    except Exception:
+        pass
+
+    return True
 
 
 def prepare_xpu_block_scale_for_scaled_mm(
