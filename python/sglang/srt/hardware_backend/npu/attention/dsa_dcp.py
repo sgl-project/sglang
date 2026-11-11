@@ -13,17 +13,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def load_dcp_fp8_sparse_attention() -> Callable:
-    """Resolve the A5 packed-KV kernel before DCP graph warmup."""
-    try:
-        return torch.ops.npu.sgl_kv_quant_sparse_flash_attention
-    except AttributeError as exc:
-        raise RuntimeError(
-            "Ascend DSA DCP with fp8_e4m3 KV requires an A5 sgl-kernel-npu "
-            "build with torch.ops.npu.sgl_kv_quant_sparse_flash_attention."
-        ) from exc
-
-
 def forward_dcp_sparse_attention(
     *,
     q_nope: torch.Tensor,
