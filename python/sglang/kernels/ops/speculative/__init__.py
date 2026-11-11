@@ -1,12 +1,17 @@
-"""Speculative-decoding kernels (Triton).
+"""Speculative-decoding kernels.
 
-The Triton kernels migrated here live in this package
-(``sglang.kernels.ops.speculative.<module>``); import them from there. Their
-``KernelSpec`` metadata is registered below for inventory (backend = Triton).
+The kernels live in this package (``sglang.kernels.ops.speculative.<module>``);
+import them from there. Their ``KernelSpec`` metadata is registered below for
+inventory.
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 # (module, public_fn) migrated from speculative/triton_ops.
 _TRITON_KERNELS = [
@@ -32,7 +37,9 @@ _TRITON_KERNELS = [
     ("lilicorr", "lilicorr_topk_lse"),
     ("lilicorr", "lilicorr_sample_path"),
     ("reject_sampling", "chain_speculative_sampling_triton"),
-    ("row_argmax", "row_argmax"),
+    ("acceptance_estimator", "predict_acceptance"),
+    ("acceptance_estimator", "accumulate_acceptance_counts"),
+    ("acceptance_estimator", "refit_acceptance"),
     ("reconstruct_tree", "reconstruct_indices_from_tree_mask_triton"),
     ("reconstruct_tree", "reconstruct_indices_from_tree_mask_func"),
 ]
@@ -68,6 +75,19 @@ register_kernel(
         op="speculative.pack_verify_mask_into",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.speculative.pack_verify_mask:pack_verify_mask_into",
+    )
+)
+
+# Exactly SM90: an int8 wgmma kernel launched as a cooperative grid, tuned on
+# H100.
+register_kernel(
+    KernelSpec(
+        op="speculative.dspark_markov_walk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.speculative.dspark.markov_walk:markov_walk",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
     )
 )
 

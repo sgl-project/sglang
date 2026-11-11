@@ -264,6 +264,26 @@ class TestFlux2TI2ISizeResolution(unittest.TestCase):
         self.assertEqual((batch.width, batch.height), (768, 512))
 
 
+class TestFlux2EditOutputSize(unittest.TestCase):
+    def _output_size(self, image_size):
+        image = Image.new("RGB", image_size, color="red")
+        batch = _make_batch(image, width=1024, height=1024)
+        batch.extra = {"explicit_fields": []}
+        config = Flux2PipelineConfig()
+        config.vae_config.arch_config.vae_scale_factor = 8
+        config.vae_config.arch_config.block_out_channels = [128, 256, 512, 512]
+        InputValidationStage().preprocess_condition_image(
+            batch, _make_server_args(config), image.width, image.height
+        )
+        return batch.width, batch.height
+
+    def test_output_follows_aligned_input_image(self):
+        self.assertEqual(self._output_size((768, 1344)), (768, 1344))
+
+    def test_output_follows_unaligned_input_image(self):
+        self.assertEqual(self._output_size((770, 1344)), (768, 1344))
+
+
 class TestPerRequestTask(unittest.TestCase):
     def test_image_preprocessing_uses_request_on_video_default(self):
         config = _DummyTI2IConfig()

@@ -14,7 +14,7 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, List, Literal, Optional
+from typing import Any, List, Optional
 
 import addict
 import yaml
@@ -224,7 +224,9 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ltx-2.3",
         "ltx-2.5-diffusers",
         "minimax-h3",
+        "minimax-h3-image",
         "minimaxai/minimax-h3",
+        "minimaxai/minimax-h3-image",
         "inclusionai/ming-image-0.1-design",
         "inclusionai/ming-image-0.1-design-layer",
         "ming-image-0.1-design",
@@ -260,6 +262,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "LongCatImagePipelineConfig",
         "LongCatImageEditPipelineConfig",
         "MiniMaxH3PipelineConfig",
+        "MiniMaxH3ImagePipelineConfig",
         "MingImagePipelineConfig",
         "MingImageLayerPipelineConfig",
         "QwenImagePipelineConfig",
@@ -426,16 +429,15 @@ class ServerArgs(DisaggServerArgsMixin):
     transformer_weights_path: str | None = None
     # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
     minimax_h3_adaln_cache_path: str | None = None
-    # Rebuild AdaLN outputs per request from the checkpoint, no sidecar needed.
-    minimax_h3_adaln_online: bool = False
-    # Widest timestep plan the rebuild slab is sized for; see
-    # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
-    minimax_h3_adaln_plan_width: int = 4
+    # None lets the model choose; False explicitly keeps resident projections.
+    minimax_h3_adaln_online: bool | None = None
+    # None chooses 2 for image releases, otherwise MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
+    minimax_h3_adaln_plan_width: int | None = None
     # Pinned-host cache for built AdaLN plans (decimal GB, 0 disables). Plans
     # evicted from the GPU slab swap back in from here instead of re-reading
     # the 24.2 GiB checkpoint. Expert knobs (GPU slot count, fp32 rebuild)
     # live in envs.py as SGLANG_DIFFUSION_MINIMAX_H3_ADALN_*.
-    minimax_h3_adaln_host_cache_gb: float = 8.0
+    minimax_h3_adaln_host_cache_gb: float | None = None
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -610,16 +612,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
     disagg_timeout: int = 3600
-    disagg_downstream_wait_timeout: int = 1800
     disagg_dispatch_policy: str = "round_robin"
     disagg_mode: bool = False
-    disagg_instance_id: int = 0
-    disagg_max_slots_per_instance: int = 8
-    disagg_transfer_redundancy: float = 1.25
-    disagg_role_device: Literal["auto", "cpu", "cuda"] = "auto"
-    disagg_transfer_backend: Literal["auto", "mock", "mooncake"] = "auto"
     disagg_transfer_pool_size: int = 256 * 1024 * 1024
-    disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
     disagg_p2p_hostname: str = "127.0.0.1"
     disagg_ib_device: str | None = None
     disagg_server_addr: str | None = None
@@ -655,7 +650,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # SGLang backend for encoder stage
     srt_encoder_url: str | None = None
-    srt_encoder_connect_timeout: int = 3.05
+    srt_encoder_connect_timeout: float = 3.05
     srt_encoder_timeout: int = 100
 
     # SGLang server for PE model inference
@@ -1761,6 +1756,18 @@ class ServerArgs(DisaggServerArgsMixin):
                     "Automatically set kv_gather_degree=sp_degree=2; set "
                     "--ulysses-degree explicitly to keep the Ulysses exchange"
                 )
+            elif self._dit_num_attention_heads() % self.sp_degree:
+                # Ulysses splits attention heads across the SP ranks and fails
+                # at the first all-to-all; K/V gather keeps every head local
+                self.kv_gather_degree = self.sp_degree
+                self.sp_split_auto = True
+                logger.info(
+                    "Automatically set kv_gather_degree=sp_degree=%d: the DiT's "
+                    "%d attention heads do not divide across %d Ulysses ranks",
+                    self.sp_degree,
+                    self._dit_num_attention_heads(),
+                    self.sp_degree,
+                )
             else:
                 self.ulysses_degree = self.sp_degree
                 logger.info(
@@ -1796,11 +1803,18 @@ class ServerArgs(DisaggServerArgsMixin):
             # composes with Ulysses).
             self.ulysses_degree = self.kv_gather_degree
 
+    def _dit_num_attention_heads(self) -> int:
+        """Head count from the DiT arch config, or 0 when the config does not set it."""
+        dit_config = getattr(self.pipeline_config, "dit_config", None)
+        arch_config = getattr(dit_config, "arch_config", None)
+        return getattr(arch_config, "num_attention_heads", 0) or 0
+
     def _model_default_uses_cfg(self) -> bool:
         """
         Check whether the model uses classifier-free guidance by default.
 
         CFG is active when *both* ``negative_prompt is not None`` and ``guidance_scale > 1``.
+        A ``guidance_scale`` of None (resolved per request, e.g. FLUX.3) does not count.
         """
         from sglang.multimodal_gen.registry import get_model_info
 
@@ -1808,10 +1822,12 @@ class ServerArgs(DisaggServerArgsMixin):
         if model_info is None:
             return False
         default_params = model_info.sampling_param_cls()
+        guidance_scale = getattr(default_params, "guidance_scale", None)
 
         return (
             getattr(default_params, "negative_prompt", None) is not None
-            and getattr(default_params, "guidance_scale", 0) > 1.0
+            and guidance_scale is not None
+            and guidance_scale > 1.0
         )
 
     @staticmethod
@@ -2309,7 +2325,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 "from the GPU slab swaps back in over PCIe instead of "
                 "re-reading the 24.2 GiB checkpoint (measured 5.8-6.7 s). One "
                 "50-step schedule needs ~0.9 (t2va) / 1.33 (fl2va) / 1.77 "
-                "(ref2va) GB; the default 8 holds several. Groups are evicted "
+                "(ref2va) GB. Auto uses 8 GB, or 0 for image releases whose "
+                "fixed timestep plans all fit on the GPU. Groups are evicted "
                 "LRU and over-cap groups just recompute. 0 disables the tier."
             ),
         )
@@ -2382,6 +2399,16 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=None,
             help="Configuration for the attention backend. Can be a JSON string, a path to a JSON/YAML file, or key=value pairs.",
+        )
+        parser.add_argument(
+            "--enable-attention-backend-autotune",
+            action=StoreBoolean,
+            default=ServerArgs.enable_attention_backend_autotune,
+            help=(
+                "For native pipelines, time the compatible attention backends on "
+                "each layer's first large enough input and keep one only when it "
+                "is numerically compatible and faster. Validated on SM90 and SM12x."
+            ),
         )
         parser.add_argument(
             "--component-attention-backends",
@@ -2612,11 +2639,6 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Path to a text file containing prompts (one per line) for batch processing",
         )
 
-        parser.add_argument(
-            "--mask-strategy-file-path",
-            type=str,
-            help="Path to mask strategy JSON file for STA",
-        )
         parser.add_argument(
             "--enable-torch-compile",
             action=StoreBoolean,
@@ -3034,7 +3056,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
                 "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
                 "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
-                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (A5 series for mxfp4_npu)."
+                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (Ascend 950 series for mxfp4_npu)."
             ),
         )
         parser.add_argument(
@@ -3334,7 +3356,8 @@ class ServerArgs(DisaggServerArgsMixin):
         )
         parser.add_argument(
             "--srt-encoder-connection-timeout",
-            type=int,
+            dest="srt_encoder_connect_timeout",
+            type=float,
             default=ServerArgs.srt_encoder_connect_timeout,
             help="Timeout (in seconds) for establishing the initial TCP connection to the SGLang encoder server. "
             "Default value is 3.05.",
@@ -4227,45 +4250,12 @@ class ServerArgs(DisaggServerArgsMixin):
 
 @dataclasses.dataclass
 class PortArgs:
-    # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
-    scheduler_input_ipc_name: str
-
-    # The port for nccl initialization (torch.dist)
-    nccl_port: int
-
-    # The ipc filename for rpc call between Engine and Scheduler
-    rpc_ipc_name: str
-
-    # The ipc filename for Scheduler to send metrics
-    metrics_ipc_name: str
-
     # Master port for distributed inference
     master_port: int | None = None
 
     @staticmethod
-    def from_server_args(
-        server_args: ServerArgs, dp_rank: Optional[int] = None
-    ) -> "PortArgs":
-        if server_args.nccl_port is None:
-            nccl_port = server_args.scheduler_port + random.randint(100, 1000)
-            while True:
-                if is_port_available(nccl_port):
-                    break
-                if nccl_port < 60000:
-                    nccl_port += 42
-                else:
-                    nccl_port -= 43
-        else:
-            nccl_port = server_args.nccl_port
-
-        # Normal case, use IPC within a single node
-        return PortArgs(
-            scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-            nccl_port=nccl_port,
-            rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-            metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-            master_port=server_args.master_port,
-        )
+    def from_server_args(server_args: ServerArgs) -> "PortArgs":
+        return PortArgs(master_port=server_args.master_port)
 
 
 _global_server_args = None
