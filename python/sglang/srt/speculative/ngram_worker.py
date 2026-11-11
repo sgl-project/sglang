@@ -24,7 +24,10 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
-from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
+from sglang.srt.speculative.cpp_ngram.ngram_corpus import (
+    NgramCorpus,
+    ngram_namespace_mask_from_req,
+)
 from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
@@ -184,6 +187,9 @@ class NGRAMWorker(BaseSpecWorker):
         need_from_seq1 = n - seq2_len
         return seq1[-need_from_seq1:] + seq2
 
+    def _req_namespace_masks(self, batch: ScheduleBatch) -> list[int]:
+        return [ngram_namespace_mask_from_req(req) for req in batch.reqs]
+
     def _init_preallocated_tensors(self):
         max_total_drafts = self.max_batch_size * self.draft_token_num
         max_total_mask_size = (
@@ -304,7 +310,10 @@ class NGRAMWorker(BaseSpecWorker):
             batch_tokens.append(check_token)
             total_lens.append(base_lens[i] + len(prev_tokens))
         req_drafts, mask = self.ngram_corpus.batch_get(
-            req_ids, batch_tokens, total_lens
+            req_ids,
+            batch_tokens,
+            total_lens,
+            namespace_masks=self._req_namespace_masks(batch),
         )
         total_draft_token_num = len(req_drafts)
 
@@ -422,7 +431,9 @@ class NGRAMWorker(BaseSpecWorker):
             )
             batch_tokens.append(put_ids)
             i += 1
-        self.ngram_corpus.batch_put(batch_tokens)
+        self.ngram_corpus.batch_put(
+            batch_tokens, namespace_masks=self._req_namespace_masks(batch)
+        )
 
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors=None
