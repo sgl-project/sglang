@@ -267,6 +267,8 @@ jobs:
       - name: Build runs_on_map (resolves $b200_runner sentinel)
         id: runner-map
         run: |
+          python3 -c 'import yaml' 2>/dev/null ||
+            python3 -m pip install --disable-pip-version-check pyyaml
           python3 scripts/ci/runner_configs.py --map \
             '${{ steps.set-runner.outputs.b200_runner }}' \
             >> "$GITHUB_OUTPUT"
