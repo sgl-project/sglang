@@ -437,6 +437,11 @@ class Envs:
     SGLANG_OPT_SPEC_STAGED_SEQ_LENS = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # With SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT: a staged draft reads its write slots from the
+    # staged buffer instead of a strided copy of the window's first columns (batch > 1).
+    SGLANG_OPT_SPEC_STAGED_DRAFT_LOCS = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

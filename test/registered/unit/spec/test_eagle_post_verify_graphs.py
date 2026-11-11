@@ -848,7 +848,12 @@ class TestStagedNextDraft(CustomTestCase):
             mrope=False,
             runner_buffers=_runner_buffers(),
         )
-        for staged, taken in ((None, False), (mismatched, False), (staging, True)):
+        for staged, taken, draft_locs in (
+            (None, False, True),
+            (mismatched, False, True),
+            (staging, True, False),
+            (staging, True, True),
+        ):
             batch = SimpleNamespace(
                 forward_mode=ForwardMode.DECODE,
                 seq_lens=torch.tensor([17, 40]),
@@ -859,7 +864,8 @@ class TestStagedNextDraft(CustomTestCase):
                 device="cpu",
                 out_cache_loc=None,
             )
-            translator = SimpleNamespace(plan=MagicMock(return_value="plan"))
+            iteration_ids = MagicMock()
+            translator = SimpleNamespace(plan=MagicMock(return_value=iteration_ids))
             draft_runner = SimpleNamespace(
                 model_config=SimpleNamespace(model_is_mrope=False),
                 spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
@@ -867,8 +873,11 @@ class TestStagedNextDraft(CustomTestCase):
             launch = MagicMock()
             init_new = MagicMock(return_value=SimpleNamespace())
             with (
-                self.subTest(staged=staged is not None, taken=taken),
+                self.subTest(
+                    staged=staged is not None, taken=taken, draft_locs=draft_locs
+                ),
                 patch.object(eagle_worker_common, "_is_cpu", False),
+                patch.object(eagle_worker_common, "_STAGED_DRAFT_LOCS", draft_locs),
                 patch.object(
                     eagle_worker_common,
                     "assign_draft_cache_locs_contiguous_func",
@@ -890,7 +899,14 @@ class TestStagedNextDraft(CustomTestCase):
                     staged=staged,
                 )
                 self.assertEqual(launch.called, not taken)
-                self.assertEqual(plan, "plan")
+                self.assertIs(plan, iteration_ids)
+                # SGLANG_OPT_SPEC_STAGED_DRAFT_LOCS: the draft steps' slots as staged
+                if taken and draft_locs:
+                    iteration_ids.take_staged_cols.assert_called_once_with(
+                        slice(0, steps), staging.draft_out_cache_loc
+                    )
+                else:
+                    iteration_ids.take_staged_cols.assert_not_called()
                 self.assertIs(
                     translator.plan.call_args.kwargs["write_virtual"],
                     batch.out_cache_loc,

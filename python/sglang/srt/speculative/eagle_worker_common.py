@@ -49,6 +49,8 @@ from sglang.srt.utils.device import is_npu
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+# SGLANG_OPT_SPEC_STAGED_DRAFT_LOCS: a staged draft's write slots are the staged buffer itself
+_STAGED_DRAFT_LOCS = envs.SGLANG_OPT_SPEC_STAGED_DRAFT_LOCS.get()
 
 
 _provider_spec = import_module("sglang.kernels.plugin_kernels.nvidia.spec")
@@ -502,6 +504,11 @@ def prepare_for_draft(
                 write_virtual=batch.out_cache_loc,
                 read_extent=num_draft_tokens,
             )
+            if _STAGED_DRAFT_LOCS:
+                # the same launch wrote them from the same slots as the window's first cols
+                iteration_ids.take_staged_cols(
+                    slice(0, num_steps), staged.draft_out_cache_loc
+                )
         elif page_size == 1 or topk == 1:
             empty = round_outputs.empty_fn()
             batch.out_cache_loc = empty(

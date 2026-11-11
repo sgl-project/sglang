@@ -644,6 +644,34 @@ class TestIterationIds(CustomTestCase):
         )
         self.assertTrue(torch.equal(derived.read_table().ids, reference))
 
+    def test_a_staged_draft_reads_its_slots_from_the_staged_buffer(self):
+        """SGLANG_OPT_SPEC_STAGED_DRAFT_LOCS: the window's first columns staged in a
+        buffer of their own are what a reader of the virtual ids gets for exactly
+        those columns, a derived plan's too; other columns, and a translating reader's
+        own ids, are taken out of the window as before."""
+        plan = self._plan()
+        bs = int(self.rpi.numel())
+        first, second = slice(0, 1), slice(1, 2)
+        staged = self.window.view(bs, -1)[:, first].reshape(-1).clone()
+        before = plan.write_ids(self.target, cols=first)
+        plan.take_staged_cols(first, staged)
+        self.assertIs(plan.write_ids(self.private_draft, cols=first), staged)
+        self.assertIs(plan.virtual_write_ids(cols=first), staged)
+        self.assertTrue(
+            torch.equal(
+                plan.write_ids(self.private_draft, cols=second),
+                self.window.view(bs, -1)[:, second].reshape(-1),
+            )
+        )
+        self.assertTrue(torch.equal(plan.write_ids(self.target, cols=first), before))
+        derived = plan.reads_from(
+            self.private_draft,
+            seq_lens=self.seq_lens,
+            seq_lens_cpu=self.seq_lens.clone(),
+            read_extent=1,
+        )
+        self.assertIs(derived.virtual_write_ids(cols=first), staged)
+
     def test_bind_sets_the_write_fields(self):
         """`bind` gives a batch the columns it writes, the same ones in both
         spaces, with the virtual mirror only when its ids were translated."""
