@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
@@ -64,6 +65,50 @@ class TestQwen3_5MTPQuantConfig(CustomTestCase):
         quant_config = _FakeQuantConfig("fp8", _MIXED_EXCLUDES)
 
         self.assertIs(_mtp_quant_config(quant_config), quant_config)
+
+    def test_the_loader_reads_the_quant_config_the_mtp_keeps(self):
+        """Before the draft is built, the loader answers with the quant config
+        the MTP head keeps, so its `auto` KV cache dtype can be resolved then:
+        a serialized NVFP4 checkpoint whose KV cache is FP8 ships its MTP head
+        in BF16, so the target keeps FP8 KV and the draft BF16."""
+        import torch
+
+        from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+        from sglang.srt.model_loader import loader
+
+        checkpoint = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            kv_cache_quant_algo="FP8",
+            group_size=16,
+            exclude_modules=[],
+        )
+        for model_class, is_draft, kept, kv_dtype in (
+            (Qwen3_5ForCausalLM, False, checkpoint, torch.float8_e4m3fn),
+            (Qwen3_5ForCausalLMMTP, True, None, torch.bfloat16),
+        ):
+            with (
+                self.subTest(model_class=model_class.__name__),
+                patch.object(
+                    loader, "_get_quantization_config", return_value=checkpoint
+                ),
+                patch.object(
+                    loader,
+                    "get_model_architecture",
+                    return_value=(model_class, model_class.__name__),
+                ),
+            ):
+                built = loader.built_quant_config(object(), object())
+                self.assertIs(built, kept)
+                _, resolved = configure_kv_cache_dtype(
+                    server_args_kv_cache_dtype="auto",
+                    quant_config=built,
+                    model_dtype=torch.bfloat16,
+                    is_draft_worker=is_draft,
+                    is_dflash=False,
+                    speculative_draft_attention_backend=None,
+                )
+                self.assertEqual(resolved, kv_dtype)
 
     def test_mtp_reuses_target_packed_modules_mapping(self):
         self.assertEqual(

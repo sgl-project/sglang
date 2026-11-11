@@ -1638,7 +1638,9 @@ class ModelRunner:
         resolved_kv_cache_dtype, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
                 server_args_kv_cache_dtype=get_model().kv_cache_dtype,
-                model=getattr(self, "model", None),
+                quant_config=getattr(
+                    getattr(self, "model", None), "quant_config", None
+                ),
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
                 is_draft_worker=getattr(self, "is_draft_worker", False),
                 is_dflash=(

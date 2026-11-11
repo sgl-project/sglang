@@ -138,6 +138,15 @@ class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
     # The draft checkpoint reports the NextN architecture name.
     fused_shared_experts_architecture = "Glm4MoeLiteForCausalLMNextN"
 
+    @staticmethod
+    def own_quant_config(quant_config):
+        """The quant config this class keeps, read before it is built to size
+        the draft's KV cache: an NPU draft runs unquantized unless a draft
+        quantization is named."""
+        if is_npu() and get_spec().speculative_draft_model_quantization is None:
+            return None
+        return quant_config
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -146,8 +155,7 @@ class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        if is_npu() and get_spec().speculative_draft_model_quantization is None:
-            quant_config = None
+        quant_config = self.own_quant_config(quant_config)
         self.quant_config = quant_config
 
         # Drives the inherited loader's shared-expert remap after the build.
