@@ -564,5 +564,7 @@ POSITIONAL_FIELD_ORDER = (
     "disable_normalize_embedding",
     "log_schedule_decisions",
     "speculative_dspark_lm_head_dtype",
+    "media_url_timeout",
+    "allow_local_media_files",
 )
 # fmt: on

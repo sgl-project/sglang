@@ -33,10 +33,11 @@ the event loop at the same step.
 A launcher that got no SIGTERM (another node's, or one scheduler's own, began
 the drain) treats its first scheduler exiting 0 as that gang shutdown: it
 stops its subprocess watchdog and bounds the other schedulers by the same
-exit bound. A crashed scheduler also exits 0, but only after sending SIGQUIT
-to this process, whose handler kills the process tree; with a
-``--custom-sigquit-handler`` that does not, the other schedulers are killed
-once the bound expires and the launcher returns. Without a local
+exit bound. A crashed scheduler exits non-zero after sending SIGQUIT to this
+process, whose handler kills the process tree; with a
+``--custom-sigquit-handler`` that does not, the same bound applies with the
+watchdog left armed, so the other schedulers are killed once it expires and
+the launcher returns. Without a local
 listener-hosting scheduler (elastic EP joiners and plain data parallelism,
 whose schedulers the DP controller starts) the main process keeps its previous
 SIGTERM behavior.
@@ -114,7 +115,7 @@ class RustServerSigtermDrain:
 
     def wait(self) -> None:
         """Block until every scheduler exited, or, once draining (or once a
-        scheduler exited 0 without a SIGTERM here), until Python's
+        scheduler exited without a SIGTERM here), until Python's
         scheduler-exit bound expires; the schedulers still alive then
         are killed and reaped, as Python's drain does, so a caller without the
         CLI's process-tree cleanup (a multiprocessing target) does not wait on
@@ -148,6 +149,17 @@ class RustServerSigtermDrain:
                 logger.warning(
                     "Scheduler exited without SIGTERM; treating it as a gang "
                     "shutdown, bounding the others by "
+                    f"{_SCHEDULER_EXIT_TIMEOUT_SECS}s"
+                )
+            elif (
+                exit_deadline is None
+                and not self._sigterm_received
+                and any(proc.exitcode is not None for proc in procs)
+            ):
+                # A crash: the watchdog stays armed so it is still reported.
+                exit_deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
+                logger.warning(
+                    "Scheduler crashed; bounding the others by "
                     f"{_SCHEDULER_EXIT_TIMEOUT_SECS}s"
                 )
             if exit_deadline is not None and time.monotonic() >= exit_deadline:
