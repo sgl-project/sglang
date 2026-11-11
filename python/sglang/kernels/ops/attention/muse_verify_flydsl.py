@@ -32,12 +32,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
-# The 64-bit address path needs aiter FlyDSL helpers newer than some pinned aiter builds; without
-# them the module is unavailable and the backend keeps its Triton verify kernels.
-if not all(hasattr(buffer_ops, n) for n in ("extract_base_index", "create_llvm_ptr")):
-    raise ImportError(
-        "aiter.ops.flydsl.kernels.buffer_ops lacks extract_base_index / create_llvm_ptr"
-    )
+from sglang.kernels.ops.attention.flydsl_ptr import create_llvm_ptr, extract_base_index
 
 QL = 8
 GQA = 8
@@ -101,7 +96,7 @@ def _cvt8(lo_word, hi_word):
 
 def _global_load16(addr):
     """16 bytes (vector<4 x i32>) at the 64-bit global byte address ``addr``."""
-    ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
+    ptr = create_llvm_ptr(addr, address_space=1)
     return llvm.LoadOp(T.vec(4, T.i32), _to_raw(ptr), alignment=16).result
 
 
@@ -262,8 +257,8 @@ def _launcher(
         kd_r = buffer_ops.create_buffer_resource(kd, max_size=True)
         q_r = buffer_ops.create_buffer_resource(q, max_size=True)
         if fx.const_expr(addr64):
-            k_addr = fx.Int64(arith.index_cast(T.i64, buffer_ops.extract_base_index(k)))
-            v_addr = fx.Int64(arith.index_cast(T.i64, buffer_ops.extract_base_index(v)))
+            k_addr = fx.Int64(arith.index_cast(T.i64, extract_base_index(k)))
+            v_addr = fx.Int64(arith.index_cast(T.i64, extract_base_index(v)))
         else:
             k_r = buffer_ops.create_buffer_resource(k, max_size=True)
             v_r = buffer_ops.create_buffer_resource(v, max_size=True)

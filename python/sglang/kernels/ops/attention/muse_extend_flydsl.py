@@ -38,6 +38,8 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
+from sglang.kernels.ops.attention.flydsl_ptr import extract_base_index
+
 GQA = 8
 HD = 64
 BQ = 16  # query tokens per workgroup
@@ -231,7 +233,7 @@ def _launcher(
 
         # Q^T B fragment: column col -> token local*16 + 4 wave + col // 8, head h*8 + col % 8; lane half hl holds
         # dims 32 hl .. 32 hl + 31 (rows past the request read as zero through the descriptor bound)
-        q_base = fx.Int64(arith.index_cast(T.i64, buffer_ops.extract_base_index(q)))
+        q_base = fx.Int64(arith.index_cast(T.i64, extract_base_index(q)))
         q_rs = buffer_ops.create_buffer_resource_from_addr(
             _to_raw(q_base + fx.Int64(q_start) * fx.Int64(q_s0)),
             num_records_bytes=_to_raw(fx.Int64(q_len) * fx.Int64(q_s0)),
@@ -246,8 +248,8 @@ def _launcher(
         )
         qpos = ctx + tok
 
-        k_base = fx.Int64(arith.index_cast(T.i64, buffer_ops.extract_base_index(k)))
-        v_base = fx.Int64(arith.index_cast(T.i64, buffer_ops.extract_base_index(v)))
+        k_base = fx.Int64(arith.index_cast(T.i64, extract_base_index(k)))
+        v_base = fx.Int64(arith.index_cast(T.i64, extract_base_index(v)))
 
         lds = fx.SharedAllocator().allocate(Lds).peek()
         lptr = lds.kv.ptr
@@ -769,7 +771,7 @@ def _launcher(
             lsum = _allreduce32(lsum, False)
         inv = arith.divf(descale[2], lsum)
 
-        o_base = fx.Int64(arith.index_cast(T.i64, buffer_ops.extract_base_index(out)))
+        o_base = fx.Int64(arith.index_cast(T.i64, extract_base_index(out)))
         o_rs = buffer_ops.create_buffer_resource_from_addr(
             _to_raw(o_base + fx.Int64(q_start) * fx.Int64(o_s0 * 2)),
             num_records_bytes=_to_raw(fx.Int64(q_len) * fx.Int64(o_s0 * 2)),

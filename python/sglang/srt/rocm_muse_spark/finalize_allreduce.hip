@@ -2,7 +2,7 @@
 //
 // One 256-thread block per token row r of an M-row batch (M a multiple of NR, hidden 4096, top-8):
 //   1. finalize: the per-expert input-scale RMSNorm and route-weighted sum of the row's local-expert slots, with the
-//      thread mapping, reduction order and rounding points of aiter's FlyDSL muse_moe_finalize_vector_flydsl;
+//      thread mapping, reduction order and rounding points of the FlyDSL muse_moe_finalize_vector_flydsl (sglang.kernels.ops.moe.muse_moe_finalize);
 //   2. the row's partial goes to its owner rank r / (M / NR), which sums the NR partials in the order of aiter's
 //      cross_device_reduce_2stage (owner first, then owner+1, ...; FP32, one BF16 rounding) and pushes the sum to
 //      the other ranks; every rank writes the row to `out`.
