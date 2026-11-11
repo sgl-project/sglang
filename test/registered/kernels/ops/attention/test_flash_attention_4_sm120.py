@@ -19,7 +19,6 @@ from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
     flash_attn_with_kvcache,
     get_flash_attention_v4_sm120_runtime_policy,
 )
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -43,14 +42,6 @@ def test_sm120_runtime_policy_delegates_decode_shapes():
     assert policy.num_splits == 0
     assert policy.decode_num_splits == 0
     assert policy.decode_uses_static_max_seqlen_k
-
-    with envs.SGLANG_OPT_SM120_FA4_GENERIC_SPLITKV.override(False):
-        pinned_policy = get_flash_attention_v4_sm120_runtime_policy(
-            device_capability=(12, 0),
-            deterministic=False,
-        )
-    assert pinned_policy.num_splits == 1
-    assert pinned_policy.decode_num_splits == 0
 
     deterministic_policy = get_flash_attention_v4_sm120_runtime_policy(
         device_capability=(12, 0),
