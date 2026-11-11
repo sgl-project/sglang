@@ -7,8 +7,12 @@ from typing import Any, Callable, Optional, Tuple
 import torch
 
 from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits_verify
+from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.layers.dcp.layout import get_dcp_lens
-from sglang.srt.utils import print_info_once
+from sglang.srt.layers.layernorm import LayerNorm
+from sglang.srt.utils import is_gfx95_supported, print_info_once
+
+_is_gfx95 = is_gfx95_supported()
 
 
 class _PerForwardMemo:
@@ -485,3 +489,25 @@ def fp4_prefill(
         act_quant=act_quant,
     )
     return fp4_prefill_q(indexer, query, x)
+
+
+class Fp32LayerNormHip(LayerNorm):
+    """An fp32-weight LayerNorm (Kimi-K3.1's index k_norm) whose bf16 / fp16 input
+    runs on gfx950 as fp32 math in one launch instead of upcast + layer_norm +
+    downcast: the fused norm without a gate is a LayerNorm."""
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            _is_gfx95
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and self.dtype == torch.float32
+            and self.elementwise_affine
+        ):
+            return rms_norm_gated(
+                x=x,
+                weight=self.weight,
+                bias=self.bias if self.use_bias else None,
+                eps=self.variance_epsilon,
+                is_rms_norm=False,
+            )
+        return super().forward_hip(x)

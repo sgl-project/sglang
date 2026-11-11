@@ -432,7 +432,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if index_k_uses_rmsnorm:
             self.k_norm = RMSNorm(self.head_dim, **k_norm_eps_kwargs)
         else:
-            self.k_norm = LayerNorm(
+            k_norm_cls = LayerNorm
+            if _is_hip and getattr(config, "index_k_norm_fp32", False):
+                # Kimi-K3.1's fp32 index k_norm runs in one launch on gfx950
+                from sglang.srt.layers.attention.dsa.dsa_indexer_hip import (
+                    Fp32LayerNormHip as k_norm_cls,
+                )
+            self.k_norm = k_norm_cls(
                 self.head_dim,
                 dtype=(
                     torch.float32
