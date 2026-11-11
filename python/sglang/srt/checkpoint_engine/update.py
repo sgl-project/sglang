@@ -114,6 +114,7 @@ def req_inference(
     timeout: float = 300.0,
     uds: str | None = None,
     weight_version: str | None = None,
+    admin_api_key: str | None = None,
 ) -> Callable[[list[tuple[str, str]]], None]:
     rank = int(os.getenv("RANK", 0))
     src = rank // inference_parallel_size * inference_parallel_size
@@ -131,6 +132,11 @@ def req_inference(
                         "weight_version": weight_version,
                     },
                     timeout=timeout,
+                    headers=(
+                        {"Authorization": f"Bearer {admin_api_key}"}
+                        if admin_api_key
+                        else None
+                    ),
                 )
                 resp.raise_for_status()
 
@@ -259,6 +265,12 @@ def main():
     parser.add_argument("--update-method", type=str, default="broadcast")
     parser.add_argument("--uds", type=str, default=None)
     parser.add_argument("--weight-version", type=str, default=None)
+    parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=None,
+        help="The server's --admin-api-key, which /update_weights_from_ipc requires.",
+    )
     args = parser.parse_args()
 
     # Get rank and world_size from environment (set by torchrun)
@@ -270,6 +282,7 @@ def main():
         args.inference_parallel_size,
         uds=args.uds,
         weight_version=args.weight_version,
+        admin_api_key=args.admin_api_key,
     )
 
     if ParameterServer is None:

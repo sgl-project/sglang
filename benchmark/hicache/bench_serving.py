@@ -205,7 +205,11 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         output = RequestFuncOutput()
         try:
-            async with session.post(url=api_url) as response:
+            admin_api_key = getattr(args, "admin_api_key", None)
+            headers = (
+                {"Authorization": f"Bearer {admin_api_key}"} if admin_api_key else {}
+            )
+            async with session.post(url=api_url, headers=headers) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -966,6 +970,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+    )
+    parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=None,
+        help="The server's --admin-api-key, which --profile requires.",
     )
     parser.add_argument(
         "--lora-name",

@@ -121,6 +121,7 @@ class ServerContext(msgspec.Struct, frozen=True):
     cuda_graph_max_bs: Optional[int]
     skip_max_running_requests_threshold: float
     skip_token_capacity_threshold: float
+    admin_api_key: Optional[str] = None
 
 
 class RoundSettings(msgspec.Struct, frozen=True):
@@ -172,6 +173,7 @@ def run_profile(
     repeats: int,
     local_tokenizer_path: Optional[str],
     fracs: Optional[list[float]],
+    admin_api_key: Optional[str] = None,
 ) -> None:
     if get_tokenizer is None:
         raise RuntimeError(
@@ -206,6 +208,7 @@ def run_profile(
         base_url=base_url,
         local_tokenizer_path=local_tokenizer_path,
         allowed_modes=("compact", "cap-accept") if offdiag else ("static",),
+        admin_api_key=admin_api_key,
     )
     vocab_size = len(get_tokenizer(context.tokenizer_path))
     batch_sizes = sorted(set(batch_sizes))
@@ -349,6 +352,7 @@ def profile_all(
     local_tokenizer_path: Optional[str],
     fracs: Optional[list[float]],
     plot: bool,
+    admin_api_key: Optional[str] = None,
 ) -> None:
     run_profile(
         base_url=base_url,
@@ -358,6 +362,7 @@ def profile_all(
         repeats=repeats,
         local_tokenizer_path=local_tokenizer_path,
         fracs=fracs,
+        admin_api_key=admin_api_key,
     )
     fit_profile(
         out=out,
@@ -412,6 +417,7 @@ def fetch_server_context(
     base_url: str,
     local_tokenizer_path: Optional[str],
     allowed_modes: tuple[str, ...] = ("static",),
+    admin_api_key: Optional[str] = None,
 ) -> ServerContext:
     response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
@@ -511,6 +517,7 @@ def fetch_server_context(
         cuda_graph_max_bs=cuda_graph_max_bs,
         skip_max_running_requests_threshold=skip_max_running,
         skip_token_capacity_threshold=skip_token_capacity,
+        admin_api_key=admin_api_key,
     )
 
 
@@ -638,7 +645,11 @@ def run_one_round(
         return None
 
     if frac is not None:
-        set_forced_budget_frac(base_url=context.base_url, frac=frac)
+        set_forced_budget_frac(
+            base_url=context.base_url,
+            frac=frac,
+            admin_api_key=context.admin_api_key,
+        )
 
     flush_cache(base_url=context.base_url)
     watermarks = [
@@ -832,12 +843,17 @@ def flush_cache(*, base_url: str) -> None:
         logger.warning("POST /flush_cache failed; continuing.", exc_info=True)
 
 
-def set_forced_budget_frac(*, base_url: str, frac: Optional[float]) -> None:
+def set_forced_budget_frac(
+    *, base_url: str, frac: Optional[float], admin_api_key: Optional[str] = None
+) -> None:
     response = requests.post(
         base_url + "/set_internal_state",
         json={"server_args": {"dspark_force_budget_frac": frac}},
+        headers={"Authorization": f"Bearer {admin_api_key}"} if admin_api_key else {},
         timeout=DEFAULT_TIMEOUT,
-    ).json()
+    )
+    response.raise_for_status()
+    response = response.json()
     outs = response if isinstance(response, list) else [response]
 
     def _ok(out) -> bool:
@@ -1377,6 +1393,12 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         "http://localhost:30000. The profiler never launches a server.",
     )
     parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=None,
+        help="The server's --admin-api-key, which --fracs needs to force a budget.",
+    )
+    parser.add_argument(
         "--fracs",
         type=float,
         nargs="+",
@@ -1549,6 +1571,7 @@ def cli_main() -> None:
             repeats=args.repeats,
             local_tokenizer_path=args.local_tokenizer_path,
             fracs=args.fracs,
+            admin_api_key=args.admin_api_key,
         )
     elif args.command == "fit":
         fit_profile(
@@ -1568,6 +1591,7 @@ def cli_main() -> None:
             self_check=args.self_check,
             local_tokenizer_path=args.local_tokenizer_path,
             fracs=args.fracs,
+            admin_api_key=args.admin_api_key,
             plot=args.plot,
         )
 

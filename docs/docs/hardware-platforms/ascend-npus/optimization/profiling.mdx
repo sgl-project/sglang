@@ -31,6 +31,14 @@ Launch an SGLang online service and set the `SGLANG_TORCH_PROFILER_DIR`
 environment variable to control where performance files are saved. Once the
 service starts, profiling is ready on standby.
 
+<Note>
+`/start_profile` and `/stop_profile` are admin endpoints: the server must be
+launched with `--admin-api-key`, and each request must carry that key as
+`Authorization: Bearer <key>`. Without an admin key configured, the server
+answers HTTP 403. The examples below assume the key is exported as
+`ADMIN_API_KEY`.
+</Note>
+
 ```shell Command
 # Set the performance data output directory
 export SGLANG_TORCH_PROFILER_DIR=./sglang_profile
@@ -41,7 +49,8 @@ sglang serve \
   --attention-backend ascend \
   --host 0.0.0.0 --port 30000 \
   --tp-size 1 \
-  --max-running-requests 128
+  --max-running-requests 128 \
+  --admin-api-key "${ADMIN_API_KEY}"
 ```
 
 **Profiling-related environment variables:**
@@ -131,6 +140,7 @@ manually call `analyse()`**.
 ```bash Command
 # Step 1: Start profiling (no num_steps, requires manual stop)
 curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Authorization: Bearer ${ADMIN_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "output_dir": "./sglang_profile",
@@ -144,7 +154,8 @@ curl http://127.0.0.1:30000/generate \
   -d '{"text": "Hello", "sampling_params": {"max_new_tokens": 10}}'
 
 # Step 3: Stop profiling
-curl -X POST http://127.0.0.1:30000/stop_profile
+curl -X POST http://127.0.0.1:30000/stop_profile \
+  -H "Authorization: Bearer ${ADMIN_API_KEY}"
 ```
 
 <Note>
@@ -164,6 +175,7 @@ automatically after N steps and generates output — **no need to manually send
 ```bash Command
 # num_steps=10, wait 3 warmup steps, auto-stop after 10 steps
 curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Authorization: Bearer ${ADMIN_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "output_dir": "./sglang_profile",
@@ -196,6 +208,7 @@ python -m sglang.benchmark.serving \
   --random-output-len 100 \
   --num-prompts 10 \
   --profile \
+  --admin-api-key "${ADMIN_API_KEY}" \
   --profile-steps 10 \
   --profile-output-dir ./sglang_profile
 
@@ -210,6 +223,7 @@ python -m sglang.benchmark.serving \
   --random-output-len 100 \
   --num-prompts 10 \
   --profile \
+  --admin-api-key "${ADMIN_API_KEY}" \
   --profile-output-dir ./sglang_profile
 ```
 
@@ -239,6 +253,7 @@ redirect PyTorch Profiler's CUDA activity to NPU, so
   </thead>
   <tbody>
     <tr><td><code>--profile</code></td><td>Enable auto profiling start/stop</td></tr>
+    <tr><td><code>--admin-api-key</code></td><td>The server's admin API key, required by <code>--profile</code></td></tr>
     <tr><td><code>--profile-steps N</code></td><td>Auto-stop after N steps (skips /stop_profile)</td></tr>
     <tr><td><code>--profile-output-dir</code></td><td>Trace output directory</td></tr>
   </tbody>
@@ -255,6 +270,7 @@ profiler will wait indefinitely).
 # Terminal 1: Start sglang.profiler first (sends /start_profile, then waits for completion)
 python3 -m sglang.profiler \
   --url http://127.0.0.1:30000 \
+  --admin-api-key "${ADMIN_API_KEY}" \
   --output-dir ./my_profiles \
   --num-steps 3 \
   --cpu --gpu &
@@ -283,6 +299,7 @@ python3 -m sglang.benchmark.serving \
   --random-output-len 32 \
   --num-prompts 10 \
   --profile \
+  --admin-api-key "${ADMIN_API_KEY}" \
   --profile-steps 3 \
   --profile-output-dir ./my_profiles
 ```
@@ -303,6 +320,7 @@ Method C (bench_serving --profile) instead.
   </thead>
   <tbody>
     <tr><td><code>--url</code></td><td>SGLang server address</td></tr>
+    <tr><td><code>--admin-api-key</code></td><td>The server's admin API key, required by <code>/start_profile</code></td></tr>
     <tr>
       <td><code>--output-dir</code></td>
       <td>Output directory (defaults to <code>SGLANG_TORCH_PROFILER_DIR</code>)</td>

@@ -915,7 +915,13 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
                 body["start_step"] = str(args.profile_start_step)
             if hasattr(args, "profile_steps") and args.profile_steps is not None:
                 body["num_steps"] = str(args.profile_steps)
-            async with session.post(url=api_url, json=body) as response:
+            admin_api_key = getattr(args, "admin_api_key", None)
+            headers = (
+                {"Authorization": f"Bearer {admin_api_key}"} if admin_api_key else {}
+            )
+            async with session.post(
+                url=api_url, json=body, headers=headers
+            ) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -1022,9 +1028,14 @@ def flush_server_cache(
             base_url + "/reset_prefix_cache", headers=get_auth_headers()
         )
     elif backend.startswith("sglang"):
+        admin_api_key = getattr(args, "admin_api_key", None)
         response = requests.post(
             base_url + "/flush_cache",
-            headers=get_auth_headers(),
+            headers=(
+                {"Authorization": f"Bearer {admin_api_key}"}
+                if admin_api_key
+                else get_auth_headers()
+            ),
             params={"timeout": flush_cache_timeout},
         )
     else:
@@ -2582,6 +2593,13 @@ def cli_main():
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+    )
+    parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=None,
+        help="The server's --admin-api-key, which --profile requires and "
+        "--flush-cache uses when the server has one.",
     )
     parser.add_argument(
         "--plot-throughput",

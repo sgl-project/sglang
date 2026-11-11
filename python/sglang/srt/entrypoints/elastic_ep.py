@@ -13,7 +13,7 @@ router = APIRouter()
 
 
 @router.post("/scale_elastic_ep")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def scale_elastic_ep(raw_request: Request):
     """Request an asynchronous EP scale-up."""
     try:

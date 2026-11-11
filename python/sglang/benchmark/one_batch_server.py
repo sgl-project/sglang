@@ -549,11 +549,16 @@ def _warmup_cache(
     print("Cache warmup completed")
 
 
-def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
+def _flush_cache_with_retry(
+    url: str, endpoint: str, max_retries: int = 3, admin_api_key: Optional[str] = None
+):
     """Post to a cache flush endpoint with retries on failure."""
+    headers = {"Authorization": f"Bearer {admin_api_key}"} if admin_api_key else {}
     for attempt in range(max_retries):
         try:
-            response = requests.post(url + endpoint, timeout=DEFAULT_TIMEOUT)
+            response = requests.post(
+                url + endpoint, headers=headers, timeout=DEFAULT_TIMEOUT
+            )
             if response.status_code == 200:
                 return
             if attempt >= max_retries - 1:
@@ -628,6 +633,7 @@ def run_one_case(
     profile_by_stage: bool = False,
     profile_prefix: Optional[str] = BenchArgs.profile_prefix,
     profile_output_dir: Optional[str] = BenchArgs.profile_output_dir,
+    admin_api_key: Optional[str] = None,
     dataset_name: str = BenchArgs.dataset_name,
     dataset_path: str = BenchArgs.dataset_path,
     parallel_batch: bool = False,
@@ -651,11 +657,13 @@ def run_one_case(
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
         _flush_cache_with_retry(url, "/reset_prefix_cache")
     else:
-        _flush_cache_with_retry(url, "/flush_cache")
+        _flush_cache_with_retry(url, "/flush_cache", admin_api_key=admin_api_key)
         # /flush_cache resets the radix tree and the host tier; a storage tier
         # persists across it and would serve the same prompts on the next case.
         if flush_hicache_storage:
-            _flush_cache_with_retry(url, "/hicache/storage-backend/clear")
+            _flush_cache_with_retry(
+                url, "/hicache/storage-backend/clear", admin_api_key=admin_api_key
+            )
 
     if fixed_prompt_file:
         tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
@@ -850,6 +858,7 @@ def run_one_case(
             profile_by_stage=profile_by_stage,
             profile_prefix=profile_prefix,
             start_step=profile_start_step,
+            admin_api_key=admin_api_key,
         )
 
     # Get metrics before the request (for cache hit rate calculation)
@@ -1442,6 +1451,7 @@ def run_benchmark_internal(
                 run_name="",
                 result_filename="",
                 tokenizer=tokenizer,
+                admin_api_key=server_args.admin_api_key,
                 dataset_name=bench_args.dataset_name,
                 dataset_path=bench_args.dataset_path,
                 parallel_batch=bench_args.parallel_batch,
@@ -1493,6 +1503,7 @@ def run_benchmark_internal(
                     run_name=bench_args.run_name,
                     result_filename=bench_args.result_filename,
                     tokenizer=tokenizer,
+                    admin_api_key=server_args.admin_api_key,
                     dataset_name=bench_args.dataset_name,
                     dataset_path=bench_args.dataset_path,
                     parallel_batch=bench_args.parallel_batch,
@@ -1561,6 +1572,7 @@ def run_benchmark_internal(
                             profile_by_stage=bench_args.profile_by_stage,
                             profile_prefix=profile_prefix,
                             profile_output_dir=bench_args.profile_output_dir,
+                            admin_api_key=server_args.admin_api_key,
                             backend=bench_args.backend,
                             model_name=model_name,
                             fake_prefill=bench_args.fake_prefill,

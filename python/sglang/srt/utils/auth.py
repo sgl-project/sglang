@@ -10,6 +10,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional
 
+# The Rust server answers with the same text (`ADMIN_KEY_MISSING`).
+ADMIN_API_KEY_MISSING_MESSAGE = (
+    "This endpoint requires admin API key, but this server was started "
+    "without one (admin-api-key). Restart with --admin-api-key to enable."
+)
+
 
 @dataclass(frozen=True)
 class AuthDecision:
@@ -224,7 +230,7 @@ def add_api_key_middleware(app, *, get_keys: Callable[[], tuple]):
                     "error": (
                         "Unauthorized"
                         if decision.error_status_code == 401
-                        else "Forbidden"
+                        else ADMIN_API_KEY_MISSING_MESSAGE
                     )
                 },
                 status_code=decision.error_status_code,

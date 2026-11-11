@@ -34,6 +34,12 @@ if __name__ == "__main__":
         choices=["debug", "info", "warning", "error", "critical"],
         help="Set runtime log level",
     )
+    parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=None,
+        help="The server's --admin-api-key, which /configure_logging requires.",
+    )
     parser.add_argument("--log-requests", action="store_true")
     parser.add_argument("--log-requests-level", type=int, default=3)
     parser.add_argument(
@@ -66,5 +72,10 @@ if __name__ == "__main__":
             if k.strip()
         ]
 
-    response = requests.post(args.url + "/configure_logging", json=payload)
+    headers = (
+        {"Authorization": f"Bearer {args.admin_api_key}"} if args.admin_api_key else {}
+    )
+    response = requests.post(
+        args.url + "/configure_logging", json=payload, headers=headers
+    )
     assert response.status_code == 200
