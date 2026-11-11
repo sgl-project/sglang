@@ -621,7 +621,7 @@ def register_fused_all_reduce_comm(
 ) -> None:
     """Hand a push plane to the fusion kernels, once per process: the TP group's
     own, or with ``max_push_size`` a dedicated push-only plane of that slot size
-    and ``max_push_blocks`` row counters. Must run before graph capture;
+    and ``max_push_blocks`` default launch width. Must run before graph capture;
     unregistered means everything runs unfused."""
     global _fused_all_reduce_comm
     if _fused_all_reduce_comm is not None:
@@ -661,8 +661,8 @@ def register_fused_all_reduce_comm(
 
 def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:
     """Whether the registered push plane can stage ``[num_tokens, hidden_dim]``
-    BF16 rows: one slot holds them and each row owns a push phase counter. The
-    384 ceiling is the bench-validated range of the fused collective family.
+    BF16 rows in one slot. The 384 ceiling is the bench-validated range of the
+    fused collective family.
 
     The deferred-finalize handle type carries its own numeric contract (every
     producer folds the routed scaling; no consumer rescales)."""
@@ -671,8 +671,6 @@ def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:
     comm = _fused_all_reduce_comm
     if comm is None or comm.world_size != get_parallel().tp_size:
         return False
-    return (
-        num_tokens <= 384
-        and num_tokens <= comm.config.num_push_blocks
-        and all_reduce_fusion.fits_push_slot(comm.max_push_size, num_tokens, hidden_dim)
+    return num_tokens <= 384 and all_reduce_fusion.fits_push_slot(
+        comm.max_push_size, num_tokens, hidden_dim
     )
