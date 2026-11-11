@@ -17,6 +17,7 @@ from einops import rearrange
 
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     PAD_SLOT_ID,
+    _causal_conv1d_fwd_kernel,
     causal_conv1d_fn,
     causal_conv1d_update,
 )
@@ -489,6 +490,51 @@ def test_causal_conv1d_varlen_mixed_input_and_state_dtype():
 
     torch.testing.assert_close(out, torch.cat(expected, dim=-1), rtol=1e-2, atol=5e-2)
     torch.testing.assert_close(conv_states, conv_states_ref, rtol=1e-2, atol=5e-2)
+
+
+def test_causal_conv1d_varlen_compiles_once_across_state_row_counts():
+    """A conv-state tensor staged per batch has a different row count on every
+    call; prefill must reuse one compiled kernel rather than compile per count."""
+    device = get_device()
+    torch.manual_seed(0)
+    dim, width, seqlen = 64, 4, 2
+    # Token-major activations seen transposed, as the GDN prefill passes them.
+    x = torch.randn(seqlen, dim, device=device, dtype=torch.bfloat16).T
+    weight = torch.randn(dim, width, device=device, dtype=torch.bfloat16)
+    query_start_loc = torch.tensor([0, seqlen], dtype=torch.int32, device=device)
+    has_initial_state = torch.ones(1, dtype=torch.bool, device=device)
+
+    def run(num_rows):
+        conv_states = torch.randn(
+            num_rows, width - 1, dim, device=device, dtype=torch.bfloat16
+        ).transpose(1, 2)
+        causal_conv1d_fn(
+            x,
+            weight,
+            bias=None,
+            conv_states=conv_states,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=[seqlen],
+            cache_indices=torch.tensor(
+                [num_rows - 1], dtype=torch.int32, device=device
+            ),
+            has_initial_state=has_initial_state,
+            activation="silu",
+        )
+
+    def num_compiled():
+        # Each per-device entry of Triton's JIT cache starts with its kernel cache.
+        return sum(
+            len(caches[0])
+            for caches in _causal_conv1d_fwd_kernel.device_caches.values()
+        )
+
+    run(1)
+    compiled = num_compiled()
+    # 1 and 16 cross Triton's default ==1 and divisible-by-16 int specializations.
+    for num_rows in range(2, 18):
+        run(num_rows)
+    assert num_compiled() == compiled
 
 
 @pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
