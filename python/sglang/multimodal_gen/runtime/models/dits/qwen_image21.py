@@ -172,24 +172,12 @@ def apply_qk_norm(x, norm):
     return norm(x)
 
 
-def _can_use_rmsnorm_npu(x, weight):
-    # Shape, layout and tile limits are the kernel's contract; it rejects what
-    # it cannot serve instead of returning a wrong result.
-    return _is_npu and x.is_npu and x.dtype in (torch.float16, torch.bfloat16)
-
-
-def _can_use_residual_gate_npu(residual, update, gate):
-    return _is_npu and residual.is_npu and residual.dtype is torch.bfloat16
-
-
-def _can_use_silu_mul_npu(gate, value):
-    return _is_npu and gate.is_npu and gate.dtype is torch.bfloat16
-
-
 def apply_residual_gate(residual, update, gate):
     fused = None
     if (
-        _can_use_residual_gate_npu(residual, update, gate)
+        _is_npu
+        and residual.is_npu
+        and residual.dtype is torch.bfloat16
         and _RESIDUAL_GATE_NPU_FUSION.can_attempt_once()
     ):
         fused = residual_gate_add_npu(residual, update, gate)
@@ -227,7 +215,12 @@ def apply_qk_norm_rope(x, norm, rope):
             lambda: apply_rope(norm(x), rope),
             logger=logger,
         )
-    if _can_use_rmsnorm_npu(x, norm.weight) and _QK_NORM_NPU_FUSION.can_attempt_once():
+    if (
+        _is_npu
+        and x.is_npu
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and _QK_NORM_NPU_FUSION.can_attempt_once()
+    ):
         npu_fused = apply_rope(
             rmsnorm_npu_onepass(x, norm.weight, norm.variance_epsilon), rope
         )
@@ -508,7 +501,12 @@ class QwenImage21FeedForward(nn.Module):
                 lambda: nn.functional.silu(gate) * value,
                 logger=logger,
             )
-        elif _can_use_silu_mul_npu(gate, value) and _SILU_MUL_FUSION.can_attempt_once():
+        elif (
+            _is_npu
+            and gate.is_npu
+            and gate.dtype is torch.bfloat16
+            and _SILU_MUL_FUSION.can_attempt_once()
+        ):
             fused = silu_mul_npu(gate, value)
             if _SILU_MUL_FUSION.verified:
                 return self.out(fused)[0]
