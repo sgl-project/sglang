@@ -1119,6 +1119,10 @@ class Envs:
     # (transfer_mamba_split.cuh, same bytes); None keeps the stock kernel.
     SGLANG_HICACHE_MAMBA_LOAD_BLOCK_QUOTA = EnvInt(None)
     SGLANG_HICACHE_MAMBA_BACKUP_BLOCK_QUOTA = EnvInt(None)
+    # With the master: the recurrent-state host pool's GB of --hicache-size (sglang#47867's
+    # --hicache-mamba-size-gb); the other host pools split the rest. None keeps the
+    # split proportional to the device pools.
+    SGLANG_HICACHE_MAMBA_SIZE_GB = EnvFloat(None)
     # Seconds between cumulative cache-residency counter log lines; 0 disables them.
     SGLANG_HICACHE_RESIDENCY_LOG_INTERVAL = EnvInt(300)
     # Base token count for each MLA/DSA dedup broadcast chunk.

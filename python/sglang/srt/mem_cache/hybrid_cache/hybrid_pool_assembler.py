@@ -238,6 +238,30 @@ def _split_hicache_size(
     )
 
 
+def _pinned_state_host_gb(hicache_size: float) -> Optional[float]:
+    """SGLANG_HICACHE_MAMBA_SIZE_GB, read only with the runtime master; None keeps
+    the proportional split."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return None
+    pinned = envs.SGLANG_HICACHE_MAMBA_SIZE_GB.get()
+    if pinned is None:
+        return None
+    if not 0 < pinned < hicache_size:
+        raise ValueError(
+            f"SGLANG_HICACHE_MAMBA_SIZE_GB={pinned} must lie in (0, --hicache-size "
+            f"{hicache_size})"
+        )
+    logger.info(
+        "HiCache: the Mamba state host pool takes %s of %s GB "
+        "(SGLANG_HICACHE_MAMBA_SIZE_GB)",
+        pinned,
+        hicache_size,
+    )
+    return float(pinned)
+
+
 def build_pool_entry(
     *,
     name: PoolName,
@@ -1219,9 +1243,14 @@ def build_hybrid_mamba_stack(
     kv_pool = config.root
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (kv_pool, mamba_pool)
-        )
+        pinned = _pinned_state_host_gb(get_memory().hicache_size)
+        if pinned is not None:
+            kv_host_size = get_memory().hicache_size - pinned
+            mamba_host_size = pinned
+        else:
+            kv_host_size, mamba_host_size = _split_hicache_size(
+                get_memory().hicache_size, (kv_pool, mamba_pool)
+            )
     index_bytes = _kv_budget_index_bytes(config)
     if index_bytes and kv_host_size is not None:
         kv_bytes = sum(kv_pool.get_kv_size_bytes())
@@ -1424,7 +1453,30 @@ def build_unified_host_stack(
         envelope = None
 
     host_sizes = {s.name: 0 if s.holds_state else None for s in sub_pools}
+    pinned = None
     if memory.hicache_size > 0 and envelope is None:
+        pinned = _pinned_state_host_gb(memory.hicache_size)
+    if pinned is not None:
+        state = [s.name for s in sub_pools if s.holds_state]
+        if len(state) != 1:
+            raise ValueError(
+                "SGLANG_HICACHE_MAMBA_SIZE_GB needs one recurrent-state sub-pool, "
+                f"got {state}"
+            )
+        rest = [s.name for s in sub_pools if not s.holds_state]
+        shares = dict(
+            zip(
+                rest,
+                _split_hicache_size(
+                    memory.hicache_size - pinned,
+                    tuple(storage.view(name) for name in rest),
+                ),
+            )
+        )
+        host_sizes = {
+            name: pinned if name == state[0] else shares[name] for name in host_sizes
+        }
+    elif memory.hicache_size > 0 and envelope is None:
         host_sizes = dict(
             zip(
                 host_sizes,
