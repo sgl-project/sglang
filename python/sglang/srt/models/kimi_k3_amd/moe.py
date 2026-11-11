@@ -772,6 +772,13 @@ def link_row_sharded_stream_hip(model) -> None:
         later_on_shards = later_on_shards and layer._row_shards is not None
 
 
+def link_hip_paths(model) -> None:
+    """A KimiK3LinearModel's links between its layers' ROCm paths, once every
+    layer is built."""
+    link_column_tails_hip(model)
+    link_row_sharded_stream_hip(model)
+
+
 def link_column_tails_hip(model) -> None:
     """Hand each stream-writing latent MoE of a KimiK3LinearModel the next layer's
     attention read, which its column-parallel tail's all-gather then runs (gfx950

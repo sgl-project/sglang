@@ -131,8 +131,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
 from sglang.srt.models.kimi_k3_amd.moe import (
     KimiK3MoEHipMixin,
-    link_column_tails_hip,
-    link_row_sharded_stream_hip,
+    link_hip_paths,
     row_shard_bank_hooks_hip,
 )
 from sglang.srt.models.kimi_k3_amd.row_shard_o_proj import (
@@ -3347,8 +3346,7 @@ class KimiK3LinearModel(nn.Module):
             ),
         )
         if _is_hip:
-            link_column_tails_hip(self)
-            link_row_sharded_stream_hip(self)
+            link_hip_paths(self)
 
     def forward(
         self,
