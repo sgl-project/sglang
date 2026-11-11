@@ -99,6 +99,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _is_cuda,
     _use_aiter_gfx95,
+    quant_blocks_shared_experts_fusion,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Glm5NextMLP
@@ -1430,6 +1431,19 @@ class Glm5NextForConditionalGeneration(nn.Module):
             return "No shared experts are defined in the config."
         if getattr(text_config, "n_shared_experts", None) != 1:
             return "Shared experts fusion requires exactly one shared expert."
+        # A quantization that keeps the shared experts at a higher precision (a
+        # compressed-tensors ignore entry, a Quark exclusion) cannot share the
+        # routed experts' quantized slot. ModelOpt FP4 is checked per layer below.
+        if (
+            quant_config is not None
+            and quant_config.get_name() != "modelopt_fp4"
+            and quant_blocks_shared_experts_fusion(quant_config)
+        ):
+            return (
+                "Quantization keeps shared experts at a higher precision than the "
+                "routed experts, so they cannot be fused into the quantized "
+                "routed-expert path."
+            )
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             first_sparse_layer = getattr(text_config, "first_k_dense_replace", 0)
             for layer_id in range(first_sparse_layer, text_config.num_hidden_layers):
