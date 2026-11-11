@@ -3185,7 +3185,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         if run_compact:
             target_out = self._run_compact_verify(
                 batch=batch,
-                draft_input=draft_input,
                 layout=layout,
                 draft_tokens=draft_tokens,
                 verify_window=VerifyWindow(
@@ -3468,7 +3467,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         self,
         *,
         batch: ScheduleBatch,
-        draft_input: DFlashDraftInputV2,
         layout: RaggedVerifyLayout,
         draft_tokens: torch.Tensor,
         verify_window: VerifyWindow,
@@ -3476,26 +3474,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         """Verify only verify_lens[i] rows of request i. The logits (still on
         the vocabulary shard when the gather is deferred) and hidden states
         come back in the [bs * block_size] layout."""
-        seq_lens_cpu_backup = batch.seq_lens_cpu
-        seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is None and draft_input.nxt_kv_lens_cpu is not None:
-            batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu - int(self.block_size)
-            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-        try:
-            target_out, _ = self._verify_executor.run_compact(
-                batch=batch,
-                layout=layout,
-                draft_block_ids=draft_tokens,
-                draft_tokens=draft_tokens[:, 1:],
-                bs=int(draft_tokens.shape[0]),
-                device=self.device,
-                # Applied by the caller once the logits are gathered.
-                sampling_info=None,
-                verify_window=verify_window,
-            )
-        finally:
-            batch.seq_lens_cpu = seq_lens_cpu_backup
-            batch.seq_lens_sum = seq_lens_sum_backup
+        target_out, _ = self._verify_executor.run_compact(
+            batch=batch,
+            layout=layout,
+            draft_block_ids=draft_tokens,
+            draft_tokens=draft_tokens[:, 1:],
+            bs=int(draft_tokens.shape[0]),
+            device=self.device,
+            # Applied by the caller once the logits are gathered.
+            sampling_info=None,
+            verify_window=verify_window,
+        )
         return target_out
 
     def _observe_decode_step(

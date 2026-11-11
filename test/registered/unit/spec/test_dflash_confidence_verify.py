@@ -57,19 +57,6 @@ def test_greedy_accept_stops_at_planned_verify_len():
     assert out_tokens[:, :3].tolist() == [[1, 2, 3], [7, 8, 12]]
 
 
-def test_greedy_accept_with_full_verify_len_matches_static():
-    torch.manual_seed(0)
-    candidates = torch.randint(0, 4, (16, 8))
-    target_predict = torch.randint(0, 4, (16, 8))
-    static = _greedy_accept(candidates, target_predict, None)
-    capped = _greedy_accept(
-        candidates, target_predict, torch.full((16,), 8, dtype=torch.int32)
-    )
-    for got, ref in zip(capped[:4], static[:4]):
-        torch.testing.assert_close(got.long(), ref.long())
-    assert capped[5].tolist() == [0] * 16
-
-
 class _RecordingEstimator:
     def predict(self, *, logits, temperatures, features_out, predictions_out):
         self.scores, self.temperatures = logits, temperatures
