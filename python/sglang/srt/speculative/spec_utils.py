@@ -1343,7 +1343,9 @@ def commit_mamba_states_after_verify(
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         ring_indices = None
         if mamba_pool.replayssm_request_ring:
-            ring_indices = batch.req_pool_indices[: replay_state_indices.shape[0]]
+            # The ring rows the forward resolved, never the live request table.
+            assert state_slots.ring is not None, "request-scoped ring without rows"
+            ring_indices = state_slots.ring[: replay_state_indices.shape[0]]
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,
             state_batch_indices=replay_state_indices,

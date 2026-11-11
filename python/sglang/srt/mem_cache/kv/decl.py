@@ -364,16 +364,19 @@ def with_state_replay(
             )
         )
     extras, requests = list(geometry.extra_parts), list(geometry.request_parts)
-    if replay.speculative and not replay.is_kda:
+    if replay.speculative:
+        # A verify's ring never enters a checkpoint (each commit folds what it
+        # accepted into the state): it is the request's, not the slot's.
         requests.extend(ring)
-        requests.extend(
-            TensorPartDecl(name=name, shape=(), dtype=dtype)
-            for name, dtype in (
-                ("replayssm_spec_write_pos", torch.int32),
-                ("replayssm_cache_base", torch.int32),
-                ("replayssm_is_flush", torch.int8),
+        if not replay.is_kda:
+            requests.extend(
+                TensorPartDecl(name=name, shape=(), dtype=dtype)
+                for name, dtype in (
+                    ("replayssm_spec_write_pos", torch.int32),
+                    ("replayssm_cache_base", torch.int32),
+                    ("replayssm_is_flush", torch.int8),
+                )
             )
-        )
     else:
         extras.extend(ring)
     if replay.decode:

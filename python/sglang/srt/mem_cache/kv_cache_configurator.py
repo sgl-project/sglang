@@ -1060,17 +1060,6 @@ class KVCacheConfigurator:
             replay_spec = mamba.enable_linear_replayssm_spec and (
                 self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
             )
-            if (
-                replay_spec
-                and cache_params.is_kda
-                and get_disagg().disaggregation_mode != "null"
-            ):
-                raise ValueError(
-                    "Unified KDA speculative ReplaySSM does not support PD "
-                    "disaggregation: prefill and decode have different state "
-                    "entry layouts. Disable --enable-linear-replayssm-spec "
-                    "or --enable-unified-memory."
-                )
             if mamba.enable_linear_replayssm or replay_spec:
                 geometry = with_state_replay(
                     geometry,
