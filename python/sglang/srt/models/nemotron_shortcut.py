@@ -333,6 +333,30 @@ class NemotronShortcutIndexer(nn.Module):
         )
 
 
+def _check_clamped_relu2_backend() -> None:
+    """The experts' soft-clamped squared ReLU runs only on Marlin (W4A16) and on
+    FlashInfer's CuTe-DSL NVFP4 MoE (FlashInfer >= 0.7.4)."""
+    backend = get_moe_runner_backend()
+    if backend.is_marlin():
+        return
+    if backend.is_flashinfer_cutedsl():
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+            cutedsl_supports_clamped_relu2,
+        )
+
+        if cutedsl_supports_clamped_relu2():
+            return
+        raise ValueError(
+            "Nemotron Shortcut's soft-clamped squared-ReLU experts need "
+            "FlashInfer >= 0.7.4 for "
+            "--moe-runner-backend flashinfer_cutedsl."
+        )
+    raise ValueError(
+        "Nemotron Shortcut experts use a soft-clamped squared ReLU; launch with "
+        "--moe-runner-backend marlin or flashinfer_cutedsl."
+    )
+
+
 class NemotronShortcutMoE(nn.Module):
     """Latent MoE: route at model width, run the experts in the latent space,
     RMSNorm the latent sum, project back; the shared expert reads its own input."""
@@ -357,12 +381,8 @@ class NemotronShortcutMoE(nn.Module):
             torch.empty(config.n_routed_experts, dtype=torch.float32)
         )
         clamp_value = config.activation_clamp_value
-        if clamp_value is not None and not get_moe_runner_backend().is_marlin():
-            raise ValueError(
-                "Nemotron Shortcut experts use a soft-clamped squared ReLU that only the "
-                "Marlin "
-                "NVFP4 MoE implements; launch with --moe-runner-backend marlin."
-            )
+        if clamp_value is not None:
+            _check_clamped_relu2_backend()
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
