@@ -1,3 +1,4 @@
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -7,25 +8,21 @@ from transformers.activations import ACT2FN
 from sglang.srt.configs.step3p7 import Step3p7Config
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.step3_vl_10b import PerceptionEncoder
 from sglang.srt.models.step3p5 import Step3p5ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.utils import add_prefix
+from sglang.srt.multimodal.modality import Modality
 
 
 class Step3p7ForConditionalGeneration(nn.Module):
-
     # NVFP4 checkpoints (e.g. huangyu-nv/step3p7-nvfp4-moe-only-kvfp8) use
     # "model.language_model." prefix, while sglang parameters are named
     # "language_model.model.". This mapper remaps the quantization ignore
@@ -129,9 +126,8 @@ class Step3p7ForConditionalGeneration(nn.Module):
             )
         return self._flatten_embeddings(merged_image_features)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def forward(
         self,

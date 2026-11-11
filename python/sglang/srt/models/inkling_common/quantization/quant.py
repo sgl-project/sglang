@@ -7,7 +7,8 @@ import torch
 
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.utils import ceil_div, set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.utils import ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.models.inkling_common.quantization.config import (
@@ -50,9 +51,9 @@ class InklingNvfp4MoEMethod(InklingMoEMethodBase):
 
         from sglang.srt.models.inkling_common.dense_mlp import InklingBatchDenseMLP
 
-        assert isinstance(
-            layer, InklingBatchDenseMLP
-        ), "InklingNvfp4MoEMethod is only used for InklingBatchDenseMLP (shared experts)"
+        assert isinstance(layer, InklingBatchDenseMLP), (
+            "InklingNvfp4MoEMethod is only used for InklingBatchDenseMLP (shared experts)"
+        )
 
         w13_up_dim = 2 * intermediate_size_per_partition
 

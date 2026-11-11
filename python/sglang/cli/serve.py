@@ -3,7 +3,10 @@
 import argparse
 import logging
 import os
+import shlex
 
+from sglang.cli.interactive import recipes_for_this_machine, run_guide
+from sglang.cli.main import COOKBOOK_EPILOG
 from sglang.cli.serve_backends import (
     SERVE_BACKEND_API_VERSION,
     ServeBackend,
@@ -11,9 +14,15 @@ from sglang.cli.serve_backends import (
     ServeBackendRegistry,
     ServeRequest,
 )
-from sglang.cli.utils import get_is_diffusion_model, get_model_path, try_get_model_path
+from sglang.cli.utils import (
+    get_is_diffusion_model,
+    get_model_path,
+    get_pipeline_class_name,
+    is_registered_native_pipeline,
+    try_get_model_path,
+)
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.common import suppress_noisy_warnings
+from sglang.srt.utils.log_utils import suppress_noisy_warnings
 
 suppress_noisy_warnings()
 
@@ -104,6 +113,10 @@ def _detect_diffusion(request: ServeRequest) -> ServeBackendDetection:
         return ServeBackendDetection.UNKNOWN
     if get_is_diffusion_model(request.model_path):
         return ServeBackendDetection.MATCH
+    # A native diffusion pipeline selected by name (e.g. FLUX.3's package
+    # directory, which has no model_index.json) is a diffusion request too.
+    if is_registered_native_pipeline(get_pipeline_class_name(list(request.argv))):
+        return ServeBackendDetection.MATCH
     return ServeBackendDetection.NO_MATCH
 
 
@@ -111,6 +124,10 @@ def _run_diffusion(request: ServeRequest) -> None:
     if any(arg in request.argv for arg in ("-h", "--help")):
         _print_diffusion_help(request)
         return
+
+    from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
+
+    apply_plugin_hooks()
 
     from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
         add_multimodal_gen_serve_args,
@@ -153,7 +170,12 @@ def _print_general_help(registry: ServeBackendRegistry) -> None:
         f"Optional override: --model-type {{{available}}} "
         "(default: auto, fallback to LLM when no backend matches).\n"
         "Use `sglang serve --model-type BACKEND --help` for backend-specific "
-        "help."
+        "help.\n\n"
+        "`sglang serve MODEL` with no other arguments runs the CLI Guide: it picks "
+        "the Cookbook command for the visible GPUs, prints it, and launches it. "
+        "Without a Cookbook command for those GPUs, it launches with the default "
+        "flags.\n"
+        "--dry-run prints the command without launching it."
     )
 
     print("\n--- Help for Standard Language Model Server ---")
@@ -166,6 +188,8 @@ def _print_general_help(registry: ServeBackendRegistry) -> None:
 def serve(args, extra_argv):
     del args  # The top-level parser currently has no serve-owned fields.
 
+    dry_run = "--dry-run" in extra_argv
+    extra_argv = [arg for arg in extra_argv if arg != "--dry-run"]
     backend_name, dispatch_argv = _extract_model_type_override(extra_argv)
     dispatch_argv, positional_model_path = _normalize_positional_model_path(
         dispatch_argv
@@ -182,6 +206,9 @@ def serve(args, extra_argv):
             _print_general_help(registry)
         else:
             registry.get(backend_name).backend.run(request)
+        # Printed here rather than as a backend parser's epilog so it appears
+        # exactly once, after whichever backend help ran.
+        print(f"\n{COOKBOOK_EPILOG}")
         return
 
     from sglang.srt.plugins import load_plugins
@@ -195,12 +222,26 @@ def serve(args, extra_argv):
         else:
             registered = registry.get(backend_name)
             logger.info(
-                "Dispatch override enabled: --model-type=%s " "(skip auto detection)",
+                "Dispatch override enabled: --model-type=%s (skip auto detection)",
                 backend_name,
             )
 
+        if (
+            registered.name == "llm"
+            and len(extra_argv) == 1
+            and not extra_argv[0].startswith("-")
+        ):
+            recipes = recipes_for_this_machine(extra_argv[0])
+            if recipes:
+                run_guide(model=extra_argv[0], recipes=recipes, dry_run=dry_run)
+                return
+
         if registered.backend.requires_model_path and request.model_path is None:
             get_model_path(request.argv)  # Raise the existing actionable CLI error.
+
+        if dry_run:
+            print(shlex.join(["sglang", "serve", *extra_argv]))
+            return
 
         registered.backend.run(request)
     finally:

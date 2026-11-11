@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -192,11 +193,8 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
                     # forward branch in UnquantizedFusedMoEMethod). The loader's
                     # shared_w13 [up||gate] swap keys on the same predicate.
                     # Routed quant-EXCLUDED bf16 layers keep the triton runner.
-                    return UnquantizedFusedMoEMethod(
-                        use_triton_kernels=False,
-                        use_flashinfer_trtllm_moe=True,
-                    )
-                return UnquantizedFusedMoEMethod(use_triton_kernels=False)
+                    return UnquantizedFusedMoEMethod(use_flashinfer_trtllm_moe=True)
+                return UnquantizedFusedMoEMethod()
             logger.debug(f"quantizing fused MoE layer: {prefix}")
             # Upstream ModelOpt NVFP4 fused-MoE method. It de-interleaves the Inkling
             # interleaved-w13 layout when the layer sets inference_moe_w13_interleaved.
@@ -226,7 +224,6 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
     def maybe_from_model_config(
         cls, model_config: ModelConfig
     ) -> InklingModelOptNvfp4Config | None:
-        from sglang.srt.runtime_context import get_parallel
 
         raw_quant_config = _get_raw_quant_config(model_config)
 

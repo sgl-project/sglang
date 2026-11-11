@@ -16,7 +16,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
@@ -42,9 +42,9 @@ class WhisperAttention(torch.nn.Module):
         self.is_encoder = is_encoder
 
         tp_size = get_parallel().tp_size
-        assert (
-            num_heads % tp_size == 0
-        ), f"num_heads ({num_heads}) must be divisible by tp_size ({tp_size})"
+        assert num_heads % tp_size == 0, (
+            f"num_heads ({num_heads}) must be divisible by tp_size ({tp_size})"
+        )
         self.num_heads = num_heads // tp_size
 
         if (head_dim * num_heads) != embed_dim:
@@ -262,7 +262,6 @@ class WhisperDecoderLayer(torch.nn.Module):
 
 
 class WhisperEncoder(torch.nn.Module):
-
     def __init__(
         self, config: WhisperConfig, quant_config: Optional[QuantizationConfig] = None
     ):
@@ -314,7 +313,6 @@ class WhisperEncoder(torch.nn.Module):
 
 
 class WhisperDecoder(torch.nn.Module):
-
     def __init__(
         self, config: WhisperConfig, quant_config: Optional[QuantizationConfig] = None
     ):
@@ -362,7 +360,6 @@ class WhisperDecoder(torch.nn.Module):
 
 
 class WhisperForConditionalGeneration(torch.nn.Module):
-
     def __init__(
         self, config: WhisperConfig, quant_config: Optional[QuantizationConfig] = None
     ):

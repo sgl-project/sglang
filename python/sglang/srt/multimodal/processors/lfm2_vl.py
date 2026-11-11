@@ -14,8 +14,9 @@
 
 from typing import List, Union
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.lfm2_vl import Lfm2VlForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -74,7 +75,7 @@ class Lfm2VlImageProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 

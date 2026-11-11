@@ -8,7 +8,9 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -25,8 +27,10 @@ def _make_req(rid, origin_input_text, origin_input_ids, sampling_params=None, **
 
 
 class TestSchedulePolicy(CustomTestCase):
-
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="test")
         self.tree_cache = RadixCache.create_simulated()
 
     def test_init_with_cache_aware_policy(self):
@@ -85,7 +89,7 @@ class TestSchedulePolicy(CustomTestCase):
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        policy.calc_priority(waiting_queue)
+        waiting_queue = policy.calc_priority(waiting_queue)
         # Check if FCFS keeps the original order
         self.assertEqual(waiting_queue[0].rid, 1)
         self.assertEqual(waiting_queue[1].rid, 3)
@@ -109,7 +113,7 @@ class TestSchedulePolicy(CustomTestCase):
             enable_priority_scheduling=True,
             schedule_low_priority_values_first=False,
         )
-        policy.calc_priority(waiting_queue)
+        waiting_queue = policy.calc_priority(waiting_queue)
 
         # Check if priority enabled fcfs ordering is applied.
         self.assertEqual(waiting_queue[0].rid, 1)
@@ -136,7 +140,7 @@ class TestSchedulePolicy(CustomTestCase):
             enable_priority_scheduling=True,
             schedule_low_priority_values_first=True,
         )
-        policy.calc_priority(waiting_queue)
+        waiting_queue = policy.calc_priority(waiting_queue)
         # Check if priority enabled fcfs ordering is applied.
         self.assertEqual(waiting_queue[0].rid, 1)
         self.assertEqual(waiting_queue[1].rid, 2)
@@ -158,7 +162,7 @@ class TestSchedulePolicy(CustomTestCase):
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        policy.calc_priority(waiting_queue)
+        waiting_queue = policy.calc_priority(waiting_queue)
         # Check if priority enabled fcfs ordering is applied.
         self.assertEqual(waiting_queue[0].rid, 1)
         self.assertEqual(waiting_queue[1].rid, 2)
@@ -182,7 +186,7 @@ class TestSchedulePolicy(CustomTestCase):
             enable_priority_scheduling=True,
             schedule_low_priority_values_first=False,
         )
-        policy.calc_priority(waiting_queue)
+        waiting_queue = policy.calc_priority(waiting_queue)
         # Check if priority enabled fcfs ordering is applied.
         self.assertEqual(waiting_queue[0].rid, 1)
         self.assertEqual(waiting_queue[1].rid, 2)
@@ -208,7 +212,7 @@ class TestSchedulePolicy(CustomTestCase):
             enable_priority_scheduling=True,
             schedule_low_priority_values_first=True,
         )
-        policy.calc_priority(waiting_queue)
+        waiting_queue = policy.calc_priority(waiting_queue)
         # Check if priority enabled fcfs ordering is applied.
         self.assertEqual(waiting_queue[0].rid, 1)
         self.assertEqual(waiting_queue[1].rid, 2)
@@ -238,7 +242,7 @@ class TestSchedulePolicy(CustomTestCase):
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        policy.calc_priority(waiting_queue, running_batch)
+        waiting_queue = policy.calc_priority(waiting_queue, running_batch)
 
         self.assertEqual(waiting_queue[0].rid, "w2")
         self.assertEqual(waiting_queue[1].rid, "w1")
@@ -266,7 +270,7 @@ class TestSchedulePolicy(CustomTestCase):
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        policy.calc_priority(waiting_queue, running_batch)
+        waiting_queue = policy.calc_priority(waiting_queue, running_batch)
 
         self.assertEqual(waiting_queue[0].rid, "w2")
         self.assertEqual(waiting_queue[1].rid, "w1")
@@ -295,7 +299,7 @@ class TestSchedulePolicy(CustomTestCase):
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        policy.calc_priority(waiting_queue, running_batch)
+        waiting_queue = policy.calc_priority(waiting_queue, running_batch)
 
         self.assertEqual(waiting_queue[0].rid, "w3")
         self.assertEqual(waiting_queue[1].rid, "w1")
@@ -320,7 +324,7 @@ class TestSchedulePolicy(CustomTestCase):
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
-        policy.calc_priority(waiting_queue, running_batch)
+        waiting_queue = policy.calc_priority(waiting_queue, running_batch)
 
         self.assertEqual(waiting_queue[0].rid, "w1")
         self.assertEqual(waiting_queue[1].rid, "w2")

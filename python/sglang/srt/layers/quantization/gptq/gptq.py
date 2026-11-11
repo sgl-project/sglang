@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.utils import (
     get_linear_quant_method,
     get_scalar_types,
 )
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from .schemes import (
@@ -28,6 +29,8 @@ from .schemes import (
     GPTQMarlinLinearScheme,
     GPTQMarlinMoEScheme,
     GPTQMoEAscendScheme,
+    GPTQTritonLinearScheme,
+    GPTQXPULinearScheme,
 )
 
 if TYPE_CHECKING:
@@ -181,6 +184,8 @@ class GPTQConfig(QuantizationConfig):
         )
 
     def get_linear_scheme(self, layer: torch.nn.Module):
+        if is_hip():
+            return GPTQTritonLinearScheme(self)
         return GPTQLinearScheme(self)
 
     def get_moe_scheme(self, layer: torch.nn.Module):
@@ -261,6 +266,35 @@ class CPUGPTQConfig(GPTQConfig):
         return GPTQIntelAMXMoEScheme(self)
 
 
+class GPTQXPUConfig(GPTQConfig):
+    """Config class for GPTQ on Intel XPU.
+
+    Dense int4 GPTQ lowers to torch's native
+    ``_weight_int4pack_mm_with_scales_and_zeros`` op (no Marlin on XPU). MoE is
+    out of scope for the dense phase.
+    """
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return [torch.half, torch.bfloat16]
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[LinearMethodBase]:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, FusedMoE):
+            raise NotImplementedError(
+                "GPTQ MoE is not yet supported on XPU (dense-only phase)."
+            )
+        return get_linear_quant_method(
+            self, layer, prefix=prefix, linear_method_cls=GPTQLinearMethod
+        )
+
+    def get_linear_scheme(self, layer: torch.nn.Module):
+        return GPTQXPULinearScheme(self)
+
+
 class GPTQMarlinConfig(QuantizationConfig):
     """Config class for GPTQ Marlin"""
 
@@ -322,7 +356,7 @@ class GPTQMarlinConfig(QuantizationConfig):
 
         if (weight_bits, is_sym) not in self.TYPE_MAP:
             raise ValueError(
-                "Unsupported quantization config: " f"bits={weight_bits}, sym={is_sym}"
+                f"Unsupported quantization config: bits={weight_bits}, sym={is_sym}"
             )
 
         # (num_bits, is_sym) -> quant_type
@@ -497,7 +531,6 @@ class GPTQLinearMethod(LinearMethodBase):
 
 
 class GPTQMoEMethod(FusedMoEMethodBase):
-
     def __init__(self, quant_config: GPTQConfig):
         super().__init__()
         self.quant_config = quant_config
@@ -529,6 +562,9 @@ class GPTQMoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         layer.scheme.create_moe_runner(layer, moe_runner_config)
+
+    def get_moe_runner_backend(self, layer):
+        return layer.scheme.get_moe_runner_backend(layer)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
@@ -622,6 +658,9 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
     ):
         layer.scheme.create_moe_runner(layer, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return layer.scheme.get_moe_runner_backend(layer)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -632,18 +671,8 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
 
 # Register fake implementations for torch.compile support. The decorator is a
 # no-op when the custom op is unavailable on the current platform.
-@register_fake_if_exists("sgl_kernel::gptq_gemm")
-def _(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit):
-    return a.new_empty((a.shape[0], b_q_weight.shape[-1]), dtype=a.dtype)
-
-
 @register_fake_if_exists("sgl_kernel::gptq_marlin_repack")
 def _(b_q_weight, perm, size_k, size_n, num_bits):
     return b_q_weight.new_empty(
         (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
     )
-
-
-@register_fake_if_exists("sgl_kernel::gptq_shuffle")
-def _(q_weight, q_perm, bit):
-    return

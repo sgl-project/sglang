@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MiniMax H3 cfg-distilled full denoise loop.
+"""MiniMax H3 full denoise loops.
 
-Per step, the positive presentation is forwarded exactly once. Video and audio
-target rows chain through the Euler-eta0 update while visual and audio condition
-rows stay pinned to their noised step-0 anchors.
+Video (cfg-distilled): per step, the positive presentation is forwarded exactly
+once. Video and audio target rows chain through the Euler-eta0 update while
+visual and audio condition rows stay pinned to their noised step-0 anchors.
+
+Image (t2i/edit, PDD checkpoints): one positive branch per step and a plain
+Euler update on the target rows; see ``minimax_h3_image_denoise_loop``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
@@ -20,6 +25,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_ulysses_ctx,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionMetadata,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    set_forward_context,
+)
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 # ref2va audio reference anchor timestep
@@ -28,6 +39,69 @@ MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
 # (24 * 1 * 2 * 2 = 96); audio rows carry the 32-dim audio latent.
 MINIMAX_H3_VIDEO_ROW_WIDTH = 96
 MINIMAX_H3_AUDIO_ROW_WIDTH = 32
+_MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE = 64
+
+
+def _minimax_h3_subblock_video_query_indices(
+    packed: dict[str, torch.Tensor],
+    text_video_token_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Return packed video rows plus any Qwen rows marked as video."""
+    latent_video_pos = packed["video_pos"].view(-1).to(dtype=torch.long)
+    if text_video_token_mask is None:
+        return latent_video_pos
+    text_pos = packed["text_pos"].view(-1).to(dtype=torch.long)
+    text_video_token_mask = text_video_token_mask.view(-1).to(
+        device=text_pos.device,
+        dtype=torch.bool,
+    )
+    if text_video_token_mask.shape[0] != text_pos.shape[0]:
+        raise ValueError(
+            "text_video_token_mask must align with packed text rows "
+            f"({text_pos.shape[0]}), got {text_video_token_mask.shape[0]}"
+        )
+    return torch.cat([text_pos[text_video_token_mask], latent_video_pos])
+
+
+def _minimax_h3_subblock_sparse_query_block_mask(
+    video_query_indices: torch.Tensor,
+    *,
+    used_len: int,
+) -> torch.Tensor:
+    """Return True for pure-video 64-row Q blocks and False otherwise."""
+    if used_len < 0:
+        raise ValueError(f"used_len must be non-negative, got {used_len}")
+    if video_query_indices.ndim != 1:
+        raise ValueError(
+            f"video_query_indices must be rank 1, got {list(video_query_indices.shape)}"
+        )
+    video_query_indices = video_query_indices.to(dtype=torch.long)
+    if video_query_indices.numel():
+        first = int(video_query_indices.min())
+        last = int(video_query_indices.max())
+        if first < 0 or last >= used_len:
+            raise ValueError(
+                "video_query_indices must be first-segment-relative and in "
+                f"[0, {used_len}), got min={first}, max={last}"
+            )
+        if torch.unique(video_query_indices).numel() != video_query_indices.numel():
+            raise ValueError("video_query_indices must not contain duplicates")
+    block_size = _MINIMAX_H3_SUBBLOCK_QUERY_BLOCK_SIZE
+    num_query_blocks = -(-used_len // block_size)
+    video_rows_per_block = torch.bincount(
+        torch.div(video_query_indices, block_size, rounding_mode="floor"),
+        minlength=num_query_blocks,
+    )
+    block_ids = torch.arange(
+        num_query_blocks, device=video_query_indices.device, dtype=torch.long
+    )
+    real_rows_per_block = (used_len - block_ids * block_size).clamp(
+        min=0, max=block_size
+    )
+    # BSA is block-granular. Only blocks whose real rows are all video may use
+    # the sparse budget; mixed boundary blocks stay dense so their non-video
+    # rows retain exact attention in the single heterogeneous BSA call.
+    return video_rows_per_block == real_rows_per_block
 
 
 @torch.inference_mode()
@@ -48,6 +122,30 @@ def _minimax_h3_update_target_rows_(
     torch.mul(one_minus_sigma_ratio, denoised_scratch, out=velocity)
     torch.mul(sigma_ratio, state, out=state)
     torch.add(state, velocity, out=state)
+
+
+@torch.inference_mode()
+def _minimax_h3_renoise_target_rows_(
+    state: torch.Tensor,
+    velocity: torch.Tensor,
+    *,
+    sigma: float,
+    sigma_next: float,
+    generator: torch.Generator,
+) -> None:
+    """Few-step re-noising update, in place and in fp32.
+
+    ``x0 = x + sigma * v`` from the grid sigma, then
+    ``x_next = (1 - sigma_next) * x0 + sigma_next * noise`` with fresh noise.
+    The terminal ``sigma_next == 0`` returns ``x0`` and draws nothing.
+    """
+    state.add_(velocity, alpha=sigma)
+    if sigma_next == 0.0:
+        return
+    noise = torch.randn(
+        state.shape, generator=generator, device=state.device, dtype=torch.float32
+    )
+    state.mul_(1.0 - sigma_next).add_(noise, alpha=sigma_next)
 
 
 def _build_local_embedding_layout(
@@ -95,7 +193,9 @@ class MiniMaxH3DenoiseBranch:
 
     `packed` is a minimax_h3_packed_sequence(...) result (or equivalent layout
     dict); `text_embeddings` is the branch's [text_len, 5120] hidden states;
-    `token_tags` must already carry any fl2va vision-span overrides.
+    `token_tags` must already carry any fl2va vision-span overrides, and
+    `video_query_indices` explicitly identifies the only rows eligible for
+    SubBlock sparsity.
     """
 
     def __init__(
@@ -105,6 +205,7 @@ class MiniMaxH3DenoiseBranch:
         text_embeddings: torch.Tensor,
         token_tags: torch.Tensor,
         device: torch.device,
+        video_query_indices: torch.Tensor | None = None,
     ) -> None:
         seq_len = int(packed["seq_len"])
         self.seq_len = seq_len
@@ -183,6 +284,14 @@ class MiniMaxH3DenoiseBranch:
         sp_world_size = ulysses_world_size * ring_world_size
         sp_rank = ring_rank * ulysses_world_size + ulysses_rank
         token_tags_host = token_tags.view(-1).to(dtype=torch.long)
+        subblock_sparse_query_block_mask = (
+            _minimax_h3_subblock_sparse_query_block_mask(
+                video_query_indices.view(-1).to(dtype=torch.long),
+                used_len=int(cu[1]),
+            ).to(device)
+            if video_query_indices is not None
+            else None
+        )
         local_seq_len = seq_len // sp_world_size
         local_row_start = sp_rank * local_seq_len
         local_row_stop = local_row_start + local_seq_len
@@ -228,6 +337,10 @@ class MiniMaxH3DenoiseBranch:
                 "max_seqlen_q": text_len,
             },
         }
+        if subblock_sparse_query_block_mask is not None:
+            self.static_kwargs["subblock_sparse_query_block_mask"] = (
+                subblock_sparse_query_block_mask
+            )
 
     def forward_kwargs(
         self,
@@ -235,6 +348,7 @@ class MiniMaxH3DenoiseBranch:
         video_rows: torch.Tensor,
         audio_rows: torch.Tensor,
         step_timesteps: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        adaln_slot: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         x = self.x_buffer
         audio_x = self.audio_x_buffer
@@ -257,7 +371,7 @@ class MiniMaxH3DenoiseBranch:
                 0, self.audio_target_seq_idx, audio_rows[self.audio_target_slice]
             )
         unique_timesteps, inverse_indices, block_combined_indices = step_timesteps
-        return {
+        kwargs = {
             **self.static_kwargs,
             "x": x,
             "audio_x": audio_x,
@@ -265,6 +379,11 @@ class MiniMaxH3DenoiseBranch:
             "inverse_indices": inverse_indices,
             "block_combined_indices": block_combined_indices,
         }
+        if adaln_slot is not None:
+            # Device scalar, never a Python int: an int would key one breakable
+            # CUDA graph per slot value and go stale when LRU reuses the slot.
+            kwargs["adaln_cache_slot"] = adaln_slot
+        return kwargs
 
     def _expand_step_timesteps(
         self,
@@ -334,6 +453,9 @@ class MiniMaxH3DenoiseBranch:
         audio_timesteps: list[float],
         imgvid_cond_noise_aug: float,
         audio_ref_cond_noise_aug: float,
+        # True: condition rows keep ``imgvid_cond_noise_aug`` on every step
+        # instead of ``max(t, imgvid_cond_noise_aug)``.
+        pin_imgvid_cond: bool = False,
     ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Stage every step's packed timestep state before denoising."""
         if len(video_timesteps) != len(audio_timesteps):
@@ -344,7 +466,9 @@ class MiniMaxH3DenoiseBranch:
             self._expand_step_timesteps(
                 t_video=t_video,
                 t_audio=t_audio,
-                imgvid_cond_timestep=max(t_video, imgvid_cond_noise_aug),
+                imgvid_cond_timestep=imgvid_cond_noise_aug
+                if pin_imgvid_cond
+                else max(t_video, imgvid_cond_noise_aug),
                 audio_ref_cond_timestep=max(t_audio, audio_ref_cond_noise_aug),
                 inverse_indices_by_pattern=inverse_indices_by_pattern,
                 block_combined_by_pattern=block_combined_by_pattern,
@@ -369,8 +493,11 @@ def minimax_h3_denoise_loop(
     device: torch.device,
     imgvid_cond_noise_aug_for_inference: float = MINIMAX_H3_IMGVID_COND_TIMESTEP,
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
+    attn_metadata: AttentionMetadata | None = None,
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
+    rollout_ctx=None,
+    renoise_generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -380,12 +507,16 @@ def minimax_h3_denoise_loop(
     update signal; MiniMax H3 only supports cfg-distilled checkpoints.
     ``model_forward`` is the native-stage hook for residency/BCG runners and
     receives the zero-based loop step; the default keeps this helper
-    independently testable with a plain callable.
+    independently testable with a plain callable. ``renoise_generator``
+    switches both modalities from the Euler blend to the few-step re-noising
+    update, drawing each step's fresh noise from it, video rows first.
     """
     if len(sigmas_video) != len(sigmas_audio):
         raise ValueError("video/audio sigma schedules must have equal length")
     if len(sigmas_video) < 2:
         raise ValueError("sigma schedules need at least 2 entries")
+    if renoise_generator is not None and rollout_ctx is not None:
+        raise ValueError("re-noising sampling does not support rollout")
     n_cond = positive.video_target_start
     if keyframe_cond_rows is None:
         if n_cond != 0:
@@ -452,7 +583,7 @@ def minimax_h3_denoise_loop(
     # Every step's timesteps are settled by now. Rebuilding AdaLN reads all
     # 24.2 GiB of adaln_proj whatever is missing, so fill the whole request in
     # one pass here instead of topping up step by step inside the loop.
-    model.prepare_adaln_plans([entry[0] for entry in timestep_plan])
+    adaln_plan_slots = model.prepare_adaln_plans([entry[0] for entry in timestep_plan])
 
     # match the scheduler's device-fp32 math once, then reuse one denoised
     # scratch per modality instead of allocating intermediates every step
@@ -466,18 +597,41 @@ def minimax_h3_denoise_loop(
     audio_one_minus_sigma_ratios = 1.0 - audio_sigma_ratios
     video_denoised_scratch = torch.empty_like(video_rows[video_target_slice])
     audio_denoised_scratch = torch.empty_like(audio_rows[audio_target_slice])
+    if rollout_ctx is not None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
+            minimax_h3_rollout_update_video_target,
+        )
+
+        rollout_ctx.batch._h3_rollout_sigma_max = float(max(sigmas_video))
+        video_target = video_rows[video_target_slice]
+        rollout_ctx.collector.record_initial(video_target.detach().clone())
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
             s_v = sigmas_video[step]
             s_a = sigmas_audio[step]
+            s_n_v = sigmas_video[step + 1]
+            if rollout_ctx is not None:
+                rollout_ctx.batch._rollout_loop_step_index = step
 
             fk = positive.forward_kwargs(
                 video_rows=video_rows,
                 audio_rows=audio_rows,
                 step_timesteps=timestep_plan[step],
+                adaln_slot=(
+                    None if adaln_plan_slots is None else adaln_plan_slots[step]
+                ),
             )
-            with torch.inference_mode():
+            if attn_metadata is not None:
+                attn_metadata.current_timestep = step
+            if model_forward is None and attn_metadata is not None:
+                forward_cm: AbstractContextManager = set_forward_context(
+                    current_timestep=step,
+                    attn_metadata=attn_metadata,
+                )
+            else:
+                forward_cm = nullcontext()
+            with forward_cm, torch.inference_mode():
                 if model_forward is None:
                     v_video, v_audio = model(**fk)
                 else:
@@ -489,30 +643,203 @@ def minimax_h3_denoise_loop(
                 mv_audio_t = v_audio[audio_target_slice].float()
 
                 video_target = video_rows[video_target_slice]
-                _minimax_h3_update_target_rows_(
-                    video_target,
-                    mv_video_t,
-                    sigma_t=video_sigma_t[step],
-                    sigma_curr=s_v,
-                    sigma_ratio=video_sigma_ratios[step],
-                    one_minus_sigma_ratio=video_one_minus_sigma_ratios[step],
-                    denoised_scratch=video_denoised_scratch,
-                )
+                if rollout_ctx is not None:
+                    (
+                        updated,
+                        log_sum,
+                        log_count,
+                        rollout_ctx.noise_buffer,
+                    ) = minimax_h3_rollout_update_video_target(
+                        video_target,
+                        mv_video_t,
+                        sigma_curr=s_v,
+                        sigma_next=s_n_v,
+                        batch=rollout_ctx.batch,
+                        generator=rollout_ctx.generator,
+                        loop_step_index=step,
+                        noise_buffer=rollout_ctx.noise_buffer,
+                    )
+                    video_target.copy_(updated)
+                    rollout_ctx.collector.record_step(
+                        video_target.detach().clone(),
+                        log_sum,
+                        log_count,
+                    )
+                elif renoise_generator is not None:
+                    _minimax_h3_renoise_target_rows_(
+                        video_target,
+                        mv_video_t,
+                        sigma=s_v,
+                        sigma_next=s_n_v,
+                        generator=renoise_generator,
+                    )
+                else:
+                    _minimax_h3_update_target_rows_(
+                        video_target,
+                        mv_video_t,
+                        sigma_t=video_sigma_t[step],
+                        sigma_curr=s_v,
+                        sigma_ratio=video_sigma_ratios[step],
+                        one_minus_sigma_ratio=video_one_minus_sigma_ratios[step],
+                        denoised_scratch=video_denoised_scratch,
+                    )
 
                 audio_target = audio_rows[audio_target_slice]
-                _minimax_h3_update_target_rows_(
-                    audio_target,
-                    mv_audio_t,
-                    sigma_t=audio_sigma_t[step],
-                    sigma_curr=s_a,
-                    sigma_ratio=audio_sigma_ratios[step],
-                    one_minus_sigma_ratio=audio_one_minus_sigma_ratios[step],
-                    denoised_scratch=audio_denoised_scratch,
-                )
+                if renoise_generator is not None:
+                    _minimax_h3_renoise_target_rows_(
+                        audio_target,
+                        mv_audio_t,
+                        sigma=s_a,
+                        sigma_next=sigmas_audio[step + 1],
+                        generator=renoise_generator,
+                    )
+                else:
+                    _minimax_h3_update_target_rows_(
+                        audio_target,
+                        mv_audio_t,
+                        sigma_t=audio_sigma_t[step],
+                        sigma_curr=s_a,
+                        sigma_ratio=audio_sigma_ratios[step],
+                        one_minus_sigma_ratio=audio_one_minus_sigma_ratios[step],
+                        denoised_scratch=audio_denoised_scratch,
+                    )
             if on_step is not None:
                 on_step(step, video_rows, audio_rows)
 
     return video_rows, audio_rows
+
+
+@dataclass(frozen=True)
+class PackedBranchInputs:
+    """One image branch: packed layout, text states and tags, attention metadata."""
+
+    packed: dict[str, Any]
+    text_embeddings: torch.Tensor
+    token_tags: torch.Tensor
+    attn_metadata: AttentionMetadata | None = None
+
+
+@torch.inference_mode()
+def minimax_h3_image_denoise_loop(
+    *,
+    model: Any,
+    model_forward: (
+        Callable[[Any, dict[str, Any], int], tuple[torch.Tensor, torch.Tensor]] | None
+    ) = None,
+    positive: PackedBranchInputs,
+    initial_video_rows: torch.Tensor,
+    keyframe_cond_rows: torch.Tensor | None,
+    sigmas: Sequence[float],
+    device: torch.device,
+    imgvid_cond_noise_aug_for_inference: float = MINIMAX_H3_IMGVID_COND_TIMESTEP,
+    on_step: Callable[[int], None] | None = None,
+    step_profiler: Callable[[int], AbstractContextManager] | None = None,
+    prepare_branch: Callable[[MiniMaxH3DenoiseBranch], None] | None = None,
+    adaln_sigmas: Sequence[float] | None = None,
+    prewarm_both_tasks: bool = False,
+) -> torch.Tensor:
+    """Return fp32 image rows after ``len(sigmas) - 1`` positive-branch steps.
+
+    Each step forwards the positive branch once and steps only the target
+    rows, with the plain Euler update the PDD heads were distilled with:
+    ``x + dt * v`` with the fp32 ``dt = sigma_k - sigma_{k+1}``. Reference rows
+    are restored from their noised anchors on every step, and their
+    conditioning timestep stays fixed at ``imgvid_cond_noise_aug_for_inference``.
+    ``adaln_sigmas`` may extend this prefix to prewarm a whole grid when the
+    cache can hold it; the extra plans do not add model forwards or Euler steps.
+    ``prewarm_both_tasks`` also reserves the other image task's plans when
+    both tasks are declared and the cache can hold both grids.
+    """
+    sigmas = [float(sigma) for sigma in sigmas]
+    cond_t = float(imgvid_cond_noise_aug_for_inference)
+    n_cond = int((~positive.packed["update_mask"]).sum())
+    branch = MiniMaxH3DenoiseBranch(
+        packed=positive.packed,
+        text_embeddings=positive.text_embeddings,
+        token_tags=positive.token_tags,
+        device=device,
+    )
+    if prepare_branch is not None:
+        prepare_branch(branch)
+    video_rows = initial_video_rows.to(device=device, dtype=torch.float32, copy=True)
+    anchors = None
+    if keyframe_cond_rows is not None:
+        anchors = keyframe_cond_rows.to(device=device, dtype=torch.float32, copy=True)
+        video_rows[:n_cond].copy_(anchors)
+    audio_rows = torch.empty(
+        (0, MINIMAX_H3_AUDIO_ROW_WIDTH), device=device, dtype=torch.float32
+    )
+    num_steps = len(sigmas) - 1
+    plan_sigmas = sigmas
+    if adaln_sigmas is not None:
+        adaln_sigmas = [float(sigma) for sigma in adaln_sigmas]
+        if adaln_sigmas[: len(sigmas)] != sigmas:
+            raise ValueError("AdaLN prewarm grid must extend the denoising prefix")
+        cache = getattr(model, "adaln_cache", None)
+        if cache is not None and cache.max_plans >= len(adaln_sigmas) - 1:
+            # A checkpoint pass costs the same for one or all missing plans.
+            # Prepare the whole grid while keeping the requested warmup work.
+            plan_sigmas = adaln_sigmas
+    timesteps = [1.0 - sigma for sigma in plan_sigmas[:-1]]
+    plan = branch.prepare_timestep_plan(
+        video_timesteps=timesteps,
+        audio_timesteps=timesteps,
+        imgvid_cond_noise_aug=cond_t,
+        audio_ref_cond_noise_aug=1.0,
+        pin_imgvid_cond=True,
+    )
+    plan_timesteps = [entry[0] for entry in plan]
+    cache = getattr(model, "adaln_cache", None)
+    if (
+        prewarm_both_tasks
+        and adaln_sigmas is not None
+        and cache is not None
+        and cache.max_plan_width >= 2
+        and cache.max_plans >= 2 * (len(adaln_sigmas) - 1)
+    ):
+        # T2I has one timestep per plan; editing adds the fixed reference time.
+        # Keep each plan's original M in F.linear while sharing a weight pass.
+        plan_timesteps.extend(
+            torch.unique(
+                torch.tensor([t] if n_cond else [t, cond_t], dtype=torch.float32),
+                sorted=True,
+            ).to(device)
+            for t in timesteps
+        )
+    slots = model.prepare_adaln_plans(plan_timesteps)
+    sigma_values = torch.tensor(sigmas, dtype=torch.float32, device=device)
+    sigma_deltas = sigma_values[:-1] - sigma_values[1:]
+
+    for step in range(num_steps):
+        if n_cond:
+            video_rows[:n_cond].copy_(anchors)
+        kwargs = branch.forward_kwargs(
+            video_rows=video_rows,
+            audio_rows=audio_rows,
+            step_timesteps=plan[step],
+            adaln_slot=None if slots is None else slots[step],
+        )
+        # The image loop forwards and returns every image row, references
+        # included; the video helper forwards target rows only.
+        kwargs["x"][0].index_copy_(0, branch.img_pos_dev, video_rows)
+        kwargs["img_pos_for_infer_output_info"] = {"position_ids": branch.img_pos_dev}
+        kwargs["skip_mask_out_condition"] = n_cond == 0
+        metadata = positive.attn_metadata
+        if metadata is not None:
+            metadata.current_timestep = step
+        step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
+        with step_cm:
+            with set_forward_context(current_timestep=step, attn_metadata=metadata):
+                video, _ = (
+                    model(**kwargs)
+                    if model_forward is None
+                    else model_forward(model, kwargs, step)
+                )
+            target_rows = video_rows[n_cond:]
+            target_rows.copy_(target_rows + sigma_deltas[step] * video[n_cond:].float())
+        if on_step is not None:
+            on_step(step)
+    return video_rows
 
 
 __all__ = [
@@ -521,5 +848,7 @@ __all__ = [
     "MINIMAX_H3_IMGVID_COND_TIMESTEP",
     "MINIMAX_H3_VIDEO_ROW_WIDTH",
     "MiniMaxH3DenoiseBranch",
+    "PackedBranchInputs",
     "minimax_h3_denoise_loop",
+    "minimax_h3_image_denoise_loop",
 ]

@@ -164,16 +164,16 @@ def sigmoid_gate_topk_renorm(
     # Only column-stride-1 is required (the kernel reads rows via stride_lm). In
     # InklingGate the gate logits are a [t,258] slice of a padded [t,264] tensor, so
     # they are NOT contiguous but are column-contiguous -- no copy needed.
-    assert (
-        logits.ndim == 2 and logits.stride(1) == 1
-    ), f"{logits.shape=} {logits.stride()=}"
-    assert (
-        logits.shape[0] * logits.stride(0) <= 2**31
-    ), f"assumes int32 indexing: {logits.stride()=}"
+    assert logits.ndim == 2 and logits.stride(1) == 1, (
+        f"{logits.shape=} {logits.stride()=}"
+    )
+    assert logits.shape[0] * logits.stride(0) <= 2**31, (
+        f"assumes int32 indexing: {logits.stride()=}"
+    )
     assert k <= 32, f"topk kernels only support k <= 32: {k=}"
-    assert (
-        n_shared_experts >= 0
-    ), f"expected non-negative shared experts: {n_shared_experts=}"
+    assert n_shared_experts >= 0, (
+        f"expected non-negative shared experts: {n_shared_experts=}"
+    )
     M, G = logits.shape
     N = G - n_shared_experts
     A = k + n_shared_experts

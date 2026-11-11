@@ -27,6 +27,9 @@ Method status annotations:
 
 import enum
 import random
+from collections.abc import Iterator
+from contextlib import contextmanager
+from functools import cached_property
 from typing import NamedTuple, Optional
 
 import numpy as np
@@ -48,8 +51,10 @@ class PlatformEnum(enum.Enum):
     XPU = enum.auto()
     MUSA = enum.auto()
     NPU = enum.auto()
+    MLU = enum.auto()
     TPU = enum.auto()
     MPS = enum.auto()
+    SAIL = enum.auto()
     OOT = enum.auto()  # Out-of-tree (external plugin)
     UNSPECIFIED = enum.auto()
 
@@ -88,6 +93,7 @@ _DEVICE_TO_DISTRIBUTED_BACKEND: dict[str, str] = {
     "cpu": "gloo",
     "npu": "hccl" if not envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 else "zbal",
     "musa": "mccl",
+    "mlu": "cncl",
 }
 
 
@@ -126,18 +132,25 @@ class DeviceMixin:
     def is_npu(self) -> bool:
         return self._enum == PlatformEnum.NPU
 
+    def is_mlu(self) -> bool:
+        return self._enum == PlatformEnum.MLU
+
     def is_tpu(self) -> bool:
         return self._enum == PlatformEnum.TPU
 
     def is_mps(self) -> bool:
         return self._enum == PlatformEnum.MPS
 
+    def is_sail(self) -> bool:
+        return self._enum == PlatformEnum.SAIL
+
     def is_cuda_alike(self) -> bool:
-        """True for CUDA, ROCm, or MUSA (all expose CUDA-like APIs)."""
+        """True for CUDA, ROCm, MUSA, or SAIL (all expose CUDA-like APIs)."""
         return self._enum in (
             PlatformEnum.CUDA,
             PlatformEnum.ROCM,
             PlatformEnum.MUSA,
+            PlatformEnum.SAIL,
         )
 
     def is_out_of_tree(self) -> bool:
@@ -162,6 +175,11 @@ class DeviceMixin:
     def is_pin_memory_available(self, device=None) -> bool:
         """[Active] Whether pinned host memory is available for a target device."""
         return False
+
+    @contextmanager
+    def reindex_device_id(self, device_id: int) -> Iterator[int]:
+        """[Active] Temporarily remap a physical device to logical device 0."""
+        yield device_id
 
     # ------------------------------------------------------------------
     # Planned methods — reserved interface.  Core still uses hardcoded
@@ -238,6 +256,10 @@ class DeviceMixin:
     def verify_quantization(self, quant: str) -> None:
         """[Planned] Validate that a quantization method is supported. No-op by default."""
         pass
+
+    @cached_property
+    def cpu_arch(self) -> "CpuArchEnum":
+        return self.get_cpu_architecture()
 
     @classmethod
     def get_cpu_architecture(cls) -> "CpuArchEnum":

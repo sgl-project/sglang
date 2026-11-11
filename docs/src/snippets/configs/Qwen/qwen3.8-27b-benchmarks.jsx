@@ -11,7 +11,7 @@
 // commands differ (explicit --kv-cache-dtype fp8_e4m3, strategy flag emitted
 // by the tier row) and the accept lengths are protocol-specific.
 //
-// All six rows are ONE-BATCH measurements (sglang.bench_serving --flush-cache,
+// All six rows are ONE-BATCH measurements (sglang.benchmark.serving --flush-cache,
 // random dataset, ISL=1024 / OSL=1024, --random-range-ratio 1, request-rate inf,
 // max_concurrency 1/16/64, n=64/64/256 respectively) on a single GB300 GPU
 // (Blackwell Ultra SM103, 288GB HBM) on 2026-08-14. SGLang binary:
@@ -30,7 +30,7 @@
 // (see journal 2026-08-14-1048-claude-jrn_f6c1265be8cbdf86c44fe36c).
 export const benchmarks = [
   {
-    match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+    match: { hw: "gb300", variant: "default", quant: "nvfp4-fp4-head", strategy: "balanced", nodes: "single" },
     sglang_version: "lmsysorg/sglang:dev @ c4271c3fe",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1, num_prompts: 64 },
@@ -44,7 +44,7 @@ export const benchmarks = [
     notes: "NVFP4 = RadixArk W4A4-0811 (private). KV auto fp8_e4m3 from ckpt-declared kv_cache_quant_algo. GSM8K fp8-KV = 96.44 / bf16-KV = 96.82 (sgl-eval, `c7c03ec`, sibling experiment on `/scratch/qwen38-w4a4-kv-ab-0814` on `qwen38-27b-nvfp4-convert-0812`); both stop_rate 100% / truncated 0% on full 1319.",
   },
   {
-    match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+    match: { hw: "gb300", variant: "default", quant: "nvfp4-fp4-head", strategy: "high-throughput", nodes: "single" },
     sglang_version: "lmsysorg/sglang:dev @ c4271c3fe",
     speed: [
       { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1, num_prompts: 64 },

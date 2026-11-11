@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
+from torch import nn
+
+from sglang.kernels.ops import diffusion as diffusion_ops
+from sglang.kernels.ops.diffusion import BitExactFusionGate
+from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
+    apply_convrot_int8_shared_input,
+    convrot_int8_shares_input,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def modulate(
@@ -22,10 +34,53 @@ def modulate(
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
+def layernorm_modulate_bitexact(
+    gate: BitExactFusionGate,
+    norm: nn.Module,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    reference: Callable[[], torch.Tensor],
+    *,
+    sig: Any = None,
+) -> torch.Tensor:
+    """Single-kernel ``LN(x) * (1 + scale) + shift`` for an affine-free LayerNorm.
+
+    ``scale`` / ``shift`` are the ``(B, D)`` modulation rows and ``reference``
+    is the model's eager chain. The kernel replicates the BF16 aten LayerNorm
+    reduction, so ``gate`` verifies it against ``reference`` per its mode.
+    """
+    if not (
+        x.is_cuda
+        and diffusion_ops.is_plain_layer_norm(norm, x.shape[-1])
+        and diffusion_ops.can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
+    ):
+        return reference()
+    # The raw launch skips the custom-op dispatch, which compile tracing needs.
+    kernel = (
+        diffusion_ops.fused_layernorm_modulate
+        if torch.compiler.is_compiling()
+        else diffusion_ops.fused_layernorm_modulate_raw
+    )
+    return gate.run(
+        lambda: kernel(x, scale, shift, norm.eps), reference, sig=sig, logger=logger
+    )
+
+
+def _project_shared_input(
+    x: torch.Tensor, layers: Sequence[torch.nn.Module]
+) -> list[torch.Tensor]:
+    if convrot_int8_shares_input(layers):
+        return apply_convrot_int8_shared_input(x=x, layers=layers)
+    return [layer(x)[0] for layer in layers]
+
+
 def get_qkv_projections(
     attn: Any,
     hidden_states: torch.Tensor,
     encoder_hidden_states: torch.Tensor | None = None,
+    *,
+    make_contiguous: bool = True,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -41,25 +96,33 @@ def get_qkv_projections(
     set by those blocks' constructors, and ``use_fused_added_qkv`` whenever
     ``added_kv_proj_dim`` is not ``None`` — direct attribute access so a
     renamed flag fails loudly instead of silently unfusing.
+
+    ``make_contiguous=False`` preserves zero-copy views for a caller that can
+    consume packed projection output strides directly.
     """
     if attn.use_fused_qkv:
         qkv, _ = attn.to_qkv(hidden_states)
-        query, key, value = [t.contiguous() for t in qkv.chunk(3, dim=-1)]
+        query, key, value = qkv.chunk(3, dim=-1)
+        if make_contiguous:
+            query, key, value = [t.contiguous() for t in (query, key, value)]
     else:
-        query, _ = attn.to_q(hidden_states)
-        key, _ = attn.to_k(hidden_states)
-        value, _ = attn.to_v(hidden_states)
+        query, key, value = _project_shared_input(
+            x=hidden_states, layers=(attn.to_q, attn.to_k, attn.to_v)
+        )
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
         if attn.use_fused_added_qkv:
             added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-            encoder_query, encoder_key, encoder_value = [
-                t.contiguous() for t in added_qkv.chunk(3, dim=-1)
-            ]
+            encoder_query, encoder_key, encoder_value = added_qkv.chunk(3, dim=-1)
+            if make_contiguous:
+                encoder_query, encoder_key, encoder_value = [
+                    t.contiguous() for t in (encoder_query, encoder_key, encoder_value)
+                ]
         else:
-            encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
-            encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
-            encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
+            encoder_query, encoder_key, encoder_value = _project_shared_input(
+                x=encoder_hidden_states,
+                layers=(attn.add_q_proj, attn.add_k_proj, attn.add_v_proj),
+            )
 
     return query, key, value, encoder_query, encoder_key, encoder_value

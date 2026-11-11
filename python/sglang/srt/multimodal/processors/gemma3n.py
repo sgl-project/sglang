@@ -14,12 +14,14 @@
 
 from typing import Dict, List, Optional, Union
 
-from sglang.srt.managers.multimodal_processor import (
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
+from sglang.srt.models.gemma3n_mm import Gemma3nForConditionalGeneration
+from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
-from sglang.srt.models.gemma3n_mm import Gemma3nForConditionalGeneration
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 
 
 class Gemma3nSGLangProcessor(SGLangBaseProcessor):
@@ -59,7 +61,7 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 

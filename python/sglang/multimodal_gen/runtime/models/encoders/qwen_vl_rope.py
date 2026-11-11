@@ -5,9 +5,9 @@ from typing import Any
 
 import torch
 
+from sglang.srt.hf_transformers.common import get_rope_config
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
-from sglang.srt.utils.hf_transformers.common import get_rope_config
 
 
 def build_qwen_vl_text_rope(
@@ -38,8 +38,7 @@ def apply_qwen_vl_text_rope(
     """Apply three-axis MRoPE to batched attention tensors."""
     if query.ndim != 4 or key.ndim != 4:
         raise ValueError(
-            "Qwen-VL query and key must have shape "
-            "[batch, heads, sequence, head_dim]"
+            "Qwen-VL query and key must have shape [batch, heads, sequence, head_dim]"
         )
     if position_ids.ndim != 3 or position_ids.shape[0] != 3:
         raise ValueError(

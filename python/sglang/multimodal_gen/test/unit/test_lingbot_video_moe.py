@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.layers.moe import (
     LingBotVideoGroupedExperts,
     LingBotVideoRouter,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context,
+)
 from sglang.multimodal_gen.runtime.models.dits import (
     lingbot_video_moe as dits_lingbot_video_moe,
 )
@@ -28,7 +31,6 @@ from sglang.multimodal_gen.runtime.models.dits.lingbot_video_moe import (
     LingBotVideoAttention,
     LingBotVideoTransformer3DModel,
     _joint_position_ids,
-    make_joint_position_ids,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.text_encoding import (
     PROMPT_TEMPLATE,
@@ -232,6 +234,7 @@ class _FakeQwenProcessor:
 
 def _text_encoding_stage(processor, encoder):
     stage = object.__new__(LingBotVideoTextEncodingStage)
+    stage._component_residency_manager = None
     stage.text_encoders = [encoder]
     stage.tokenizers = [processor]
     stage.token_length = 128
@@ -260,6 +263,31 @@ def test_text_encoding_crops_template_then_trims_padding():
     torch.testing.assert_close(embeds, hidden[:, prefix_width:true_len])
     assert int(mask.sum()) == true_len - prefix_width
     assert stage._compute_crop_start() == prefix_width
+
+
+def test_text_encoding_sets_forward_context_for_native_encoder():
+    prompt_width, prefix_width, true_len, channels = 6, 2, 5, 4
+    hidden = torch.zeros(1, prompt_width, channels)
+
+    class NativeEncoder:
+        uses_sglang_forward_context = True
+
+        def __call__(self, **kwargs):
+            context = get_forward_context()
+            assert context.current_timestep == 0
+            assert context.attn_metadata is None
+            assert kwargs["output_hidden_states"] is True
+            return SimpleNamespace(hidden_states=[hidden])
+
+    stage = _text_encoding_stage(
+        _FakeQwenProcessor(prompt_width, prefix_width, true_len), NativeEncoder()
+    )
+    embeds, mask = stage._encode_prompt(
+        "a structured caption", torch.device("cpu"), torch.float32
+    )
+
+    assert tuple(embeds.shape) == (1, true_len - prefix_width, channels)
+    assert tuple(mask.shape) == (1, true_len - prefix_width)
 
 
 def test_check_inputs_enforces_frame_and_size_contract():
@@ -335,6 +363,19 @@ def test_preprocess_packs_w1_w3_into_w13_weight():
     torch.testing.assert_close(out["blocks.0.ffn.experts.w2"], w2)
 
 
+def _one_prompt_position_ids(text_len, grid_t, grid_h, grid_w, device):
+    """The per-sample (video; text) positions: video t after the prompt, text on t."""
+    tt = torch.arange(grid_t, device=device, dtype=torch.int32) + (text_len + 1)
+    hh = torch.arange(grid_h, device=device, dtype=torch.int32)
+    ww = torch.arange(grid_w, device=device, dtype=torch.int32)
+    grid = torch.stack(torch.meshgrid(tt, hh, ww, indexing="ij"), dim=-1).flatten(0, 2)
+    text_t = torch.arange(text_len, device=device, dtype=torch.int32) + 1
+    text_pos = torch.stack(
+        [text_t, torch.zeros_like(text_t), torch.zeros_like(text_t)], dim=-1
+    )
+    return torch.cat([grid, text_pos], dim=0)
+
+
 def test_joint_position_ids_match_reference_and_cover_padding():
     dev = torch.device("cpu")
     gt, gh, gw = 2, 3, 4
@@ -342,13 +383,13 @@ def test_joint_position_ids_match_reference_and_cover_padding():
 
     # B==1, no padding: byte-identical to the per-sample reference.
     vec = _joint_position_ids(torch.tensor([5]), gt, gh, gw, 5, dev)
-    torch.testing.assert_close(vec, make_joint_position_ids(5, gt, gh, gw, dev))
+    torch.testing.assert_close(vec, _one_prompt_position_ids(5, gt, gh, gw, dev))
 
     # B==1 with padding: real tokens match the text_len=4 reference; the extra
     # padding row is (0,0,0). vec has n_video+L rows (matches q for B*S).
     vec_p = _joint_position_ids(torch.tensor([4]), gt, gh, gw, 5, dev)
     torch.testing.assert_close(
-        vec_p[: n_video + 4], make_joint_position_ids(4, gt, gh, gw, dev)
+        vec_p[: n_video + 4], _one_prompt_position_ids(4, gt, gh, gw, dev)
     )
     torch.testing.assert_close(
         vec_p[n_video + 4 :], torch.zeros((1, 3), dtype=torch.int32)
@@ -363,5 +404,5 @@ def test_joint_position_ids_match_reference_and_cover_padding():
         start = i * (n_video + L)
         real = n_video + t
         torch.testing.assert_close(
-            vec_b[start : start + real], make_joint_position_ids(t, gt, gh, gw, dev)
+            vec_b[start : start + real], _one_prompt_position_ids(t, gt, gh, gw, dev)
         )

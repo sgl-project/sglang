@@ -10,7 +10,7 @@ import triton.language as tl
 from sglang.kernels.ops.attention.rope import rotary_embedding
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=18, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=18, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 @triton.jit
@@ -481,7 +481,7 @@ def test_performance(
     print(
         f"\nPerformance Test - Batch={batch_size}, SeqLen={seq_len}, Tokens={total_tokens}"
     )
-    print(f"JIT: {jit_time*1000:.9f}ms, SGL: {sgl_time*1000:.9f}ms")
+    print(f"JIT: {jit_time * 1000:.9f}ms, SGL: {sgl_time * 1000:.9f}ms")
     if sgl_time > 0:
         speedup = sgl_time / jit_time if jit_time > 0 else float("inf")
         print(f"Speedup (SGL/JIT): {speedup:.2f}x")

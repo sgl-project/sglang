@@ -20,6 +20,18 @@ class LingBotVideoMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+try:
+    from sglang.kernels.ops.diffusion import (
+        can_use_group_limited_topk as _can_use_group_limited_topk,
+    )
+    from sglang.kernels.ops.diffusion import (
+        group_limited_topk as _fused_group_limited_topk,
+    )
+except Exception:  # pragma: no cover - triton/kernel unavailable
+    _can_use_group_limited_topk = None
+    _fused_group_limited_topk = None
+
+
 class LingBotVideoRouter(nn.Module):
     def __init__(
         self,
@@ -46,6 +58,18 @@ class LingBotVideoRouter(nn.Module):
         )
 
     def _group_limited_topk(self, scores_for_choice: torch.Tensor) -> torch.Tensor:
+        if (
+            _can_use_group_limited_topk is not None
+            and _fused_group_limited_topk is not None
+            and self.n_group is not None
+            and self.topk_group is not None
+            and _can_use_group_limited_topk(
+                scores_for_choice, self.n_group, self.topk_group, self.top_k
+            )
+        ):
+            return _fused_group_limited_topk(
+                scores_for_choice, self.n_group, self.topk_group, self.top_k
+            )
         seq_len = scores_for_choice.shape[0]
         experts_per_group = self.num_experts // self.n_group
         grouped = scores_for_choice.view(seq_len, self.n_group, experts_per_group)

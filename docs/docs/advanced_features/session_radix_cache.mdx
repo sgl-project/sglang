@@ -13,7 +13,7 @@ Session references are soft protection, not memory pins. Referenced KV can still
 This feature is implemented only by `UnifiedRadixCache`.
 
 ```bash Command
-SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 python3 -m sglang.launch_server \
+python3 -m sglang.launch_server \
   --model-path MODEL_PATH \
   --enable-session-radix-cache
 ```

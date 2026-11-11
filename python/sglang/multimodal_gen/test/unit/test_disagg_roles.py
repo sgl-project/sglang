@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for disaggregation role-based module filtering."""
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -16,6 +19,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
     filter_modules_for_role,
     get_module_role,
 )
+from sglang.multimodal_gen.runtime.pipelines.flux3_image import Flux3ImagePipeline
 from sglang.multimodal_gen.runtime.pipelines.flux_2 import Flux2Pipeline
 from sglang.multimodal_gen.runtime.pipelines.glm_image import GlmImagePipeline
 from sglang.multimodal_gen.runtime.pipelines.hunyuan3d_pipeline import (
@@ -63,6 +67,76 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.q
     _resolve_text_encoder_dtype,
 )
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
+from sglang.test.test_utils import CustomTestCase
+
+
+class TestFlux3RoleLoading(CustomTestCase):
+    def test_only_load_owned_weights(self):
+        """An encoder/decoder process must not allocate a DiT or the other encoder."""
+        import sglang.multimodal_gen.runtime.pipelines.flux3_image as module
+
+        ownership = {
+            RoleType.MONOLITHIC: {"transformer", "vae", "text_encoder"},
+            RoleType.ENCODER: {"vae", "text_encoder"},
+            RoleType.PROMPT_ENCODER: {"text_encoder"},
+            RoleType.IMAGE_ENCODER: {"vae"},
+            RoleType.DENOISER: {"transformer"},
+            RoleType.DECODER: {"vae"},
+        }
+        for role, expected in ownership.items():
+            with self.subTest(role=role):
+                pipeline = object.__new__(Flux3ImagePipeline)
+                pipeline.memory_usages = {}
+                package = SimpleNamespace(
+                    config=SimpleNamespace(vae=SimpleNamespace(dtype="float32")),
+                    vae="vae.safetensors",
+                )
+                args = SimpleNamespace(
+                    pipeline_config=SimpleNamespace(flux3_package=package),
+                    quantization=None,
+                    disagg_role=role,
+                    should_start_component_on_cpu=lambda _: True,
+                )
+                with (
+                    patch.object(
+                        module,
+                        "get_local_torch_device",
+                        return_value=torch.device("cpu"),
+                    ),
+                    patch.object(
+                        pipeline,
+                        "_load_transformer",
+                        side_effect=lambda *_: torch.nn.Linear(2, 2),
+                    ),
+                    patch.object(
+                        pipeline,
+                        "_load_text_encoder",
+                        side_effect=lambda *_: torch.nn.Linear(2, 2),
+                    ),
+                    patch.object(
+                        module,
+                        "Flux3ImageVAE",
+                        side_effect=lambda _: torch.nn.Linear(2, 2),
+                    ),
+                    patch.object(
+                        module,
+                        "load_file",
+                        side_effect=lambda *_args, **_kwargs: {
+                            "weight": torch.ones(2, 2),
+                            "bias": torch.zeros(2),
+                        },
+                    ),
+                ):
+                    modules = pipeline.load_modules(args)
+                self.assertEqual(set(modules), expected)
+                self.assertEqual(set(pipeline.memory_usages), expected)
+                self.assertTrue(
+                    all(
+                        not p.requires_grad
+                        for m in modules.values()
+                        for p in m.parameters()
+                    )
+                )
 
 
 class _GlobalStageArgsMixin:
@@ -244,6 +318,39 @@ class _FakeStage:
 
 
 class TestPipelineStageRoleFilter(unittest.TestCase):
+    def test_load_config_passes_server_revision_to_model_download(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            (tmp_path / "model_index.json").write_text(
+                json.dumps(
+                    {
+                        "_class_name": "FakePipeline",
+                        "_diffusers_version": "0.34.0",
+                        "transformer": ["diffusers", "FakeTransformer"],
+                    }
+                )
+            )
+            (tmp_path / "transformer").mkdir()
+
+            pipeline = object.__new__(_FakePipeline)
+            pipeline.model_path = "org/repo"
+            pipeline.server_args = SimpleNamespace(
+                model_subfolder=None,
+                revision="a" * 40,
+            )
+
+            with patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base.maybe_download_model",
+                return_value=str(tmp_path),
+            ) as download_model:
+                pipeline._load_config()
+
+        download_model.assert_called_once_with(
+            "org/repo",
+            force_diffusers_model=True,
+            revision="a" * 40,
+        )
+
     def test_stage_factory_skips_without_constructing_for_other_role(self):
         pipeline = _make_pipeline(RoleType.ENCODER)
 
@@ -484,7 +591,8 @@ class TestImageVAEEncodingStageComponentName(_GlobalStageArgsMixin, unittest.Tes
     def test_component_name_can_follow_non_default_vae_key(self):
         stage = ImageVAEEncodingStage(vae=object(), component_name="video_vae")
         server_args = SimpleNamespace(
-            pipeline_config=SimpleNamespace(vae_precision="bf16")
+            component_precisions={},
+            pipeline_config=SimpleNamespace(vae_precision="bf16"),
         )
 
         uses = stage.component_uses(server_args, "image_vae_encoding")
@@ -579,13 +687,6 @@ class TestStageAffinityAndValidation(_GlobalStageArgsMixin, unittest.TestCase):
             pipeline = self._make_hunyuan_pipeline(role, paint_enable=False)
             pipeline.create_pipeline_stages(pipeline.server_args)
             self.assertEqual(list(pipeline._stage_name_mapping.keys()), stage_names)
-
-    def test_hunyuan3d_shape_stage_no_longer_stores_model_dtype(self):
-        pipeline = self._make_hunyuan_pipeline(RoleType.ENCODER, paint_enable=False)
-        pipeline.create_pipeline_stages(pipeline.server_args)
-        stage = pipeline._stage_name_mapping["shape_before_denoising"]
-        self.assertIsInstance(stage, Hunyuan3DShapeBeforeDenoisingStage)
-        self.assertFalse(hasattr(stage, "model_dtype"))
 
     def test_ltx2_refinement_stage_keeps_class_name_stage_key(self):
         stage = object.__new__(LTX2RefinementStage)

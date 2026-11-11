@@ -17,16 +17,16 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.srt.configs.nemotron_h import NemotronHConfig
+from sglang.srt.configs.nemotron_h import NemotronHConfig, NemotronHPuzzleConfig
 from sglang.srt.configs.radio import RadioConfig
 from sglang.srt.multimodal.internvl_utils import IMAGENET_MEAN, IMAGENET_STD
 
 
 def float_triplet(seq: Any):
     a, b, c = tuple(seq)
-    assert (
-        isinstance(a, float) and isinstance(b, float) and isinstance(c, float)
-    ), "expected three floats"
+    assert isinstance(a, float) and isinstance(b, float) and isinstance(c, float), (
+        "expected three floats"
+    )
     return a, b, c
 
 
@@ -67,17 +67,23 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         if vision_config is None:
             vision_config = kwargs.pop("raw_vision_config", None)
 
-        super().__init__(**kwargs)
-
         # Handle both cases: when loading from JSON (llm_config is dict) and when called internally by transformers (llm_config; vision_config are None)
         if llm_config is not None:
-            self.llm_config = NemotronHConfig(**llm_config)
+            if llm_config.get("model_type") != "nemotron_h_puzzle":
+                self.llm_config = NemotronHConfig(**llm_config)
+            else:
+                self.llm_config = NemotronHPuzzleConfig(**llm_config)
+                # Puzzle requires block_configs; nested diff serialization cannot
+                # construct a default instance of its config.
+                self.has_no_defaults_at_init = True
             assert isinstance(vision_config, dict), "vision_config must be a dictionary"
             self.raw_vision_config = vision_config
         else:
             assert vision_config is None
             self.llm_config = NemotronHConfig()
             self.raw_vision_config = {}
+
+        super().__init__(**kwargs)
 
         # Audio (Parakeet) config: stored as a PretrainedConfig sub-object
         if sound_config is not None and isinstance(sound_config, dict):
@@ -137,6 +143,9 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
             "video_maintain_aspect_ratio", True
         )
 
+    def get_text_config(self, decoder=None, encoder=None):
+        return self.llm_config
+
     def create_radio_config(self):
         config = self.raw_vision_config
         model_name = config["args"]["model"]
@@ -161,6 +170,15 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
 
 class NemotronH_Nano_Omni_Reasoning_V3_Config(NemotronH_Nano_VL_V2_Config):
     model_type = "NemotronH_Nano_Omni_Reasoning_V3"
+
+    def __init__(self, *args, **kwargs):
+        # Explicit __init__ prevents PretrainedConfig.__init_subclass__ from
+        # replacing the parent's custom __init__ with a dataclass-generated one.
+        super().__init__(*args, **kwargs)
+
+
+class NemotronH_Omni_Reasoning_V3_Config(NemotronH_Nano_Omni_Reasoning_V3_Config):
+    model_type = "nemotron_h_omni"
 
     def __init__(self, *args, **kwargs):
         # Explicit __init__ prevents PretrainedConfig.__init_subclass__ from

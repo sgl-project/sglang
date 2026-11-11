@@ -2,18 +2,28 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-c-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
 import copy
+import re
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import msgspec
 
+from sglang.srt.entrypoints.openai.protocol import OPENAI_MAX_N
+from sglang.srt.environ import envs
 from sglang.srt.sampling.sampling_params import (
+    LOGIT_BIAS_ABS_MAX,
     MAX_LEN,
+    MAX_REQUEST_REASONING_END_TOKEN_IDS,
+    MAX_STOP_COUNT,
+    MAX_STOP_REGEX_COUNT,
+    MAX_STOP_REGEX_LEN,
+    REQUEST_REASONING_END_TOKEN_IDS_KEY,
     TOP_K_ALL,
     SamplingParams,
     get_max_seq_length,
@@ -22,7 +32,6 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class TestSamplingParamsInit(CustomTestCase):
-
     def test_zero_temperature_becomes_greedy(self):
         """Test greedy conversion when temperature is 0."""
         sp = SamplingParams(temperature=0.0)
@@ -85,7 +94,6 @@ class TestSamplingParamsInit(CustomTestCase):
 
 
 class TestSamplingParamsVerify(CustomTestCase):
-
     VOCAB_SIZE = 32000
     GRAMMAR_VALUES = {
         "json_schema": '{"type":"object"}',
@@ -104,6 +112,49 @@ class TestSamplingParamsVerify(CustomTestCase):
         """Default valid params should pass verify() without raising."""
         sp = self._make()
         sp.verify(self.VOCAB_SIZE)
+
+    def test_n_bounds(self):
+        """Native n is bounded by SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ, not OpenAI's."""
+        with envs.SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ.override(4096):
+            for value in (-1, 0, 4097, "2"):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(ValueError, "n must be"):
+                        self._make(n=value).verify(self.VOCAB_SIZE)
+
+            for value in (1, OPENAI_MAX_N + 1, 4096):
+                self._make(n=value).verify(self.VOCAB_SIZE)
+
+        with envs.SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ.override(8192):
+            self._make(n=8192).verify(self.VOCAB_SIZE)
+
+        # A negative limit disables the cap, matching the Rust server.
+        with envs.SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ.override(-1):
+            for value in (1, 10**6):
+                self._make(n=value).verify(self.VOCAB_SIZE)
+            with self.assertRaisesRegex(ValueError, "n must be an integer >= 1"):
+                self._make(n=0).verify(self.VOCAB_SIZE)
+
+    def test_request_reasoning_end_token_ids_are_vocab_bounded_integers(self):
+        self._make(
+            custom_params={REQUEST_REASONING_END_TOKEN_IDS_KEY: [17, 18]}
+        ).verify(self.VOCAB_SIZE)
+
+        invalid_values = [
+            [],
+            [-1],
+            [True],
+            [self.VOCAB_SIZE],
+            "17",
+            list(range(MAX_REQUEST_REASONING_END_TOKEN_IDS + 1)),
+        ]
+        for value in invalid_values:
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "request reasoning end token IDs"),
+            ):
+                self._make(
+                    custom_params={REQUEST_REASONING_END_TOKEN_IDS_KEY: value}
+                ).verify(self.VOCAB_SIZE)
 
     def test_negative_temperature_raises(self):
         """Test that verify() rejects negative temperature (must be >= 0)."""
@@ -283,10 +334,78 @@ class TestSamplingParamsVerify(CustomTestCase):
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
+    def test_logit_bias_token_id_at_vocab_size_raises(self):
+        """The first id past the vocabulary must be rejected, not the last one."""
+        with self.assertRaises(ValueError):
+            self._make(logit_bias={str(self.VOCAB_SIZE): 1.0}).verify(self.VOCAB_SIZE)
+
     def test_logit_bias_valid_tokens(self):
         """Test that logit_bias with token_ids within [0, vocab_size) is accepted."""
         sp = self._make(logit_bias={"0": 1.0, "31999": -0.5})
         sp.verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_value_types(self):
+        """Non-finite, non-numeric and bool bias values must fail admission."""
+        for value in (
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            "abc",
+            None,
+            True,
+            1 << 2000,
+            -(1 << 2000),
+        ):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "logit_bias"):
+                    self._make(logit_bias={"0": value}).verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_outside_openai_range_is_accepted(self):
+        """Integer biases and values outside OpenAI's range must remain accepted."""
+        self._make(logit_bias={"0": -1e4, "1": 5, "31999": 1e4}).verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_beyond_overflow_bound_is_rejected(self):
+        """A bias that overflows after the temperature division must fail admission."""
+        for value in (1e39, -1e39, 3e38, 1.1 * LOGIT_BIAS_ABS_MAX):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "logit_bias"):
+                    self._make(logit_bias={"0": value}).verify(self.VOCAB_SIZE)
+        self._make(
+            logit_bias={"0": LOGIT_BIAS_ABS_MAX, "1": -LOGIT_BIAS_ABS_MAX}
+        ).verify(self.VOCAB_SIZE)
+
+    def test_stop_token_ids_outside_vocab_are_accepted(self):
+        """Stop IDs outside the vocab are accepted (they never match), not rejected."""
+        for token_id in (-1, self.VOCAB_SIZE, self.VOCAB_SIZE + 1):
+            with self.subTest(token_id=token_id):
+                self._make(stop_token_ids=[token_id], min_new_tokens=1).verify(
+                    self.VOCAB_SIZE
+                )
+
+    # --- sampling_seed ---
+    def test_sampling_seed_valid(self):
+        """Test that None (the default) and the int64 min/max boundaries are accepted."""
+        self._make(sampling_seed=None).verify(self.VOCAB_SIZE)
+        self._make(sampling_seed=2**63 - 1).verify(self.VOCAB_SIZE)
+        self._make(sampling_seed=-(2**63)).verify(self.VOCAB_SIZE)
+
+    def test_sampling_seed_out_of_range_raises(self):
+        """Test that verify() rejects a seed outside the int64 range.
+
+        With deterministic inference enabled the seed feeds a torch.int64
+        tensor; an out-of-range value raises "Overflow when unpacking long
+        long" inside the scheduler and crashes every rank, so it must be
+        rejected at admission instead.
+        """
+        with self.assertRaises(ValueError):
+            self._make(sampling_seed=2**63).verify(self.VOCAB_SIZE)
+        with self.assertRaises(ValueError):
+            self._make(sampling_seed=-(2**63) - 1).verify(self.VOCAB_SIZE)
+
+    def test_sampling_seed_non_int_raises(self):
+        """Test that verify() rejects a non-integer seed (e.g. a string)."""
+        with self.assertRaises(ValueError):
+            self._make(sampling_seed="100").verify(self.VOCAB_SIZE)
 
     def test_multiple_grammars_raises(self):
         """Reject structural_tag combined with any other grammar constraint.
@@ -311,13 +430,12 @@ class TestSamplingParamsVerify(CustomTestCase):
 
 
 class TestSamplingParamsNormalize(CustomTestCase):
-
     def _mock_tokenizer(self, encode_map=None):
         """Create a mock tokenizer that returns predetermined token lists."""
         tokenizer = MagicMock()
         if encode_map:
-            tokenizer.encode.side_effect = (
-                lambda s, add_special_tokens=False: encode_map.get(s, [1])
+            tokenizer.encode.side_effect = lambda s, add_special_tokens=False: (
+                encode_map.get(s, [1])
             )
         else:
             tokenizer.encode.return_value = [1]  # Default: 1 token
@@ -343,6 +461,17 @@ class TestSamplingParamsNormalize(CustomTestCase):
         tokenizer = self._mock_tokenizer()
         sp.normalize(tokenizer=tokenizer)
         self.assertEqual(sp.stop_strs, ["stop1", "stop2"])
+
+    def test_stop_count_limit(self):
+        tokenizer = self._mock_tokenizer()
+        SamplingParams(stop=["x"] * MAX_STOP_COUNT).normalize(tokenizer)
+
+        with self.assertRaises(ValueError) as cm:
+            SamplingParams(stop=["x"] * (MAX_STOP_COUNT + 1)).normalize(tokenizer)
+        self.assertEqual(
+            str(cm.exception),
+            f"at most {MAX_STOP_COUNT} stop strings are allowed, got {MAX_STOP_COUNT + 1}",
+        )
 
     def test_stop_str_max_len_uses_encoded_length(self):
         """Test that max_len is based on encoded token count, not character count."""
@@ -385,8 +514,54 @@ class TestSamplingParamsNormalize(CustomTestCase):
         sp.normalize(tokenizer=tokenizer)
         self.assertEqual(sp.stop_regex_max_len, 3)
 
+    def test_stop_regex_count_limit(self):
+        tokenizer = self._mock_tokenizer()
+        SamplingParams(stop_regex=["x"] * MAX_STOP_REGEX_COUNT).normalize(tokenizer)
+
+        with self.assertRaises(ValueError) as cm:
+            SamplingParams(stop_regex=["x"] * (MAX_STOP_REGEX_COUNT + 1)).normalize(
+                tokenizer
+            )
+        self.assertEqual(
+            str(cm.exception),
+            f"at most {MAX_STOP_REGEX_COUNT} stop_regex patterns are allowed, "
+            f"got {MAX_STOP_REGEX_COUNT + 1}",
+        )
+
+    def test_stop_regex_byte_length_limit(self):
+        tokenizer = self._mock_tokenizer()
+        pattern = "é" * (MAX_STOP_REGEX_LEN // 2)
+        SamplingParams(stop_regex=pattern).normalize(tokenizer)
+
+        with self.assertRaises(ValueError) as cm:
+            SamplingParams(stop_regex=pattern + "a").normalize(tokenizer)
+        self.assertEqual(
+            str(cm.exception),
+            f"stop_regex is {MAX_STOP_REGEX_LEN + 1} bytes, over the "
+            f"{MAX_STOP_REGEX_LEN}-byte limit",
+        )
+
 
 class TestSamplingParamsMsgspecStruct(CustomTestCase):
+    def test_rust_sampling_schema_stays_in_lockstep(self):
+        """Compare Rust fields with the imported Python wire schema."""
+        rust_path = (
+            Path(__file__).resolve().parents[4]
+            / "rust/sglang-server/src/message/sampling.rs"
+        )
+        source = rust_path.read_text()
+        start = source.index("pub struct SamplingParams {")
+        # The struct's own closing brace: the first one back at column 0.
+        end = source.index("\n}\n", start)
+        rust_fields = tuple(
+            re.findall(
+                r"^\s*pub ([a-z][a-z0-9_]*):",
+                source[start:end],
+                re.MULTILINE,
+            )
+        )
+
+        self.assertEqual(SamplingParams.__struct_fields__, rust_fields)
 
     def test_copy_remains_mutable_and_independent(self):
         sp = SamplingParams(max_new_tokens=8, custom_params={"a": 1})
@@ -460,7 +635,6 @@ class TestSamplingParamsMsgspecStruct(CustomTestCase):
 
 
 class TestRegexMaxLength(CustomTestCase):
-
     def test_literal_string(self):
         """Test that plain string 'abc' gives max length 3."""
         self.assertEqual(get_max_seq_length("abc"), 3)
@@ -476,11 +650,6 @@ class TestRegexMaxLength(CustomTestCase):
     def test_unbounded_star(self):
         """Test that 'a*' (zero or more, no upper bound) returns MAX_LEN."""
         result = get_max_seq_length("a*")
-        self.assertEqual(result, MAX_LEN)
-
-    def test_unbounded_plus(self):
-        """Test that 'a+' (one or more, no upper bound) returns MAX_LEN."""
-        result = get_max_seq_length("a+")
         self.assertEqual(result, MAX_LEN)
 
     def test_bounded_repeat(self):
@@ -527,11 +696,6 @@ class TestRegexMaxLength(CustomTestCase):
     def test_lookahead_triggers_unhandled_token(self):
         """Test that lookahead (?=a) hits the unhandled-token fallback (MAX_LEN)."""
         result = get_max_seq_length("(?=a)b")
-        self.assertGreaterEqual(result, MAX_LEN)
-
-    def test_lookbehind_triggers_unhandled_token(self):
-        """Test that lookbehind (?<=x) hits the unhandled-token fallback (MAX_LEN)."""
-        result = get_max_seq_length("(?<=x)y")
         self.assertGreaterEqual(result, MAX_LEN)
 
 

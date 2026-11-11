@@ -4,12 +4,12 @@ import deep_gemm
 import torch
 import triton
 import triton.language as tl
-from deep_gemm import calc_diff
+from deep_gemm.testing import calc_diff
 from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
 
-# Import shared functionality from the regular GEMM benchmark
 from sglang.benchmark.bench_utils import run_bench
-from sglang.benchmark.kernels.deepseek.benchmark_deepgemm_fp8_gemm import (
+from sglang.benchmark.deepseek_utils import (
+    get_weight_shapes,
     per_block_cast_to_fp8,
     per_token_cast_to_fp8,
 )
@@ -318,39 +318,6 @@ def calculate_diff(m: int, n: int, k: int, num_groups: int):
         )
 
 
-def get_weight_shapes(tp_size):
-    # cannot TP
-    total = [
-        (512 + 64, 7168),
-        ((128 + 64) * 128, 7168),
-        (128 * (128 + 128), 512),
-        (7168, 16384),
-        (7168, 18432),
-    ]
-    # N can TP
-    n_tp = [
-        (18432 * 2, 7168),
-        ((128 + 64) * 128, 7168),
-        (128 * (128 + 128), 512),
-        (24576, 1536),
-        (4096, 7168),
-    ]
-    # K can TP
-    k_tp = [(7168, 18432), (7168, 16384), (7168, 2048)]
-
-    weight_shapes = []
-    for t in total:
-        weight_shapes.append(t)
-    for n_t in n_tp:
-        new_t = (n_t[0] // tp_size, n_t[1])
-        weight_shapes.append(new_t)
-    for k_t in k_tp:
-        new_t = (k_t[0], k_t[1] // tp_size)
-        weight_shapes.append(new_t)
-
-    return weight_shapes
-
-
 def create_benchmark_configs(tp_size):
     configs = []
     weight_shapes = get_weight_shapes(tp_size)
@@ -435,7 +402,7 @@ def get_benchmark(tp_size):
         flops = 2 * m * n * k  # multiply-adds
         tflops = flops / (ms * 1e-3) / 1e12
 
-        print(f"Time: {ms*1000:.2f} ms, TFLOPS: {tflops:.2f}")
+        print(f"Time: {ms * 1000:.2f} ms, TFLOPS: {tflops:.2f}")
         return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
 
     return benchmark

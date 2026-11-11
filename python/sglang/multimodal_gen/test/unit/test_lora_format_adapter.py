@@ -16,7 +16,7 @@ import torch
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
-from sglang.multimodal_gen.runtime.pipelines_core.lora_format_adapter import (
+from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
     LoRAFormat,
     detect_lora_format_from_state_dict,
     normalize_lora_state_dict,
@@ -339,9 +339,9 @@ def main() -> None:
 class TestLoRAFormatAdapter:
     def test_lora_format_adapter_all_formats(self):
         results = _run_all_tests()
-        assert all(
-            r["pass"] for r in results
-        ), "At least one LoRA format adapter case failed"
+        assert all(r["pass"] for r in results), (
+            "At least one LoRA format adapter case failed"
+        )
 
 
 if __name__ == "__main__":

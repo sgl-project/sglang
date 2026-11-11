@@ -28,6 +28,7 @@ spec:
       metadata:
         labels:
           app: sgl-ascend
+          run-id: "{{ run_id }}"
           ring-controller.atlas: ascend-1980
       spec:
         hostNetwork: True
@@ -58,6 +59,8 @@ spec:
             value: "https://hf-mirror.com"
           - name: METRICS_DATA_FILE
             value: "{{ metrics_data_file }}"
+          - name: NPU_ACCURACY_DATASET
+            value: "{{ accuracy_dataset }}"
           - name: SGLANG_IS_IN_CI
             value: "{{ sglang_is_in_ci }}"
           - name: RUN_LABEL
@@ -102,7 +105,13 @@ spec:
           - name: share
             mountPath: /root/sglang
             subPath: {{ sglang_source_relative_path }}
+          - name: shm-volume
+            mountPath: /dev/shm
         volumes:
+        - name: shm-volume
+          emptyDir:
+            medium: Memory
+            sizeLimit: "16Gi"
         {% if env in ["ci", "debug"] %}
         - name: share
           persistentVolumeClaim:
@@ -144,6 +153,7 @@ spec:
       metadata:
         labels:
           app: sgl-ascend
+          run-id: "{{ run_id }}"
           ring-controller.atlas: ascend-1980
       spec:
         hostNetwork: True
@@ -174,6 +184,8 @@ spec:
             value: "https://hf-mirror.com"
           - name: METRICS_DATA_FILE
             value: "{{ metrics_data_file }}"
+          - name: NPU_ACCURACY_DATASET
+            value: "{{ accuracy_dataset }}"
           - name: SGLANG_IS_IN_CI
             value: "{{ sglang_is_in_ci }}"
           - name: RUN_LABEL
@@ -218,7 +230,13 @@ spec:
           - name: share
             mountPath: /root/sglang
             subPath: {{ sglang_source_relative_path }}
+          - name: shm-volume
+            mountPath: /dev/shm
         volumes:
+        - name: shm-volume
+          emptyDir:
+            medium: Memory
+            sizeLimit: "16Gi"
         {% if env in ["ci", "debug"] %}
         - name: share
           persistentVolumeClaim:
@@ -260,6 +278,7 @@ spec:
       metadata:
         labels:
           app: sgl-ascend
+          run-id: "{{ run_id }}"
           ring-controller.atlas: ascend-1980
       spec:
         hostNetwork: True
@@ -282,6 +301,8 @@ spec:
             value: "{{ install_sglang_from_source }}"
           - name: METRICS_DATA_FILE
             value: "{{ metrics_data_file }}"
+          - name: NPU_ACCURACY_DATASET
+            value: "{{ accuracy_dataset }}"
           - name: RUN_LABEL
             value: "{{ run_label }}"
           - name: KUBECONFIG
@@ -324,7 +345,13 @@ spec:
           - name: share
             mountPath: /root/sglang
             subPath: {{ sglang_source_relative_path }}
+          - name: shm-volume
+            mountPath: /dev/shm
         volumes:
+        - name: shm-volume
+          emptyDir:
+            medium: Memory
+            sizeLimit: "16Gi"
         {% if env in ["ci", "debug"] %}
         - name: share
           persistentVolumeClaim:

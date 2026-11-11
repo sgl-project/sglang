@@ -18,7 +18,7 @@
 
 namespace sglang {
 
-using device::distributed::Counter;
+using device::distributed::EpochCounter;
 using host::distributed::CommunicatorObj, host::distributed::CommunicatorRef;
 
 struct ParallelQKNormParams {
@@ -33,25 +33,7 @@ struct ParallelQKNormParams {
   uint32_t rank;
   uint32_t num_tokens;
   uint32_t epoch_bytes;
-  uint32_t num_clean_up_count = 0;
 };
-
-template <typename T>
-SGL_DEVICE void ld_global_volatile_8B(T& x, const void* addr, int64_t offset) {
-  static_assert(alignof(T) == 8 && sizeof(T) == 8);
-  addr = device::pointer::offset<T>(addr, offset);
-  uint2 val;
-  asm volatile("ld.volatile.global.v2.b32 {%0, %1}, [%2];" : "=r"(val.x), "=r"(val.y) : "l"(addr));
-  x = *reinterpret_cast<const T*>(&val);
-}
-
-template <typename T>
-SGL_DEVICE void st_global_volatile_8B(const T& x, void* addr, int64_t offset) {
-  static_assert(alignof(T) == 8 && sizeof(T) == 8);
-  const uint2 val = *reinterpret_cast<const uint2*>(&x);
-  addr = device::pointer::offset<T>(addr, offset);
-  asm volatile("st.volatile.global.v2.b32 [%2], {%0, %1};" ::"r"(val.x), "r"(val.y), "l"(addr));
-}
 
 [[maybe_unused]]
 SGL_DEVICE float sync_float(float x) {
@@ -101,7 +83,7 @@ struct KernelTrait {
 
 template <typename Trait>
 __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel_qknorm_across_head(
-    const ParallelQKNormParams __grid_constant__ params, Counter* const __restrict__ counters) {
+    const ParallelQKNormParams __grid_constant__ params, EpochCounter* const __restrict__ counter) {
   using namespace device;
 
   // each cta will handle exactly 1 token
@@ -109,7 +91,7 @@ __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel
   using DType2 = typename Trait::DType2;
   const auto &[
       buffer, q_ptr, k_ptr, q_weight, k_weight, q_stride_bytes, k_stride_bytes, //
-      eps, rank, num_tokens, epoch_bytes, num_clean_up_count
+      eps, rank, num_tokens, epoch_bytes
   ] = params;
 
   using Package = AlignedVector<float, 2>;
@@ -133,18 +115,9 @@ __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel
   const auto input_stride_bytes = load_q ? q_stride_bytes : k_stride_bytes;
   PDLWaitPrimary<Trait::kUsePDL>();
   PDLTriggerSecondary<Trait::kUsePDL>();
-  if (bx >= num_tokens) {
-    [[unlikely]];
-    // In this case, we use the last few blocks to clean up other controllers
-    const auto start = (bx - num_tokens) * blockDim.x + threadIdx.x;
-    const auto stride = (gridDim.x - num_tokens) * blockDim.x;
-    for (uint32_t i = start; i < num_clean_up_count; i += stride)
-      counters[num_tokens + i].inc(1);
-    return;
-  }
-  const auto epoch_offset = (counters[bx].get() % 2) * epoch_bytes;  // only for comm
+  const auto epoch_offset = counter->load() * epoch_bytes;  // only for comm
 
-  __builtin_assume(bx < num_tokens);  // since we have `bx >= num_tokens`
+  __builtin_assume(bx < num_tokens);  // the host launches min(num_tokens, default_blocks) blocks
   Storage next_input;
   void* input_i_ptr = pointer::offset(input_ptr, bx * input_stride_bytes);
   if (is_valid) next_input.load(input_i_ptr, offset);
@@ -193,10 +166,10 @@ __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel
         sum_q_k[0] = sum_q + eps;
         sum_q_k[1] = sum_k + eps;
         const auto push_ptr = pointer::offset(buffer[tx], epoch_offset);
-        st_global_volatile_8B(sum_q_k, push_ptr, i * kNumGPU + rank);
+        ptx::st_relaxed_8B(sum_q_k, push_ptr, i * kNumGPU + rank);
         const auto poll_ptr = pointer::offset(buffer[rank], epoch_offset);
         while (true) {
-          ld_global_volatile_8B(sum_q_k, poll_ptr, i * kNumGPU + tx);
+          ptx::ld_relaxed_8B(sum_q_k, poll_ptr, i * kNumGPU + tx);
           if (sum_q_k[0] != 0.0f && sum_q_k[1] != 0.0f) break;
         }
         constexpr uint32_t kActiveMask = (1 << kNumGPU) - 1;
@@ -226,9 +199,7 @@ __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel
     input_i_ptr = input_next_ptr;
   }
   __syncthreads();
-  if (threadIdx.x == 0) {
-    counters[bx].inc(1);  // NOTE: u32 overflow is safe under mod 2
-  }
+  if (threadIdx.x == 0) counter->commit();
 }
 
 template <typename DType, uint32_t kNumGPU, int64_t kQDim, int64_t kKDim, bool kUsePDL>
@@ -246,11 +217,12 @@ struct FusedParallelQKNormAcrossHead {
       const float eps  // passed in unscaled
   ) {
     using namespace host;
+    const auto& push = comm.get_push_obj();
     constexpr auto Q = Trait::kLocalQDim;
     constexpr auto K = Trait::kLocalKDim;
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
     TensorMatcher({N, Q})  // q
         .with_strides({-1, 1})
         .with_dtype<DType>()
@@ -271,19 +243,12 @@ struct FusedParallelQKNormAcrossHead {
         .verify(k_weight);
     const auto device = device_.unwrap();
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
-    // use at most `world_size` blocks to clean up,
-    // this is based on the observation that occupancy is usually linear
-    // with respect to the world size
-    const auto max_num_blocks = comm.num_push_blocks;
-    const bool need_clean = num_tokens < max_num_blocks;
-    const auto num_clean = need_clean ? (max_num_blocks - num_tokens) : 0;
-    const auto num_blocks = need_clean ? num_tokens + div_ceil(num_clean, Trait::kBlockSize)  //
-                                       : max_num_blocks;                                      //
+    if (num_tokens == 0) return;  // nothing pushed, so the epoch need not advance
+    const auto num_blocks = std::min(num_tokens, push.default_blocks);
     const auto num_threads = Trait::kBlockSize;
-    RuntimeCheck(num_blocks <= max_num_blocks, "internal error");
     ParallelQKNormParams params;
     for (uint32_t i = 0; i < kNumGPU; ++i) {
-      params.buffer[i] = comm.push_workspaces[i];
+      params.buffer[i] = push.workspaces[i];
     }
     params.q_ptr = q.data_ptr();
     params.k_ptr = k.data_ptr();
@@ -292,21 +257,20 @@ struct FusedParallelQKNormAcrossHead {
     params.q_stride_bytes = q.stride(0) * sizeof(DType);
     params.k_stride_bytes = k.stride(0) * sizeof(DType);
     params.eps = eps / kNumGPU;  // scale down eps by number of GPUs
-    params.rank = comm.rank;
+    params.rank = push.rank;
     params.num_tokens = num_tokens;
-    params.epoch_bytes = static_cast<uint32_t>(comm.push_bytes);
-    params.num_clean_up_count = num_clean;
+    params.epoch_bytes = static_cast<uint32_t>(push.slot_bytes);
 
     const auto needed_buffer_bytes = static_cast<int64_t>(num_tokens) * 2 * sizeof(float);
-    RuntimeCheck(comm.world_size == kNumGPU, "Number of GPUs mismatch");
+    RuntimeCheck(push.world_size == kNumGPU, "Number of GPUs mismatch");
     RuntimeCheck(std::bit_cast<intptr_t>(params.q_ptr) % 16 == 0, "q pointer is not properly aligned");
     RuntimeCheck(std::bit_cast<intptr_t>(params.k_ptr) % 16 == 0, "k pointer is not properly aligned");
     RuntimeCheck(std::bit_cast<intptr_t>(params.q_weight) % 16 == 0, "q_weight pointer is not properly aligned");
     RuntimeCheck(std::bit_cast<intptr_t>(params.k_weight) % 16 == 0, "k_weight pointer is not properly aligned");
-    RuntimeCheck(needed_buffer_bytes <= comm.push_bytes, "Push buffer is too small");
+    RuntimeCheck(needed_buffer_bytes <= push.slot_bytes, "Push buffer is too small");
 
     LaunchKernel(num_blocks, num_threads, device)  //
-        .enable_pdl(kUsePDL)(kernel, params, comm.push_counter);
+        .enable_pdl(kUsePDL)(kernel, params, push.counter);
   }
 
   static uint32_t get_max_occupancy() {

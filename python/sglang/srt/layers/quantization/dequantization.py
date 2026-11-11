@@ -10,7 +10,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 NVFP4_BLOCK_SIZE = 16
 _FP4_E2M1_LUT = torch.tensor(
@@ -74,9 +74,11 @@ def dequantize_nvfp4(
     w_s: torch.Tensor,
     w_s2: Optional[torch.Tensor],
     out_dtype: torch.dtype = torch.bfloat16,
+    high_nibble_first: bool = False,
 ) -> torch.Tensor:
     """NVFP4 -> ``out_dtype``. ``w_q``: uint8 [..., out, in/2] packed e2m1
-    (low nibble = even idx). ``w_s``: fp8 e4m3 [..., out, in/16] per-block.
+    (low nibble = even idx unless ``high_nibble_first``). ``w_s``: fp8 e4m3
+    [..., out, in/16] per-block.
     ``w_s2``: optional fp32 per-tensor scalar that multiplies the per-block
     scale (ModelOpt / AMD Quark NVFP4)."""
     device = w_q.device
@@ -85,10 +87,11 @@ def dequantize_nvfp4(
 
     low = (w_q & 0xF).to(torch.int64)
     high = (w_q >> 4).to(torch.int64)
+    first, second = (high, low) if high_nibble_first else (low, high)
     lut = _FP4_E2M1_LUT.to(device=device, dtype=torch.float32)
     deq = torch.empty(*batch, out_dim, in_dim, dtype=torch.float32, device=device)
-    deq[..., 0::2] = lut[low]
-    deq[..., 1::2] = lut[high]
+    deq[..., 0::2] = lut[first]
+    deq[..., 1::2] = lut[second]
 
     scale = w_s.to(torch.float32)
     if w_s2 is not None:

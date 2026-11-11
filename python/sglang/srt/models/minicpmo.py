@@ -16,6 +16,7 @@
 """Inference-only MiniCPM-o model compatible with HuggingFace weights."""
 
 import math
+from array import array
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Literal, Optional, Tuple, Union
 
@@ -39,22 +40,18 @@ from transformers.models.whisper.modeling_whisper import (
 
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalInputFormat,
-    MultimodalInputs,
-    flatten_nested_list,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.minicpmv import MiniCPMBaseModel, Resampler2_5
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.utils import get_device, logger
+from sglang.srt.multimodal.modality import MultimodalInputFormat
+from sglang.srt.utils import flatten_nested_list, get_device, logger
 
 try:
     # `LogitsWarper` was removed in transformers v4.48 (merged into
@@ -1188,7 +1185,6 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
 
 # Copied from from transformers.models.whisper.modeling_whisper.WhisperEncoder and add use_cache for streaming inference
 class MiniCPMWhisperEncoder(WhisperEncoder):
-
     def __init__(self, config: WhisperConfig):
         super().__init__(config)
         self.layers = nn.ModuleList(
@@ -1355,9 +1351,9 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
 
         # check if head_mask has a correct number of layers specified if desired
         if head_mask is not None:
-            assert head_mask.size()[0] == (
-                len(self.layers)
-            ), f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
+            assert head_mask.size()[0] == (len(self.layers)), (
+                f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
+            )
 
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -1457,9 +1453,9 @@ class MiniCPMO(MiniCPMBaseModel):
         logger.info("TTS is disabled for now")
         if self.config.init_tts:
             # print("tts enabled")
-            assert (
-                _tts_deps
-            ), "please make sure vector_quantize_pytorch and vocos are installed."
+            assert _tts_deps, (
+                "please make sure vector_quantize_pytorch and vocos are installed."
+            )
             self.tts = self.init_tts_module()
 
     def init_tts_module(self):
@@ -1519,7 +1515,7 @@ class MiniCPMO(MiniCPMBaseModel):
 
         return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
 
-    def pad_input_ids(self, input_ids: List[int], mm_input: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_input: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = mm_input.im_start_id
         im_end_id: int = mm_input.im_end_id
@@ -1532,11 +1528,13 @@ class MiniCPMO(MiniCPMBaseModel):
             (mm_input.audio_start_id, mm_input.audio_end_id),
         ]
         data_start_token_ids = [im_start_id, mm_input.audio_start_id]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(
-            data_token_pairs=data_token_pairs, data_start_token_ids=data_start_token_ids
-        )
 
-        return pattern.pad_input_tokens(input_ids, mm_input)
+        return pad_mm_token_pairs(
+            input_ids,
+            mm_input,
+            data_token_pairs=data_token_pairs,
+            data_start_token_ids=data_start_token_ids,
+        )
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
         """
@@ -1878,7 +1876,6 @@ class MiniCPMO(MiniCPMBaseModel):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-
             if "rotary_emb.inv_freq~" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:

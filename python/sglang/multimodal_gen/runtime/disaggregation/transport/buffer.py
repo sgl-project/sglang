@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
@@ -23,9 +23,6 @@ class SlotHandle:
     request_id: str
     offset: int  # byte offset in the pool
     size: int  # allocated size in bytes
-    tensor_views: dict[str, torch.Tensor | list[torch.Tensor]] = field(
-        default_factory=dict
-    )
 
 
 class TransferTensorBuffer:
@@ -54,8 +51,7 @@ class TransferTensorBuffer:
 
         pool_location = "pinned CPU" if device == "cpu" else f"GPU ({device})"
         logger.info(
-            "TransferTensorBuffer[%s]: allocated %d MiB %s memory "
-            "(min_block=%d KiB)",
+            "TransferTensorBuffer[%s]: allocated %d MiB %s memory (min_block=%d KiB)",
             role_name,
             actual_size >> 20,
             pool_location,

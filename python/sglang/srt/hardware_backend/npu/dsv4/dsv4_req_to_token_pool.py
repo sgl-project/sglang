@@ -77,21 +77,41 @@ class DSV4ReqToTokenTablesMixin:
         release C128 KV pages."""
         self._dsv4_allocator = allocator
 
+    def get_dsv4_c4_state_transfer_rows(
+        self, req_pool_idx: int, seq_len: int
+    ) -> torch.Tensor:
+        """Resolve the C4 history needed by the next call to local state rows."""
+        if self._dsv4_allocator is None:
+            raise RuntimeError("DSV4 allocator is not registered")
+        kv_pool = self._dsv4_allocator.get_kvcache()
+        state_pool = next(
+            pool
+            for pool in kv_pool.compress_state_pools
+            if pool is not None and pool.ratio == 4
+        )
+        # Retain the previous group and any partially filled current group.
+        history_len = seq_len % 4 + 4
+        full_locs = self.req_to_token[
+            req_pool_idx, max(0, seq_len - history_len) : seq_len
+        ]
+        swa_locs = kv_pool.translate_loc_from_full_to_swa(full_locs)
+        return state_pool.translate_from_swa_loc_to_state_loc(swa_locs)
+
     def set_c128_prefix_pages(self, req, page_ids: torch.Tensor) -> None:
         """Install pages returned by a Radix match.
 
         Prefix matching can happen before a request slot is allocated, so the
         page ids are temporarily carried by ``Req`` and installed by ``alloc``.
         """
-        if req.req_pool_idx is None:
+        if not req.kv.holds_kv:
             req.c128_prefix_page_ids = page_ids
             return
         self._dsv4_allocator.replace_req_c128_prefix(
-            int(req.req_pool_idx), page_ids, self
+            int(req.kv.req_pool_idx), page_ids, self
         )
 
     def alloc(self, reqs):
-        fresh = [req.req_pool_idx is None for req in reqs]
+        fresh = [not req.kv.holds_kv for req in reqs]
         indices = super().alloc(reqs)
         if indices is None:
             return None

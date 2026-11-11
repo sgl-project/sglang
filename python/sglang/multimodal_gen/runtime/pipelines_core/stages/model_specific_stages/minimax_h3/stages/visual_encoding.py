@@ -106,7 +106,9 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
                     ) as video_vae:
                         assert video_vae is not None
                         self.video_vae = video_vae
-                        self._encode_keyframes_from_plan(batch, plan, routed)
+                        self._encode_keyframes_from_plan(
+                            batch, plan, routed, server_args
+                        )
                 except Exception as exc:
                     owner_exception = exc
                     owner_error = f"{type(exc).__name__}: {exc}"
@@ -162,11 +164,10 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
             raise ValueError("MiniMax H3 visual routing selected no visual materials")
         return tuple(keys)
 
-    def _encode_keyframes_from_plan(self, batch: Req, plan, routed) -> None:
+    def _encode_keyframes_from_plan(self, batch: Req, plan, routed, server_args):
         """Direct keyframe encode: seeded sampled encode_images ->
         normalized [n,96] cond rows in batch.extra."""
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.keyframe_encoding import (
-            minimax_h3_encode_keyframe_cond_rows,
             minimax_h3_scoped_encode_fp32,
         )
 
@@ -177,13 +178,13 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
             for material in materials
             if material.material_chain == "image.target_canvas"
         ]
-        if str(plan.task) == "fl2va":
+        if keyframe_materials and str(plan.task) in {"fl2va", "ref2va"}:
             frame_indices = tuple(
                 material.frame_index for material in keyframe_materials
             )
             if frame_indices not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES:
                 raise ValueError(
-                    "fl2va visual encoding requires an ordered keyframe signature "
+                    "MiniMax H3 visual encoding requires an ordered keyframe signature "
                     f"in {MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES!r}, got "
                     f"{frame_indices!r}"
                 )
@@ -191,36 +192,38 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
             raise ValueError(
                 f"task {plan.task!r} cannot carry image.target_canvas materials"
             )
-        if MINIMAX_H3_KEYFRAME_COND_ROWS_EXTRA_KEY in batch.extra:
-            return
-        if chains == {"image.reference_preserve"}:
-            with minimax_h3_scoped_encode_fp32(self.video_vae):
-                self._encode_reference_image(batch, plan)
-            return
         video_chains = {
             "video.reference_preserve",
             "video_audio.reference_preserve",
         }
-        if chains and chains <= {"image.reference_preserve", *video_chains}:
-            # One VAE dtype toggle for both encodes below, not one each.
-            with minimax_h3_scoped_encode_fp32(self.video_vae):
-                if "image.reference_preserve" in chains:
-                    self._encode_reference_image(batch, plan)
-                if chains & video_chains:
-                    self._encode_reference_video(batch, plan)
-            return
-        unsupported = [
-            m.material_chain
-            for m in materials
-            if m.material_chain != "image.target_canvas"
-        ]
+        supported_chains = {
+            "image.target_canvas",
+            "image.reference_preserve",
+            *video_chains,
+        }
+        unsupported = sorted(chains - supported_chains)
         if unsupported:
             raise NotImplementedError(
-                "MiniMaxH3VisualEncodingStage direct encode only supports "
-                f"image.target_canvas / image.reference_preserve, got {unsupported}"
+                "MiniMaxH3VisualEncodingStage cannot encode material chains "
+                f"{unsupported}"
             )
+        # One VAE dtype toggle for every visual condition in the request.
+        with minimax_h3_scoped_encode_fp32(self.video_vae):
+            if keyframe_materials:
+                self._encode_target_keyframes(batch, plan)
+            if "image.reference_preserve" in chains:
+                self._encode_reference_image(batch, plan, server_args)
+            if chains & video_chains:
+                self._encode_reference_video(batch, plan)
+
+    def _encode_target_keyframes(self, batch: Req, plan) -> None:
+        if MINIMAX_H3_KEYFRAME_COND_ROWS_EXTRA_KEY in batch.extra:
+            return
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.canvas import (
             minimax_h3_prepared_keyframes,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.keyframe_encoding import (
+            minimax_h3_encode_keyframe_cond_rows,
         )
 
         # Parallel tiling gives each replicated rank complete tiles, then gathers
@@ -231,38 +234,34 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
             prepared.get("images") or ()
         ) != len(prepared_indices):
             raise ValueError(
-                "fl2va visual preparation requires one or two ordered images "
+                "keyframe visual preparation requires one or two ordered images "
                 "with a supported semantic_frame_indices signature"
             )
         encoded = []
         rows_list = []
-        # One VAE dtype toggle for the whole signature (up to two keyframes),
-        # not one per keyframe.
-        with minimax_h3_scoped_encode_fp32(self.video_vae):
-            for item in prepared["images"]:
-                image = item["image"]
-                width, height = item["canvas_width"], item["canvas_height"]
-                # The encode sampling seed is pinned at 42 (the VAE sample
-                # seed is part of the contract), independent of the
-                # request seed.
-                rows = minimax_h3_encode_keyframe_cond_rows(
-                    self.video_vae,
-                    image,
-                    self.vae_arch_config,
-                )
-                encoded.append(
-                    {
-                        "rows": rows,
-                        "latent_h": height // 16,
-                        "latent_w": width // 16,
-                        "canvas_height": height,
-                        "canvas_width": width,
-                        "frame_index": item.get("frame_index"),
-                        "resolved_frame_index": item.get("resolved_frame_index"),
-                        "condition_index": item.get("condition_index"),
-                    }
-                )
-                rows_list.append(rows)
+        for item in prepared["images"]:
+            image = item["image"]
+            width, height = item["canvas_width"], item["canvas_height"]
+            # The encode sampling seed is pinned at 42 (the VAE sample
+            # seed is part of the contract), independent of the request seed.
+            rows = minimax_h3_encode_keyframe_cond_rows(
+                self.video_vae,
+                image,
+                self.vae_arch_config,
+            )
+            encoded.append(
+                {
+                    "rows": rows,
+                    "latent_h": height // 16,
+                    "latent_w": width // 16,
+                    "canvas_height": height,
+                    "canvas_width": width,
+                    "frame_index": item.get("frame_index"),
+                    "resolved_frame_index": item.get("resolved_frame_index"),
+                    "condition_index": item.get("condition_index"),
+                }
+            )
+            rows_list.append(rows)
         rows = rows_list[0] if len(rows_list) == 1 else torch.cat(rows_list, dim=0)
         first = encoded[0]
         batch.extra[MINIMAX_H3_KEYFRAME_COND_ROWS_EXTRA_KEY] = {
@@ -325,37 +324,76 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
         payload["videos"] = entries
         batch.extra[MINIMAX_H3_REFERENCE_VIDEO_ROWS_EXTRA_KEY] = payload
 
-    def _encode_reference_image(self, batch: Req, plan) -> None:
+    def _encode_reference_image(self, batch: Req, plan, server_args) -> None:
         """ref2va reference image encode: cap_resize (intrinsic
         geometry) + the verified keyframe recipe; rows use the image's OWN
         latent grid, not the target canvas."""
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
             MINIMAX_H3_REFERENCE_IMAGE_ROWS_EXTRA_KEY,
         )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.image_noise import (
+            minimax_h3_image_noise,
+            minimax_h3_image_reference_grid,
+        )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.keyframe_encoding import (
             minimax_h3_encode_keyframe_cond_rows,
         )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.reference_encoding import (
+            minimax_h3_bound_image_reference,
             minimax_h3_prepared_reference_image,
         )
 
         if MINIMAX_H3_REFERENCE_IMAGE_ROWS_EXTRA_KEY in batch.extra:
             return
         prepared = minimax_h3_prepared_reference_image(batch, plan)
-        entries = []
+        # Image releases encode the original geometry, resized when its short
+        # edge leaves the VAE bounds (Qwen resizes its own copy in text
+        # encoding), then a 16px top-left pixel crop in encode_images and an
+        # even latent crop.
+        original_geometry = plan.output_modality == "image"
+        vae_images = []
+        grids = []
         for item in prepared["images"]:
             image = item["image"]
+            width, height = image.size
+            if original_geometry:
+                if min(width, height) < 32:
+                    raise ValueError(
+                        "image reference must retain at least 32 pixels on each axis"
+                    )
+                low, high = (
+                    server_args.pipeline_config.edit_reference_short_edge_bounds("vae")
+                )
+                image = minimax_h3_bound_image_reference(
+                    image, min_short_edge=low, max_short_edge=high
+                )
+                grids.append(minimax_h3_image_reference_grid(*image.size))
+            else:
+                grids.append((height // 16, width // 16))
+            vae_images.append(image)
+        generator = None
+        if original_geometry:
+            # Positioned after the target and anchor draws; the posterior
+            # samples are the request's last draws (see image_noise.py).
+            generator = minimax_h3_image_noise(
+                batch, plan, server_args, reference_grids=grids
+            ).generator
+        entries = []
+        for item, image, (latent_h, latent_w) in zip(
+            prepared["images"], vae_images, grids
+        ):
             rows = minimax_h3_encode_keyframe_cond_rows(
                 self.video_vae,
                 image,
                 self.vae_arch_config,
+                crop_to_even=original_geometry,
+                generator=generator,
             )
-            width, height = image.size
             entries.append(
                 {
                     "rows": rows,
-                    "latent_h": height // 16,
-                    "latent_w": width // 16,
+                    "latent_h": latent_h,
+                    "latent_w": latent_w,
                     "condition_index": int(item["condition_index"]),
                     "material_chain": "image.reference_preserve",
                 }

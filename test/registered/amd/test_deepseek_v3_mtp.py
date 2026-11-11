@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=980, suite="stage-c-test-large-8-gpu-amd")
+register_amd_ci(est_time=980, suite="nightly-amd-8-gpu", nightly=True)
 
 FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 
@@ -66,7 +66,7 @@ class TestDeepseekV3MTP(CustomTestCase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)

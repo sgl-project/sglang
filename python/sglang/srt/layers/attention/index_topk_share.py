@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterator, Optional
 
+from sglang.srt.layers.cp.utils import cp_gather_after_forward, is_cp_active
+
 if TYPE_CHECKING:
     import torch
 
@@ -33,8 +35,11 @@ class IndexTopKShareState:
 
     @property
     def _seed_buf(self) -> Optional[torch.Tensor]:
-        if self._forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-            return self._forward_batch.spec_info.dsa_seed_topk_capture
+        spec_info = self._forward_batch.spec_info
+        if spec_info is not None and self._forward_batch.forward_mode.is_extend(
+            include_draft_extend_v2=True
+        ):
+            return spec_info.dsa_seed_topk_capture
         return None
 
     @property
@@ -46,6 +51,12 @@ class IndexTopKShareState:
         return self._topk_indices
 
     def update(self, topk_indices: Optional[torch.Tensor]) -> None:
+        if (
+            topk_indices is not None
+            and self.should_publish
+            and is_cp_active(self._forward_batch)
+        ):
+            topk_indices = cp_gather_after_forward(topk_indices, self._forward_batch)
         self._topk_indices = topk_indices
 
     def publish(self) -> None:
@@ -55,13 +66,7 @@ class IndexTopKShareState:
             self._forward_batch.spec_info.dsa_topk_indices = self._topk_indices
         seed_buf = self._seed_buf
         if seed_buf is not None:
-            sel = self._forward_batch.spec_info.dsa_seed_topk_select
-            src = (
-                self._topk_indices[: seed_buf.shape[0]]
-                if sel is None
-                else self._topk_indices[sel]
-            )
-            seed_buf[: src.shape[0]].copy_(src)
+            write_mtp_seed(self._forward_batch, seed_buf, self._topk_indices)
 
     @classmethod
     @contextmanager
@@ -84,3 +89,26 @@ class IndexTopKShareState:
         finally:
             spec_info.dsa_topk_indices = None
             forward_batch.reuse_dsa_topk_indices = False
+
+
+def write_mtp_seed(
+    forward_batch: ForwardBatch, seed_buf: torch.Tensor, topk_indices: torch.Tensor
+) -> None:
+    """Copy the selected top-k rows into the MTP seed buffer.
+
+    Both the MHA and sparse-MLA prefill paths export seeds here so the backend
+    can convert prefill-only index representations (e.g. fused RAGGED logical
+    offsets) into what the next draft decode consumes.
+    """
+    from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
+        resolve_attn_backend,
+    )
+
+    select = forward_batch.spec_info.dsa_seed_topk_select
+    src = topk_indices[: seed_buf.shape[0]] if select is None else topk_indices[select]
+    prepare_seed = getattr(
+        resolve_attn_backend(forward_batch), "prepare_mtp_seed_indices", None
+    )
+    if prepare_seed is not None:
+        src = prepare_seed(src, forward_batch.forward_mode)
+    seed_buf[: src.shape[0]].copy_(src)

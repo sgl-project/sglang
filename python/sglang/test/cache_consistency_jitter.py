@@ -190,7 +190,7 @@ def get_jitter_engine(
     engine_kwargs.setdefault("schedule_conservativeness", 0.05)
 
     if (
-        engine_kwargs.get("enable_dp_attention")
+        engine_kwargs.get("attn_dp_size", 1) > 1
         and "dist_init_addr" not in engine_kwargs
     ):
         import portpicker
@@ -199,9 +199,7 @@ def get_jitter_engine(
 
         port = portpicker.pick_unused_port_range(  # pyright: ignore[reportAttributeAccessIssue]
             DP_ATTENTION_HANDSHAKE_PORT_DELTA + 1
-        )[
-            0
-        ]
+        )[0]
         engine_kwargs["dist_init_addr"] = f"127.0.0.1:{port}"
 
     scheduler_process = (
@@ -307,9 +305,9 @@ def _record_response(
     out_ids = [int(t) for t in out["output_ids"]]
     out_lps = meta["output_token_logprobs"]
     out_top = meta["output_top_logprobs"]
-    assert (
-        len(out_ids) == req.max_new_tokens
-    ), f"{req.label}: got {len(out_ids)} output tokens, expected {req.max_new_tokens}"
+    assert len(out_ids) == req.max_new_tokens, (
+        f"{req.label}: got {len(out_ids)} output tokens, expected {req.max_new_tokens}"
+    )
     expected = out_ids if baseline is None else baseline[req.cut :]
     for m, (tid, lp_entry, top) in enumerate(
         zip(out_ids, out_lps, out_top, strict=True)

@@ -32,7 +32,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import (
     CacheLookup,
     CacheMiss,
@@ -42,7 +41,8 @@ from sglang.srt.multimodal.cache import (
     parse_content_hash,
     snapshot_media,
 )
-from sglang.srt.utils import load_image
+from sglang.srt.multimodal.media_io import CLIENT_MEDIA_EXCEPTIONS, load_image
+from sglang.srt.multimodal.modality import Modality
 
 
 @runtime_checkable
@@ -51,8 +51,8 @@ class MediaArtifact(Protocol):
 
     ``content_digest`` identifies the media contents. ``artifact_key`` also
     includes every preprocessing choice that can change the artifact.
-    ``feature_hash`` becomes ``MultimodalDataItem.hash`` and identifies the
-    corresponding encoder embedding.
+    ``feature_hash`` carries a full-width server-computed fingerprint, not a
+    caller-provided hint or a truncated embedding-cache key.
     """
 
     content_digest: str
@@ -118,7 +118,7 @@ class MediaArtifactCacheMixin:
     def _resolve_artifact_modality(self, modality: Optional[Modality]) -> Modality:
         modality = modality or self.artifact_modality
         if modality is None:
-            raise ValueError("A modality is required for artifact caching")
+            raise RuntimeError("A modality is required for artifact caching")
         return modality
 
     def _artifact_key(
@@ -147,7 +147,7 @@ class MediaArtifactCacheMixin:
         """
         if modality != Modality.IMAGE:
             raise NotImplementedError(
-                f"{modality.name.lower()} artifact decoding " "requires a model adapter"
+                f"{modality.name.lower()} artifact decoding requires a model adapter"
             )
         data = snapshot.data
         if isinstance(data, torch.Tensor):
@@ -157,9 +157,12 @@ class MediaArtifactCacheMixin:
         if isinstance(data, Image.Image):
             data.load()
             return data
-        image, _ = load_image(data, self.gpu_image_decode)
-        if isinstance(image, Image.Image):
-            image.load()
+        try:
+            image, _ = load_image(data, self.gpu_image_decode)
+            if isinstance(image, Image.Image):
+                image.load()
+        except CLIENT_MEDIA_EXCEPTIONS as e:
+            raise ValueError(f"Could not load image: {e}") from e
         return image
 
     def snapshot_media_source(self, source: Any, modality: Modality) -> MediaSnapshot:
@@ -171,7 +174,7 @@ class MediaArtifactCacheMixin:
         """
         if modality != Modality.IMAGE:
             raise NotImplementedError(
-                f"{modality.name.lower()} artifact identity " "requires a model adapter"
+                f"{modality.name.lower()} artifact identity requires a model adapter"
             )
         return snapshot_media(source)
 
@@ -202,15 +205,17 @@ class MediaArtifactCacheMixin:
     def validate_artifact(artifact: MediaArtifact, entry: MediaArtifactInput) -> None:
         """Enforce identity invariants shared by every model adapter."""
         if artifact.content_digest != entry.content_digest:
-            raise ValueError("prepare_artifact_batch changed the media content digest")
+            raise RuntimeError(
+                "prepare_artifact_batch changed the media content digest"
+            )
         if artifact.artifact_key != entry.artifact_key:
-            raise ValueError("prepare_artifact_batch changed the media artifact key")
+            raise RuntimeError("prepare_artifact_batch changed the media artifact key")
         if (
             isinstance(artifact.feature_hash, bool)
             or not isinstance(artifact.feature_hash, int)
             or artifact.feature_hash < 0
         ):
-            raise ValueError(
+            raise RuntimeError(
                 "Media artifact feature_hash must be a non-negative integer"
             )
 
@@ -291,7 +296,7 @@ class MediaArtifactCacheMixin:
         if featureless_hit_mask is None:
             featureless_hit_mask = [False] * media_count
         if len(featureless_hit_mask) != media_count:
-            raise ValueError("featureless_hit_mask must align with media_data")
+            raise RuntimeError("featureless_hit_mask must align with media_data")
 
         # keep per-input state aligned for duplicates and partial hits
         artifacts: list[Optional[MediaArtifact]] = [None] * media_count
@@ -412,6 +417,66 @@ class MediaArtifactCacheMixin:
             raise RuntimeError("Artifact cache did not resolve every media item")
         return [artifact for artifact in artifacts if artifact is not None]
 
+    async def prepare_media_artifacts_without_cache(
+        self,
+        media_data: Sequence[Any],
+        *,
+        content_hashes: Optional[Sequence[Optional[str]]] = None,
+        modality: Optional[Modality] = None,
+    ) -> list[MediaArtifact]:
+        """Build request-local artifacts without cache lookup or retention."""
+        modality = self._resolve_artifact_modality(modality)
+        media_count = len(media_data)
+        if content_hashes is None:
+            content_hashes = [None] * media_count
+        if len(content_hashes) != media_count:
+            raise ValueError(
+                f"mm_content_hashes has {len(content_hashes)} entries for "
+                f"{media_count} {modality.name.lower()} items"
+            )
+        content_hashes = [parse_content_hash(value) for value in content_hashes]
+
+        snapshot_futures = [
+            self.io_executor.submit(self.snapshot_media_source, source, modality)
+            for source in media_data
+        ]
+        snapshots = []
+        for index, future in enumerate(snapshot_futures):
+            snapshot = await asyncio.wrap_future(future)
+            caller_hash = content_hashes[index]
+            if caller_hash is not None and caller_hash != snapshot.content_digest:
+                raise ValueError(
+                    f"content hash mismatch for media_data[{index}]: "
+                    f"expected {caller_hash}, got {snapshot.content_digest}"
+                )
+            snapshots.append(snapshot)
+
+        decode_futures = [
+            self.io_executor.submit(self.decode_media_snapshot, snapshot, modality)
+            for snapshot in snapshots
+        ]
+        entries = []
+        for source, snapshot, future in zip(media_data, snapshots, decode_futures):
+            entries.append(
+                MediaArtifactInput(
+                    content_digest=snapshot.content_digest,
+                    artifact_key=self._artifact_key(
+                        snapshot.content_digest, source, modality=modality
+                    ),
+                    modality=modality,
+                    media=await asyncio.wrap_future(future),
+                )
+            )
+
+        artifacts = await self._run_preprocess_and_build_artifact_batch(entries)
+        if len(artifacts) != len(entries):
+            raise RuntimeError(
+                "prepare_artifact_batch must return one artifact per media input"
+            )
+        for artifact, entry in zip(artifacts, entries):
+            self.validate_artifact(artifact, entry)
+        return artifacts
+
     async def _compute_cache_misses(
         self,
         misses_to_compute: Sequence[CacheMiss[str, MediaArtifact]],
@@ -453,7 +518,7 @@ class MediaArtifactCacheMixin:
                 missed_media
             )
             if len(missed_artifacts) != len(misses_to_compute):
-                raise ValueError(
+                raise RuntimeError(
                     "prepare_artifact_batch must return one artifact per cache miss"
                 )
             for missed, entry, artifact in zip(
@@ -465,7 +530,7 @@ class MediaArtifactCacheMixin:
                     previous is not None
                     and previous.feature_hash != artifact.feature_hash
                 ):
-                    raise ValueError(
+                    raise RuntimeError(
                         "Cached media artifact feature hash changed for identical "
                         f"identity {missed.key}"
                     )
