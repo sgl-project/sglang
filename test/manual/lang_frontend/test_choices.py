@@ -85,6 +85,27 @@ class TestChoices(CustomTestCase):
             atol=0.01,
         )
 
+    def test_choices_with_empty_or_nan_logprobs(self):
+        """Ensure empty token lists or NaN/None logprobs do not crash selection or win over valid options."""
+        data = {
+            "choices": ["empty_choice", "valid_choice", "nan_choice"],
+            "normalized_prompt_logprobs": [float("nan"), -0.2, float("nan")],
+            "input_token_logprobs": [
+                [],
+                [[-0.2, 1, None], [-0.2, 2, None]],
+                [[float("nan"), 3, None]],
+            ],
+            "output_token_logprobs": [[], [], []],
+            "unconditional_token_logprobs": [
+                [],
+                [[None, 1, None], [-0.5, 2, None]],
+                [[None, 3, None]],
+            ],
+        }
+        assert token_length_normalized(**data).decision == "valid_choice"
+        assert greedy_token_selection(**data).decision == "valid_choice"
+        assert unconditional_likelihood_normalized(**data).decision == "valid_choice"
+
 
 if __name__ == "__main__":
     unittest.main()
