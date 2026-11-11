@@ -67,6 +67,8 @@ Tensor parallelism counts logical devices: TP4 requires four A2 cards or two A3
 cards. The selector shows the card and device requirements for each recipe.
 See the [Ascend hardware reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
+<div className="qwen3-ascend-table">
+
 | Model | Quantization | Workload | Hardware / physical cards | Logical devices / TP | Status |
 | --- | --- | --- | --- | --- | --- |
 | Qwen3-8B | W8A8 | Low latency | A3 / 1 | 2 | Measured |
@@ -75,6 +77,8 @@ See the [Ascend hardware reference](/docs/hardware-platforms/ascend-npus/referen
 | Qwen3-32B | BF16 | Low latency | A2 / 4 | 4 | Measured |
 | Qwen3-32B | W8A8 | High throughput | A2 / 4 | 4 | Measured |
 | Qwen3-235B-A22B | W8A8 | High throughput | A2 / 8 | 8 | Startup and GSM8K measured; performance incomplete |
+
+</div>
 
 The 32B W8A8 recipe follows the command in the
 [A2 best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b#qwen3-32b-w8a8-2p-in3k5-out1k5-55ms-a2-series).
@@ -122,6 +126,8 @@ Ascend tutorials describe v0.5.16; earlier releases can use different flags.
 
 The A3 measurements and A2 32B validation use the following environments:
 
+<div className="qwen3-ascend-table">
+
 | Component | A3, 2026-09-12 | A2 32B, 2026-09-22–23 |
 | :--- | :--- | :--- |
 | SGLang | `main` at `c389dd086340878934bf96bc209534f1fbb8440c` | `main` at `b44e2486824e2fbde9cbcb09adad10bce5593c16` |
@@ -130,6 +136,8 @@ The A3 measurements and A2 32B validation use the following environments:
 | sgl-kernel-npu | `2026.9.0` | `2026.9.0`, 910B / aarch64 package |
 | triton-ascend | `3.2.1.dev20260530` | `3.2.1.dev20260530` |
 | Transformers | `5.8.1` | `5.12.1` |
+
+</div>
 
 The 2026-10-21 A3 8B TP1 GPQA retest used the same versions listed in the A3
 column, with Python 3.11.15, `memfabric-hybrid 1.0.8`, and `memfabric-zbal 1.1.1`.
@@ -166,11 +174,15 @@ The A2 32B assets are pinned to these **ModelScope** repository revisions. Their
 complete file manifests were checked against the downloaded sizes and SHA256
 digests; these revision identifiers refer to ModelScope, not Hugging Face.
 
+<div className="qwen3-ascend-table">
+
 | ModelScope checkpoint | Revision |
 | :--- | :--- |
 | `vllm-ascend/Qwen3-32B-W8A8` | `9ecdf711a9629fbf2385b17b47359c8a604e39ed` |
 | `Zjcxy-SmartAI/Eagle3-Qwen3-32B-zh` | `d7272a49b25d36d75f7ec629503fb704f67268db` |
 | `Qwen/Qwen3-32B` | `d64d397e66908737784bb9172614b88e085b2ad1` |
+
+</div>
 
 In the NPU container, load the environment scripts supplied by your installation:
 
@@ -229,11 +241,15 @@ The existing Ascend tests evaluate 8B and 32B W8A8 on **GPQA Diamond (198 questi
 temperature 1.0. Run the full dataset against the running service; a short
 request that returns `Paris` only checks that inference works.
 
+<div className="qwen3-ascend-table">
+
 | Model | `EVAL_DATASET` | Maximum output tokens | Client concurrency |
 | :--- | :--- | ---: | ---: |
 | Qwen3-8B W8A8 | `gpqa_diamond` | 38000 | 64 |
 | Qwen3-32B W8A8 | `gpqa_diamond` | 38000 | 64 |
 | Qwen3-30B-A3B W8A8 | `aime25` | 32768 | 16 |
+
+</div>
 
 The measured 8B and 32B checkpoints have a 40,960-token context limit. In the initial runs, one GPQA
 input was reported as 2,829 tokens, so the upstream 40,000-token output budget
@@ -369,6 +385,8 @@ define task-specific workloads, without a reference latency target. The 32B BF16
 workload is measured; the 235B workload remains incomplete after a 900-second timeout. ISL and OSL are input and output token counts
 per request.
 
+<div className="qwen3-ascend-table">
+
 | Hardware | Model / quantization | Workload | ISL | OSL | Concurrency | Requests | Reference TPOT |
 | :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
 | A3 | Qwen3-8B / W8A8 | [Low latency](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b#qwen3-8b-w8a8-1p-in3k5-out1k5-5ms) | 3500 | 1500 | 1 | 4 | 5 ms |
@@ -378,6 +396,8 @@ per request.
 | A2 | Qwen3-32B / BF16 | Low latency | 18000 | 4000 | 1 | 4 | No reference target |
 | A2 | Qwen3-32B / W8A8 | [High throughput](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b#qwen3-32b-w8a8-2p-in3k5-out1k5-55ms-a2-series) | 3584 | 1536 | 100 | 400 | 55 ms (source) |
 | A2 | Qwen3-235B-A22B / W8A8 | Throughput candidate | 3500 | 1500 | 8 | 32 | Incomplete (timeout); no final metrics |
+
+</div>
 
 The A2 32B reference's card-count inconsistency prevents treating its published
 55 ms as a matched-hardware baseline until the source topology is clarified.
