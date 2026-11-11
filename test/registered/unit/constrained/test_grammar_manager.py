@@ -110,6 +110,7 @@ def _make_req(
     """Create a mock request with sampling params."""
     req = MagicMock()
     req.rid = rid
+    req.owner_list = None
     req.sampling_params.json_schema = json_schema
     req.sampling_params.regex = regex
     req.sampling_params.ebnf = ebnf

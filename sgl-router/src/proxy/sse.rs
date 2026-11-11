@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
+use axum::http::StatusCode;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
@@ -136,6 +137,38 @@ impl ErrorEventScanner {
 /// Whether a buffered SSE body carries an error event.
 pub fn has_error_event(body: &[u8]) -> bool {
     ErrorEventScanner::default().feed(body)
+}
+
+/// The status and JSON error body of a buffered SSE body's first error event,
+/// when the engine gave it a 4xx code: the engine refused the request, so the
+/// client receives the 4xx a non-streaming response would have carried.
+/// sglang's OpenAI routes send `{"error": {"message", "type", "code", ...}}`,
+/// passed on unchanged; native `/generate` sends an abort finish reason with a
+/// `status_code`, reframed as its non-streaming body `{"error": {"message", "code"}}`.
+pub fn client_error_event(body: &[u8]) -> Option<(StatusCode, Bytes)> {
+    let payloads = body.split(|&b| b == b'\n');
+    for payload in payloads.filter_map(|line| line.strip_prefix(b"data:")) {
+        let payload = payload.trim_ascii();
+        if is_error_payload(payload) {
+            let event: serde_json::Value = serde_json::from_slice(payload).ok()?;
+            return client_status(&event["error"]["code"], Bytes::copy_from_slice(payload));
+        }
+        let Ok(event) = serde_json::from_slice::<serde_json::Value>(payload) else {
+            continue;
+        };
+        let reason = &event["meta_info"]["finish_reason"];
+        let code = &reason["status_code"];
+        if reason["type"] == "abort" && !code.is_null() {
+            let error = serde_json::json!({"error": {"message": reason["message"], "code": code}});
+            return client_status(code, Bytes::from(error.to_string()));
+        }
+    }
+    None
+}
+
+fn client_status(code: &serde_json::Value, body: Bytes) -> Option<(StatusCode, Bytes)> {
+    let status = StatusCode::from_u16(u16::try_from(code.as_u64()?).ok()?).ok()?;
+    status.is_client_error().then_some((status, body))
 }
 
 /// An upstream item the pump forwards unchanged.

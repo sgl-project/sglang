@@ -207,9 +207,6 @@ class _MoeRunnerBackendPredicates:
     def is_ascend(self):
         return self.value == MoeRunnerBackend.ASCEND.value
 
-    def is_triton_kernels(self):
-        return self.value == MoeRunnerBackend.TRITON_KERNELS.value
-
     def is_flashinfer_trtllm(self):
         # experimental_sgl_trtllm shares the TRT-LLM FP8 kernels + layout, so it inherits
         # trtllm weight-prep here; divergent sites check is_experimental_sgl_trtllm() first.
@@ -278,7 +275,6 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
-    TRITON_KERNELS = "triton_kernel"
     ASCEND = "ascend"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     EXPERIMENTAL_SGL_TRTLLM = "experimental_sgl_trtllm"
