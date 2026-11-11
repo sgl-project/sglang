@@ -127,6 +127,11 @@ Add `--image-path first_frame.png` to condition the video on an image. Frame
 counts align to `8n+1`; width and height must be divisible by 32. The 4-step
 preview is a different checkpoint and is not supported by this pipeline.
 
+With two GPUs, add `--num-gpus 2` to split the video tokens across them
+(sequence parallelism). The result is not bit-identical to the single-GPU
+result. The sequence-parallel degree must divide the 10 softmax attention
+heads; `--ring-degree` above 1 and `--enable-cfg-parallel` are not supported.
+
 For offline weights, keep the model directory name, such as
 `/path/to/SANA-Video_2.0_5B_720p`, and pass it as `--model-path`. That directory
 must contain `config.yaml` and `checkpoints/SANA_Video_2.0_5B_720p.pth`. Set
