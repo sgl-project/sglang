@@ -305,8 +305,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.disable_chunked_prefix_cache = get_schedule().disable_chunked_prefix_cache
 
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
-        # (id(forward_batch), layer_id, indices, counts) of the last sliding layer;
-        # a reused id cannot match, as a new forward starts at a lower layer id.
+        # (id(forward_batch), layer_id, indices, counts); a new forward restarts lower.
         self._window_index_cache = None
         self._window_counter_buffer = None
         self._window_row_indptr = None
@@ -1453,8 +1452,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def _window_sparse_indices(
         self, layer: RadixAttention, forward_batch: ForwardBatch
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """This rank's window indices and counts per query row, shared by the
-        sliding layers of one forward."""
         cache = self._window_index_cache
         if (
             cache is not None
@@ -1488,8 +1485,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         metadata: TRTLLMMLADecodeMetadata,
     ):
-        """Row p attends [p - sliding_window_size, p] via trtllm-gen sparse MLA;
-        under DCP returns the rank-local (out, lse) for the caller's merge."""
+        """Row p attends [p - window, p]; under DCP returns the rank-local (out, lse)."""
         bs, q_len, heads, head_dim = q.shape
         rows = bs * q_len
         assert rows < self._window_row_indptr.numel(), (
