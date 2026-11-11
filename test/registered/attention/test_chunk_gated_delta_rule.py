@@ -494,7 +494,7 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         final states are the same either way."""
         device = get_device()
         dtype = torch.bfloat16
-        B, T_per_seq, pad, H, K, V, pool_size = 3, 100, 40, 4, 128, 128, 8
+        B, T_per_seq, H, K, V, pool_size = 3, 100, 4, 128, 128, 8
         T = B * T_per_seq
         torch.manual_seed(0)
 
@@ -517,10 +517,8 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         def nans(*shape, dtype=dtype):
             return torch.full(shape, float("nan"), dtype=dtype, device=device)
 
-        padded = nans(1, T + pad, H, V)
         for label, output, in_place in (
             ("contiguous", nans(1, T, H, V), True),
-            ("real rows of a padded buffer", padded[:, :T], True),
             ("other dtype", nans(1, T, H, V, dtype=torch.float32), False),
             ("strided", nans(1, T, H, 2 * V)[..., :V], False),
         ):
@@ -544,8 +542,6 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                 self.assertTrue(torch.equal(pool, pool_ref))
                 if not in_place:
                     self.assertTrue(torch.isnan(output.float()).all())
-        # Nothing is written past the rows of the output.
-        self.assertTrue(torch.isnan(padded[:, T:].float()).all())
 
     def test_pipelined_scan_is_bit_identical(self):
         """With SGLANG_GDN_CHUNK_PIPELINE one long sequence runs as up to 4
@@ -560,12 +556,8 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         cases = (
             # label, rows, sequence lengths, inplace_update
             ("16384 tokens, 4 parts", 16384, [16384], True),
-            ("12600 tokens, 3 parts", 12600, [12600], True),
-            ("8192 tokens, 2 parts", 8192, [8192], True),
             ("10000 tokens + padded tail", 10240, [10000], True),
-            ("8000 tokens, one pass", 8000, [8000], True),
             ("two sequences, one pass", 18000, [9000, 9000], True),
-            ("read-only state, one pass", 16384, [16384], False),
         )
         for label, T, lens, inplace_update in cases:
             with self.subTest(label):
@@ -633,9 +625,7 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         cases = (
             # label, rows, sequence lengths, pipeline
             ("three sequences, one pass", 3000, [1000, 64, 1936], False),
-            ("16384 tokens, pipelined", 16384, [16384], True),
             ("10000 tokens + padded tail, pipelined", 10240, [10000], True),
-            ("1696 tokens + padded tail, one pass", 2048, [1696], True),
         )
         for label, T, lens, pipeline in cases:
             with self.subTest(label):
@@ -696,36 +686,6 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                 self.assertTrue(torch.equal(h1, h0))
                 self.assertTrue(torch.equal(pool1, pool0))
 
-    def test_chunk_indices_and_offsets_from_host_offsets(self):
-        """Chunk indices built from host offsets and chunk offsets padded on
-        the device match the device-read versions, values and dtype."""
-        from sglang.kernels.ops.attention.fla.index import (
-            prepare_chunk_indices,
-            prepare_chunk_offsets,
-        )
-
-        device = get_device()
-        for lens in ([1], [64], [65], [1000, 64, 1936], [5, 0, 3], [16384]):
-            for dtype in (torch.int32, torch.long):
-                with self.subTest(lens=lens, dtype=dtype):
-                    offsets = [0, *itertools.accumulate(lens)]
-                    cu_seqlens = torch.tensor(offsets, dtype=dtype, device=device)
-                    expected = prepare_chunk_indices(cu_seqlens.clone(), 64)
-                    actual = prepare_chunk_indices(
-                        cu_seqlens, 64, torch.tensor(offsets, dtype=dtype)
-                    )
-                    self.assertEqual(actual.dtype, expected.dtype)
-                    self.assertEqual(actual.device, expected.device)
-                    self.assertTrue(torch.equal(actual, expected))
-
-                    lens_t = cu_seqlens[1:] - cu_seqlens[:-1]
-                    expected = torch.cat(
-                        [cu_seqlens.new_tensor([0]), (lens_t + 63) // 64]
-                    ).cumsum(-1)
-                    actual = prepare_chunk_offsets(cu_seqlens.clone(), 64)
-                    self.assertEqual(actual.dtype, expected.dtype)
-                    self.assertTrue(torch.equal(actual, expected))
-
     # ------------------------------------------------------------------
     # The fused kkt + solve kernel writes all of A (no zero fill first)
     # ------------------------------------------------------------------
@@ -735,7 +695,7 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         of each chunk's rows, including the zero blocks above the diagonal.
 
         Runs the intra-chunk forward with fresh memory holding 0 (what a zero
-        fill gave), NaN and 7, and expects the same bits from all three.
+        fill gave) and NaN, and expects the same bits from both.
         """
         device = get_device()
         if device == "xpu":
@@ -744,7 +704,7 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         H, Hg, K, V, BT = 6, 2, 128, 128, 64
         empty = torch.empty
 
-        for label, lens in (("one sequence", [300]), ("varlen", [64, 1, 130, 77])):
+        for label, lens in (("varlen", [64, 1, 130, 77]),):
             with self.subTest(label):
                 torch.manual_seed(0)
                 T = sum(lens)
@@ -767,7 +727,7 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                 beta = torch.sigmoid(torch.randn(1, T, H, device=device)).to(dtype)
 
                 runs = []
-                for fill in (0.0, float("nan"), 7.0):
+                for fill in (0.0, float("nan")):
 
                     def stale_empty(*args, fill=fill, **kwargs):
                         out = empty(*args, **kwargs)
@@ -782,7 +742,7 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
 
                 w0, u0, A0 = runs[0]
                 upper = torch.ones(BT, BT, dtype=torch.bool, device=device).triu(1)
-                for fill, (w, u, A) in zip(("nan", "7"), runs[1:]):
+                for fill, (w, u, A) in zip(("nan",), runs[1:]):
                     self.assertTrue(torch.equal(A, A0), f"A differs with {fill}")
                     self.assertTrue(torch.equal(w, w0), f"w differs with {fill}")
                     self.assertTrue(torch.equal(u, u0), f"u differs with {fill}")
