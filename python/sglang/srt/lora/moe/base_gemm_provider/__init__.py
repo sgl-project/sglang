@@ -2,45 +2,21 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sglang.srt.lora.moe.base_gemm_provider.base import MoeBaseProvider
 
-logger = logging.getLogger(__name__)
-
-# The first vendor is the default for each weight family.
-VENDORS = {
-    "bf16": ("cutedsl", "triton"),
-    "fp8": ("cutedsl", "triton"),
-    "nvfp4": ("marlin",),
-}
-
 
 def select_provider_cls(
-    base_gemm_rows: str, family: str, vendor: str | None = None
+    base_gemm_rows: str, family: str, vendor: str
 ) -> type[MoeBaseProvider]:
-    """Use the family default when the requested vendor cannot serve it.
-
-    Triton and Marlin use route-major rows for either requested row order.
-    """
+    """Triton and Marlin use route-major rows for either requested row order."""
     if base_gemm_rows not in ("expert_major", "route_major"):
         raise ValueError(
             f"unknown MoE LoRA base-GEMM row order {base_gemm_rows!r}; "
             "expected 'expert_major' or 'route_major'"
         )
-    vendors = VENDORS[family]
-    if vendor not in vendors:
-        if vendor is not None:
-            logger.info(
-                "MoE LoRA base-GEMM vendor %r serves no %s layers; this layer "
-                "family uses its default vendor %r",
-                vendor,
-                family,
-                vendors[0],
-            )
-        vendor = vendors[0]
     expert_major = base_gemm_rows == "expert_major"
     match vendor, family:
         case "cutedsl", "bf16":
@@ -77,9 +53,83 @@ def select_provider_cls(
             )
 
             return TritonFp8ContiguousProvider
+        case "triton", "fp8_channel":
+            from sglang.srt.lora.moe.base_gemm_provider.triton_fp8 import (
+                TritonFp8ChannelContiguousProvider,
+            )
+
+            return TritonFp8ChannelContiguousProvider
+        case "triton", "fp8_tensor":
+            from sglang.srt.lora.moe.base_gemm_provider.triton_fp8 import (
+                TritonFp8TensorContiguousProvider,
+            )
+
+            return TritonFp8TensorContiguousProvider
+        case "cutedsl", "fp8_channel":
+            from sglang.srt.lora.moe.base_gemm_provider.cutedsl_fp8_channel import (
+                CuteDslFp8ChannelContiguousProvider,
+                CuteDslFp8ChannelMaskedProvider,
+            )
+
+            return (
+                CuteDslFp8ChannelMaskedProvider
+                if expert_major
+                else CuteDslFp8ChannelContiguousProvider
+            )
         case "marlin", "nvfp4":
             from sglang.srt.lora.moe.base_gemm_provider.marlin_nvfp4 import (
                 MarlinNvFp4ContiguousProvider,
             )
 
             return MarlinNvFp4ContiguousProvider
+        case "marlin", "mxfp4":
+            from sglang.srt.lora.moe.base_gemm_provider.marlin_mxfp4 import (
+                MarlinMxfp4ContiguousProvider,
+            )
+
+            return MarlinMxfp4ContiguousProvider
+        case "marlin", ("fp8" | "fp8_channel" | "fp8_tensor" | "mxfp8"):
+            # One W8A16 provider: the repack folds every FP8 scale layout into
+            # Marlin groups, so only the group size differs per family.
+            from sglang.srt.lora.moe.base_gemm_provider.marlin_fp8 import (
+                MarlinFp8ContiguousProvider,
+            )
+
+            return MarlinFp8ContiguousProvider
+        case "cutedsl", "mxfp4":
+            from sglang.srt.lora.moe.base_gemm_provider.cutedsl_blockscaled import (
+                CuteDslMxfp4ContiguousProvider,
+                CuteDslMxfp4MaskedProvider,
+            )
+
+            return (
+                CuteDslMxfp4MaskedProvider
+                if expert_major
+                else CuteDslMxfp4ContiguousProvider
+            )
+        case "cutedsl", "nvfp4":
+            from sglang.srt.lora.moe.base_gemm_provider.cutedsl_blockscaled import (
+                CuteDslNvFp4ContiguousProvider,
+                CuteDslNvFp4MaskedProvider,
+            )
+
+            return (
+                CuteDslNvFp4MaskedProvider
+                if expert_major
+                else CuteDslNvFp4ContiguousProvider
+            )
+        case "cutedsl", "mxfp8":
+            from sglang.srt.lora.moe.base_gemm_provider.cutedsl_blockscaled import (
+                CuteDslMxfp8ContiguousProvider,
+                CuteDslMxfp8MaskedProvider,
+            )
+
+            return (
+                CuteDslMxfp8MaskedProvider
+                if expert_major
+                else CuteDslMxfp8ContiguousProvider
+            )
+        case _:
+            raise ValueError(
+                f"no {vendor} MoE LoRA base-GEMM provider for {family} layers"
+            )

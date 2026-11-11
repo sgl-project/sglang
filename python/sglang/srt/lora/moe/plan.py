@@ -56,6 +56,9 @@ class AFamily(str, Enum):
 class BFamily(str, Enum):
     GROUPED = "grouped"
     PER_ROW = "per_row"
+    # Down only: the base GEMM adds the delta in its epilogue (block-scaled
+    # CuTeDSL providers), so nothing materializes it.
+    EPILOGUE = "epilogue"
 
 
 class ActFamily(str, Enum):
@@ -145,10 +148,20 @@ class BSpec:
 
     def __post_init__(self) -> None:
         _check_down_bridge_layout(self.site, self.input_layout)
+        if self.family is BFamily.EPILOGUE and (
+            self.site is not Site.DOWN or self.is_shared_outer
+        ):
+            raise ValueError(
+                "the epilogue B family fuses the per-expert down delta into the "
+                "base down GEMM"
+            )
 
     def route_requirements(self) -> frozenset[RouteRequirement]:
         if self.family is BFamily.PER_ROW:
             return frozenset((_raw_requirement(self.is_shared_outer),))
+        if self.family is BFamily.EPILOGUE:
+            # The down A kernel places the bridge by provider row; no route.
+            return frozenset()
         return frozenset((_aligned_requirement(self.is_shared_outer),))
 
 
@@ -257,6 +270,14 @@ class MoePlan:
                 f"{self.down_overlap.value} overlap requires standalone down B"
             )
 
+        # The epilogue B reads the bridge inside the base GEMM: the down A
+        # kernel must finish first, and nothing else may own the delta.
+        if self.down_b is not None and self.down_b.family is BFamily.EPILOGUE:
+            if self.down_overlap is not DownOverlap.NONE or self.down_b_into_base:
+                raise ValueError(
+                    "the epilogue down-B needs the down A bridge before the base "
+                    "down GEMM: no down overlap and no into-base B"
+                )
         # In-place B must wait for the base down GEMM to finish writing.
         if self.down_b_into_base and not (
             self.down_b is not None
@@ -506,9 +527,18 @@ class _PlanRowModel(pydantic.BaseModel):
     layout: Literal["per_expert", "shared"] | None = None
     phase: Phase | None = None
     max_rank: int | None = None
+    # Rows for kernels that need a rank floor (the epilogue down-B's TMA tiles).
+    min_rank: int | None = pydantic.Field(default=None, gt=0)
+    # Rows for kernels that take only ranks that are multiples of a tile row
+    # count (the epilogue down-B: 8); other ranks fall through to later rows.
+    rank_multiple: int | None = pydantic.Field(default=None, gt=0)
+    # Rows for kernels that implement one activation-scale mode only (the
+    # epilogue down-B: static NVFP4 scales); other modes fall through.
+    act_scale: list[Literal["static", "per_token"]] | None = None
     min_local_experts: int | None = None
     max_local_experts: int | None = None
     quant: list[str] | None = None
+    vendor: list[str] | None = None
     base_gemm_rows: Literal["expert_major", "route_major"]
     plan: _PlanSpecModel
     # Rank rules precede token buckets; an unbounded rule ends the ladder.
@@ -703,7 +733,11 @@ def resolve_plans(
     hidden_size: int,
     num_local_experts: int,
     quant_family: str,
+    vendor: str,
+    act_scale: str = "static",
 ) -> dict[Phase, SelectedPlan]:
+    """``act_scale`` is the activation-scale mode the base layer resolved:
+    ``static`` for every family but per-token NVFP4."""
     table = _load_plans(architecture)
     layout_name = "shared" if is_shared_outer else "per_expert"
     in_domain = table.domain.admits(
@@ -722,6 +756,11 @@ def resolve_plans(
                 if candidate.layout in (None, layout_name)
                 and candidate.phase in (None, phase)
                 and (candidate.max_rank is None or physical_rank <= candidate.max_rank)
+                and (candidate.min_rank is None or physical_rank >= candidate.min_rank)
+                and (
+                    candidate.rank_multiple is None
+                    or physical_rank % candidate.rank_multiple == 0
+                )
                 and (
                     candidate.min_local_experts is None
                     or num_local_experts >= candidate.min_local_experts
@@ -731,6 +770,8 @@ def resolve_plans(
                     or num_local_experts <= candidate.max_local_experts
                 )
                 and (candidate.quant is None or quant_family in candidate.quant)
+                and (candidate.vendor is None or vendor in candidate.vendor)
+                and (candidate.act_scale is None or act_scale in candidate.act_scale)
             ),
             None,
         )

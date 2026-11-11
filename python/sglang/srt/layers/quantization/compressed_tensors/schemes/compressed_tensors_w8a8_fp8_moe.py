@@ -76,8 +76,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 "For FP8 Fused MoE layer, we require either per tensor or "
                 "channelwise, dynamic per token quantization."
             )
-        # --moe-runner-backend marlin: W8A16 from Marlin tiles.
-        self.use_marlin = get_moe_runner_backend().is_marlin()
+        # --moe-runner-backend marlin / lora_marlin: W8A16 from Marlin tiles.
+        self.use_marlin = get_moe_runner_backend().reads_marlin_tiles()
 
     @classmethod
     def get_min_capability(cls) -> int:

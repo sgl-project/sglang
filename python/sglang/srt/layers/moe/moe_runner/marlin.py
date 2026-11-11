@@ -15,7 +15,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     RunnerOutput,
     register_fused_func,
 )
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -150,9 +150,12 @@ def build_marlin_fp8_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
 
 
 def marlin_base_moe_runner(moe_runner_config):
-    """The base runner over Marlin-repacked experts."""
+    """The base runner over Marlin-repacked experts, or None under a lora_*
+    runner: the LoRA MoE runner owns the forward of those experts."""
     from sglang.srt.layers.moe.moe_runner import MoeRunner
 
+    if get_moe_runner_backend().is_lora():
+        return None
     return MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 
 

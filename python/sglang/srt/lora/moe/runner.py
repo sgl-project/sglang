@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -22,6 +23,7 @@ from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
 from sglang.srt.lora.moe.base_gemm_provider.base import (
     MoeBaseProvider,
 )
+from sglang.srt.lora.moe.families import family_of_layer, resolve_vendor
 from sglang.srt.lora.moe.plan import (
     ActFamily,
     AFamily,
@@ -38,6 +40,7 @@ from sglang.srt.lora.moe.plan import (
     Site,
     resolve_plans,
 )
+from sglang.srt.lora.moe.quant_info import nvfp4_activation_scale_mode
 from sglang.srt.lora.moe.routing import MoeLoraRoutes, build_moe_routes
 from sglang.srt.lora.utils import Phase, architecture_for_capability
 from sglang.srt.lora.workspace import LoraWorkspace
@@ -68,6 +71,58 @@ class MoeLoraBatch(msgspec.Struct, kw_only=True):
     @property
     def max_loras(self) -> int:
         return self.gate_up_lora_a.shape[0]
+
+
+logger = logging.getLogger(__name__)
+# Every distinct plan selection a process makes is logged once (one line per
+# rank for a homogeneous model), so a server log names the rows it serves.
+_SELECTIONS_LOGGED: set[tuple] = set()
+
+
+def _log_selection(key: tuple, plans: Mapping, providers: Mapping) -> None:
+    """One INFO line per distinct resolved selection per process: the key
+    (architecture, quant family, vendor, activation-scale mode, layout, rank)
+    together with the selected row of every phase, its base-GEMM rows, the
+    provider class serving those rows and the activation recipe, so two
+    selections that share a key but differ in any of these each get a line."""
+    rows = tuple(
+        (phase.name.lower(), sel.name, sel.base_gemm_rows)
+        for phase, sel in plans.items()
+    )
+    provider_names = tuple(
+        (base_rows, type(provider).__name__)
+        for base_rows, provider in providers.items()
+    )
+    recipe = next(
+        (
+            provider.quant_info.recipe
+            for provider in providers.values()
+            if getattr(provider.quant_info, "recipe", None) is not None
+        ),
+        None,
+    )
+    entry = (*key, rows, provider_names, repr(recipe))
+    if entry in _SELECTIONS_LOGGED:
+        return
+    _SELECTIONS_LOGGED.add(entry)
+    architecture, family, vendor, act_scale, is_shared_outer, physical_rank = key
+    logger.info(
+        "MoE LoRA plans selected for %s %s/%s act_scale=%s recipe=%s %s rank %d: "
+        "%s; providers %s",
+        architecture,
+        family,
+        vendor,
+        act_scale,
+        recipe,
+        "shared-outer" if is_shared_outer else "per-expert",
+        physical_rank,
+        {phase: f"{name} ({base_rows})" for phase, name, base_rows in rows},
+        dict(provider_names),
+    )
+
+
+def _epilogue_down_b(plan: MoePlan) -> bool:
+    return plan.down_b is not None and plan.down_b.family is BFamily.EPILOGUE
 
 
 class MoeLoraRunner:
@@ -110,6 +165,16 @@ class MoeLoraRunner:
         self.workspace = workspace if workspace is not None else LoraWorkspace()
         self.plans: dict[Phase, SelectedPlan] = {}
 
+    @property
+    def derived_base_weights(self) -> str | None:
+        """What the providers derive from the base weights, if anything."""
+        reasons = dict.fromkeys(
+            provider.derived_base_weights
+            for provider in self.providers.values()
+            if provider.derived_base_weights
+        )
+        return " and ".join(reasons) or None
+
     @classmethod
     def from_layer(
         cls,
@@ -127,6 +192,10 @@ class MoeLoraRunner:
         architecture = architecture_for_capability(major)
         config = base_layer.moe_runner_config
         activation = ActivationFn.parse(config.activation)
+        vendor = resolve_vendor(
+            family, get_moe_runner_backend().value.removeprefix("lora_")
+        )
+        act_scale = cls._act_scale_mode(base_layer, family)
         plans = resolve_plans(
             architecture=architecture,
             is_shared_outer=is_shared_outer,
@@ -135,6 +204,8 @@ class MoeLoraRunner:
             hidden_size=int(base_layer.hidden_size),
             num_local_experts=int(base_layer.num_local_experts),
             quant_family=family,
+            vendor=vendor,
+            act_scale=act_scale,
         )
         # Shared finalizers hold the rank reduction in one tile, tested up to 256.
         if physical_rank > 256 and any(
@@ -144,14 +215,18 @@ class MoeLoraRunner:
             raise ValueError(
                 f"the shared finalizes are capped at rank 256, got {physical_rank}"
             )
-        vendor = get_moe_runner_backend().value.removeprefix("lora_")
+        # One provider per row layout the plans use. One quant info per layer and
+        # quant-info class: the layer's providers share it and what it derives.
+        quant_infos: dict[type, object] = {}
+        providers: dict[str, MoeBaseProvider] = {}
+        for rows in dict.fromkeys(sel.base_gemm_rows for sel in plans.values()):
+            provider_cls = select_provider_cls(rows, family, vendor)
+            quant_info_cls = provider_cls.contract.quant_info_cls
+            if quant_info_cls not in quant_infos:
+                quant_infos[quant_info_cls] = quant_info_cls.from_layer(base_layer)
+            providers[rows] = provider_cls(quant_infos[quant_info_cls])
         runner = cls(
-            providers={
-                rows: cls._build_provider(
-                    base_layer, base_gemm_rows=rows, vendor=vendor, family=family
-                )
-                for rows in dict.fromkeys(sel.base_gemm_rows for sel in plans.values())
-            },
+            providers=providers,
             top_k=int(config.top_k),
             routed_scaling_factor=config.routed_scaling_factor,
             activation=activation,
@@ -160,57 +235,23 @@ class MoeLoraRunner:
         )
         for sel in plans.values():
             runner.validate_plan(sel.plan, base_gemm_rows=sel.base_gemm_rows)
+            if _epilogue_down_b(sel.plan):
+                runner.providers[sel.base_gemm_rows].enable_epilogue_down_lora(
+                    physical_rank
+                )
         runner.plans = dict(plans)
+        _log_selection(
+            (architecture, family, vendor, act_scale, is_shared_outer, physical_rank),
+            plans,
+            runner.providers,
+        )
         return runner
-
-    @staticmethod
-    def _weight_family(base_layer: FusedMoE) -> str:
-        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-
-        quant_method = base_layer.quant_method
-        if isinstance(quant_method, UnquantizedFusedMoEMethod):
-            if (
-                base_layer.w13_weight.dtype != torch.bfloat16
-                or base_layer.w2_weight.dtype != torch.bfloat16
-            ):
-                raise NotImplementedError(
-                    "MoE LoRA on an unquantized layer requires resident BF16 weights"
-                )
-            return "bf16"
-        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
-
-        if isinstance(quant_method, Fp8MoEMethod):
-            if base_layer.params_dtype != torch.bfloat16:
-                raise NotImplementedError("FP8 MoE LoRA requires BF16 activations.")
-            if not quant_method.block_quant or getattr(
-                quant_method, "use_mxfp8", False
-            ):
-                raise NotImplementedError(
-                    "MoE LoRA on FP8 requires 128-block weight quantization; "
-                    "per-tensor and MXFP8 layers are unsupported"
-                )
-            if base_layer.w13_weight.dtype != torch.float8_e4m3fn:
-                raise NotImplementedError(
-                    "MoE LoRA on FP8 requires resident float8_e4m3fn weights; "
-                    "a Marlin-repacked FP8 layer is unsupported"
-                )
-            return "fp8"
-        from sglang.srt.layers.quantization.modelopt_quant import (
-            ModelOptNvFp4FusedMoEMethod,
-        )
-
-        if isinstance(quant_method, ModelOptNvFp4FusedMoEMethod):
-            return "nvfp4"
-        raise NotImplementedError(
-            "MoE LoRA supports unquantized BF16, 128-block FP8, and NVFP4 "
-            f"MoE; this layer's quant method is {type(quant_method).__name__}"
-        )
 
     @classmethod
     def _admit(cls, base_layer: FusedMoE) -> str:
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
 
-        family = cls._weight_family(base_layer)
+        family = family_of_layer(base_layer)
         if not isinstance(base_layer.dispatcher, StandardDispatcher):
             raise NotImplementedError(
                 "MoE LoRA currently requires the Standard dispatcher"
@@ -232,9 +273,7 @@ class MoeLoraRunner:
         if base_layer.should_fuse_routed_scaling_factor_in_topk:
             raise NotImplementedError(
                 "MoE LoRA applies routed scaling exactly once in its own "
-                "finalize; this layer already folds it into the top-k weights. "
-                "Under a lora backend only ModelOpt NVFP4 does that, so those "
-                "experts need --moe-runner-backend lora_marlin"
+                "finalize; this layer already folds it into the top-k weights"
             )
         if getattr(base_layer, "with_bias", False):
             raise NotImplementedError(
@@ -260,16 +299,13 @@ class MoeLoraRunner:
         return family
 
     @staticmethod
-    def _build_provider(
-        base_layer: FusedMoE,
-        *,
-        base_gemm_rows: str,
-        vendor: str,
-        family: str,
-    ) -> MoeBaseProvider:
-        provider_cls = select_provider_cls(base_gemm_rows, family, vendor)
-        quant_info = provider_cls.contract.quant_info_cls.from_layer(base_layer)
-        return provider_cls(quant_info)
+    def _act_scale_mode(base_layer: FusedMoE, family: str) -> str:
+        """The activation-scale mode the base layer resolved: NVFP4 layers
+        follow their quant config's per-token flag; every other family is
+        static."""
+        if family != "nvfp4":
+            return "static"
+        return nvfp4_activation_scale_mode(base_layer)
 
     def validate_plan(self, plan: MoePlan, *, base_gemm_rows: str) -> None:
         provider = self.providers[base_gemm_rows]
@@ -283,6 +319,13 @@ class MoeLoraRunner:
             raise ValueError(
                 f"provider exposes {provider.gate_up_slices} gate/up slices "
                 f"but is_gated={self.is_gated} needs {expected_slices}"
+            )
+        if _epilogue_down_b(plan) and not getattr(
+            provider, "supports_epilogue_down_lora", False
+        ):
+            raise ValueError(
+                f"the plan fuses down-B into the base GEMM epilogue, which "
+                f"{provider.contract.key} does not implement"
             )
 
     def run(
@@ -394,7 +437,12 @@ class MoeLoraRunner:
         name: str,
         *,
         pair_to_row: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
+        output_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``output`` replaces the pair-major bridge buffer: with
+        ``output_rows`` the grouped kernel stores pair p at row output_rows[p]
+        of its slot's plane (a 3-D output)."""
         if spec.family is AFamily.TOKEN_GROUPED:
             route = routes.shared_token
             if route is None:
@@ -412,12 +460,17 @@ class MoeLoraRunner:
         if spec.family is AFamily.TOKEN_DENSE:
             # One bridge plane per resident slot; per-row B indexes the planes.
             shape = (route.max_loras, num_output_rows, weight.shape[1])
-        output = self.workspace.tensor(
-            f"{name}:output",
-            shape,
-            dtype=self.lora_delta_dtype,
-            device=input.device,
-        )
+        if output is None:
+            output = self.workspace.tensor(
+                f"{name}:output",
+                shape,
+                dtype=self.lora_delta_dtype,
+                device=input.device,
+            )
+        elif spec.family is not AFamily.GROUPED:
+            raise NotImplementedError(
+                f"only the grouped A family writes a placed bridge, not {spec.family.value}"
+            )
         config = launch_config.for_a(spec.site)
         pair_input = spec.site is Site.DOWN
         match spec.family.value:
@@ -458,6 +511,7 @@ class MoeLoraRunner:
                     pair_to_row=pair_to_row,
                     partial=partial,
                     counters=counters,
+                    output_rows=output_rows,
                 )
             case "per_row":
                 per_row_lora_a(
@@ -633,24 +687,6 @@ class MoeLoraRunner:
             else None
         )
         if plan.act.family is ActFamily.MATERIALIZED:
-            quant_group = provider.contract.act_quant_group
-            act_quant = None
-            if quant_group is not None:
-                # Quantize during activation to avoid a separate down-GEMM input pass.
-                act_quant = (
-                    self.workspace.tensor(
-                        "act:quant_rows",
-                        act_out.shape,
-                        dtype=torch.float8_e4m3fn,
-                        device=gateup_out.device,
-                    ),
-                    self.workspace.tensor(
-                        "act:quant_scales",
-                        (act_out.shape[0], act_out.shape[1] // quant_group),
-                        dtype=torch.float32,
-                        device=gateup_out.device,
-                    ),
-                )
             provider.act_with_delta(
                 base_gemm_state,
                 gateup_out,
@@ -663,7 +699,6 @@ class MoeLoraRunner:
                 act_out,
                 act_pairs,
                 activation=self.activation.value,
-                **({"act_quant": act_quant} if act_quant is not None else {}),
             )
             # Pair-major input needs no gather.
             return act_out, act_pairs, None
@@ -707,7 +742,7 @@ class MoeLoraRunner:
     ]:
         state = _LoraStageState()
 
-        def down_a() -> None:
+        def down_a(**placed) -> None:
             state.rank = self._run_a(
                 launch_config,
                 plan.down_a,
@@ -716,6 +751,7 @@ class MoeLoraRunner:
                 routes,
                 "down_a",
                 pair_to_row=down_a_gather,
+                **placed,
             )
 
         def down_b() -> None:
@@ -751,6 +787,29 @@ class MoeLoraRunner:
             provider.down(base_gemm_state, act_out, down_out)
             return down_out
 
+        if _epilogue_down_b(plan):
+            # The down A kernel places the raw bridge in the provider's row
+            # order, one plane per slot; the base GEMM adds slot x expert
+            # weights times those rows per tile.
+            weights = batch.down_lora_b.flatten(0, 1)
+            planes = provider.epilogue_down_lora_planes(
+                base_gemm_state,
+                self.workspace,
+                max_loras=batch.max_loras,
+                rank=weights.shape[-1],
+            )
+            if down_a_gather is None:
+                raise ValueError("the epilogue down-B needs provider-ordered rows")
+            down_a(output=planes, output_rows=down_a_gather)
+            down_out = provider.down_output(base_gemm_state, self.workspace)
+            provider.down(
+                base_gemm_state,
+                act_out,
+                down_out,
+                lora=(weights, planes, self._slots_used(batch)),
+            )
+            return down_out, state.rank, None
+
         if plan.down_overlap is DownOverlap.NONE:
             down_a()
             if plan.down_b_into_base:
@@ -785,6 +844,21 @@ class MoeLoraRunner:
             )
 
         return down_out, state.rank, state.delta
+
+    def _slots_used(self, batch: MoeLoraBatch) -> torch.Tensor:
+        """int32 [1]: the resident slots the batch addresses (max slot + 1),
+        once per forward and mapping, replayed inside graphs."""
+        mapping = batch.token_lora_mapping
+
+        def build():
+            slots = self.workspace.tensor(
+                "lora:slots_used", (1,), dtype=torch.int32, device=mapping.device
+            )
+            slots.copy_(mapping.max().view(1))
+            slots.add_(1)
+            return slots
+
+        return self.workspace.route(mapping, ("slots_used",), build)
 
     def _allocate_output(
         self,
@@ -833,7 +907,7 @@ class MoeLoraRunner:
                 output,
                 lora_delta=(
                     None
-                    if plan.down_b_into_base
+                    if plan.down_b_into_base or _epilogue_down_b(plan)
                     else down_delta.view(num_tokens, self.top_k, self.hidden_size)
                 ),
             )

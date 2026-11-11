@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
@@ -17,6 +17,11 @@ if TYPE_CHECKING:
 # Token-count cutoff for the vectorized top-k gather.
 _SMALL_FINALIZE_MAX_TOKENS = 64
 
+# What a row domain's _input_buffers() hook returns beside the GEMM input rows:
+# the encoding's other row-state fields by name. None is a field the mode
+# leaves unset (the per-token row scales of a static build).
+RowBuffers = dict[str, Optional[torch.Tensor]]
+
 
 class MoeBaseProviderContract(msgspec.Struct, frozen=True, kw_only=True):
     key: str
@@ -27,8 +32,6 @@ class MoeBaseProviderContract(msgspec.Struct, frozen=True, kw_only=True):
     gate_up_output_dtype: torch.dtype
     lora_delta_dtype: torch.dtype
     lora_activation_dtype: torch.dtype
-    # Fuse FP8 quantization into activation for the down GEMM.
-    act_quant_group: int | None = None
 
 
 def expected_rows_per_expert(num_pairs: int, num_experts: int) -> int:
@@ -36,9 +39,19 @@ def expected_rows_per_expert(num_pairs: int, num_experts: int) -> int:
     return (num_pairs - 1) // num_experts + 1 if num_pairs else 1
 
 
-def prepare_buffer(workspace, name: str, shape, *, dtype, device) -> torch.Tensor:
+def prepare_buffer(
+    workspace, name: str, shape, *, dtype, device, zero_on_first_allocation=False
+) -> torch.Tensor:
     if workspace is not None:
-        return workspace.tensor(name, shape, dtype=dtype, device=device)
+        return workspace.tensor(
+            name,
+            shape,
+            dtype=dtype,
+            device=device,
+            zero_on_first_allocation=zero_on_first_allocation,
+        )
+    if zero_on_first_allocation:
+        return torch.zeros(shape, dtype=dtype, device=device)
     return torch.empty(shape, dtype=dtype, device=device)
 
 
@@ -46,10 +59,12 @@ def admit_weight_layout(quant_info) -> int:
     """Validate [E, S*I, H] / [E, H, I] weights and return S."""
     if quant_info.intermediate_size <= 0:
         raise ValueError("intermediate_size must be positive")
+    # Sub-byte formats pack K elements per byte.
+    pack = getattr(quant_info, "elements_per_byte", 1)
     expected_w2 = (
         quant_info.num_local_experts,
         quant_info.hidden_size,
-        quant_info.intermediate_size,
+        quant_info.intermediate_size // pack,
     )
     if quant_info.w2_weight.shape != expected_w2:
         raise ValueError(
@@ -58,7 +73,7 @@ def admit_weight_layout(quant_info) -> int:
     if (
         quant_info.w13_weight.ndim != 3
         or quant_info.w13_weight.shape[0] != quant_info.num_local_experts
-        or quant_info.w13_weight.shape[2] != quant_info.hidden_size
+        or quant_info.w13_weight.shape[2] != quant_info.hidden_size // pack
     ):
         raise ValueError(
             "w13_weight must be [num_local_experts, slices*intermediate, hidden]"
@@ -81,6 +96,9 @@ class MoeBaseProvider:
     """One provider per layer; logical sizes come from quant_info."""
 
     contract: MoeBaseProviderContract
+    # What the provider derives from the base weights when bound, if anything;
+    # online base-weight updates cannot refresh it, so the LoRA layer declines them.
+    derived_base_weights: str | None = None
 
     @property
     def num_local_experts(self) -> int:
@@ -115,6 +133,14 @@ class MoeBaseProvider:
     def release_prepared_inputs(self, row_state) -> None:
         raise NotImplementedError
 
+    def _act_quant_target(
+        self, row_state, fused: bool, config: Mapping[str, int] | None
+    ):
+        """Where this activation may write the down GEMM's input: FP8 (rows,
+        scales, group width), block-scaled rows, or None to leave it to down().
+        ``config`` is the fused kernel's tile configuration."""
+        return None
+
     def act_with_delta(
         self,
         row_state,
@@ -126,7 +152,23 @@ class MoeBaseProvider:
         *,
         activation: str = "silu",
     ) -> None:
-        raise NotImplementedError
+        from sglang.kernels.ops.lora.moe.activation_delta import act_delta
+
+        act_quant = self._act_quant_target(row_state, fused=False, config=None)
+        act_delta(
+            gateup_out,
+            gate_up_delta,
+            act_out,
+            activation_lora_input,
+            row_state.pair_to_row,
+            topk_ids,
+            num_local_experts=self.num_local_experts,
+            gate_first=self.contract.gate_first,
+            interleaved=self.contract.interleaved,
+            activation=activation,
+            act_quant=act_quant,
+        )
+        self._set_act_quant_ready(row_state, act_quant is not None)
 
     def fused_act(
         self,
@@ -142,16 +184,45 @@ class MoeBaseProvider:
         b_gate_up: torch.Tensor | None = None,
         bridge_top_k: int = 1,
     ) -> None:
-        raise NotImplementedError(
-            f"{self.contract.key} has no fused-act implementation"
+        from sglang.kernels.ops.lora.moe.fused_act import fused_b_act
+
+        act_quant = self._act_quant_target(row_state, fused=True, config=config)
+        fused_b_act(
+            activation=activation,
+            base_gateup=base_gateup,
+            act_rows=act_rows,
+            act_pairs=act_pairs,
+            pair_to_row=row_state.pair_to_row,
+            routing=routing,
+            num_local_experts=self.num_local_experts,
+            gate_first=self.contract.gate_first,
+            interleaved=self.contract.interleaved,
+            config=config,
+            bridge_gateup=bridge_gateup,
+            b_gate_up=b_gate_up,
+            bridge_top_k=bridge_top_k,
+            act_quant=act_quant,
         )
+        self._set_act_quant_ready(row_state, act_quant is not None)
+
+    @staticmethod
+    def _set_act_quant_ready(row_state, written: bool) -> None:
+        """Row states that carry ``act_quant_ready`` say whether the activation
+        that just ran wrote the down GEMM's input; down() runs its quantizer
+        exactly when it did not. Cleared as well as set: a row state that is
+        activated again must not keep the earlier activation's answer."""
+        if hasattr(row_state, "act_quant_ready"):
+            row_state.act_quant_ready = written
 
     def down(
         self,
         row_state,
         act_out: torch.Tensor,
         out: torch.Tensor,
+        lora: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
+        """``lora`` (down-B weights, bridge planes, slots) is only passed to
+        providers that set ``supports_epilogue_down_lora``."""
         raise NotImplementedError
 
     def down_output(self, row_state, workspace: LoraWorkspace) -> torch.Tensor:

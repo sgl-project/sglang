@@ -258,6 +258,11 @@ class _MoeRunnerBackendPredicates:
     def is_lora_marlin(self):
         return self.value == MoeRunnerBackend.LORA_MARLIN.value
 
+    def reads_marlin_tiles(self):
+        # The loaders repack the experts into Marlin tiles for these runners;
+        # under lora_marlin the LoRA MoE runner then owns the forward.
+        return self.is_marlin() or self.is_lora_marlin()
+
     def is_humming(self):
         return self.value == MoeRunnerBackend.HUMMING.value
 

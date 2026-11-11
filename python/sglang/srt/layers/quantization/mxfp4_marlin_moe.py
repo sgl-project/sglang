@@ -10,6 +10,7 @@ from sglang.srt.layers.moe.moe_runner.marlin import (
     build_marlin_moe_quant_info,
     marlin_base_moe_runner,
 )
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import log_info_on_rank0, round_up
@@ -31,10 +32,11 @@ class Mxfp4MarlinMoEMethod:
         self.prefix = prefix
 
     def create_moe_runner(self, layer, moe_runner_config):
+        self._moe_runner_backend = get_moe_runner_backend()
         self.runner = marlin_base_moe_runner(moe_runner_config)
 
     def get_moe_runner_backend(self, layer):
-        return self.runner.runner_backend
+        return self._moe_runner_backend
 
     def get_moe_routing_method_type(
         self, layer: Module, requested_method: RoutingMethodType | None
@@ -153,7 +155,7 @@ class Mxfp4MarlinMoEMethod:
             logger,
             f"Preparing MXFP4 experts for Marlin backend (layer: {self.prefix})...",
         )
-        if self.runner.config.gemm1_alpha is not None:
+        if layer.moe_runner_config.gemm1_alpha is not None:
             deinterleave_moe_mxfp4_w13_for_marlin(layer)
         prepare_moe_mxfp4_layer_for_marlin(layer)
         layer._dsv4_mxfp4_backend = "marlin"

@@ -307,7 +307,7 @@ class TestMxfp8DenseAdmissionOnHopper(_LinearBackendCheck):
             self.assertRaisesRegex(
                 RuntimeError,
                 r"MXFP8 dense weight \(512, 512\) of \w+ cannot run on this device"
-                r".*--moe-runner-backend marlin\)",
+                r".*--moe-runner-backend marlin / lora_marlin",
             ),
         ):
             layer.quant_method.process_weights_after_loading(layer)

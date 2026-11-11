@@ -207,8 +207,8 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: W8A8Fp8Config):
         self.quant_config = quant_config
-        # --moe-runner-backend marlin: W8A16 from Marlin tiles.
-        self.use_marlin = get_moe_runner_backend().is_marlin()
+        # --moe-runner-backend marlin / lora_marlin: W8A16 from Marlin tiles.
+        self.use_marlin = get_moe_runner_backend().reads_marlin_tiles()
 
     def create_weights(
         self,

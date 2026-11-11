@@ -47,10 +47,10 @@ _ACTIVATION_PARAMS = ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
 
 
 class TestMxfp8CapabilityGate(CustomTestCase):
-    """MXFP8 keeps its SM100 gate unless the MoE runner is marlin, which serves
-    the experts W8A16 on SM90 (dense MXFP8 layers are then admitted one by one
-    when they load); no other backend lowers it, and the gate of plain FP8 does
-    not move."""
+    """MXFP8 keeps its SM100 gate unless the MoE runner is marlin or lora_marlin,
+    which serve the experts W8A16 on SM90 (dense MXFP8 layers are then admitted
+    one by one when they load); no other backend lowers it, and the gate of
+    plain FP8 does not move."""
 
     def test_only_the_marlin_runners_lower_the_mxfp8_gate(self):
         config = Fp8Config(is_checkpoint_fp8_serialized=True, use_mxfp8=True)
@@ -59,7 +59,9 @@ class TestMxfp8CapabilityGate(CustomTestCase):
                 (MoeRunnerBackend.AUTO, 100),
                 (MoeRunnerBackend.TRITON, 100),
                 (MoeRunnerBackend.FLASHINFER_TRTLLM, 100),
+                (MoeRunnerBackend.LORA_CUTEDSL, 100),
                 (MoeRunnerBackend.MARLIN, 90),
+                (MoeRunnerBackend.LORA_MARLIN, 90),
             ):
                 with (
                     self.subTest(backend.value),
@@ -97,7 +99,7 @@ class TestMxfp8DenseAdmission(CustomTestCase):
         with self.assertRaisesRegex(
             RuntimeError,
             r"MXFP8 dense weight \(512, 256\) of Module has no GEMM backend"
-            r".*--moe-runner-backend marlin when",
+            r".*marlin / lora_marlin",
         ):
             method.create_weights(
                 layer,

@@ -346,7 +346,11 @@ class Fp8Config(QuantizationConfig):
         # TODO: torch.xpu.get_device_capability
         if self.use_mxfp8 and is_xpu():
             return 20
-        if self.use_mxfp8 and _is_cuda and get_moe_runner_backend().is_marlin():
+        if (
+            self.use_mxfp8
+            and _is_cuda
+            and get_moe_runner_backend().reads_marlin_tiles()
+        ):
             # Marlin serves the MXFP8 experts W8A16 without SM100 kernels; dense
             # MXFP8 layers are admitted one by one when their weights load.
             return 90
@@ -467,7 +471,8 @@ class Fp8Config(QuantizationConfig):
 
                 return NPUW4A8MXFP4FusedMoEMethod(prefix=prefix)
 
-            if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
+            # lora_marlin: Marlin tiles with the LoRA MoE runner on top.
+            if self.is_fp4_experts and get_moe_runner_backend().reads_marlin_tiles():
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
                     Mxfp4MarlinMoEMethod,
                 )
@@ -784,7 +789,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 f"{get_fp8_gemm_runner_backend().value} resolves to no MXFP8 dense "
                 "kernel (before Blackwell only DeepGEMM serves them, and it is missing "
                 "or disabled here). The MXFP8 MoE experts can still be served with "
-                "--moe-runner-backend marlin when the dense layers stay "
+                "--moe-runner-backend marlin / lora_marlin when the dense layers stay "
                 "BF16 (ignored_layers)."
             )
         Fp8LinearMethod.create_fp8_weight_(
@@ -1178,7 +1183,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         "cannot run on this device: the installed DeepGEMM rejects "
                         "per-row 32-wide K scale groups and no other MXFP8 GEMM "
                         "exists before Blackwell; only the MXFP8 MoE experts can be "
-                        "served here (--moe-runner-backend marlin)"
+                        "served here (--moe-runner-backend marlin / lora_marlin)"
                     )
             if scale_u8 is None:
                 scale_u8 = layer.weight_scale_inv.data
@@ -1636,8 +1641,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
-        # --moe-runner-backend marlin: the e4m3 experts serve W8A16 from
-        # Marlin tiles (FP4-expert checkpoints wrap this method).
+        # --moe-runner-backend marlin / lora_marlin: the e4m3 experts serve
+        # W8A16 from Marlin tiles (FP4-expert checkpoints wrap this method).
         self.use_marlin = self._marlin_requested()
         # The MxFP4 wrapper methods borrow this instance for weight loading;
         # they never call create_moe_runner, so moe_runner_config is unset.
@@ -1655,13 +1660,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
 
     def _marlin_requested(self) -> bool:
-        if self.is_fp4_expert or not get_moe_runner_backend().is_marlin():
+        if self.is_fp4_expert or not get_moe_runner_backend().reads_marlin_tiles():
             return False
         if _is_hip:
             raise NotImplementedError("Marlin W8A16 FP8 MoE experts need CUDA kernels")
         if not self.block_quant:
-            # Per-tensor FP8 experts of this method are not served
-            # (compressed-tensors per-tensor experts are).
+            # Per-tensor FP8 experts of this method: not admitted by the LoRA
+            # engine either (compressed-tensors per-tensor experts are).
             raise NotImplementedError(
                 "Marlin W8A16 serves 128-block and MXFP8 FP8 experts of the fp8 "
                 "quant method; its per-tensor FP8 experts have no Marlin path"
@@ -2046,6 +2051,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             is_fp4_expert=self.is_fp4_expert,
             params_dtype=params_dtype,
             with_bias=with_bias,
+            # The LoRA MoE runner's vendors read MX scales as E8M0 bytes.
+            fp4_scale_dtype=(
+                torch.float8_e8m0fnu if get_moe_runner_backend().is_lora() else None
+            ),
             allow_fp8_blockwise_tail=self._supports_blockwise_fp8_tail(layer),
             **extra_weight_attrs,
         )
@@ -2698,6 +2707,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             elif (
                 get_moe_runner_backend().is_flashinfer_trtllm()
                 or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                # The LoRA MoE runner packs the canonical scales itself.
+                or get_moe_runner_backend().is_lora()
             ):
                 # Match FlashInfer TRT-LLM MoE test contracts:
                 # 1) quantize in canonical (non-swizzled) scale layout, and
@@ -2726,6 +2737,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             elif (
                 get_moe_runner_backend().is_flashinfer_trtllm()
                 or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                or get_moe_runner_backend().is_lora()
             ):
                 w13_q = layer.w13_weight.data
                 w2_q = layer.w2_weight.data
