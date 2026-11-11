@@ -761,3 +761,46 @@ def kv_b_lora_correction(attn_module) -> str | None:
     if layer.lora_backend.name != "triton_v2":
         return "legacy"
     return "v2" if layer.lora_active else None
+
+
+# Prefill backends whose dispatch keeps a cached prefix on the MHA paths no
+# matter what --disable-chunked-prefix-cache says (attention_backend_handler).
+KV_B_LORA_UNSAFE_PREFILL_BACKENDS = ("dsa", "nsa", "aiter")
+
+
+def kv_b_lora_prefix_cache_error(
+    prefill_backend: Optional[str],
+    *,
+    disable_chunked_prefix_cache: bool,
+    enable_kv_cache_sharding: bool,
+    fa4_absorbed_mla: bool,
+) -> Optional[str]:
+    """Why a ``kv_b_proj`` adapter cannot serve cached prefixes here, or None.
+
+    The MHA prefix paths of DeepSeek-style attention re-project the cached
+    latent through ``kv_b_proj`` on prefix rows, and the wrapped layer runs the
+    adapter kernels with the batch's extend-token segments: fewer prefix rows
+    than extend tokens read and write past the buffers, more land the delta on
+    the wrong rows. Only the absorbed MLA path adds the ``kv_b_proj`` delta per
+    token, so cached prefixes must dispatch there, which
+    ``--disable-chunked-prefix-cache`` guarantees on the backends that honor it.
+    """
+    lead = (
+        "LoRA on kv_b_proj can only serve cached prefixes through the absorbed MLA path"
+    )
+    if prefill_backend in KV_B_LORA_UNSAFE_PREFILL_BACKENDS or (
+        prefill_backend == "fa4" and not fa4_absorbed_mla
+    ):
+        return (
+            f"{lead}, but the {prefill_backend} prefill backend keeps them on the "
+            "MHA path regardless of --disable-chunked-prefix-cache; drop kv_b_proj "
+            "from the LoRA targets or use another attention backend."
+        )
+    if enable_kv_cache_sharding:
+        return (
+            f"{lead}, which --enable-kv-cache-sharding cannot use (it requires the "
+            "chunked prefix cache); drop kv_b_proj from the LoRA targets."
+        )
+    if not disable_chunked_prefix_cache:
+        return f"{lead}; pass --disable-chunked-prefix-cache."
+    return None
