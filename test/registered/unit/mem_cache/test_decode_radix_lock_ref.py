@@ -408,6 +408,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         req = MagicMock()
         req.rid = "req-1"
+        req.owner_list = None
         req.origin_input_ids = list(range(8))
         req.output_ids = [99]
         req.last_node = object()

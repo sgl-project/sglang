@@ -190,6 +190,12 @@ _run_direct_dense = None
 _warp_splitk_tactic = None
 _run_warp_splitk_dense = None
 _enable_bf16_splitk_gemm = False
+_mm_bf16 = None
+_flashinfer_autotuner = None
+# CuTe DSL tactics lose to the hand tables and TGV/cuBLAS at M = 24/32.
+_BF16_LOW_M_AUTOTUNE_MAX_M = 16
+# FlashInfer's cute-dsl mm_bf16 raises, rather than falling back, unless K % CTA_K == 0.
+_CUTE_DSL_BF16_CTA_K = 128
 
 # GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
 # Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
@@ -431,6 +437,7 @@ def initialize_bf16_gemm_config() -> None:
     global _warp_splitk_tactic, _run_warp_splitk_dense
     global _enable_bf16_splitk_gemm, _use_sm107_splitk_tactics
     global _active_warp_splitk_tactics
+    global _mm_bf16, _flashinfer_autotuner
     global _skip_aiter_unquant
 
     _skip_aiter_unquant = (
@@ -491,6 +498,7 @@ def initialize_bf16_gemm_config() -> None:
     _enable_bf16_splitk_gemm = False
     _use_sm107_splitk_tactics = False
     _active_warp_splitk_tactics = _BF16_WARP_SPLITK_TUNED_TACTICS
+    _mm_bf16 = None
     if backend.is_cutedsl():
         from flashinfer.gemm.kernels.dense_bf16_gemm_direct import (
             default_tactic,
@@ -520,6 +528,12 @@ def initialize_bf16_gemm_config() -> None:
                 **_BF16_SM107_WARP_SPLITK_TUNED_TACTICS,
             }
             _use_sm107_splitk_tactics = True
+        elif not get_exec().kernel.disable_flashinfer_autotune:
+            from flashinfer.autotuner import AutoTuner
+            from flashinfer.gemm import mm_bf16
+
+            _mm_bf16 = mm_bf16
+            _flashinfer_autotuner = AutoTuner.get()
 
     _BF16_GEMM_BACKEND = backend
 
@@ -583,12 +597,52 @@ def _bf16_splitk_gemm(
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
+def _bf16_low_m_autotune(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Run bias-free M <= 16 through FlashInfer's autotuned CuTe DSL kernels; None if not taken.
+
+    Under FlashInfer autotune, every other eligible call profiles M <= 16 bias-free.
+    """
+    if _mm_bf16 is None:
+        return None
+    m = x.numel() // x.shape[-1]
+    taken = bias is None and 0 < m <= _BF16_LOW_M_AUTOTUNE_MAX_M
+    if not (taken or (m > 0 and _flashinfer_autotuner.is_tuning_mode)):
+        return None
+    if not (
+        x.is_cuda
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and weight.shape[1] % _CUTE_DSL_BF16_CTA_K == 0
+        and not weight.requires_grad
+    ):
+        return None
+    output = _mm_bf16(
+        x.view(-1, x.shape[-1])[:_BF16_LOW_M_AUTOTUNE_MAX_M],
+        weight.T,
+        None,
+        pdl=True,
+        out=out if taken else None,
+        backend="cute-dsl",
+    )
+    return output.view(*x.shape[:-1], weight.shape[0]) if taken else None
+
+
 def _bf16_gemm_dispatch_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    output = _bf16_low_m_autotune(x, weight, bias)
+    if output is not None:
+        return output if addend is None else output.add_(addend)
     m = x.numel() // x.shape[-1]
     if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
         m, weight.shape[0], weight.shape[1]
@@ -662,6 +716,10 @@ def _can_accumulate_into_addend(
         and addend.shape == (x.shape[0], weight.shape[0])
         and not (x.requires_grad or addend.requires_grad or weight.requires_grad)
     )
+
+
+def bf16_gemm_needs_autotune() -> bool:
+    return _mm_bf16 is not None
 
 
 def get_bf16_gemm_backend() -> Bf16GemmBackend:
@@ -914,6 +972,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
+        if bias is not None:
+            # RowParallelLinear holds its bias on TP rank 0 only, and FlashInfer
+            # syncs each tuning call across TP ranks.
+            _bf16_low_m_autotune(x, layer.weight, bias)
         return F.linear(x, layer.weight, bias)
 
     def apply_with_addend(
@@ -943,6 +1005,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
+        if (
+            x.ndim == 2
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and _bf16_low_m_autotune(x, layer.weight, bias, out=output) is not None
+        ):
+            return output
         if (
             _enable_bf16_splitk_gemm
             and bias is None

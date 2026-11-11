@@ -1108,11 +1108,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req: Req,
         is_retracted: bool = False,
         is_rebootstrap: bool = False,
-        *,
-        src: Optional[ReqList] = None,
     ) -> None:
-        """Add a request to the pending queue, moving it out of `src` if given;
-        one refused at the door is finished and leaves `src` for no list.
+        """Add a request to the pending queue, moving it out of the list it is
+        in; one refused at the door is finished and leaves for no list.
 
         ``is_rebootstrap`` marks a PD true-retraction request whose prefix KV
         must be recomputed by the original prefill worker under the current
@@ -1126,22 +1124,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # this point carries none of the markers `is_unadmitted_reject` reads,
         # so take the caller's word for it rather than sniffing.
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
-            self.scheduler.request_retirer.retire_unadmitted(req, src=src)
+            self.scheduler.request_retirer.retire_unadmitted(req)
             return
         if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
             req.time_stats.set_retract_time()
             is_retracted = False
             is_rebootstrap = True
 
-        if self._check_if_req_exceed_kv_capacity(req, src=src):
+        if self._check_if_req_exceed_kv_capacity(req):
             return
 
         if is_retracted:
             req.retraction_mb_id = None
-            move([req], src, self.retracted_queue)
+            move([req], self.retracted_queue)
         else:
             decode_req = self._create_receiver_and_enqueue(
-                req, is_rebootstrap=is_rebootstrap, src=src
+                req, is_rebootstrap=is_rebootstrap
             )
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
@@ -1204,8 +1202,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self,
         req: Req,
         is_rebootstrap: bool = False,
-        *,
-        src: Optional[ReqList],
     ) -> DecodeRequest:
         backend = (
             TransferBackend.FAKE if _is_fake_transfer(req) else self.transfer_backend
@@ -1221,10 +1217,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         decode_req = DecodeRequest(
             req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
         )
-        move([decode_req], src, self.queue)
+        move([decode_req], self.queue)
         return decode_req
 
-    def hold_rebootstrap(self, req: Req, *, src: Optional[ReqList] = None) -> None:
+    def hold_rebootstrap(self, req: Req) -> None:
         """Stage a retracted request for rebootstrap without enqueuing it yet.
 
         Retraction is always paired with a weight update
@@ -1234,23 +1230,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         scheduler non-idle so ``update_weights``' post-update cache flush
         asserts and crashes the decode worker. Instead we hold the request and
         enqueue it from ``enqueue_held_rebootstrap`` on resume, so its prefix KV
-        is recomputed by the prefill worker under the updated weights. It moves
-        out of `src` if given.
+        is recomputed by the prefill worker under the updated weights.
         """
-        move([req], src, self.held_rebootstrap_reqs)
+        move([req], self.held_rebootstrap_reqs)
 
     def enqueue_held_rebootstrap(self) -> None:
         """Move all staged rebootstrap requests into the pending queue when
         generation resumes."""
-        held = self.held_rebootstrap_reqs
-        for req in list(held):
-            self.add(req, is_rebootstrap=True, src=held)
+        for req in list(self.held_rebootstrap_reqs):
+            self.add(req, is_rebootstrap=True)
 
-    def _check_if_req_exceed_kv_capacity(
-        self, req: Req, *, src: Optional[ReqList] = None
-    ) -> bool:
-        """Whether the request can never fit; one that cannot is finished and
-        leaves `src`."""
+    def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
+        """Whether the request can never fit; one that cannot is finished."""
         message = None
         allocator = self.token_to_kv_pool_allocator
         full_required, _ = self._prealloc_required(req)
@@ -1292,7 +1283,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if message is not None:
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.request_retirer.retire_unadmitted(req, src=src)
+            self.scheduler.request_retirer.retire_unadmitted(req)
             return True
         return False
 
@@ -1419,7 +1410,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 get_disagg().disaggregation_decode_retraction_backup,
             )
 
-        move(resumed_reqs, self.retracted_queue, dst)
+        move(resumed_reqs, dst)
 
         return resumed_reqs
 
@@ -2041,7 +2032,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
 
         self.queue.leave([decode_req.req for decode_req in failed_reqs])
-        move(preallocated_reqs, self.queue, dst)
+        move(preallocated_reqs, dst)
         self.note_destinations_queued(len(preallocated_reqs))
 
         return preallocated_reqs, failed_reqs
@@ -3848,7 +3839,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.metadata_buffers.clear_slot(idx)
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
-        move(transferred_reqs, self.queue, dst)
+        move(transferred_reqs, dst)
         self.queue.leave([queue[i].req for i in indices_to_remove])
         polls = [poll for i, poll in enumerate(polls) if i not in indices_to_remove]
 
@@ -3883,7 +3874,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self._required_abort_acks(decode_req),
                 )
             ],
-            self.queue,
             self._deferred_releases,
         )
 
@@ -4395,7 +4385,7 @@ class SchedulerDisaggregationDecodeMixin:
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
-                self._add_request_to_queue(req, src=self.grammar_manager.grammar_queue)
+                self._add_request_to_queue(req)
 
         if len(self.waiting_queue) == 0:
             return None
@@ -4450,7 +4440,7 @@ class SchedulerDisaggregationDecodeMixin:
             return None
         # They run from here on; one the checksum or the prebuilt result ends
         # leaves again before the merge.
-        move(can_run_list, self.waiting_queue, self.running_reqs)
+        move(can_run_list, self.running_reqs)
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
