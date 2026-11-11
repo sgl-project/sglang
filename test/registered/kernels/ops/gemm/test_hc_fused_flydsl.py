@@ -38,7 +38,9 @@ def _layers():
 @pytest.mark.parametrize("rows", [1, 24, 96, 128])
 def test_fused_hc_matches_unfused(rows):
     ref, fused = _layers()
-    h = torch.randn(rows, 10240, device="cuda", dtype=torch.bfloat16)
+    # Scale branch b by b + 1 so a kernel that mixes up per-branch norm scales fails.
+    branch_scale = torch.arange(1, 5, device="cuda", dtype=torch.float32)[:, None]
+    h = (torch.randn(rows, 4, 2560, device="cuda") * branch_scale).flatten(1).bfloat16()
     y = torch.randn(rows, 2560, device="cuda", dtype=torch.bfloat16)
     with torch.no_grad():
         m_ref, res_ref = ref.mix(h)
