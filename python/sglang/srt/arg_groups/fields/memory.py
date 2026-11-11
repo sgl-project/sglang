@@ -45,6 +45,7 @@ class Memory(msgspec.Struct):
             ),
             choices=RADIX_EVICTION_POLICY_CHOICES,
             resolvable=True,
+            fallback="lru",
         ),
     ] = None
     # Whether the caller chose the policy, which model-specific defaults must keep.

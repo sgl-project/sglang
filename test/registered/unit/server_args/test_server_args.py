@@ -117,6 +117,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.runtime_context import (
     describe_kv_events_publisher,
     get_context,
+    get_memory,
     get_serving,
     override_platform,
 )
@@ -127,6 +128,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
     enter_scope,
+    published_topology,
 )
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -511,6 +513,12 @@ class TestPrepareServerArgs(CustomTestCase):
                     resolution_result(rebuilt, "_radix_eviction_policy_explicitly_set"),
                     explicit,
                 )
+
+    def test_unset_radix_eviction_policy_publishes_lru_on_a_dummy_model(self):
+        """A dummy-model record skips the hook that fills the policy; the scheduler
+        still calls .lower() on the published value."""
+        with published_topology():
+            self.assertEqual(get_memory().radix_eviction_policy, "lru")
 
     def test_monokernel_flag_spellings_in_config_and_cli(self):
         """The deprecated --monokernel-backend amd|msa sets --enable-amd-monokernel or
