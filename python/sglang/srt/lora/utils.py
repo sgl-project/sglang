@@ -761,3 +761,23 @@ def kv_b_lora_correction(attn_module) -> str | None:
     if layer.lora_backend.name != "triton_v2":
         return "legacy"
     return "v2" if layer.lora_active else None
+
+
+def check_lora_token_rows(x: torch.Tensor, batch_info: LoRABatchInfo) -> None:
+    """Refuse an activation whose rows are not the tokens the segments describe.
+
+    The dense LoRA kernels walk ``seg_lens`` / ``seg_indptr`` and never look at
+    ``x.shape[0]``; a caller that hands them a tensor of other rows (a cached
+    prefix, a TBO child) reads and writes past the buffers or lands the delta
+    on the wrong rows. ``expected_tokens`` is the host-side token count of the
+    eager batch; graph infos carry the captured width instead, so only eager
+    infos are checked.
+    """
+    expected = batch_info.expected_tokens
+    if expected is None or batch_info.use_cuda_graph:
+        return
+    assert x.shape[0] == expected, (
+        f"LoRA kernel input has {x.shape[0]} rows but the batch metadata "
+        f"describes {expected} tokens; the adapter segments only cover the "
+        "forward batch's own tokens."
+    )

@@ -106,6 +106,11 @@ def check_lora_server_args(server_args: Any):
             )
 
     if cfg.enable_lora:
+        if cfg.enable_two_batch_overlap:
+            # TBO children are sliced from the parent ForwardBatch without a
+            # LoRA batch of their own, so the adapter segments outrun their rows.
+            raise ValueError("LoRA does not support --enable-two-batch-overlap")
+
         if cfg.lora_backend == "triton_v2" and not cfg.moe_runner_backend.startswith(
             "lora"
         ):
