@@ -201,6 +201,50 @@ class TestModulePostLoadValidation(unittest.TestCase):
 
         self.assertEqual(module.weight.device, PROCESS_DEVICE)
 
+    @unittest.skipUnless(PROCESS_DEVICE is not None, "requires CUDA")
+    def test_loading_context_returns_replaced_weights_to_device(self):
+        """The memory of a replaced weight returns to the device when the context exits;
+        left in the allocator cache, the next module's tensors pin it."""
+        mib = 1 << 20
+        torch.cuda.empty_cache()
+        cached_before = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        modules = []
+        for _ in range(4):
+            module = nn.Module()
+            module.weight = nn.Parameter(
+                torch.empty(64 * mib, dtype=torch.uint8, device=PROCESS_DEVICE),
+                requires_grad=False,
+            )
+            modules.append(module)
+
+        for module in modules:
+            with device_loading_context(module, PROCESS_DEVICE):
+                # Larger than the weight it replaces, like a padded repack.
+                module.weight = nn.Parameter(
+                    torch.empty(128 * mib, dtype=torch.uint8, device=PROCESS_DEVICE),
+                    requires_grad=False,
+                )
+
+        cached_after = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        self.assertLess(cached_after - cached_before, 64 * mib)
+
+    @unittest.skipUnless(PROCESS_DEVICE is not None, "requires CUDA")
+    def test_loading_context_keeps_cache_when_hook_replaces_nothing(self):
+        """A hook that replaces no tensor leaves the allocator cache alone;
+        weight updates on a live engine go through this context too."""
+        module = nn.Module()
+        module.weight = nn.Parameter(torch.ones(4, device=PROCESS_DEVICE))
+        torch.cuda.empty_cache()
+        freed = torch.empty(64 << 20, dtype=torch.uint8, device=PROCESS_DEVICE)
+        del freed
+        cached_before = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+
+        with device_loading_context(module, PROCESS_DEVICE):
+            module.weight.data.add_(1)
+
+        cached_after = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        self.assertEqual(cached_after, cached_before)
+
     def test_parks_existing_meta_tensor_and_stages_the_rest(self):
         module = nn.Module()
         module.meta_weight = nn.Parameter(torch.empty(1, device="meta"))
