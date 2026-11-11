@@ -520,3 +520,200 @@ class TestNPUSparseDispatch(unittest.TestCase):
         )
         return compile(ast.Module(body=[block], type_ignores=[]), str(path), "exec")
 
+    def test_npu_layout_resolution_separates_dsv4_from_mla(self):
+        code = self._npu_hicache_resolution_code()
+        for dsv4, mla in ((False, False), (False, True), (True, False), (True, True)):
+            for layout in (
+                "layer_first",
+                "page_first",
+                "page_first_direct",
+                "layer_first_kv_split",
+                "page_first_kv_split",
+            ):
+                with self.subTest(dsv4=dsv4, mla=mla, layout=layout):
+                    resolved = {}
+                    cfg = SimpleNamespace(
+                        enable_hierarchical_cache=True, hicache_mem_layout=layout
+                    )
+                    namespace = dict(
+                        os=os,
+                        cfg=cfg,
+                        args=cfg,
+                        use_mla_backend=lambda _: mla,
+                        model_config_of=lambda _: SimpleNamespace(hf_config=None),
+                        declare_resolution=lambda args, source, **kw: resolved.update(
+                            kw
+                        ),
+                    )
+                    with (
+                        patch.dict(os.environ, {}, clear=True),
+                        patch.dict(
+                            sys.modules,
+                            {
+                                "sglang.srt.configs.model_config": SimpleNamespace(
+                                    is_deepseek_v4=lambda _: dsv4
+                                )
+                            },
+                        ),
+                    ):
+                        exec(code, namespace)
+                        self.assertEqual(
+                            os.environ.get("SGLANG_HICACHE_HOST_MEM_BACKEND"),
+                            "acl" if dsv4 or mla else None,
+                        )
+                    if dsv4:
+                        expected = (
+                            "layer_first" if layout == "layer_first" else "page_first"
+                        )
+                    elif mla:
+                        expected = (
+                            "layer_first_kv_split"
+                            if layout in ("layer_first", "layer_first_kv_split")
+                            else "page_first_kv_split"
+                        )
+                    else:
+                        expected = "page_first_direct"
+                    self.assertEqual(resolved["hicache_mem_layout"], expected)
+                    self.assertEqual(resolved["hicache_io_backend"], "kernel_ascend")
+
+    def test_npu_host_backend_default_respects_explicit_values_and_cache_triggers(self):
+        code = self._npu_hicache_resolution_code()
+        env_name = "SGLANG_HICACHE_HOST_MEM_BACKEND"
+        for dsv4, mla in ((False, False), (False, True), (True, False), (True, True)):
+            for backend in (None, "acl", "memfabric", ""):
+                for trigger in ("disabled", "hicache", "offload", "retraction"):
+                    with self.subTest(
+                        dsv4=dsv4, mla=mla, backend=backend, trigger=trigger
+                    ):
+                        cfg = SimpleNamespace(
+                            enable_hierarchical_cache=trigger == "hicache",
+                            disaggregation_decode_enable_offload_kvcache=trigger
+                            == "offload",
+                            disaggregation_mode=(
+                                "decode" if trigger == "retraction" else None
+                            ),
+                            disaggregation_decode_retraction_backup=None,
+                            hicache_mem_layout="page_first",
+                        )
+                        namespace = dict(
+                            os=os,
+                            cfg=cfg,
+                            args=cfg,
+                            use_mla_backend=lambda _: mla,
+                            model_config_of=lambda _: SimpleNamespace(hf_config=None),
+                            declare_resolution=Mock(),
+                        )
+                        environment = {} if backend is None else {env_name: backend}
+                        with (
+                            patch.dict(os.environ, environment, clear=True),
+                            patch.dict(
+                                sys.modules,
+                                {
+                                    "sglang.srt.configs.model_config": SimpleNamespace(
+                                        is_deepseek_v4=lambda _: dsv4
+                                    ),
+                                },
+                            ),
+                        ):
+                            exec(code, namespace)
+                            expected = backend
+                            if (
+                                backend is None
+                                and (dsv4 or mla)
+                                and trigger != "disabled"
+                            ):
+                                expected = "acl"
+                            self.assertEqual(os.environ.get(env_name), expected)
+                            if trigger == "disabled":
+                                namespace["declare_resolution"].assert_not_called()
+
+    def test_controller_keeps_pf_and_lf_indices_on_npu(self):
+        path = ROOT / "python/sglang/srt/managers/cache_controller.py"
+        tree = ast.parse(path.read_text())
+        cls = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "HiCacheController"
+        )
+        method = next(
+            n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef) and n.name == "move_indices"
+        )
+        namespace = {"torch": SimpleNamespace(Tensor=object)}
+        exec(
+            compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
+            namespace,
+        )
+        backend_path = ROOT / "python/sglang/srt/mem_cache/pool_host/npu_host_memory.py"
+        backend_functions = [
+            node
+            for node in ast.parse(backend_path.read_text()).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in ("host_memory_backend", "ascendc_io_enabled")
+        ]
+        backend_namespace = {"os": os}
+        exec(
+            compile(
+                ast.Module(body=backend_functions, type_ignores=[]),
+                str(backend_path),
+                "exec",
+            ),
+            backend_namespace,
+        )
+        hi = SimpleNamespace(device="npu")
+        cpu_hi = SimpleNamespace(device="cpu")
+        cpu_di = object()
+        for backend in ("acl", "memfabric", None):
+            layouts = (
+                (
+                    "page_first_kv_split",
+                    "layer_first_kv_split",
+                    "page_first",
+                    "layer_first",
+                    "page_first_direct",
+                )
+                if backend
+                else ("page_first_direct",)
+            )
+            for layout in layouts:
+                with self.subTest(backend=backend, layout=layout):
+                    di = SimpleNamespace(cpu=Mock(return_value=cpu_di))
+                    upload = Mock(return_value=hi)
+                    environment = (
+                        {"SGLANG_HICACHE_HOST_MEM_BACKEND": backend} if backend else {}
+                    )
+                    with (
+                        patch.dict(os.environ, environment, clear=True),
+                        patch.dict(
+                            sys.modules,
+                            {
+                                "sglang.srt.mem_cache.pool_host.npu_host_memory": SimpleNamespace(
+                                    ascendc_io_enabled=backend_namespace[
+                                        "ascendc_io_enabled"
+                                    ],
+                                    to_device_no_sync=upload,
+                                ),
+                            },
+                        ),
+                    ):
+                        ctl = SimpleNamespace(
+                            io_backend="kernel_ascend",
+                            device="npu",
+                            mem_pool_host=SimpleNamespace(layout=layout),
+                        )
+                        move = namespace["move_indices"]
+                        if backend:
+                            self.assertEqual(move(ctl, hi, di), (hi, di))
+                            upload.assert_not_called()
+                            self.assertEqual(move(ctl, cpu_hi, di), (hi, di))
+                            upload.assert_called_once_with(cpu_hi, "npu")
+                            di.cpu.assert_not_called()
+                        else:
+                            self.assertEqual(move(ctl, cpu_hi, di), (cpu_hi, cpu_di))
+                            di.cpu.assert_called_once_with()
+                            upload.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
