@@ -203,7 +203,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
 
         group = BeamGroup(
             beam_width=beam_width,
-            stop_token_ids=self._collect_stop_token_ids(req, user_params),
+            stop_token_ids=self._collect_stop_token_ids(
+                req, user_params, vocab_size=self.model_config.vocab_size
+            ),
             max_new_tokens=max_new_tokens,
             num_return=user_params.n,
             # Frontier state lives on device: selection consumes device top-2k
@@ -241,7 +243,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         )
 
     @staticmethod
-    def _collect_stop_token_ids(req: Req, user_params) -> List[int]:
+    def _collect_stop_token_ids(req: Req, user_params, *, vocab_size: int) -> List[int]:
         if user_params.ignore_eos:
             return []
         stop_ids = set(user_params.stop_token_ids or ())
@@ -251,7 +253,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             if getattr(tokenizer, "eos_token_id", None) is not None:
                 stop_ids.add(tokenizer.eos_token_id)
             stop_ids |= set(getattr(tokenizer, "additional_stop_token_ids", None) or ())
-        return sorted(stop_ids)
+        # Out-of-vocab ids never match; past int64 they would break BeamGroup's tensor.
+        return sorted(t for t in stop_ids if 0 <= t < vocab_size)
 
     def maybe_select_and_relay(
         self, batch: ScheduleBatch, batch_result, chunked_req: Optional[Req] = None
@@ -322,8 +325,6 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         """Deferred half of the leader's prefill tick: fold the staged selection
         into the DAG (the designated D2H point) and apply finish/abort."""
         group: BeamGroup = req.beam_group
-        if group.retired:
-            return
         if req.to_finish is not None:
             self._abort_group(group)
             return
@@ -378,29 +379,24 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             )
             self._apply_survivors(group, next_tokens, parent_idx, batch.forward_iter)
 
-    def commit_decode(self, batch: ScheduleBatch) -> set:
+    def commit_decode(self, reqs: List[Req], forward_iter: int) -> None:
         """Deferred half: fold staged selections into the DAG and apply
-        finish/abort. Returns groups finished by THIS call -- under overlap a
-        finished leader reappears for one overshoot tick, so the caller runs the
-        shared finish machinery only on the committing tick."""
-        newly_finished = set()
+        finish/abort, on ``reqs``, the requests the step at ``forward_iter``
+        commits on."""
         if self._num_live_groups == 0:
-            return newly_finished
-        for req in batch.reqs:
+            return
+        for req in reqs:
             group = req.beam_group
-            if group is None or group.retired:
+            if group is None:
                 continue
             # Reclaim even if the DAG commit is discarded: the launch path
             # already mutated req_to_token, so the orphans are real either way.
-            self._reclaim_orphans(group, batch.forward_iter)
+            self._reclaim_orphans(group, forward_iter)
             if req.to_finish is not None:
                 self._abort_group(group)
-                newly_finished.add(id(group))
                 continue
-            if group.commit_pending(batch.forward_iter):
+            if group.commit_pending(forward_iter):
                 self._finish_group(group)
-                newly_finished.add(id(group))
-        return newly_finished
 
     def _select_group(
         self,

@@ -27,6 +27,10 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import (
+    get_processor,
+    resolve_image_processor_backend,
+)
 from sglang.srt.managers.io_struct import (
     EncoderDispatchErrorReq,
     GenerateReqInput,
@@ -34,6 +38,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
+from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
@@ -47,17 +52,12 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ImageData, VideoData
-from sglang.srt.utils.common import safe_pickle_loads
-from sglang.srt.utils.hf_transformers import (
-    get_processor,
-    resolve_image_processor_backend,
-)
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
+from sglang.srt.utils.serialization import safe_pickle_loads
 
 logger = logging.getLogger(__name__)
 
