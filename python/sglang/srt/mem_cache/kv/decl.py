@@ -86,10 +86,62 @@ class MHAGeometry(msgspec.Struct, frozen=True, kw_only=True):
     kv_cache_dtype: torch.dtype
 
 
-class MLAGeometry(msgspec.Struct, frozen=True, kw_only=True):
+# The stored latent row format of FP8 MLA with per-block scales: the FP8 NoPE
+# values, one FP32 scale per 128 of them, then the BF16 RoPE tail.
+FP8_DS_MLA = "fp8_ds_mla"
+
+
+class MLARowFormat(msgspec.Struct, frozen=True, kw_only=True):
+    """A stored latent row other than ``kv_lora_rank + qk_rope_head_dim``
+    values of the cache dtype: its format, its width in bytes, and whether its
+    block scales are rounded up to powers of two."""
+
+    name: str
+    row_bytes: int
+    scale_ue8m0: bool = False
+
+
+class MLAGeometry(msgspec.Struct, frozen=True, kw_only=True, repr_omit_defaults=True):
+    """One latent row per token per layer. ``row_format`` stores rows in another
+    format than the cache dtype's (None: plain rows). ``layer_major`` lays each
+    page out layer by layer -- a layer's rows of the page contiguous, a row
+    apart -- for readers that want a row-sized token stride within a page and
+    address pages by the page's stride; otherwise rows are token-major."""
+
     kv_lora_rank: int
     qk_rope_head_dim: int
     kv_cache_dtype: torch.dtype
+    row_format: Optional[MLARowFormat] = None
+    layer_major: bool = False
+
+    def row_bytes(self) -> int:
+        """Bytes of one stored latent row."""
+        if self.row_format is not None:
+            return self.row_format.row_bytes
+        return (
+            self.kv_lora_rank + self.qk_rope_head_dim
+        ) * self.kv_cache_dtype.itemsize
+
+
+class IndexKeyGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """A sparse-attention indexer's keys: one blob per page, the page's keys
+    then their scales, as the paged index kernels read it. FP8 keys keep one
+    FP32 scale per 128 values; FP4 keys pack two values per byte and keep one
+    exponent byte per 32 values."""
+
+    index_head_dim: int
+    use_fp4: bool = False
+    quant_block_size: ClassVar[int] = 128
+
+    @property
+    def key_bytes_per_token(self) -> int:
+        return self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
+
+    @property
+    def bytes_per_token(self) -> int:
+        if self.use_fp4:
+            return self.index_head_dim // 2 + self.index_head_dim // 32
+        return self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
 
 
 class StateReplay(msgspec.Struct, frozen=True, kw_only=True):
@@ -133,7 +185,9 @@ class RequestGeometry(msgspec.Struct, frozen=True, kw_only=True):
     parts: Tuple["TensorPartDecl", ...]
 
 
-PartGeometry = Union[MHAGeometry, MLAGeometry, StateGeometry, RequestGeometry]
+PartGeometry = Union[
+    MHAGeometry, MLAGeometry, IndexKeyGeometry, StateGeometry, RequestGeometry
+]
 
 
 class KVPartDecl(msgspec.Struct, frozen=True, kw_only=True):
@@ -462,6 +516,8 @@ def with_state_ple(
 
 # The part every token KV view holds; derived parts get their own names.
 KV_PART = "kv"
+# A sparse-attention indexer's keys, beside a layer's KV in the same sub-pool.
+INDEX_K_PART = "index_k"
 # A request's recurrent state, one slot per request, in the state sub-pool.
 STATE_PART = "state"
 
