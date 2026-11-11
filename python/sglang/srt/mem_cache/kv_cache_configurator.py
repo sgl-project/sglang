@@ -41,6 +41,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import resolve_linear_attn_verify_backend
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
@@ -112,6 +113,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_model,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
     mamba_cache_chunk_size,
@@ -120,6 +122,10 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_parallel import legacy_draft_attn_tp_size
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.device import (
@@ -3260,22 +3266,36 @@ class KVCacheConfigurator:
         return config
 
     def _linear_lossless_verify_enabled(self) -> bool:
-        """--enable-linear-lossless-verify, checked against the model."""
-        if not get_exec().mamba.enable_linear_lossless_verify:
+        """Whether GDN target-verify keeps (u, k, g) tuples instead of snapshots.
+
+        The tuple replay is bit-identical to the snapshot verify, so it is used
+        wherever it is supported: a GDN hybrid model verifying a linear draft
+        chain with the Triton verify kernel on CUDA or ROCm. Everything else
+        (tree verify, KDA, ReplaySSM, unified memory, ragged verify, FlashInfer
+        verify, other platforms) keeps the full-state snapshots.
+        """
+        if self.hybrid_gdn_config is None or self.spec_algorithm.is_none():
             return False
-        if self.hybrid_gdn_config is None:
-            raise ValueError(
-                "--enable-linear-lossless-verify supports GDN hybrid "
-                "linear-attention models only."
-            )
-        return True
+        if not (get_platform().is_cuda or get_platform().is_hip):
+            return False
+        mamba = get_exec().mamba
+        return (
+            get_spec().speculative_eagle_topk == 1
+            and not mamba.enable_linear_replayssm
+            and not mamba.enable_linear_replayssm_spec
+            # Only the Triton verify kernel writes the tuples.
+            and resolve_linear_attn_verify_backend().is_triton()
+            and not get_memory().enable_unified_memory
+            # The verify reshapes the batch to a fixed draft width.
+            and read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+        )
 
     def _spec_intermediate_bytes(
         self, n_slots: int, stage_per_req: int, pp_layer_scale: float
     ) -> int:
         """Target-verify scratch to reserve for ``n_slots`` request slots.
 
-        The default verify keeps a full (conv + SSM) snapshot per draft token,
+        The snapshot verify keeps a full (conv + SSM) snapshot per draft token,
         charged as ``stage_per_req * D`` (the priced state entry, including a
         fused draft's widening). The lossless tuple verify keeps only (u, k, g)
         per draft token, ~K x less; charging it the snapshot cost would park the
@@ -3564,27 +3584,45 @@ class KVCacheConfigurator:
 
             if reserves_spec_state:
                 ratio = self._calculate_mamba_ratio()
-                # Joint solve: main_state + intermediate = mamba_budget, i.e.
-                #   (K + 1) * per_req + (K / ratio + 1) * inter = budget,
-                # where `inter` is the real scratch of one request's D draft
-                # steps (not per_req * D, see _spec_intermediate_bytes).
-                inter_per_req = self._spec_intermediate_bytes(
-                    1, per_req, pp_layer_scale
+                D = get_spec().speculative_num_draft_tokens
+                max_reqs = max(
+                    1, get_schedule().max_running_requests // self.attn_dp_size
                 )
+                # Joint solve: main_state + intermediate = mamba_budget
+                max_mamba_cache_size = int(
+                    (mamba_budget_bytes - per_req * (1 + D) - extra_per_slot)
+                    // (per_req * (1 + D / ratio) + extra_per_slot)
+                )
+                if self._linear_lossless_verify_enabled():
+                    # The solve prices each running request's verify scratch as
+                    # D full-state snapshots; the tuple verify needs far less.
+                    # Spend the difference on slots while they still cap the
+                    # running requests (ratio slots each, up to max_reqs) and
+                    # leave the rest to the KV cache, so neither shrinks.
+                    capped_reqs = min(max_reqs, max_mamba_cache_size // ratio)
+                    tuple_row = self._spec_intermediate_bytes(
+                        1, per_req, pp_layer_scale
+                    )
+                    freed = (capped_reqs + 1) * (per_req * D - tuple_row)
+                    extra_reqs = min(
+                        max_reqs - capped_reqs,
+                        freed // (ratio * (per_req + extra_per_slot) + tuple_row),
+                    )
+                    max_mamba_cache_size = max(
+                        max_mamba_cache_size, ratio * (capped_reqs + extra_reqs)
+                    )
                 get_context().override(
                     "mamba_pool.memory_budget_spec",
-                    max_mamba_cache_size=int(
-                        (mamba_budget_bytes - per_req - inter_per_req - extra_per_slot)
-                        // (per_req + inter_per_req / ratio + extra_per_slot)
-                    ),
+                    max_mamba_cache_size=max_mamba_cache_size,
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
-                    max(1, get_schedule().max_running_requests // self.attn_dp_size),
-                    get_schedule().max_mamba_cache_size // ratio,
+                    max_reqs, get_schedule().max_mamba_cache_size // ratio
                 )
-                intermediate_size = inter_per_req * (capped_reqs + 1)
+                intermediate_size = self._spec_intermediate_bytes(
+                    capped_reqs + 1, per_req, pp_layer_scale
+                )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 per_slot = per_req + extra_per_slot

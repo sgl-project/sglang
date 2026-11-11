@@ -1909,10 +1909,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
-        # Lossless GDN tuple verify (--enable-linear-lossless-verify): the pool
-        # keeps per-step (u, k, g) tuples instead of a full SSM snapshot per
-        # draft token, so the accepted SSM state is replayed here instead of
-        # gather-scattered. Conv windows keep the upstream scatter below.
+        # Lossless GDN tuple verify: the pool keeps per-step (u, k, g) tuples
+        # instead of a full SSM snapshot per draft token, so the accepted SSM
+        # state is replayed here instead of gather-scattered. Conv windows keep
+        # the upstream scatter below.
         u_tuple_cache = mamba_caches.intermediate_ssm_u
         if u_tuple_cache is not None:
             # Verify wrote the tuples to the rows it was handed: stable request

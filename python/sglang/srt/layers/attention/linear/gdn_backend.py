@@ -649,11 +649,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def _assert_lossless_verify_kernel(self):
         """Only the Triton verify kernel writes the (u, k, g) tuple ring.
 
-        The FlashInfer verify kernel -- picked by GDNKernelDispatcher when
-        --linear-attn-decode-backend flashinfer is set and it supports MTP
-        verify -- takes ``**kwargs`` and would silently DROP the three tuple
-        buffers: the ring stays zero, the replay commits a wrong state, and
-        nothing fails. Fail here instead.
+        The pool allocates the ring only when the verify backend resolves to
+        Triton (see KVCacheConfigurator._linear_lossless_verify_enabled). Any
+        other verify kernel, e.g. FlashInfer's, takes ``**kwargs`` and would
+        silently DROP the three tuple buffers: the ring stays zero, the replay
+        commits a wrong state, and nothing fails. Fail here instead.
 
         Runs exactly once: this sits in forward_extend, i.e. once per GDN layer
         per verify step, so the isinstance must not stay on the hot path.
@@ -661,9 +661,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         kernel = self.kernel_dispatcher.verify_kernel
         if not isinstance(kernel, TritonGDNKernel):
             raise RuntimeError(
-                "--enable-linear-lossless-verify requires the Triton GDN verify "
-                f"kernel, but the dispatcher selected {type(kernel).__name__}. "
-                "Pass --linear-attn-verify-backend triton."
+                "The lossless GDN tuple verify requires the Triton GDN verify "
+                f"kernel, but the dispatcher selected {type(kernel).__name__}."
             )
         self._lossless_kernel_checked = True
 
@@ -1350,7 +1349,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self.req_to_token_pool.size,
             )
             # Lossless verify writes (u, k, g) tuples instead of the full
-            # [HV, V, K] state cache (None unless --enable-linear-lossless-verify).
+            # [HV, V, K] state cache (None unless the pool allocated the tuples).
             u_tuple_cache = mamba_cache_params.intermediate_ssm_u
             k_tuple_cache = mamba_cache_params.intermediate_ssm_k
             g_tuple_cache = mamba_cache_params.intermediate_ssm_g
@@ -1493,7 +1492,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     draft_token_num=forward_batch.spec_info.draft_token_num,
                 )
             else:
-                # Under --enable-linear-lossless-verify the pool swaps the
+                # Under the lossless tuple verify the pool swaps the
                 # per-draft full-state snapshots for the (u, k, g) tuple ring,
                 # so the full-state buffer is None and the tuples are written.
                 _lossless = u_tuple_cache is not None
@@ -1503,7 +1502,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     # Runtime half of the topk == 1 gate: the replay follows
                     # one linear chain and cannot honour tree parents.
                     assert retrieve_parent_token is None, (
-                        "--enable-linear-lossless-verify got an EAGLE tree verify "
+                        "The lossless GDN tuple verify got an EAGLE tree verify "
                         "batch; it supports --speculative-eagle-topk 1 only."
                     )
                 # The recurrent fallback needs the per-draft snapshots (or the

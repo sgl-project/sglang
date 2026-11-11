@@ -78,6 +78,20 @@ class LinearAttnBackends(msgspec.Struct, frozen=True):
     verify: LinearAttnKernelBackend
 
 
+def resolve_linear_attn_verify_backend() -> LinearAttnKernelBackend:
+    """The configured verify kernel; unset follows decode (flashinfer -> its
+    recurrent kernel, else triton). The pool sizes its verify scratch from it
+    before any runner resolves its backends."""
+    mamba = get_exec().mamba
+    verify = mamba.linear_attn_verify_backend
+    if verify is None:
+        decode = LinearAttnKernelBackend(
+            mamba.linear_attn_decode_backend or mamba.linear_attn_backend
+        )
+        verify = decode.value if decode.is_flashinfer() else "triton"
+    return LinearAttnKernelBackend(verify)
+
+
 def resolve_linear_attn_backends(
     prefill_default: Optional[str] = None,
 ) -> LinearAttnBackends:
@@ -93,13 +107,8 @@ def resolve_linear_attn_backends(
         mamba.linear_attn_prefill_backend or prefill_default or base
     )
 
-    # Unset verify follows decode (flashinfer -> its recurrent kernel, else triton).
-    verify = mamba.linear_attn_verify_backend
-    if verify is None:
-        verify = decode.value if decode.is_flashinfer() else "triton"
-
     backends = LinearAttnBackends(
-        decode=decode, prefill=prefill, verify=LinearAttnKernelBackend(verify)
+        decode=decode, prefill=prefill, verify=resolve_linear_attn_verify_backend()
     )
     rank0_log(
         f"Linear attention kernel backend: decode={backends.decode.value}, "

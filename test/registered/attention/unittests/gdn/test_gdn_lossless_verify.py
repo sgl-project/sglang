@@ -1,4 +1,4 @@
-"""Lossless GDN tuple verify (--enable-linear-lossless-verify).
+"""Lossless GDN tuple verify.
 
 Target-verify keeps each draft step's (u, k, g) tuple instead of a full
 [HV, V, K] state snapshot, and the commit replays the accepted prefix. Every
@@ -22,6 +22,7 @@ from sglang.srt.configs.mamba_utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import hybrid_linear_attn_backend as hlab
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
 from sglang.srt.mem_cache.memory_pool import (
     MambaPool,
     get_tensor_size_bytes,
@@ -152,10 +153,6 @@ def _verify(pool, inputs, d, rows, sel=ALL_ROWS):
 def _commit(pool, last, track_idx, track_steps, req_pool_indices=None, sel=ALL_ROWS):
     """Drive the real commit hook with a minimal stand-in for the backend."""
     slots = torch.tensor([SLOTS[i] for i in sel], dtype=torch.int64, device=DEVICE)
-    slot_of_req = torch.full((64,), -1, dtype=torch.int64, device=DEVICE)
-    if req_pool_indices is not None:
-        slot_of_req[req_pool_indices] = slots
-    req_pool = types.SimpleNamespace(get_mamba_indices=lambda r: slot_of_req[r])
     state_pool = types.SimpleNamespace(
         get_speculative_mamba2_params_all_layers=lambda: pool.mamba_cache,
         replayssm_is_kda=False,
@@ -163,9 +160,6 @@ def _commit(pool, last, track_idx, track_steps, req_pool_indices=None, sel=ALL_R
     # No PLE side-state parts are bound.
     layer_router = types.SimpleNamespace(part_view=lambda part: None)
     linear = types.SimpleNamespace(
-        _translate_mamba_indices=lambda x: x,
-        forward_metadata=types.SimpleNamespace(mamba_cache_indices=slots),
-        req_to_token_pool=req_pool,
         state_pool=state_pool,
         token_to_kv_pool=types.SimpleNamespace(layer_router=layer_router),
         accept_lens_pool=None,
@@ -184,6 +178,8 @@ def _commit(pool, last, track_idx, track_steps, req_pool_indices=None, sel=ALL_R
         mamba_steps_to_track=track_steps,
         model=None,
         req_pool_indices=req_pool_indices,
+        # The slots the verify forward resolved; track_idx is already physical.
+        state_slots=ForwardStateSlots(slots, track_idx),
     )
 
 
@@ -411,6 +407,55 @@ class TestGdnLosslessVerify(CustomTestCase):
     def test_rejects_tree_verify(self):
         with self.assertRaises(ValueError):
             _pool(True, 4, 16, 32, torch.float32, topk=2)
+
+
+class TestLosslessVerifyDefault(CustomTestCase):
+    """The tuple verify is on wherever it is supported and off everywhere else."""
+
+    @staticmethod
+    def _enabled(*, gdn=True, spec=True, ragged="static", platform=None, **fields):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        fake = types.SimpleNamespace(
+            hybrid_gdn_config=object() if gdn else None,
+            spec_algorithm=types.SimpleNamespace(is_none=lambda: not spec),
+        )
+        args = dict(speculative_eagle_topk=1, speculative_num_draft_tokens=4)
+        args.update(fields)
+        with (
+            rc.get_context().override_server_args(**args),
+            rc.override_platform(**(platform or dict(is_cuda=True, is_hip=False))),
+            envs.SGLANG_RAGGED_VERIFY_MODE.override(ragged),
+        ):
+            return KVCacheConfigurator._linear_lossless_verify_enabled(fake)
+
+    def test_on_for_linear_chain_triton_verify(self):
+        self.assertTrue(self._enabled())
+        self.assertTrue(self._enabled(platform=dict(is_cuda=False, is_hip=True)))
+        # An explicit Triton verify wins over a FlashInfer decode.
+        self.assertTrue(
+            self._enabled(
+                linear_attn_decode_backend="flashinfer",
+                linear_attn_verify_backend="triton",
+            )
+        )
+
+    def test_off_where_unsupported(self):
+        for name, kwargs in (
+            ("no speculative decoding", dict(spec=False)),
+            ("not GDN", dict(gdn=False)),
+            ("other platform", dict(platform=dict(is_cuda=False, is_hip=False))),
+            ("tree verify", dict(speculative_eagle_topk=4)),
+            ("replayssm", dict(enable_linear_replayssm=True)),
+            ("replayssm spec", dict(enable_linear_replayssm_spec=True)),
+            ("flashinfer decode", dict(linear_attn_decode_backend="flashinfer")),
+            ("flashinfer verify", dict(linear_attn_verify_backend="flashinfer")),
+            ("unified memory", dict(enable_unified_memory=True)),
+            ("ragged verify", dict(ragged="compact")),
+        ):
+            with self.subTest(name):
+                self.assertFalse(self._enabled(**kwargs))
 
 
 if __name__ == "__main__":

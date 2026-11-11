@@ -238,9 +238,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_GDC: tl.constexpr = False,
     MATCH_CUTEDSL_DECODE: tl.constexpr = False,
     ROUND_STATE_TO_BF16: tl.constexpr = False,
-    # Lossless verify (--enable-linear-lossless-verify): cache per-position corrected
-    # values u (=beta*(v - k^T h)), the l2-normed k and the decay g instead of
-    # full [K,V] states. Per-layer shapes [slots, cache_steps, HV, {V,K,-}] (no
+    # Lossless GDN tuple verify: cache per-position corrected values
+    # u (=beta*(v - k^T h)), the l2-normed k and the decay g instead of full
+    # [K,V] states. Per-layer shapes [slots, cache_steps, HV, {V,K,-}] (no
     # K x V product -> ~K x smaller). S_accept is replayed post-accept.
     u_states_buffer=None,
     k_states_buffer=None,

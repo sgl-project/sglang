@@ -164,8 +164,8 @@ def check_linear_lossless_verify(
     """Reject configurations the lossless GDN tuple verify cannot serve.
 
     The replay applies the accepted steps of one linear draft chain with the
-    GDN scalar gate. Server-arg validation already enforces this; the pool
-    re-checks so a direct construction cannot silently fall back.
+    GDN scalar gate. KVCacheConfigurator only enables it where this holds;
+    the pool re-checks so a direct construction cannot silently fall back.
     """
     if speculative_eagle_topk != 1:
         raise ValueError(
@@ -656,7 +656,7 @@ class MambaPool:
         # full-state snapshots are never produced or consumed.
         intermediate_ssm: Optional[torch.Tensor]
         intermediate_conv_window: List[torch.Tensor]
-        # Lossless GDN tuple ring (--enable-linear-lossless-verify); None
+        # Lossless GDN tuple ring (enable_linear_lossless_verify); None
         # otherwise. fp32 whatever the state dtype, so the replay sees exactly
         # the values the verify kernel computed.
         #   intermediate_ssm_u: [num_layers, spec_slots, D, HV, V]
@@ -987,11 +987,11 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                # Lossless GDN tuple verify (--enable-linear-lossless-verify):
+                # Lossless GDN tuple verify (enable_linear_lossless_verify):
                 # keep each draft step's (u, k, g) tuple instead of a full
                 # [HV, V, K] snapshot -- ~K x smaller -- and replay the accepted
                 # state at commit. The replay is a linear chain, so this requires
-                # speculative_eagle_topk == 1 (checked here and in server args).
+                # speculative_eagle_topk == 1 (checked here and by the caller).
                 # The tuples stand in for the snapshots, so allocate_intermediate_ssm
                 # gates them too.
                 lossless_verify = (
