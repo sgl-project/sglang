@@ -10,9 +10,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Nemotron Shortcut: the hybrid text stack.
+"""Nemotron Shortcut: the GDP / SDSA hybrid text stack and the Pixtral vision tower.
 
-Not served yet: the Pixtral vision tower, the MTP head, the top-k sparse
+Not served yet: the MTP head, the top-k sparse
 attention indexer (attention is dense, exact for contexts <= index_topk) and
 TP/EP > 1.
 """
@@ -20,8 +20,9 @@ TP/EP > 1.
 from __future__ import annotations
 
 import logging
+from array import array
 from collections.abc import Iterable
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -55,8 +56,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.mm_utils import general_mm_embed_routine, pad_mm_tokens
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.nemotron_shortcut_vision import (
+    NemotronShortcutMultiModalProjector,
+    nemotron_shortcut_image_features,
+)
+from sglang.srt.models.pixtral import PixtralHFVisionModel
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -570,6 +578,9 @@ class NemotronShortcutTextModel(nn.Module):
         self.residual_readout = NemotronShortcutWideResidualRead(config)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def get_input_embeddings(self) -> VocabParallelEmbedding:
+        return self.embed_tokens
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -585,13 +596,24 @@ class NemotronShortcutTextModel(nn.Module):
 
 
 class NemotronShortcutModel(nn.Module):
-    """Mirrors the checkpoint's `model.language_model` nesting."""
+    """Mirrors the checkpoint's `model.{language_model,vision_tower,
+    multi_modal_projector}` nesting; vision_config None builds the text stack only."""
 
-    def __init__(self, config, quant_config, prefix):
+    def __init__(self, text_config, quant_config, prefix, vision_parent_config=None):
         super().__init__()
         self.language_model = NemotronShortcutTextModel(
-            config, quant_config, prefix=add_prefix("language_model", prefix)
+            text_config, quant_config, prefix=add_prefix("language_model", prefix)
         )
+        if vision_parent_config is not None:
+            # The vision tower and projector are unquantized in the checkpoint.
+            self.vision_tower = PixtralHFVisionModel(
+                vision_parent_config.vision_config,
+                None,
+                prefix=add_prefix("vision_tower", prefix),
+            )
+            self.multi_modal_projector = NemotronShortcutMultiModalProjector(
+                vision_parent_config
+            )
 
 
 class NemotronShortcutForConditionalGeneration(nn.Module):
@@ -614,8 +636,12 @@ class NemotronShortcutForConditionalGeneration(nn.Module):
         self.config = config
         self.text_config = text_config
         self.quant_config = quant_config
+        self.has_vision = not config.language_model_only
         self.model = NemotronShortcutModel(
-            text_config, quant_config, prefix=add_prefix("model", prefix)
+            text_config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            vision_parent_config=config if self.has_vision else None,
         )
         self.lm_head = ParallelLMHead(
             text_config.vocab_size,
@@ -634,6 +660,16 @@ class NemotronShortcutForConditionalGeneration(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.language_model.embed_tokens
 
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        return nemotron_shortcut_image_features(
+            vision_tower=self.model.vision_tower,
+            projector=self.model.multi_modal_projector,
+            items=items,
+        )
+
     @torch.no_grad()
     def forward(
         self,
@@ -643,18 +679,27 @@ class NemotronShortcutForConditionalGeneration(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        hidden_states = self.model.language_model(
-            input_ids, forward_batch, input_embeds
-        )
+        if self.has_vision and input_embeds is None:
+            hidden_states = general_mm_embed_routine(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self.model.language_model,
+                multimodal_model=self,
+            )
+        else:
+            hidden_states = self.model.language_model(
+                input_ids, forward_batch, input_embeds
+            )
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    @staticmethod
-    def _skip_weight(name: str) -> bool:
+    def _skip_weight(self, name: str) -> bool:
+        is_vision = name.startswith(
+            ("model.vision_tower.", "model.multi_modal_projector.")
+        )
         return (
-            name.startswith("model.vision_tower.")
-            or name.startswith("model.multi_modal_projector.")
+            (is_vision and not self.has_vision)
             or ".mtp." in name
             # NVFP4 KV-cache scales; the KV cache is served unquantized.
             or name.endswith(".k_scale")
@@ -676,8 +721,14 @@ class NemotronShortcutForConditionalGeneration(nn.Module):
         )
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
+        vision_tower_weights = []
         for name, loaded_weight in weights:
             if self._skip_weight(name):
+                continue
+            if name.startswith("model.vision_tower."):
+                vision_tower_weights.append(
+                    (name.removeprefix("model.vision_tower."), loaded_weight)
+                )
                 continue
             if ".self_attn." in name and ".indexer." not in name:
                 for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -716,6 +767,11 @@ class NemotronShortcutForConditionalGeneration(nn.Module):
                 continue
             self._load_plain(params_dict, name, loaded_weight, loaded)
 
+        if vision_tower_weights:
+            self.model.vision_tower.load_weights(vision_tower_weights)
+            loaded.update(
+                name for name in params_dict if name.startswith("model.vision_tower.")
+            )
         missing = sorted(set(params_dict) - loaded)
         if missing:
             logger.warning(

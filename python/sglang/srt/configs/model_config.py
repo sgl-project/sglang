@@ -2633,6 +2633,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 
 multimodal_model_archs = [
     "CLIPModel",
+    "Nemotron4ForConditionalGeneration",
     "Cohere2VisionForConditionalGeneration",
     "Cosmos3EdgeForConditionalGeneration",
     "DeepseekVL2ForCausalLM",
