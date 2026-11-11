@@ -32,7 +32,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
-from sglang.kernels.ops.attention.flydsl_ptr import create_llvm_ptr, extract_base_index
+from sglang.kernels.jit.utils.flydsl_ptr import create_llvm_ptr, extract_base_index
 
 QL = 8
 GQA = 8
