@@ -503,6 +503,37 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
         self.assertCountEqual(self._event_hashes(restored_gpu), stored_hashes)
         self.assertEqual(restored_gpu[0].session_id, "session-a")
 
+    def test_storage_backup_reannounces_device_hashes_on_storage_tier(self):
+        """A whole L3 backup announces the node's blocks as EXTERNAL with the
+        hashes of its GPU store, on both tree cores, so an indexer merges the
+        tiers; a span the node does not cover (split since) announces nothing."""
+        seq = [1, 2, 3, 4]
+        for backend in ("python", "rust"):
+            with self.subTest(tree_core_backend=backend):
+                cache, allocator, _ = build_fixture(
+                    self.cfg, enable_kv_cache_events=True, tree_core_backend=backend
+                )
+                cache.take_events()
+                self._insert(cache, allocator, seq)
+                device_hashes = self._event_hashes(
+                    self._stored_events(cache, StorageMedium.GPU)
+                )
+                node = self._leaf_for(cache, seq)
+
+                self.assertFalse(
+                    cache.tree_core.record_storage_backup_event(node, backed_tokens=2)
+                )
+                self.assertEqual(cache.take_events(), [])
+
+                self.assertTrue(
+                    cache.tree_core.record_storage_backup_event(
+                        node, backed_tokens=len(seq)
+                    )
+                )
+                stored = self._stored_events(cache, StorageMedium.EXTERNAL)
+                self.assertEqual(self._event_hashes(stored), device_hashes)
+                self.assertIsNone(stored[0].parent_block_hash)
+
 
 if __name__ == "__main__":
     unittest.main()

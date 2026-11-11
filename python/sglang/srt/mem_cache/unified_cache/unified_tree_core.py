@@ -2868,6 +2868,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 comp_xfers[comp.component_type] = t
         return device_value, comp_xfers
 
+    def record_storage_backup_event(self, node_id: NodeId, backed_tokens: int) -> bool:
+        node = self.node_by_id(node_id)
+        pages = -(-len(node.key) // self.page_size)
+        if pages * self.page_size != backed_tokens:
+            return False
+        self.kv_events.record_store(node, medium=StorageMedium.EXTERNAL)
+        return True
+
     def build_storage_backup_spec(
         self, node_id: NodeId, pass_prefix_keys: bool
     ) -> Optional[StorageBackupSpec]:
