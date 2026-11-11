@@ -1510,29 +1510,16 @@ class KVCacheConfigurator:
             return 2 * max_running_requests
         return max_running_requests
 
-    def _req_pool_pre_alloc_size(self) -> Optional[int]:
-        """Pre-alloc rows of a PD decode req pool (0 for any other pool)."""
-        disagg = get_disagg()
-        # A flip-capable prefill needs the decode pool shape, and the extra-slot
-        # default is only computed for a decode launch.
-        if disagg.enable_pd_role_switch:
-            return disagg.disaggregation_decode_extra_slots or 0
-        if disagg.disaggregation_mode == "decode":
-            return disagg.disaggregation_decode_extra_slots
-        return 0
-
-    def _req_to_token_rows(self, max_running_requests: int) -> int:
-        """req_to_token rows of the pool built for max_running_requests: the
-        request rows, the PD pre-alloc rows and the padding row."""
-        pre_alloc_size = self._req_pool_pre_alloc_size() or 0
-        return self._req_pool_rows(max_running_requests) + pre_alloc_size + 1
-
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
         extra_max_context_len = get_req_to_token_extra_context_len()
 
         disagg = get_disagg()
         if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
-            pre_alloc_size = self._req_pool_pre_alloc_size()
+            # A flip-capable prefill needs the decode pool shape, and the extra-slot
+            # default is only computed for a decode launch.
+            pre_alloc_size = disagg.disaggregation_decode_extra_slots
+            if disagg.enable_pd_role_switch:
+                pre_alloc_size = pre_alloc_size or 0
             if self.mambaish_config:
                 return self._build_hybrid_mamba_decode_req_pool(
                     max_num_reqs=max_num_reqs,
@@ -2767,16 +2754,18 @@ class KVCacheConfigurator:
         from sglang.srt.speculative.dflash_draft_ring import (
             draft_kv_ring_pool_rows,
             draft_kv_ring_rows_per_req,
-            draft_kv_ring_window_left,
+        )
+        from sglang.srt.speculative.dflash_utils import (
+            get_dflash_attention_sliding_window_size,
         )
 
         rows_per_req = draft_kv_ring_rows_per_req(
-            window_left=draft_kv_ring_window_left(draft_hf_config),
+            window_left=get_dflash_attention_sliding_window_size(draft_hf_config),
             block_size=int(get_spec().speculative_num_draft_tokens),
             dcp_size=get_parallel().attn_dcp_size,
         )
         return draft_kv_ring_pool_rows(
-            req_pool_rows=req_to_token_rows,
+            req_to_token_rows=req_to_token_rows,
             rows_per_req=rows_per_req,
             page_size=page_size,
         )
@@ -2794,7 +2783,8 @@ class KVCacheConfigurator:
         page_size = get_schedule().page_size * self.dflash_draft_loc_space_scale
         rows = self._dflash_draft_kv_ring_rows(
             draft_hf_config=draft_model_config.hf_config,
-            req_to_token_rows=self._req_to_token_rows(max_num_reqs),
+            # The ring is off under PD, so the table is the request rows plus padding.
+            req_to_token_rows=self._req_pool_rows(max_num_reqs) + 1,
             page_size=page_size,
         )
         ring_bytes = (rows + page_size) * int(cell_size)

@@ -22,6 +22,7 @@ Under PD disaggregation prefill sends a request's last window of ring rows
 ``min_pos`` row; a decode rank keeps the positions it owns.
 """
 
+import weakref
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -80,22 +81,6 @@ def draft_kv_ring_unsupported_reason(
     return None
 
 
-def draft_kv_ring_window_left(draft_hf_config) -> int:
-    """The draft's sliding window (window_left); a ring needs every layer to slide."""
-    from sglang.srt.speculative.dflash_utils import (
-        get_dflash_attention_sliding_window_size,
-        get_dflash_layer_types,
-    )
-
-    layer_types = get_dflash_layer_types(draft_hf_config)
-    if not layer_types or any(t != "sliding_attention" for t in layer_types):
-        raise ValueError(
-            "A DFLASH draft KV ring needs a draft whose every layer is "
-            f"sliding_attention; got layer_types={layer_types}."
-        )
-    return get_dflash_attention_sliding_window_size(draft_hf_config)
-
-
 def draft_kv_ring_rows_per_req(
     *, window_left: int, block_size: int, dcp_size: int
 ) -> int:
@@ -106,9 +91,9 @@ def draft_kv_ring_rows_per_req(
 
 
 def draft_kv_ring_pool_rows(
-    *, req_pool_rows: int, rows_per_req: int, page_size: int
+    *, req_to_token_rows: int, rows_per_req: int, page_size: int
 ) -> int:
-    rows = 1 + req_pool_rows * rows_per_req
+    rows = 1 + req_to_token_rows * rows_per_req
     return -(-rows // page_size) * page_size
 
 
@@ -128,7 +113,7 @@ class DFlashDraftKVRing:
         *,
         rows_per_req: int,
         dcp_size: int,
-        req_pool_rows: int,
+        req_to_token_rows: int,
         device: torch.device,
         window_left: int = 0,
         dcp_rank: int = 0,
@@ -145,8 +130,10 @@ class DFlashDraftKVRing:
         # PD writes min_pos rows remotely; Mooncake's NVLink transport only
         # reaches memory from the KV pools' cuMemCreate pool.
         with torch.cuda.use_mem_pool(mem_pool) if mem_pool else nullcontext():
-            self.min_pos = torch.zeros(req_pool_rows, dtype=torch.int32, device=device)
-        self._floor_rids: Dict[int, str] = {}
+            self.min_pos = torch.zeros(
+                req_to_token_rows, dtype=torch.int32, device=device
+            )
+        self._floor_owners: Dict[int, weakref.ref] = {}
 
     def locs(
         self, req_pool_indices: torch.Tensor, positions: torch.Tensor
@@ -201,8 +188,9 @@ class DFlashDraftKVRing:
         slots, floors = [], []
         for req, prefix_len in zip(reqs, prefix_lens):
             slot = req.kv.req_pool_idx
-            if self._floor_rids.get(slot) != req.rid:
-                self._floor_rids[slot] = req.rid
+            owner = self._floor_owners.get(slot)
+            if owner is None or owner() is not req:
+                self._floor_owners[slot] = weakref.ref(req)
                 slots.append(slot)
                 floors.append(int(prefix_len))
         if slots:

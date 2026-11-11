@@ -1,6 +1,3 @@
-"""dflash_ring_block_locs: a draft block's KV ring locs in one launch, bitwise
-equal to DFlashDraftKVRing.locs on the repeated request indices."""
-
 import sys
 
 import pytest
@@ -25,7 +22,7 @@ def test_block_locs_match_ring_locs(dcp):
             window_left=1023, block_size=BLOCK, dcp_size=dcp
         ),
         dcp_size=dcp,
-        req_pool_rows=9,
+        req_to_token_rows=9,
         device="cuda",
     )
     req_pool_indices = torch.tensor([3, 7, 1, 8], dtype=torch.int32, device="cuda")

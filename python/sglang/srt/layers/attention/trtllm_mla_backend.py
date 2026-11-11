@@ -1470,9 +1470,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             dcp_size=parallel.attn_dcp_size,
             dcp_rank=parallel.attn_dcp_rank,
             page_size=self.page_size,
-            v2p=None if ring else self.runner_ids.full_v2p_table,
-            ring_rows_per_req=ring.rows_per_req if ring else 0,
-            min_pos=ring.min_pos if ring else None,
+            v2p=None if ring is not None else self.runner_ids.full_v2p_table,
+            ring_rows_per_req=ring.rows_per_req if ring is not None else 0,
+            min_pos=ring.min_pos if ring is not None else None,
         )
         self._window_index_cache = (id(forward_batch), layer.layer_id, indices, counts)
         return indices, counts

@@ -1,11 +1,3 @@
-"""DFLASH draft KV ring: its row layout and its resolution.
-
-The ring is resolved once at startup into speculative_dflash_draft_kv_ring:
-on by default for an all-sliding MLA draft on trtllm_mla / cutedsl_mla,
-colocated or PD over Mooncake; off (with a log line) where it is not served;
-and an explicit SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1 there is an error.
-"""
-
 import contextlib
 import unittest
 from types import SimpleNamespace
@@ -39,7 +31,6 @@ SWA_MLA_DRAFT = {
 
 @contextlib.contextmanager
 def _switch(value=None):
-    """The ring switch at ``value``, or unset (the default) for None."""
     with SWITCH.override(True if value is None else value):
         if value is None:
             SWITCH.clear()
@@ -149,13 +140,13 @@ WINDOW_LEFT = 1023
 BLOCK = 8
 
 
-def _ring(dcp, req_pool_rows=4, dcp_rank=0, pool=None):
+def _ring(dcp, req_to_token_rows=4, dcp_rank=0, pool=None):
     return DFlashDraftKVRing(
         rows_per_req=draft_kv_ring_rows_per_req(
             window_left=WINDOW_LEFT, block_size=BLOCK, dcp_size=dcp
         ),
         dcp_size=dcp,
-        req_pool_rows=req_pool_rows,
+        req_to_token_rows=req_to_token_rows,
         device="cpu",
         window_left=WINDOW_LEFT,
         dcp_rank=dcp_rank,
@@ -195,6 +186,20 @@ class TestDraftKVRingLayout(CustomTestCase):
         self.assertEqual(first[kept].unique().numel(), ring.span)
         self.assertTrue(bool((second != 0).all()))
 
+    def test_a_new_request_with_a_reused_rid_resets_the_floor(self):
+        class Req:
+            def __init__(self):
+                self.rid = "same"
+                self.kv = SimpleNamespace(req_pool_idx=2)
+
+        ring = _ring(1)
+        first = Req()
+        ring.record_floors([first], [100])
+        ring.record_floors([first], [3000])
+        self.assertEqual(int(ring.min_pos[2]), 100)
+        ring.record_floors([Req()], [5])
+        self.assertEqual(int(ring.min_pos[2]), 5)
+
 
 class TestDraftKVRingPDTransfer(CustomTestCase):
     """Prefill and decode build position-matched ``transfer_rows`` for their own
@@ -206,8 +211,8 @@ class TestDraftKVRingPDTransfer(CustomTestCase):
         received = {}
         for rank in range(decode_dcp):
             src_rank = rank if prefill_dcp == decode_dcp else 0
-            prefill = _ring(prefill_dcp, req_pool_rows=8, dcp_rank=src_rank)
-            decode = _ring(decode_dcp, req_pool_rows=8, dcp_rank=rank)
+            prefill = _ring(prefill_dcp, req_to_token_rows=8, dcp_rank=src_rank)
+            decode = _ring(decode_dcp, req_to_token_rows=8, dcp_rank=rank)
             src, dst = draft_ring_row_pairs(
                 prefill.transfer_rows(3, seq_len).tolist(),
                 decode.transfer_rows(5, seq_len).tolist(),
