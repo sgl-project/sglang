@@ -1232,129 +1232,70 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             out.append(layer_chunks)
         return out
 
-    # KV cache: [layer_num, num_pages, page_size, 1, kv_lora_rank]
-    def _get_kv_cache_layer_buffers(self, local_layer_id):
+    def _get_cpu_offload_layer_buffers(self, local_layer_id):
         # flatten(page, slot) also works for the zero-width packed V placeholder.
         buffers = [
             self.k_buffer[local_layer_id].flatten(0, 1),
             self.v_buffer[local_layer_id].flatten(0, 1),
         ]
-        if self.dsa_kv_cache_store_fp8:
-            # Copy FP8 records as opaque bytes without decoding/requantizing.
-            buffers = [
-                buf.view(torch.uint8) if buf.dtype == torch.float8_e4m3fn else buf
-                for buf in buffers
-            ]
-        return buffers
-
-    def _get_kv_cache_cpu_copy(self, indices):
-        buf_of_layers = [
-            self._get_kv_cache_layer_buffers(i) for i in range(self.layer_num)
-        ]
-        return self._chunk_copy_npu_to_cpu(
-            buf_of_layers,
-            indices,
-            [[self.is_draft_worker] * 2 for _ in buf_of_layers],
-        )
-
-    def _load_kv_cache_cpu_copy(self, kv_cpu, indices):
-        chunk_size = self.cpu_offloading_chunk_size
-        for local_layer_id in range(self.layer_num):
-            buffers = self._get_kv_cache_layer_buffers(local_layer_id)
-            for i in range(0, len(indices), chunk_size):
-                chunk_indices = indices[i : i + chunk_size]
-                chunk = kv_cpu[local_layer_id][i // chunk_size]
-                for buffer, cpu in zip(buffers, chunk, strict=True):
-                    rows = self._copy_indices_for_buffer(
-                        chunk_indices, self.is_draft_worker
-                    )
-                    assert cpu.shape[0] == len(rows)
-                    buffer[rows] = cpu.to(buffer.device, non_blocking=True)
-
-    # Index cache: [layer_num, num_index_pages, index_page_size, 1, index_head_dim]
-    def _get_index_cache_layer_buffers(self, local_layer_id):
         slot = self.indexer_layer_id_to_slot.get(local_layer_id + self.start_layer)
-        if slot is None:
-            return []
-        buffers = [self.index_k_buffer[slot].flatten(0, 1)]
-        if self.index_k_scale_buffer is not None:
-            buffers.append(self.index_k_scale_buffer[slot].flatten(0, 1))
+        if slot is not None:
+            buffers.append(self.index_k_buffer[slot].flatten(0, 1))
+            if self.index_k_scale_buffer is not None:
+                buffers.append(self.index_k_scale_buffer[slot].flatten(0, 1))
         if self.dsa_kv_cache_store_fp8:
+            # Retraction copies opaque records; byte views also avoid FP8
+            # advanced-indexing restrictions, without decoding/requantizing.
             buffers = [
                 buf.view(torch.uint8) if buf.dtype == torch.float8_e4m3fn else buf
                 for buf in buffers
             ]
         return buffers
-
-    def _get_index_cache_cpu_copy(self, indices):
-        # only 1/index_kpool of indices are used
-        index_rows = torch.unique_consecutive(indices // self.index_kpool)
-        chunk_size = self.cpu_offloading_chunk_size
-        index_cpu = []
-        for local_layer_id in range(self.layer_num):
-            index_cpu.append([])
-            buffers = self._get_index_cache_layer_buffers(local_layer_id)
-            if not buffers:
-                continue
-            for i in range(0, len(index_rows), chunk_size):
-                rows = index_rows[i : i + chunk_size]
-                index_cpu[-1].append(
-                    [buf[rows].to("cpu", non_blocking=True) for buf in buffers]
-                )
-        return index_cpu
-
-    def _load_index_cache_cpu_copy(self, index_cpu, indices):
-        index_rows = torch.unique_consecutive(indices // self.index_kpool)
-        chunk_size = self.cpu_offloading_chunk_size
-        for local_layer_id in range(self.layer_num):
-            buffers = self._get_index_cache_layer_buffers(local_layer_id)
-            if not buffers:
-                continue
-            for i in range(0, len(index_rows), chunk_size):
-                rows = index_rows[i : i + chunk_size]
-                chunk = index_cpu[local_layer_id][i // chunk_size]
-                for buf, saved in zip(buffers, chunk, strict=True):
-                    assert saved.shape[0] == len(rows)
-                    buf[rows] = saved.to(buf.device)
-
-    # Tail: list[Tensor[tail_slots, index_head_dim]]
-    def _kpool_tail_rows(self, req_pool_index):
-        return [
-            buf[req_pool_index] if buf.shape[0] else None
-            for group in (self._compress_tail_k, self._compress_tail_score)
-            for buf in group
-        ]
-
-    def _get_tail_cpu_copy(self, req_pool_index):
-        return [
-            row.to("cpu").clone() if row is not None else None
-            for row in self._kpool_tail_rows(req_pool_index)
-        ]
-
-    def _load_tail_cpu_copy(self, tail_cpu, req_pool_index):
-        for buf, saved in zip(
-            self._kpool_tail_rows(req_pool_index), tail_cpu, strict=True
-        ):
-            if saved is not None:
-                buf.copy_(saved.to(buf.device))
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         torch.npu.synchronize()
-        snapshot = {
-            "kv": self._get_kv_cache_cpu_copy(indices),
-            "index": self._get_index_cache_cpu_copy(indices),
-        }
-        if self.kpool_use_compress:
-            snapshot["tail"] = self._get_tail_cpu_copy(req_pool_index)
+        buf_of_layers = [
+            self._get_cpu_offload_layer_buffers(i) for i in range(self.layer_num)
+        ]
+        uses_global_slots_per_layer = []
+        for buffers in buf_of_layers:
+            # MLA K/V is rank-local under DCP. The replicated
+            # indexer buffers retain allocator-global slot identities.
+            uses_global_slots_per_layer.append(
+                [self.is_draft_worker, self.is_draft_worker]
+                + [True] * (len(buffers) - 2)
+            )
+
+        kv_cache_cpu = self._chunk_copy_npu_to_cpu(
+            buf_of_layers, indices, uses_global_slots_per_layer
+        )
         torch.npu.synchronize()
-        return snapshot
+        return kv_cache_cpu
 
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         torch.npu.synchronize()
-        self._load_kv_cache_cpu_copy(kv_cache_cpu["kv"], indices)
-        self._load_index_cache_cpu_copy(kv_cache_cpu["index"], indices)
-        if self.kpool_use_compress:
-            self._load_tail_cpu_copy(kv_cache_cpu["tail"], req_pool_index)
+        chunk_size = self.cpu_offloading_chunk_size
+        for local_layer_id in range(self.layer_num):
+            buffers = self._get_cpu_offload_layer_buffers(local_layer_id)
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                chunk = kv_cache_cpu[local_layer_id][i // chunk_size]
+                cpu_index = 0
+                for buffer, uses_global_slots in zip(
+                    buffers,
+                    [self.is_draft_worker, self.is_draft_worker]
+                    + [True] * (len(buffers) - 2),
+                    strict=True,
+                ):
+                    if buffer is None:
+                        continue
+                    cpu = chunk[cpu_index]
+                    cpu_index += 1
+                    target_indices = self._copy_indices_for_buffer(
+                        chunk_indices, uses_global_slots
+                    )
+                    assert cpu.shape[0] == len(target_indices)
+                    buffer[target_indices] = cpu.to(buffer.device, non_blocking=True)
         torch.npu.synchronize()

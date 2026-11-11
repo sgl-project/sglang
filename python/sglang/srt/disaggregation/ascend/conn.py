@@ -124,6 +124,23 @@ class AscendKVManager(MooncakeKVManager):
             disaggregation_mode=self.disaggregation_mode,
         )
 
+    def register_buffer_to_engine(self):
+        # MemFabric aligns registered buffers to 2 MiB. Register everything in
+        # one batch so overlapping aligned ranges from small tensors are merged
+        # before they are published to the peer.
+        ptrs = list(self.kv_args.kv_data_ptrs)
+        lens = list(self.kv_args.kv_data_lens)
+        ptrs.extend(self.kv_args.aux_data_ptrs)
+        lens.extend(self.kv_args.aux_data_lens)
+        for component_ptrs, component_lens in zip(
+            self.kv_args.state_data_ptrs or [],
+            self.kv_args.state_data_lens or [],
+        ):
+            ptrs.extend(component_ptrs)
+            lens.extend(component_lens)
+        if ptrs:
+            self.engine.batch_register(ptrs, lens)
+
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self._is_npu_dsa_layout() and self.dcp_size != dst_dcp_size:
             if self.dcp_size == 1 and dst_dcp_size > 1:
@@ -216,6 +233,8 @@ class AscendKVManager(MooncakeKVManager):
 
         # src_kv_ptrs: k_data, v_data, index_k_data(optional)
         # dst_kv_ptrs: k_data, v_data, index_k_data(optional)
+        # state_type is accepted for parity with the common disaggregation path;
+        # the NPU kv_buf_groups slicing below is state-type agnostic.
         kv_buf_groups = getattr(self.kv_args, "kv_buf_groups", 1)
         hidden_kv_layers = getattr(self.kv_args, "hidden_kv_layers", 0)
         draft_kv_layers = getattr(self.kv_args, "draft_kv_layers", 0)
