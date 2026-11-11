@@ -2629,19 +2629,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.fp4_index_k
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            # FP4 index-K prefill: FP4 queries and the bf16 head gate the FP4 kernel reads
-            assert not isinstance(x, tuple) or len(x) == 3, "the gate needs bf16 input"
-            query, key, _ = self._get_q_k_bf16(
-                q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
-            )
-            self._store_index_k_cache(
-                forward_batch=forward_batch,
-                layer_id=layer_id,
-                key=key,
-                act_quant=act_quant,
-            )
-            q_fp8, weights = fp4_index_hip.indexer_q_fp4_head_gate(
-                query, self._project_head_gates(x), 1.0, torch.bfloat16
+            q_fp8, weights = dsa_indexer_hip.fp4_prefill(
+                self,
+                x,
+                q_lora,
+                positions,
+                enable_dual_stream,
+                forward_batch,
+                layer_id,
+                act_quant,
             )
         elif enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
             current_stream = torch.cuda.current_stream()

@@ -155,14 +155,9 @@ def pcg_dsa_indexer_prefill_split(
     from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 
     if indexer.fp4_index_k:
-        from sglang.kernels.ops.attention.dsa.fp4_index_hip import (
-            indexer_q_fp4_head_gate,
-        )
+        from sglang.srt.layers.attention.dsa import dsa_indexer_hip
 
-        # FP4 queries and the bf16 head gate the FP4 prefill kernel reads
-        q_fp8, weights = indexer_q_fp4_head_gate(
-            query, indexer._project_head_gates(x), 1.0, torch.bfloat16
-        )
+        q_fp8, weights = dsa_indexer_hip.fp4_prefill_q(indexer, query, x)
     elif (
         _is_cuda
         and indexer.bf16_head_gate

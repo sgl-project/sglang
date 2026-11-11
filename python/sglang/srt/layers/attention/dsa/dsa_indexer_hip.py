@@ -436,3 +436,37 @@ def fp4_logits_plans(metadata) -> Optional[dict]:
     if torch.cuda.is_current_stream_capturing() or is_in_breakable_cuda_graph():
         return None
     return getattr(metadata.attn_metadata, "fp4_logits_plans", None)
+
+
+def fp4_prefill_q(indexer, query: torch.Tensor, x):
+    """FP4 queries and the bf16 head gate the FP4 prefill logits read."""
+    from sglang.kernels.ops.attention.dsa import fp4_index_hip
+
+    return fp4_index_hip.indexer_q_fp4_head_gate(
+        query, indexer._project_head_gates(x), 1.0, torch.bfloat16
+    )
+
+
+def fp4_prefill(
+    indexer,
+    x,
+    q_lora: torch.Tensor,
+    positions: torch.Tensor,
+    enable_dual_stream: bool,
+    forward_batch,
+    layer_id: int,
+    act_quant,
+):
+    """FP4 index-K prefill outside the graph split op: store the keys, return
+    fp4_prefill_q's queries and gate."""
+    assert not isinstance(x, tuple) or len(x) == 3, "the gate needs bf16 input"
+    query, key, _ = indexer._get_q_k_bf16(
+        q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
+    )
+    indexer._store_index_k_cache(
+        forward_batch=forward_batch,
+        layer_id=layer_id,
+        key=key,
+        act_quant=act_quant,
+    )
+    return fp4_prefill_q(indexer, query, x)
