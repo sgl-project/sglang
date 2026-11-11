@@ -240,6 +240,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                         batches[:2] + [None] * idle_iterations + batches[2:] + [None]
                     )
                 scheduler = self.make_scheduler(schedule)
+                scheduler.running_reqs = [
+                    req for batch in batches for req in batch.reqs
+                ]
                 scheduler.scripted_scheduler_hook = None
                 scheduler.future_map = None
                 scheduler.result_queue = deque()
