@@ -25,7 +25,8 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils.common import ceil_div, log_info_on_rank0, print_info_once
+from sglang.srt.utils.common import ceil_div
+from sglang.srt.utils.log_utils import log_info_on_rank0, print_info_once
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch

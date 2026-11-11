@@ -15,7 +15,7 @@ import torch
 
 import sglang.srt.layers.moe.aiter_mega_moe_tp as mmtp
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils.common import print_info_once
+from sglang.srt.utils.log_utils import print_info_once
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -60,7 +60,7 @@ def test_only_an_eager_extend_forward_inside_the_window_takes_the_kernel(
     if compiled:
         # A logger call in maybe_forward would break this trace.
         took_kernel = torch.compile(took_kernel, backend="eager", fullgraph=True)
-    with caplog.at_level(logging.INFO, logger="sglang.srt.utils.common"):
+    with caplog.at_level(logging.INFO, logger="sglang.srt.utils.log_utils"):
         assert took_kernel(hidden) is takes_kernel
 
     # Routing and the kernel run only on the kernel path.
