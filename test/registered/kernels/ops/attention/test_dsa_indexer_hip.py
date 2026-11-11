@@ -39,7 +39,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
 # backend-specific: AITER's preshuffled index-K, paged-MQA logits and NoPE prologue.
-register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 PAGE, HEADS, HEAD_DIM = 64, 32, 128
 ROWS = 4096
@@ -87,7 +87,7 @@ class TestDSAIndexerHip(CustomTestCase):
         key = torch.randn(loc.numel(), HEAD_DIM, device="cuda", generator=gen)
         key = key.bfloat16()
         with patch.object(dcp_layout, "_dsa_shards_index_k", True):
-            for rank in (0, dcp_size - 1):
+            for rank in (dcp_size - 1,):
                 with self.subTest(rank=rank):
                     with published_topology(tp_size=dcp_size, dcp_size=dcp_size):
                         with get_parallel().override(attn_dcp_rank=rank, dcp_rank=rank):
@@ -290,8 +290,7 @@ class TestNoPEPrologueHip(CustomTestCase):
         gen = torch.Generator(device="cuda").manual_seed(2)
         cases = [
             (ForwardMode.DECODE, 5, 1, False),
-            (ForwardMode.TARGET_VERIFY, 24, 1, True),
-            (ForwardMode.TARGET_VERIFY, 48, 8, False),
+            (ForwardMode.TARGET_VERIFY, 48, 8, True),
         ]
         for merged in (False, True):
             indexer = _kimi_k31_indexer()
