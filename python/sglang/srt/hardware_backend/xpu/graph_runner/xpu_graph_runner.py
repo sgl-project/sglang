@@ -19,17 +19,15 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
-from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import register_xpu_device_properties_for_dynamo
 
-logger = logging.getLogger(__name__)
-
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+logger = logging.getLogger(__name__)
 
 _fake_ops_registered = False
 
@@ -116,16 +114,20 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
         torch._dynamo.config.suppress_errors = True
 
     def __init__(self, model_runner: ModelRunner):
-        assert not get_exec().features.enable_memory_saver, (
-            "XPUGraphRunner does not support Torch Memory Saver yet."
-        )
+        if get_exec().features.enable_memory_saver:
+            logger.info(
+                "XPUGraphRunner initialized with Torch Memory Saver enabled: "
+                "weights and KV cache memory saving is supported, but XPU graph "
+                "allocations themselves cannot be paused on Intel XPU."
+            )
         register_fake_ops()
         self._apply_xpu_compile_config()
         register_xpu_device_properties_for_dynamo()
         super().__init__(model_runner)
 
         assert not self.enable_two_batch_overlap, (
-            "XPUGraphRunner does not support two batch overlap yet."
+            "XPUGraphRunner does not support two batch overlap (TBO) yet "
+            "because TBO requires concurrent multi-stream graph capture."
         )
         assert not self.require_mlp_tp_gather, (
             "XPUGraphRunner does not support MLP TP gather yet."
@@ -136,27 +138,3 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
         assert not self.require_gathered_buffer, (
             "XPUGraphRunner does not support gathered buffer yet."
         )
-
-    def _init_profile_context_and_memory_record(self):
-        profile_context = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.XPU],
-            record_shapes=True,
-        )
-        torch.xpu.memory._record_memory_history()
-        return profile_context
-
-    def _post_process_after_profile(self, prof_context):
-        torch.xpu.memory._dump_snapshot("xpu_graph_runner_memory_usage.pickle")
-        torch.xpu.memory._record_memory_history(enabled=None)
-        log_message = (
-            "Sorted by XPU Time:\n"
-            + prof_context.key_averages(group_by_input_shape=True).table(
-                sort_by="self_xpu_time_total"
-            )
-            + "\n\nSorted by CPU Time:\n"
-            + prof_context.key_averages(group_by_input_shape=True).table(
-                sort_by="self_cpu_time_total"
-            )
-            + "\n\nMemory Usage is saved to xpu_graph_runner_memory_usage.pickle\n"
-        )
-        logger.info(log_message)

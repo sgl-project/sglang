@@ -10,7 +10,7 @@ Sequence parallelism splits long image or video latent sequences across GPUs. In
 - `--sp-degree`: total sequence parallel degree
 - `--ulysses-degree`: Ulysses parallel degree
 - `--ring-degree`: ring parallel degree
-- `--sp-attention-mode`: attention exchange used inside each SP group
+- `--kv-gather-degree`: K/V-gather parallel degree, an alternative to Ulysses and ring
 
 The degrees must satisfy:
 
@@ -18,12 +18,17 @@ The degrees must satisfy:
 sp_degree = ulysses_degree * ring_degree
 ```
 
-The default `--sp-attention-mode ulysses` uses all-to-all to redistribute
-sequence shards over attention heads. `--sp-attention-mode kv_gather` keeps
-queries sequence-sharded and all-gathers keys and values, then computes each
-rank's local output directly. The K/V-gather mode currently supports
-non-causal attention with `--ring-degree 1`. Varlen calls through the legacy
-`UlyssesAttention` adapter and video sparse attention are not supported.
+or `sp_degree = kv_gather_degree` for K/V gather.
+
+Ulysses uses all-to-all to redistribute sequence shards over attention heads.
+K/V gather keeps queries sequence-sharded and all-gathers keys and values, then
+computes each rank's local output directly. It supports non-causal attention
+only and does not compose with `--ulysses-degree` or `--ring-degree` yet.
+Varlen calls through the legacy `UlyssesAttention` adapter and video sparse
+attention are not supported. When no degree is set explicitly, `--sp-degree 2`
+picks K/V gather and larger SP degrees pick Ulysses; under that automatic
+choice, attention calls K/V gather cannot take fall back to the Ulysses
+exchange, while an explicit `--kv-gather-degree` fails instead.
 
 Use SP when sequence length or video shape makes the DiT forward pass the bottleneck and the model supports sequence sharding. For latency-oriented multi-GPU Qwen/Wan deployments, also compare against CFG parallelism and FSDP; SP is not automatically the best multi-GPU setting for every model.
 
@@ -38,7 +43,7 @@ Use SP when sequence length or video shape makes the DiT forward pass the bottle
   </colgroup>
   <thead>
     <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Exchange</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Communication</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Memory</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Constraints</th>
@@ -46,16 +51,16 @@ Use SP when sequence length or video shape makes the DiT forward pass the bottle
   </thead>
   <tbody>
     <tr>
-      <td style={{padding: "9px 12px"}}><code>ulysses</code></td>
+      <td style={{padding: "9px 12px"}}><code>--ulysses-degree</code></td>
       <td style={{padding: "9px 12px"}}>All-to-all before and after attention</td>
       <td style={{padding: "9px 12px"}}>Full sequence with a shard of the attention heads during attention</td>
       <td style={{padding: "9px 12px"}}>Attention head divisibility must match the Ulysses degree</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px"}}><code>kv_gather</code></td>
+      <td style={{padding: "9px 12px"}}><code>--kv-gather-degree</code></td>
       <td style={{padding: "9px 12px"}}>All-gather K and V; Q and output remain sequence-sharded</td>
       <td style={{padding: "9px 12px"}}>Replicates full K and V within the SP group</td>
-      <td style={{padding: "9px 12px"}}>Non-causal attention and <code>ring_degree=1</code>; no legacy varlen or video sparse attention</td>
+      <td style={{padding: "9px 12px"}}>Non-causal attention; no Ulysses or ring degree; no legacy varlen or video sparse attention</td>
     </tr>
   </tbody>
 </table>
@@ -76,8 +81,8 @@ scaling makes the interconnect and input shape part of the selection policy.
 
 ### Ulysses Sequence Parallelism
 
-The default mode needs only the total SP degree when ring parallelism is not
-used:
+Above SP degree 2, Ulysses is the default and needs only the total SP degree
+when ring parallelism is not used:
 
 ```bash
 sglang serve \
@@ -96,8 +101,7 @@ exchange explicitly:
 sglang serve \
   --model-path Qwen/Qwen-Image \
   --num-gpus 4 \
-  --sp-degree 4 \
-  --sp-attention-mode kv_gather \
+  --kv-gather-degree 4 \
   --port 8898
 ```
 
@@ -112,12 +116,11 @@ sglang serve \
   --model-path Qwen/Qwen-Image \
   --num-gpus 4 \
   --tp-size 2 \
-  --sp-degree 2 \
-  --sp-attention-mode kv_gather \
+  --kv-gather-degree 2 \
   --port 8898
 ```
 
-Omit `--sp-attention-mode kv_gather` to use TP plus Ulysses with the same
+Pass `--ulysses-degree 2` instead to use TP plus Ulysses with the same
 `tp=2, sp=2` topology.
 
 #### How TP Plus SP Works
@@ -174,14 +177,12 @@ sglang serve \
   --model-path Lightricks/LTX-2.3 \
   --num-gpus 2 \
   --use-fsdp-inference true \
-  --sp-degree 2 \
-  --sp-attention-mode kv_gather \
+  --kv-gather-degree 2 \
   --port 8898
 ```
 
 FSDP adds weight all-gather communication, so compare it with pure SP when
-both fit. K/V gather has the same non-causal and `ring_degree=1` constraints
-under FSDP.
+both fit. K/V gather keeps the same constraints under FSDP.
 
 ### Ring Sequence Parallelism
 

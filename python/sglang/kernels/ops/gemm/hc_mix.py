@@ -13,6 +13,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
+
 _FUSED_MIX_MAX_ROWS = 16
 
 
@@ -190,7 +192,7 @@ def fused_hc_mix(
     lowrank = w_down.shape[0]
     rows_pad = 16
     device = hyper_input_normed.device
-    num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
+    num_ctas = current_arch().num_sms
     t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
     out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
     if rows == 0:

@@ -36,13 +36,14 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NormQuantReadout,
 )
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
-from sglang.srt.utils.common import make_layers
+from sglang.srt.layers.utils.layer_list import make_layers
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def layer_stages(sparse=False):

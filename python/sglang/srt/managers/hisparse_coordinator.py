@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import logging
 import weakref
-from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 
@@ -39,12 +47,15 @@ else:
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    ReqList,
+    move,
+)
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
-)
-from sglang.srt.mem_cache.hisparse_memory_pool import (
-    HiSparseDSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
@@ -569,8 +580,8 @@ class HiSparseCoordinator:
             self.token_to_kv_pool_allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
         )
         self.is_m3_hisparse = isinstance(kvcache, MiniMaxSparseKVPool)
+        self.mem_pool_device = self.token_to_kv_pool_allocator.get_hisparse_kvcache()
         if self.is_dsv4_hisparse:
-            self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             page_size = self.mem_pool_device.page_size
             num_host_pages = (
                 self.token_to_kv_pool_allocator.size_full // self.compress_ratio
@@ -594,7 +605,6 @@ class HiSparseCoordinator:
                 self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
             )
             if self.is_m3_hisparse:
-                self.mem_pool_device = kvcache.main_pool
                 assert self.mem_pool_device.head_num == 1, (
                     "MiniMax M3 HiSparse requires one KV head per TP rank, "
                     f"got {self.mem_pool_device.head_num}. Increase the "
@@ -614,7 +624,6 @@ class HiSparseCoordinator:
                 )
                 self.item_size_bytes = self.mem_pool_device.bytes_per_token_k
             else:
-                self.mem_pool_device: HiSparseDSATokenToKVPool = kvcache
                 self.mem_pool_host = MLATokenToKVPoolHost(
                     buffer_info=self.mem_pool_device.get_device_pool_infos()[
                         0
@@ -665,7 +674,9 @@ class HiSparseCoordinator:
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
-        self.ack_staging_queue: List[HiSparseAct] = []
+        self.ack_staging_queue = IndexedReqList(
+            ListKind.HISPARSE_STAGING, req_of=lambda x: x.req
+        )
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
@@ -836,6 +847,7 @@ class HiSparseCoordinator:
         )
 
     def admit_request_into_staging(self, req: Req) -> None:
+        """Start the host copy of a prefilled request and move it into staging."""
         req.hisparse_staging = True
 
         full_kv_indices = self.req_to_token_pool.req_to_token[
@@ -873,7 +885,7 @@ class HiSparseCoordinator:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_staging_stream)
 
-        self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
+        move([HiSparseAct(start_event, finish_event, req)], self.ack_staging_queue)
 
     def admit_request_direct(self, req: Req) -> None:
         """Direct-to-host path: KV data already resides in host pool via RDMA.
@@ -1057,16 +1069,19 @@ class HiSparseCoordinator:
         reserved_positions = (seq_lens - 1).clamp(max=self.device_buffer_size)
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
-    def has_ongoing_staging(self) -> bool:
-        return len(self.ack_staging_queue) > 0
+    def request_lists(self) -> Dict[ListKind, ReqList]:
+        return {ListKind.HISPARSE_STAGING: self.ack_staging_queue}
 
-    def collect_ready_reqs(self) -> List[Req]:
+    def move_ready_reqs(self, dst: ReqList) -> List[Req]:
+        """Move the staged requests whose host copy has landed into `dst`, and
+        return them."""
         ready_reqs: List[Req] = []
         if len(self.ack_staging_queue) == 0:
             return ready_reqs
 
+        staged = list(self.ack_staging_queue.items())
         finish_count = 0
-        for _, finish_event, _ in self.ack_staging_queue:
+        for _, finish_event, _ in staged:
             if not finish_event.query():
                 break
             finish_count += 1
@@ -1079,13 +1094,12 @@ class HiSparseCoordinator:
                 group=self.tp_group,
             )
         finish_count = int(queue_size.item())
-        while finish_count > 0:
-            _, _, req = self.ack_staging_queue.pop(0)
+        move([req for _, _, req in staged[:finish_count]], dst)
+        for _, _, req in staged[:finish_count]:
             # prepare device buffer and update req
             self.alloc_device_buffer(req)
             self._skip_first_backup[req.kv.req_pool_idx] = True
             req.hisparse_staging = False
-            finish_count -= 1
             ready_reqs.append(req)
         return ready_reqs
 
@@ -1238,12 +1252,19 @@ class HiSparseCoordinator:
             self.decode_backup_stream.wait_stream(schedule_stream)
             if self.decode_producer_stream is not None:
                 self.decode_backup_stream.wait_stream(self.decode_producer_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_locs,
-                device_locs,
-                io_backend="kernel",
-            )
+            if self.is_dsv4_hisparse:
+                # One scattered token per request: a multiple of the page size
+                # must not be mistaken for whole pages.
+                self.mem_pool_host.backup_tokens_from_device_all_layer(
+                    host_locs, device_locs
+                )
+            else:
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    host_locs,
+                    device_locs,
+                    io_backend="kernel",
+                )
             self._backup_done_event.record()
             if host_locs.is_cuda:
                 host_locs.record_stream(self.decode_backup_stream)
@@ -1353,16 +1374,8 @@ class HiSparseCoordinator:
 
         return top_k_indices
 
-    def abort_staging_request(self, req: Req) -> None:
-        """Remove a request from the staging queue and free its host + device resources.
-
-        Must be called when aborting a request that has been admitted into staging
-        but has not yet completed (i.e. req.hisparse_staging is True).
-        """
-        # Remove from staging queue
-        self.ack_staging_queue = [
-            act for act in self.ack_staging_queue if act.req is not req
-        ]
+    def _release_staging(self, req: Req) -> None:
+        """Free a staged request's host + device resources."""
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
@@ -1386,13 +1399,12 @@ class HiSparseCoordinator:
         self.spec_swap.free_unrotated_scratch(req.kv.req_pool_idx)
         req.hisparse_staging = False
 
-    def retract_req(self, req: Req) -> None:
+    def release_request(self, req: Req):
+        """Free what a request holds here, whether finished, aborted or retracted."""
         if req.hisparse_staging:
-            self.abort_staging_request(req)
-        else:
-            self.request_finished(req)
+            self._release_staging(req)
+            return
 
-    def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
@@ -1545,8 +1557,8 @@ class HiSparseCoordinator:
             device_buffer_locs=self.req_device_buffer_token_locs[host_layer],
             host_cache_k=self.mem_pool_host.k_buffer[host_layer],
             host_cache_v=self.mem_pool_host.v_buffer[host_layer],
-            device_buffer_k=self.mem_pool_device.get_key_buffer(layer_id),
-            device_buffer_v=self.mem_pool_device.get_value_buffer(layer_id),
+            device_buffer_k=self.mem_pool_device.layer_router.read(layer_id).key(),
+            device_buffer_v=self.mem_pool_device.layer_router.read(layer_id).value(),
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,

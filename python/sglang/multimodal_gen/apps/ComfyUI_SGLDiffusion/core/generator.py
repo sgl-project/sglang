@@ -20,7 +20,7 @@ from ..executors.minimax_h3 import (
 )
 from ..executors.qwen_image21 import QwenImage21Executor
 from ..executors.zimage import ZImageExecutor
-from ..options import PLUGIN_KEYS
+from ..options import ATTENTION_DISPLAY, INT8_GEMM_DISPLAY, PLUGIN_KEYS
 from .preflight import check_model_options, check_sgld_options
 
 logger = logging.getLogger(__name__)
@@ -77,15 +77,41 @@ def _check_h3_single_file(path: str, sgld_options: dict) -> None:
             "file (e.g. *_int8_convrot), whose per-layer metadata selects the "
             "format, and leave quantization empty"
         )
-    from safetensors import safe_open
 
-    with safe_open(path, framework="pt") as f:
-        if any(".to_gate_compress." in key for key in f.keys()):
-            raise ValueError(
-                "This is a FastH3 checkpoint (VSA gate weights), which the base "
-                "MiniMax H3 model cannot load; load the native FastH3 directory "
-                "with SGLDNativeModelLoader"
-            )
+
+def _default_fasth3_attention(path: str, sgld_options: dict) -> None:
+    """A FastH3 single file runs the VSA-H3 attention it was distilled with.
+
+    FastH3 8-Step V2 trains at 0.8 sparsity, as the native loader defaults, and
+    the same GPU and execution-mode gates apply: elsewhere, and for Ref2VA files
+    (VSA-H3 does not tile the ComfyUI Ref2VA layout), attention stays dense. An
+    explicit attention_backend wins.
+    """
+    from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+        vsa_h3_device_supported,
+        vsa_h3_execution_supported,
+    )
+    from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.minimax_h3 import (
+        has_vsa_gate,
+        is_reference_checkpoint,
+    )
+
+    if "attention_backend" in sgld_options or not has_vsa_gate(path):
+        return
+    if is_reference_checkpoint(path):
+        return
+    if not vsa_h3_device_supported() or not vsa_h3_execution_supported(
+        enable_torch_compile=sgld_options.get("enable_torch_compile"),
+        enable_breakable_cuda_graph=sgld_options.get("enable_breakable_cuda_graph"),
+        ring_degree=sgld_options.get("ring_degree"),
+    ):
+        logger.info(
+            "FastH3 single file runs dense attention: VSA-H3 needs a supported "
+            "GPU and no torch.compile, CUDA graph or ring attention"
+        )
+        return
+    sgld_options["attention_backend"] = "video_sparse_attn_h3"
+    sgld_options.setdefault("attention_backend_config", '{"VSA_sparsity": 0.8}')
 
 
 # Renamed local files and directories miss the registry's path detectors and
@@ -234,6 +260,57 @@ _SHARED = None
 _ATEXIT_REGISTERED = False
 
 
+def _loader_settings(*, args, sgld_options: dict, int8_kernel: str, model_type) -> dict:
+    """The worker's loader-time settings, as SGLDOptions widget names and values.
+
+    Values come from ServerArgs, so they are what the worker runs; fields that do
+    not apply to the chosen mode are left out, as SGLDOptions ignores them too.
+    """
+    settings = {
+        "model_type": model_type,
+        "num_gpus": args.num_gpus,
+        # create_options only passes tp_size when parallel_mode is manual.
+        "parallel_mode": "manual" if "tp_size" in sgld_options else "auto",
+        "tp_size": args.tp_size,
+        "ulysses_degree": args.ulysses_degree,
+        "ring_degree": args.ring_degree,
+        "attention_backend": ATTENTION_DISPLAY.get(
+            args.attention_backend, args.attention_backend or "auto"
+        ),
+    }
+    if sgld_options.get("attention_backend_config"):
+        settings["attention_backend_config"] = sgld_options["attention_backend_config"]
+    settings["quantization"] = args.quantization or "none"
+    # A pre-quantized H3 file reports quantization=none, but an explicit
+    # ConvRot backend still affects the worker through its environment.
+    if int8_kernel != "auto":
+        settings["int8_gemm"] = INT8_GEMM_DISPLAY.get(int8_kernel, int8_kernel)
+    if args.enable_torch_compile:
+        settings["execution_mode"] = "torch_compile"
+        settings["regional_compile"] = args.regional_compile
+    elif args.enable_breakable_cuda_graph:
+        settings["execution_mode"] = "cuda_graph"
+    else:
+        settings["execution_mode"] = "eager"
+    if args.dit_layerwise_offload:
+        settings["memory_mode"] = "layerwise_offload"
+        settings["resident_layers"] = args.dit_layerwise_resident_layers
+        settings["prefetch_layers"] = args.dit_offload_prefetch_size
+    else:
+        settings["memory_mode"] = "resident"
+    return settings
+
+
+def _cache_mode(executor) -> str:
+    """The cache_mode the next request will use, as set by SGLDOptions."""
+    if getattr(executor, "enable_spectrum", False):
+        return "spectrum"
+    cache_dit = getattr(executor, "enable_cache_dit", None)
+    if cache_dit is None:
+        return "worker default"
+    return "cache_dit" if cache_dit else "off"
+
+
 class SGLDiffusionGenerator:
     """Process-wide owner of the one live SGLD worker.
 
@@ -248,6 +325,9 @@ class SGLDiffusionGenerator:
         self.model_path = None
         self.generator = None
         self.executor = None
+        # Executor that sent the last request; differs from self.executor
+        # after a cached executor rebuilt the worker.
+        self._active_executor = None
         self.model_type = None
         self.last_options = None
         self._patcher = None
@@ -361,6 +441,56 @@ class SGLDiffusionGenerator:
             return []
         return list(getattr(gen, "local_scheduler_process", None) or [])
 
+    def status_text(self) -> str:
+        """Worker summary from ServerArgs and the worker's RequestMetrics."""
+        if self.generator is None:
+            return "SGLD worker: not started (run the workflow once to load a model)"
+        import torch
+
+        import sglang
+
+        args = self.generator.server_args
+        executor = self._active_executor or self.executor
+        pids = [proc.pid for proc in self._worker_processes()]
+        loader = _loader_settings(
+            args=args,
+            sgld_options=self.last_options["sgld_options"],
+            int8_kernel=self.last_options["int8_kernel"],
+            model_type=self.model_type,
+        )
+        lines = [
+            f"model: {args.model_path} pipeline={args.pipeline_class_name}",
+            f"worker: {'live' if self._is_live() else 'NOT live'} pids={pids}",
+            "loader settings (fixed until the worker restarts): "
+            + " ".join(f"{k}={v}" for k, v in loader.items()),
+        ]
+        if executor is None:
+            lines.append("per-run settings: no executor")
+        else:
+            params = getattr(executor, "cache_dit_params", None)
+            lines.append(
+                f"per-run settings (apply to the next request): "
+                f"cache_mode={_cache_mode(executor)}"
+                + (f" cache_dit_params={params}" if params else "")
+            )
+        metrics = getattr(executor, "last_metrics", None)
+        if metrics is None:
+            lines.append("last DiT call: none yet")
+        else:
+            lines.append(
+                f"last DiT call (one sampler step, or half of a CFG step): "
+                f"{metrics.total_duration_ms:.1f} ms"
+            )
+            snapshot = metrics.memory_snapshots.get("after_forward")
+            if snapshot is not None:
+                lines.append(
+                    f"vram during that call: peak allocated "
+                    f"{snapshot.peak_allocated_mb:.0f} MiB, peak reserved "
+                    f"{snapshot.peak_reserved_mb:.0f} MiB"
+                )
+        lines.append(f"sglang={sglang.__version__} torch={torch.__version__}")
+        return "\n".join(lines)
+
     def _is_live(self) -> bool:
         """True when this owner still has a usable worker + scheduler client."""
         if self.generator is None:
@@ -399,6 +529,7 @@ class SGLDiffusionGenerator:
 
     def ensure_executor(self, executor) -> None:
         """Rebuild the worker if this cached executor no longer owns it."""
+        self._active_executor = executor
         if self._owns_live(executor):
             return
         reload = executor._sgld_reload
@@ -450,6 +581,7 @@ class SGLDiffusionGenerator:
         self.model_path = None
         self.generator = None
         self.executor = None
+        self._active_executor = None
         self.model_type = None
         self._patcher = None
 
@@ -575,6 +707,8 @@ class SGLDiffusionGenerator:
         else:
             sgld_options.pop("transformer_weights_path", None)
         detect_path = model_path
+        if not native_dir:
+            _default_fasth3_attention(detect_path, sgld_options)
         gather_options = {
             "model_path": detect_path,
             "model_options": model_options,
