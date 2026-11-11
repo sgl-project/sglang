@@ -1,9 +1,13 @@
+import contextlib
+import functools
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
@@ -390,6 +394,96 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         torch.testing.assert_close(
             flashinfer_tracked, triton_tracked, atol=3e-2, rtol=3e-2
         )
+
+    # Qwen3.5-like heads: FlashInfer runs one sequence on its context-parallel
+    # kernel and three on its native kernel, on SM90 and on SM100.
+    PREWARM_CASES = (
+        (
+            GDNAttentionCase(
+                name="flashinfer_gdn_prefill_one_sequence",
+                backend="triton",
+                linear_attn_prefill_backend="flashinfer",
+                forward_mode=ForwardMode.EXTEND,
+                num_k_heads=16,
+                num_v_heads=32,
+                page_size=16,
+                prefix_lens=(0,),
+                extend_lens=(192,),
+            ),
+            [129],
+        ),
+        (
+            GDNAttentionCase(
+                name="flashinfer_gdn_prefill_three_sequences",
+                backend="triton",
+                linear_attn_prefill_backend="flashinfer",
+                forward_mode=ForwardMode.EXTEND,
+                num_k_heads=16,
+                num_v_heads=32,
+                page_size=16,
+                prefix_lens=(0, 64, 128),
+                extend_lens=(64, 65, 129),
+            ),
+            [64, 129, 257],
+        ),
+    )
+
+    def test_prewarm_leaves_no_prefill_variant_to_compile_while_serving(self):
+        """FlashInfer compiles each GDN prefill variant on its first call, which
+        stalls serving for seconds; after the startup prewarm, no prefill of one
+        or several sequences, with or without tracked checkpoints, compiles."""
+        from flashinfer.gdn_kernels.delta_rule_dsl import custom_compile_cache
+
+        fixtures = [
+            build_gdn_attention_fixture(
+                self,
+                case,
+                head_k_dim=self.HEAD_DIM,
+                head_v_dim=self.HEAD_DIM,
+                max_context_len=320,
+                runner_batch_size=6,
+            )
+            for case, _ in self.PREWARM_CASES
+        ]
+        with contextlib.ExitStack() as stack:
+            # Start from empty compile caches, as a new server process does.
+            stack.enter_context(
+                patch.dict(custom_compile_cache._in_mem_compile_cache, clear=True)
+            )
+            compiled = [lambda: len(custom_compile_cache._in_mem_compile_cache)]
+            if _sm_major == 10:
+                from flashinfer.gdn_kernels.blackwell import gdn_prefill
+
+                fresh = functools.cache(gdn_prefill._get_compiled_cache.__wrapped__)
+                stack.enter_context(
+                    patch.object(gdn_prefill, "_get_compiled_cache", fresh)
+                )
+                compiled.append(lambda: fresh.cache_info().currsize)
+            stack.enter_context(
+                get_exec().mamba.override(enable_mamba_extra_buffer=True)
+            )
+
+            linear_backend = fixtures[0].backend.linear_attn_backend
+            linear_backend.prewarm_flashinfer_extend(fixtures[0].actual_module)
+            prewarmed = [count() for count in compiled]
+            self.assertGreater(sum(prewarmed), 0)
+
+            for fixture, (case, track_seqlens) in zip(fixtures, self.PREWARM_CASES):
+                run_gdn_fixture_eager(fixture)
+                batch = fixture.forward_batch
+                batch.mamba_track_mask = torch.ones(
+                    case.batch_size, dtype=torch.bool, device="cuda"
+                )
+                batch.mamba_track_indices = torch.arange(
+                    4, 4 + case.batch_size, dtype=torch.int64, device="cuda"
+                )
+                batch.mamba_track_seqlens = torch.tensor(
+                    track_seqlens, dtype=torch.int64, device="cuda"
+                )
+                run_gdn_fixture_eager(fixture)
+                metadata = fixture.backend.linear_attn_backend.forward_metadata
+                self.assertGreater(metadata.num_state_checkpoints, 0)
+            self.assertEqual([count() for count in compiled], prewarmed)
 
 
 if __name__ == "__main__":
