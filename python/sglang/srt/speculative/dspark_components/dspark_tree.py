@@ -430,15 +430,25 @@ def greedy_tree_accept(
     target_predict: torch.Tensor,
     *,
     active: torch.Tensor | None = None,
+    max_depth: int | None = None,
+    max_children: int | None = None,
 ) -> TreeAcceptance:
     """Walk the draft tree against per-node target argmax tokens.
 
     ``target_predict`` is [batch, budget + 1]; column 0 is the root's target
     argmax and column i+1 is node i's target argmax.
+
+    Optional host-side bounds must describe the tree's construction: pruning
+    cannot increase its depth or any parent's number of children. Unbounded
+    callers retain the general budget-by-budget traversal.
     """
     if tree.tokens.dim() != 2:
         raise ValueError("tree.tokens must be [batch, budget]")
     batch, budget = tree.tokens.shape
+    steps = budget if max_depth is None else min(budget, max_depth)
+    siblings = budget if max_children is None else min(budget, max_children)
+    if steps < 0 or siblings < 0 or (budget and (steps == 0 or siblings == 0)):
+        raise ValueError("tree acceptance bounds must be positive for a nonempty tree")
     if target_predict.shape != (batch, budget + 1):
         raise ValueError(
             f"target_predict must be [{batch}, {budget + 1}], "
@@ -454,11 +464,11 @@ def greedy_tree_accept(
     num_accepted = torch.zeros(batch, dtype=torch.int32, device=device)
     num_sampled = active.to(torch.int32).clone()
 
-    for step in range(budget):
+    for step in range(steps):
         target = target_predict[rows, current.clamp(0, budget)]
         child = tree.first_child[rows, current.clamp(0, budget)].long()
         found = torch.full_like(current, -1)
-        for _ in range(budget):
+        for _ in range(siblings):
             linked = alive & (found < 0) & (child > 0) & (child <= budget)
             token = tree.tokens[rows, (child - 1).clamp(0, budget - 1)]
             match = linked & (token == target)
@@ -1104,6 +1114,8 @@ class TreePrePlan:
     node_records: list = field(default_factory=list)
     tree_node_kv: dict = field(default_factory=dict)
     tree_node_scale: dict = field(default_factory=dict)
+    accept_max_depth: int | None = None
+    accept_max_children: int | None = None
 
 
 @dataclass
@@ -1172,6 +1184,8 @@ def plan_tree_pre(
         metadata=metadata,
         ori_sparse_indices=sparse,
         max_prefix=max_prefix,
+        accept_max_depth=config.depth,
+        accept_max_children=config.topk,
     )
 
 
@@ -1191,7 +1205,12 @@ def plan_tree_post(
             f"target_predict must be [{batch}, {pre.metadata.query_width}], "
             f"got {tuple(target_predict.shape)}"
         )
-    acceptance = greedy_tree_accept(pre.layout, target_predict)
+    acceptance = greedy_tree_accept(
+        pre.layout,
+        target_predict,
+        max_depth=pre.accept_max_depth,
+        max_children=pre.accept_max_children,
+    )
     outputs = build_tree_accept_outs(
         verify_ids=pre.metadata.verify_ids.reshape(batch, -1),
         path_node_ids=acceptance.path_node_ids,
