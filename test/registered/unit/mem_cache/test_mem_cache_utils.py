@@ -408,8 +408,9 @@ class TestSplitNodeHashValue(unittest.TestCase):
 
 class TestLogHiCacheEvent(CustomTestCase):
     """Pin the `[HICACHE]` log line contract consumed by downstream stats/alert
-    scripts: the prefix, every field name + value, INFO level, the one-decimal
-    `duration_ms` format, and that default args still emit a parseable line.
+    scripts: the prefix, every field name + value, the level split (WARNING for
+    real failures, DEBUG for normal declines), the one-decimal `duration_ms`
+    format, and that default args still emit a parseable line.
 
     These are cross-component contracts (external dashboards parse the line),
     not internal logic -- a refactor renaming a field or changing the number
@@ -418,13 +419,13 @@ class TestLogHiCacheEvent(CustomTestCase):
 
     _LOGGER = "sglang.srt.mem_cache.utils"
 
-    def _capture(self, *args, **kwargs) -> str:
-        with self.assertLogs(self._LOGGER, level="INFO") as cm:
+    def _capture(self, *args, level: str = "DEBUG", **kwargs) -> str:
+        with self.assertLogs(self._LOGGER, level=level) as cm:
             log_hicache_event(*args, **kwargs)
         self.assertEqual(len(cm.records), 1)
         return cm.records[0].getMessage()
 
-    def test_full_event_message_contract(self):
+    def test_failure_logs_at_warning(self):
         msg = self._capture(
             event="backup",
             tier="l1_to_l2",
@@ -435,6 +436,7 @@ class TestLogHiCacheEvent(CustomTestCase):
             tokens=1024,
             duration_ms=12.5,
             extra="op_id=7",
+            level="WARNING",
         )
         self.assertTrue(msg.startswith("[HICACHE]"))
         self.assertIn("rid=req-1", msg)
@@ -462,6 +464,7 @@ class TestLogHiCacheEvent(CustomTestCase):
             tier="l2_to_l3",
             result="failed",
             duration_ms=3.14159,
+            level="WARNING",
         )
         self.assertIn("duration_ms=3.1", msg)
         self.assertNotIn("duration_ms=3.14", msg)

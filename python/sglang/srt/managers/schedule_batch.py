@@ -1647,7 +1647,7 @@ class Req(ReqDllmMixin):
             else ""
         )
         input_len = len(self.origin_input_ids)
-        hit_rate = self.cached_tokens / input_len
+        hit_rate = self.cached_tokens / input_len if input_len else 0.0
         prefix = (
             f"ReqTimeStats("
             f"rid={self.rid}{bootstrap_info}, "

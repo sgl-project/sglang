@@ -404,6 +404,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # l3_actual_read_tokens (post-IO) is explainable in-dict.
             "host_alloc_failed": 0,
             "host_mem_insufficient": 0,
+            "aux_alloc_failed": 0,
             "read_failed": 0,
             "l3_expected_tokens": 0,
             "l3_actual_read_tokens": 0,
@@ -2800,7 +2801,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 reason="rate_limited",
                 rid=req_id,
                 tokens=prefetch_length,
-                extra=f"occupied={self.cache_controller.prefetch_tokens_occupied},capacity_limit={self.cache_controller.prefetch_capacity_limit}",
+                extra=f"occupied={self.cache_controller.prefetch_tokens_occupied}",
             )
             return
 
@@ -3671,6 +3672,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     continue
                 host_indices = self.components[ct].alloc_prefetch_staging(num_tokens)
                 if host_indices is None:
+                    self._prefetch_outcome_stats["aux_alloc_failed"] += 1
                     if (
                         self.enable_storage_metrics
                         and self.storage_metrics_collector is not None

@@ -653,6 +653,8 @@ class TestStoragePrefetchOutcomeMetrics(unittest.TestCase):
 
     Guards the invariant that cumulative dicts map to a cumulative Counter
     without double counting across repeated flushes of the same snapshot.
+    Token-valued reasons (``*_tokens``) are routed to a separate counter so
+    each exported metric carries a single unit.
     """
 
     L3 = "l3_to_l2_load"
@@ -671,17 +673,21 @@ class TestStoragePrefetchOutcomeMetrics(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.collector = StorageMetricsCollector(labels={"model": "test"})
-        self.counter = next(
-            metric
-            for metric in _FakeMetric.instances
-            if metric.name == "sglang:hicache_transfer_outcomes_total"
-        )
 
-    def _value(self, tier, reason):
+        def _grab(name):
+            return next(
+                metric for metric in _FakeMetric.instances if metric.name == name
+            )
+
+        self.counter = _grab("sglang:hicache_transfer_outcomes_total")
+        self.token_counter = _grab("sglang:hicache_transfer_outcome_tokens_total")
+
+    def _value(self, tier, reason, counter=None):
         # _FakeMetric.labels sorts label items, so the stored key is the
         # sorted (model, reason, tier) tuple.
+        counter = counter if counter is not None else self.counter
         key = tuple(sorted({"model": "test", "tier": tier, "reason": reason}.items()))
-        return self.counter.values.get(key, 0)
+        return counter.values.get(key, 0)
 
     # ---- prefetch_stats -> tier=l3_to_l2_load (log_prefetch_outcomes) ----
 
@@ -750,6 +756,46 @@ class TestStoragePrefetchOutcomeMetrics(unittest.TestCase):
         self.assertEqual(self._value(self.L3, "host_alloc_failed"), 2)
         self.assertEqual(self._value(self.L3, "read_failed"), 3)
 
+    def test_default_storage_metrics_flush_is_noop(self):
+        # Regression: StorageMetrics() defaults prefetch_stats to None; the
+        # flush must skip it instead of raising AttributeError on .get().
+        self.collector.log_storage_metrics(
+            StorageMetrics(load_outcome_stats={self.L2_L1: {"attempts": 1}})
+        )
+        self.assertEqual(self._value(self.L2_L1, "attempts"), 1)
+        # No l3_to_l2_load series may appear from a missing prefetch snapshot.
+        self.assertFalse([k for k in self.counter.values if dict(k)["tier"] == self.L3])
+        self.assertFalse(self.token_counter.values)
+
+    def test_prefetch_snapshot_keys_are_exported_without_whitelist(self):
+        # Regression: a hard-coded outcome list dropped keys the cache-side
+        # dict already carried (issued_assumed_stored, declined_anchor_lost,
+        # ...). Every snapshot key must be exported.
+        self.collector.log_storage_metrics(
+            StorageMetrics(
+                prefetch_stats={
+                    "issued_assumed_stored": 2,
+                    "declined_anchor_lost": 1,
+                    "declined_device_covered": 3,
+                    "declined_host_oversize": 4,
+                    "declined_unservable_prefix": 5,
+                }
+            )
+        )
+        self.assertEqual(self._value(self.L3, "issued_assumed_stored"), 2)
+        self.assertEqual(self._value(self.L3, "declined_anchor_lost"), 1)
+        self.assertEqual(self._value(self.L3, "declined_device_covered"), 3)
+        self.assertEqual(self._value(self.L3, "declined_host_oversize"), 4)
+        self.assertEqual(self._value(self.L3, "declined_unservable_prefix"), 5)
+
+    def test_prefetch_token_reasons_route_to_token_counter(self):
+        self.collector.log_storage_metrics(
+            StorageMetrics(prefetch_stats={"l3_miss_tokens": 10, "attempts": 1})
+        )
+        self.assertEqual(self._value(self.L3, "l3_miss_tokens", self.token_counter), 10)
+        self.assertEqual(self._value(self.L3, "attempts"), 1)
+        self.assertEqual(self._value(self.L3, "l3_miss_tokens"), 0)
+
     # ---- load_outcome_stats -> tier=l2_to_l1_load (_flush_outcome_delta) ----
 
     def test_load_outcome_deltas(self):
@@ -812,13 +858,21 @@ class TestStoragePrefetchOutcomeMetrics(unittest.TestCase):
         self.assertEqual(self._value(self.L1_L2, "attempts"), 2)
         self.assertEqual(self._value(self.L1_L2, "host_alloc_failed"), 1)
         self.assertEqual(self._value(self.L2_L3, "attempts"), 2)
-        self.assertEqual(self._value(self.L2_L3, "l3_write_tokens"), 64)
+        self.assertEqual(
+            self._value(self.L2_L3, "l3_write_tokens", self.token_counter), 64
+        )
         self.assertEqual(self._value(self.L2_L3, "write_failed"), 1)
-        self.assertEqual(self._value(self.L2_L3, "l3_write_failed_tokens"), 32)
+        self.assertEqual(
+            self._value(self.L2_L3, "l3_write_failed_tokens", self.token_counter), 32
+        )
+        # Token sums never land on the events counter: one unit per metric.
+        self.assertEqual(self._value(self.L2_L3, "l3_write_tokens"), 0)
 
         # Re-flush same snapshot: no growth.
         self.collector.log_storage_metrics(StorageMetrics(write_outcome_stats=snapshot))
-        self.assertEqual(self._value(self.L2_L3, "l3_write_tokens"), 64)
+        self.assertEqual(
+            self._value(self.L2_L3, "l3_write_tokens", self.token_counter), 64
+        )
 
         growth = {
             self.L1_L2: {"attempts": 4, "host_alloc_failed": 1},
@@ -832,9 +886,13 @@ class TestStoragePrefetchOutcomeMetrics(unittest.TestCase):
         self.collector.log_storage_metrics(StorageMetrics(write_outcome_stats=growth))
         self.assertEqual(self._value(self.L1_L2, "attempts"), 4)
         self.assertEqual(self._value(self.L2_L3, "attempts"), 5)
-        self.assertEqual(self._value(self.L2_L3, "l3_write_tokens"), 128)
+        self.assertEqual(
+            self._value(self.L2_L3, "l3_write_tokens", self.token_counter), 128
+        )
         self.assertEqual(self._value(self.L2_L3, "write_failed"), 2)
-        self.assertEqual(self._value(self.L2_L3, "l3_write_failed_tokens"), 48)
+        self.assertEqual(
+            self._value(self.L2_L3, "l3_write_failed_tokens", self.token_counter), 48
+        )
 
     def test_write_outcome_token_delta_is_per_reason(self):
         # l3_write_tokens is a cumulative token sum, not a req count: deltas
@@ -842,11 +900,15 @@ class TestStoragePrefetchOutcomeMetrics(unittest.TestCase):
         self.collector.log_storage_metrics(
             StorageMetrics(write_outcome_stats={self.L2_L3: {"l3_write_tokens": 100}})
         )
-        self.assertEqual(self._value(self.L2_L3, "l3_write_tokens"), 100)
+        self.assertEqual(
+            self._value(self.L2_L3, "l3_write_tokens", self.token_counter), 100
+        )
         self.collector.log_storage_metrics(
             StorageMetrics(write_outcome_stats={self.L2_L3: {"l3_write_tokens": 130}})
         )
-        self.assertEqual(self._value(self.L2_L3, "l3_write_tokens"), 130)
+        self.assertEqual(
+            self._value(self.L2_L3, "l3_write_tokens", self.token_counter), 130
+        )
 
     # ---- independent delta streams ----
 

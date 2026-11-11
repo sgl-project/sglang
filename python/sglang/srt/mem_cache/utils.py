@@ -258,7 +258,9 @@ def log_hicache_event(
     duration_ms: float = 0.0,
     extra: str = "",
 ):
-    logger.info(
+    level = logging.WARNING if result == "failed" else logging.DEBUG
+    logger.log(
+        level,
         f"[HICACHE] rid={rid} event={event} tier={tier} node={node_id} "
         f"tokens={tokens} result={result} reason={reason} "
         f"duration_ms={duration_ms:.1f} {extra}",

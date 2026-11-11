@@ -2397,8 +2397,17 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         self.hicache_transfer_outcomes_total = Counter(
             name="sglang:hicache_transfer_outcomes_total",
             documentation=(
-                "HiCache layer transmission statistics. The outcome label is bounded to "
-                "attempts, issued, decline reasons, and revoke reasons."
+                "HiCache layer transmission event counts. The outcome label is "
+                "bounded to attempts, issued, decline reasons, and revoke "
+                "reasons; token sums live on hicache_transfer_outcome_tokens_total."
+            ),
+            labelnames=list(labels.keys()) + ["tier", "reason"],
+        )
+        self.hicache_transfer_outcome_tokens_total = Counter(
+            name="sglang:hicache_transfer_outcome_tokens_total",
+            documentation=(
+                "HiCache layer transmission token sums (reasons ending in "
+                "_tokens, e.g. l3_miss_tokens, l3_write_tokens)."
             ),
             labelnames=list(labels.keys()) + ["tier", "reason"],
         )
@@ -2508,6 +2517,15 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
 
+    def _inc_outcome_delta(self, tier: str, reason: str, delta: float) -> None:
+        # Token sums live on their own counter: one unit per metric.
+        counter = (
+            self.hicache_transfer_outcome_tokens_total
+            if reason.endswith("_tokens")
+            else self.hicache_transfer_outcomes_total
+        )
+        counter.labels(**self.labels, tier=tier, reason=reason).inc(delta)
+
     def _flush_outcome_delta(self, current: Optional[dict], last: dict) -> None:
         """Inc the transfer-outcomes Counter by the delta since the last flush.
 
@@ -2524,44 +2542,29 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
                 previous = prev_tier.get(reason, 0)
                 delta = count if count < previous else count - previous
                 if delta > 0:
-                    self.hicache_transfer_outcomes_total.labels(
-                        **self.labels, tier=tier, reason=reason
-                    ).inc(delta)
+                    self._inc_outcome_delta(tier, reason, delta)
                 prev_tier[reason] = count
 
-    def log_prefetch_outcomes(self, prefetch_stats: Mapping[str, float]) -> None:
+    def log_prefetch_outcomes(
+        self, prefetch_stats: Optional[Mapping[str, float]]
+    ) -> None:
         """Export cumulative cache outcomes as monotonic Prometheus counters.
 
         UnifiedRadixCache owns the source counters and may reset them while this
         collector survives a storage detach/reattach. A lower snapshot therefore
         starts a new epoch: export its current value, never a negative delta.
+        Every snapshot key is exported; new cache-side outcomes need no
+        collector-side list.
         """
-        for outcome in (
-            "attempts",
-            "issued",
-            "declined_too_short",
-            "declined_rate_limited",
-            "revoked_insufficient",
-            "revoked_full_miss",
-            "l3_demand_requests",
-            "l1l2_miss_tokens",
-            "l3_miss_tokens",
-            "host_alloc_failed",
-            "read_failed",
-            "l3_expected_tokens",
-            "l3_actual_read_tokens",
-            "timeout",
-            "full_kv_discards",
-            "aux_kv_discards",
-            "host_mem_insufficient",
-        ):
-            current = max(float(prefetch_stats.get(outcome, 0)), 0.0)
+        if not prefetch_stats:
+            return
+        tier = TransferTier.L3_TO_L2_LOAD.value
+        for outcome, value in prefetch_stats.items():
+            current = max(float(value), 0.0)
             previous = self._last_prefetch_outcome.get(outcome, 0.0)
             increment = current if current < previous else current - previous
             if increment > 0:
-                self.hicache_transfer_outcomes_total.labels(
-                    **self.labels, tier=TransferTier.L3_TO_L2_LOAD.value, reason=outcome
-                ).inc(increment)
+                self._inc_outcome_delta(tier, outcome, increment)
             self._last_prefetch_outcome[outcome] = current
 
     def log_storage_metrics(self, storage_metrics: Optional[StorageMetrics] = None):
