@@ -92,9 +92,14 @@ def get_scalar_type(
     has_zp: bool,
     scales: Optional[torch.Tensor] = None,
     global_scale: Optional[torch.Tensor] = None,
+    is_fp8: bool = False,
 ):
     from sgl_kernel.scalar_type import scalar_types
 
+    if is_fp8:
+        # E4M3 weights pack like 8-bit integers; the kernel dequantizes them as floats.
+        assert num_bits == 8 and not has_zp
+        return scalar_types.float8_e4m3fn
     if (
         not has_zp
         and num_bits == 4
@@ -168,6 +173,7 @@ def fused_marlin_moe(
     activation: str = "silu",
     is_gated: bool = True,
     no_combine: bool = False,
+    is_fp8: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -194,6 +200,8 @@ def fused_marlin_moe(
     - num_bits (int): The number of bits in expert weights quantization.
     - no_combine (bool): Return the router-weighted per-(token, expert) outputs,
         ``[num_tokens, topk, hidden]``, instead of their top-k sum.
+    - is_fp8 (bool): The 8-bit weights are E4M3 floats (W8A16 FP8) rather
+        than GPTQ integers; their scales carry the fused exponent bias.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
@@ -286,10 +294,10 @@ def fused_marlin_moe(
         )
 
     scalar_type1 = get_scalar_type(
-        num_bits, w1_zeros is not None, w1_scale, w1_global_scale
+        num_bits, w1_zeros is not None, w1_scale, w1_global_scale, is_fp8
     )
     scalar_type2 = get_scalar_type(
-        num_bits, w2_zeros is not None, w2_scale, w2_global_scale
+        num_bits, w2_zeros is not None, w2_scale, w2_global_scale, is_fp8
     )
 
     intermediate_cache2 = torch.empty(

@@ -2192,6 +2192,19 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return _mxfp8_group_quantize_torch(x)
 
 
+def mxfp8_quantize_moe_experts(
+    weight: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """[E, N, K] BF16/FP16 experts as canonical MXFP8: E4M3 weights and one
+    UE8M0 byte per row and 32-wide K group ([E, N, K // 32]), the layout a
+    serialized MXFP8 checkpoint loads into; the same quantizer as the dense
+    online path (`mxfp8_group_quantize`: its JIT kernel on CUDA, the eager
+    form elsewhere)."""
+    num_experts, rows, k = weight.shape
+    qweight, scale = mxfp8_group_quantize(weight.reshape(-1, k).contiguous())
+    return qweight.view(num_experts, rows, k), scale.view(num_experts, rows, k // 32)
+
+
 # (N, K) of the dense MXFP8 GEMMs where cuDNN's SM107 kernel beats the CuTe-DSL one at
 # prefill sizes (wo_b, Engram KV); the two backends are bitwise equal.
 _SM107_CUDNN_MXFP8_NK = ((5120, 8192), (25600, 6144))
@@ -3169,6 +3182,28 @@ def apply_fp8_linear(
         bias,
         output_dtype,
     )
+
+
+@lru_cache(maxsize=1)
+def hopper_deepgemm_serves_mxfp8() -> bool:
+    """Whether the installed DeepGEMM runs the MXFP8 dense GEMM (E4M3 operands,
+    one FP32 scale per row and 32-wide K group) on this pre-Blackwell device.
+    Probed once with the smallest shapes the kernel takes; some Hopper builds
+    assert on this scale granularity, so loading decides instead of the first
+    forward."""
+    from sglang.kernels.ops.gemm.fp8_kernel import w8a8_mxfp8_matmul_deepgemm
+
+    try:
+        device = torch.device("cuda")
+        a = torch.zeros((64, 128), dtype=torch.float8_e4m3fn, device=device)
+        b = torch.zeros((64, 128), dtype=torch.float8_e4m3fn, device=device)
+        scales = torch.ones((64, 4), dtype=torch.float32, device=device)
+        w8a8_mxfp8_matmul_deepgemm(a, b, scales, scales, torch.bfloat16)
+        torch.cuda.synchronize()
+    except Exception as err:  # the kernel reports unsupported layouts by raising
+        logger.info("DeepGEMM MXFP8 dense GEMM unavailable here: %s", err)
+        return False
+    return True
 
 
 def can_auto_enable_marlin_fp8() -> bool:

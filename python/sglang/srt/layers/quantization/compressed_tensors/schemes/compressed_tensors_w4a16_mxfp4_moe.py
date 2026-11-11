@@ -209,7 +209,7 @@ class CompressedTensorsW4A16Mxfp4MoE(CompressedTensorsMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+        from sglang.srt.layers.moe.moe_runner.marlin import (
             build_marlin_moe_quant_info,
         )
 

@@ -68,8 +68,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_block_fp8_mxfp8_linear,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
+    hopper_deepgemm_serves_mxfp8,
     input_to_float8,
     mxfp8_group_quantize,
+    mxfp8_quantize_moe_experts,
     normalize_e4m3fn_to_e4m3fnuz,
     pack_mxfp8_weight_scale_for_deepgemm,
     prepare_xpu_block_scale_for_scaled_mm,
@@ -152,6 +154,8 @@ if _is_hip:
 _mxfp8_to_block_fp8_required = mxfp8_block_convert_required() or get_bool_env_var(
     "SGLANG_FORCE_MXFP8_BLOCK_CONVERT"
 )
+
+
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
@@ -342,6 +346,10 @@ class Fp8Config(QuantizationConfig):
         # TODO: torch.xpu.get_device_capability
         if self.use_mxfp8 and is_xpu():
             return 20
+        if self.use_mxfp8 and _is_cuda and get_moe_runner_backend().is_marlin():
+            # Marlin serves the MXFP8 experts W8A16 without SM100 kernels; dense
+            # MXFP8 layers are admitted one by one when their weights load.
+            return 90
 
         return 100 if self.use_mxfp8 else 80
 
@@ -758,6 +766,27 @@ class Fp8LinearMethod(LinearMethodBase):
         skip_block_quant_check: bool = False,
         **extra_weight_attrs,
     ):
+        if (
+            self.mxfp8_dense_backend is not None
+            and self.mxfp8_dense_backend.is_unsupported()
+        ):
+            # Decided here, not at the first forward: before Blackwell only
+            # DeepGEMM serves MXFP8 dense layers, and it may be missing or off.
+            from sglang.srt.layers.quantization.fp8_utils import (
+                get_fp8_gemm_runner_backend,
+            )
+            from sglang.srt.utils import get_device_sm
+
+            raise RuntimeError(
+                f"MXFP8 dense weight ({sum(output_partition_sizes)}, "
+                f"{input_size_per_partition}) of {type(layer).__name__} has no GEMM "
+                f"backend on this device (SM{get_device_sm()}): --fp8-gemm-backend "
+                f"{get_fp8_gemm_runner_backend().value} resolves to no MXFP8 dense "
+                "kernel (before Blackwell only DeepGEMM serves them, and it is missing "
+                "or disabled here). The MXFP8 MoE experts can still be served with "
+                "--moe-runner-backend marlin when the dense layers stay "
+                "BF16 (ignored_layers)."
+            )
         Fp8LinearMethod.create_fp8_weight_(
             layer,
             block_quant=self.block_quant,
@@ -1134,6 +1163,23 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
             n, k = layer.weight.shape
+            if not get_platform().is_blackwell:
+                # Hopper has no other MXFP8 GEMM; refuse here rather than at
+                # the first forward (the MXFP8 experts may still run on Marlin).
+                if layer.params_dtype != torch.bfloat16:
+                    raise RuntimeError(
+                        f"MXFP8 dense weight ({n}, {k}) of {type(layer).__name__}: "
+                        "the DeepGEMM MXFP8 GEMM computes in BF16 only, got "
+                        f"{layer.params_dtype}"
+                    )
+                if not hopper_deepgemm_serves_mxfp8():
+                    raise RuntimeError(
+                        f"MXFP8 dense weight ({n}, {k}) of {type(layer).__name__} "
+                        "cannot run on this device: the installed DeepGEMM rejects "
+                        "per-row 32-wide K scale groups and no other MXFP8 GEMM "
+                        "exists before Blackwell; only the MXFP8 MoE experts can be "
+                        "served here (--moe-runner-backend marlin)"
+                    )
             if scale_u8 is None:
                 scale_u8 = layer.weight_scale_inv.data
             layer.weight_scale_inv_swizzled = None
@@ -1590,6 +1636,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
+        # --moe-runner-backend marlin: the e4m3 experts serve W8A16 from
+        # Marlin tiles (FP4-expert checkpoints wrap this method).
+        self.use_marlin = self._marlin_requested()
         # The MxFP4 wrapper methods borrow this instance for weight loading;
         # they never call create_moe_runner, so moe_runner_config is unset.
         self._owns_moe_runner = False
@@ -1604,6 +1653,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 or get_platform().is_sm90
                 or get_platform().is_sm120
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
+
+    def _marlin_requested(self) -> bool:
+        if self.is_fp4_expert or not get_moe_runner_backend().is_marlin():
+            return False
+        if _is_hip:
+            raise NotImplementedError("Marlin W8A16 FP8 MoE experts need CUDA kernels")
+        if not self.block_quant:
+            # Per-tensor FP8 experts of this method are not served
+            # (compressed-tensors per-tensor experts are).
+            raise NotImplementedError(
+                "Marlin W8A16 serves 128-block and MXFP8 FP8 experts of the fp8 "
+                "quant method; its per-tensor FP8 experts have no Marlin path"
+            )
+        return True
 
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled(
@@ -2738,7 +2801,43 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
 
+    def _process_weights_for_marlin(self, layer: Module) -> None:
+        """Repack the e4m3 experts into Marlin W8A16 tiles; the scales keep their
+        K groups (the 128-wide weight blocks, or MXFP8's 32-wide E8M0 groups)."""
+        from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+            repack_moe_fp8_layer_for_marlin,
+        )
+
+        if self.use_mxfp8 and not self.quant_config.is_checkpoint_fp8_serialized:
+            # A BF16/FP16 checkpoint served as MXFP8: quantize the experts into
+            # the canonical layout a serialized checkpoint loads into, then
+            # repack them exactly like one (never quantized twice).
+            for name in ("w13", "w2"):
+                qweight, scale = mxfp8_quantize_moe_experts(
+                    getattr(layer, f"{name}_weight").data
+                )
+                setattr(
+                    layer, f"{name}_weight", Parameter(qweight, requires_grad=False)
+                )
+                scale_param = Parameter(scale, requires_grad=False)
+                scale_param.format_ue8m0 = True
+                setattr(layer, f"{name}_weight_scale_inv", scale_param)
+        if self.use_mxfp8:
+            repack_moe_fp8_layer_for_marlin(layer, "mxfp8", scales="weight_scale_inv")
+        else:
+            repack_moe_fp8_layer_for_marlin(
+                layer,
+                "block",
+                scales="weight_scale_inv",
+                block_n=self.weight_block_size[0],
+            )
+
     def process_weights_after_loading(self, layer: Module) -> None:
+        if self.use_marlin:
+            # Marlin reads the tiles and scales directly; no dispatcher wire format.
+            self._process_weights_for_marlin(layer)
+            return
+
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
 
@@ -3140,6 +3239,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_flashinfer_trtllm_routed()
             or moe_runner_backend.is_hpc_ops()
             or moe_runner_backend.is_flashinfer_megamoe()
+            or moe_runner_backend.is_marlin()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             self._owns_moe_runner = True
@@ -3163,6 +3263,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ):
             return RoutingMethodType.DeepSeekV3
         return requested_method
+
+    def get_marlin_quant_info(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.moe_runner.marlin import (
+            build_marlin_fp8_moe_quant_info,
+        )
+
+        return build_marlin_fp8_moe_quant_info(layer)
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         use_rocm_mxfp8 = self.use_mxfp8 and _is_hip and _is_gfx95_supported
@@ -3453,6 +3560,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         elif self.runner.runner_backend.is_hpc_ops():
             quant_info = self._get_hpc_ops_quant_info(layer)
+        elif self.runner.runner_backend.is_marlin():
+            quant_info = self.get_marlin_quant_info(layer)
         elif self.runner.runner_backend.is_triton():
             quant_info = self.get_triton_quant_info(layer)
         else:

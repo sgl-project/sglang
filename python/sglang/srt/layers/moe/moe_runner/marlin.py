@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 import triton.language as tl
+from torch.nn import Module
 
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -106,10 +107,53 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     # Optional
     expert_map: Optional[torch.Tensor] = None
     global_num_experts: int = -1
+    # 8-bit weights that are E4M3 floats (W8A16 FP8), not GPTQ integers.
+    is_fp8: bool = False
     w13_global_scale: Optional[torch.Tensor] = None
     w2_global_scale: Optional[torch.Tensor] = None
     w13_bias: Optional[torch.Tensor] = None
     w2_bias: Optional[torch.Tensor] = None
+
+
+def build_marlin_moe_quant_info(
+    layer: Module, *, weight_bits: int = 4, is_fp8: bool = False
+) -> MarlinMoeQuantInfo:
+    """Build the Marlin quant_info for a Marlin-repacked MoE layer.
+
+    Single source for the runner inputs shared by the marlin path of
+    ``Mxfp4MoEMethod.apply``, :class:`Mxfp4MarlinMoEMethod` and the FP8
+    methods' W8A16 path, including the dispatcher's EP mapping (global ->
+    local expert ids) when EP is on.
+    """
+    expert_map = getattr(layer.dispatcher, "local_expert_mapping", None)
+    global_num_experts = layer.dispatcher.num_experts if expert_map is not None else -1
+    return MarlinMoeQuantInfo(
+        w13_qweight=layer.w13_weight,
+        w2_qweight=layer.w2_weight,
+        w13_scales=layer.w13_weight_scale,
+        w2_scales=layer.w2_weight_scale,
+        w13_g_idx_sort_indices=None,
+        w2_g_idx_sort_indices=None,
+        weight_bits=weight_bits,
+        is_fp8=is_fp8,
+        is_k_full=True,
+        w13_bias=getattr(layer, "w13_weight_bias", None),
+        w2_bias=getattr(layer, "w2_weight_bias", None),
+        expert_map=expert_map,
+        global_num_experts=global_num_experts,
+    )
+
+
+def build_marlin_fp8_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
+    """The Marlin quant_info of an FP8 layer repacked for W8A16."""
+    return build_marlin_moe_quant_info(layer, weight_bits=8, is_fp8=True)
+
+
+def marlin_base_moe_runner(moe_runner_config):
+    """The base runner over Marlin-repacked experts."""
+    from sglang.srt.layers.moe.moe_runner import MoeRunner
+
+    return MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 
 
 @register_fused_func("none", "marlin")
@@ -211,6 +255,7 @@ def fused_experts_none_to_marlin(
         activation=runner_config.activation,
         is_gated=runner_config.is_gated,
         no_combine=runner_config.no_combine,
+        is_fp8=quant_info.is_fp8,
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(
