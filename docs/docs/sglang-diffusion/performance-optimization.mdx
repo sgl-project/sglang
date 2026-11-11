@@ -240,6 +240,30 @@ The encoder bounds queued frames and frame-conversion intermediates, and a
 failed encode falls back to normal saving. Model authors can follow the
 [frame hand-off contract](/docs/sglang-diffusion/support_new_models#video-encode-hand-off).
 
+## FFmpeg binary for MP4 encoding
+
+MP4 outputs are encoded with the static ffmpeg build bundled with
+`imageio-ffmpeg`. SGLang uses this pinned binary on purpose: a different x264
+version can change the lossy video pixels, so outputs stay reproducible across
+machines. On some CPUs the bundled build is much slower than a recent ffmpeg.
+For example, on an aarch64 host (8x RTX 5090, LTX-2.5, 960x544, 121 frames,
+`--x264-preset fast`), the bundled ffmpeg 4.2.2 took 1.21 s per video. ffmpeg
+6.1.1 from the distribution took 0.42 s with the same arguments. Changing the
+x264 preset barely helped the bundled build (1.10 s with `ultrafast`).
+
+If encoding takes a noticeable share of each request, point `imageio-ffmpeg` at
+a newer binary before starting the server:
+
+```bash Command
+IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg sglang serve ...
+```
+
+The binary needs `libx264`, which is in most distribution builds. The decoded
+frames are unchanged. Only the encoded MP4 can differ from the pinned build. In
+the run above, the PSNR between the two encodes was 42 dB or higher and the
+file sizes were the same. Leave the variable unset when you compare outputs
+byte for byte, as CI does.
+
 ## Quality-Tradeoff / Lossy Or Approximate Levers
 
 These techniques can change the denoising path, numerical representation, or generated output. They are useful after you have a baseline and an acceptance criterion for quality.
