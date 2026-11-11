@@ -59,6 +59,7 @@ def _scale_add_rmsnorm_kernel(
     eps,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
+    OPAQUE_MUL: tl.constexpr,
 ):
     row = tl.program_id(0)
     if row >= rows:
@@ -68,8 +69,12 @@ def _scale_add_rmsnorm_kernel(
     residual = tl.load(res_in_ptr + row * D + cols, mask=mask, other=0.0).to(tl.float32)
     update = tl.load(update_ptr + row * D + cols, mask=mask, other=0.0).to(tl.float32)
     scale = tl.load(scale_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    # Same rounding as the eager FP32 residual add: a rounded multiply, not an FMA.
-    acc = residual + mul_rn_f32(update, scale)
+    # Same rounding as the eager FP32 residual add: a rounded multiply, not an
+    # FMA. ROCm has no PTX mul.rn; there the launch disables FP fusion instead.
+    if OPAQUE_MUL:
+        acc = residual + mul_rn_f32(update, scale)
+    else:
+        acc = residual + update * scale
     tl.store(res_out_ptr + row * D + cols, acc, mask=mask)
     rstd = tl.rsqrt(tl.sum(acc * acc, axis=0) / D + eps)
     weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
@@ -176,7 +181,9 @@ def h3_vae_scale_add_rmsnorm(
         float(eps),
         D=dim,
         BLOCK=block,
+        OPAQUE_MUL=torch.version.hip is None,
         num_warps=num_warps,
+        **({"enable_fp_fusion": False} if torch.version.hip else {}),
     )
     out_shape = residual.shape
     residual_out = res_out.view(out_shape)

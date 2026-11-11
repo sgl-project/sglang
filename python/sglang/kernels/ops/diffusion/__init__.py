@@ -343,13 +343,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         "diffusion.h3_vae_rmsnorm",
         KernelBackend.TRITON,
         "norm.h3_vae_fused_norm:h3_vae_rmsnorm",
-        _CUDA,
+        _CUDA | _HIP,
     ),
     (
         "diffusion.h3_vae_scale_add_rmsnorm",
         KernelBackend.TRITON,
         "norm.h3_vae_fused_norm:h3_vae_scale_add_rmsnorm",
-        _CUDA,
+        _CUDA | _HIP,
     ),
     (
         "diffusion.flux2_layernorm_modulate_fp8_quant",

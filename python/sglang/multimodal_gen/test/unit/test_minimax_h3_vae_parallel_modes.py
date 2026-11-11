@@ -373,7 +373,7 @@ def _h3_shaped_decoder():
     return decoder
 
 
-@requires_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_fused_decoder_runs_only_under_the_fast_path_gate():
     """The fused residual add + RMSNorm is not bit-exact, so it runs only while
     the decode-scoped gate is on (quality lossless/high); exact keeps the
@@ -406,9 +406,7 @@ def test_fused_decoder_runs_only_under_the_fast_path_gate():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-def test_fused_decoder_is_disabled_off_nvidia():
-    # On ROCm tensor.is_cuda is true, but the fused Triton norms decoded to NaN
-    # on MI300; the decoder must keep the unfused path there.
+def test_fused_decoder_is_disabled_off_cuda_and_rocm():
     decoder = _h3_shaped_decoder()
     latent = torch.randn(2, 4, 1, 2, 2, device="cuda", dtype=torch.float16)
     from sglang.kernels.ops import diffusion as diffusion_ops
@@ -422,10 +420,39 @@ def test_fused_decoder_is_disabled_off_nvidia():
         torch.autocast("cuda", dtype=torch.float16),
         set_forward_context(current_timestep=0, attn_metadata=None),
         mock.patch(f"{vae_dir}.vae_vit.current_platform.is_cuda", return_value=False),
+        mock.patch(f"{vae_dir}.vae_vit.current_platform.is_rocm", return_value=False),
         mock.patch.object(diffusion_ops, "h3_vae_scale_add_rmsnorm") as scale_add,
     ):
         decoder(latent)
     scale_add.assert_not_called()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_residual_adds_match_the_eager_fp32_add(dtype):
+    """Both fused kernels store the residual as eager computes it: a rounded
+    FP32 multiply, then the add (no FMA; on ROCm the launch disables fusion)."""
+    from sglang.kernels.ops.diffusion import (
+        h3_vae_scale_add_rmsnorm,
+        try_fused_scaled_residual_add_exact,
+    )
+
+    torch.manual_seed(0)
+    residual = torch.randn(3, 1797, 2048, device="cuda") * 4
+    update = torch.randn(3, 1797, 2048, device="cuda").to(dtype)
+    scale = torch.randn(2048, device="cuda")
+    weight = torch.randn(2048, device="cuda")
+    expected = residual + update * scale
+    with torch.no_grad():
+        assert torch.equal(
+            try_fused_scaled_residual_add_exact(residual, update, scale), expected
+        )
+        added, normed = h3_vae_scale_add_rmsnorm(
+            residual.clone(), update, scale, weight, 1e-5
+        )
+    assert torch.equal(added, expected)
+    reference = nn.functional.rms_norm(expected, (2048,), weight, 1e-5)
+    torch.testing.assert_close(normed, reference, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm aten replica")
