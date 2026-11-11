@@ -34,8 +34,9 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
 )
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -151,22 +152,26 @@ class _Arm:
                 ),
                 intermediate_conv_window=[_conv_window(conv.dtype)],
             )
-            self.pool = SimpleNamespace()
+            self.pool = SimpleNamespace(
+                replayssm_is_kda=False, replayssm_spec_fold=False
+            )
         self.dispatcher = dispatcher
         self.lazy = lazy
 
     def backend(self, query_start_loc, cache_indices):
         backend = GDNAttnBackend.__new__(GDNAttnBackend)
-        backend.req_to_token_pool = SimpleNamespace(
-            size=NUM_ROWS - 1,
-            mamba2_layer_cache=self.state.at_layer_idx,
-            get_speculative_mamba2_params_all_layers=lambda: self.state,
-            translate_mamba_indices=lambda ids: ids,
-            mamba_pool=self.pool,
-            short_conv_pool=SimpleNamespace(
-                conv_state=None, intermediate_conv_state=None
-            ),
-            ngram_pool=SimpleNamespace(context=None, intermediate_context=None),
+        backend.req_to_token_pool = SimpleNamespace(size=NUM_ROWS - 1)
+        self.pool.size = NUM_ROWS - 1
+        self.pool.get_speculative_mamba2_params_all_layers = lambda: self.state
+        backend.state_pool = self.pool
+        state_view = SimpleNamespace(mamba2_layer_cache=self.state.at_layer_idx)
+        backend.token_to_kv_pool = SimpleNamespace(
+            layer_router=SimpleNamespace(
+                read=lambda layer_id, part: SimpleNamespace(
+                    view=state_view, view_layer_id=layer_id
+                ),
+                part_view=lambda part: self.pool if part == STATE_PART else None,
+            )
         )
         backend.forward_metadata = ForwardMetadata(
             query_start_loc=query_start_loc, mamba_cache_indices=cache_indices
@@ -200,6 +205,9 @@ class _Arm:
                 fold_every_commit=False,
             )
             return
+        self.hybrid.linear_attn_backend.forward_metadata.mamba_track_indices = (
+            track_slots
+        )
         self.hybrid.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=accept_steps,
             mamba_track_indices=track_slots,
