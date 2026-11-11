@@ -25,7 +25,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session 
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
 )
-from sglang.multimodal_gen.runtime.models.dits.nomas_kv_cache import NomasCache
+from sglang.multimodal_gen.runtime.layers.kvcache.nomas_segment_cache import NomasCache
 from sglang.multimodal_gen.runtime.models.vaes.nomas import NomasStreamingDecoder
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.denoise_loop import (
     NomasLatentSession,

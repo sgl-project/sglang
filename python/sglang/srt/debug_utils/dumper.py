@@ -1605,7 +1605,7 @@ def _init_custom_process_group(
     one and any other custom groups (e.g. RLHF weight-update groups). Used by
     the grafter to bridge baseline and target systems.
 
-    Adapted from sglang.srt.utils.common.init_custom_process_group; inlined
+    Adapted from sglang.srt.utils.process_group.init_custom_process_group; inlined
     here to keep dumper.py free of cross-file imports.
     """
     from torch.distributed.distributed_c10d import (

@@ -10,7 +10,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import NodeId
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
