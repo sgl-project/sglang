@@ -130,12 +130,20 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         super().__init__()
         # Marlin's kernels are CUDA-only; gfx950 requantizes the experts at load
         platform = get_platform()
-        self.requantizes_experts = platform.is_hip and platform.is_gfx95
+        self.use_flashinfer_cutile = get_moe_runner_backend().is_flashinfer_cutile()
+        self.requantizes_experts = (
+            platform.is_hip and platform.is_gfx95 and not self.use_flashinfer_cutile
+        )
         # Marlin unpacks the packed NVFP4 weights in-register and multiplies on
         # bf16 tensor cores, keeping the 4-bit footprint without FP4 hardware.
-        self.use_marlin = not platform.is_blackwell and not self.requantizes_experts
+        self.use_marlin = (
+            not platform.is_blackwell
+            and not self.requantizes_experts
+            and not self.use_flashinfer_cutile
+        )
         self.use_flashinfer_trtllm = (
-            not self.use_marlin
+            not self.use_flashinfer_cutile
+            and not self.use_marlin
             and get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
         self.use_mega_moe_prefill = (
@@ -144,6 +152,7 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         if (
             not self.use_marlin
             and not self.requantizes_experts
+            and not self.use_flashinfer_cutile
             and not self.use_flashinfer_trtllm
             and not get_moe_a2a_backend().is_megamoe()
         ):
@@ -162,6 +171,30 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         # Compressed-tensors loaders do not perform the ModelOpt W31 remap.
         return False
 
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        super().create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=params_dtype,
+            **extra_weight_attrs,
+        )
+        if self.use_flashinfer_cutile:
+            # Dynamic-activation checkpoints may omit these scales. Set their
+            # defaults before loading, so explicit checkpoint values still win
+            # and unsupported non-unit values are rejected during preparation.
+            layer.w13_input_global_scale.fill_(1.0)
+            layer.w2_input_global_scale.fill_(1.0)
+
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
         if self.requantizes_experts:
@@ -171,6 +204,12 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
             from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
 
             self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+        elif self.use_flashinfer_cutile:
+            from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
+
+            self.runner = MoeRunner(
+                MoeRunnerBackend.FLASHINFER_CUTILE, moe_runner_config
+            )
         elif self.use_flashinfer_trtllm:
             import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm  # noqa: F401
             from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
@@ -251,6 +290,26 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
             global_num_experts=global_num_experts,
         )
 
+    def _process_cutile_weights(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutile import (
+            prepare_flashinfer_cutile_nvfp4_weights,
+        )
+
+        self.cutile_quant_info = prepare_flashinfer_cutile_nvfp4_weights(
+            layer=layer, config=self.moe_runner_config
+        )
+        # The prepared view owns the tensors needed at execution time.
+        # Do not retain the original gate/up and unswizzled scale copies.
+        for name in (
+            "w13_weight_packed",
+            "w2_weight_packed",
+            "w13_weight_scale",
+            "w2_weight_scale",
+        ):
+            layer.register_parameter(name, None)
+        layer._mega_moe_nvfp4 = False
+        layer._mega_moe_weights_built = False
+
     def _process_trtllm_weights(self, layer: torch.nn.Module) -> None:
         if self.use_mega_moe_prefill:
             _set_mega_moe_alphas(layer)
@@ -280,6 +339,9 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
             return
         if self.use_marlin:
             self._process_marlin_weights(layer)
+            return
+        if self.use_flashinfer_cutile:
+            self._process_cutile_weights(layer)
             return
         if self.use_flashinfer_trtllm:
             self._process_trtllm_weights(layer)
@@ -319,6 +381,8 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
             return _hip.apply_requantized_experts(self, layer, dispatch_output)
         if self.use_marlin:
             return self.runner.run(dispatch_output, self.get_marlin_quant_info(layer))
+        if self.use_flashinfer_cutile:
+            return self.runner.run(dispatch_output, self.cutile_quant_info)
         if self.use_flashinfer_trtllm:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmFp4MoeQuantInfo,
