@@ -401,17 +401,9 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             parse_dflash_draft_config,
         )
 
-        model_override_args = json.loads(cfg.json_model_override_args)
         inferred_block_size = None
         try:
-            from sglang.srt.hf_transformers import get_config
-
-            draft_hf_config = get_config(
-                cfg.speculative_draft_model_path,
-                trust_remote_code=cfg.trust_remote_code,
-                revision=cfg.speculative_draft_model_revision,
-                model_override_args=model_override_args,
-            )
+            draft_hf_config = _load_draft_hf_config(cfg)
             inferred_block_size = parse_dflash_draft_config(
                 draft_hf_config=draft_hf_config
             ).resolve_block_size(default=None)
@@ -915,7 +907,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
 
 
 def _load_draft_hf_config(cfg):
-    # Deferred: hf_transformers adds ~0.8 s to the server_args import.
     from sglang.srt.hf_transformers import get_config
 
     return get_config(
@@ -961,8 +952,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     Consumed by ModelRunner's `is_draft_worker` override (one backend for all
     draft modes).
     """
-    # Deferred: dflash_utils adds ~1.6 s to the server_args import.
-    from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
+    from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
     cfg = resolving_view(server_args)
 
@@ -974,16 +964,14 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 "DFLASH", backend
             )
         if backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
-            # These serve only MLA layers: a draft verify window through the
-            # target's MLA decode kernels (DCP owner rows under DCP).
-            # trtllm_mla's decode kernel has no bidirectional mask, so a draft
-            # takes it only when it is named, not from the target.
+            # trtllm_mla has no bidirectional mask: taken only when named.
             if (
                 backend == "trtllm_mla"
                 and cfg.speculative_draft_attention_backend is None
             ):
                 return False
-            return is_dflash_mla_draft_config(_load_draft_hf_config(cfg))
+            draft_hf_config = _load_draft_hf_config(cfg)
+            return parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla
         return backend in supported_draft_backends
 
     def get_fallback_backend() -> str:
@@ -1029,18 +1017,9 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         )
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
-        from sglang.srt.hf_transformers import get_config
-        from sglang.srt.speculative.dflash_utils import (
-            get_dflash_layer_types,
-            parse_dflash_draft_config,
-        )
+        from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
 
-        draft_hf_config = get_config(
-            cfg.speculative_draft_model_path,
-            trust_remote_code=cfg.trust_remote_code,
-            revision=cfg.speculative_draft_model_revision,
-            model_override_args=json.loads(cfg.json_model_override_args),
-        )
+        draft_hf_config = _load_draft_hf_config(cfg)
         draft_text_config = (
             getattr(draft_hf_config, "text_config", None) or draft_hf_config
         )
@@ -1081,10 +1060,9 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
 
 
 def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
-    # Deferred: dflash_utils adds ~1.6 s to the server_args import.
     from sglang.srt.speculative.dflash_utils import (
         get_dflash_layer_types,
-        is_dflash_mla_draft_config,
+        parse_dflash_draft_config,
     )
 
     cfg = resolving_view(server_args)
@@ -1095,10 +1073,9 @@ def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
     ):
         return
     draft_hf_config = _load_draft_hf_config(cfg)
-    if not is_dflash_mla_draft_config(draft_hf_config):
+    if not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
         return
-    # Sliding layers index req_to_token by absolute position, which the compact
-    # draft table of --speculative-draft-window-size does not keep.
+    # Sliding layers index req_to_token by absolute position, not the compact table.
     layer_types = get_dflash_layer_types(draft_hf_config)
     if layer_types and "sliding_attention" in layer_types:
         raise ValueError(

@@ -40,6 +40,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 
@@ -114,13 +115,14 @@ class TestAllPPLoras(CustomTestCase):
             req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
             req.output_ids = []
             req.is_retracted = False
+            req.owner_list = None
             req.time_stats = SimpleNamespace(wait_queue_entry_time=0.0)
             return req
 
         short, long = request("short", 5), request("long", 100)
         waiting = request("waiting", 100)
         waiting_queue = IndexedReqList(ListKind.WAITING)
-        waiting_queue.join([waiting])
+        move([waiting], waiting_queue)
         first, second = _batch(short), _batch(long)
         for batch in (first, second):
             batch.batch_is_full = False

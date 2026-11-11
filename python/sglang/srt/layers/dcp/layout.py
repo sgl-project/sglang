@@ -12,8 +12,8 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Pure index math for decode context parallel (DCP): per-rank lengths and
-the owner-rule local-index filter."""
+"""Decode context parallel (DCP) layout: per-rank lengths, the owner-rule
+local-index filter, and the LSE base of each MLA backend's partials."""
 
 from typing import Optional
 

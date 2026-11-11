@@ -565,5 +565,7 @@ POSITIONAL_FIELD_ORDER = (
     "log_schedule_decisions",
     "speculative_dspark_lm_head_dtype",
     "speculative_dflash_draft_kv_ring",
+    "media_url_timeout",
+    "allow_local_media_files",
 )
 # fmt: on

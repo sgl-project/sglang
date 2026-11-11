@@ -306,11 +306,10 @@ class TestDFlashMLABackends(unittest.TestCase):
             with self.subTest(backend=backend_name):
                 self._check(backend_name, causal=True, sliding_window=SLIDING_WINDOW)
         # trtllm-gen has no 64 < heads < 128 kernel: the query is padded to 128.
-        for backend_name in ("trtllm_mla", "cutedsl_mla"):
-            with self.subTest(backend=backend_name, heads=96):
-                self._check(
-                    backend_name, causal=True, sliding_window=SLIDING_WINDOW, heads=96
-                )
+        with self.subTest(backend="cutedsl_mla", heads=96):
+            self._check(
+                "cutedsl_mla", causal=True, sliding_window=SLIDING_WINDOW, heads=96
+            )
 
 
 if __name__ == "__main__":

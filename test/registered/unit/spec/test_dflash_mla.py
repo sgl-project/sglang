@@ -302,19 +302,27 @@ class TestDFlashMLA(CustomTestCase):
             with self.subTest(backend=backend), patch(resolve, return_value=backend):
                 attn = DFlashMLAAttention(config, layer_id=0)
                 self.assertEqual(attn.attn_mqa.sliding_window_size, 3)
+        # DSPARK's worker runs cutedsl_mla / trtllm_mla drafts on flashinfer.
+        with (
+            patch(
+                resolve,
+                side_effect=lambda algo_label=None: (
+                    "cutedsl_mla" if algo_label == "DFLASH" else "flashinfer"
+                ),
+            ),
+            patch(
+                "sglang.srt.models.dflash.get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="DSPARK"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "require .* triton"):
+                DFlashMLAAttention(config, layer_id=0)
         config.is_causal = False
-        for backend in ("trtllm_mla", "cutedsl_mla"):
-            with self.subTest(backend=backend, causal=False):
-                with patch(resolve, return_value=backend):
-                    with self.assertRaisesRegex(ValueError, "causally"):
-                        DFlashMLAAttention(config, layer_id=0)
-
-    def test_bidirectional_full_attention_layers_reject_trtllm_mla(self):
-        """trtllm_mla verifies causally; cutedsl_mla keeps main's behavior for
-        full_attention layers."""
-        config = Qwen3Config(**_export_fields(), layer_types=["full_attention"])
-        config.is_causal = False
-        resolve = "sglang.srt.speculative.draft_worker_common.resolve_draft_worker_attention_backend"
+        with patch(resolve, return_value="cutedsl_mla"):
+            with self.assertRaisesRegex(ValueError, "causally"):
+                DFlashMLAAttention(config, layer_id=0)
+        # Bidirectional full_attention layers: rejected on trtllm_mla only.
+        config.layer_types = ["full_attention"]
         with patch(resolve, return_value="trtllm_mla"):
             with self.assertRaisesRegex(ValueError, "causally"):
                 DFlashMLAAttention(config, layer_id=0)

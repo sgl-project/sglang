@@ -114,6 +114,11 @@ def _multi_ctas_kv_counter_bytes(
     )
 
 
+def trtllm_padded_heads(num_heads: int) -> int:
+    """Pad the unsupported 65-127 MLA query-head range for trtllm-gen."""
+    return 128 if 64 < num_heads < 128 else num_heads
+
+
 def make_persistent_multi_ctas_kv_counter_buffer(
     device: torch.device, num_q_heads: int, max_batch_size: int
 ) -> torch.Tensor:
@@ -300,23 +305,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.disable_chunked_prefix_cache = get_schedule().disable_chunked_prefix_cache
 
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
-        # Per-row window indices, built at the first sliding layer of a forward
-        # and reused by the next ones: (id(forward_batch), layer_id, indices,
-        # counts). An id reused by a later batch cannot match: its forward
-        # starts at a layer id no greater than the cached one.
+        # (id(forward_batch), layer_id, indices, counts) of the last sliding layer;
+        # a reused id cannot match, as a new forward starts at a lower layer id.
         self._window_index_cache = None
         self._window_counter_buffer = None
         self._window_row_indptr = None
         if model_runner.sliding_window_size is not None and (
             model_runner.sliding_window_size >= 0
         ):
-            # The parent's q_indptr_decode covers the padded batch, which can
-            # exceed max_running_requests under MLP sync.
-            max_rows = (self.q_indptr_decode.numel() - 1) * max(
-                self.num_draft_tokens or 1, 1
-            )
+            # Padded graph batch, which can exceed max_running_requests.
+            max_rows = (self.q_indptr_decode.numel() - 1) * (self.num_draft_tokens or 1)
             self._window_counter_buffer = make_persistent_multi_ctas_kv_counter_buffer(
-                torch.device(self.device), 128, max_batch_size=max_rows
+                torch.device(self.device),
+                trtllm_padded_heads(self.num_decode_q_heads),
+                max_batch_size=max_rows,
             )
             self._window_row_indptr = torch.arange(
                 max_rows + 1, dtype=torch.int32, device=self.device
@@ -1274,8 +1276,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             return self._dummy_dcp_decode_for_autotune(q, layer)
         if layer.sliding_window_size >= 0:
             raise NotImplementedError(
-                "trtllm_mla applies a sliding window only to target-verify / "
-                "draft-extend forwards."
+                "trtllm_mla applies a sliding window only to target-verify forwards."
             )
 
         merge_query = q_rope is not None
@@ -1502,8 +1503,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
             return (out, lse) if get_parallel().dcp_enabled else out
         indices, counts = self._window_sparse_indices(layer, forward_batch)
-        # trtllm-gen MLA has no 64 < heads < 128 variant (96-head draft under DCP8).
-        kernel_heads = 128 if 64 < heads < 128 else heads
+        kernel_heads = trtllm_padded_heads(heads)
         query = q.reshape(rows, 1, heads, head_dim)
         if kernel_heads != heads:
             padded = query.new_zeros((rows, 1, kernel_heads, head_dim))
@@ -1530,8 +1530,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if not get_parallel().dcp_enabled:
             return out.reshape(rows, -1)
         lse = lse[:, :heads]
-        # trtllm-gen returns a base-2 LSE; the DCP merge reads the base from the
-        # backend name. -inf rows (no owned key) stay -inf.
+        # trtllm-gen returns a base-2 LSE; -inf rows (no owned key) stay -inf.
         if is_mla_dcp_lse_base_on_e(self.decode_attention_backend_str):
             lse = lse * math.log(2.0)
         return out.contiguous().flatten(1), lse.contiguous()
@@ -1558,13 +1557,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and get_in_autotune_dummy_run()
         ):
             return self._dummy_dcp_decode_for_autotune(q, layer)
-        if layer.sliding_window_size >= 0 and not (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+        if (
+            layer.sliding_window_size >= 0
+            and not forward_batch.forward_mode.is_target_verify()
         ):
             raise NotImplementedError(
-                "trtllm_mla applies a sliding window only to target-verify / "
-                "draft-extend forwards."
+                "trtllm_mla applies a sliding window only to target-verify forwards."
             )
 
         # The fallback belongs to genuine extend forwards only. Target-verify /
