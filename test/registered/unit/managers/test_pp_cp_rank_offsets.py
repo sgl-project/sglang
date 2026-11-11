@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -14,6 +14,10 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.io_struct import (  # noqa: E402
+    ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
@@ -257,6 +261,44 @@ class TestDSparkPPOutput(CustomTestCase):
         torch.testing.assert_close(batch.spec_info.new_seq_lens, batch.seq_lens)
         torch.testing.assert_close(payloads[0].bonus_tokens, tokens)
         self.assertEqual(payloads[0].hidden_states.numel(), 0)
+
+
+class TestReleaseVerdictRing(CustomTestCase):
+    def _stage(self, *, is_first_rank, verdict_from_prev_stage):
+        return SimpleNamespace(
+            pp_group=SimpleNamespace(is_first_rank=is_first_rank),
+            _pp_release_reqs_awaiting_verdict=(),
+            _pp_release_verdict_send_work=[],
+            _pp_commit_comm_work=Mock(),
+            _pp_send_pyobj_to_next_stage=Mock(return_value=[]),
+            _pp_recv_pyobj_from_prev_stage=Mock(return_value=[verdict_from_prev_stage]),
+            send_control_output=Mock(),
+        )
+
+    def test_the_first_stage_answers_with_the_verdict_that_came_round(self):
+        """Answering at dispatch tells the caller memory is free while later stages hold it."""
+        request = ReleaseMemoryOccupationReqInput()
+        released = ReleaseMemoryOccupationReqOutput(success=True, message="Success")
+        refused = ReleaseMemoryOccupationReqOutput(success=False, message="busy")
+        stage = self._stage(is_first_rank=True, verdict_from_prev_stage=refused)
+
+        SchedulerPPMixin._pp_pass_release_verdict(stage, released, request)
+        stage.send_control_output.assert_not_called()
+
+        SchedulerPPMixin._pp_answer_release_requests(stage)
+        stage.send_control_output.assert_called_once_with(refused, request)
+
+    def test_a_later_stage_passes_on_an_earlier_refusal(self):
+        refused = ReleaseMemoryOccupationReqOutput(success=False, message="busy")
+        released = ReleaseMemoryOccupationReqOutput(success=True, message="Success")
+        stage = self._stage(is_first_rank=False, verdict_from_prev_stage=refused)
+
+        SchedulerPPMixin._pp_pass_release_verdict(
+            stage, released, ReleaseMemoryOccupationReqInput()
+        )
+
+        (sent,), _ = stage._pp_send_pyobj_to_next_stage.call_args
+        self.assertEqual(sent, [refused])
 
 
 if __name__ == "__main__":

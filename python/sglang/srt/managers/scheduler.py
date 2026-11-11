@@ -54,7 +54,6 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
     is_scheduler_io_rank,
-    is_scheduler_last_stage_io_rank,
     publish,
     spawn_world_rank,
 )
@@ -193,6 +192,7 @@ from sglang.srt.managers.io_struct import (
     PluginWeightUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
     ReleaseUocrDocReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -886,8 +886,6 @@ class Scheduler(
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
             is_rank_zero=is_rank_zero,
-            is_last_stage_io_rank=is_scheduler_last_stage_io_rank()
-            and not envs.SGLANG_RUST_SERVER.get(),
             # The snapshot taken at construction, not a second bag read: this
             # scheduler gates its tokenizer init on the same value, and the two
             # must not be able to disagree.
@@ -2342,6 +2340,11 @@ class Scheduler(
                 if self.rust_server is None and isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
+                elif get_parallel().pp_size > 1 and isinstance(
+                    output, ReleaseMemoryOccupationReqOutput
+                ):
+                    # Answered by the first stage once every stage has released.
+                    self._pp_pass_release_verdict(output, recv_req)
                 else:
                     self.send_control_output(output, recv_req)
 
@@ -2375,7 +2378,7 @@ class Scheduler(
             # not consumed); the Rust api_server shapes it per-endpoint.
             self.rust_server.push_control_output(recv_req, output)
         else:
-            self.ipc_channels.send_control_output(output, recv_req)
+            self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
     @staticmethod
     def _tokenized_requests(recv_req):

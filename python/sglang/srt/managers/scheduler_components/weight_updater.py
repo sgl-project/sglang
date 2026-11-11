@@ -470,9 +470,15 @@ class SchedulerWeightUpdaterManager:
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         scheduler = self.scheduler
-        if not self.is_fully_idle(
+        idle = self.is_fully_idle(
             ignore_waiting=scheduler is not None and scheduler.pause_state.paused
-        ):
+        )
+        # A rank refusing alone would leave its peers in the barriers below.
+        busy = torch.tensor([int(not idle)])
+        torch.distributed.all_reduce(
+            busy, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group
+        )
+        if busy.item():
             return ReleaseMemoryOccupationReqOutput(
                 success=False,
                 message="Memory was not released because requests are still "
@@ -516,8 +522,7 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         torch.get_device_module().synchronize()
-        # Rank 0 relays the request to the next stage and sends the reply.
-        # neither may happen before this rank's TP peers have released too.
+        # The verdict leaves on return; every TP peer must have released by then.
         torch.distributed.barrier(group=self.tp_cpu_group)
 
         return ReleaseMemoryOccupationReqOutput(success=True, message="Success")

@@ -52,7 +52,6 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_server_args,
     is_scheduler_io_rank,
-    is_scheduler_last_stage_io_rank,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
     publish,
@@ -581,22 +580,6 @@ class TestSchedulerIoRank(_IsolatedOverrides):
         for name in ranks:
             with get_parallel().override(**{**ranks, name: 1}):
                 self.assertFalse(is_scheduler_io_rank(), name)
-
-
-class TestSchedulerLastStageIoRank(_IsolatedOverrides):
-    def test_only_the_io_rank_counterpart_on_the_last_stage_matches(self):
-        ranks = {"pp_size": 2, "pp_rank": 1, "attn_tp_rank": 0, "attn_cp_rank": 0}
-        with get_parallel().override(**ranks):
-            self.assertTrue(is_scheduler_last_stage_io_rank())
-        for name, value in (("pp_rank", 0), ("attn_tp_rank", 1), ("attn_cp_rank", 1)):
-            with get_parallel().override(**{**ranks, name: value}):
-                self.assertFalse(is_scheduler_last_stage_io_rank(), name)
-
-    def test_a_single_stage_io_rank_is_also_the_last_stage_io_rank(self):
-        with get_parallel().override(
-            pp_size=1, pp_rank=0, attn_tp_rank=0, attn_cp_rank=0
-        ):
-            self.assertTrue(is_scheduler_last_stage_io_rank())
 
 
 class TestParallelDCP(_IsolatedOverrides):
