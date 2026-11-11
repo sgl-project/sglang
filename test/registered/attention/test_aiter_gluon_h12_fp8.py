@@ -545,6 +545,8 @@ class TestFp8QAsmPersistScope(CustomTestCase):
             get_num_kv_heads=lambda tp_size: 1,
             attention_arch=AttentionArch.MLA,
             v_head_dim=512,
+            qk_rope_head_dim=64,
+            hf_config=SimpleNamespace(model_type="kimi_k3"),
             context_len=4096,
         )
         kv_pool = SimpleNamespace(
