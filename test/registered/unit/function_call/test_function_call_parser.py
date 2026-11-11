@@ -6292,7 +6292,7 @@ class TestMuseSparkFunctionCallParser(CustomTestCase):
                 )
 
 
-class TestToolCallParserNames(CustomTestCase):
+class TestToolCallParserNames(unittest.TestCase):
     def test_matches_registry(self):
         # `server_args` builds the --tool-call-parser choices from this list to
         # keep the registry, and its dependencies, out of argument parsing.
@@ -6300,17 +6300,6 @@ class TestToolCallParserNames(CustomTestCase):
             sorted(TOOL_CALL_PARSER_NAMES),
             sorted(FunctionCallParser.ToolCallParserEnum),
         )
-
-    def test_minicpm5_uses_team_xml_detector(self):
-        from sglang.srt.function_call.minicpm5_detector import MiniCPM5Detector
-        from sglang.srt.function_call.minicpm5_xml_detector import (
-            MiniCPM5XmlFormatDetector,
-        )
-
-        self.assertNotIn("minicpm4_xml", TOOL_CALL_PARSER_NAMES)
-        self.assertIs(MiniCPM5Detector, MiniCPM5XmlFormatDetector)
-        parser = FunctionCallParser(tools=[], tool_call_parser="minicpm5")
-        self.assertIs(type(parser.detector), MiniCPM5XmlFormatDetector)
 
 
 if __name__ == "__main__":
