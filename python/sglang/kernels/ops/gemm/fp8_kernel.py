@@ -635,10 +635,13 @@ def w8a8_block_fp8_matmul_triton(
 
     # Split-K accumulates K in SPLIT_K separate fp32 partials, so its results
     # do not match the single-accumulator kernels bit-for-bit.
-    hopper_tuned = get_platform().is_sm90 and (
+    # The split/swap kernel body is plain Triton (pointer arithmetic, tl.dot,
+    # tl.trans), so route on the requested config rather than on the architecture:
+    # sm_120 gets the same entries when its tuned configs ask for them.
+    split_k_tuned = _is_cuda and (
         config.get("SWAP_AB", False) or config.get("SPLIT_K", 1) > 1
     )
-    if hopper_tuned:
+    if split_k_tuned:
         kernel = _w8a8_block_fp8_matmul_hopper
     elif _is_gfx1250:
         config = {**config, "num_stages": 1}
@@ -646,7 +649,7 @@ def w8a8_block_fp8_matmul_triton(
     else:
         kernel = _w8a8_block_fp8_matmul
 
-    split_k = config.get("SPLIT_K", 1) if hopper_tuned else 1
+    split_k = config.get("SPLIT_K", 1) if split_k_tuned else 1
     if split_k > 1:
         assert split_k & (split_k - 1) == 0
         partials = torch.empty((split_k, M, N), device=A.device, dtype=torch.float32)
@@ -659,7 +662,7 @@ def w8a8_block_fp8_matmul_triton(
         blocks = triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(
             N, META["BLOCK_SIZE_N"]
         )
-        return (blocks, split_k) if hopper_tuned else (blocks,)
+        return (blocks, split_k) if split_k_tuned else (blocks,)
 
     kernel[grid](
         A,
