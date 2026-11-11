@@ -65,6 +65,32 @@ register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 class InputMessageConstructionTestCase(CustomTestCase):
+    def test_standalone_reasoning_has_content_for_chat_rendering(self):
+        """Reasoning without an adjacent assistant answer must remain renderable
+        by chat templates requiring content or tool calls on assistant messages."""
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "plan"}],
+                },
+                {"role": "user", "content": "Continue"},
+            ],
+            store=False,
+        )
+
+        messages = serving._construct_input_messages(request)
+
+        self.assertEqual(
+            messages,
+            [
+                {"role": "assistant", "content": "", "reasoning_content": "plan"},
+                {"role": "user", "content": "Continue"},
+            ],
+        )
+
     def test_previous_response_replays_assistant_text_not_instructions(self):
         serving = make_serving()
         prev_response = Mock(id="resp_prev")
@@ -329,7 +355,7 @@ class InputMessageConstructionTestCase(CustomTestCase):
             [m.get("phase") for m in messages], ["commentary", "final_answer", None]
         )
         self.assertEqual(
-            [m.get("content") for m in messages], ["working", "answer", None]
+            [m.get("content") for m in messages], ["working", "answer", ""]
         )
         self.assertEqual(
             [m["reasoning_content"] for m in messages], ["plan", "conclusion", "lookup"]

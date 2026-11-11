@@ -1632,6 +1632,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return None
             return {
                 "role": "assistant",
+                "content": "",
                 "reasoning_content": "\n".join(text_parts),
             }
         if msg_type not in (None, "message"):
@@ -1674,7 +1675,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 and merged[-1].get("role") == "assistant"
                 and (
                     merged[-1].get("phase") == msg.get("phase")
-                    or set(merged[-1]) == {"role", "reasoning_content"}
+                    or (
+                        set(merged[-1]) - {"content"} == {"role", "reasoning_content"}
+                        and not merged[-1].get("content")
+                    )
                 )
             ):
                 prev = merged[-1] = dict(merged[-1])
