@@ -421,6 +421,11 @@ class Envs:
     # With SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION: post-verify graph sets (batch shape x
     # verify logits buffer) kept before a new one runs eager (64 without the master).
     SGLANG_POST_VERIFY_MAX_GRAPH_KEYS = EnvInt(64)
+    # The post-verify graph writes the bonus tokens as int64, the dtype the relay and the
+    # next draft read, so an unchanged batch's relay needs no cast.
+    SGLANG_OPT_SPEC_POST_VERIFY_BONUS_I64 = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

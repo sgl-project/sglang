@@ -293,6 +293,49 @@ class TestPostVerifyGraphs(CustomTestCase):
                         eagle_post_verify_graphs._max_graph_keys(), expected
                     )
 
+    def test_bonus_tokens_take_the_relay_dtype_only_under_their_switch(self):
+        """SGLANG_OPT_SPEC_POST_VERIFY_BONUS_I64: the graphs' commit-outputs launch
+        writes the bonus tokens as int64, the relay buffer's dtype, so the next round's
+        relay keeps them uncast; otherwise int32 as before."""
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        child = envs.SGLANG_OPT_SPEC_POST_VERIFY_BONUS_I64
+        for master_on, value, expected in (
+            (False, "1", torch.int32),
+            (True, None, torch.int64),
+            (True, "0", torch.int32),
+        ):
+            with (
+                self.subTest(master=master_on, value=value),
+                master.override(master_on),
+                child.override(value) if value else nullcontext(),
+            ):
+                self.assertIs(eagle_post_verify_graphs._bonus_dtype(), expected)
+        graphs = EaglePostVerifyGraphs(
+            target_worker=_target_worker(),
+            simulated_acc_len_rng=simulated_acc_len_generator(0),
+        )
+        slot = SimpleNamespace(
+            staged={"seq_lens": torch.tensor([5])},
+            tokens_per_request=4,
+            track_interval=0,
+        )
+        for dtype in (torch.int32, torch.int64):
+            commit = MagicMock(return_value=(None, None, None, None))
+            with (
+                self.subTest(dtype=dtype),
+                patch.object(eagle_post_verify_graphs, "_BONUS_DTYPE", dtype),
+                patch.object(
+                    eagle_post_verify_graphs, "_sample", return_value=(1, 2, 3)
+                ),
+                patch(
+                    "sglang.kernels.ops.speculative.eagle."
+                    "prepare_verify_commit_outputs",
+                    commit,
+                ),
+            ):
+                graphs._body(slot)
+                self.assertIs(commit.call_args.kwargs["bonus_dtype"], dtype)
+
     def test_a_kv_pool_that_clears_c128_draft_states_keeps_the_eager_verify(self):
         """The post-verify graphs skip the eager verify's cleanup of rejected c128
         draft states (DeepSeek-V4), so a KV pool that has one never reaches them;

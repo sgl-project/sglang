@@ -46,6 +46,17 @@ _MAX_POST_VERIFY_STATES = _max_graph_keys()
 _ONE_LAUNCH_LOAD = envs.SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD.get()
 
 
+def _bonus_dtype() -> torch.dtype:
+    """SGLANG_OPT_SPEC_POST_VERIFY_BONUS_I64: the bonus tokens in the relay buffer's
+    dtype (int64), so the next round's relay does not cast them."""
+    return (
+        torch.int64 if envs.SGLANG_OPT_SPEC_POST_VERIFY_BONUS_I64.get() else torch.int32
+    )
+
+
+_BONUS_DTYPE = _bonus_dtype()
+
+
 class EaglePostVerifyGraphs:
     """The verify's post-section in SGLang's own CUDA graphs, one set per key: batch
     size, sampling mode, forced acceptance, tracking and the verify logits buffer."""
@@ -222,6 +233,7 @@ class EaglePostVerifyGraphs:
                 slot.staged["seq_lens"],
                 num_draft_tokens=slot.tokens_per_request,
                 mamba_track_interval=slot.track_interval,
+                bonus_dtype=_BONUS_DTYPE,
             )
         )
         return (
