@@ -894,9 +894,13 @@ class SchedulerPPMixin:
         return next_pp_outputs, next_batch_result, d2h_event
 
     def _pp_send_reqs_to_next_stage(self: Scheduler, recv_reqs: List) -> List[P2PWork]:
-        return self._pp_send_pyobj_to_next_stage(
+        work = self._pp_send_pyobj_to_next_stage(
             strip_mm_features_for_pp_relay(recv_reqs), async_send=True
         )
+        # The next stage receives a verdict only once it has these requests.
+        work += self._pp_release_verdict_send_work
+        self._pp_release_verdict_send_work = []
+        return work
 
     def _pp_send_pyobj_to_next_stage(
         self: Scheduler, data, async_send: bool = False, tag: int = 0
@@ -928,16 +932,27 @@ class SchedulerPPMixin:
     ) -> None:
         """Fold this stage's verdict into the earlier stages' and send it on."""
         if self.pp_group.is_first_rank:
-            self._pp_release_reqs_awaiting_verdict += (recv_req,)
+            first_stage_released = output.success
+            if first_stage_released:
+                self._pp_release_reqs_awaiting_verdict += (recv_req,)
+            else:
+                # A busy pipeline stalls if this stage waits on a later one.
+                self.send_control_output(output, recv_req)
         else:
-            (earlier,) = self._pp_recv_pyobj_from_prev_stage(tag=_RELEASE_VERDICT_TAG)
+            first_stage_released, earlier = self._pp_recv_pyobj_from_prev_stage(
+                tag=_RELEASE_VERDICT_TAG
+            )
             if not earlier.success:
                 output = earlier
-        self._pp_commit_comm_work(self._pp_release_verdict_send_work)
-        # Async: the next stage receives only after this one relays the request.
-        self._pp_release_verdict_send_work = self._pp_send_pyobj_to_next_stage(
-            [output], async_send=True, tag=_RELEASE_VERDICT_TAG
-        )
+        if not self.pp_group.is_last_rank:
+            self._pp_release_verdict_send_work += self._pp_send_pyobj_to_next_stage(
+                [first_stage_released, output],
+                async_send=True,
+                tag=_RELEASE_VERDICT_TAG,
+            )
+        elif first_stage_released:
+            # Blocking: the first stage is idle and receives at the end of its iteration.
+            self._pp_send_pyobj_to_next_stage([output], tag=_RELEASE_VERDICT_TAG)
 
     def _pp_answer_release_requests(self: Scheduler) -> None:
         """Blocks on the last stage, so runs after the iteration's sends."""
