@@ -165,6 +165,52 @@ def test_sampling_mask_output_uses_generation_result_copy_path():
     assert result.copy_done.record_count == 1
 
 
+def test_decode_top_logprobs_take_one_host_copy_per_list():
+    """The decode loop waits on the host copies of a step, so per-request
+    top-logprob rows must not each take their own: the count stays fixed as the
+    batch grows, and rows of different lengths keep their values and order."""
+    values = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    indices = torch.arange(12).reshape(4, 3)
+    lengths = [3, 1, 0, 2]
+    logits_output = LogitsProcessorOutput(
+        next_token_logits=None,
+        next_token_logprobs=torch.zeros(4),
+        next_token_top_logprobs_val=[values[i, :k] for i, k in enumerate(lengths)],
+        next_token_top_logprobs_idx=[indices[i, :k] for i, k in enumerate(lengths)],
+        next_token_token_ids_logprobs_val=[values[0, :2], [], values[2, :1], []],
+    )
+    result = GenerationBatchResult(
+        logits_output=logits_output,
+        next_token_ids=torch.arange(4),
+        copy_done=CopyDone(),
+    )
+
+    with patch(
+        "sglang.srt.managers.utils._async_d2h",
+        side_effect=lambda tensor: tensor.clone(),
+    ) as copy_tensor:
+        result.copy_to_cpu(return_logprob=True)
+
+    # next_token_logprobs, next_token_ids, and one per row list.
+    assert copy_tensor.call_count == 5
+    assert [v.tolist() for v in logits_output.next_token_top_logprobs_val] == [
+        [0.0, 1.0, 2.0],
+        [3.0],
+        [],
+        [9.0, 10.0],
+    ]
+    assert [x.tolist() for x in logits_output.next_token_top_logprobs_idx] == [
+        [0, 1, 2],
+        [3],
+        [],
+        [9, 10],
+    ]
+    token_ids_rows = logits_output.next_token_token_ids_logprobs_val
+    assert token_ids_rows[0].tolist() == [0.0, 1.0]
+    assert token_ids_rows[2].tolist() == [6.0]
+    assert token_ids_rows[1] == [] and token_ids_rows[3] == []
+
+
 def test_pipeline_sampling_mask_round_trip_without_logprobs():
     sampling_output = SamplingMaskOutput(
         token_ids=torch.tensor([[3, 5]], dtype=torch.int32),
