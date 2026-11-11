@@ -634,6 +634,8 @@ class TestBuildResponseViaStore(unittest.TestCase):
                 "denoising_env.pos_cond_kwargs.encoder_hidden_states.0.0",
                 "denoising_env.pos_cond_kwargs.encoder_hidden_states.0.1",
                 "denoising_env.pos_cond_kwargs.pooled",
+                "generated_output.0",
+                "generated_output.1",
             },
         )
         self.assertTrue(
@@ -641,11 +643,15 @@ class TestBuildResponseViaStore(unittest.TestCase):
                 stored["dit_trajectory.latents.1.2"], rtd.dit_trajectory.latents[1, 2]
             )
         )
+        self.assertTrue(torch.equal(stored["generated_output.1"], batch.output[1]))
         self.assertIs(
             stored["denoising_env.pos_cond_kwargs.pooled"],
             rtd.denoising_env.pos_cond_kwargs["pooled"],
         )
         for row, resp in enumerate(resps):
+            self.assertEqual(
+                resp.generated_output, {"__store__": f"generated_output.{row}"}
+            )
             self.assertEqual(
                 resp.dit_trajectory["latents"],
                 [{"__store__": f"dit_trajectory.latents.{row}.{k}"} for k in (0, 1, 2)],
@@ -714,16 +720,47 @@ class TestBuildResponseViaStore(unittest.TestCase):
                 ).tolist(),
                 [0, 1, 2],
             )
-            self.assertIsNotNone(resp.generated_output)
 
     def test_markers_resolve_to_the_inline_tensors(self):
         batch = _store_batch()
+        fields = (
+            "generated_output",
+            "rollout_debug_tensors",
+            "denoising_env",
+            "dit_trajectory",
+        )
+        for video_dtype in (None, "uint8"):
+            stored = {}
+            inline = _build_response("r", "p", 0, True, batch, video_dtype=video_dtype)
+            via_store = _build_response(
+                "r", "p", 0, True, batch, video_dtype=video_dtype, stored=stored
+            )
+            for a, b in zip(inline, via_store):
+                for field in fields:
+                    _assert_same_tensors(
+                        self, getattr(a, field), getattr(b, field), stored
+                    )
+
+    def test_numpy_output_is_stored_as_the_tensor_the_inline_path_sends(self):
+        batch = _store_batch()
+        batch.output = batch.output.numpy()
         stored = {}
         inline = _build_response("r", "p", 0, True, batch)
         via_store = _build_response("r", "p", 0, True, batch, stored=stored)
         for a, b in zip(inline, via_store):
-            for field in ("rollout_debug_tensors", "denoising_env", "dit_trajectory"):
-                _assert_same_tensors(self, getattr(a, field), getattr(b, field), stored)
+            _assert_same_tensors(self, a.generated_output, b.generated_output, stored)
+
+    def test_skipped_decode_stores_no_output(self):
+        """A request that skipped the decode has no output; storing one would fail on None."""
+        batch = _store_batch()
+        num_outputs = batch.output.shape[0]
+        batch.output = None
+        stored = {}
+        resps = _build_response(
+            "r", "p", 0, True, batch, stored=stored, num_outputs=num_outputs
+        )
+        self.assertEqual([resp.generated_output for resp in resps], [None] * len(resps))
+        self.assertFalse(any(key.startswith("generated_output.") for key in stored))
 
     def test_eval_response_stores_nothing(self):
         batch = OutputBatch(
