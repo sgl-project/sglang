@@ -37,6 +37,7 @@ register_amd_ci(
     est_time=1800,
     suite="nightly-amd-2-gpu-mi30x-qwen38-flash-next-fp8",
     nightly=True,
+    disabled="QSA relative prefill indexer needs 80 KiB LDS, over gfx942's 64 KiB; re-enable with #46945",
 )
 register_amd_ci(
     est_time=1800,
