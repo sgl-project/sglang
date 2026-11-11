@@ -359,7 +359,10 @@ export const DiffusionModelCatalog = ({ category }) => {
     },
     {
       name: "Praxis-1",
-      modelIds: ["runwayml/praxis-1-droid-lerobot"],
+      modelIds: [
+        "runwayml/praxis-1-droid-lerobot",
+        "runwayml/praxis-1-yam-lerobot",
+      ],
       cookbook: "/cookbook/vla/Runway/Praxis-1",
     },
     {
