@@ -162,7 +162,7 @@ class _MooncakeEPDispatcherImpl:
         assert self.num_max_dispatch_tokens_per_rank <= 1024
 
         self.first_execution = True
-        self.timeout_us = 10000000
+        self.timeout_us = get_int_env_var('SGLANG_MOONCAKE_EP_TIMEOUT_US', 30000000)
 
         self.handle = None
 
