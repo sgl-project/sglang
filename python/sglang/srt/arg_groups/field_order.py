@@ -566,5 +566,7 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_dspark_lm_head_dtype",
     "media_url_timeout",
     "allow_local_media_files",
+    "enable_hi_engram",
+    "hi_engram_config",
 )
 # fmt: on
