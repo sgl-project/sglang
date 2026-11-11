@@ -110,6 +110,8 @@ class TestAiterEncoderOnlyTargetVerify(CustomTestCase):
         backend._use_unified_verify = True
         backend.kv_cache_dtype = kv_dtype
         backend.page_size = _PAGE_SIZE
+        backend.muse_verify_kernels = frozenset()
+        backend.muse_unified_attention_kwargs = {}
         unit_scale = torch.ones(1, dtype=torch.float32, device=device)
         backend.k_scale = backend.v_scale = unit_scale
         backend.token_to_kv_pool = _FakeKVPool(k_cache, v_cache)
@@ -123,6 +125,7 @@ class TestAiterEncoderOnlyTargetVerify(CustomTestCase):
             ),
             max_q_len=_DRAFT_NUM,
             verify_seqused_k=None,
+            verify_seqlen_k=None,
         )
         scaling = head_dim**-0.5
         layer = SimpleNamespace(
