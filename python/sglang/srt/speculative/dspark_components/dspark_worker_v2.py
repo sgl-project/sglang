@@ -75,11 +75,20 @@ from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph impor
     DsparkSamplingAcceptGraph,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
+    AcceptOuts,
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
     target_model_type,
     verify_logits_adjustments_are_noop,
+)
+from sglang.srt.speculative.online_acceptance_estimator import (
+    OnlineAcceptanceEstimator,
+)
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
 )
 from sglang.srt.speculative.spec_sampling_mask import (
     SpeculativeSamplingMaskCapture,
@@ -98,6 +107,7 @@ from sglang.srt.utils import (
     is_npu,
 )
 from sglang.srt.utils.device import async_h2d
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -319,6 +329,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         self._target_hidden_projection_enabled = False
 
+        self._acceptance_estimator = self._build_acceptance_estimator()
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
             gamma=self.gamma,
@@ -327,6 +338,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=get_parallel().tp_rank,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
+            online_confidence=self._acceptance_estimator is not None,
         )
         if (
             get_parallel().attn_dp_enabled
@@ -365,11 +377,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._sharded_accept = (
             is_hip()
             and not self._greedy_draft
+            and self._acceptance_estimator is None
             and markov_head is not None
             and markov_head.vocab_shard is not None
         )
         if self._sharded_accept and self._target_tp_rank == 0:
             logger.info("DSpark sampling accept runs on the vocab shards.")
+        if self._acceptance_estimator is not None and self._greedy_draft:
+            raise ValueError(
+                "The online acceptance estimator scores the draft step logits, which "
+                "SGLANG_DSPARK_USE_GREEDY_DRAFT does not keep. Unset it, or use a "
+                "draft checkpoint with a confidence head."
+            )
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
             draft_model_runner=self.draft_model_runner,
@@ -381,6 +400,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             greedy_draft=self._greedy_draft,
             sharded_accept=self._sharded_accept,
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
+            acceptance_estimator=self._acceptance_estimator,
         )
         self._verify_epilogue = None
         self._deferred_draft_kv: Optional[DeferredDraftKVStore] = None
@@ -528,6 +548,43 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
 
+    def _build_acceptance_estimator(self) -> Optional[OnlineAcceptanceEstimator]:
+        if (
+            read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+            or self.draft_model.confidence_head is not None
+        ):
+            return None
+        log_info_on_rank0(
+            logger,
+            "DSpark ragged-verify confidences come from the online acceptance "
+            f"estimator (gamma={self.gamma}, refit every "
+            f"{OnlineAcceptanceEstimator.REFIT_INTERVAL} steps).",
+        )
+        return OnlineAcceptanceEstimator(
+            num_positions=self.gamma,
+            device=self.device,
+            log_rank=get_parallel().tp_rank == 0,
+        )
+
+    def _observe_acceptance(
+        self,
+        *,
+        features: torch.Tensor,
+        accept: AcceptOuts,
+        layout: Optional[RaggedVerifyLayout],
+    ) -> None:
+        bs = features.shape[0]
+        num_graded_drafts = (
+            torch.full_like(accept.correct_len, self.gamma)
+            if layout is None
+            else torch.clamp(layout.verify_lens[:bs] - 1, max=self.gamma)
+        )
+        self._acceptance_estimator.observe(
+            features=features,
+            num_correct_drafts=accept.correct_len + accept.cap_trim_lens,
+            num_graded_drafts=num_graded_drafts,
+        )
+
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
@@ -648,6 +705,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if self._verify_epilogue is not None
                 else None
             ),
+            acceptance_estimator=self._acceptance_estimator,
         )
 
     def clear_cache_pool(self):
@@ -1177,6 +1235,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            )
+        if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:
+            self._observe_acceptance(
+                features=proposal.acceptance_features,
+                accept=accept,
+                layout=layout if run_compact else None,
             )
         if graph_accept and self._deferred_draft_kv is not None:
             self._deferred_draft_kv.note_staged(batch.reqs)

@@ -1832,7 +1832,12 @@ def build_swa_draft_pools(
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build a draft SWA sidecar whose indices follow the target's window,
     backed up to host pool ``target_window_host`` (`target_window_host_pool`)."""
-    draft_swa_pool = draft_kv_pool.swa_kv_pool
+    # A pool already on the target's SWA ids is the SWA component itself.
+    draft_swa_pool = (
+        draft_kv_pool
+        if draft_kv_pool.follows_target_swa_ids
+        else draft_kv_pool.swa_kv_pool
+    )
     if draft_swa_pool is None:
         raise NotImplementedError(
             "HiCache draft SWA sidecar requires a non-unified draft SWA pool."
@@ -1936,9 +1941,11 @@ def build_hicache_draft_sidecars(
 
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
-    if draft_kv_pool.layer_router.sub_pool(
-        IdSpaceKind.SLIDING_WINDOW
-    ) is not None or isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool):
+    if (
+        draft_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+        or isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
+        or draft_kv_pool.follows_target_swa_ids
+    ):
         return build_swa_draft_pools(
             draft_kv_pool=draft_kv_pool,
             tree_cache=tree_cache,
