@@ -781,9 +781,14 @@ class _Accumulator(ABC):
         rank: int,
     ):
         self._expert_location_metadata = expert_location_metadata
-        self._rank = rank
         self._communication_group = get_eplb_group()
-        self._communication_root = (
+        # NPU communication uses stage-local ranks; collective roots are global.
+        self._group_rank = (
+            rank
+            if self._communication_group is None
+            else torch.distributed.get_rank(self._communication_group)
+        )
+        self._root_global_rank = (
             0
             if self._communication_group is None
             else torch.distributed.get_global_rank(self._communication_group, 0)
@@ -835,7 +840,9 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self.window_sizes = EPLB_BALANCEDNESS_WINDOW_SIZES
             self._history = _DequeCollection(maxlens=self.window_sizes)
             self._reset_server_log_history = True
-            self._rank = torch.distributed.get_rank(self._communication_group)
+            if self._communication_group is None:
+                # Preserve the existing WORLD rank behavior when reporting.
+                self._group_rank = torch.distributed.get_rank()
             expert_dispatch_cls = resolve_collector_class(
                 STAT_LOGGER_ROLE_EXPERT_DISPATCH,
                 ExpertDispatchCollector,
@@ -877,12 +884,12 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
         torch.distributed.reduce(
             gpu_physical_count,
-            dst=self._communication_root,
+            dst=self._root_global_rank,
             op=torch.distributed.ReduceOp.SUM,
             group=self._communication_group,
         )
 
-        if self._rank == 0:
+        if self._group_rank == 0:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
             layer_utilization = compute_utilization_rate(gpu_physical_count)
@@ -960,7 +967,7 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         self._record_rank = (
             torch.distributed.get_rank()
             if self._communication_group is not None
-            else self._rank
+            else self._group_rank
         )
         self._records = []
 
@@ -1064,7 +1071,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         )
 
         output = dict(
-            rank=self._rank,
+            rank=self._group_rank,
             logical_count=logical_count_of_buffered_step,
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
@@ -1073,7 +1080,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             return output
         if output_mode != "file":
             raise NotImplementedError
-        if self._rank != 0:
+        if self._group_rank != 0:
             return
 
         parallel = get_parallel()
@@ -1095,7 +1102,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         ):
             return None
 
-        if self._rank == 0:
+        if self._group_rank == 0:
             utilization_mean_rates = self._history.mean()
             window_index = self.window_sizes[-1]
             average_utilization_rate_over_window = (
@@ -1117,7 +1124,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             )
         torch.distributed.broadcast(
             avg_rate_tensor,
-            src=self._communication_root,
+            src=self._root_global_rank,
             group=self._communication_group,
         )
         return avg_rate_tensor.item()

@@ -254,18 +254,9 @@ def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
             raise ValueError("NPU EPLB requires complete expert blocks in ND storage.")
         total_experts = storage_bytes // bytes_per_expert
     else:
-        if full_storage_tensor.ndim != 3 or weight.ndim != 3:
-            raise ValueError("NPU EPLB requires 3D batched NZ expert weights.")
-        if (
-            weight.element_size() != full_storage_tensor.element_size()
-            or weight.stride(0) != full_storage_tensor.stride(0)
-            or full_storage_tensor.numel()
-            != full_storage_tensor.shape[0] * weight.stride(0)
-        ):
-            raise ValueError("NPU EPLB requires the original NZ expert blocks.")
-        total_experts = full_storage_tensor.shape[0]
-        if total_experts <= 0 or storage_elements % total_experts:
-            raise ValueError("NPU EPLB requires equal physical NZ expert blocks.")
+        total_experts = _validate_nz_expert_blocks(
+            weight, full_storage_tensor, storage_elements
+        )
     if weight.shape[0] > total_experts:
         raise ValueError("NPU EPLB expert prefix exceeds the backing storage.")
     return _ExpertStorageLayout(
@@ -279,6 +270,25 @@ def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
             npu_format not in _BASE_FORMATS or not weight.is_contiguous()
         ),
     )
+
+
+def _validate_nz_expert_blocks(
+    weight: torch.Tensor, full_storage_tensor: torch.Tensor, storage_elements: int
+) -> int:
+    """Validate NZ expert boundaries and return the full storage's expert count."""
+    if full_storage_tensor.ndim != 3 or weight.ndim != 3:
+        raise ValueError("NPU EPLB requires 3D batched NZ expert weights.")
+    if (
+        weight.element_size() != full_storage_tensor.element_size()
+        or weight.stride(0) != full_storage_tensor.stride(0)
+        or full_storage_tensor.numel()
+        != full_storage_tensor.shape[0] * weight.stride(0)
+    ):
+        raise ValueError("NPU EPLB requires the original NZ expert blocks.")
+    total_experts = full_storage_tensor.shape[0]
+    if total_experts <= 0 or storage_elements % total_experts:
+        raise ValueError("NPU EPLB requires equal physical NZ expert blocks.")
+    return total_experts
 
 
 def _expert_storage_view(
@@ -376,20 +386,22 @@ def _copy_expert_weight_runs(
     local_start = rank * num_local_experts
     start = 0
     while start < len(copy_infos):
-        src, dst = copy_infos[start]
+        src_slot, dst_slot = copy_infos[start]
         end = start + 1
         while end < len(copy_infos) and copy_infos[end] == (
-            src + end - start,
-            dst + end - start,
+            src_slot + end - start,
+            dst_slot + end - start,
         ):
             end += 1
-        count = end - start
-        src -= local_start
-        dst -= local_start
-        assert 0 <= src <= num_local_experts - count
-        assert 0 <= dst <= num_local_experts - count
+        run_length = end - start
+        local_src = src_slot - local_start
+        local_dst = dst_slot - local_start
+        assert 0 <= local_src <= num_local_experts - run_length
+        assert 0 <= local_dst <= num_local_experts - run_length
         for weight, buffer in zip(weights, buffers, strict=True):
-            weight[dst : dst + count].copy_(buffer[src : src + count])
+            weight[local_dst : local_dst + run_length].copy_(
+                buffer[local_src : local_src + run_length]
+            )
         start = end
 
 
