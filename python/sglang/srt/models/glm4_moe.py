@@ -73,6 +73,7 @@ from sglang.srt.layers.moe.utils import (
     get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import precompile_sm107_splitk_tactics
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
@@ -1291,6 +1292,10 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
         # expert directly. Keep the generic DeepSeek Gluon+EP guard scoped to
         # models whose kernels have not implemented that ABI.
         return hf_config.n_shared_experts or 0
+
+    def precompile_kernels_after_loading(self) -> None:
+        if precompile_sm107_splitk_tactics():
+            logger.info("Precompiled SM107 BF16 split-K GEMM tactics for GLM-5")
 
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):

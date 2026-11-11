@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     )
 
 SMALL_PROJECTION_MAX_TOKENS = 8
+B200_PROJECTION_MAX_TOKENS = 128
 MAX_TOKENS = 512
 _VEC = 8
 
@@ -75,11 +76,16 @@ def gemm_ag_supported(
                 and n in (4096, 8192)
                 and current_arch().is_sm(10, 3)
             )
+            or (
+                comm.world_size == 8
+                and n in (4096, 8192)
+                and m <= B200_PROJECTION_MAX_TOKENS
+                and torch.cuda.get_device_capability(x.device) == (10, 0)
+            )
         )
         and weight.shape[1] == k
         and n % (comm.world_size * _VEC) == 0
         and m * n * 2 <= comm.max_push_size
-        and comm.config.num_push_blocks >= 2
         and weight.is_contiguous()
     )
 

@@ -975,8 +975,22 @@ def can_serve_block_fp8_as_mxfp8(
     return not resolve_block_fp8_mxfp8_backend().is_unsupported()
 
 
+def _b12x_or_cutlass_mxfp8_linear(input, weight, *args, **kwargs):
+    # SM12x: b12x has small-M tiles and beats CUTLASS at every M, but needs
+    # K % 128 == 0.
+    backend = "b12x" if weight.shape[1] % 128 == 0 else "cutlass"
+    return flashinfer_mxfp8_blockscaled_linear(
+        input, weight, *args, backend=backend, pin_tactic=True, **kwargs
+    )
+
+
 def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
     """The MXFP8 linear for a block-fp8 weight served as MXFP8."""
+    if (
+        backend.is_flashinfer_cutlass()
+        and _raw_flashinfer_mm_mxfp8.is_backend_supported("b12x", get_device_sm())
+    ):
+        return _b12x_or_cutlass_mxfp8_linear
     if backend.is_flashinfer_cutlass():
         return partial(
             flashinfer_mxfp8_blockscaled_linear, backend="cutlass", pin_tactic=True
@@ -1922,6 +1936,18 @@ def _unpack_ue8m0_scale_for_triton(
     return sf_fp32
 
 
+def fp8_input_quant_format(weight: torch.Tensor, num_tokens: int) -> str:
+    """What a fused producer may quantize the input of an MXFP8-converted linear (one
+    with the rowwise copy) to: "fp8_per_token" as ``aiter.per_token_quant_hip`` for the
+    rowwise GEMM, "fp8" as ``aiter_per1x128_quant`` for the bpreshuffle block GEMM, or
+    "" when aiter_w8a8_block_fp8_linear must quantize it itself."""
+    if getattr(weight, "_ptpc_weight", None) is None:
+        return ""
+    if num_tokens <= MXFP8_DENSE_PTPC_DECODE_MAX_M:
+        return "fp8_per_token"
+    return "fp8" if _use_aiter_bpreshuffle_gfx95 else ""
+
+
 def aiter_w8a8_block_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1941,8 +1967,8 @@ def aiter_w8a8_block_fp8_linear(
 
     # dense linears converted from MXFP8 carry a rowwise-fp8 copy; its ptpc GEMM
     # beats the block-fp8 GEMMs at decode-sized M
+    ptpc_weight = getattr(weight, "_ptpc_weight", None)
     if input_scale is None:
-        ptpc_weight = getattr(weight, "_ptpc_weight", None)
         if (
             ptpc_weight is not None
             and input_2d.shape[0] <= MXFP8_DENSE_PTPC_DECODE_MAX_M
@@ -1954,6 +1980,15 @@ def aiter_w8a8_block_fp8_linear(
                 bias=bias,
             )
             return out.to(input.dtype).view(*output_shape)
+    elif ptpc_weight is not None and input_scale.shape == (input_2d.shape[0], 1):
+        # quantized per token by a fused producer, see fp8_input_quant_format
+        out = apply_fp8_ptpc_linear(
+            input=(input_2d, input_scale),
+            weight=ptpc_weight,
+            weight_scale=weight._ptpc_scale,
+            bias=bias,
+        )
+        return out.view(*output_shape)
 
     # DeepSeek-V4 e8m0 mxscale route (SGLANG_DSV4_DENSE_MXSCALE): same
     # (16, 16)-preshuffled weight, e8m0 copy of its scale. A producer that
@@ -2116,15 +2151,24 @@ def triton_w8a8_block_fp8_linear(
     return output.to(dtype=output_dtype).view(*output_shape)
 
 
-@lru_cache(maxsize=1)
-def _get_triton_mxfp8_downcast():
-    try:
-        from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
-    except Exception as err:
-        raise RuntimeError(
-            "MXFP8 quantization requires triton_kernels with MXFP8 support."
-        ) from err
-    return downcast_to_mxfp
+def _mxfp8_group_quantize_torch(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Eager MXFP8 quantization with the same ROUND_UP E8M0 scale as the JIT kernel."""
+    m, k = x.shape
+    blocks = x.to(torch.float32).view(m, k // 32, 32)
+    dequant = blocks.abs().amax(dim=-1, keepdim=True) / 448.0
+    # Adding 0x007FFFFF carries into the exponent unless the mantissa is zero.
+    scale_bits = (dequant.view(torch.int32) + 0x007FFFFF) & 0x7F800000
+    dequant_rounded = scale_bits.view(torch.float32)
+    quant_scale = torch.where(
+        dequant_rounded == 0,
+        torch.zeros_like(dequant_rounded),
+        1.0 / dequant_rounded,
+    )
+    q = (blocks * quant_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    scale_u8 = (scale_bits >> 23).to(torch.uint8)
+    return q.view(m, k), scale_u8.view(m, k // 32)
 
 
 def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -2139,9 +2183,27 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         )
 
         return mxfp8_e4m3_quantize(x)
-    downcast_to_mxfp = _get_triton_mxfp8_downcast()
-    q_input, scale_u8 = downcast_to_mxfp(x, torch.float8_e4m3fn, axis=1)
-    return q_input.contiguous(), scale_u8.contiguous()
+    if _is_cuda:
+        from sglang.kernels.ops.quantization.mxfp8_group_quant import (
+            mxfp8_group_quant,
+        )
+
+        return mxfp8_group_quant(x)
+    return _mxfp8_group_quantize_torch(x)
+
+
+# (N, K) of the dense MXFP8 GEMMs where cuDNN's SM107 kernel beats the CuTe-DSL one at
+# prefill sizes (wo_b, Engram KV); the two backends are bitwise equal.
+_SM107_CUDNN_MXFP8_NK = ((5120, 8192), (25600, 6144))
+_SM107_CUDNN_MXFP8_MIN_M = 8192
+
+
+@lru_cache(maxsize=1)
+def _cudnn_mxfp8_reuses_graphs() -> bool:
+    # Without override-shape support cuDNN builds a new graph for every distinct M.
+    from flashinfer.gemm import gemm_base
+
+    return getattr(gemm_base, "_is_cudnn_override_shape_available", lambda: False)()
 
 
 def flashinfer_mxfp8_blockscaled_linear(
@@ -2185,6 +2247,15 @@ def flashinfer_mxfp8_blockscaled_linear(
             output_dtype = input_2d.dtype
         else:
             output_dtype = torch.bfloat16
+
+    if (
+        backend == "cute-dsl"
+        and input_2d.shape[0] >= _SM107_CUDNN_MXFP8_MIN_M
+        and (weight.shape[0], k) in _SM107_CUDNN_MXFP8_NK
+        and get_platform().device_sm == 107
+        and _cudnn_mxfp8_reuses_graphs()
+    ):
+        backend = "cudnn"
 
     if backend == "trtllm":
         weight_scale_t = weight_scale.view(-1)
@@ -2758,6 +2829,11 @@ def use_aiter_bpreshuffle_gemm(output_size: int) -> bool:
     return _use_aiter and output_size % 64 == 0
 
 
+# Measured on SM120: a tuned bmm_fp8 + add beat the bias epilogue by up to 1.6x
+# at small M and by 7% at 4096 rows; from 8192 rows on, the epilogue always won.
+_FP8_BIAS_EPILOGUE_MIN_ROWS = 8192
+
+
 def apply_fp8_linear_bmm_flashinfer(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -2787,9 +2863,22 @@ def apply_fp8_linear_bmm_flashinfer(
     else:
         qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
         output_dtype = input.dtype
-    output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, output_dtype)
-    if bias is not None:
-        output = output + bias
+    if bias is not None and qinput.shape[0] >= _FP8_BIAS_EPILOGUE_MIN_ROWS:
+        # bmm_fp8 takes no bias; torch._scaled_mm runs the same cuBLASLt GEMM
+        # and adds the bias in its epilogue instead of in a separate kernel.
+        output = torch._scaled_mm(
+            qinput,
+            weight,
+            out_dtype=output_dtype,
+            scale_a=x_scale,
+            scale_b=weight_scale,
+            bias=bias,
+            use_fast_accum=True,  # bmm_fp8 sets cuBLASLt fast accumulation too
+        )
+    else:
+        output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, output_dtype)
+        if bias is not None:
+            output = output + bias
     return output.view(*output_shape)
 
 
@@ -2840,12 +2929,6 @@ def apply_fp8_linear(
     cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
     use_cutlass_channelwise_gemm = (
         channelwise_cutlass and cutlass_compatible_b and not use_triton_w8a8_fp8_kernel
-    )
-    # Consider a tuned Triton tile only where the shape would otherwise go to
-    # CUTLASS (that is the path the offline sweep tuned against). On by default;
-    # SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 is the kill switch.
-    use_tuned_triton_channelwise = (
-        use_cutlass_channelwise_gemm and envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.get()
     )
     native_scalar_a_scale = use_cutlass_channelwise_gemm and (
         get_platform().is_sm90 or get_platform().is_sm100 or get_platform().is_sm120
@@ -2936,12 +3019,14 @@ def apply_fp8_linear(
     if channelwise_cutlass:
         # A tuned config exists only for shapes where tuned Triton beat the
         # CUTLASS dispatch on this GPU; otherwise this is None and the backend
-        # choice below is unchanged. weight is [K, N] here.
+        # choice below is unchanged. Only shapes that would otherwise go to
+        # CUTLASS consult it (the path the offline sweep tuned against).
+        # weight is [K, N] here.
         tuned_config = (
             get_w8a8_channelwise_fp8_config(
                 N=weight.shape[1], K=weight.shape[0], M=qinput.shape[0]
             )
-            if use_tuned_triton_channelwise
+            if use_cutlass_channelwise_gemm
             else None
         )
         if not use_cutlass_channelwise_gemm:
