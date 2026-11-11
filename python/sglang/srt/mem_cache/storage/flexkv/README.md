@@ -259,6 +259,24 @@ This is the path you'll use under any non-trivial deployment topology
   same dp/pp/instance settings, so configuration is taken care of as
   long as you launch FlexKV consistently.
 
+### Cache namespaces
+
+Lookup, store and prefetch pass FlexKV a `namespace` derived from the
+request's `(extra_key, cache_salt)` — the LoRA adapter and the tenant
+salt — using the same seed as the HiCache L3 storage keys
+(`storage_namespace_seed`). FlexKV folds it into its block hashes, so KV
+stored under one namespace is never matched by a request in another,
+including across DP ranks and instances sharing one store. Requests with
+neither field pass no namespace and keep their previous hashes.
+
+* Requires a FlexKV whose `get_match` / `put_match` / `prefetch_async`
+  accept `namespace` (present at the verified commit `aa74e39`). On an
+  older FlexKV those calls fail and every request is a cache miss.
+* A persistent SSD / remote store written before this isolation existed
+  holds salted and adapter KV under un-namespaced hashes, where an
+  unsalted base-model request with the same tokens can still match it.
+  Clear such a store when upgrading.
+
 ---
 
 ## Files

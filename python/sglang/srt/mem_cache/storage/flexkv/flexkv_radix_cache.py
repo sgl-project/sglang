@@ -29,7 +29,7 @@ import enum
 import logging
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.capacity import evict_to_free_tokens, shares_memory
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
+from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
@@ -53,6 +54,14 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _flexkv_namespace(
+    *, extra_key: Optional[str], cache_salt: Optional[str]
+) -> Optional[List[str]]:
+    # None keeps unnamespaced requests on FlexKV's unseeded block hashes.
+    seed = storage_namespace_seed(extra_key, cache_salt)
+    return None if seed is None else [seed]
 
 
 class FlexKVMode(enum.Enum):
@@ -203,7 +212,12 @@ class FlexKVRadixCache(RadixCache):
         token_mask[device_len:] = True
 
         fkv_task_id, hit = self.flexkv_connector.lookup_kv(
-            token_ids=token_ids, token_mask=token_mask, handle=req.cache_request_handle
+            token_ids=token_ids,
+            token_mask=token_mask,
+            handle=req.cache_request_handle,
+            namespace=_flexkv_namespace(
+                extra_key=key.extra_key, cache_salt=key.cache_salt
+            ),
         )
         if hit <= 0:
             return base_res
@@ -249,7 +263,12 @@ class FlexKVRadixCache(RadixCache):
         # No handle here — IP mode self-pops; pass a synthetic stable key.
         synthetic_handle = CacheRequestHandle(f"_ip_{id(key)}", 0)
         _, hit = self.flexkv_connector.lookup_kv(
-            token_ids=token_ids, token_mask=token_mask, handle=synthetic_handle
+            token_ids=token_ids,
+            token_mask=token_mask,
+            handle=synthetic_handle,
+            namespace=_flexkv_namespace(
+                extra_key=key.extra_key, cache_salt=key.cache_salt
+            ),
         )
         if hit <= 0:
             return base_res
@@ -430,6 +449,9 @@ class FlexKVRadixCache(RadixCache):
                     handle=req.cache_request_handle,
                     token_ids=list(token_ids),
                     kv_indices=kv_indices,
+                    namespace=_flexkv_namespace(
+                        extra_key=req.extra_key, cache_salt=req.cache_salt
+                    ),
                 )
         except Exception:  # noqa: BLE001
             self.dec_lock_ref(new_last_node)
@@ -493,11 +515,26 @@ class FlexKVRadixCache(RadixCache):
         self.flexkv_connector.cancel_prefetch(handle)
 
     def prefetch_from_storage(
-        self, handle: CacheRequestHandle, last_host_node: TreeNode, token_ids
+        self,
+        handle: CacheRequestHandle,
+        last_host_node: TreeNode,
+        new_input_tokens,
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[List[str]] = None,
+        matched_prefix_tokens=None,
+        extra_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
+        storage_hit_end: Optional[int] = None,
     ) -> None:
         """Kick off an opportunistic prefetch (SSD/Remote → CPU)."""
+        # FlexKV hashes blocks from token 0, so it needs the matched prefix too.
+        token_ids = list(matched_prefix_tokens or []) + list(new_input_tokens)
         try:
-            self.flexkv_connector.prefetch_async(handle, list(token_ids))
+            self.flexkv_connector.prefetch_async(
+                handle,
+                token_ids,
+                namespace=_flexkv_namespace(extra_key=extra_key, cache_salt=cache_salt),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.debug("[FlexKV] prefetch_from_storage: %s", exc)
 
