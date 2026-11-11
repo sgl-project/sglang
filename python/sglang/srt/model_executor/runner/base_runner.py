@@ -274,6 +274,7 @@ class BaseRunner(ABC):
         if prepare_model_resources is not None:
             prepare_model_resources(mr)
         prepare_megakernel(mr)
+        self._finalize_symm_workspaces()
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
@@ -362,6 +363,15 @@ class BaseRunner(ABC):
         init_dcp_push_combine(
             parallel.dcp_group, self.model_runner.model_config.num_attention_heads
         )
+
+    def _finalize_symm_workspaces(self):
+        """Allocate the symmetric workspaces every consumer has requested by now;
+        must run before CG capture, which forbids the multicast mapping."""
+        from sglang.srt.distributed.device_communicators.symm_workspace import (
+            finalize_symm_workspaces,
+        )
+
+        finalize_symm_workspaces()
 
     def _pre_initialize_pcie_ipc_workspace(self):
         """Build the PCIe-IPC all-reduce workspace before graph capture.

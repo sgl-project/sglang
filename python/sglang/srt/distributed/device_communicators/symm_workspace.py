@@ -152,11 +152,11 @@ class _Workspace:
         self._symm_owner, slabs, multicast_ptr = _allocate_symmetric_memory(
             total_bytes, device=self.device, group=self.group, multinode=self.multinode
         )
-        # consumers already branched on the device attribute; the mapping must honour it
+        # consumers already branched on the probe; the mapping must honour it
         if self.has_multicast and multicast_ptr == 0:
             raise RuntimeError(
-                f"{self.group.group_name}: the devices support multicast but the "
-                "symmetric allocation has no multicast mapping"
+                f"{self.group.group_name}: the multicast probe got a mapping but the "
+                "workspace allocation did not"
             )
         if not self.has_multicast:
             multicast_ptr = 0
@@ -419,18 +419,35 @@ def v2_push_slot_bytes(group: ProcessGroup) -> Optional[int]:
 
 
 def is_multicast_supported(group: ProcessGroup, device: torch.device) -> bool:
-    """Whether every rank's device can map multicast memory (collective, cached).
+    """Whether a symmetric allocation on ``group`` gets a multicast mapping on every
+    rank (collective, cached); callers may branch on it at model construction.
 
-    A device attribute, independent of any workspace: callers may branch on it at
-    model construction without allocating.
+    Measured once with a small probe allocation: a device can report multicast support
+    that the driver then refuses to map (seen on H100 TP2).
     """
     name = group.group_name
     if name not in _MULTICAST:
-        local = not _is_hip() and _device_has_multicast(device)
-        everyone: List[object] = [None] * dist.get_world_size(group=group)
-        dist.all_gather_object(everyone, local, group=group)
-        _MULTICAST[name] = all(everyone)
+        supported = _on_all_ranks(
+            group, not _is_hip() and _device_has_multicast(device)
+        )
+        if supported:
+            probe = SymmetricBuffer(group, device, _ALIGN_BYTES)
+            supported = _on_all_ranks(group, probe.multicast_ptr != 0)
+            probe.close()
+            if not supported and dist.get_rank(group=group) == 0:
+                logger.warning(
+                    "%s: the devices report multicast support but symmetric memory "
+                    "gets no multicast mapping; the multicast paths are off",
+                    name,
+                )
+        _MULTICAST[name] = supported
     return _MULTICAST[name]
+
+
+def _on_all_ranks(group: ProcessGroup, value: bool) -> bool:
+    everyone: List[object] = [None] * dist.get_world_size(group=group)
+    dist.all_gather_object(everyone, value, group=group)
+    return all(everyone)
 
 
 def _device_has_multicast(device: torch.device) -> bool:
@@ -496,6 +513,18 @@ def request_group_workspace(
     """:func:`request_symm_workspace` on a ``GroupCoordinator``'s group, the one its
     custom all-reduce uses, so every consumer of that group shares one workspace."""
     return request_symm_workspace(coordinator.cpu_group, coordinator.device, request)
+
+
+def finalize_symm_workspaces() -> None:
+    """Allocate every workspace still pending (collective on each group).
+
+    Must run before CUDA graph capture: a capture in progress on any stream makes the
+    driver refuse the multicast mapping. Groups go in name order, the same on every
+    rank, so ranks that share several groups do not wait on each other.
+    """
+    for name in sorted(_WORKSPACES):
+        for workspace in _WORKSPACES[name]:
+            workspace.finalize()
 
 
 def close_symm_workspaces() -> None:
