@@ -7,8 +7,8 @@ from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.utils import get_schema_properties, safe_literal_eval
 
 if TYPE_CHECKING:
-    from sglang.srt.function_call.minicpm4_xml_detector import (
-        MiniCPM4XmlFormatDetector as MiniCPM5Detector,
+    from sglang.srt.function_call.minicpm5_xml_detector import (
+        MiniCPM5XmlFormatDetector as MiniCPM5Detector,
     )
 
 __all__ = ["MiniCPM5Detector", "get_argument_type", "parse_arguments"]
@@ -40,9 +40,9 @@ def parse_arguments(json_value):
 def __getattr__(name: str):
     if name == "MiniCPM5Detector":
         # The team detector imports parse_arguments from this module.
-        from sglang.srt.function_call.minicpm4_xml_detector import (
-            MiniCPM4XmlFormatDetector,
+        from sglang.srt.function_call.minicpm5_xml_detector import (
+            MiniCPM5XmlFormatDetector,
         )
 
-        return MiniCPM4XmlFormatDetector
+        return MiniCPM5XmlFormatDetector
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

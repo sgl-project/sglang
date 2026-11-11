@@ -6302,15 +6302,15 @@ class TestToolCallParserNames(CustomTestCase):
         )
 
     def test_minicpm5_uses_team_xml_detector(self):
-        from sglang.srt.function_call.minicpm4_xml_detector import (
-            MiniCPM4XmlFormatDetector,
-        )
         from sglang.srt.function_call.minicpm5_detector import MiniCPM5Detector
+        from sglang.srt.function_call.minicpm5_xml_detector import (
+            MiniCPM5XmlFormatDetector,
+        )
 
         self.assertNotIn("minicpm4_xml", TOOL_CALL_PARSER_NAMES)
-        self.assertIs(MiniCPM5Detector, MiniCPM4XmlFormatDetector)
+        self.assertIs(MiniCPM5Detector, MiniCPM5XmlFormatDetector)
         parser = FunctionCallParser(tools=[], tool_call_parser="minicpm5")
-        self.assertIs(type(parser.detector), MiniCPM4XmlFormatDetector)
+        self.assertIs(type(parser.detector), MiniCPM5XmlFormatDetector)
 
 
 if __name__ == "__main__":

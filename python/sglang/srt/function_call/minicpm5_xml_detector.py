@@ -167,7 +167,7 @@ def _parse_function_block(
     return call, end_pos, True
 
 
-class MiniCPM4XmlFormatDetector(BaseFormatDetector):
+class MiniCPM5XmlFormatDetector(BaseFormatDetector):
     """
     MiniCPM <function>/<param> tool calls scanned in order: a </function>
     inside CDATA does not close the call, unknown params are dropped, and

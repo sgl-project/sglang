@@ -4,7 +4,7 @@ import sys
 import pytest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
-from sglang.srt.function_call.minicpm4_xml_detector import MiniCPM4XmlFormatDetector
+from sglang.srt.function_call.minicpm5_xml_detector import MiniCPM5XmlFormatDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(1.0, "base-a-test-cpu")
@@ -111,7 +111,7 @@ def make_tools_string_list():
 
 
 def test_detect_and_parse_single_call_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_weather()
     text = (
         "Intro before.\n"
@@ -131,7 +131,7 @@ def test_detect_and_parse_single_call_v3():
 
 
 def test_detect_and_parse_cdata_multiline_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_weather()
     text = (
         '<function name="get_weather">'
@@ -147,7 +147,7 @@ def test_detect_and_parse_cdata_multiline_v3():
 
 
 def test_unknown_tool_block_preserved_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_weather()
     text = '<function name="unknown"><param name="x">1</param></function>\n'
     res = detector.detect_and_parse(text, tools)
@@ -156,7 +156,7 @@ def test_unknown_tool_block_preserved_v3():
 
 
 def test_missing_required_param_call_dropped_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_weather()
     text = 'a<function name="get_weather"><param name="date">x</param></function>b'
     res = detector.detect_and_parse(text, tools)
@@ -165,7 +165,7 @@ def test_missing_required_param_call_dropped_v3():
 
 
 def test_non_string_types_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_sum()
     text = (
         '<function name="sum_values">'
@@ -181,7 +181,7 @@ def test_non_string_types_v3():
 
 
 def test_multiple_calls_interleaved_text_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_weather() + make_tools_sum()
     text = (
         "Head\n"
@@ -206,7 +206,7 @@ def test_multiple_calls_interleaved_text_v3():
 
 
 def test_incomplete_missing_function_end_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_weather()
     text = '<function name="get_weather"><param name="city">北京</param>'
     res = detector.detect_and_parse(text, tools)
@@ -215,7 +215,7 @@ def test_incomplete_missing_function_end_v3():
 
 
 def test_param_missing_name_invalid_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_weather()
     text = (
         '<function name="get_weather">'
@@ -229,7 +229,7 @@ def test_param_missing_name_invalid_v3():
 
 
 def test_duplicate_param_names_invalid_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_weather()
     text = (
         '<function name="get_weather">'
@@ -244,7 +244,7 @@ def test_duplicate_param_names_invalid_v3():
 
 
 def test_case_sensitive_param_name_invalid_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_weather()
     text = '<function name="get_weather"><param name="City">北京</param></function>\n'
     res = detector.detect_and_parse(text, tools)
@@ -252,7 +252,7 @@ def test_case_sensitive_param_name_invalid_v3():
 
 
 def test_no_required_and_zero_param_valid_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_no_required()
     text = '<function name="noop"></function>\n'
     res = detector.detect_and_parse(text, tools)
@@ -262,7 +262,7 @@ def test_no_required_and_zero_param_valid_v3():
 
 
 def test_streaming_increment_v3():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_weather()
     c1 = 'Hello\n<function name="get_weather">\n  <param name="city">'
     c2 = '北京</param>\n  <param name="date">2024-06-27</param>\n</function>\n'
@@ -292,7 +292,7 @@ def _exec_block(command: str) -> str:
     ],
 )
 def test_exec_special_chars_non_stream(command):
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_exec()
     res = detector.detect_and_parse(_exec_block(command), tools)
     assert len(res.calls) == 1
@@ -316,7 +316,7 @@ def test_exec_special_chars_non_stream(command):
     ],
 )
 def test_multi_block_no_state_leak(text, expected_calls):
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_exec()
     res = detector.detect_and_parse(text, tools)
     assert len(res.calls) == expected_calls
@@ -324,7 +324,7 @@ def test_multi_block_no_state_leak(text, expected_calls):
 
 
 def test_unknown_param_ignored_but_call_kept():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_exec()
     text = (
         '<function name="exec">'
@@ -339,7 +339,7 @@ def test_unknown_param_ignored_but_call_kept():
 
 
 def test_entity_not_decoded():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_exec()
     text = _exec_block("echo a &amp; b")
     res = detector.detect_and_parse(text, tools)
@@ -349,7 +349,7 @@ def test_entity_not_decoded():
 
 
 def test_untyped_param_stays_string():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_untyped_command()
     text = '<function name="run"><param name="command">2</param></function>'
     res = detector.detect_and_parse(text, tools)
@@ -360,7 +360,7 @@ def test_untyped_param_stays_string():
 
 
 def test_string_param_not_json_parsed():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_string_list()
     text = '<function name="store"><param name="items">[1,2,3]</param></function>'
     res = detector.detect_and_parse(text, tools)
@@ -370,7 +370,7 @@ def test_string_param_not_json_parsed():
 
 
 def test_missing_param_close_stops_at_next_param():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_weather()
     text = (
         '<function name="get_weather">'
@@ -386,7 +386,7 @@ def test_missing_param_close_stops_at_next_param():
 
 
 def test_cdata_with_literal_close_tags():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_exec()
     text = (
         '<function name="exec">'
@@ -400,7 +400,7 @@ def test_cdata_with_literal_close_tags():
 
 
 def test_broken_cdata_falls_back_to_nearest_boundary():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_exec()
     text = (
         '<function name="exec">'
@@ -415,7 +415,7 @@ def test_broken_cdata_falls_back_to_nearest_boundary():
 
 
 def test_mixed_cdata_and_plain_in_one_call():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_exec()
     text = (
         '<function name="exec">'
@@ -446,7 +446,7 @@ def test_mixed_cdata_and_plain_in_one_call():
 
 
 def test_mixed_compliant_and_violating_blocks():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_exec()
     text = _exec_block("<![CDATA[ls 2>&1]]>") + _exec_block("ls 2>&1")
     res = detector.detect_and_parse(text, tools)
@@ -454,7 +454,7 @@ def test_mixed_compliant_and_violating_blocks():
 
 
 def test_empty_param_value():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_no_required()
     text = '<function name="noop"><param name="note"></param></function>'
     res = detector.detect_and_parse(text, tools)
@@ -464,7 +464,7 @@ def test_empty_param_value():
 
 
 def test_single_quote_param_name():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_weather()
     text = "<function name='get_weather'><param name='city'>北京</param></function>"
     res = detector.detect_and_parse(text, tools)
@@ -474,7 +474,7 @@ def test_single_quote_param_name():
 
 
 def test_function_tag_with_extra_space():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_weather()
     text = '<function name="get_weather" ><param name="city">北京</param></function>'
     res = detector.detect_and_parse(text, tools)
@@ -482,7 +482,7 @@ def test_function_tag_with_extra_space():
 
 
 def test_plain_text_without_function():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_weather()
     text = "Just a normal answer."
     res = detector.detect_and_parse(text, tools)
@@ -491,7 +491,7 @@ def test_plain_text_without_function():
 
 
 def test_empty_tools_list():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     text = _exec_block("echo hi")
     res = detector.detect_and_parse(text, tools=[])
     assert len(res.calls) == 0
@@ -503,7 +503,7 @@ def test_empty_tools_list():
     ["ls 2>&1", "cat '<stdin>'"],
 )
 def test_streaming_exec_special_chars(command):
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_exec()
     block = _exec_block(command)
     res = detector.parse_streaming_increment(block, tools)
@@ -514,7 +514,7 @@ def test_streaming_exec_special_chars(command):
 
 
 def test_streaming_value_split_across_chunks():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_exec()
     c1 = '<function name="exec"><param name="command">ls 2>'
     c2 = "&1</param></function>"
@@ -527,7 +527,7 @@ def test_streaming_value_split_across_chunks():
 
 
 def test_streaming_multiple_calls_across_chunks():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_exec()
     c1 = _exec_block("echo hi")
     c2 = _exec_block("ls 2>&1")
@@ -539,7 +539,7 @@ def test_streaming_multiple_calls_across_chunks():
 
 
 def test_streaming_cdata_across_chunks():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_exec()
     c1 = '<function name="exec"><param name="command"><![CDATA[ls 2>&'
     c2 = "1]]></param></function>"
@@ -552,7 +552,7 @@ def test_streaming_cdata_across_chunks():
 
 
 def test_streaming_partial_function_token_buffered():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_exec()
     c1 = "Hello <func"
     c2 = 'tion name="exec"><param name="command">echo hi</param></function>'
@@ -565,7 +565,7 @@ def test_streaming_partial_function_token_buffered():
 
 
 def test_streaming_broken_cdata_uses_function_close():
-    detector = MiniCPM4XmlFormatDetector()
+    detector = MiniCPM5XmlFormatDetector()
     tools = make_tools_exec()
     c1 = '<function name="exec"><param name="command"><![CDATA[ls 2>&1'
     c2 = "</function>"
