@@ -5,7 +5,8 @@ list holds did both.
 An exit gives the request's resources back (`RequestRetirer.release`,
 `abort_retracted`); `abandon` records one that gives nothing back. A send is its
 final output (the streams' finished branches, `Scheduler.send_abort_output`).
-Retract, chunk steps and beam member rows are not exits. Gated on `SGLANG_ENABLE_RUNNING_REQS_CHECK`.
+Retract, chunk steps and beam member rows are not exits. Gated on
+`SGLANG_ENABLE_RUNNING_REQS_CHECK`.
 """
 
 from __future__ import annotations

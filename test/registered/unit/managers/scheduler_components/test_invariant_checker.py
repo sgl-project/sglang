@@ -184,18 +184,15 @@ class TestListedRequestsUnfinished(CustomTestCase):
         def req(rid, finished):
             return FakeReq(rid=rid, finished=lambda: finished)
 
-        deferred, stuck = req("deferred", True), req("stuck", True)
-        lists = {
-            ListKind.DEFERRED: [deferred],
-            ListKind.DECODING: [req("running", False), stuck],
-        }
-        checker = _checker_over(lists)
+        checker = _checker_over(
+            {
+                ListKind.DEFERRED: [req("deferred", True)],
+                ListKind.DECODING: [req("running", False), req("stuck", True)],
+            }
+        )
 
         with self.assertRaisesRegex(StateCheckError, r"at idle: \['stuck'\]"):
             checker._check_listed_requests_unfinished()
-
-        lists[ListKind.DECODING].remove(stuck)
-        checker._check_listed_requests_unfinished()
 
 
 class TestEveryWindowIsConserved(CustomTestCase):

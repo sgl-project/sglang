@@ -717,9 +717,8 @@ class SchedulerInvariantChecker:
         )
 
     def _check_listed_requests_unfinished(self) -> None:
-        """At idle, no list but DEFERRED holds a finished request; lists that
-        hold one on its way out (PD_RELEASING, PD_OFFLOADING) keep the
-        scheduler busy."""
+        """At idle, no list but DEFERRED holds a finished request; a nonempty
+        PD_RELEASING or PD_OFFLOADING keeps the scheduler from idling."""
         self._raise_if_any(
             {
                 req

@@ -1604,8 +1604,7 @@ class SchedulerBatchResultProcessor:
             self._maybe_collect_indexer_topk(req)
 
             if get_disagg().disaggregation_decode_enable_offload_kvcache:
-                # Offload the tail asynchronously; the release waits for every
-                # Device->Host copy of the request to land.
+                # The release waits for every Device->Host copy of the request to land.
                 self.decode_offload_manager.offload_kv_cache(req)
                 self.decode_offload_manager.finalize_release_on_finish(req)
             else:

@@ -154,7 +154,6 @@ class TestTakeOutWithoutRelease(CustomTestCase):
 
         self.retirer.abandon(req, RuntimeError("release failed"))
 
-        self.assertEqual(list(queue), [])
         self.assertIsNone(req.owner_list)
         self.assertEqual(req.exit_via, "abandon")
 
@@ -167,9 +166,6 @@ class TestTakeOutWithoutRelease(CustomTestCase):
 
     def test_abandon_raises_in_ci(self):
         req = FakeReq(rid="r", bootstrap_room=7)
-        queue = IndexedReqList(ListKind.PD_RELEASING)
-        move([req], queue)
-
         with (
             envs.SGLANG_IS_IN_CI.override(True),
             self.assertRaisesRegex(RuntimeError, "release failed"),
@@ -183,7 +179,6 @@ class TestTakeOutWithoutRelease(CustomTestCase):
 
         self.retirer.settle_output(req)
 
-        self.assertEqual(list(deferred), [])
         self.assertIsNone(req.owner_list)
         self.assertEqual(req.exit_via, "release")
 

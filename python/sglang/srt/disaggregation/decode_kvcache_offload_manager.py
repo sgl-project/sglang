@@ -407,7 +407,6 @@ class DecodeKVCacheOffloadManager:
         return page_hashes
 
     def finalize_release_on_finish(self, req: Req):
-        """Release a finished request, or list it until its last offload lands."""
         if self._has_inflight_offload(req):
             move([req], self.offloading_reqs)
             return

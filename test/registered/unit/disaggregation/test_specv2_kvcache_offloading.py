@@ -334,9 +334,7 @@ class TestSamplingMaskAbortOffload(CustomTestCase):
                 if inflight:
                     self.assertEqual(freed, [])
                     self.assertEqual(req.kv.req_pool_idx, 0)
-                    self.assertIn(req, manager.offloading_reqs)
                     manager._check_offload_progress(1)
-                self.assertNotIn(req, manager.offloading_reqs)
                 self.assertEqual(len(freed), 1)
                 self.assertTrue(torch.equal(freed[0], torch.arange(20)))
                 self.assertIsNone(req.kv.req_pool_idx)

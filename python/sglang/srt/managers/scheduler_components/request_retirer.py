@@ -144,9 +144,8 @@ class RequestRetirer:
         )
 
     def abandon(self, req: Req, error: Exception) -> None:
-        """Take out a request whose release raised `error`, freeing nothing;
-        nothing to take out once the release did. A failed release is a bug:
-        raised in CI, logged otherwise."""
+        """Take out a request whose release raised `error`, freeing nothing.
+        A failed release is a bug: CI raises it."""
         if envs.SGLANG_IS_IN_CI.get():
             raise error
         logger.error(
@@ -160,9 +159,8 @@ class RequestRetirer:
         record_exit(req, "abandon")
 
     def settle_output(self, req: Req) -> None:
-        """Take a released request out of the list holding its final output
-        once that output is sent or aborted; records no exit, as its release
-        did."""
+        """Take a released request out of the list holding its final output;
+        its release already recorded the exit."""
         _leave_owner_list(req)
 
     def _detach(self, req: Req) -> None:

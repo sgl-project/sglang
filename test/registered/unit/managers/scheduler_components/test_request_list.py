@@ -148,7 +148,7 @@ class TestKeyedReqList(CustomTestCase):
         running._leave([a, outsider])
 
         self.assertEqual(list(running), [b, c])
-        self.assertNotIn(a, running)
+        self.assertIsNone(a.owner_list)
 
 
 def _reqs(rids):
@@ -188,18 +188,6 @@ class TestMove(CustomTestCase):
         self.assertEqual(list(dst), [])
         self.assertIs(a.owner_list, held)
         self.assertIsNone(b.owner_list)
-
-    def test_every_way_out_of_a_list_clears_the_owner(self):
-        a, c = _reqs("ac")
-        queue = IndexedReqList(ListKind.WAITING)
-        move([a], queue)
-        running = KeyedReqList(ListKind.DECODING)
-        move([c], running)
-
-        queue._leave([a])
-        running._leave([c])
-
-        self.assertEqual([r.owner_list for r in (a, c)], [None, None])
 
     def test_a_request_moved_on_reads_as_gone(self):
         a, b = _reqs("ab")

@@ -341,7 +341,6 @@ class TestRunningReqsHooks(CustomTestCase):
 
         def process_batch_result(batch, result):
             _finish(done)
-            # A finished request is released in its step's processing.
             leaving_retirer().release(done, checkpoint=True)
             s._on_step_processed(batch, result)
 
