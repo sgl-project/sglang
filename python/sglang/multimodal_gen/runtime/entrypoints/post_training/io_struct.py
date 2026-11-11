@@ -90,6 +90,8 @@ class RolloutRequest(BaseModel):
     rollout_return_dit_trajectory: bool = False
     # The latents, debug and cond tensors go to the server's output store; the response carries the ref.
     rollout_return_outputs_via_store: bool = False
+    # False skips the VAE decode: the response carries only the rollout trajectory.
+    rollout_return_generated_output: bool = True
 
     # 0-indexed denoising-loop step filters. None = all steps.
     rollout_sde_step_indices: Optional[list[int]] = None

@@ -926,6 +926,9 @@ class JoyEchoMemoryBankFetchStage(PipelineStage):
 class JoyEchoAVDecodingStage(LTX2AVDecodingStage):
     """Decode AV outputs and commit paired memory slots when enabled."""
 
+    # forward commits the decoded clip to the memory bank.
+    skip_decode_supported = False
+
     def __init__(
         self,
         vae,
