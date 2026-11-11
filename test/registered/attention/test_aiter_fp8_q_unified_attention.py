@@ -1,4 +1,5 @@
-"""Coverage for the AITER FP8-Q unified-attention decode path."""
+"""Coverage for the AITER FP8-Q unified-attention decode path and the gfx950
+FP8 ASM prefill with GQA KV-head repeat."""
 
 import math
 import unittest
@@ -8,7 +9,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -19,11 +20,15 @@ if _RUNNABLE:
     from aiter.ops.triton.attention.unified_attention import unified_attention
 
     import sglang.srt.layers.attention.aiter_backend as aiter_backend
+    from sglang.kernels.ops.attention.kv_gather_repeat import gather_repeat_kv_heads
     from sglang.kernels.ops.quantization.fp8_kernel import (
         fp8_dtype,
         scaled_fp8_quant,
     )
-    from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+    from sglang.srt.layers.attention.aiter_backend import (
+        AiterAttnBackend,
+        _aiter_fp8_asm_gqa_repeat,
+    )
 
 
 class _FakeKVPool:
@@ -322,6 +327,250 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
             actual.flatten(), expected.flatten(), dim=0
         ).item()
         self.assertGreater(cosine, 0.99)
+
+
+@unittest.skipUnless(
+    _RUNNABLE and is_gfx95_supported(), "requires gfx950 AITER FP8 ASM prefill"
+)
+class TestAiterFP8AsmPrefillGQARepeat(CustomTestCase):
+    def test_repeat_factor(self):
+        cases = {
+            (24, 4): 3,  # Qwen3.8-27B TP1: ratio 6 -> 2
+            (16, 2): 1,  # ratio 8 is native
+            (64, 2): 1,  # ratio 32 has no supported power-of-two factor
+        }
+        for (num_q_heads, num_kv_heads), repeat in cases.items():
+            with self.subTest(num_q_heads=num_q_heads, num_kv_heads=num_kv_heads):
+                self.assertEqual(
+                    _aiter_fp8_asm_gqa_repeat(num_q_heads, num_kv_heads), repeat
+                )
+
+    def _run_prefill(self, num_q_heads, num_kv_heads):
+        head_dim, device = 256, "cuda"
+        prefix_lens, extend_lens = [64, 50], [32, 77]
+        seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+        ratio = num_q_heads // num_kv_heads
+        torch.manual_seed(0)
+
+        # Each query attends almost only to its own key, so head mapping,
+        # bottom-right causal alignment and varlen offsets all show in the output.
+        keys, values, queries = [], [], []
+        for prefix, seq_len in zip(prefix_lens, seq_lens):
+            k = 0.1 * torch.randn(seq_len, num_kv_heads, head_dim, device=device)
+            base = torch.randn(seq_len, head_dim, device=device)
+            k += 2 * base[:, None, :]
+            q = base[prefix:, None, :] + 0.05 * torch.randn(
+                seq_len - prefix, num_q_heads, head_dim, device=device
+            )
+            keys.append(k)
+            values.append(torch.randn(seq_len, num_kv_heads, head_dim, device=device))
+            queries.append(q)
+        k, v, q = (torch.cat(t).to(torch.bfloat16) for t in (keys, values, queries))
+
+        fp8_max = torch.finfo(fp8_dtype).max
+        k_scale = (k.abs().float().amax() / fp8_max).view(1)
+        v_scale = (v.abs().float().amax() / fp8_max).view(1)
+        k_fp8, _ = scaled_fp8_quant(k.reshape(-1, num_kv_heads * head_dim), k_scale)
+        v_fp8, _ = scaled_fp8_quant(v.reshape(-1, num_kv_heads * head_dim), v_scale)
+        q_scale = torch.ones(1, dtype=torch.float32, device=device)
+        q_fp8, _ = scaled_fp8_quant(q.reshape(q.shape[0], -1), q_scale)
+
+        # Scatter the KV rows to random cache slots (uint8: no fp8 index_put).
+        total_k = sum(seq_lens)
+        tok_idx = torch.randperm(total_k + 7, device=device)[:total_k]
+        k_cache = torch.zeros(
+            total_k + 7, num_kv_heads, head_dim, dtype=torch.uint8, device=device
+        )
+        v_cache = torch.zeros_like(k_cache)
+        k_cache[tok_idx] = k_fp8.view(torch.uint8).view(-1, num_kv_heads, head_dim)
+        v_cache[tok_idx] = v_fp8.view(torch.uint8).view(-1, num_kv_heads, head_dim)
+        k_cache, v_cache = k_cache.view(fp8_dtype), v_cache.view(fp8_dtype)
+
+        def cu(lengths):
+            out = torch.zeros(len(lengths) + 1, dtype=torch.int32, device=device)
+            out[1:] = torch.tensor(lengths, device=device).cumsum(0)
+            return out
+
+        backend = object.__new__(AiterAttnBackend)
+        backend.input_dtype = torch.bfloat16
+        backend.q_scale = q_scale
+        backend.k_scale = k_scale
+        backend.qo_indptr = cu(extend_lens)
+        backend.token_to_kv_pool = _FakeKVPool(k_cache, v_cache)
+        backend.forward_metadata = SimpleNamespace(
+            max_q_len=max(extend_lens), max_kv_len=max(seq_lens)
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=num_q_heads,
+            tp_k_head_num=num_kv_heads,
+            qk_head_dim=head_dim,
+            v_head_dim=head_dim,
+            k_scale=k_scale,
+            scaling=head_dim**-0.5,
+        )
+        with mock.patch.object(
+            backend,
+            "_asm_context_prefill_indices",
+            return_value=(tok_idx.to(torch.int32), cu(seq_lens)),
+        ):
+            out = backend._forward_extend_fp8_asm_gqa_repeat(
+                q,
+                layer,
+                SimpleNamespace(batch_size=len(seq_lens)),
+                _aiter_fp8_asm_gqa_repeat(num_q_heads, num_kv_heads),
+                len(seq_lens) + 1,
+                k_scale,
+                v_scale,
+            )
+
+        # Float reference on the dequantized FP8 inputs.
+        q_ref = (q_fp8.float() * q_scale).view(-1, num_q_heads, head_dim)
+        k_ref = (k_fp8.float() * k_scale).view(-1, num_kv_heads, head_dim)
+        v_ref = (v_fp8.float() * v_scale).view(-1, num_kv_heads, head_dim)
+        expected, q_start, k_start = [], 0, 0
+        for prefix, seq_len in zip(prefix_lens, seq_lens):
+            ext = seq_len - prefix
+            qs = q_ref[q_start : q_start + ext].transpose(0, 1)
+            ks = k_ref[k_start : k_start + seq_len].repeat_interleave(ratio, dim=1)
+            vs = v_ref[k_start : k_start + seq_len].repeat_interleave(ratio, dim=1)
+            scores = qs @ ks.permute(1, 2, 0) * head_dim**-0.5
+            q_pos = torch.arange(prefix, seq_len, device=device)[:, None]
+            k_pos = torch.arange(seq_len, device=device)[None, :]
+            scores = scores.masked_fill(k_pos > q_pos, float("-inf"))
+            expected.append((scores.softmax(-1) @ vs.transpose(0, 1)).transpose(0, 1))
+            q_start, k_start = q_start + ext, k_start + seq_len
+        expected = torch.cat(expected)
+        actual = out.float().view_as(expected)
+
+        self.assertEqual(out.dtype, torch.bfloat16)
+        self.assertTrue(bool(torch.isfinite(actual).all()))
+        mismatch = (actual - expected).abs() > 0.1 + 0.1 * expected.abs()
+        self.assertLess(mismatch.float().mean().item(), 0.005)
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.flatten(), expected.flatten(), dim=0
+        ).item()
+        self.assertGreater(cosine, 0.99)
+
+    def test_qwen38_27b_prefill_with_prefix_matches_reference(self):
+        self._run_prefill(24, 4)
+
+    def test_gather_repeat_kv_heads_is_byte_exact(self):
+        """The one-pass gather + repeat writes cache[idx] with each KV head
+        repeated, byte for byte, for any head count, row size and slot order."""
+        device = "cuda"
+        torch.manual_seed(0)
+        cases = (
+            (4, 3, 256, fp8_dtype),  # Qwen3.8-27B TP1
+            (3, 2, 256, fp8_dtype),  # 96 words per row, not a power of two
+        )
+        for num_kv_heads, repeat, head_dim, dtype in cases:
+            row_bytes = head_dim * torch.empty((), dtype=dtype).element_size()
+            for n in (0, 17, 4099):
+                for idx_dtype in (torch.int32, torch.int64):
+                    with self.subTest(
+                        num_kv_heads=num_kv_heads, n=n, idx_dtype=idx_dtype
+                    ):
+                        num_slots = n + 33
+                        cache_bytes = torch.randint(
+                            0,
+                            256,
+                            (num_slots, num_kv_heads, row_bytes),
+                            dtype=torch.uint8,
+                            device=device,
+                        )
+                        idx = torch.randperm(num_slots, device=device)[:n]
+                        got = gather_repeat_kv_heads(
+                            cache_bytes.view(dtype), idx.to(idx_dtype), repeat
+                        )
+                        self.assertEqual(got.dtype, dtype)
+                        self.assertEqual(
+                            tuple(got.shape), (n, num_kv_heads * repeat, head_dim)
+                        )
+                        expected = cache_bytes[idx].repeat_interleave(repeat, dim=1)
+                        self.assertTrue(torch.equal(got.view(torch.uint8), expected))
+
+    def test_prefill_writes_into_the_attention_output_buffer(self):
+        """A contiguous bf16 attention output buffer on the batch (the breakable
+        prefill graph's static output) goes to the kernel as `out` and comes
+        back as the result, so the caller has nothing to copy."""
+        num_q_heads, num_kv_heads, head_dim, device = 24, 4, 256, "cuda"
+        repeat = _aiter_fp8_asm_gqa_repeat(num_q_heads, num_kv_heads)
+        num_tokens, width = 9, num_q_heads * head_dim
+        cache = torch.zeros(
+            16, num_kv_heads, head_dim, dtype=torch.uint8, device=device
+        ).view(fp8_dtype)
+        backend = object.__new__(AiterAttnBackend)
+        backend.input_dtype = torch.bfloat16
+        backend.q_scale = backend.k_scale = torch.ones(1, device=device)
+        backend.qo_indptr = torch.tensor(
+            [0, num_tokens], dtype=torch.int32, device=device
+        )
+        backend.token_to_kv_pool = _FakeKVPool(cache, cache)
+        backend.forward_metadata = SimpleNamespace(
+            max_q_len=num_tokens, max_kv_len=num_tokens
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=num_q_heads,
+            tp_k_head_num=num_kv_heads,
+            qk_head_dim=head_dim,
+            v_head_dim=head_dim,
+            k_scale=backend.k_scale,
+            scaling=head_dim**-0.5,
+        )
+        q = torch.randn(num_tokens, width, dtype=torch.bfloat16, device=device)
+        tok_idx = torch.arange(num_tokens, dtype=torch.int32, device=device)
+        cu_k = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+        static = torch.zeros(num_tokens + 3, width, dtype=torch.bfloat16).to(device)
+        cases = {
+            "graph buffer": (static[:num_tokens], True, True),
+            "older AITER": (static[:num_tokens], False, False),
+            "no buffer": (None, True, False),
+            "fp32": (static.float()[:num_tokens], True, False),
+        }
+        for label, (buf, takes_out, expect_out) in cases.items():
+            with self.subTest(label):
+                seen = []
+
+                def fake_attention(q, *args, out=None, **kwargs):
+                    seen.append(out)
+                    result = torch.full(
+                        q.shape, 1.5, dtype=torch.bfloat16, device=q.device
+                    )
+                    return result if out is None else out.copy_(result)
+
+                with (
+                    mock.patch.object(
+                        backend,
+                        "_asm_context_prefill_indices",
+                        return_value=(tok_idx, cu_k),
+                    ),
+                    mock.patch.object(
+                        aiter_backend,
+                        "flash_attn_varlen_fp8_pertensor_func",
+                        side_effect=fake_attention,
+                    ),
+                    mock.patch.object(
+                        aiter_backend, "_FP8_VARLEN_PREFILL_TAKES_OUT", takes_out
+                    ),
+                ):
+                    o = backend._forward_extend_fp8_asm_gqa_repeat(
+                        q,
+                        layer,
+                        SimpleNamespace(batch_size=1, _attn_output=buf),
+                        repeat,
+                        2,
+                        backend.k_scale,
+                        backend.k_scale,
+                    )
+                self.assertEqual(tuple(o.shape), (num_tokens, width))
+                self.assertTrue(bool((o == 1.5).all()))
+                if expect_out:
+                    self.assertEqual(seen[0].data_ptr(), buf.data_ptr())
+                    self.assertEqual(o.data_ptr(), buf.data_ptr())
+                else:
+                    self.assertIsNone(seen[0])
 
 
 if __name__ == "__main__":
