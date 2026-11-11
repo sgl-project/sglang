@@ -60,7 +60,11 @@ def resolve_window_id_space(
         return None
     allocator = model_runner.token_to_kv_pool_allocator
     if allocator.hands_out_virtual_ids and window_pool.requires_physical_write_loc:
-        return allocator.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
+        # The runner's ids resolve the sliding-window role to the storage its
+        # window layers live in: the target's window for the target, and for
+        # a fused draft its host, which is a band of its own when the draft's
+        # window differs from every target window.
+        return model_runner.runner_ids.space(IdSpaceKind.SLIDING_WINDOW)
     return window_pool.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
 
 
@@ -106,6 +110,14 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # Bind-time cap on the window sub-pools one runner's layers attend through.
+    max_window_sub_pools: int = 1
+
+    def window_capacity_children(self) -> list:
+        """The backends a wrapper runs its layers' attention through, whose
+        window capacity binds in its place; none for a leaf."""
+        return []
+
     # Whether target verify runs correctly under decode context parallelism:
     # each rank reads its shard of the DCP-widened pages with the global causal
     # bound and returns its LSE for the cross-rank merge.
@@ -273,7 +285,6 @@ class AttentionBackend(ABC):
         self,
         forward_batch: ForwardBatch,
         *,
-        num_qo_tokens: int,
         build_snapshot: bool = True,
     ) -> SharedReadEnds:
         """Return this batch's prefill read end, building a snapshot when asked.
@@ -288,13 +299,11 @@ class AttentionBackend(ABC):
         if forward_batch.forward_mode != ForwardMode.EXTEND:
             return SharedReadEnds.UNKNOWN
         if build_snapshot:
-            return self._snapshot_prefill_shared_reads(
-                forward_batch, num_qo_tokens=num_qo_tokens
-            )
+            return self._snapshot_prefill_shared_reads(forward_batch)
         return self.shared_read_ends(forward_batch.forward_mode)
 
     def _snapshot_prefill_shared_reads(
-        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+        self, forward_batch: ForwardBatch
     ) -> SharedReadEnds:
         """Snapshot late shared reads; return PRE_REPLAY only if none remain.
 

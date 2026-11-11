@@ -3,11 +3,13 @@ from types import SimpleNamespace
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.custom_logit_processor import (
     DisallowedTokensLogitsProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -45,6 +47,60 @@ class TestSamplingMaskValidation(CustomTestCase):
             sampling_logprobs_mode=sampling_logprobs_mode,
         )
         self.manager._validate_one_request(req, req.input_ids)
+
+    def test_top_logprobs_num_must_be_a_valid_count_when_logprobs_requested(self):
+        """A malformed or oversized candidate count must not reach the scheduler."""
+        self.manager.model_config.vocab_size = 32
+        for top_logprobs_num, return_logprob, accepted in (
+            (None, True, True),
+            (0, True, True),
+            (32, True, True),
+            (33, True, False),
+            (-3, True, False),
+            ([33], True, False),
+            (33, False, True),
+        ):
+            with self.subTest(top_logprobs_num=top_logprobs_num, rl=return_logprob):
+                req = GenerateReqInput(
+                    input_ids=[1, 2, 3],
+                    sampling_params={},
+                    return_logprob=return_logprob,
+                    top_logprobs_num=top_logprobs_num,
+                )
+                if accepted:
+                    self.manager._validate_one_request(req, req.input_ids)
+                else:
+                    with self.assertRaisesRegex(ValueError, "top_logprobs"):
+                        self.manager._validate_one_request(req, req.input_ids)
+
+    def test_mixed_batch_forwards_zero_count_for_logprob_disabled_items(self):
+        """Disabled items must not contribute their raw count to a shared topk.
+
+        Each enabled item keeps its own count.
+        """
+        self.manager.model_config.vocab_size = 32
+        self.manager.preferred_sampling_params = None
+        self.manager.sampling_params_class = SamplingParams
+        self.manager.tokenizer = None
+        self.manager.fake_bootstrap_room_counter = 0
+        req = GenerateReqInput(
+            input_ids=[[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]],
+            sampling_params={},
+            return_logprob=[True, False, False, True],
+            top_logprobs_num=[5, 33, "many", 7],
+        )
+        req.normalize_batch_and_arguments()
+        self.manager.rid_to_state = {
+            rid: SimpleNamespace(time_stats=APIServerReqTimeStats()) for rid in req.rid
+        }
+        forwarded_counts = []
+        for i in range(4):
+            self.manager._validate_one_request(req[i], req[i].input_ids)
+            tokenized_request = self.manager._create_tokenized_object(
+                req[i], "", req[i].input_ids
+            )
+            forwarded_counts.append(tokenized_request.top_logprobs_num)
+        self.assertEqual(forwarded_counts, [5, 0, 0, 7])
 
     def test_accepts_hard_exclusion(self):
         class BoundMask(DisallowedTokensLogitsProcessor):

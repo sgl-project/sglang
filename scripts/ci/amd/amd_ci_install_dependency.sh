@@ -1,5 +1,8 @@
 #!/bin/bash
 set -euo pipefail
+# Container the CI steps run in. Spur jobs that share a node give each job its
+# own; everywhere else it stays ci_sglang.
+CI_CONTAINER_NAME="${CI_CONTAINER_NAME:-ci_sglang}"
 HOSTNAME_VALUE=$(hostname)
 GPU_ARCH="mi30x"   # default
 SKIP_TT_DEPS=""
@@ -27,8 +30,8 @@ OPTIONAL_DEPS="${1:-}"
 
 if [[ ",${OPTIONAL_DEPS}," == *,diffusion,* ]]; then
   # MiniMax H3 uses ffprobe for input admission and output audio validation.
-  docker exec ci_sglang apt-get update
-  docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang apt-get install -y --no-install-recommends ffmpeg
+  docker exec "$CI_CONTAINER_NAME" apt-get update
+  docker exec -e DEBIAN_FRONTEND=noninteractive "$CI_CONTAINER_NAME" apt-get install -y --no-install-recommends ffmpeg
 fi
 
 # Build python extras
@@ -57,9 +60,9 @@ fi
 # Images built before that ENV existed: 724 stages already set
 # PIP_CONSTRAINT and HSA_ENABLE_IPC_MODE_LEGACY; remaining HIP 7.2* is
 # 720; else 7.0. Do not key off torch 2.11 — 720 may ship that later.
-IMAGE_TORCH_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.__version__)')
-IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
-IMAGE_GPU_ARCH=$(docker exec ci_sglang printenv GPU_ARCH 2>/dev/null || true)
+IMAGE_TORCH_VERSION=$(docker exec "$CI_CONTAINER_NAME" python3 -c 'import torch; print(torch.__version__)')
+IMAGE_HIP_VERSION=$(docker exec "$CI_CONTAINER_NAME" python3 -c 'import torch; print(torch.version.hip or "")')
+IMAGE_GPU_ARCH=$(docker exec "$CI_CONTAINER_NAME" printenv GPU_ARCH 2>/dev/null || true)
 if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950|gfx1250)(-rocm720|-rocm724|-rocm1000|-rocm1010)?$ ]]; then
     echo "[CI-IMAGE] Image GPU_ARCH=${IMAGE_GPU_ARCH}"
     case "${IMAGE_GPU_ARCH}" in
@@ -71,8 +74,8 @@ if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950|gfx1250)(-rocm720|-rocm724|-rocm100
     esac
     IMAGE_GFX="${IMAGE_GPU_ARCH%-*}"
 else
-    IMAGE_PIP_CONSTRAINT=$(docker exec ci_sglang printenv PIP_CONSTRAINT 2>/dev/null || true)
-    IMAGE_HSA_LEGACY=$(docker exec ci_sglang printenv HSA_ENABLE_IPC_MODE_LEGACY 2>/dev/null || true)
+    IMAGE_PIP_CONSTRAINT=$(docker exec "$CI_CONTAINER_NAME" printenv PIP_CONSTRAINT 2>/dev/null || true)
+    IMAGE_HSA_LEGACY=$(docker exec "$CI_CONTAINER_NAME" printenv HSA_ENABLE_IPC_MODE_LEGACY 2>/dev/null || true)
     if [[ -n "${IMAGE_PIP_CONSTRAINT}" || "${IMAGE_HSA_LEGACY}" == "1" ]]; then
         IMAGE_BASE_ARG_SUFFIX="_ROCM724"
         IMAGE_STAGE_SUFFIX="-rocm724"
@@ -107,8 +110,8 @@ echo "Image torch ${IMAGE_TORCH_VERSION}, HIP ${IMAGE_HIP_VERSION}; installing p
 # Fix permissions on pip cache, ignore errors from concurrent access or missing temp files.
 # pip running as root disables the cache unless the cache dir itself is owned by root; it
 # never checks the entries beneath it. Simply changing folder permissions reduces chown runtime.
-docker exec ci_sglang chown root:root /sgl-data/pip-cache 2>/dev/null || true
-docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
+docker exec "$CI_CONTAINER_NAME" chown root:root /sgl-data/pip-cache 2>/dev/null || true
+docker exec "$CI_CONTAINER_NAME" pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 
 # Helper function to install with retries and fallback PyPI mirror
 install_with_retry() {
@@ -148,7 +151,7 @@ install_with_retry() {
 #   TypeError: HTTPTransport.__init__() got an unexpected keyword argument 'socket_options'
 # Call this as the LAST pip operation so nothing can downgrade httpx afterwards.
 ensure_httpx() {
-  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
+  install_with_retry docker exec "$CI_CONTAINER_NAME" pip install --cache-dir=/sgl-data/pip-cache --upgrade 'httpx>=0.25.0'
 }
 
 # shellcheck source=scripts/ci/utils/git_clone_with_retry.sh
@@ -158,14 +161,14 @@ source "$(dirname "${BASH_SOURCE[0]}")/../utils/git_clone_with_retry.sh"
 if [ -n "$SKIP_SGLANG_BUILD" ]; then
   echo "Didn't build checkout SGLang"
 else
-  docker exec ci_sglang pip uninstall sgl-kernel -y || true
-  docker exec ci_sglang pip uninstall sglang-kernel -y || true
-  docker exec ci_sglang pip uninstall sglang -y || true
+  docker exec "$CI_CONTAINER_NAME" pip uninstall sgl-kernel -y || true
+  docker exec "$CI_CONTAINER_NAME" pip uninstall sglang-kernel -y || true
+  docker exec "$CI_CONTAINER_NAME" pip uninstall sglang -y || true
   # Clear Python cache in the checkout so the latest code is used. The uninstalls
   # above already removed the old sglang files from /opt/venv, so walking all of
   # site-packages there (~6 s) only made every job recompile torch's bytecode.
-  docker exec ci_sglang find /sglang-checkout -name "*.pyc" -delete || true
-  docker exec ci_sglang find /sglang-checkout -name "__pycache__" -type d -exec rm -rf {} + || true
+  docker exec "$CI_CONTAINER_NAME" find /sglang-checkout -name "*.pyc" -delete || true
+  docker exec "$CI_CONTAINER_NAME" find /sglang-checkout -name "__pycache__" -type d -exec rm -rf {} + || true
 
   # The AOT kernels depend only on python/sglang/kernels/aot, the image and the
   # GPU arch, yet rebuilding them took ~30 s in every job. Cache the wheel on the
@@ -174,7 +177,7 @@ else
   AOT_KEY=""
   if git diff --quiet HEAD -- python/sglang/kernels/aot 2>/dev/null; then
     AOT_TREE=$(git rev-parse --short=16 HEAD:python/sglang/kernels/aot 2>/dev/null || true)
-    AOT_IMAGE=$(docker inspect --format '{{.Image}}' ci_sglang 2>/dev/null || true)
+    AOT_IMAGE=$(docker inspect --format '{{.Image}}' "$CI_CONTAINER_NAME" 2>/dev/null || true)
     AOT_IMAGE="${AOT_IMAGE#sha256:}"
     if [[ -n "${AOT_TREE}" && -n "${AOT_IMAGE}" ]]; then
       AOT_KEY="${AOT_TREE}-${AOT_IMAGE:0:16}-${IMAGE_GFX}"
@@ -182,17 +185,17 @@ else
   fi
   AOT_CACHE_ROOT=/sgl-data/sgl-kernel-wheels
   AOT_CACHE="${AOT_CACHE_ROOT}/${AOT_KEY}"
-  if [[ -n "${AOT_KEY}" ]] && docker exec ci_sglang bash -c "ls ${AOT_CACHE}/*.whl" >/dev/null 2>&1; then
+  if [[ -n "${AOT_KEY}" ]] && docker exec "$CI_CONTAINER_NAME" bash -c "ls ${AOT_CACHE}/*.whl" >/dev/null 2>&1; then
     echo "[AOT] Reusing cached sglang-kernel wheel ${AOT_KEY}"
-    docker exec ci_sglang touch "${AOT_CACHE}" || true
+    docker exec "$CI_CONTAINER_NAME" touch "${AOT_CACHE}" || true
     AOT_WHEEL_DIR="${AOT_CACHE}"
   else
     echo "[AOT] Building sglang-kernel (cache key: ${AOT_KEY:-none})"
-    docker exec -w /sglang-checkout/python/sglang/kernels/aot ci_sglang bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && rm -rf dist && python3 setup_rocm.py bdist_wheel"
+    docker exec -w /sglang-checkout/python/sglang/kernels/aot "$CI_CONTAINER_NAME" bash -c "rm -f pyproject.toml && mv pyproject_rocm.toml pyproject.toml && rm -rf dist && python3 setup_rocm.py bdist_wheel"
     AOT_WHEEL_DIR=/sglang-checkout/python/sglang/kernels/aot/dist
     if [[ -n "${AOT_KEY}" ]]; then
       # Publish atomically: concurrent jobs on the same host may build the same key.
-      docker exec ci_sglang bash -c "
+      docker exec "$CI_CONTAINER_NAME" bash -c "
         mkdir -p ${AOT_CACHE_ROOT} &&
         tmp=\$(mktemp -d ${AOT_CACHE_ROOT}/.tmp.XXXXXX) &&
         cp ${AOT_WHEEL_DIR}/*.whl \"\$tmp\"/ &&
@@ -201,10 +204,10 @@ else
       " || echo "[AOT] Warning: could not store the wheel in ${AOT_CACHE}" >&2
     fi
   fi
-  docker exec ci_sglang bash -c "pip install --no-deps --force-reinstall ${AOT_WHEEL_DIR}/*.whl"
+  docker exec "$CI_CONTAINER_NAME" bash -c "pip install --no-deps --force-reinstall ${AOT_WHEEL_DIR}/*.whl"
 
-  docker exec ci_sglang bash -c 'rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml'
-  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
+  docker exec "$CI_CONTAINER_NAME" bash -c 'rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml'
+  install_with_retry docker exec "$CI_CONTAINER_NAME" pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
 fi
 
 # serving_responses.py imports responses_tools/beam.py, which needs
@@ -212,7 +215,7 @@ fi
 # pins openai==2.6.1, so the Responses handler fails to import and every
 # /v1/responses request returns 500. Drop this once pyproject_other.toml moves
 # to 2.8.0.
-install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "openai==2.8.0"
+install_with_retry docker exec "$CI_CONTAINER_NAME" pip install --cache-dir=/sgl-data/pip-cache "openai==2.8.0"
 
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
@@ -222,21 +225,21 @@ else
   # owned by the runner (non-root); mark it safe so setuptools_scm /
   # vcs_versioning can run `git` introspection during pip install.
   git_clone_with_retry https://github.com/EvolvingLMMs-Lab/lmms-eval.git lmms-eval "--branch v0.4.1"
-  docker cp lmms-eval ci_sglang:/
-  docker exec ci_sglang git config --global --add safe.directory /lmms-eval
+  docker cp lmms-eval "$CI_CONTAINER_NAME":/
+  docker exec "$CI_CONTAINER_NAME" git config --global --add safe.directory /lmms-eval
   # pyarrow 26 needs NumPy 2 at import, but lmms-eval pins numpy 1.26.4;
   # drop the cap once lmms-eval allows NumPy 2.
-  install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e . "pyarrow<26"
+  install_with_retry docker exec -w /lmms-eval "$CI_CONTAINER_NAME" pip install --cache-dir=/sgl-data/pip-cache -e . "pyarrow<26"
 
   # lmms-eval v0.4.1 pulls latex2sympy2, which pins antlr4-python3-runtime==4.7.2
   # and uninstalls the 4.9.3 that sgl-eval's latex2sympy2_extended requires, so
   # every `sgl-eval run mmlu` dies with "Unsupported ANTLR version 4.7.2". Pin it
   # back, the same way the CUDA installer does after its own lmms-eval install.
-  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "antlr4-python3-runtime==4.9.3" --force-reinstall --no-deps
+  install_with_retry docker exec "$CI_CONTAINER_NAME" pip install --cache-dir=/sgl-data/pip-cache "antlr4-python3-runtime==4.9.3" --force-reinstall --no-deps
 
   git_clone_with_retry https://github.com/akao-amd/human-eval.git human-eval
-  docker cp human-eval ci_sglang:/
-  install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+  docker cp human-eval "$CI_CONTAINER_NAME":/
+  install_with_retry docker exec -w /human-eval "$CI_CONTAINER_NAME" pip install --cache-dir=/sgl-data/pip-cache -e .
 
   mkdir -p dummy-grok
   cat > dummy-grok/config.json << 'EOF'
@@ -262,17 +265,17 @@ else
     "torch_dtype": "bfloat16"
   }
 EOF
-  docker exec -w / ci_sglang mkdir -p /dummy-grok
-  docker cp ./dummy-grok/config.json ci_sglang:/dummy-grok/config.json
+  docker exec -w / "$CI_CONTAINER_NAME" mkdir -p /dummy-grok
+  docker cp ./dummy-grok/config.json "$CI_CONTAINER_NAME":/dummy-grok/config.json
 
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
+  docker exec "$CI_CONTAINER_NAME" pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
+  docker exec "$CI_CONTAINER_NAME" pip install --cache-dir=/sgl-data/pip-cache pytest
 
   # Install cache-dit for qwen_image_t2i_cache_dit_enabled test (added in PR 16204)
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'cache-dit==1.3.0' || echo "cache-dit installation failed"
+  docker exec "$CI_CONTAINER_NAME" pip install --cache-dir=/sgl-data/pip-cache --upgrade 'cache-dit==1.3.0' || echo "cache-dit installation failed"
 
   # Install accelerate for distributed training and inference support
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
+  docker exec "$CI_CONTAINER_NAME" pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
 fi
 
 # -----------------------
@@ -282,10 +285,10 @@ fi
 # the Dockerfile does. Only ENABLE_MORI=1 images ship /sgl-workspace/mori.
 # When the image's checkout is already at the pin the reinstall is redundant.
 MORI_COMMIT=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_COMMIT=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_COMMIT="\([^"]*\)".*/\1/' || true)
-IMAGE_MORI_COMMIT=$(docker exec ci_sglang git -C /sgl-workspace/mori rev-parse HEAD 2>/dev/null || true)
+IMAGE_MORI_COMMIT=$(docker exec "$CI_CONTAINER_NAME" git -C /sgl-workspace/mori rev-parse HEAD 2>/dev/null || true)
 if [[ -n "${MORI_COMMIT}" && "${IMAGE_MORI_COMMIT}" == "${MORI_COMMIT}" ]]; then
   echo "[MORI] Image already has MORI ${MORI_COMMIT}; skipping reinstall"
-elif docker exec ci_sglang test -d /sgl-workspace/mori; then
+elif docker exec "$CI_CONTAINER_NAME" test -d /sgl-workspace/mori; then
   MORI_REPO=$(grep -E '^[[:space:]]*ARG[[:space:]]+MORI_REPO=' docker/rocm.Dockerfile | head -n1 | sed 's/.*MORI_REPO="\([^"]*\)".*/\1/')
 
   if [[ -z "${MORI_COMMIT}" ]]; then
@@ -306,7 +309,7 @@ elif docker exec ci_sglang test -d /sgl-workspace/mori; then
   # guard is not specific to the rocm-osdb source that first triggered this.
   # Retries are already configured image-wide (Acquire::Retries) and do not
   # help against a 404.
-  docker exec ci_sglang bash -c "
+  docker exec "$CI_CONTAINER_NAME" bash -c "
     set -euo pipefail
     export MORI_GPU_ARCHS='${MORI_GPU_ARCHS}'
     rm -rf /sgl-workspace/mori
@@ -394,7 +397,7 @@ echo "[CI-AITER-CHECK] Dockerfile expects AITER_COMMIT=${REPO_AITER_COMMIT}"
 #############################################
 # 2. Check container pre-installed AITER version
 #############################################
-IMAGE_AITER_VERSION=$(docker exec ci_sglang bash -c "pip show amd-aiter 2>/dev/null | grep '^Version:' | awk '{print \$2}'" || echo "none")
+IMAGE_AITER_VERSION=$(docker exec "$CI_CONTAINER_NAME" bash -c "pip show amd-aiter 2>/dev/null | grep '^Version:' | awk '{print \$2}'" || echo "none")
 IMAGE_AITER_VERSION="v${IMAGE_AITER_VERSION}"
 echo "[CI-AITER-CHECK] AITER version inside CI image: ${IMAGE_AITER_VERSION}"
 
@@ -438,13 +441,13 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     echo "[CI-AITER-CHECK] === AITER REBUILD START ==="
 
     # uninstall existing aiter
-    docker exec ci_sglang pip uninstall -y amd-aiter || true
+    docker exec "$CI_CONTAINER_NAME" pip uninstall -y amd-aiter || true
 
     # delete old aiter directory
-    docker exec ci_sglang rm -rf /sgl-workspace/aiter
+    docker exec "$CI_CONTAINER_NAME" rm -rf /sgl-workspace/aiter
 
     # clone a fresh copy to /sgl-workspace/aiter
-    docker exec ci_sglang git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
+    docker exec "$CI_CONTAINER_NAME" git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
 
     # checkout correct version and install requirements
     # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
@@ -452,7 +455,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     # not block switching to commits that predate that rule. The working tree
     # was just produced by `rm -rf` + fresh `git clone` above, so there are no
     # real user changes to preserve.
-    docker exec ci_sglang bash -c "
+    docker exec "$CI_CONTAINER_NAME" bash -c "
         cd /sgl-workspace/aiter && \
         git fetch --all && \
         git checkout -f ${REPO_AITER_COMMIT} && \
@@ -463,7 +466,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     # gfx942/gfx950: re-apply the Dockerfile's AITER patches, the v4 fp4 indexer
     # fix and the grouped dsv4 decode .co (built from ROCm/aiter#5195's).
     if [[ "${IMAGE_GFX}" == "gfx942" || "${IMAGE_GFX}" == "gfx950" ]]; then
-        docker exec ci_sglang bash -c "
+        docker exec "$CI_CONTAINER_NAME" bash -c "
             cd /sgl-workspace/aiter && \
             sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py && \
             sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py && \
@@ -473,7 +476,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
 
     # Re-apply the Dockerfile torch.Stream patch after re-clone (ROCm/aiter#4817).
     if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm1000" || "${IMAGE_GFX}" == "gfx942" || "${IMAGE_GFX}" == "gfx950" ]]; then
-        docker exec -i ci_sglang python3 - <<'PY'
+        docker exec -i "$CI_CONTAINER_NAME" python3 - <<'PY'
 from pathlib import Path
 p = Path("/sgl-workspace/aiter/csrc/cpp_itfs/torch_utils.py")
 s = p.read_text()
@@ -507,12 +510,12 @@ PY
     # PREBUILD_KERNELS=1 step (~2h per arch, past the job timeouts); kernels
     # JIT-compile on first use.
     if [[ "${IMAGE_GFX}" == "gfx942" || "${IMAGE_GFX}" == "gfx950" ]]; then
-        docker exec ci_sglang bash -c "
+        docker exec "$CI_CONTAINER_NAME" bash -c "
             cd /sgl-workspace/aiter && \
             AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${IMAGE_GFX} pip install --config-settings editable_mode=compat -e .
         "
     else
-        docker exec ci_sglang bash -c "
+        docker exec "$CI_CONTAINER_NAME" bash -c "
             cd /sgl-workspace/aiter && \
             AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
         "
@@ -531,9 +534,9 @@ ensure_httpx
 # # Clear pre-built AITER kernels from Docker image to avoid segfaults
 # # The Docker image may contain pre-compiled kernels incompatible with the current environment
 # echo "Clearing pre-built AITER kernels from Docker image..."
-# docker exec ci_sglang find /sgl-workspace/aiter/aiter/jit -name "*.so" -delete 2>/dev/null || true
-# docker exec ci_sglang ls -la /sgl-workspace/aiter/aiter/jit/ 2>/dev/null || echo "jit dir empty or not found"
+# docker exec "$CI_CONTAINER_NAME" find /sgl-workspace/aiter/aiter/jit -name "*.so" -delete 2>/dev/null || true
+# docker exec "$CI_CONTAINER_NAME" ls -la /sgl-workspace/aiter/aiter/jit/ 2>/dev/null || echo "jit dir empty or not found"
 
 # # Pre-build AITER kernels to avoid timeout during tests
 # echo "Warming up AITER JIT kernels..."
-# docker exec -e SGLANG_USE_AITER=1 ci_sglang python3 /sglang-checkout/scripts/ci/amd/amd_ci_warmup_aiter.py || echo "AITER warmup completed (some kernels may not be available)"
+# docker exec -e SGLANG_USE_AITER=1 "$CI_CONTAINER_NAME" python3 /sglang-checkout/scripts/ci/amd/amd_ci_warmup_aiter.py || echo "AITER warmup completed (some kernels may not be available)"
