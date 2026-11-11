@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.runtime_context import get_context
@@ -72,6 +72,47 @@ class TestSamplingMaskValidation(CustomTestCase):
                 else:
                     with self.assertRaisesRegex(ValueError, "top_logprobs"):
                         self.manager._validate_one_request(req, req.input_ids)
+
+    def test_token_indices_to_pool_must_be_prompt_positions(self):
+        for indices, accepted in (
+            (None, True),
+            ([0], True),
+            ([0, 2], True),
+            ([], False),
+            ([3], False),
+            ([-1], False),
+            ([[0]], False),
+            ([0.5], False),
+        ):
+            with self.subTest(indices=indices):
+                req = GenerateReqInput(
+                    input_ids=[1, 2, 3],
+                    sampling_params={},
+                    token_indices_to_pool=indices,
+                )
+                if accepted:
+                    self.manager._validate_one_request(req, req.input_ids)
+                else:
+                    with self.assertRaisesRegex(ValueError, "token_indices_to_pool"):
+                        self.manager._validate_one_request(req, req.input_ids)
+
+    def test_token_indices_to_pool_checked_on_embedding_requests(self):
+        self.manager.is_generation = False
+        req = EmbeddingReqInput(
+            input_ids=[1, 2, 3], sampling_params={}, token_indices_to_pool=[3]
+        )
+        with self.assertRaisesRegex(ValueError, "token_indices_to_pool"):
+            self.manager._validate_one_request(req, req.input_ids)
+
+    def test_token_indices_to_pool_bounded_by_input_embeds(self):
+        req = GenerateReqInput(
+            input_embeds=[[0.0], [0.0]], sampling_params={}, token_indices_to_pool=[2]
+        )
+        with self.assertRaisesRegex(ValueError, r"\[0, 2\)"):
+            self.manager._validate_one_request(req, None)
+        # No prompt length is known yet: nothing to bound against.
+        req = GenerateReqInput(text="x", sampling_params={}, token_indices_to_pool=[0])
+        self.manager._validate_one_request(req, None)
 
     def test_mixed_batch_forwards_zero_count_for_logprob_disabled_items(self):
         """Disabled items must not contribute their raw count to a shared topk.
