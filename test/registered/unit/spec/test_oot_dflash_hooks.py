@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _publish_dspark_mla_draft_backend,
+    _reject_dflash_sliding_mla_draft_window,
     _resolve_dflash_draft_attention_backend,
 )
 from sglang.srt.platforms.interface import SRTPlatform
@@ -168,6 +169,47 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
                 ),
                 expected,
             )
+
+
+def _mla_draft(layer_types, sliding_window=None):
+    return {
+        "num_hidden_layers": len(layer_types),
+        "dflash_config": {"attention_mode": "mla"},
+        "layer_types": list(layer_types),
+        "sliding_window": sliding_window,
+    }
+
+
+class TestRejectDflashSlidingMlaDraftWindow(CustomTestCase):
+    """--speculative-draft-window-size with an MLA draft on the MLA-only DFLASH
+    draft backends, which apply the draft's own window."""
+
+    def _check(self, draft_backend, window_size, draft_cfg):
+        args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="DFLASH",
+            speculative_draft_model_path="draft",
+            speculative_num_draft_tokens=8,
+            speculative_draft_window_size=window_size,
+            speculative_draft_attention_backend=draft_backend,
+        )
+        with patch(f"{HOOK_MODULE}._load_draft_hf_config", return_value=draft_cfg):
+            _reject_dflash_sliding_mla_draft_window(args)
+
+    def test_drafts_with_sliding_layers_are_rejected(self):
+        drafts = (
+            _mla_draft(["sliding_attention"] * 5, 1024),
+            _mla_draft(["sliding_attention", "full_attention"], 1024),
+        )
+        for backend in ("cutedsl_mla", "trtllm_mla"):
+            for draft_cfg in drafts:
+                with self.subTest(backend=backend, layers=draft_cfg["layer_types"]):
+                    with self.assertRaises(ValueError):
+                        self._check(backend, 1024, draft_cfg)
+
+    def test_full_attention_draft_and_no_flag_are_accepted(self):
+        self._check("cutedsl_mla", 1024, _mla_draft(["full_attention"] * 7))
+        self._check("cutedsl_mla", None, _mla_draft(["sliding_attention"] * 5, 1024))
 
 
 if __name__ == "__main__":
