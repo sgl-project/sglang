@@ -311,7 +311,10 @@ class Engine(EngineScoreMixin, EngineBase):
             if "log_level" not in kwargs:
                 # Do not print logs by default
                 kwargs["log_level"] = "error"
-            server_args = self.server_args_class(**kwargs)
+            server_args = self.server_args_class(
+                **kwargs,
+                _radix_eviction_policy_explicitly_set="radix_eviction_policy" in kwargs,
+            )
             # There was no command line, so the call is what the operator
             # asked for. `log_level` is filled in above when absent, so it
             # shows here even when the caller did not pass it.

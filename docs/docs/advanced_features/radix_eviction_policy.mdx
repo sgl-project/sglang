@@ -16,7 +16,7 @@ A policy only scores. It does not decide how much to free, and it cannot pin KV 
 
 ## Available policies
 
-Select one with `--radix-eviction-policy`. The default is `lru`; hybrid recurrent models default to `gds` when the flag is not set, unless `--enable-session-radix-cache` is on. All of them fall back to least-recently-used order within a tie, except the recurrent-state order of `gds`, which breaks ties by node.
+Select one with `--radix-eviction-policy`. The default is `lru`. Hybrid models on the Mamba radix cache list (the linear-attention registry and the Mamba architectures in `arg_groups/overrides.py`, e.g. Qwen3-Next and GLM-5.3-Flash) default to `gds` when the flag is not given on the command line, in a config file or to `Engine`, unless `--enable-session-radix-cache` is on. All of them fall back to least-recently-used order within a tie, except the recurrent-state order of `gds`, which breaks ties by node.
 
 | Policy | Evicts first | Use when |
 |---|---|---|

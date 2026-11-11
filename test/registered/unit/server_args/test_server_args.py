@@ -474,6 +474,18 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertTrue(joined._radix_eviction_policy_explicitly_set)
         self.assertTrue(configured._radix_eviction_policy_explicitly_set)
 
+        # Launchers with their own parser (bench_offline_throughput, bench_one_batch)
+        # build ServerArgs with from_cli_args and must carry the mark too.
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for argv, expected in (
+            (["--model-path", "dummy"], False),
+            (["--model-path", "dummy", "--radix-eviction-policy", "lru"], True),
+        ):
+            with self.subTest(argv=argv):
+                args = ServerArgs.from_cli_args(parser.parse_args(argv))
+                self.assertIs(args._radix_eviction_policy_explicitly_set, expected)
+
     def test_monokernel_flag_spellings_in_config_and_cli(self):
         """The deprecated --monokernel-backend amd|msa sets --enable-amd-monokernel or
         --enable-nvidia-megakernel; a config file accepts every spelling."""

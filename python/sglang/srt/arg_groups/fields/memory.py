@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
 )
+from sglang.srt.arg_groups.argparse_actions import RadixEvictionPolicyAction
 from sglang.srt.arg_groups.choices import RADIX_EVICTION_POLICY_CHOICES
 
 
@@ -37,12 +38,15 @@ class Memory(msgspec.Struct):
                 "--enable-unified-memory, and acts as 'lru' elsewhere. 'gds' evicts "
                 "cached recurrent-state checkpoints on hybrid models by GreedyDual-Size "
                 "over the prefill each one saves, and acts as 'lru' on other models. "
-                "Hybrid recurrent models default to 'gds' when this flag is not set, "
+                "Hybrid models on the Mamba radix cache list (e.g. Qwen3-Next, "
+                "GLM-5.3-Flash) default to 'gds' when this flag is not given, "
                 "unless --enable-session-radix-cache is on. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy "
                 "for what each policy optimizes for."
             ),
             choices=RADIX_EVICTION_POLICY_CHOICES,
+            action=RadixEvictionPolicyAction,
+            action_kwargs={"choices": RADIX_EVICTION_POLICY_CHOICES},
             resolvable=True,
         ),
     ] = "lru"
