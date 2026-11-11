@@ -1115,7 +1115,6 @@ class MoriKVManager(CommonKVManager):
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         relayout = super().requires_dcp_relayout(dst_dcp_size, dst_dcp_rank)
-        # The row relayout does not move a hybrid DSA index-K (Kimi-K3.1).
         if relayout and getattr(self.kv_args, "dsa_index_k_token_bytes", None):
             raise RuntimeError(
                 f"MoRI PD cannot relayout a DSA index-K from DCP-{self.dcp_size} "

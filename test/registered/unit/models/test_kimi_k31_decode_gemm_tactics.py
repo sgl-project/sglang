@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -59,3 +60,7 @@ def test_overlapping_ranges_are_rejected(registry):
     cg.register_tgv_m_ranges({(2112, 7168): ((1, 64, None),)})
     with pytest.raises(ValueError):
         cg.register_tgv_m_ranges({(2112, 7168): ((64, 96, 21),)})
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -76,3 +77,7 @@ def test_same_token_id_generated_twice_is_not_deduplicated():
     source = ledger([b"a"])
     source.append([0])
     assert ids(source.take("aa", text=True)) == [0, 0]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

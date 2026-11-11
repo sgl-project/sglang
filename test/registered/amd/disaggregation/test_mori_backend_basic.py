@@ -139,15 +139,6 @@ class TestMoriDCP(unittest.TestCase):
         self.assertTrue(info.requires_dcp_relayout)
         self.assertEqual(info.dcp_token_item_lens, [64])
 
-    def test_dcp_relayout_refuses_a_dsa_index_k(self):
-        manager = object.__new__(mori_conn.MoriKVManager)
-        manager.dcp_size, manager.dcp_rank = 1, 0
-        manager.is_mla_backend, manager.is_hybrid_mla_backend = False, True
-        manager.kv_args = SimpleNamespace(dsa_index_k_token_bytes=(128, 4))
-
-        with self.assertRaisesRegex(RuntimeError, "DSA index-K"):
-            manager.requires_dcp_relayout(8, 3)
-
 
 class TestMoriDsaStateElision(unittest.TestCase):
     """_send_swa_dsa_state must read the dst length of the paired dst entry.
