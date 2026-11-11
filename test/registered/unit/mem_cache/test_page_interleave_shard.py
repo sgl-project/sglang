@@ -1960,6 +1960,21 @@ class TestShardSendFilter(CustomTestCase):
     """P/D send side: rank r sends the pages with l % N == r, as its local page
     l // N, at their request-global send positions."""
 
+    def test_single_host_tensor_page_preserves_ownership_and_send_position(self):
+        # A short last chunk has one page. NumPy must treat its torch-derived
+        # mask as a boolean mask, not scalar index 0/1.
+        for rank in range(N):
+            with self.subTest(rank=rank):
+                local, positions = filter_kv_indices_for_shard_rank(
+                    kv_indices=torch.tensor([5], dtype=torch.int32),
+                    index_slice=slice(64, 65),
+                    shard_rank=rank,
+                    shard_size=N,
+                )
+                self.assertIsInstance(local, np.ndarray)
+                np.testing.assert_array_equal(local, [1] if rank == 1 else [])
+                np.testing.assert_array_equal(positions, [64] if rank == 1 else [])
+
     def test_ranks_partition_a_rotated_chunk(self):
         # A base-2 rotated chain: owners are not position-congruent.
         pages = np.array(_chain_pages(base=2, n_pages=9), dtype=np.int64)

@@ -1667,6 +1667,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         seq_lens = [int(x) for x in forward_batch.seq_lens_cpu[: meta.bs]]
         extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu[: meta.bs]]
         prefix_lens = [seq - extend for seq, extend in zip(seq_lens, extend_lens)]
+        # Both cached-prefix paths read the pool getters, which expose the
+        # shard scratch during a sharded extend. Address it by scratch row.
+        slot_table = (
+            metadata.token_slot_table
+            if self._kv_shard_pool is None
+            else metadata.kv_shard_slot_table
+        )
         if any(prefix_lens) and save_kv_cache and q.is_cuda:
             # Every selected token, prefix or new, is in the pool now (the
             # gathered new K/V was just written), so read it in place instead of
@@ -1676,7 +1683,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 q,
                 pool.layer_router.read(layer.layer_id).key(),
                 pool.layer_router.read(layer.layer_id).value(),
-                metadata.token_slot_table[: meta.bs],
+                slot_table[: meta.bs],
                 indices,
                 meta.cu_seqlens_q_combined_tensor,
                 meta.kv_len_combined_tensor,
@@ -1698,11 +1705,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             # Row i holds request i's slots, translated to the shard scratch
             # when needed. Indexing by row avoids a device sync on
             # req_pool_indices in every layer.
-            slot_table = (
-                metadata.token_slot_table
-                if self._kv_shard_pool is None
-                else metadata.kv_shard_slot_table
-            )
             k_parts, v_parts = [], []
             extend_start = 0
             for row, (prefix_len, extend_len) in enumerate(

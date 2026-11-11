@@ -314,7 +314,7 @@ class CommonKVManager(BaseKVManager):
     # shard group. Each rank owns a subset of logical KV pages.
     kv_shard_rank: int = 0
     kv_shard_size: int = 1
-    # Prefill KV sharding under CP-TP group sharing: decode pulls KV pages from
+    # QSA prefill KV sharding under CP-TP group sharing: decode pulls KV pages from
     # every CP rank, but GDN/QSA/PLE state and aux only from its rank-matched
     # one (see _is_request_peer).
     kv_shard_state_peer_only: bool = False
@@ -404,7 +404,13 @@ class CommonKVManager(BaseKVManager):
             # No sharded rank holds a full page, so every CP rank sends.
             or self.kv_shard_size > 1
         )
-        self.kv_shard_state_peer_only = self.kv_shard_size > 1 and cp_tp_group_sharing
+        # QSA state is whole or head-sharded on each rank. DSA indexer pages
+        # instead need every owner, even when CP and TP share a group.
+        self.kv_shard_state_peer_only = (
+            self.kv_shard_size > 1
+            and cp_tp_group_sharing
+            and StateType.QSA_COMPRESSED in args.state_types
+        )
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
@@ -549,7 +555,7 @@ class CommonKVManager(BaseKVManager):
 
     def _is_request_peer(self, dst_tp_rank: int) -> bool:
         """Whether this prefill rank sends the per-request state and aux to
-        decode attention-TP rank ``dst_tp_rank``.
+        decode global TP rank ``dst_tp_rank``.
 
         Under KV sharding with CP-TP group sharing every prefill rank sends its
         KV pages to every decode rank, but only one sends the rest. The GDN
@@ -558,9 +564,11 @@ class CommonKVManager(BaseKVManager):
         decode attention-TP rank r. QSA and PLE state and the aux are identical
         on every rank and travel with it, so each decode slot has one writer.
         ``_kv_shard_peer_mismatch`` rejects decode peers of another width, so
-        the ranks pair one to one.
+        the ranks pair one to one within each decode attention-DP group.
+        Decode registers its global TP rank, so reduce it by the validated
+        attention-TP width before matching the GDN head shard.
         """
-        return dst_tp_rank == self.kv_args.engine_rank
+        return dst_tp_rank % self.state_tp_size == self.kv_args.engine_rank
 
     def _kv_shard_peer_mismatch(self, dst_attn_tp_size: int) -> Optional[str]:
         """Why a decode peer cannot pair with this prefill, if it cannot. Every

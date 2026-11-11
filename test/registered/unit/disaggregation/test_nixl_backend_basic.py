@@ -524,6 +524,8 @@ class TestNixlTransferWorker(CustomTestCase):
         for peer_only, decode_tp_rank, is_peer in (
             (True, 1, True),
             (True, 2, False),
+            (True, 5, True),
+            (True, 6, False),
             (False, 2, True),
         ):
             # A non-peer sends no state or aux, so it has no handle to fail.

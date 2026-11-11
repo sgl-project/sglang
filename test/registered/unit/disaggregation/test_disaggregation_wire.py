@@ -31,6 +31,7 @@ from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import (
     FailedSessionProbe,
     MooncakeKVManager,
@@ -67,7 +68,7 @@ from sglang.srt.mem_cache.qsa_kv_pool import (
     QSATokenToKVPool,
 )
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
@@ -1297,6 +1298,56 @@ class TestKvShardedCpTpPrefillPairing(unittest.TestCase):
     """KV sharding on a CP-TP group sharing prefill: every decode rank pulls
     its KV pages from all prefill ranks, its state from the rank-matched one."""
 
+    def test_request_peer_routing_is_limited_to_qsa_state(self):
+        for state_types, expected in (
+            ([StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED], True),
+            ([StateType.MAMBA, StateType.DSA], False),
+            ([StateType.MAMBA], False),
+        ):
+            with self.subTest(state_types=state_types):
+                args = KVArgs()
+                args.kv_cache_dtype_str = "bfloat16"
+                args.kv_item_lens = []
+                args.state_item_lens = []
+                args.state_types = state_types
+                args.system_dp_rank = args.pp_rank = 0
+                manager = object.__new__(CommonKVManager)
+                with (
+                    get_context().override_server_args(
+                        tp_size=4,
+                        attn_cp_size=4,
+                        enable_cp_tp_group_sharing=True,
+                        enable_kv_cache_sharding=True,
+                    ) as server_args,
+                    get_parallel().override(
+                        tp_rank=0,
+                        attn_tp_rank=0,
+                        attn_cp_rank=0,
+                        attn_dcp_rank=0,
+                        attn_dp_rank=0,
+                        pp_group=None,
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.common.conn.get_kv_shard_group",
+                        return_value=SimpleNamespace(rank_in_group=0, world_size=4),
+                    ),
+                    patch("sglang.srt.disaggregation.common.conn.zmq.Context"),
+                    patch(
+                        "sglang.srt.disaggregation.common.conn.get_local_ip_auto",
+                        return_value="127.0.0.1",
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.common.conn.get_zmq_socket_on_host",
+                        return_value=(1234, Mock()),
+                    ),
+                    patch.object(manager, "_sync_bootstrap_port_across_nodes"),
+                    patch.object(manager, "register_to_bootstrap"),
+                ):
+                    CommonKVManager.__init__(
+                        manager, args, DisaggregationMode.PREFILL, server_args
+                    )
+                self.assertEqual(manager.kv_shard_state_peer_only, expected)
+
     @staticmethod
     def _resolve(prefill_tp, decode_tp, dst_rank):
         decode = object.__new__(CommonKVManager)
@@ -1317,7 +1368,8 @@ class TestKvShardedCpTpPrefillPairing(unittest.TestCase):
         return info
 
     def test_decode_pulls_kv_from_every_prefill_rank(self):
-        for dst_rank in range(4):
+        # TP8 / DP2 decode: both attention-DP groups pull from all CP4 owners.
+        for dst_rank in range(8):
             with self.subTest(dst_rank=dst_rank):
                 info = self._resolve(prefill_tp=4, decode_tp=4, dst_rank=dst_rank)
                 self.assertIsNone(info.target_tp_rank)
@@ -1350,7 +1402,7 @@ class TestKvShardedCpTpPrefillPairing(unittest.TestCase):
         with get_context().override_server_args(enable_cp_tp_group_sharing=True):
             for n in (4, 8):
                 prefills = [self._prefill(rank, n) for rank in range(n)]
-                for dst_rank in range(n):
+                for dst_rank in range(2 * n):
                     with self.subTest(n=n, dst_rank=dst_rank):
                         # The GDN head shard index matches on both sides.
                         self.assertEqual(
@@ -1359,7 +1411,7 @@ class TestKvShardedCpTpPrefillPairing(unittest.TestCase):
                                 for p in prefills
                                 if p._is_request_peer(dst_rank)
                             ],
-                            [dst_rank],
+                            [dst_rank % n],
                         )
                         # The CP-replicated skip is off, so no rank drops the
                         # state for another reason.
@@ -1462,23 +1514,28 @@ class TestKvShardedCpTpPrefillPairing(unittest.TestCase):
         return prefill._transfer_data
 
     def test_mooncake_sends_state_and_aux_to_the_peer_only(self):
-        prefill = self._prefill(rank=1, n=4)
-        transfer_data = self._run_room(
-            prefill, dst_ranks=range(4), required_dst_info_num=4
-        )
-        self.assertEqual(prefill.request_status[42], KVPoll.Success)
-        # Every decode rank hears Success; only decode rank 1 gets the state
-        # and the aux.
-        self.assertEqual(prefill._send_multipart_locked.call_count, 4)
-        prefill.maybe_send_extra.assert_called_once()
-        self.assertEqual(
-            prefill.maybe_send_extra.call_args.args[0].mooncake_session_id,
-            "decode:1",
-        )
-        self.assertEqual(
-            transfer_data.call_args_list,
-            [call("decode:1", [(0x5000 + 2 * 8, 0x6000 + 5 * 8, 8)])],
-        )
+        for dp_rank in range(2):
+            with self.subTest(dp_rank=dp_rank):
+                prefill = self._prefill(rank=1, n=4)
+                transfer_data = self._run_room(
+                    prefill,
+                    dst_ranks=range(dp_rank * 4, (dp_rank + 1) * 4),
+                    required_dst_info_num=4,
+                )
+                self.assertEqual(prefill.request_status[42], KVPoll.Success)
+                # Every rank in this DP group hears Success; only its attention-TP
+                # rank 1 gets the state and aux.
+                self.assertEqual(prefill._send_multipart_locked.call_count, 4)
+                prefill.maybe_send_extra.assert_called_once()
+                peer_session = f"decode:{dp_rank * 4 + 1}"
+                self.assertEqual(
+                    prefill.maybe_send_extra.call_args.args[0].mooncake_session_id,
+                    peer_session,
+                )
+                self.assertEqual(
+                    transfer_data.call_args_list,
+                    [call(peer_session, [(0x5000 + 2 * 8, 0x6000 + 5 * 8, 8)])],
+                )
 
     def test_mooncake_fails_a_room_whose_decode_does_not_pull_from_every_rank(self):
         # A decode without the CP-TP fan-in pulls only from its matched rank.
