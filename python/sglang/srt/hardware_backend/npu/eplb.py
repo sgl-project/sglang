@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Ascend expert-weight staging and migration for EPLB.
+"""Ascend expert-weight storage views and migration for EPLB.
 
 Callers select these helpers after NPU distributed initialization.
 Import torch_npu only when an NPU operation actually needs it.
@@ -58,15 +58,15 @@ def update_expert_weights_with_staging(
     group = get_eplb_group()
     world_size = dist.get_world_size(group)
     _validate_migration_topology(world_size)
-    staging = _ExpertWeightStaging(weights_by_layer, changed_layer_ids, rank)
+    adapter = _ExpertWeightAdapter(weights_by_layer, changed_layer_ids, rank)
     temp_buffers = []
     missing_experts_by_layer = {}
 
     for layer, old_placement, new_placement in local_update_plan:
         weights = weights_by_layer[layer]
         if not temp_buffers:
-            temp_buffers = staging.create_temp_buffers()
-        migration_weights = staging.load(weights)
+            temp_buffers = adapter.create_temp_buffers()
+        migration_weights = adapter.make_weight_views(weights)
         missing_experts = []
         update_layer_fn(
             routed_experts_weights=migration_weights,
@@ -200,19 +200,22 @@ class _ExpertStorageLayout(NamedTuple):
         return self.shape[0], bytes_per_expert
 
 
-def _validated_weight_owner(weight: torch.Tensor) -> torch.Tensor:
-    """Validate the routed-expert prefix and return its complete backing tensor."""
+def _validated_full_storage_tensor(weight: torch.Tensor) -> torch.Tensor:
+    """Validate the expert prefix using the full tensor restored from storage metadata."""
     import torch_npu
 
     if weight.ndim == 0 or weight.storage_offset() != 0:
         raise ValueError("NPU EPLB requires a full expert tensor or its expert prefix.")
     # Storage metadata retains the full expert axis even when .data or detach()
     # drops the Python base. Rebuild only tensor metadata, without copying data.
-    owner = torch_npu._C._tensor_construct_from_storage(weight.untyped_storage())
+    # Use this tensor for layout validation; migration views retain weight itself.
+    full_storage_tensor = torch_npu._C._tensor_construct_from_storage(
+        weight.untyped_storage()
+    )
     if (
-        owner.ndim == 0
-        or weight.element_size() != owner.element_size()
-        or not 0 < weight.shape[0] <= owner.shape[0]
+        full_storage_tensor.ndim == 0
+        or weight.element_size() != full_storage_tensor.element_size()
+        or not 0 < weight.shape[0] <= full_storage_tensor.shape[0]
     ):
         raise ValueError("NPU EPLB requires a full expert tensor or its expert prefix.")
     # Expert rows must occupy independent contiguous blocks. Inner transposes
@@ -225,51 +228,53 @@ def _validated_weight_owner(weight: torch.Tensor) -> torch.Tensor:
             expert_elements *= size
     if (
         weight.stride(0) != expert_elements
-        or owner.stride(0) != expert_elements
-        or owner.numel() != owner.shape[0] * expert_elements
+        or full_storage_tensor.stride(0) != expert_elements
+        or full_storage_tensor.numel() != full_storage_tensor.shape[0] * expert_elements
     ):
         raise ValueError("NPU EPLB requires an outermost, contiguous expert axis.")
-    return owner
+    return full_storage_tensor
 
 
 def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
     """Check that raw storage can be split into equal, complete expert blocks."""
     import torch_npu
 
-    owner = _validated_weight_owner(weight)
-    storage_elements = torch_npu.get_storage_size(owner)
-    npu_format = torch_npu.get_npu_format(owner)
+    full_storage_tensor = _validated_full_storage_tensor(weight)
+    storage_elements = torch_npu.get_storage_size(full_storage_tensor)
+    npu_format = torch_npu.get_npu_format(full_storage_tensor)
     # Inspect the tensor's actual format, independently of the model name.
     # This implementation accepts base formats and 3D batched FRACTAL_NZ.
     if npu_format not in _BASE_FORMATS + (_FORMAT_FRACTAL_NZ,):
         raise ValueError(f"NPU EPLB does not support storage format {npu_format}.")
-    if npu_format not in _BASE_FORMATS and (owner.ndim != 3 or weight.ndim != 3):
+    if npu_format not in _BASE_FORMATS and (
+        full_storage_tensor.ndim != 3 or weight.ndim != 3
+    ):
         raise ValueError("NPU EPLB requires 3D batched NZ expert weights.")
     # The byte view must stay within the original allocation, including NZ padding.
-    storage_bytes = storage_elements * owner.element_size()
-    allocated_bytes = owner.untyped_storage().nbytes()
+    storage_bytes = storage_elements * full_storage_tensor.element_size()
+    allocated_bytes = full_storage_tensor.untyped_storage().nbytes()
     if (
         storage_elements <= 0
-        or storage_elements < owner.numel()
+        or storage_elements < full_storage_tensor.numel()
         or storage_bytes > allocated_bytes
     ):
         raise ValueError(
             f"NPU EPLB has invalid storage capacity: {storage_elements} elements "
-            f"for shape {tuple(owner.shape)} and "
+            f"for shape {tuple(full_storage_tensor.shape)} and "
             f"{allocated_bytes} allocated bytes."
         )
-    if storage_elements % owner.shape[0]:
+    if storage_elements % full_storage_tensor.shape[0]:
         raise ValueError(
             f"NPU EPLB cannot divide {storage_elements} storage elements evenly "
-            f"among {owner.shape[0]} experts."
+            f"among {full_storage_tensor.shape[0]} experts."
         )
-    if npu_format in _BASE_FORMATS and storage_elements != owner.numel():
+    if npu_format in _BASE_FORMATS and storage_elements != full_storage_tensor.numel():
         raise ValueError("NPU EPLB requires base-format storage without padding.")
     return _ExpertStorageLayout(
         shape=tuple(weight.shape),
         dtype=weight.dtype,
         device=weight.device,
-        total_experts=owner.shape[0],
+        total_experts=full_storage_tensor.shape[0],
         storage_elements=storage_elements,
         npu_format=npu_format,
         needs_storage_alias=(
@@ -281,7 +286,7 @@ def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
 def _expert_storage_view(
     weight: torch.Tensor, layout: _ExpertStorageLayout
 ) -> torch.Tensor:
-    """Expose physical expert bytes without changing the original NZ descriptor."""
+    """Return a writable byte alias, preserving the original tensor's descriptor."""
     if not layout.needs_storage_alias:
         return weight.view(torch.uint8).view(layout.expert_byte_shape)
 
@@ -312,11 +317,13 @@ def _expert_storage_view(
     return view
 
 
-class _ExpertWeightStaging:
+class _ExpertWeightAdapter:
     """Expose original expert bytes and allocate the updater's scratch buffers.
 
-    Independent ND views preserve NZ padding and packed values. Only routed
-    expert rows are exposed; shared experts retain their original storage.
+    Returned views share storage with the model: writing a view changes its
+    original weight. Independent ND descriptors preserve NZ padding and packed
+    values. Only routed expert rows are exposed; shared experts retain their
+    original storage.
     The updater stages sources before overwriting any destination, so no full
     weight snapshot or separate writeback is needed.
     """
@@ -339,7 +346,8 @@ class _ExpertWeightStaging:
             for layout in self._layouts
         ]
 
-    def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
+    def make_weight_views(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Return writable aliases of the routed experts, without copying weights."""
         return [
             _expert_storage_view(weight, layout)
             for weight, layout in zip(weights, self._layouts, strict=True)
