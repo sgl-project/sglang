@@ -287,7 +287,8 @@ class BeamMoE(nn.Module):
             raise ValueError(
                 "Beam supports the auto or triton MoE runner for BF16/FP8 "
                 "and flashinfer_trtllm for NVFP4, with no MoE all-to-all; "
-                "NVFP4 also supports the flashinfer_megamoe all-to-all"
+                "NVFP4 also supports the flashinfer_megamoe all-to-all; the "
+                "lora_* runners serve --lora-backend triton_v2"
             )
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -1274,10 +1275,11 @@ def get_beam_quantization(quant_config: Optional[QuantizationConfig]) -> Optiona
 
 
 def get_beam_supported_moe_runners(quant_scheme: Optional[str]) -> Tuple[str, ...]:
+    """Base runners first; the lora_* runners need --lora-backend triton_v2."""
     return {
-        "bf16": ("auto", "triton"),
-        "fp8": ("auto", "triton"),
-        "nvfp4": ("flashinfer_trtllm",),
+        "bf16": ("auto", "triton", "lora_cutedsl", "lora_triton"),
+        "fp8": ("auto", "triton", "lora_marlin", "lora_cutedsl", "lora_triton"),
+        "nvfp4": ("flashinfer_trtllm", "lora_marlin", "lora_cutedsl"),
     }.get(quant_scheme, ())
 
 
@@ -1327,13 +1329,17 @@ class BeamForCausalLM(nn.Module):
                 "Beam has not been validated with expert relocation or "
                 "redundant experts; use trivial expert placement"
             )
-        if (get_lora().enable_lora or get_lora().lora_paths) and (
-            quant_scheme == "nvfp4"
-            or get_lora().lora_backend not in ("csgmv", "triton")
+        lora = get_lora()
+        if (lora.enable_lora or lora.lora_paths) and not (
+            # The v2 backend serves the experts through its lora_* MoE runners.
+            lora.lora_backend == "triton_v2"
+            or (quant_scheme != "nvfp4" and lora.lora_backend in ("csgmv", "triton"))
         ):
             raise NotImplementedError(
-                "Beam LoRA supports BF16 or compressed-tensors FP8 with "
-                "--lora-backend csgmv or triton and --moe-runner-backend triton"
+                "Beam LoRA supports --lora-backend triton_v2 with a lora_* MoE "
+                "runner (BF16, compressed-tensors FP8 or NVFP4), or BF16 and "
+                "compressed-tensors FP8 with --lora-backend csgmv or triton and "
+                "--moe-runner-backend triton"
             )
         self.config = config
         self.model = BeamModel(config, quant_config, prefix=add_prefix("model", prefix))

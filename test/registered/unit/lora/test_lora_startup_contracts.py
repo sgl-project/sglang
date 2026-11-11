@@ -134,6 +134,21 @@ class TestLagunaPerLayerAttentionDims(CustomTestCase):
                 )
 
 
+class TestBeamMoeRunners(CustomTestCase):
+    def test_v2_lora_runners_follow_the_quantization(self):
+        from sglang.srt.models.beam import get_beam_supported_moe_runners
+
+        self.assertEqual(
+            get_beam_supported_moe_runners("fp8"),
+            ("auto", "triton", "lora_marlin", "lora_cutedsl", "lora_triton"),
+        )
+        self.assertEqual(
+            get_beam_supported_moe_runners("nvfp4"),
+            ("flashinfer_trtllm", "lora_marlin", "lora_cutedsl"),
+        )
+        self.assertEqual(get_beam_supported_moe_runners(None), ())
+
+
 class TestBeamLoraConstruction(CustomTestCase):
     def test_lora_keeps_wrappable_projections_and_expert_dispatch(self):
         """Packed projections hide adapter targets; deferred sums bypass LoRA.
