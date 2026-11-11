@@ -966,17 +966,16 @@ class DeepseekSparseAttnBackend(
             )
             # the indexer returns only this rank's local KV slots, which top-k capture can't use
             assert not get_exec().features.enable_return_indexer_topk
-            # the merge and candidate workspaces are NVLS multicast buffers
-            if not _is_hip:
-                if not init_dcp_topk_merge(max_rows, self.dsa_index_topk):
-                    init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
-                if envs.SGLANG_ENABLE_DSA_DCP_FUSED_TOPK.get():
-                    init_dcp_fused_topk(
-                        max_rows,
-                        self.dsa_index_topk,
-                        self.physical_page_size,
-                        self.max_context_len,
-                    )
+            # ROCm skips the merge and candidate workspaces: NVLS multicast buffers
+            if not _is_hip and not init_dcp_topk_merge(max_rows, self.dsa_index_topk):
+                init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
+            if not _is_hip and envs.SGLANG_ENABLE_DSA_DCP_FUSED_TOPK.get():
+                init_dcp_fused_topk(
+                    max_rows,
+                    self.dsa_index_topk,
+                    self.physical_page_size,
+                    self.max_context_len,
+                )
 
         if _is_xpu:
             self.device_capability = (0, 0)
