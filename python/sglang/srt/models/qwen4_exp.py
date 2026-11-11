@@ -1039,6 +1039,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # with the table.
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
         del embedding.weight
+        self._engram_gather_source = None
         self._block_d = triton.next_power_of_2(self.embedding_dim)
 
     def allocate_output(
@@ -1056,6 +1057,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     def gather(
         self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        if self._engram_gather_source is not None:
+            return self._engram_gather_source(input_ids, out)
         expected_shape = (*input_ids.shape, self.embedding_dim)
         if out is None:
             output = self.allocate_output(expected_shape, input_ids.device)

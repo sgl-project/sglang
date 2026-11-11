@@ -372,6 +372,7 @@ POSITIONAL_FIELD_ORDER = (
     "unified_cache_external_linker_backend",
     "enable_hisparse",
     "hisparse_config",
+    "engram_mnnvl_config",
     "enable_broadcast_mm_inputs_process",
     "enable_prefix_mm_cache",
     "mm_enable_dp_encoder",
