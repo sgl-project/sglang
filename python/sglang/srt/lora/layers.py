@@ -574,6 +574,33 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output, output_bias
 
+    def forward_rows(self, input_: torch.Tensor, row_lens: list[int]):
+        """``forward`` on rows that are not the batch's tokens.
+
+        Rows are request-major, ``row_lens[i]`` of them from request ``i``.
+        """
+        if not self.lora_active:
+            return self.forward(input_)
+        # the row routing is built per call from host-side lengths
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "LoRA on rows other than the batch's tokens cannot be graph-captured"
+        )
+        bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+        output = self.lora_backend.forward_with_base(
+            self,
+            input_,
+            lambda: self.base_layer.quant_method.apply(self.base_layer, input_, bias),
+            self.lora_a,
+            self.lora_b,
+            self.output_offset,
+            self.lora_offsets,
+            pruned_batch_info=self.lora_backend.build_rows_batch_info(row_lens),
+        )
+        if self.base_layer.gather_output:
+            output = tensor_model_parallel_all_gather(output)
+        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+        return output, output_bias
+
     def slice_lora_a_weights(self, A: torch.Tensor):
         return A
 

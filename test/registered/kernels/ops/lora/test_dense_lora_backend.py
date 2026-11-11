@@ -513,7 +513,7 @@ def test_pruned_chunked_lm_head_numeric_and_single_binding(monkeypatch):
     assert envs.SGLANG_ENABLE_LOGPROB_CHUNK.get()
     backend = TritonV2LoRABackend(SLOTS, DEVICE)
     backend.validate_lora_targets(None, {"lm_head"})
-    backend.lm_head_runner._plan_tables[POOL_RANK] = _FixedPlanTable(
+    backend.rows_runner._plan_tables[POOL_RANK] = _FixedPlanTable(
         DensePlan(overlap=Overlap.NONE)  # as the shipped vocab rows
     )
     vocab = 128

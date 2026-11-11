@@ -40,7 +40,7 @@ class _BatchInfo:
 
 
 @dataclass
-class _LmHeadBatchInfo:
+class _RowsBatchInfo:
     seg_indptr: torch.Tensor
     weight_indices: torch.Tensor
     expected_tokens: int
@@ -51,6 +51,7 @@ class _LmHeadBatchInfo:
 class TritonV2LoRABackend(BaseLoRABackend):
     name = "triton_v2"
     supports_prefill_cuda_graph = True
+    supports_rows_routing = True
     skip_inactive_dense_lora = True
 
     def __init__(self, max_loras_per_batch: int, device: torch.device, **kwargs):
@@ -59,13 +60,17 @@ class TritonV2LoRABackend(BaseLoRABackend):
         self.runner = DenseLoraRunner(
             self.lora_workspace, max_loras=max_loras_per_batch, device=device
         )
-        self.lm_head_runner: DenseLoraRunner | None = None
+        # Serves inputs whose rows are not the batch's tokens.
+        self.rows_runner: DenseLoraRunner | None = None
+        self.adapts_lm_head = False
         self.decode_cuda_graph_batch_info: _BatchInfo | None = None
 
     def validate_lora_targets(self, base_model, target_modules: set[str]) -> None:
-        if "lm_head" in target_modules and self.lm_head_runner is None:
-            # Pruned/chunked logits run outside the model graph on their own rows.
-            self.lm_head_runner = DenseLoraRunner(
+        self.adapts_lm_head = "lm_head" in target_modules
+        # Pruned/chunked logits and MLA cached-prefix latents run on their own
+        # rows; logits also run outside the model graph.
+        if {"lm_head", "kv_b_proj"} & target_modules and self.rows_runner is None:
+            self.rows_runner = DenseLoraRunner(
                 LoraWorkspace(),
                 max_loras=self.max_loras_per_batch,
                 device=self.device,
@@ -75,13 +80,13 @@ class TritonV2LoRABackend(BaseLoRABackend):
     def reset_batch_state(self):
         super().reset_batch_state()
         self.runner.reset()
-        if self.lm_head_runner is not None:
-            self.lm_head_runner.reset()
+        if self.rows_runner is not None:
+            self.rows_runner.reset()
 
     def reset_routing_cache(self) -> None:
         self.runner.reset_routes()
-        if self.lm_head_runner is not None:
-            self.lm_head_runner.reset_routes()
+        if self.rows_runner is not None:
+            self.rows_runner.reset_routes()
 
     def init_cuda_graph_moe_buffers(
         self, max_bs, max_loras, compute_dtype, moe_layer, *, prefill=False
@@ -229,7 +234,8 @@ class TritonV2LoRABackend(BaseLoRABackend):
             graph_mode=batch.use_cuda_graph,
             is_prefill_graph=use_prefill_cuda_graph,
         )
-        if self.lm_head_runner is not None:
+        self.request_weight_indices = weight_indices
+        if self.adapts_lm_head:
             self.lm_head_batch_info, self.lm_head_pass_batch_infos = (
                 self._prepare_lm_head_batch_info(forward_batch, weight_indices)
             )
@@ -250,14 +256,19 @@ class TritonV2LoRABackend(BaseLoRABackend):
             else None
         )
 
-    def _build_lm_head_batch_info(self, segments) -> _LmHeadBatchInfo:
+    def build_rows_batch_info(self, row_lens: list[int]) -> _RowsBatchInfo:
+        return self._build_lm_head_batch_info(
+            self._merge_request_rows(row_lens, chunk_size=sum(row_lens))
+        )
+
+    def _build_lm_head_batch_info(self, segments) -> _RowsBatchInfo:
         weight_indices, lengths = segments
         indptr = [0]
         for length in lengths:
             indptr.append(indptr[-1] + length)
         host = torch.tensor(indptr + weight_indices, dtype=torch.int32, pin_memory=True)
         device = host.to(self.device, non_blocking=True)
-        return _LmHeadBatchInfo(
+        return _RowsBatchInfo(
             seg_indptr=device[: len(indptr)],
             weight_indices=device[len(indptr) :],
             expected_tokens=indptr[-1],
@@ -265,12 +276,14 @@ class TritonV2LoRABackend(BaseLoRABackend):
         )
 
     def _runner_for(
-        self, pruned_batch_info: _LmHeadBatchInfo | None
+        self, pruned_batch_info: _RowsBatchInfo | None
     ) -> DenseLoraRunner:
         if pruned_batch_info is None:
             return self.runner
-        if self.lm_head_runner is None:
-            raise RuntimeError("lm_head LoRA was not enabled in the target modules")
+        if self.rows_runner is None:
+            raise RuntimeError(
+                "neither lm_head nor kv_b_proj LoRA was enabled in the target modules"
+            )
         batch = self.batch_info
         token_slots = _compute_token_lora_mapping(
             pruned_batch_info.expected_tokens,
@@ -280,7 +293,7 @@ class TritonV2LoRABackend(BaseLoRABackend):
             None,
             max_len=pruned_batch_info.max_len,
         )
-        self.lm_head_runner.begin_batch(
+        self.rows_runner.begin_batch(
             token_slots=token_slots,
             lora_ranks=batch.lora_ranks,
             scalings=batch.scalings,
@@ -288,7 +301,7 @@ class TritonV2LoRABackend(BaseLoRABackend):
             phase=self.runner.phase,
             graph_mode=False,
         )
-        return self.lm_head_runner
+        return self.rows_runner
 
     def forward_with_base(
         self,
@@ -302,7 +315,7 @@ class TritonV2LoRABackend(BaseLoRABackend):
         *,
         all_reduce=None,
         kind: DenseLoraKind = DenseLoraKind.LINEAR,
-        pruned_batch_info: _LmHeadBatchInfo | None = None,
+        pruned_batch_info: _RowsBatchInfo | None = None,
     ):
         runner = self._runner_for(pruned_batch_info)
         plan = runner.plan_for(
