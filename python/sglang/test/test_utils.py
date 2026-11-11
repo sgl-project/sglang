@@ -47,8 +47,8 @@ from sglang.srt.utils import (
     kill_process_tree,
     retry,
 )
-from sglang.srt.utils.common import filter_noisy_warnings
 from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
+from sglang.srt.utils.log_utils import filter_noisy_warnings
 from sglang.srt.utils.network import is_port_available
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.utils import normalize_base_url
@@ -1287,7 +1287,7 @@ def run_score_benchmark_multi(
 
     async def _run_benchmark(batch_size, warmup):
         # Load tokenizer for generating test data
-        from sglang.srt.utils.hf_transformers import get_tokenizer
+        from sglang.srt.hf_transformers import get_tokenizer
 
         tokenizer = get_tokenizer(model)
 
