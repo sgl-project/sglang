@@ -484,12 +484,13 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             processed_tokens_counter=0,
             prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
         )
+        scheduler.prefill_launched_reqs.join([req])
         with patch(
             "sglang.srt.disaggregation.prefill.get_disagg",
             return_value=SimpleNamespace(optimistic_prefill_attempts=3),
         ):
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req, scheduler.prefill_launched_reqs
+                scheduler, req
             )
 
         self.assertEqual(tree.total_size(), (self.TRACK_SEQLEN, 1))
@@ -571,6 +572,7 @@ class TestOptimisticPrefillWriteThroughRetryPublish(CustomTestCase):
             processed_tokens_counter=0,
             prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
         )
+        scheduler.prefill_launched_reqs.join([req])
         with (
             patch(
                 "sglang.srt.disaggregation.prefill.get_disagg",
@@ -582,7 +584,7 @@ class TestOptimisticPrefillWriteThroughRetryPublish(CustomTestCase):
             ),
         ):
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req, scheduler.prefill_launched_reqs
+                scheduler, req
             )
 
         # The tree keeps the computed prefix (write-through backs it up on

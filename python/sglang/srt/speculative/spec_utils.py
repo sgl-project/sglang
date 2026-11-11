@@ -723,22 +723,35 @@ def traverse_tree(
         if is_accepted:
             if curr != 0:
                 # Accept the current token
-                grammar.accept_token(int(draft_tokens[curr]))
-            if not grammar.is_terminated():
-                # Generate the bitmask for the current token
-                grammar.fill_vocab_mask(allocate_token_bitmask, curr)
-                if retrieve_next_token[curr] != -1:
-                    # Visit the child node
-                    dfs(
-                        int(retrieve_next_token[curr]),
-                        retrieve_next_token,
-                        retrieve_next_sibling,
-                        curr,
+                try:
+                    grammar.accept_token(int(draft_tokens[curr]))
+                except ValueError:
+                    # The matcher can reject a draft token that passed the parent
+                    # mask row (mask/matcher desync, e.g. a disagg retracted-request
+                    # double-accept). Clear it in the parent row so verify won't
+                    # accept it, and prune this branch rather than raising to -- and
+                    # killing -- the scheduler. The accept failed, so the grammar is
+                    # still at the parent state; no rollback is owed for this node.
+                    parent_bitmask[int(current_token) // 32] &= ~(
+                        1 << (int(current_token) % 32)
                     )
+                    is_accepted = False
+            if is_accepted:
+                if not grammar.is_terminated():
+                    # Generate the bitmask for the current token
+                    grammar.fill_vocab_mask(allocate_token_bitmask, curr)
+                    if retrieve_next_token[curr] != -1:
+                        # Visit the child node
+                        dfs(
+                            int(retrieve_next_token[curr]),
+                            retrieve_next_token,
+                            retrieve_next_sibling,
+                            curr,
+                        )
 
-            if curr != 0:
-                # Rollback the current token
-                grammar.rollback(1)
+                if curr != 0:
+                    # Rollback the current token
+                    grammar.rollback(1)
 
         if retrieve_next_sibling[curr] != -1:
             # Visit the sibling node
