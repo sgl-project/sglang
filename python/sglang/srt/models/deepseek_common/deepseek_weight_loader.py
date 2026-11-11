@@ -113,6 +113,20 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _requantize_fused_qkv_a_rows(
+    weight: torch.Tensor, q_lora_rank: int, q_a_scale: float, kv_a_scale: float
+) -> None:
+    """Rescale the rows quantized with the smaller per-tensor scale to the larger one."""
+    if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        raise NotImplementedError(
+            "fused_qkv_a_proj_with_mqa: cannot merge different per-tensor scales "
+            f"of a {weight.dtype} weight"
+        )
+    rows = weight[:q_lora_rank] if q_a_scale < kv_a_scale else weight[q_lora_rank:]
+    ratio = min(q_a_scale, kv_a_scale) / max(q_a_scale, kv_a_scale)
+    rows.copy_((rows.float() * ratio).to(weight.dtype))
+
+
 def _get_indexer_weight_block_size(
     quant_config: Optional[QuantizationConfig],
 ) -> List[int]:
@@ -308,6 +322,8 @@ class DeepseekV2WeightLoaderMixin:
             self.config.q_lora_rank is not None
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
+        # fused weight name -> (q_a_proj, kv_a_proj_with_mqa) per-tensor scales
+        fused_qkv_a_requant: Dict[str, Tuple[float, float]] = {}
 
         pending_indexer_wk: Dict[str, Dict[str, torch.Tensor]] = {}
 
@@ -512,7 +528,29 @@ class DeepseekV2WeightLoaderMixin:
                                 q_a_proj_weight = cached_a_proj[q_a_proj_name]
                                 kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
 
-                                if q_a_proj_weight.shape == torch.Size(
+                                requant_scales = None
+                                # Per-tensor scales are 0-d, or [1] in compressed-tensors.
+                                if name.endswith(
+                                    (".weight_scale", ".input_scale")
+                                ) and (
+                                    q_a_proj_weight.numel()
+                                    == kv_a_proj_weight.numel()
+                                    == 1
+                                ):
+                                    # The fused layer has a single per-tensor
+                                    # scale: load the max, and for weight scales
+                                    # requantize the other rows after loading.
+                                    q_a_scale = q_a_proj_weight.reshape(())
+                                    kv_a_scale = kv_a_proj_weight.reshape(())
+                                    fused_weight = torch.maximum(q_a_scale, kv_a_scale)
+                                    if name.endswith(
+                                        ".weight_scale"
+                                    ) and not torch.equal(q_a_scale, kv_a_scale):
+                                        requant_scales = (
+                                            q_a_scale.item(),
+                                            kv_a_scale.item(),
+                                        )
+                                elif q_a_proj_weight.shape == torch.Size(
                                     []
                                 ) and kv_a_proj_weight.shape == torch.Size([]):
                                     fused_weight = q_a_proj_weight
@@ -550,6 +588,10 @@ class DeepseekV2WeightLoaderMixin:
                                     cached_a_proj.pop(kv_a_proj_name, None)
                                     continue
                                 param = params_dict[param_name]
+                                if requant_scales is not None:
+                                    fused_qkv_a_requant[
+                                        param_name.removesuffix("_scale")
+                                    ] = requant_scales
 
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
@@ -605,6 +647,11 @@ class DeepseekV2WeightLoaderMixin:
             # Wait for all tasks to complete and raise any exceptions.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+
+            for weight_name, scales in fused_qkv_a_requant.items():
+                _requantize_fused_qkv_a_rows(
+                    params_dict[weight_name].data, self.config.q_lora_rank, *scales
+                )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
