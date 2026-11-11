@@ -188,35 +188,21 @@ class _ExpertStorageLayout(NamedTuple):
     dtype: torch.dtype
     device: torch.device
     total_experts: int
-    storage_elements: int
+    storage_bytes: int
     npu_format: int
     needs_storage_alias: bool
 
     @property
     def expert_byte_shape(self) -> tuple[int, int]:
         """Return [routed experts, physical bytes per expert] for uint8 transport."""
-        elements_per_expert = self.storage_elements // self.total_experts
-        bytes_per_expert = elements_per_expert * self.dtype.itemsize
-        return self.shape[0], bytes_per_expert
+        return self.shape[0], self.storage_bytes // self.total_experts
 
 
 def _validated_full_storage_tensor(weight: torch.Tensor) -> torch.Tensor:
-    """Validate the expert prefix using the full tensor restored from storage metadata."""
+    """Validate dense expert rows and recover the backing storage's metadata."""
     import torch_npu
 
-    if weight.ndim == 0 or weight.storage_offset() != 0:
-        raise ValueError("NPU EPLB requires a full expert tensor or its expert prefix.")
-    # Storage metadata retains the full expert axis even when .data or detach()
-    # drops the Python base. Rebuild only tensor metadata, without copying data.
-    # Use this tensor for layout validation; migration views retain weight itself.
-    full_storage_tensor = torch_npu._C._tensor_construct_from_storage(
-        weight.untyped_storage()
-    )
-    if (
-        full_storage_tensor.ndim == 0
-        or weight.element_size() != full_storage_tensor.element_size()
-        or not 0 < weight.shape[0] <= full_storage_tensor.shape[0]
-    ):
+    if weight.numel() == 0 or weight.ndim == 0 or weight.storage_offset() != 0:
         raise ValueError("NPU EPLB requires a full expert tensor or its expert prefix.")
     # Expert rows must occupy independent contiguous blocks. Inner transposes
     # are allowed, but selecting/stepping elements within an expert is not.
@@ -226,13 +212,12 @@ def _validated_full_storage_tensor(weight: torch.Tensor) -> torch.Tensor:
             if stride != expert_elements:
                 raise ValueError("NPU EPLB requires dense storage within each expert.")
             expert_elements *= size
-    if (
-        weight.stride(0) != expert_elements
-        or full_storage_tensor.stride(0) != expert_elements
-        or full_storage_tensor.numel() != full_storage_tensor.shape[0] * expert_elements
-    ):
+    if weight.stride(0) != expert_elements:
         raise ValueError("NPU EPLB requires an outermost, contiguous expert axis.")
-    return full_storage_tensor
+    # Recover allocation metadata without copying data. For ND, dtype views and
+    # reshapes can change the exported tensor's dtype and expert axis. NZ still
+    # needs the original expert axis to account for physical padding.
+    return torch_npu._C._tensor_construct_from_storage(weight.untyped_storage())
 
 
 def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
@@ -246,10 +231,6 @@ def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
     # This implementation accepts base formats and 3D batched FRACTAL_NZ.
     if npu_format not in _BASE_FORMATS + (_FORMAT_FRACTAL_NZ,):
         raise ValueError(f"NPU EPLB does not support storage format {npu_format}.")
-    if npu_format not in _BASE_FORMATS and (
-        full_storage_tensor.ndim != 3 or weight.ndim != 3
-    ):
-        raise ValueError("NPU EPLB requires 3D batched NZ expert weights.")
     # The byte view must stay within the original allocation, including NZ padding.
     storage_bytes = storage_elements * full_storage_tensor.element_size()
     allocated_bytes = full_storage_tensor.untyped_storage().nbytes()
@@ -263,19 +244,36 @@ def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
             f"for shape {tuple(full_storage_tensor.shape)} and "
             f"{allocated_bytes} allocated bytes."
         )
-    if storage_elements % full_storage_tensor.shape[0]:
-        raise ValueError(
-            f"NPU EPLB cannot divide {storage_elements} storage elements evenly "
-            f"among {full_storage_tensor.shape[0]} experts."
-        )
-    if npu_format in _BASE_FORMATS and storage_elements != full_storage_tensor.numel():
-        raise ValueError("NPU EPLB requires base-format storage without padding.")
+    if npu_format in _BASE_FORMATS:
+        if storage_elements != full_storage_tensor.numel():
+            raise ValueError("NPU EPLB requires base-format storage without padding.")
+        # ND packing/reshaping may retain a different allocation dtype or shape.
+        # Derive expert boundaries from the exported tensor, in bytes.
+        bytes_per_expert = weight.stride(0) * weight.element_size()
+        if storage_bytes % bytes_per_expert:
+            raise ValueError("NPU EPLB requires complete expert blocks in ND storage.")
+        total_experts = storage_bytes // bytes_per_expert
+    else:
+        if full_storage_tensor.ndim != 3 or weight.ndim != 3:
+            raise ValueError("NPU EPLB requires 3D batched NZ expert weights.")
+        if (
+            weight.element_size() != full_storage_tensor.element_size()
+            or weight.stride(0) != full_storage_tensor.stride(0)
+            or full_storage_tensor.numel()
+            != full_storage_tensor.shape[0] * weight.stride(0)
+        ):
+            raise ValueError("NPU EPLB requires the original NZ expert blocks.")
+        total_experts = full_storage_tensor.shape[0]
+        if total_experts <= 0 or storage_elements % total_experts:
+            raise ValueError("NPU EPLB requires equal physical NZ expert blocks.")
+    if weight.shape[0] > total_experts:
+        raise ValueError("NPU EPLB expert prefix exceeds the backing storage.")
     return _ExpertStorageLayout(
         shape=tuple(weight.shape),
         dtype=weight.dtype,
         device=weight.device,
-        total_experts=full_storage_tensor.shape[0],
-        storage_elements=storage_elements,
+        total_experts=total_experts,
+        storage_bytes=storage_bytes,
         npu_format=npu_format,
         needs_storage_alias=(
             npu_format not in _BASE_FORMATS or not weight.is_contiguous()
@@ -297,7 +295,7 @@ def _expert_storage_view(
     storage = torch_npu._C._construct_storage_from_data_pointer(
         weight.data_ptr(),
         weight.device,
-        layout.storage_elements * weight.element_size(),
+        layout.storage_bytes,
     )
     _, bytes_per_expert = layout.expert_byte_shape
     view = torch_npu._C._construct_NPU_Tensor_From_Storage_And_Metadata(

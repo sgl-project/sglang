@@ -955,6 +955,13 @@ class _DequeCollection:
 class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # NPU stage groups reuse TP-local ranks. Detailed records need a unique
+        # rank across stages, independently of balancedness reporting.
+        self._record_rank = (
+            torch.distributed.get_rank()
+            if self._communication_group is not None
+            else self._rank
+        )
         self._records = []
 
     def get_single_pass_gatherer_keys(self):
@@ -984,7 +991,7 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         self._records.append(
             dict(
                 forward_pass_id=forward_pass_id,
-                rank=self._rank,
+                rank=self._record_rank,
                 gatherer_key=gatherer_key,
                 **single_pass_data_processed,
             )
@@ -1002,7 +1009,7 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
         _dump_to_file(
-            f"expert_distribution_recorder_{time.time()}_{self._rank}.pt", output
+            f"expert_distribution_recorder_{time.time()}_{self._record_rank}.pt", output
         )
 
 
