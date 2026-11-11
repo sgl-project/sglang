@@ -337,3 +337,35 @@ python3 -m benchmark.tpu.launch_server --config recipe/configs/kimi_k3_1/server.
 Single request, all 93 layers: 133 tok/s at 8K input (TPOT 7.52 ms) and 112 tok/s at 128K. With the experimental decode megakernel and DFlash, single-user decode reaches up to about 590 tok/s.
 
 DFlash ([`RadixArk/Kimi-K3.1-Dflash2-Preview`](https://huggingface.co/RadixArk/Kimi-K3.1-Dflash2-Preview)) serves one request at a time. Structured output, tool-call grammar and image input are not yet supported on TPU7x.
+
+### 3.5 Video Input
+
+Kimi K3.1 Pro shares K3's multimodal processor: each `video_url` is sampled into
+timestamped 4-frame chunks, laid out as Moonshot's hosted API does. See
+[Kimi K3 video input](./Kimi-K3#video-input) for sampling details.
+
+<Accordion title="Video Input Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+resp = client.chat.completions.create(
+    model="moonshotai/Kimi-K3.1-Pro",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video_url",
+                    "video_url": {"url": "https://example.com/clip.mp4"},
+                },
+                {"type": "text", "text": "What happens in this video?"},
+            ],
+        }
+    ],
+)
+print(resp.choices[0].message.content)
+```
+
+</Accordion>

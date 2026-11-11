@@ -43,9 +43,8 @@ class TestPipelineStageProfiling(unittest.TestCase):
 
 
 @pytest.mark.parametrize("requested", [1, 3, -1])
-def test_profiler_window_contains_requested_steps(monkeypatch, tmp_path, requested):
+def test_profiler_window_contains_requested_steps(tmp_path, requested):
     """The trace contains N post-warmup steps, or every step for -1."""
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 
     profiler = SGLDiffusionProfiler(
