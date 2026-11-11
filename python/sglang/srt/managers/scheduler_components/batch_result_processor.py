@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
+    from sglang.srt.managers.scheduler_components.request_list import ReqList
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
     )
@@ -152,9 +153,10 @@ class SchedulerBatchResultProcessor:
     # Whether a request is still in the batch (running, prefill_launched or
     # chunked), so a step's frozen row for it may commit.
     still_in_batch: Callable
+    # The scheduler's prefill_launched_reqs, which a HiSparse prefill leaves for
+    # staging.
+    prefill_launched_reqs: ReqList
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
-    # Hands requests out of the scheduler's prefill_launched_reqs.
-    leave_prefill_launched: Callable = lambda reqs: None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -512,7 +514,6 @@ class SchedulerBatchResultProcessor:
                             partial(checkpoint_kv_cache, req, self.tree_cache)
                         )
                         if get_memory().enable_hisparse:
-                            self.leave_prefill_launched([req])
                             kv_ops.append(
                                 partial(
                                     self.hisparse_coordinator.admit_request_into_staging,

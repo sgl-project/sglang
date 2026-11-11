@@ -24,6 +24,7 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
     @staticmethod
     def _make_pool(*, use_fia=True, dtype=torch.bfloat16):
         pool = object.__new__(NPUMHATokenToKVPool)
+        pool.is_modelslim_mxfp8 = False
         pool.use_fia = use_fia
         pool.use_scatter_pa_kv_cache = (
             memory_pool_npu.envs.SGLANG_NPU_USE_SCATTER_PA_KV_CACHE.get()
