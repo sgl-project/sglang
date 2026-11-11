@@ -30,9 +30,6 @@
             "fastwan2_2_ti2v_5b": {
                 "expected_load_ms": 47751.86
             },
-            "flux1_modelopt_fp8_t2i": {
-                "expected_load_ms": 45205.14
-            },
             "flux3_action_http": {
                 "expected_load_ms": 56936.1
             },
@@ -59,9 +56,6 @@
             "flux_2_ti2i_multi_image_cache_dit": {
                 "expected_e2e_ms": 25629.79,
                 "expected_load_ms": 79741.82
-            },
-            "flux_image_t2i": {
-                "expected_load_ms": 43604.31
             },
             "hunyuan3d_shape_gen": {
                 "expected_load_ms": 56933.66
@@ -222,9 +216,6 @@
             "fastwan2_2_ti2v_5b": {
                 "expected_load_ms": 41097.57
             },
-            "flux1_modelopt_fp8_t2i": {
-                "expected_load_ms": 37119.72
-            },
             "flux_2_image_t2i": {
                 "expected_load_ms": 65596.58
             },
@@ -245,9 +236,6 @@
             },
             "flux_2_ti2i_multi_image_cache_dit": {
                 "expected_load_ms": 60590.2
-            },
-            "flux_image_t2i": {
-                "expected_load_ms": 37124.71
             },
             "hunyuan3d_shape_gen": {
                 "expected_load_ms": 47635.42
@@ -765,77 +753,6 @@
             "expected_median_denoise_ms": 435.31,
             "estimated_full_test_time_s": 120.0
         },
-        "flux_image_t2i": {
-            "expected_load_ms": 29629.92,
-            "stages_ms": {
-                "TimestepPreparationStage": 32.58,
-                "DenoisingStage": 6447.42,
-                "DecodingStage": 10.31,
-                "LatentPreparationStage": 0.19,
-                "TextEncodingStage": 20.86,
-                "InputValidationStage": 0.04
-            },
-            "denoise_step_ms": {
-                "0": 30.2,
-                "1": 53.93,
-                "2": 127.34,
-                "3": 128.02,
-                "4": 128.91,
-                "5": 128.0,
-                "6": 128.32,
-                "7": 138.16,
-                "8": 136.44,
-                "9": 130.22,
-                "10": 129.23,
-                "11": 128.63,
-                "12": 128.02,
-                "13": 128.72,
-                "14": 132.61,
-                "15": 139.33,
-                "16": 133.27,
-                "17": 130.77,
-                "18": 128.99,
-                "19": 128.9,
-                "20": 128.22,
-                "21": 130.32,
-                "22": 135.04,
-                "23": 136.12,
-                "24": 132.18,
-                "25": 130.76,
-                "26": 128.97,
-                "27": 129.91,
-                "28": 128.91,
-                "29": 131.18,
-                "30": 134.12,
-                "31": 133.24,
-                "32": 131.29,
-                "33": 129.89,
-                "34": 130.16,
-                "35": 129.0,
-                "36": 130.22,
-                "37": 132.56,
-                "38": 132.41,
-                "39": 132.75,
-                "40": 130.44,
-                "41": 129.67,
-                "42": 129.95,
-                "43": 130.37,
-                "44": 131.32,
-                "45": 132.66,
-                "46": 131.96,
-                "47": 132.01,
-                "48": 130.08,
-                "49": 128.76
-            },
-            "expected_e2e_ms": 6693.01,
-            "expected_avg_denoise_ms": 128.85,
-            "expected_median_denoise_ms": 130.22,
-            "load_peak_vram_mb": 32296.0,
-            "runtime_peak_vram_mb": 36766.0,
-            "load_peak_allocated_mb": 32191.79,
-            "runtime_peak_allocated_mb": 34669.69,
-            "estimated_full_test_time_s": 80
-        },
         "flux_2_image_t2i": {
             "expected_load_ms": 55239.13,
             "stages_ms": {
@@ -928,10 +845,10 @@
             "expected_e2e_ms": 399.62,
             "expected_avg_denoise_ms": 21.49,
             "expected_median_denoise_ms": 19.63,
-            "load_peak_vram_mb": 8504.0,
-            "runtime_peak_vram_mb": 13732.0,
-            "load_peak_allocated_mb": 8498.0,
-            "runtime_peak_allocated_mb": 10793.0,
+            "load_peak_vram_mb": 15294.0,
+            "runtime_peak_vram_mb": 20216.0,
+            "load_peak_allocated_mb": 15290.36,
+            "runtime_peak_allocated_mb": 17776.0,
             "estimated_full_test_time_s": 70
         },
         "flux_2_klein_base_image_t2i": {
@@ -1000,10 +917,10 @@
             "expected_e2e_ms": 6112.68,
             "expected_avg_denoise_ms": 116.49,
             "expected_median_denoise_ms": 117.28,
-            "load_peak_vram_mb": 8504.0,
-            "runtime_peak_vram_mb": 13754.0,
-            "load_peak_allocated_mb": 8498.0,
-            "runtime_peak_allocated_mb": 10800.0,
+            "load_peak_vram_mb": 15294.0,
+            "runtime_peak_vram_mb": 18048.0,
+            "load_peak_allocated_mb": 15290.36,
+            "runtime_peak_allocated_mb": 16921.0,
             "estimated_full_test_time_s": 50
         },
         "flux_2_ti2i": {
@@ -1149,77 +1066,6 @@
             "load_peak_allocated_mb": 63963.0,
             "runtime_peak_allocated_mb": 67003.0,
             "estimated_full_test_time_s": 100
-        },
-        "flux_image_t2i_2_gpus": {
-            "expected_load_ms": 31766.33,
-            "stages_ms": {
-                "InputValidationStage": 0.03,
-                "TextEncodingStage": 28.24,
-                "TimestepPreparationStage": 25.74,
-                "LatentPreparationStage": 0.2,
-                "DenoisingStage": 4004.08,
-                "DecodingStage": 11.98
-            },
-            "denoise_step_ms": {
-                "0": 42.52,
-                "1": 57.39,
-                "2": 80.17,
-                "3": 80.34,
-                "4": 80.43,
-                "5": 80.58,
-                "6": 80.46,
-                "7": 80.43,
-                "8": 80.73,
-                "9": 80.53,
-                "10": 80.45,
-                "11": 81.78,
-                "12": 83.73,
-                "13": 81.89,
-                "14": 81.46,
-                "15": 80.96,
-                "16": 80.88,
-                "17": 80.92,
-                "18": 80.73,
-                "19": 80.74,
-                "20": 80.74,
-                "21": 80.77,
-                "22": 81.64,
-                "23": 81.71,
-                "24": 83.15,
-                "25": 82.31,
-                "26": 82.06,
-                "27": 81.49,
-                "28": 80.85,
-                "29": 81.11,
-                "30": 81.28,
-                "31": 80.47,
-                "32": 80.64,
-                "33": 80.64,
-                "34": 80.81,
-                "35": 81.48,
-                "36": 81.86,
-                "37": 82.27,
-                "38": 82.13,
-                "39": 81.67,
-                "40": 81.7,
-                "41": 81.39,
-                "42": 81.22,
-                "43": 81.06,
-                "44": 80.77,
-                "45": 80.77,
-                "46": 81.37,
-                "47": 81.1,
-                "48": 81.91,
-                "49": 81.52
-            },
-            "expected_e2e_ms": 4244.27,
-            "expected_avg_denoise_ms": 79.98,
-            "expected_median_denoise_ms": 81.01,
-            "load_peak_vram_mb": 27722.0,
-            "runtime_peak_vram_mb": 32332.0,
-            "load_peak_allocated_mb": 27651.29,
-            "runtime_peak_allocated_mb": 30128.94,
-            "estimated_full_test_time_s": 50.0
         },
         "zimage_image_t2i": {
             "expected_load_ms": 28221.57,
@@ -3858,15 +3704,6 @@
             "load_peak_allocated_mb": 12852.0,
             "runtime_peak_allocated_mb": 15130.0,
             "estimated_full_test_time_s": 50.0
-        },
-        "flux1_modelopt_fp8_t2i": {
-            "expected_load_ms": 33073.38,
-            "stages_ms": {},
-            "denoise_step_ms": {},
-            "expected_e2e_ms": 1138.33,
-            "expected_avg_denoise_ms": 0.0,
-            "expected_median_denoise_ms": 0.0,
-            "estimated_full_test_time_s": 50
         },
         "wan22_modelopt_fp8_t2v": {
             "expected_load_ms": 63380.1,

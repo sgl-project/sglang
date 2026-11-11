@@ -516,6 +516,60 @@ def test_rank_local_eviction_forces_collective_miss(tmp_path, disabled_rank, gro
     )
 
 
+def _rank_local_vae(rank, init_method):
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=2,
+        init_method=init_method,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        from sglang.multimodal_gen.runtime.cache import conditioning
+
+        # The CPU process group exercises independent rank-local cache state;
+        # no SGLang model-parallel group is needed by this collective-free VAE.
+        conditioning.model_parallel_is_initialized = lambda: True
+        conditioning.get_world_size = dist.get_world_size
+        cache = ConditioningCache(4096)
+        model = VAE().eval()
+        x = torch.ones(1, 4, 2, 2)
+        with torch.no_grad(), cache.scope():
+            model.encode(x)
+            model.encode(x)
+            assert model.calls == 2  # Unknown distributed VAEs still bypass.
+            model.conditioning_encode_is_rank_local = True
+            first = model.encode(x).latent_dist
+            hit = model.encode(x).latent_dist
+            assert model.calls == 3
+            for seed in (42, 1234):
+                torch.testing.assert_close(
+                    first.sample(generator=torch.Generator().manual_seed(seed)),
+                    hit.sample(generator=torch.Generator().manual_seed(seed)),
+                    rtol=0,
+                    atol=0,
+                )
+            if rank == 0:
+                cache.clear()
+            model.encode(x)
+            assert model.calls == (4 if rank == 0 else 3)
+            changed = model.encode(x + 1).latent_dist
+            assert model.calls == (5 if rank == 0 else 4)
+            assert not torch.equal(changed.mean, first.mean)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_rank_local_vae_cache_preserves_sampling_and_independent_eviction(tmp_path):
+    mp.spawn(
+        _rank_local_vae,
+        args=(f"file://{tmp_path / 'vae-rendezvous'}",),
+        nprocs=2,
+        join=True,
+    )
+
+
 @torch.no_grad()
 def test_stage_conditioning_owns_output_but_preserves_vision_cache():
     model = VisionLanguageEncoder().eval()
