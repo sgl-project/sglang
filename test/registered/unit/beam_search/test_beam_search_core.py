@@ -18,6 +18,8 @@ from sglang.srt.beam_search import (
     materialize_tokens,
     select_final_topk,
 )
+from sglang.srt.beam_search.coordinator import BeamCoordinator
+from sglang.srt.beam_search.joint_select import SelectResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -96,6 +98,22 @@ class TestJointSelectGolden(CustomTestCase):
         self.assert_close(survivors, [(-0.1, 0, 10), (-0.2, 0, 11)])
         self.assertEqual(finished, [])
 
+    def test_no_stop_fast_path_matches_general_path(self):
+        # A stop id that never appears among the tokens forces the general path
+        # without finishing anything.
+        generator = torch.Generator().manual_seed(0)
+        for k in (1, 3, 8):
+            logprobs = torch.randn(k, 2 * k, generator=generator).log_softmax(-1)
+            tokens = torch.arange(k * 2 * k, dtype=torch.int64).reshape(k, 2 * k)
+            cum = torch.randn(k, generator=generator)
+            fast = joint_select(cum, logprobs, tokens, T([], torch.int64), k)
+            general = joint_select(cum, logprobs, tokens, T([10**6], torch.int64), k)
+            for name in SelectResult.__struct_fields__:
+                self.assertTrue(
+                    torch.equal(getattr(fast, name), getattr(general, name)),
+                    f"{name} differs at beam_width {k}",
+                )
+
     def test_stop_routing(self):
         # Sorted walk: 10 survives, 11 is a stop (examined), 12 survives -> stop.
         # 13 and every row-1 candidate fall outside the examined window.
@@ -131,6 +149,39 @@ class TestJointSelectGolden(CustomTestCase):
         self.assertEqual(sel.parent_idx.tolist(), [0, 0])
         for actual, expected in zip(sel.cum_logprobs.tolist(), [-0.1, -0.2]):
             self.assertAlmostEqual(actual, expected, places=5)
+
+    def test_global_candidate_pool_can_exceed_per_row_width(self):
+        sel = joint_select(
+            T([0.0, -0.1], torch.float32),
+            T([[-0.1, -0.2], [-0.05, -0.3]], torch.float32),
+            T([[10, 11], [20, 21]], torch.int64),
+            T([], torch.int64),
+            beam_width=2,
+            num_output_candidates=4,
+        )
+        survivors, finished = unpack(sel)
+        self.assert_close(survivors, [(-0.1, 0, 10), (-0.15, 1, 20)])
+        self.assertEqual(finished, [])
+
+    def test_coordinator_preserves_generic_stop_candidate_pool(self):
+        coordinator = BeamCoordinator(
+            model_config=SimpleNamespace(beam_trie_config=None),
+            spec_algorithm=None,
+            dllm_enabled=False,
+            max_req_len=0,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            tree_cache=None,
+            future_map=None,
+        )
+        group = BeamGroup(beam_width=2, stop_token_ids=[99], max_new_tokens=3)
+        tokens, _ = coordinator.select_group(
+            group,
+            T([[-0.1, -0.2, -0.3, -0.4]], torch.float32),
+            T([[99, 1, 2, 3]], torch.int64),
+            tick=0,
+        )
+        self.assertEqual(tokens.tolist(), [1, 2])
 
 
 class TestJointSelectDifferential(CustomTestCase):
@@ -187,6 +238,59 @@ class TestBeamGroup(CustomTestCase):
         defaults.update(kwargs)
         return BeamGroup(**defaults)
 
+    def test_decode_slot_budget_tracks_committed_steps(self):
+        self.assertIsNone(self._make_group().decode_slot_budget())
+        group = self._make_group(beam_width=4, max_new_tokens=3, device_history=True)
+
+        self.assertEqual(group.decode_slot_budget(), 8)
+        group.num_committed = 1
+        self.assertEqual(group.decode_slot_budget(), 8)
+        group.num_committed = 2
+        self.assertEqual(group.decode_slot_budget(), 4)
+        group.num_committed = 3
+        self.assertEqual(group.decode_slot_budget(), 0)
+        group.retired = True
+        self.assertIsNone(group.decode_slot_budget())
+
+    def test_device_history_matches_backpointer_history(self):
+        groups = [
+            self._make_group(stop_token_ids=[], device_history=False),
+            self._make_group(stop_token_ids=[], device_history=True),
+        ]
+        selections = [
+            run_select(
+                [0.0],
+                [[-0.1, -0.2, -0.3, -0.4]],
+                [[1, 2, 3, 4]],
+                set(),
+                2,
+            ),
+            run_select(
+                [-0.1, -0.2],
+                [[-0.3, -0.1], [-0.05, -0.4]],
+                [[5, 6], [7, 8]],
+                set(),
+                2,
+            ),
+        ]
+        for group in groups:
+            for selection in selections:
+                self.assertFalse(group.advance(selection))
+            final = select_final_topk(
+                group.frontier_cum_logprobs,
+                T([[-0.2, -0.4], [-0.1, -0.5]], torch.float32),
+                T([[9, 10], [11, 12]], torch.int64),
+                2,
+            )
+            self.assertTrue(group.advance_final(final))
+
+        expected = groups[0].finalize()
+        actual = groups[1].finalize()
+        self.assertEqual(
+            [(row.tokens, row.cum_logprob) for row in actual],
+            [(row.tokens, row.cum_logprob) for row in expected],
+        )
+
     def test_lifecycle_eos_and_length_finish(self):
         group = self._make_group()
 
@@ -219,7 +323,9 @@ class TestBeamGroup(CustomTestCase):
             T([[12, 13], [14, 15]], torch.int64),
             2,
         )
-        self.assertTrue(group.advance_final(fsel))
+        group.advance_final_frontier(fsel)
+        self.assertTrue(group.launch_complete())
+        self.assertTrue(group.commit_pending())
 
         results = group.finalize()
         self.assertEqual(len(results), 2)

@@ -197,7 +197,7 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
         from sglang.srt.beam_search.coordinator import BeamCoordinator
 
         return BeamCoordinator(
-            model_config=None,
+            model_config=SimpleNamespace(beam_trie_config=None),
             spec_algorithm=None,
             dllm_enabled=False,
             max_req_len=0,
@@ -235,7 +235,7 @@ class TestRetireReclaimsStagedOrphans(CustomTestCase):
             pending_orphans=[StagedOrphans(7, old_map, new_map)],
             slots_freed=0,
             retired=False,
-            _pending_steps=[],
+            clear_staged=lambda: None,
         )
 
         # retract_decode's sequence: member rows released without the

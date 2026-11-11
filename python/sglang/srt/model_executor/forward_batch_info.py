@@ -73,6 +73,7 @@ from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.shared_context_attention import BeamAttentionMetadata
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
@@ -485,6 +486,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     return_logprob: bool = False
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    # Per-row SID codebook depths for trie-conditioned decode batches.
+    beam_trie_levels: Optional[torch.Tensor] = None
+    # Shared-context attention metadata for all-beam decode batches.
+    beam_attention_metadata: Optional[BeamAttentionMetadata] = None
     spec_algorithm: SpeculativeAlgorithm = None
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
@@ -947,6 +952,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
 
+        beam_trie_levels = beam_attention_metadata = None
+        if batch.beam_tail is not None:
+            from sglang.srt.beam_search import shared_context_attention
+            from sglang.srt.beam_search.trie_output_head import build_trie_row_levels
+
+            beam_trie_levels = build_trie_row_levels(batch, model_runner)
+            beam_attention_metadata = shared_context_attention.build_metadata(
+                batch, model_runner
+            )
+
         # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
         # (incl. seq_lens_sum) is slated for removal in favor of kv-committed
         # lengths, so this init_new-time backfill onto the ScheduleBatch is
@@ -1028,6 +1043,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
+            beam_trie_levels=beam_trie_levels,
+            beam_attention_metadata=beam_attention_metadata,
             contains_last_prefill_chunk=contains_last_prefill_chunk,
             extend_is_final_cpu=extend_is_final_cpu,
             spec_algorithm=batch.spec_algorithm,

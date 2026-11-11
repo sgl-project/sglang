@@ -731,6 +731,14 @@ class Envs:
     SGLANG_DETOKENIZER_MAX_STATES = EnvInt(1 << 16)
 
     # ===================================================================
+    # Beam search
+    # ===================================================================
+    # Shared-prompt decode attention for wide beam batches (FlashInfer MHA only).
+    SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
+    # Replay the trie beam selection step as a CUDA graph.
+    SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
+
+    # ===================================================================
     # Overlap scheduler and pipeline parallelism
     # ===================================================================
     # Process a prefill step's result before scheduling the next step, for TTFT.

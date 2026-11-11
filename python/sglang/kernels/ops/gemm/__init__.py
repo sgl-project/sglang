@@ -597,6 +597,14 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
 del _mod, _fn, _desc
 register_kernel(
     KernelSpec(
+        op="gemm.project_active_codebook_logits",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.codebook_projection:project_active_codebook_logits",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.hopper_fp8_block_gemv",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.hopper_fp8_block_gemv:hopper_fp8_block_gemv",

@@ -728,6 +728,7 @@ class TboForwardBatchPreparer:
             "extend_is_final_cpu",
             "lora_ids",
             "rids",
+            "beam_trie_levels",
         ]:
             old_value = getattr(batch, key)
             if old_value is None:

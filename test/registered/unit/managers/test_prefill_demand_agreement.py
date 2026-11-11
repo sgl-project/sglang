@@ -220,6 +220,7 @@ def _req(rid, prompt, max_new_tokens=4):
     req.finished.return_value = False
     req.needs_host_load_back.return_value = False
     req.last_node = MagicMock()
+    req.beam_group = None
     return req
 
 

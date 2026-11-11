@@ -77,6 +77,7 @@ import torch
 from sglang.srt.beam_search.batch_tail import (
     BeamTail,
     append_beam_tail,
+    beam_launch_complete,
     beam_retraction_order,
     num_beam_member_rows,
     strip_beam_tail,
@@ -3353,7 +3354,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not self.reqs[i].finished() and self.reqs[i] not in reqs_to_exclude
+                if not self.reqs[i].finished()
+                and not beam_launch_complete(self.reqs[i])
+                and self.reqs[i] not in reqs_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:

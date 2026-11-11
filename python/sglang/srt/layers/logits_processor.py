@@ -38,6 +38,11 @@ from sglang.kernels.ops.sampling.softcap_row_argmax import (
     softcap_row_argmax,
 )
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
+from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
+from sglang.srt.beam_search.trie_output_head import (
+    BeamTrieOutputHead,
+    compute_beam_trie_logits,
+)
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
@@ -328,6 +333,7 @@ class LogitsProcessorOutput:
     # Beam search only: raw pre-sample logits for the scheduler-side joint
     # selection; see beam_search.logits_capture.
     beam: Optional[BeamLogitsCapture] = None
+    beam_normalizer: Optional[torch.Tensor] = None
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
@@ -428,6 +434,7 @@ class LogitsMetadata:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    beam_trie_levels: Optional[torch.Tensor] = None
 
     # Carried from ForwardBatch so logits pruning can reconstruct the SP gather.
     attn_tp_sequence_sharded: bool = False
@@ -493,6 +500,7 @@ class LogitsMetadata:
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
             attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
+            beam_trie_levels=forward_batch.beam_trie_levels,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
@@ -610,6 +618,7 @@ class LogitsProcessor(nn.Module):
         )
         self._aux_hidden_states_checked = False
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        self.beam_trie_output_head: Optional[BeamTrieOutputHead] = None
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -631,6 +640,11 @@ class LogitsProcessor(nn.Module):
             chunking_group = group.cpu_group
         self.input_logprob_processor = InputLogprobProcessor(
             self.vocab_size, chunking_group=chunking_group
+        )
+
+    def configure_beam_trie(self, config: Optional[TrieOutputHeadConfig]) -> None:
+        self.beam_trie_output_head = (
+            BeamTrieOutputHead(config, self.vocab_size) if config is not None else None
         )
 
     def enable_sharded_verify(self, *, temperature_keys: bool = False) -> None:
@@ -795,7 +809,23 @@ class LogitsProcessor(nn.Module):
                     mm_input_embeds=logits_metadata.mm_input_embeds,
                 )
             # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            beam_output = (
+                compute_beam_trie_logits(self, pruned_states, lm_head, logits_metadata)
+                if self.beam_trie_output_head is not None
+                else None
+            )
+            if beam_output is None:
+                # A trie model keeps LM-head rounding on dense rows too, so they
+                # score like the compact head; the logits buffer is bypassed.
+                logits = self._get_logits(
+                    pruned_states,
+                    lm_head,
+                    logits_metadata,
+                    use_logits_buffer=self.beam_trie_output_head is None,
+                )
+                beam_normalizer = None
+            else:
+                logits, beam_normalizer = beam_output.logits, beam_output.normalizer
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -806,6 +836,7 @@ class LogitsProcessor(nn.Module):
                 hidden_states=hidden_states_to_store,
                 last_hidden_states=last_hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
+                beam_normalizer=beam_normalizer,
             )
 
         logprobs_result, sampled_logits = self.input_logprob_processor.forward(

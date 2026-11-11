@@ -117,6 +117,13 @@ def strip_beam_tail(batch: ScheduleBatch) -> None:
     batch.seq_lens_sum = None
 
 
+def beam_launch_complete(req: Req) -> bool:
+    """A launch-complete group leaves the batch: the overlap scheduler would
+    otherwise run a forward for a group with no step left."""
+    group = req.beam_group
+    return group is not None and group.launch_complete()
+
+
 def num_beam_member_rows(reqs) -> int:
     """Extra decode-slot demand: one slot per member row per step (beam
     requires page_size == 1)."""
