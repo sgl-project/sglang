@@ -15,8 +15,12 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+    from sglang.srt.layers.attention.dsa_backend import (
+        DeepseekSparseAttnBackend,
+        DSAMetadata,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 def validate_dcp_backend_hip(prefill_impl: str, decode_impl: str) -> None:
@@ -85,3 +89,26 @@ def forward_triton_dcp_partial(
         expected_topk=expected_topk,
     )
     return o.squeeze(0), lse
+
+
+def dcp_gather_kv_cache(
+    backend: DeepseekSparseAttnBackend,
+    kv_cache: torch.Tensor,
+    forward_batch: ForwardBatch,
+    metadata: DSAMetadata,
+) -> torch.Tensor:
+    """``DeepseekSparseAttnBackend.dcp_gather_kv_cache``: the send buffer is read
+    straight from this rank's cache rows and the output is page-padded in place."""
+    from sglang.srt.layers.attention.dsa.dsa_dcp_sharded_hip import (
+        dcp_gather_request_rows,
+    )
+
+    assert metadata.dcp_local_kv_rows is not None
+    rows = kv_cache.view(torch.uint8).view(-1, backend.kv_cache_dim)
+    gathered = dcp_gather_request_rows(
+        rows,
+        forward_batch.seq_lens_cpu,
+        row_ids=metadata.dcp_local_kv_rows,
+        page_size=backend.physical_page_size,
+    )
+    return gathered.view(kv_cache.dtype)
