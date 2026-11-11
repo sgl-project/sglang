@@ -77,8 +77,8 @@ def _apply_weight_only_fp8_linear(
     enable_fused_w8a8: bool,
 ) -> torch.Tensor:
     if weight.dtype != FP8_WEIGHT_DTYPE:
-        # Weight was dequantized to the compute dtype once at load time
-        # (see dequantize_weight_only_fp8_linears_at_load).
+        # The weight was dequantized to the compute dtype once on its first
+        # device-resident forward (see _maybe_promote_fp8_weight).
         bias = bias.to(weight.dtype) if bias is not None else None
         return F.linear(x.to(weight.dtype), weight, bias)
     x = x.to(compute_dtype)
