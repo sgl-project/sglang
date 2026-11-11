@@ -4,12 +4,14 @@ ring mode, the window floor holds, and an extend keeps only the tail a later
 window can read."""
 
 import sys
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
 
 from sglang.kernels.ops.attention.mla_window_indices import mla_window_sparse_indices
+from sglang.srt.speculative import draft_worker_common
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
     draft_kv_ring_pool_rows,
@@ -168,7 +170,7 @@ def test_decode_floor_reset_and_unsupported_drafts():
 
 def test_ring_admits_triton_only_under_dcp_on_rocm():
     """Only ROCm's triton draft backend reads a ring window by index, and only under
-    DCP; elsewhere it keeps dev's refusal."""
+    DCP; elsewhere triton has no window index path."""
 
     config = {
         "num_hidden_layers": 1,
@@ -177,7 +179,11 @@ def test_ring_admits_triton_only_under_dcp_on_rocm():
     }
 
     def reason(dcp, hip):
-        with mock.patch("sglang.srt.utils.is_hip", return_value=hip):
+        with mock.patch.object(
+            draft_worker_common,
+            "get_platform",
+            return_value=SimpleNamespace(is_hip=hip),
+        ):
             return draft_kv_ring_unsupported_reason(
                 config, draft_backend="triton", draft_window_size=None, dcp_size=dcp
             )

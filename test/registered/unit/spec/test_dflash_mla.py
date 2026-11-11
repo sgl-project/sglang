@@ -367,7 +367,7 @@ class TestTritonDcpMlaDraft(CustomTestCase):
     SLIDING = (["mla"] * 2, ["sliding_attention"] * 2)  # MLA5
     FULL = (["mla"] * 2, ["full_attention"] * 2)  # MLA7
 
-    def _resolve(self, draft, *, is_hip=True, use_aiter=True, window_size=None):
+    def _resolve(self, draft, *, is_hip=True, use_aiter=True):
         modes, layer_types = draft
         draft_config = {
             "num_hidden_layers": 2,
@@ -381,7 +381,6 @@ class TestTritonDcpMlaDraft(CustomTestCase):
             speculative_algorithm="DFLASH",
             speculative_draft_model_path="draft",
             speculative_draft_attention_backend="triton",
-            speculative_draft_window_size=window_size,
             dcp_size=8,
         )
         hook = "sglang.srt.arg_groups.speculative_hook"
@@ -397,18 +396,9 @@ class TestTritonDcpMlaDraft(CustomTestCase):
     def test_rocm_with_aiter_takes_the_sliding_draft(self):
         self.assertEqual(self._resolve(self.SLIDING), "triton")
 
-    def test_other_rocm_setups_refuse(self):
-        for setup in (
-            dict(use_aiter=False),
-            # The owner rows are read through the shared req_to_token, not
-            # a compact draft one.
-            dict(window_size=1024),
-        ):
-            with (
-                self.subTest(**setup),
-                self.assertRaisesRegex(ValueError, "only with SGLANG_USE_AITER=1"),
-            ):
-                self._resolve(self.SLIDING, **setup)
+    def test_rocm_without_aiter_refuses(self):
+        with self.assertRaisesRegex(ValueError, "only with SGLANG_USE_AITER=1"):
+            self._resolve(self.SLIDING, use_aiter=False)
 
     def test_cuda_keeps_dev_resolution(self):
         self.assertEqual(self._resolve(self.FULL, is_hip=False), "triton")

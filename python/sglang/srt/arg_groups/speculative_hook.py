@@ -937,6 +937,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
     from sglang.srt.speculative.draft_worker_common import (
         DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+        dflash_draft_reads_rows_by_position,
     )
 
     cfg = resolving_view(server_args)
@@ -1039,12 +1040,12 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             fallback_backend,
         )
         draft_backend = fallback_backend
-    if draft_backend == "triton" and cfg.dcp_size > 1 and get_platform().is_hip:
+    if get_platform().is_hip and dflash_draft_reads_rows_by_position(
+        draft_backend, cfg.dcp_size
+    ):
         from sglang.srt.layers.attention.triton_draft_hip import check_dcp_mla_draft
 
-        check_dcp_mla_draft(
-            _load_draft_hf_config(cfg), cfg.speculative_draft_window_size
-        )
+        check_dcp_mla_draft(_load_draft_hf_config(cfg))
     # FIXME: avoid overriding server args directly; pass the resolved draft
     # backend to the draft worker explicitly instead.
     declare_resolution(
@@ -1063,14 +1064,16 @@ def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
         resolve_mla_draft_compact_window,
     )
     from sglang.srt.speculative.draft_worker_common import (
-        DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+        dflash_draft_reads_rows_by_position,
     )
 
     cfg = resolving_view(server_args)
     window_size = cfg.speculative_draft_window_size
     if window_size is None:
         return
-    if cfg.speculative_draft_attention_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+    if not dflash_draft_reads_rows_by_position(
+        cfg.speculative_draft_attention_backend, cfg.dcp_size
+    ):
         return
     draft_hf_config = _load_draft_hf_config(cfg)
     if not is_dflash_mla_draft_config(draft_hf_config):

@@ -210,8 +210,9 @@ def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
             f"Kimi-K3.1 DCP needs a power-of-two --dcp-size dividing --tp-size, "
             f"got dcp_size={dcp}, tp_size={cfg.tp_size}."
         )
-    # ROCm serves the DFLASH MLA draft with the Triton backend's rank-local MLA verify.
-    dflash_draft_backend = "triton" if get_platform().is_hip else "cutedsl_mla"
+    from sglang.srt.speculative.draft_worker_common import dflash_dcp_mla_draft_backend
+
+    dflash_draft_backend = dflash_dcp_mla_draft_backend()
     unsupported = {
         "speculative decoding other than DSPARK and DFLASH": cfg.speculative_algorithm
         not in (None, "DSPARK", "DFLASH"),
