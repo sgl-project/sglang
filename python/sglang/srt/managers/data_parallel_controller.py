@@ -37,6 +37,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UpdateWeightsFromIPCReqInput,
     sock_recv,
     sock_send,
     unwrap_from_pickle,
@@ -355,6 +356,7 @@ class DataParallelController:
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
+                (UpdateWeightsFromIPCReqInput, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (
                     ElasticScaleUpdateReq,
