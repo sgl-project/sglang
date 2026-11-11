@@ -337,14 +337,6 @@ class DiffusionServer:
         self._assignments: dict[str, dict[RoleType, int]] = {}
 
     @property
-    def tracker(self) -> RequestTracker:
-        return self._tracker
-
-    @property
-    def dispatcher(self) -> PoolDispatcher:
-        return self._dispatcher
-
-    @property
     def is_alive(self) -> bool:
         return self._running and self._thread is not None and self._thread.is_alive()
 

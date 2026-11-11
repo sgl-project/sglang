@@ -13,6 +13,12 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
     DSV4NPUTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache import memory_pool_host
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
+from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+    CompressStatePool,
+    KVAndScore,
+)
+from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
 from sglang.srt.mem_cache.memory_pool_host import (
@@ -99,7 +105,9 @@ class TestDSV4HostViews(CustomTestCase):
                         return_value=None,
                     ),
                     patch.object(
-                        memory_pool_host, "host_memory_budget_bytes", return_value=2**30
+                        memory_pool_host,
+                        "host_memory_preflight",
+                        side_effect=lambda lengths, **_: (sum(lengths), 2**30),
                     ),
                     patch.object(
                         memory_pool_host, "make_kernel_ptr_table", return_value=None
@@ -126,12 +134,7 @@ class TestDSV4HostViews(CustomTestCase):
                     state = DeepSeekV4StateHostPool(
                         "state",
                         [
-                            SimpleNamespace(
-                                ring_size=2,
-                                kv_score_buffer=SimpleNamespace(
-                                    kv_score=torch.empty((8, 3))
-                                ),
-                            )
+                            self._state_pool(torch.float32, 3).checkpoint_buffer_info()
                             for _ in range(2)
                         ],
                         num_host_pages=4,
@@ -159,6 +162,73 @@ class TestDSV4HostViews(CustomTestCase):
                                 self.assertTrue(buffer.is_contiguous())
                                 self.assertEqual(tuple(buffer.shape), (4, width))
                                 self.assertIs(pool.data_refs[layer], buffer)
+
+    @staticmethod
+    def _state_pool(dtype, width, ring_size=2):
+        pool = CompressStatePool.__new__(CompressStatePool)
+        pool.request_scoped = False
+        pool.ring_size = ring_size
+        pool.kv_score_buffer = KVAndScore(torch.zeros((8, width), dtype=dtype))
+        return pool
+
+    def test_state_binding_preserves_storage_and_per_layer_dtype(self):
+        for layout in ("layer_first", "page_first", "page_first_direct"):
+            with self.subTest(layout=layout):
+                pools = [
+                    self._state_pool(torch.float16, 4),
+                    self._state_pool(torch.float32, 2),
+                ]
+                infos = [pool.checkpoint_buffer_info() for pool in pools]
+                host = DeepSeekV4StateHostPool(
+                    pool_name="c4",
+                    state_infos=infos,
+                    num_host_pages=3,
+                    swa_page_size=4,
+                    layout=layout,
+                    pin_memory=False,
+                )
+                # Rebinding a pool cannot change an already assembled transfer.
+                for pool in pools:
+                    pool.kv_score_buffer = KVAndScore(torch.zeros((8, 8)))
+                for layer, (dtype, width) in enumerate(
+                    ((torch.float16, 4), (torch.float32, 2))
+                ):
+                    self.assertEqual(host.state_infos[layer].dtype, dtype)
+                    if layout != "page_first_direct":
+                        view = host._state_host_page_view(layer)
+                        self.assertEqual(view.dtype, dtype)
+                        shape = (
+                            (1, 3, 2, 1, width)
+                            if layout == "layer_first"
+                            else (3, 1, 2, 1, width)
+                        )
+                        self.assertEqual(view.shape, shape)
+                    self.assertIs(host.device_page_views[layer], infos[layer].pages)
+                    host.device_page_views[layer][1].fill_(17)
+                    self.assertTrue((pools[layer].kv_score_buffer.kv_score == 0).all())
+                pages = host._to_page_indices(torch.tensor([8, 9, 10, 11]))
+                self.assertEqual(pages.tolist(), [2])
+                self.assertEqual(host._ring_op_indices(pages).tolist(), [4, 5])
+
+    def test_state_host_rejects_incompatible_ring_groups(self):
+        first = self._state_pool(torch.float16, 4).checkpoint_buffer_info()
+        for second in (
+            self._state_pool(torch.float32, 1, ring_size=4),
+            self._state_pool(torch.float16, 6),
+        ):
+            with self.subTest(
+                ring=second.ring_size, shape=second.kv_score_buffer.shape
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "share ring size and slot bytes"
+                ):
+                    DeepSeekV4StateHostPool(
+                        pool_name="c4",
+                        state_infos=[first, second.checkpoint_buffer_info()],
+                        num_host_pages=3,
+                        swa_page_size=4,
+                        pin_memory=False,
+                    )
 
     def test_paged_and_state_host_views_support_ascend_layouts(self):
         pages, layers, page_slots, last_dim = 2, 2, 2, 3
@@ -210,11 +280,11 @@ class TestDSV4HostViews(CustomTestCase):
                 host.num_host_pages = pages
                 host.ring_size = ring_size
                 host.state_page_bytes = state_page_bytes
-                host.state_pools = [
-                    SimpleNamespace(
-                        kv_score_buffer=SimpleNamespace(
-                            kv_score=torch.empty(1, dtype=state_dtype)
-                        )
+                host.state_infos = [
+                    DSV4StateBufferInfo(
+                        pages=torch.empty((4, state_page_bytes), dtype=torch.uint8),
+                        ring_size=ring_size,
+                        dtype=state_dtype,
                     )
                     for _ in range(layers)
                 ]
@@ -319,16 +389,14 @@ class TestDSV4HostViews(CustomTestCase):
                 host.swa_page_size = 4
                 host.ring_size = 2
                 host.state_page_bytes = 12
-                host.state_pools = [
-                    SimpleNamespace(
-                        kv_score_buffer=SimpleNamespace(
-                            kv_score=torch.empty(1, dtype=torch.float16)
-                        )
-                    )
-                    for _ in range(2)
-                ]
                 host.device_page_views = [
                     torch.empty((4, 12), dtype=torch.uint8) for _ in range(2)
+                ]
+                host.state_infos = [
+                    DSV4StateBufferInfo(
+                        pages=pages, ring_size=host.ring_size, dtype=torch.float16
+                    )
+                    for pages in host.device_page_views
                 ]
                 raw = torch.empty((4, 2, 12), dtype=torch.uint8)
                 host.kv_buffer = self._layout_buffer(raw, layout)
@@ -370,12 +438,17 @@ class TestDSV4HostViews(CustomTestCase):
                     )
                 )
 
-    def test_dsv4_acl_capacity_declares_paged_pool_bytes(self):
-        kvcache = SimpleNamespace(
-            swa_kv_pool=SimpleNamespace(
-                kv_buffer=[object(), object()], bytes_per_page_padded=6
-            )
+    @staticmethod
+    def _paged_pool_info(num_layers, page_bytes):
+        return SimpleNamespace(
+            layer_ids=tuple(range(num_layers)),
+            buffer_info=SimpleNamespace(
+                buffers=(object(),) * num_layers, page_bytes=page_bytes
+            ),
         )
+
+    def test_dsv4_acl_capacity_declares_paged_pool_bytes(self):
+        infos = {PoolName.SWA: self._paged_pool_info(2, 6)}
         backend = MagicMock()
         with (
             patch.object(npu_host_memory, "is_npu", return_value=True),
@@ -392,38 +465,31 @@ class TestDSV4HostViews(CustomTestCase):
             ),
         ):
             npu_host_memory.reserve_dsv4_paged_host_memory(
-                kvcache=kvcache,
-                page_size=4,
+                infos=infos,
                 num_host_pages=4,
                 swa_num_host_pages=4,
                 c128_num_host_pages=0,
-                has_paged_swa=True,
-                mtp_swa_device_buffers=[],
-                c4_layer_mapping={},
-                c4_state_global_layers=[],
-                c128_layer_mapping={},
-                compressed_region_buffers=assembler._dsv4_compressed_region_buffers,
-                indexer_regions=assembler._dsv4_indexer_regions,
-                rope_sibling=assembler._dsv4_rope_sibling,
+                num_draft_swa_layers=0,
             )
         backend.ensure_capacity.assert_called_once_with(48, 0)
 
     def test_capacity_declares_actual_paged_and_state_allocations(self):
-        def state_pool(slot_bytes):
+        def checkpoint_info(num_layers, ring_bytes):
+            state = SimpleNamespace(pages=SimpleNamespace(shape=(1, ring_bytes)))
             return SimpleNamespace(
-                ring_size=2,
-                kv_score_buffer=SimpleNamespace(
-                    kv_score=[SimpleNamespace(nbytes=slot_bytes)]
-                ),
+                buffer_info=SimpleNamespace(states=(state,) * num_layers)
             )
 
-        kvcache = SimpleNamespace(
-            swa_kv_pool=SimpleNamespace(
-                kv_buffer=[object(), object()], bytes_per_page_padded=6
-            ),
-            compress_state_pools=[state_pool(4), state_pool(4)],
-            indexer_compress_state_pools=[state_pool(8), state_pool(8)],
-        )
+        infos = {
+            PoolName.SWA: self._paged_pool_info(2, 6),
+            PoolName.DEEPSEEK_V4_C4: self._paged_pool_info(2, 4),
+            PoolName.DEEPSEEK_V4_C4_INDEXER: self._paged_pool_info(1, 3),
+            PoolName.DEEPSEEK_V4_C4_ROPE: self._paged_pool_info(2, 2),
+            PoolName.DEEPSEEK_V4_C4_STATE: checkpoint_info(2, 8),
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE: checkpoint_info(2, 16),
+            PoolName.DEEPSEEK_V4_C128: self._paged_pool_info(1, 5),
+            PoolName.DEEPSEEK_V4_C128_ROPE: self._paged_pool_info(1, 7),
+        }
         expected_blocks = {
             "layer_first": [24, 24, 24, 16, 16, 12, 8, 8, 32, 32, 64, 64, 10, 14],
             "page_first": [72, 32, 12, 16, 64, 128, 10, 14],
@@ -443,29 +509,6 @@ class TestDSV4HostViews(CustomTestCase):
                         npu_host_memory, "get_host_memory_backend", return_value=backend
                     ),
                     patch.object(
-                        assembler,
-                        "_dsv4_compressed_region_buffers",
-                        side_effect=[
-                            ([object(), object()], 4),
-                            ([object()], 5),
-                        ],
-                    ),
-                    patch.object(
-                        assembler,
-                        "_dsv4_indexer_regions",
-                        return_value=[
-                            SimpleNamespace(device_buffers=[object()], item_bytes=3)
-                        ],
-                    ),
-                    patch.object(
-                        assembler,
-                        "_dsv4_rope_sibling",
-                        side_effect=[
-                            ("c4_rope", [object(), object()], 2),
-                            ("c128_rope", [object()], 7),
-                        ],
-                    ),
-                    patch.object(
                         torch,
                         "npu",
                         SimpleNamespace(current_device=lambda: 0),
@@ -473,19 +516,11 @@ class TestDSV4HostViews(CustomTestCase):
                     ),
                 ):
                     npu_host_memory.reserve_dsv4_paged_host_memory(
-                        kvcache=kvcache,
-                        page_size=4,
+                        infos=infos,
                         num_host_pages=4,
                         swa_num_host_pages=4,
                         c128_num_host_pages=2,
-                        has_paged_swa=True,
-                        mtp_swa_device_buffers=[object()],
-                        c4_layer_mapping={0: 0, 1: 1},
-                        c4_state_global_layers=[0, 1],
-                        c128_layer_mapping={0: 0},
-                        compressed_region_buffers=assembler._dsv4_compressed_region_buffers,
-                        indexer_regions=assembler._dsv4_indexer_regions,
-                        rope_sibling=assembler._dsv4_rope_sibling,
+                        num_draft_swa_layers=1,
                     )
                 backend.ensure_capacity.assert_called_once_with(sum(blocks), 0)
 
@@ -496,19 +531,11 @@ class TestDSV4HostViews(CustomTestCase):
             patch.object(npu_host_memory, "get_host_memory_backend") as get_backend,
         ):
             npu_host_memory.reserve_dsv4_paged_host_memory(
-                kvcache=None,
-                page_size=4,
+                infos={},
                 num_host_pages=0,
                 swa_num_host_pages=0,
                 c128_num_host_pages=0,
-                has_paged_swa=False,
-                mtp_swa_device_buffers=[],
-                c4_layer_mapping={},
-                c4_state_global_layers=[],
-                c128_layer_mapping={},
-                compressed_region_buffers=assembler._dsv4_compressed_region_buffers,
-                indexer_regions=assembler._dsv4_indexer_regions,
-                rope_sibling=assembler._dsv4_rope_sibling,
+                num_draft_swa_layers=0,
             )
         get_memory.assert_not_called()
         get_backend.assert_not_called()
@@ -602,20 +629,53 @@ class TestDSV4PoolAssembly(CustomTestCase):
         k_buffer = [torch.empty((2, 32, 1, 4), dtype=torch.int8)]
         scale_buffer = [torch.empty((2, 32, 1, 1), dtype=torch.float16)]
         c4_buffer = [torch.empty((2, 32, 1, 8), dtype=torch.int8)]
-        indexer_pool = SimpleNamespace(
-            has_npu_storage=True,
-            index_k_buffer=k_buffer,
-            index_scale_buffer=scale_buffer,
-        )
+        # Only the unavailable hardware package is stubbed; exercise the real
+        # NPU provider, including its native page geometry and scale dtype.
+        import sys
+        from types import ModuleType
+
+        with patch.dict(sys.modules, {"torch_npu": ModuleType("torch_npu")}):
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+                NPUDeepSeekV4IndexerPool,
+                NPUDeepSeekV4SingleKVPool,
+            )
+        indexer_pool = NPUDeepSeekV4IndexerPool.__new__(NPUDeepSeekV4IndexerPool)
+        indexer_pool._kernel_page_size = 32
+        indexer_pool.index_k_buffer = k_buffer
+        indexer_pool.index_scale_buffer = scale_buffer
+        c4_pool = NPUDeepSeekV4SingleKVPool.__new__(NPUDeepSeekV4SingleKVPool)
+        c4_pool.store_dtype = torch.bfloat16
+        c4_pool.kernel_page_size = 32
+        c4_pool.kv_buffer = c4_buffer
+
         kvcache = SimpleNamespace(
             _unified_kv=True,
             size=256,
             swa_size=0,
             swa_page_size=256,
-            c4_kv_pool=SimpleNamespace(kernel_page_size=32),
+            c4_kv_pool=c4_pool,
             c4_indexer_kv_pool=indexer_pool,
-            unified_region_buffers=lambda ratio: (c4_buffer, 256),
-            unified_rope_region_buffers=lambda ratio: None,
+            start_layer=5,
+            stage_layer_ids=(5,),
+            get_device_pool_infos=lambda: tuple(
+                DevicePoolInfo(
+                    pool_name=name,
+                    indices_from_pool=PoolName.KV,
+                    layer_ids=(5,),
+                    buffer_info=region,
+                )
+                for name, region in (
+                    (PoolName.DEEPSEEK_V4_C4, c4_pool.paged_buffer_info()),
+                    (
+                        PoolName.DEEPSEEK_V4_C4_INDEXER,
+                        indexer_pool.indexer_buffer_info().key,
+                    ),
+                    (
+                        PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+                        indexer_pool.indexer_buffer_info().scale,
+                    ),
+                )
+            ),
         )
         params = SimpleNamespace(
             page_size=128,
@@ -625,15 +685,6 @@ class TestDSV4PoolAssembly(CustomTestCase):
             attn_cp_cache_group=None,
             attn_tp_cache_group=None,
             pp_cache_group=None,
-        )
-        mappings = assembler._DeepSeekV4LayerMappings(
-            transfer_layer_id_max=1,
-            full={0: 0},
-            swa={},
-            c4={0: 0},
-            c128={},
-            c4_state={},
-            c4_state_global_layers=[],
         )
         memory = SimpleNamespace(
             hicache_mem_layout="page_first",
@@ -680,13 +731,13 @@ class TestDSV4PoolAssembly(CustomTestCase):
                 kvcache=kvcache,
                 load_cache_event=None,
                 storage_backend=None,
-                layer_mappings=mappings,
             )
 
         k_host = group.entry_map[PoolName.DEEPSEEK_V4_C4_INDEXER].host_pool
         scale_host = group.entry_map[PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE].host_pool
-        self.assertIs(k_host.device_buffers, k_buffer)
-        self.assertIs(scale_host.device_buffers, scale_buffer)
+        self.assertIs(k_host.device_buffers[0], k_buffer[0])
+        self.assertIs(scale_host.device_buffers[0], scale_buffer[0])
+        self.assertEqual(indexer_pool.indexer_buffer_info().key.page_slots, 32)
         self.assertEqual((k_host.item_bytes, scale_host.item_bytes), (128, 64))
         self.assertEqual((k_host.slot_page_size, scale_host.slot_page_size), (128, 128))
         self.assertIs(built_controller, controller)

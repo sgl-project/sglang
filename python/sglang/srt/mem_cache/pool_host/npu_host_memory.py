@@ -25,16 +25,17 @@ from __future__ import annotations
 import logging
 import math
 import os
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.device_pool_info import MLASplitBuffers
+    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MLASplitBuffers
 
 logger = logging.getLogger(__name__)
 
@@ -327,19 +328,11 @@ def reserve_mla_split_host_memory(
 
 def reserve_dsv4_paged_host_memory(
     *,
-    kvcache: Any,
-    page_size: int,
+    infos: Mapping[PoolName, DevicePoolInfo],
     num_host_pages: int,
     swa_num_host_pages: int,
     c128_num_host_pages: int,
-    has_paged_swa: bool,
-    mtp_swa_device_buffers: list,
-    c4_layer_mapping: dict[int, int],
-    c4_state_global_layers: list[int],
-    c128_layer_mapping: dict[int, int],
-    compressed_region_buffers: Callable[[Any, int], tuple[list, int]],
-    indexer_regions: Callable[[Any, int], list],
-    rope_sibling: Callable[[Any, int], tuple[Any, list, int] | None],
+    num_draft_swa_layers: int,
 ) -> None:
     """Reserve DSV4 paged buffers before constructing the host pools."""
     if not is_npu():
@@ -361,43 +354,40 @@ def reserve_dsv4_paged_host_memory(
         else:
             paged_blocks.append(sum(layer_bytes))
 
-    def add_paged(buffers, item_bytes, pages):
-        add_blocks([pages * item_bytes] * len(buffers))
+    def add_paged(name: PoolName, pages: int, draft_layers: int = 0) -> None:
+        info = infos.get(name)
+        if info is not None:
+            region = info.buffer_info
+            add_blocks(
+                [pages * region.page_bytes] * (len(region.buffers) + draft_layers)
+            )
 
-    if has_paged_swa:
-        add_paged(
-            [*kvcache.swa_kv_pool.kv_buffer, *mtp_swa_device_buffers],
-            kvcache.swa_kv_pool.bytes_per_page_padded,
-            swa_num_host_pages,
-        )
-    if c4_layer_mapping:
-        buffers, item_bytes = compressed_region_buffers(kvcache, 4)
-        add_paged(buffers, item_bytes, num_host_pages)
-        for region in indexer_regions(kvcache, page_size):
-            add_paged(region.device_buffers, region.item_bytes, num_host_pages)
-        sibling = rope_sibling(kvcache, 4)
-        if sibling is not None:
-            add_paged(sibling[1], sibling[2], num_host_pages)
-        if not getattr(kvcache, "_unified_kv", False):
-            for state_pools in (
-                kvcache.compress_state_pools,
-                kvcache.indexer_compress_state_pools,
-            ):
-                state_blocks = []
-                for layer_id in c4_state_global_layers:
-                    pool = state_pools[layer_id]
-                    state_blocks.append(
-                        swa_num_host_pages
-                        * pool.ring_size
-                        * pool.kv_score_buffer.kv_score[0].nbytes
-                    )
-                add_blocks(state_blocks)
-    if c128_layer_mapping:
-        buffers, item_bytes = compressed_region_buffers(kvcache, 128)
-        add_paged(buffers, item_bytes, c128_num_host_pages)
-        sibling = rope_sibling(kvcache, 128)
-        if sibling is not None:
-            add_paged(sibling[1], sibling[2], c128_num_host_pages)
+    add_paged(PoolName.SWA, swa_num_host_pages, num_draft_swa_layers)
+    c4 = infos.get(PoolName.DEEPSEEK_V4_C4)
+    if c4 is not None and c4.layer_ids:
+        for name in (
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+            PoolName.DEEPSEEK_V4_C4_ROPE,
+        ):
+            add_paged(name, num_host_pages)
+        for name in (
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        ):
+            checkpoint = infos.get(name)
+            if checkpoint is not None:
+                add_blocks(
+                    [
+                        swa_num_host_pages * state.pages.shape[1]
+                        for state in checkpoint.buffer_info.states
+                    ]
+                )
+    c128 = infos.get(PoolName.DEEPSEEK_V4_C128)
+    if c128 is not None and c128.layer_ids:
+        add_paged(PoolName.DEEPSEEK_V4_C128, c128_num_host_pages)
+        add_paged(PoolName.DEEPSEEK_V4_C128_ROPE, c128_num_host_pages)
     backend = get_host_memory_backend()
     if paged_blocks and backend is not None:
         backend.ensure_capacity(sum(paged_blocks), torch.npu.current_device())
