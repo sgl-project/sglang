@@ -5760,9 +5760,7 @@ class AiterAttnBackend(AttentionBackend):
 
         if self.use_mla:
             if self.gfx1250_mla_asm_decode:
-                o = self._forward_gfx1250_asm_mla_decode(
-                    q, layer, forward_batch, sinks
-                )
+                o = self._forward_gfx1250_asm_mla_decode(q, layer, forward_batch, sinks)
                 return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
             if self.dcp_world_size > 1 and not forward_batch.forward_mode.is_idle():
                 k_buffer = self.kv_layers.read(layer.layer_id).key()
