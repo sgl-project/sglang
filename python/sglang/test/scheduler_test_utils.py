@@ -55,7 +55,7 @@ def leaving_retirer() -> MagicMock:
     """A mock `RequestRetirer` whose exits take the request out of its list."""
     retirer = MagicMock()
 
-    def leave(req, **_):
+    def leave(req, *_, **__):
         if req.owner_list is not None:
             req.owner_list._leave([req])
 

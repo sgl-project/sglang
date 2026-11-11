@@ -48,8 +48,7 @@ def _make_mock_req(
     origin_len: int = 0,
 ):
     """Create a mock Req with the KV cache state needed for testing."""
-    req = MagicMock()
-    req.rid = rid
+    req = MagicMock(rid=rid, owner_list=None)
     req.extra_key = None  # base traffic: storage hashes chain from tokens alone
     req.cache_salt = None
     req.origin_input_ids = list(range(origin_len))
@@ -61,7 +60,6 @@ def _make_mock_req(
     req.prefix_len = prefix_len
     req.owned_kv_len = lambda: req.kv.kv_committed_len
     req.exit_via = None
-    req.owner_list = None
     return req
 
 

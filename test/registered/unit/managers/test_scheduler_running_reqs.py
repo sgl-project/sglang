@@ -157,8 +157,9 @@ class TestRequestListsCheck(CustomTestCase):
 
     def test_fails_a_request_owned_by_another_list(self):
         req = _req("a")
-        move([req], self.s.running_reqs)
-        req.owner_list = self.s.waiting_queue
+        move([req], IndexedReqList(ListKind.WAITING))
+        # Corrupt the lists: running also holds the request another list owns.
+        self.s.running_reqs._reqs[req] = None
 
         with self.assertRaisesRegex(
             RuntimeError, "a is in DECODING but owned by WAITING"

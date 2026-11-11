@@ -79,12 +79,16 @@ class TestRequestHoldersAreLists(CustomTestCase):
         self.assertEqual(fields, set())
 
 
-_SRT = pathlib.Path(sglang.srt.__path__[0])
+_REPO = pathlib.Path(sglang.srt.__path__[0]).parents[2]
+_SCANNED = ("python/sglang/srt", "python/sglang/test", "test/registered")
 _EDITS = ("_join", "_leave")
-# `move`, and the retirer module, which takes ending requests out.
+# `move`; the retirer module, which takes ending requests out; its shared test
+# double; and this file, which tests the edits themselves.
 _EDITORS = {
-    "managers/scheduler_components/request_list.py",
-    "managers/scheduler_components/request_retirer.py",
+    "python/sglang/srt/managers/scheduler_components/request_list.py",
+    "python/sglang/srt/managers/scheduler_components/request_retirer.py",
+    "python/sglang/test/scheduler_test_utils.py",
+    "test/registered/unit/managers/scheduler_components/test_request_list.py",
 }
 
 
@@ -121,13 +125,15 @@ class _EditCalls(ast.NodeVisitor):
 class TestListEdits(CustomTestCase):
     def test_lists_are_edited_through_move_and_the_retirer(self):
         found = collections.Counter()
-        for file in sorted(_SRT.rglob("*.py")):
-            path = file.relative_to(_SRT).as_posix()
-            source = file.read_text()
-            if path not in _EDITORS and any(
-                key in source for key in (*(f"{e}(" for e in _EDITS), "owner_list")
-            ):
-                _EditCalls(path, found).visit(ast.parse(source))
+        for root in _SCANNED:
+            self.assertTrue((_REPO / root).is_dir(), root)
+            for file in sorted((_REPO / root).rglob("*.py")):
+                path = file.relative_to(_REPO).as_posix()
+                source = file.read_text()
+                if path not in _EDITORS and any(
+                    key in source for key in (*(f"{e}(" for e in _EDITS), "owner_list")
+                ):
+                    _EditCalls(path, found).visit(ast.parse(source))
         self.assertEqual(dict(found), {})
 
     def test_the_scan_counts_an_owner_list_assignment(self):

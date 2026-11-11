@@ -204,9 +204,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         def record(req, is_retracted=False):
             requeue_log.append({"req": req, "is_retracted": req.is_retracted})
-            # The queue door takes every request out of its list.
-            if req.owner_list is not None:
-                req.owner_list._leave([req])
+            move([req], scheduler.waiting_queue)
 
         scheduler._add_request_to_queue = MagicMock(side_effect=record)
         return requeue_log

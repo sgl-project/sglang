@@ -327,7 +327,6 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         batch = self.ready_batches.popleft() if self.ready_batches else None
         if batch is not None:
             self.actions.append((self.iteration, "prepare_batch", batch.forward_iter))
-            self.waiting_queue._leave(batch.reqs)
             # The request between two chunks stays in chunked_reqs.
             move(
                 (
