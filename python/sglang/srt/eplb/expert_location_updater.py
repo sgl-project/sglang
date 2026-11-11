@@ -423,9 +423,6 @@ def update_expert_weights_single_layer(
         src_rank: int,
         dst_expert_location: int,
     ):
-        src_peer = src_rank
-        if group is not None:
-            src_peer = torch.distributed.get_global_rank(group, src_rank)
         p2p_op_infos.append(
             (
                 logical_expert_id,
@@ -433,7 +430,7 @@ def update_expert_weights_single_layer(
                     P2POp(
                         op=torch.distributed.irecv,
                         tensor=_get_tensor(temp_buffers, i, dst_expert_location),
-                        peer=src_peer,
+                        peer=src_rank,
                         group=group,
                     )
                     for i in range(num_tensors)
@@ -468,9 +465,7 @@ def update_expert_weights_single_layer(
         cross_node_dst_ranks = cross_node_mapping.element_values_from_chunk_value(
             chunk_value=rank
         )
-        dst_peers = same_node_dst_ranks + cross_node_dst_ranks
-        if group is not None:
-            dst_peers = [torch.distributed.get_global_rank(group, r) for r in dst_peers]
+        all_dst_ranks = same_node_dst_ranks + cross_node_dst_ranks
 
         if debug:
             output_logs.append(
@@ -484,10 +479,10 @@ def update_expert_weights_single_layer(
                     P2POp(
                         op=torch.distributed.isend,
                         tensor=_get_tensor(send_weights, i, src_expert_location),
-                        peer=dst_peer,
+                        peer=dst_rank,
                         group=group,
                     )
-                    for dst_peer in dst_peers
+                    for dst_rank in all_dst_ranks
                     for i in range(num_tensors)
                 ],
             )
@@ -694,12 +689,7 @@ def _log_p2p_op_metrics(
     for direction, ops in _group_by(all_ops, _get_direction_from_op).items():
         nbytes_of_gpu = [0] * world_size
         for op in ops:
-            peer = (
-                op.peer
-                if op.group is None
-                else torch.distributed.get_group_rank(op.group, op.peer)
-            )
-            nbytes_of_gpu[peer] += op.tensor.nbytes
+            nbytes_of_gpu[op.peer] += op.tensor.nbytes
         nbytes_of_gpu = torch.tensor(nbytes_of_gpu, dtype=torch.int64)
 
         nbytes_of_node = einops.reduce(

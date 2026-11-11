@@ -51,7 +51,6 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import get_device as get_device_namespace
 from sglang.srt.runtime_context import (
     get_exec,
-    get_parallel,
     get_platform,
     get_schedule,
     logs_expert_balancedness_to_server_log,
@@ -781,15 +780,8 @@ class _Accumulator(ABC):
         rank: int,
     ):
         self._expert_location_metadata = expert_location_metadata
+        self._rank = rank
         self._communication_group = get_eplb_group()
-        # NPU communication uses stage-local ranks; collective roots are global.
-        self._group_rank = rank
-        self._root_global_rank = 0
-        if self._communication_group is not None:
-            self._group_rank = torch.distributed.get_rank(self._communication_group)
-            self._root_global_rank = torch.distributed.get_global_rank(
-                self._communication_group, 0
-            )
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
@@ -820,26 +812,10 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         self._enable = reports_expert_balancedness()
 
         if self._enable:
-            self._pipeline_layer_slice = None
-            parallel = get_parallel()
-            if get_device_namespace().device == "npu" and parallel.pp_size > 1:
-                from sglang.srt.distributed import get_pp_indices
-
-                # Ownership is fixed for this recorder. Cache the range rather
-                # than parsing the pipeline partition on every recorded pass.
-                self._pipeline_layer_slice = slice(
-                    *get_pp_indices(
-                        self._expert_location_metadata.num_layers,
-                        parallel.pp_rank,
-                        parallel.pp_size,
-                    )
-                )
             self.window_sizes = EPLB_BALANCEDNESS_WINDOW_SIZES
             self._history = _DequeCollection(maxlens=self.window_sizes)
             self._reset_server_log_history = True
-            if self._communication_group is None:
-                # Preserve the existing WORLD rank behavior when reporting.
-                self._group_rank = torch.distributed.get_rank()
+            self._rank = torch.distributed.get_rank()
             expert_dispatch_cls = resolve_collector_class(
                 STAT_LOGGER_ROLE_EXPERT_DISPATCH,
                 ExpertDispatchCollector,
@@ -881,21 +857,17 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
         torch.distributed.reduce(
             gpu_physical_count,
-            dst=self._root_global_rank,
+            dst=0,
             op=torch.distributed.ReduceOp.SUM,
             group=self._communication_group,
         )
 
-        if self._group_rank == 0:
+        if self._rank == 0:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
-            layer_utilization = compute_utilization_rate(gpu_physical_count)
-            if self._pipeline_layer_slice is not None:
-                # Counts are reduced within this stage but indexed by global
-                # layer ID. Use ownership rather than observed traffic so a
-                # valid layer with zero sampled tokens is still included.
-                layer_utilization = layer_utilization[self._pipeline_layer_slice]
-            utilization_rate_gpu = layer_utilization.mean()
+            utilization_rate_gpu = torch.mean(
+                compute_utilization_rate(gpu_physical_count)
+            )
             should_track_history = not math.isclose(
                 get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
             )
@@ -959,13 +931,6 @@ class _DequeCollection:
 class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # NPU stage groups reuse TP-local ranks. Detailed records need a unique
-        # rank across stages, independently of balancedness reporting.
-        self._record_rank = (
-            torch.distributed.get_rank()
-            if self._communication_group is not None
-            else self._group_rank
-        )
         self._records = []
 
     def get_single_pass_gatherer_keys(self):
@@ -995,7 +960,7 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         self._records.append(
             dict(
                 forward_pass_id=forward_pass_id,
-                rank=self._record_rank,
+                rank=self._rank,
                 gatherer_key=gatherer_key,
                 **single_pass_data_processed,
             )
@@ -1013,7 +978,7 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
         _dump_to_file(
-            f"expert_distribution_recorder_{time.time()}_{self._record_rank}.pt", output
+            f"expert_distribution_recorder_{time.time()}_{self._rank}.pt", output
         )
 
 
@@ -1068,30 +1033,18 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         )
 
         output = dict(
-            rank=self._group_rank,
+            rank=self._rank,
             logical_count=logical_count_of_buffered_step,
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
 
-        if output_mode == "object":
+        if output_mode == "file":
+            if self._rank == 0:
+                _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
+        elif output_mode == "object":
             return output
-        if output_mode != "file":
+        else:
             raise NotImplementedError
-        if self._group_rank != 0:
-            return
-
-        parallel = get_parallel()
-        suffix = ""
-        if self._communication_group is not None and parallel.pp_size > 1:
-            # The scheduler forwards this request after handling it.
-            # Save each stage locally; a WORLD gather here would block
-            # the request from reaching the next stage.
-            suffix = f"_pp{parallel.pp_rank}"
-            output.update(
-                pipeline_parallel_rank=parallel.pp_rank,
-                pipeline_parallel_size=parallel.pp_size,
-            )
-        _dump_to_file(f"expert_distribution_recorder_{time.time()}{suffix}.pt", output)
 
     def _get_global_average_utilization_rate(self):
         if not self._enable or math.isclose(
@@ -1099,7 +1052,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         ):
             return None
 
-        if self._group_rank == 0:
+        if self._rank == 0:
             utilization_mean_rates = self._history.mean()
             window_index = self.window_sizes[-1]
             average_utilization_rate_over_window = (
@@ -1120,9 +1073,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                 device=get_device_namespace().device,
             )
         torch.distributed.broadcast(
-            avg_rate_tensor,
-            src=self._root_global_rank,
-            group=self._communication_group,
+            avg_rate_tensor, src=0, group=self._communication_group
         )
         return avg_rate_tensor.item()
 

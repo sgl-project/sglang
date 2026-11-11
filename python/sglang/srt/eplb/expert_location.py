@@ -39,17 +39,14 @@ logger = logging.getLogger(__name__)
 
 
 def get_eplb_group() -> torch.distributed.ProcessGroup | None:
-    """Reuse the NPU TP group; other backends retain their WORLD path."""
-    if get_device().device != "npu" or get_exec().moe.elastic_ep_backend is not None:
+    """Reuse NPU TP for non-pipelined, non-elastic EPLB; otherwise use WORLD."""
+    if (
+        get_device().device != "npu"
+        or get_exec().moe.elastic_ep_backend is not None
+        or get_parallel().pp_size != 1
+    ):
         return None
     return get_parallel().tp_group.device_group
-
-
-def get_num_nodes_per_tp_group(nnodes: int) -> int:
-    """Count nodes within an NPU pipeline stage using the launcher's placement."""
-    if get_device().device != "npu":
-        return nnodes
-    return max(nnodes // get_parallel().pp_size, 1)
 
 
 def _prefer_same_node_experts() -> bool:
@@ -210,11 +207,7 @@ class ExpertLocationMetadata:
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_physical_experts = common["num_physical_experts"]
         num_groups = model_config_for_expert_location.num_groups
-        num_nodes = (
-            1
-            if use_flat_topology
-            else get_num_nodes_per_tp_group(get_parallel().nnodes)
-        )
+        num_nodes = 1 if use_flat_topology else get_parallel().nnodes
 
         from sglang.srt.eplb import eplb_algorithms
 
@@ -616,7 +609,7 @@ def _compute_logical_to_all_physical_map(
         num_local_gpu_physical_experts = num_physical_experts // ep_size
         prefer_same_node = _prefer_same_node_experts()
         num_gpus_per_node = (
-            get_parallel().ep_size // get_num_nodes_per_tp_group(get_parallel().nnodes)
+            get_parallel().ep_size // get_parallel().nnodes
             if prefer_same_node
             else None
         )
@@ -679,9 +672,7 @@ def compute_logical_to_rank_dispatch_physical_map(
     num_local_gpu_physical_experts = num_physical_experts // ep_size
     prefer_same_node = _prefer_same_node_experts()
     num_gpus_per_node = (
-        get_parallel().ep_size // get_num_nodes_per_tp_group(get_parallel().nnodes)
-        if prefer_same_node
-        else None
+        get_parallel().ep_size // get_parallel().nnodes if prefer_same_node else None
     )
     num_local_node_physical_experts = (
         num_local_gpu_physical_experts * num_gpus_per_node

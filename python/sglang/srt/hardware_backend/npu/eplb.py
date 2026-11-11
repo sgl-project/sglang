@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Callable, NamedTuple
 import torch
 import torch.distributed as dist
 
-from sglang.srt.eplb.expert_location import get_eplb_group, get_num_nodes_per_tp_group
+from sglang.srt.eplb.expert_location import get_eplb_group
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -74,7 +74,7 @@ def update_expert_weights_with_staging(
             old_physical_to_logical_map=old_placement,
             new_physical_to_logical_map=new_placement,
             num_local_physical_experts=old_metadata.num_local_physical_experts,
-            num_gpu_per_node=world_size // get_num_nodes_per_tp_group(nnodes),
+            num_gpu_per_node=world_size // nnodes,
             rank=rank,
             world_size=world_size,
             missing_logical_experts_info=missing_experts,
@@ -92,10 +92,11 @@ def _validate_migration_topology(group_size: int) -> None:
     from sglang.srt.runtime_context import get_parallel
 
     parallel = get_parallel()
-    if parallel.tp_size != parallel.moe_ep_size or parallel.moe_ep_size != group_size:
-        raise ValueError(
-            "NPU EPLB migration requires TP size = EP size = EPLB group size."
-        )
+    # TP and WORLD must have the same members and rank numbering.
+    if parallel.pp_size != 1 or not (
+        parallel.tp_size == parallel.moe_ep_size == group_size == dist.get_world_size()
+    ):
+        raise ValueError("NPU EPLB requires PP=1 and TP size = EP size = WORLD size.")
 
 
 def _select_expert_weight_updates(old_metadata, new_metadata, layer_ids, rank):
@@ -406,18 +407,17 @@ def _copy_expert_weight_runs(
 
 
 def prewarm_eplb_communication() -> None:
-    """Materialize the NPU stage's existing TP transports before KV-cache sizing."""
+    """Materialize the existing NPU TP transports before KV-cache sizing."""
     from sglang.srt.runtime_context import get_exec, get_parallel
 
     parallel = get_parallel()
-    if (
-        not get_exec().moe.enable_eplb
-        or get_exec().moe.elastic_ep_backend is not None
-        or not parallel.moe_ep_size == parallel.tp_size > 1
-    ):
+    if not get_exec().moe.enable_eplb or get_exec().moe.elastic_ep_backend is not None:
         return
     tp = parallel.tp_group
     group = tp.device_group
+    _validate_migration_topology(dist.get_world_size(group))
+    if tp.world_size == 1:
+        return
     send = torch.empty(4 << 20, dtype=torch.uint8, device="npu")
     recv = torch.empty(
         (tp.world_size - 1, send.numel()), dtype=send.dtype, device=send.device
