@@ -382,7 +382,6 @@ jobs:
       needs.check-changes.outputs.multimodal_gen == 'true'
     uses: ./.github/workflows/pr-test-multimodal-gen.yml
     with:
-      runner_config: 4-gpu-b200
       runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
@@ -404,8 +403,6 @@ jobs:
       matrix:
         include:
           - { runner_config: 4-gpu-h100, run_timeout: '30', timeout_per_file: '' }
-          - { runner_config: 8-gpu-h200, run_timeout: '30', timeout_per_file: '1800' }
-          - { runner_config: 8-gpu-h20, run_timeout: '30', timeout_per_file: '' }
           - { runner_config: 4-gpu-b200, run_timeout: '30', timeout_per_file: '1800' }
           - { runner_config: 8-gpu-b300, run_timeout: '60', timeout_per_file: '3600' }
     uses: ./.github/workflows/_pr-test-stage.yml
