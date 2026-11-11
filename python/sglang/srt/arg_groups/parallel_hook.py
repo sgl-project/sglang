@@ -790,16 +790,16 @@ def handle_eplb_and_dispatch(server_args: Any):
     if (cfg.enable_eplb or (cfg.init_expert_location != "trivial")) and (
         cfg.ep_dispatch_algorithm is None
     ):
+        if cfg.init_expert_location == "ring":
+            default_dispatch = "ring"
+        elif needs_rank_invariant_dispatch:
+            default_dispatch = "dynamic"
+        else:
+            default_dispatch = "static"
         declare_resolution(
             server_args,
             "_handle_eplb_and_dispatch",
-            ep_dispatch_algorithm=(
-                "ring"
-                if cfg.init_expert_location == "ring"
-                else "dynamic"
-                if needs_rank_invariant_dispatch
-                else "static"
-            ),
+            ep_dispatch_algorithm=default_dispatch,
         )
 
     _validate_ring_dispatch(server_args)
