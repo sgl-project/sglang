@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 indexer_weight_stream = None
 gva_is_inited = False
+ASCEND_950_SOC_VERSION = 260
 
 
 @functools.lru_cache(maxsize=1)
@@ -231,12 +232,17 @@ def init_npu_backend():
     # and a significant reduction in performance.
     if "sglang.multimodal_gen" not in sys.modules:
         from torch_npu.contrib import transfer_to_npu  # noqa: F401
+        from torch_npu.npu._backends import get_soc_version
 
         # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
         torch.cuda.is_available = lambda: False
-        # The public query initializes the default NPU before rank selection.
-        if torch_npu._C._npu_get_soc_version() < 260:
-            torch_npu.npu.config.allow_internal_format = True
+
+        def configure_internal_format():
+            if get_soc_version() < ASCEND_950_SOC_VERSION:
+                torch_npu.npu.config.allow_internal_format = True
+
+        # The public query initializes NPU state; defer it until device selection.
+        torch_npu.npu._lazy_call(configure_internal_format)
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
