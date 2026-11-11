@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.arg_groups import lora_hook
+from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
 from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.lora.backend import lora_registry
@@ -42,7 +43,10 @@ def _args(**fields):
     fields.setdefault("lora_backend", "torch_native")
     fields.setdefault("max_lora_rank", 16)
     fields.setdefault("lora_target_modules", _KIMI_TARGETS)
-    return ServerArgs(model_path="dummy", **fields)
+    args = ServerArgs(model_path="dummy", **fields)
+    # resolved by the pipeline before check_server_args
+    parse_cuda_graph_config(args)
+    return args
 
 
 def _platform(is_sm100_or_sm110: bool):
