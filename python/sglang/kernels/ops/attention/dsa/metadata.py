@@ -5,6 +5,28 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _physical_token_ids(vals, v2p, num_v_pages, PAGE_SIZE: tl.constexpr):
+    """``v2p[t // PAGE_SIZE] * PAGE_SIZE + t % PAGE_SIZE`` for virtual token ids
+    ``t``; a negative id, a page past the table and an unmapped (-1) page all
+    resolve to 0, the padding sink."""
+    vals = vals.to(tl.int64)
+    page = vals // PAGE_SIZE
+    keep = (vals >= 0) & (page < num_v_pages)
+    phys = tl.load(v2p + tl.where(keep, page, 0)).to(tl.int64)
+    ids = tl.maximum(phys * PAGE_SIZE + vals % PAGE_SIZE, 0)
+    return tl.where(keep, ids, 0).to(tl.int32)
+
+
+def _v2p_args(v2p: Optional[torch.Tensor], dummy: torch.Tensor):
+    """The kernel arguments of an optional virtual->physical page table: the
+    table (or a dummy pointer), its row count, and whether it is present."""
+    if v2p is None:
+        return dummy, 0, False
+    assert v2p.is_cuda and v2p.dtype == torch.int64 and v2p.dim() == 1
+    return v2p, v2p.shape[0], True
+
+
 @triton.jit(
     do_not_specialize=[
         "page_table_stride_0",
@@ -22,6 +44,8 @@ def _fused_dsa_decode_metadata_kernel(
     dsa_cache_seqlens,
     dsa_cu_seqlens_k,
     real_page_table,
+    v2p,
+    num_v_pages,
     seq_lens_stride: tl.constexpr,
     req_pool_indices_stride: tl.constexpr,
     req_to_token_stride_0: tl.constexpr,
@@ -36,6 +60,7 @@ def _fused_dsa_decode_metadata_kernel(
     physical_page_size: tl.constexpr,
     HAS_REAL_PAGE_TABLE: tl.constexpr,
     HAS_PAGE_TABLE_1: tl.constexpr,
+    HAS_V2P: tl.constexpr,
     BLOCK_BS: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -86,6 +111,8 @@ def _fused_dsa_decode_metadata_kernel(
         mask=mask,
         other=0,
     ).to(tl.int32)
+    if HAS_V2P:
+        vals = _physical_token_ids(vals, v2p, num_v_pages, physical_page_size)
     # Write the wide page_size=1 table only when the caller provides it; the
     # fused decode CUDA graph drops it and consumes real_page_table alone.
     if HAS_PAGE_TABLE_1:
@@ -123,6 +150,7 @@ def fused_dsa_decode_metadata(
     max_len: int,
     dsa_index_topk: int,
     physical_page_size: int,
+    v2p: Optional[torch.Tensor] = None,
 ) -> None:
     """Fill decode-graph DSA metadata (seqlens + page tables) from req_to_token.
 
@@ -132,6 +160,11 @@ def fused_dsa_decode_metadata(
     where the wide table is never read (attention uses topk_indices, the indexer
     uses real_page_table); ``physical_page_size`` must be >1 in that case. When a
     tensor is passed, behavior is unchanged (both tables are written).
+
+    ``v2p``, a virtual->physical page table at ``physical_page_size``, maps the
+    ids ``req_to_token`` holds to the physical ids both tables then carry
+    (`_physical_token_ids`); None when they index the pool as they are. The
+    target-verify and draft-extend builders below take it alike.
 
     Contract: each page-table row is written only over its live prefix
     ([:cache_seqlens]); the tail keeps stale values across CUDA-graph replays, so
@@ -168,6 +201,8 @@ def fused_dsa_decode_metadata(
     else:
         assert page_table_1.is_cuda
 
+    v2p, num_v_pages, has_v2p = _v2p_args(v2p, req_to_token)
+
     block_bs = triton.next_power_of_2(bs)
     block_n = 128
     num_col_blocks = triton.cdiv(max_len, block_n)
@@ -183,6 +218,8 @@ def fused_dsa_decode_metadata(
         dsa_cache_seqlens,
         dsa_cu_seqlens_k,
         real_page_table,
+        v2p,
+        num_v_pages,
         seq_lens.stride(0),
         req_pool_indices.stride(0),
         req_to_token.stride(0),
@@ -197,6 +234,7 @@ def fused_dsa_decode_metadata(
         physical_page_size,
         has_real_page_table,
         has_page_table_1,
+        has_v2p,
         BLOCK_BS=block_bs,
         BLOCK_N=block_n,
     )
@@ -221,6 +259,8 @@ def _fused_dsa_target_verify_metadata_kernel(
     dsa_cu_seqlens_k,
     real_page_table,
     paged_mqa_ctx_lens_2d,
+    v2p,
+    num_v_pages,
     seq_lens_stride: tl.constexpr,
     req_pool_indices_stride: tl.constexpr,
     req_to_token_stride_0: tl.constexpr,
@@ -240,6 +280,7 @@ def _fused_dsa_target_verify_metadata_kernel(
     HAS_REAL_PAGE_TABLE: tl.constexpr,
     HAS_PAGED_MQA_CTX_LENS: tl.constexpr,
     HAS_PAGE_TABLE_1: tl.constexpr,
+    HAS_V2P: tl.constexpr,
     BLOCK_BS: tl.constexpr,
     BLOCK_EXPANDED: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -325,6 +366,8 @@ def _fused_dsa_target_verify_metadata_kernel(
             mask=mask,
             other=0,
         ).to(tl.int32)
+        if HAS_V2P:
+            vals = _physical_token_ids(vals, v2p, num_v_pages, physical_page_size)
         if HAS_PAGE_TABLE_1:
             tl.store(
                 page_table_1
@@ -363,6 +406,7 @@ def fused_dsa_target_verify_metadata(
     physical_page_size: int,
     next_n: int,
     paged_mqa_ctx_lens_2d: torch.Tensor = None,
+    v2p: Optional[torch.Tensor] = None,
 ) -> None:
     assert seq_lens.is_cuda
     assert req_pool_indices.is_cuda
@@ -405,6 +449,7 @@ def fused_dsa_target_verify_metadata(
         assert paged_mqa_ctx_lens_2d.size(1) == next_n
     else:
         paged_mqa_ctx_lens_2d = page_table_1
+    v2p, num_v_pages, has_v2p = _v2p_args(v2p, req_to_token)
 
     expanded_size = bs * next_n
     block_bs = triton.next_power_of_2(bs)
@@ -427,6 +472,8 @@ def fused_dsa_target_verify_metadata(
         dsa_cu_seqlens_k,
         real_page_table,
         paged_mqa_ctx_lens_2d,
+        v2p,
+        num_v_pages,
         seq_lens.stride(0),
         req_pool_indices.stride(0),
         req_to_token.stride(0),
@@ -446,6 +493,7 @@ def fused_dsa_target_verify_metadata(
         has_real_page_table,
         has_paged_mqa_ctx_lens,
         has_page_table_1,
+        has_v2p,
         BLOCK_BS=block_bs,
         BLOCK_EXPANDED=block_expanded,
         BLOCK_N=block_n,
@@ -472,6 +520,8 @@ def _fused_dsa_draft_extend_metadata_kernel(
     dsa_cache_seqlens,
     dsa_cu_seqlens_k,
     real_page_table,
+    v2p,
+    num_v_pages,
     seq_lens_stride: tl.constexpr,
     extend_seq_lens_stride: tl.constexpr,
     req_pool_indices_stride: tl.constexpr,
@@ -489,6 +539,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
     HAS_REAL_PAGE_TABLE: tl.constexpr,
     HAS_PAGE_TABLE_1: tl.constexpr,
     STATIC_EXTEND_LEN: tl.constexpr,
+    HAS_V2P: tl.constexpr,
     BLOCK_BS: tl.constexpr,
     BLOCK_EXPANDED: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
@@ -599,6 +650,8 @@ def _fused_dsa_draft_extend_metadata_kernel(
         mask=col_mask & has_rows,
         other=0,
     ).to(tl.int32)
+    if HAS_V2P:
+        vals = _physical_token_ids(vals, v2p, num_v_pages, physical_page_size)
     # Write the wide page_size=1 table only when the caller provides it (see
     # fused_dsa_decode_metadata for the optional-page_table_1 contract).
     if HAS_PAGE_TABLE_1:
@@ -642,6 +695,7 @@ def fused_dsa_draft_extend_metadata(
     max_extend_len: int,
     max_total_len: int,
     static_extend_len: bool = False,
+    v2p: Optional[torch.Tensor] = None,
 ) -> None:
     assert seq_lens.is_cuda
     assert extend_seq_lens.is_cuda
@@ -687,6 +741,7 @@ def fused_dsa_draft_extend_metadata(
         page_table_1 = real_page_table  # dummy pointer for stride args
     else:
         assert page_table_1.is_cuda
+    v2p, num_v_pages, has_v2p = _v2p_args(v2p, req_to_token)
 
     block_bs = triton.next_power_of_2(bs)
     block_expanded = triton.next_power_of_2(max_total_len)
@@ -707,6 +762,8 @@ def fused_dsa_draft_extend_metadata(
         dsa_cache_seqlens,
         dsa_cu_seqlens_k,
         real_page_table,
+        v2p,
+        num_v_pages,
         seq_lens.stride(0),
         extend_seq_lens.stride(0),
         req_pool_indices.stride(0),
@@ -724,8 +781,72 @@ def fused_dsa_draft_extend_metadata(
         has_real_page_table,
         has_page_table_1,
         static_extend_len,
+        has_v2p,
         BLOCK_BS=block_bs,
         BLOCK_EXPANDED=block_expanded,
         BLOCK_ROWS=block_rows,
         BLOCK_N=block_n,
     )
+
+
+@triton.jit
+def _gather_physical_token_table_kernel(
+    req_to_token,
+    req_pool_indices,
+    v2p,
+    out,
+    num_v_pages,
+    req_to_token_stride_0,
+    out_stride_0,
+    width,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < width
+    req = tl.load(req_pool_indices + row).to(tl.int64)
+    vals = tl.load(
+        req_to_token + req * req_to_token_stride_0 + offs, mask=mask, other=0
+    )
+    ids = _physical_token_ids(vals, v2p, num_v_pages, PAGE_SIZE)
+    tl.store(out + row.to(tl.int64) * out_stride_0 + offs, ids, mask=mask)
+
+
+def gather_physical_token_table(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    width: int,
+    v2p: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    """``req_to_token[req_pool_indices, :width]`` with each id mapped through
+    the virtual->physical page table ``v2p`` (`_physical_token_ids`), as int32,
+    in one launch: the gather a static pool's eager metadata does, translated."""
+    width = min(int(width), req_to_token.shape[1])
+    bs = req_pool_indices.shape[0]
+    if not req_to_token.is_cuda:
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
+
+        return translate_token_ids(
+            loc=req_to_token[req_pool_indices, :width], v2p=v2p, page_size=page_size
+        ).to(torch.int32)
+    assert req_to_token.stride(1) == 1
+    out = torch.empty((bs, width), dtype=torch.int32, device=req_to_token.device)
+    if bs == 0 or width == 0:
+        return out
+    v2p, num_v_pages, _ = _v2p_args(v2p, req_to_token)
+    block = 1024
+    _gather_physical_token_table_kernel[(bs, triton.cdiv(width, block))](
+        req_to_token,
+        req_pool_indices,
+        v2p,
+        out,
+        num_v_pages,
+        req_to_token.stride(0),
+        out.stride(0),
+        width,
+        PAGE_SIZE=page_size,
+        BLOCK=block,
+    )
+    return out
