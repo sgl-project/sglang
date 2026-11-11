@@ -385,6 +385,11 @@ class Envs:
     SGLANG_OPT_SCHEDULER_MAIN_THREAD_AFFINITY = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # The two-host leader link of SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP receives by
+    # spinning on a non-blocking socket instead of sleeping in a blocking recv.
+    SGLANG_OPT_SCHEDULER_LEADER_LINK_SPIN = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
