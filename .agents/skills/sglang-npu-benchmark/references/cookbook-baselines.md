@@ -54,6 +54,8 @@ Re-validated on a second Atlas A3 node (8 cards x 2 dies = 16 NPU, openEuler 22.
 CANN 9.1.0, driver 25.5.0, SGLang 0.0.0.dev18415, torch_npu 2.10.0.post6), Qwen3-8B BF16,
 `random-ids`, gsm8k gate on (20 questions):
 
+> **Not directly comparable to the table above**: this node runs a different SGLang build (`0.0.0.dev18415`, 2026-09-29) and CANN 9.1.0 on different hardware; the section is a portability check of the workflow (and a TP=2 vs TP=8 comparison on one node), not a performance comparison across stacks.
+
 | config | output tok/s | per card | p99 TTFT | p99 TPOT | gsm8k | SLA |
 |---|---|---|---|---|---|---|
 | TP=2, conc 1 | 53.8 | 26.9 | 120.8 ms | 19.3 ms | 0.900 | pass |
