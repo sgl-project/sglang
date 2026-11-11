@@ -75,6 +75,9 @@ class MatchPrefixParams:
 
     # Mamba specific
     cow_mamba: bool = False
+    # With cow_mamba, take no working state slot: the copy is staged from the
+    # matched state, and the slot is bound with the request's row.
+    defer_cow_slot: bool = False
     req: Optional[Req] = None
 
 
@@ -610,8 +613,26 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     ) -> EvictResult:
         """Evict until the allocator can take all of ``demand`` at once from
         its shared memory, window entries before token entries when
-        ``windows_first``."""
-        return self.evict_pool_shortfalls(demand)
+        ``windows_first``. A cache keeping no window slots evicts token entries,
+        which hold rows in every sub-pool, until the demand fits."""
+        allocator = self.token_to_kv_pool_allocator
+        demands = {
+            name: pages
+            for name, pages in allocator.page_demands(
+                demand.completed(allocator.window_pool_names())
+            ).items()
+            if pages > 0
+        }
+        result = EvictResult()
+        # Doubling bounds the walks at the cost of evicting up to twice the need.
+        tokens = allocator.page_size
+        while not allocator.fits_after_frees(demands):
+            evicted = self.evict(EvictParams(num_tokens=tokens))
+            if not evicted.num_tokens_evicted:
+                break
+            result.add(evicted)
+            tokens *= 2
+        return result
 
     def evict_pool_shortfalls(self, demand: KVDemand) -> EvictResult:
         """Evict each pool's shortfall for ``demand``, as counts. A cache that
