@@ -579,6 +579,14 @@ for _mod, _fn in [
         )
     )
 del _mod, _fn
+register_kernel(
+    KernelSpec(
+        op="attention.fused_qkv_gating_gdn_prefill",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.triton_gdn_fused_proj:fused_qkv_gating_gdn_prefill",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
 # tcgen05 + TMEM: datacenter Blackwell only (SM100 / SM103), not SM120.
 for _mod, _fn in [
     ("linear.gdn_blackwell", "chunk_gated_delta_rule_cutedsl"),

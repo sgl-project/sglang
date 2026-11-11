@@ -9,7 +9,9 @@ import torch
 from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+    fused_qkv_gating_gdn_prefill,
     fused_qkv_split_gdn_prefill,
 )
 from sglang.srt.layers.attention.linear import gdn_backend
@@ -145,6 +147,145 @@ class TestGDNMISOutput(CustomTestCase):
     def test_fused_split_qk_norm_within_one_ulp_across_chunk_boundary(self):
         self._assert_fused_split_norm(num_tokens=198, allow_norm_ulp=True)
 
+    @torch.inference_mode()
+    def test_mapped_prepare_preserves_gate_rounding_and_strides(self):
+        for dtype in (torch.bfloat16, torch.float16, torch.float32):
+            for heads in (5, 16):
+                for mapped in (False, True):
+                    with self.subTest(dtype=dtype, heads=heads, mapped=mapped):
+                        torch.manual_seed(55)
+                        tokens, source_tokens, dim = 19, 29 if mapped else 19, 64
+                        channels = (2 * 3 + heads) * dim
+                        packed = torch.randn(
+                            tokens, channels * 2, device="cuda", dtype=dtype
+                        )[:, ::2]
+                        a = torch.randn(
+                            source_tokens, heads * 3, device="cuda", dtype=dtype
+                        )[:, ::3]
+                        b = torch.randn(
+                            source_tokens, heads * 4, device="cuda", dtype=dtype
+                        )[:, 1::4]
+                        a[0] = 40
+                        a[1] = -40
+                        A_log = torch.randn(heads * 2, device="cuda")[::2]
+                        dt_bias = torch.randn(heads * 2, device="cuda", dtype=dtype)[
+                            ::2
+                        ]
+                        indices = (
+                            torch.randperm(source_tokens, device="cuda")[:tokens]
+                            .to(torch.int32 if heads == 5 else torch.int64)
+                            .contiguous()
+                            if mapped
+                            else None
+                        )
+                        before = tuple(t.clone() for t in (packed, a, b))
+                        expected_qkv = fused_qkv_split_gdn_prefill(
+                            packed, 3, 3, heads, dim, dim, dim, normalize_qk=True
+                        )
+                        expected_gates = fused_gdn_gating(
+                            A_log.contiguous(),
+                            a[indices] if mapped else a.contiguous(),
+                            b[indices] if mapped else b.contiguous(),
+                            dt_bias.contiguous(),
+                        )
+                        actual = fused_qkv_gating_gdn_prefill(
+                            packed,
+                            3,
+                            3,
+                            heads,
+                            dim,
+                            dim,
+                            dim,
+                            A_log=A_log,
+                            a=a,
+                            b=b,
+                            dt_bias=dt_bias,
+                            token_indices=indices,
+                        )
+                        for result, expected in zip(
+                            actual, (*expected_qkv, *expected_gates)
+                        ):
+                            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+                            self.assertTrue(result.is_contiguous())
+                        for result in actual[3:]:
+                            self.assertEqual(result.dtype, torch.float32)
+                        for original, snapshot in zip((packed, a, b), before):
+                            torch.testing.assert_close(
+                                original, snapshot, rtol=0, atol=0
+                            )
+
+    @torch.inference_mode()
+    def test_mapped_prepare_graph_reads_updated_indices(self):
+        torch.manual_seed(56)
+        tokens, heads, dim = 7, 4, 64
+        packed = torch.randn(
+            tokens, heads * dim * 3, device="cuda", dtype=torch.bfloat16
+        )
+        a = torch.randn(tokens + 3, heads, device="cuda", dtype=packed.dtype)
+        b = torch.randn_like(a)
+        A_log = torch.randn(heads, device="cuda")
+        dt_bias = torch.randn(heads, device="cuda", dtype=packed.dtype)
+        indices = torch.arange(tokens, device="cuda")
+
+        def prepare():
+            return fused_qkv_gating_gdn_prefill(
+                packed,
+                heads,
+                heads,
+                heads,
+                dim,
+                dim,
+                dim,
+                A_log=A_log,
+                a=a,
+                b=b,
+                dt_bias=dt_bias,
+                token_indices=indices,
+            )
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            prepare()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = prepare()
+        indices.copy_(torch.arange(tokens + 2, 2, -1, device="cuda"))
+        a.add_(1)
+        graph.replay()
+        expected = fused_gdn_gating(A_log, a[indices], b[indices], dt_bias)
+        for result, reference in zip(actual[3:], expected):
+            torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+    @torch.inference_mode()
+    def test_prepare_rejects_malformed_gate_mapping(self):
+        packed = torch.empty(3, 384, device="cuda", dtype=torch.bfloat16)
+        a = torch.empty(5, 2, device="cuda", dtype=packed.dtype)
+        args = dict(
+            A_log=torch.zeros(2, device="cuda"),
+            a=a,
+            b=a,
+            dt_bias=torch.zeros(2, device="cuda"),
+            token_indices=torch.arange(3, device="cuda"),
+        )
+        for override in (
+            {"a": a[:, :1]},
+            {"b": a[:3]},
+            {"A_log": args["A_log"][:1]},
+            {"dt_bias": args["dt_bias"].cpu()},
+            {"token_indices": None},
+            {"token_indices": torch.arange(2, device="cuda")},
+            {"token_indices": torch.arange(3, device="cuda").float()},
+            {"token_indices": torch.arange(6, device="cuda")[::2]},
+            {"token_indices": torch.arange(3)},
+        ):
+            with self.subTest(fields=tuple(override)):
+                with self.assertRaisesRegex(ValueError, "GDN preparation requires"):
+                    fused_qkv_gating_gdn_prefill(
+                        packed, 2, 2, 2, 64, 64, 64, **(args | override)
+                    )
+
     def _assert_within_ulp(self, actual, expected, max_ulp=1):
         self.assertTrue(bool(torch.isfinite(actual).all()))
         self.assertTrue(bool(torch.isfinite(expected).all()))
@@ -233,6 +374,12 @@ class TestGDNMISOutput(CustomTestCase):
             q, k, v = split(*args)
             return (l2norm_fwd(q), l2norm_fwd(k), v) if normalize_qk else (q, k, v)
 
+        def separate_prepare(*args, A_log, a, b, dt_bias, token_indices=None):
+            qkv = separate_norm(*args, normalize_qk=True)
+            if token_indices is not None:
+                a, b = a[token_indices], b[token_indices]
+            return (*qkv, *fused_gdn_gating(A_log, a, b, dt_bias))
+
         for dtype in (torch.bfloat16, torch.float16):
             for query_len in (0, 5):
                 with self.subTest(dtype=dtype, query_len=query_len):
@@ -289,8 +436,10 @@ class TestGDNMISOutput(CustomTestCase):
                     inputs = torch.randn(
                         tokens + 3, channels, device="cuda", dtype=dtype
                     )
-                    a = torch.randn(tokens + 3, heads, device="cuda", dtype=dtype)
-                    b = torch.randn_like(a)
+                    gates = torch.randn(
+                        tokens + 3, heads * 2, device="cuda", dtype=dtype
+                    )
+                    a, b = gates.split(heads, dim=-1)
                     conv = torch.randn(6, channels, 3, device="cuda", dtype=dtype)
                     ssm = torch.randn(6, heads, dim, dim, device="cuda")
                     expected_conv, expected_ssm = conv.clone(), ssm.clone()
@@ -303,7 +452,9 @@ class TestGDNMISOutput(CustomTestCase):
                     )
                     with (
                         patch.object(
-                            gdn_backend, "fused_qkv_split_gdn_prefill", separate_norm
+                            gdn_backend,
+                            "fused_qkv_gating_gdn_prefill",
+                            separate_prepare,
                         ),
                         patch.object(
                             backend.kernel_dispatcher,
@@ -363,6 +514,9 @@ class TestGDNMISOutput(CustomTestCase):
                     dt_bias=torch.randn(heads, device="cuda", dtype=packed.dtype),
                 )
                 index = torch.tensor([0], device="cuda")
+                token_indices = torch.tensor([4, 0, 2], device="cuda")
+                a = torch.randn(tokens + 2, heads, device="cuda", dtype=packed.dtype)
+                b = torch.randn_like(a)
                 with (
                     patch.object(
                         gdn_backend,
@@ -375,8 +529,8 @@ class TestGDNMISOutput(CustomTestCase):
                     backend._forward_mis_segments(
                         layer=layer,
                         mixed_qkv=packed,
-                        a=torch.randn(tokens, heads, device="cuda", dtype=packed.dtype),
-                        b=torch.randn(tokens, heads, device="cuda", dtype=packed.dtype),
+                        a=a,
+                        b=b,
                         conv_states=torch.empty(
                             1, channels, 3, device="cuda", dtype=packed.dtype
                         ),
@@ -393,12 +547,20 @@ class TestGDNMISOutput(CustomTestCase):
                         ),
                         ssm_cache_indices=index,
                         inplace_update=True,
+                        output_indices=token_indices,
                     )
                 captured = backend.kernel_dispatcher.extend.call_args.kwargs
                 supported = (
                     cuda_split and channels <= gdn_backend.MAX_FUSED_QKV_SPLIT_DIM
                 )
                 self.assertIs(captured["use_qk_l2norm_in_kernel"], not supported)
+                expected_g, expected_beta = fused_gdn_gating(
+                    layer.A_log, a[token_indices], b[token_indices], layer.dt_bias
+                )
+                torch.testing.assert_close(captured["g"], expected_g, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    captured["beta"], expected_beta, rtol=0, atol=0
+                )
                 for field, unnormalized in zip(
                     ("q", "k"), packed.split(heads * dimension, -1)[:2]
                 ):
