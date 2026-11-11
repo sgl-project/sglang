@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     backup_kv_cache,
     discard_kv_cache_backup,
+    evict_from_tree_cache,
     release_kv_cache,
 )
 from sglang.srt.runtime_context import get_disagg
@@ -106,8 +107,10 @@ class RequestRetirer:
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
-    def retract(self, req: Req, *, offload_kv: bool) -> bool:
-        """Release a retracted request's memory uncheckpointed; return whether it can resume."""
+    def retract(self, req: Req, *, remaining_req_count: int, offload_kv: bool) -> bool:
+        """Release a retracted request's memory uncheckpointed, evict cache room
+        for `remaining_req_count` requests' next decode steps, and reset it;
+        return whether it can resume."""
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
             self.hisparse_coordinator.release_request(req)
 
@@ -128,6 +131,11 @@ class RequestRetirer:
         # TODO (csy): for preempted requests, we may want to insert into the tree
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=False)
+        # NOTE(lsyin): we should use the newly evictable memory instantly.
+        num_tokens = remaining_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
+        evict_from_tree_cache(self.tree_cache, num_tokens)
+
+        req.reset_for_retract()
         return resumable
 
     def abort_retracted(self, req: Req, *, reason: FINISH_ABORT) -> None:

@@ -93,6 +93,7 @@ class TestPrefillAdder(CustomTestCase):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         self.mock_tree_cache = self.create_tree_cache()
         self.mock_token_allocator = self.create_token_allocator()
+        self.mock_request_retirer = MagicMock()
 
     def create_tree_cache(
         self,
@@ -146,7 +147,6 @@ class TestPrefillAdder(CustomTestCase):
     def create_running_batch(self, reqs=None) -> MagicMock:
         batch = MagicMock()
         batch.reqs = list(reqs or [])
-        batch.release_req.return_value = None
         batch.filter_batch.return_value = None
         return batch
 
@@ -201,6 +201,7 @@ class TestPrefillAdder(CustomTestCase):
             rem_chunk_tokens=None,
             num_mixed_decode_tokens=0,
             priority_scheduling_preemption_threshold=0,
+            request_retirer=self.mock_request_retirer,
         )
         defaults.update(kwargs)
         defaults["token_to_kv_pool_allocator"].page_size = defaults["page_size"]
@@ -637,7 +638,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(
             adder.memory_budget.total_offset, 175
         )  # 50 + 75 + 100 - 50 = 175
-        running_batch.release_req.assert_called_once()
+        self.mock_request_retirer.retract.assert_called_once()
 
     @staticmethod
     def create_unified_cache(*, page=4, window=8, sessions=False):
@@ -898,8 +899,9 @@ class TestPrefillAdder(CustomTestCase):
             )
             req.kv.kv_committed_len = req.kv.kv_allocated_len = req.extend_end
             checkpoint_kv_cache(req, cache)
-            release_only_retirer(tree_cache=cache).retract(req, offload_kv=False)
-            req.reset_for_retract()
+            release_only_retirer(tree_cache=cache).retract(
+                req, remaining_req_count=0, offload_kv=False
+            )
         req.init_next_round_input(cache)
         self.assertEqual(req.prefix_len % block, 0)
 
@@ -933,7 +935,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(
             adder.memory_budget.total_offset, 125
         )  # 50 + 75 + 100 - 100 = 125
-        running_batch.release_req.assert_called_once()
+        self.mock_request_retirer.retract.assert_called_once()
 
     def test_preempt_fail_low_priority_values_first(self):
         params = [
@@ -1038,7 +1040,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertTrue(first_success)
         self.assertIn(running_reqs[0], adder.preempt_list)
         self.assertEqual(adder.memory_budget.total_offset, 175)
-        running_batch.release_req.assert_called_once()
+        self.mock_request_retirer.retract.assert_called_once()
 
         # Second call needs more tokens than currently free, so it would need to
         # preempt req_prio_0 again if already-preempted requests were not filtered out.
@@ -1050,7 +1052,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertFalse(second_success)
         self.assertEqual(adder.memory_budget.total_offset, 175)
         self.assertEqual(adder.preempt_list.count(running_reqs[0]), 1)
-        running_batch.release_req.assert_called_once()
+        self.mock_request_retirer.retract.assert_called_once()
 
     def test_preempt_success_low_priority_values_first_exact_once(self):
         params = [
@@ -1083,7 +1085,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(
             adder.memory_budget.total_offset, 375
         )  # 50 + 75 + 100 + 125 + 125 - 100 = 375
-        running_batch.release_req.assert_called_once()
+        self.mock_request_retirer.retract.assert_called_once()
 
     def test_preempt_success_low_priority_values_first_exact_twice(self):
         params = [
@@ -1117,7 +1119,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(
             adder.memory_budget.total_offset, 250
         )  # 50 + 75 + 100 + 125 + 125 - 100 - 125 = 250
-        self.assertEqual(running_batch.release_req.call_count, 2)
+        self.assertEqual(self.mock_request_retirer.retract.call_count, 2)
 
     def test_mixed_chunk_prefill_budgets(self):
         self.mock_token_allocator.available_size.return_value = 1000
