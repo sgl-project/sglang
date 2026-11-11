@@ -675,6 +675,8 @@ A worker whose `/server_info` does not answer has no readable protocol and
 forwards over HTTP/1.1 for as long as it stays registered — a throughput cost,
 never a correctness one. Admin fan-out (`/flush_cache`) always uses the default
 client, because it addresses every worker at once rather than a selected one.
+The forwarded `/server_info`, `/model_info`, and `/health_generate` use it too:
+they are low-volume GETs, and every engine serves HTTP/1.1.
 
 Two things worth knowing when debugging. h2c is prior-knowledge only — there is
 no negotiation and no fallback — which is why the router requires the engine's

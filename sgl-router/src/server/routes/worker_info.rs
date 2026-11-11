@@ -3,14 +3,14 @@
 
 //! Engine endpoints answered by one worker: `/server_info`, `/model_info`
 //! (and their `/get_` aliases) and `/health_generate`, as SGLang engines
-//! serve them. Workers come from the pools chat dispatch uses (healthy only;
-//! under P/D a prefill with a decode peer), picked at random. The worker's
-//! status and body pass through; only a transport failure becomes a router
-//! error.
+//! serve them. The worker is a healthy one that chat can route to (under P/D
+//! a prefill with a decode peer), picked at random. The worker's status and
+//! body pass through; only a transport failure becomes a router error.
 
+use crate::buckets_reorg::ReadyPools;
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::PdPoolResolver;
-use crate::server::app_context::AppContext;
+use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
 use crate::server::routes::chat::pool_error;
 use crate::workers::worker::Worker;
@@ -18,7 +18,7 @@ use axum::extract::State;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-use rand::seq::SliceRandom;
+use rand::seq::{IteratorRandom, SliceRandom};
 use std::sync::Arc;
 
 pub async fn server_info(State(ctx): State<Arc<AppContext>>, headers: HeaderMap) -> Response {
@@ -34,20 +34,14 @@ pub async fn model_info(State(ctx): State<Arc<AppContext>>, headers: HeaderMap) 
 /// else with the decode's response.
 pub async fn health_generate(State(ctx): State<Arc<AppContext>>, headers: HeaderMap) -> Response {
     const PATH: &str = "/health_generate";
-    let model = ModelId(ctx.config.model.id.clone());
-    let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
-    let first = match resolver.prefill_candidates(&model) {
-        Ok(candidates) => pick(&candidates),
-        Err(e) => return pool_error(e, &model).into_response(),
+    let (first, decode) = match select(&ctx) {
+        Ok(selected) => selected,
+        Err(e) => return e.into_response(),
     };
-    if first.mode() != WorkerMode::Prefill {
+    let Some(decode) = decode else {
         return forward(&ctx, &headers, &first, PATH)
             .await
             .unwrap_or_else(IntoResponse::into_response);
-    }
-    let decode = match resolver.decode_peers(&model, &first) {
-        Ok(peers) => pick(&peers),
-        Err(e) => return pool_error(e, &model).into_response(),
     };
     let (prefill, decode) = tokio::join!(
         forward(&ctx, &headers, &first, PATH),
@@ -63,20 +57,70 @@ pub async fn health_generate(State(ctx): State<Arc<AppContext>>, headers: Header
 /// Forwards to a plain worker, or a prefill worker under P/D.
 async fn forward_to_first_stage(ctx: &AppContext, headers: &HeaderMap, path: &str) -> Response {
     let model = ModelId(ctx.config.model.id.clone());
-    match PdPoolResolver::new(Arc::clone(&ctx.registry)).prefill_candidates(&model) {
-        Ok(candidates) => forward(ctx, headers, &pick(&candidates), path)
+    match pools(ctx, &model) {
+        Ok(pools) => forward(ctx, headers, &pick(&pools.firsts), path)
             .await
             .unwrap_or_else(IntoResponse::into_response),
-        Err(e) => pool_error(e, &model).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
-/// `candidates` is non-empty: the resolver errors on an empty pool.
+/// One plain worker, or one prefill worker and one of its decode peers.
+fn select(ctx: &AppContext) -> Result<(Arc<Worker>, Option<Arc<Worker>>), ApiError> {
+    let model = ModelId(ctx.config.model.id.clone());
+    let ReadyPools { firsts, decoders } = pools(ctx, &model)?;
+    let first = pick(&firsts);
+    if first.mode() != WorkerMode::Prefill {
+        return Ok((first, None));
+    }
+    let peers: Vec<_> = decoders
+        .into_iter()
+        .filter(|d| d.version_group() == first.version_group())
+        .collect();
+    if peers.is_empty() {
+        return Err(ApiError::NoDecodeWorkersAvailable { model: model.0 });
+    }
+    Ok((first, Some(pick(&peers))))
+}
+
+/// The pools chat routes over. Under bucket routing, those of one bucket with
+/// ready workers, so a pair never spans two buckets; with none ready the
+/// answer is `no_healthy_workers`, as `/readyz` sees it, without the per-stage
+/// detail.
+fn pools(ctx: &AppContext, model: &ModelId) -> Result<ReadyPools, ApiError> {
+    match &ctx.chat_routing {
+        ChatRouting::Legacy => {
+            let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
+            let firsts = resolver
+                .prefill_candidates(model)
+                .map_err(|e| pool_error(e, model))?;
+            // Decoders matter only to `/health_generate`, which reports their absence.
+            let decoders = resolver
+                .decode_candidates(model)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|w| w.mode() == WorkerMode::Decode)
+                .collect();
+            Ok(ReadyPools { firsts, decoders })
+        }
+        ChatRouting::Reorg(resolvers) => resolvers
+            .get(model)
+            .into_iter()
+            .flat_map(|resolver| &resolver.buckets)
+            .map(|bucket| bucket.ready_pools(&ctx.registry, model))
+            .filter(|pools| !pools.firsts.is_empty())
+            .choose(&mut rand::thread_rng())
+            .ok_or_else(|| ApiError::NoHealthyWorkers {
+                model: model.0.clone(),
+            }),
+    }
+}
+
 fn pick(candidates: &[Arc<Worker>]) -> Arc<Worker> {
     Arc::clone(
         candidates
             .choose(&mut rand::thread_rng())
-            .expect("the resolver never returns an empty pool"),
+            .expect("callers pass a non-empty pool"),
     )
 }
 
@@ -127,9 +171,14 @@ async fn forward(
 
 #[cfg(test)]
 mod tests {
+    use crate::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::health::circuit_breaker::CircuitBreakerConfig;
+    use crate::policies_reorg::power_of_two::PowerOfTwoPolicy;
+    use crate::policies_reorg::Policy;
     use crate::server::app_context::AppContext;
+    use crate::server::app_context::ChatRouting;
+    use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
     use crate::workers::worker::WireProtocol;
     use axum::body::Body;
     use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -230,17 +279,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_status_passes_through() {
-        let plain = spawn_engine("plain", StatusCode::SERVICE_UNAVAILABLE).await;
-        let ctx = ctx_with(&[(&plain, WorkerMode::Plain)]);
-        let (status, body) = get_json(ctx, "/health_generate").await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["worker"], "plain");
-    }
-
-    /// Under PD both sides run a generation; the prefill's failure wins, then
-    /// the decode's, so a pair is healthy only when both are.
-    #[tokio::test]
     async fn pd_health_generate_fails_when_either_side_fails() {
         let ok_prefill = spawn_engine("prefill", StatusCode::OK).await;
         let bad_prefill = spawn_engine("prefill", StatusCode::SERVICE_UNAVAILABLE).await;
@@ -321,6 +359,42 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["worker"], "up");
         }
+    }
+
+    /// Under bucket routing only bucket members answer, as chat would route;
+    /// a fleet with no ready bucket is a 503.
+    #[tokio::test]
+    async fn bucket_routing_answers_from_bucket_members_only() {
+        let inside = spawn_engine("inside", StatusCode::OK).await;
+        let outside = spawn_engine("outside", StatusCode::OK).await;
+        let mut ctx = Arc::into_inner(ctx_with(&[
+            (&inside, WorkerMode::Plain),
+            (&outside, WorkerMode::Plain),
+        ]))
+        .unwrap();
+        let bucket_of = |id: &str| {
+            let policy: Arc<dyn Policy> =
+                Arc::new(PowerOfTwoPolicy::new(EngineReportedLoadTable::new()));
+            let group = EngineGroup {
+                worker_ids: Some([WorkerId(id.into())].into()),
+                ..EngineGroup::new(policy)
+            };
+            let resolver =
+                BucketResolver::new(vec![Bucket::new("b", BucketGroups::Plain(group))]).unwrap();
+            ChatRouting::Reorg([(ModelId("stub-model".into()), resolver)].into())
+        };
+        ctx.chat_routing = bucket_of("w-0");
+        let ctx = Arc::new(ctx);
+        for _ in 0..32 {
+            let (_, body) = get_json(Arc::clone(&ctx), "/server_info").await;
+            assert_eq!(body["worker"], "inside");
+        }
+
+        let mut ctx = Arc::into_inner(ctx_with(&[(&outside, WorkerMode::Plain)])).unwrap();
+        ctx.chat_routing = bucket_of("absent");
+        let (status, body) = get_json(Arc::new(ctx), "/health_generate").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["code"], "no_healthy_workers");
     }
 
     #[tokio::test]
