@@ -19,6 +19,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
+import traceback
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -68,7 +69,6 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, is_xpu
-from sglang.utils import get_exception_traceback
 
 _is_xpu = is_xpu()
 
@@ -842,7 +842,7 @@ class LlamaForCausalLM(nn.Module):
 
         except Exception:
             logger.error(
-                f"Error getting weights by name {name} in LlamaForCausalLM: {get_exception_traceback()}"
+                f"Error getting weights by name {name} in LlamaForCausalLM: {traceback.format_exc()}"
             )
             return None
 

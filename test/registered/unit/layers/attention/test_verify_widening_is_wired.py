@@ -57,6 +57,7 @@ def _runner_ids(req_to_token, page_size, n_pages):
     v2p = torch.randperm(n_pages, generator=g).to(torch.int64)
     v2p[0] = 0  # page 0 is the reserved sink
     t = RunnerIds.__new__(RunnerIds)
+    t._role_sub_pools = {}
     t.req_to_token = req_to_token
     t.page_size = page_size
     t.device = _DEV

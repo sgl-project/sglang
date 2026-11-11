@@ -11,6 +11,7 @@ from torch import nn
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     modulate_scale_shift,
+    residual_gate_add,
     tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits.anima import AnimaDiTConfig
@@ -34,6 +35,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 logger = init_logger(__name__)
 
@@ -76,6 +80,13 @@ def _anima_rope(q, k, cos, sin):
 
 def _is_anima_block(name, module):
     return is_module_list_entry_in(name, ("transformer_blocks",))
+
+
+def _anima_residual_add(residual, update, gate):
+    # Fuse in BCG warmup/capture; dispatch overhead outweighs the savings in eager.
+    if is_in_breakable_cuda_graph() and not torch.compiler.is_compiling():
+        return residual_gate_add(residual, update, gate)
+    return residual + gate * update
 
 
 class AnimaPatchEmbed(nn.Module):
@@ -288,15 +299,15 @@ class AnimaTransformerBlock(nn.Module):
         attn_mask_meta=None,
     ):
         x, gate = self.norm1(hidden_states, embedded_timestep, temb)
-        hidden_states = hidden_states + gate * self.attn1(
-            x, rope=rope, attn_mask_meta=attn_mask_meta
+        hidden_states = _anima_residual_add(
+            hidden_states, self.attn1(x, rope=rope, attn_mask_meta=attn_mask_meta), gate
         )
         x, gate = self.norm2(hidden_states, embedded_timestep, temb)
-        hidden_states = hidden_states + gate * self.attn2(
-            x, context=encoder_hidden_states
+        hidden_states = _anima_residual_add(
+            hidden_states, self.attn2(x, context=encoder_hidden_states), gate
         )
         x, gate = self.norm3(hidden_states, embedded_timestep, temb)
-        return hidden_states + gate * self.ff(x)
+        return _anima_residual_add(hidden_states, self.ff(x), gate)
 
 
 class AnimaTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):

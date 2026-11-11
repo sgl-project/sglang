@@ -627,10 +627,16 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
     def test_engine_startup_failure_releases_parent_pool(self):
         from sglang.srt.entrypoints import engine as engine_module
         from sglang.srt.entrypoints.engine import Engine
+        from sglang.srt.environ import envs
         from sglang.srt.managers.tokenizer_manager import TokenizerManager
         from sglang.srt.multimodal.transport.cuda_vmm import (
             CudaVmmFeatureTransport,
         )
+
+        # The pool is the Python server's TokenizerManager's, which Rust-server
+        # mode never starts, so pin the mode against an inherited
+        # SGLANG_RUST_SERVER=1.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
 
         manager = object.__new__(TokenizerManager)
         transport = object.__new__(CudaVmmFeatureTransport)
@@ -713,7 +719,9 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         scheduler.scheduler_stage_metrics = None
         scheduler.session_controller = SimpleNamespace(maybe_reap=MagicMock())
         scheduler._request_dispatcher = MagicMock(return_value=None)
-        scheduler.flush_wrapper = SimpleNamespace(check_pending=MagicMock())
+        scheduler.flush_wrapper = SimpleNamespace(
+            check_pending=MagicMock(return_value=False)
+        )
         scheduler.external_corpus_manager = None
 
     @staticmethod
@@ -728,26 +736,20 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         scheduler = object.__new__(scheduler_module.Scheduler)
         scheduler.model_config = SimpleNamespace(requires_mm_token_modalities=False)
         scheduler.dp_tp_cpu_group = object()
+        scheduler.mm_feature_receive_budget = SimpleNamespace(
+            materialize=MagicMock(side_effect=local_exception, return_value=object())
+        )
         request = TokenizedRequest()
 
         def gather_errors(errors, local_error, **_kwargs):
             errors[:] = [local_error, remote_error]
 
-        materialize = MagicMock(
-            side_effect=local_exception,
-            return_value=object(),
-        )
         with (
             patch.object(
                 scheduler_module, "TokenizedGenerateReqInput", TokenizedRequest
             ),
             patch.object(
                 scheduler_module, "TokenizedEmbeddingReqInput", TokenizedRequest
-            ),
-            patch.object(
-                scheduler_module.MultimodalInputs,
-                "from_processor_output",
-                materialize,
             ),
             patch.object(
                 scheduler_module.torch.distributed, "is_available", return_value=True
@@ -784,16 +786,13 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         raw_inputs = object()
         materialized = object()
         request = SimpleNamespace(mm_inputs=raw_inputs, positional_embed_overrides=None)
+        build_inputs = MagicMock(return_value=materialized)
+        scheduler.mm_feature_receive_budget = SimpleNamespace(materialize=build_inputs)
 
         with (
             patch.object(
                 scheduler_module, "TokenizedGenerateReqInput", SimpleNamespace
             ),
-            patch.object(
-                scheduler_module.MultimodalInputs,
-                "from_processor_output",
-                return_value=materialized,
-            ) as build_inputs,
             patch.object(
                 scheduler, "_process_and_broadcast_mm_inputs"
             ) as cpu_broadcast,
@@ -832,6 +831,8 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         materialized = [object(), object()]
         inner_requests = [TokenizedRequest(value) for value in raw_inputs]
         request = BatchRequest(inner_requests)
+        build_inputs = MagicMock(side_effect=materialized)
+        scheduler.mm_feature_receive_budget = SimpleNamespace(materialize=build_inputs)
 
         with (
             patch.object(
@@ -846,11 +847,6 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             patch.object(
                 scheduler_module, "BatchTokenizedEmbeddingReqInput", BatchRequest
             ),
-            patch.object(
-                scheduler_module.MultimodalInputs,
-                "from_processor_output",
-                side_effect=materialized,
-            ) as build_inputs,
             patch.object(
                 scheduler_module, "is_health_check_generate_req", return_value=False
             ),

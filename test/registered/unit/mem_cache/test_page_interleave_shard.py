@@ -88,6 +88,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -489,11 +490,13 @@ def _make_mtp_configurator(use_mla=True):
     return kvc, target
 
 
-def _build_mtp_pool(kvc, *, capacity=128, is_dsa_model=False, is_dsv4_model=False):
+def _build_mtp_pool(
+    kvc, *, capacity=128, is_dsa_model=False, is_compressed_kv_model=False
+):
     return kvc._build_token_to_kv_pool(
         sizes=SimpleNamespace(max_total_num_tokens=capacity),
         is_dsa_model=is_dsa_model,
-        is_dsv4_model=is_dsv4_model,
+        is_compressed_kv_model=is_compressed_kv_model,
         req_to_token_pool=None,
     )
 
@@ -553,7 +556,7 @@ class TestMTPKVShardConfig(CustomTestCase):
                     kvc._build_token_to_kv_pool_allocator(
                         sizes=SimpleNamespace(max_total_num_tokens=128),
                         token_to_kv_pool=pool,
-                        is_dsv4_model=False,
+                        is_compressed_kv_model=False,
                         req_to_token_pool=None,
                         token_to_kv_pool_allocator=allocator,
                     ),
@@ -670,7 +673,7 @@ class TestMTPKVShardConfig(CustomTestCase):
                 _build_mtp_pool(kvc)
         for options, message in (
             ({"is_dsa_model": True}, "same DSA indexer layout"),
-            ({"is_dsv4_model": True}, "MLA, DSA and MHA"),
+            ({"is_compressed_kv_model": True}, "MLA, DSA and MHA"),
         ):
             with (
                 self.subTest(options=options),
@@ -1125,9 +1128,9 @@ class TestShardedAllocationEviction(CustomTestCase):
         initial_available = allocator.available_size()
         self.assertEqual(initial_available, GS)
 
-        # The shortfall is smaller than the initial free capacity: treating
-        # it as the absolute target would incorrectly skip eviction.
-        result = tree.evict_for_alloc(EvictParams(num_tokens=PS))
+        # A demand one page past the free capacity: the min-class capacity
+        # rises only once the tight class gets a page back.
+        result = tree.evict_for_alloc(KVDemand(full_tokens=initial_available + PS))
 
         self.assertGreaterEqual(allocator.available_size(), initial_available + PS)
         self.assertEqual(allocator.class_free_page_counts(), [2, 3, 4, 4])
@@ -1137,7 +1140,9 @@ class TestShardedAllocationEviction(CustomTestCase):
     def test_allocation_eviction_stops_when_tight_class_cannot_be_reclaimed(self):
         tree, allocator = self._cache_with_imbalanced_classes(cache_tight_page=False)
 
-        result = tree.evict_for_alloc(EvictParams(num_tokens=PS))
+        result = tree.evict_for_alloc(
+            KVDemand(full_tokens=allocator.available_size() + PS)
+        )
 
         self.assertEqual(allocator.available_size(), GS)
         self.assertEqual(allocator.class_free_page_counts(), [1, 3, 4, 4])
@@ -1945,8 +1950,8 @@ def _host_pool(shard_rank, device_pages=32):
     # These tiny CPU fixtures test ownership, not the machine's free-RAM budget.
     with (
         unittest.mock.patch(
-            "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
-            side_effect=lambda requested: requested,
+            "sglang.srt.mem_cache.pool_host.base.host_memory_preflight",
+            side_effect=lambda lengths, *args: (sum(lengths), sum(lengths)),
         ),
         unittest.mock.patch(
             "sglang.srt.mem_cache.pool_host.common.alloc_mmap",
@@ -2156,6 +2161,7 @@ class TestOwnerMatchedLoadBack(CustomTestCase):
         host = _host_pool(0).alloc(5 * PS, start_owner=2)
         controller = SimpleNamespace(
             mem_pool_device_allocator=_make_allocator(),
+            kv_storage=None,
             device="cpu",
             load_queue=[],
             _resolve_device_transfers=lambda *args, **kwargs: None,

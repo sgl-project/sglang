@@ -13,7 +13,7 @@ from types import ModuleType
 from typing import Mapping
 
 _MIN_SUPPORTED_TORCH = (2, 11)
-_MAX_SUPPORTED_TORCH = (2, 14)
+_MAX_SUPPORTED_TORCH = (2, 15)
 
 
 @dataclass(frozen=True)
