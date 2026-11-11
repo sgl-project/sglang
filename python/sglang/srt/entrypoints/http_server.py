@@ -20,8 +20,10 @@ This file implements HTTP APIs for the inference engine via fastapi.
 import asyncio
 import dataclasses
 import errno
+import inspect
 import logging
 import os
+import signal
 import socket
 import ssl
 import tempfile
@@ -2720,7 +2722,43 @@ def _wait_weights_ready():
     )
 
 
-class _ReusePortMultiprocess(Multiprocess):
+class _SigquitForwardingMultiprocess(Multiprocess):
+    """uvicorn supervisor that keeps SIGQUIT meaning "a child failed".
+
+    ``Multiprocess.__init__`` replaces the SIGQUIT handler with a queue that has
+    no ``handle_quit``, so a scheduler's SIGQUIT to this process is dropped and
+    the server outlives its schedulers. The handler installed before uvicorn
+    took over is called from the supervisor loop instead.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._sigquit_handler = signal.getsignal(signal.SIGQUIT)
+        super().__init__(*args, **kwargs)
+
+    def handle_quit(self) -> None:
+        if callable(self._sigquit_handler):
+            self._sigquit_handler(signal.SIGQUIT, None)
+        else:
+            logger.error("Received SIGQUIT from a child process; exiting.")
+            kill_process_tree(os.getpid())
+
+
+def _run_uvicorn_workers(app_path: str, **uvicorn_options) -> None:
+    """What ``uvicorn.run()`` does for workers > 1, minus its SIGQUIT trap."""
+    config = uvicorn.Config(app_path, **uvicorn_options)
+    sockets = [config.bind_socket()]
+    if "target" in inspect.signature(Multiprocess.__init__).parameters:
+        # uvicorn < 0.51 (not pinned on every platform): the supervisor is
+        # given the server's run().
+        supervisor = _SigquitForwardingMultiprocess(
+            config, target=uvicorn.Server(config=config).run, sockets=sockets
+        )
+    else:
+        supervisor = _SigquitForwardingMultiprocess(config, sockets=sockets)
+    supervisor.run()
+
+
+class _ReusePortMultiprocess(_SigquitForwardingMultiprocess):
     """Give each uvicorn worker a private SO_REUSEPORT listener.
 
     uvicorn's supervisor reads ``self.sockets`` once per worker it spawns, so a
@@ -2868,8 +2906,6 @@ def _run_granian_server(
     The event loop is uvloop. The default backlog and backpressure values are set
     exactly like uvicorn's defaults.
     """
-    import signal
-
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
     from granian.http import HTTP2Settings
@@ -3164,7 +3200,7 @@ def _setup_and_run_http_server(
                     )
                     supervisor.run()
                 else:
-                    uvicorn.run(app_path, **uvicorn_options)
+                    _run_uvicorn_workers(app_path, **uvicorn_options)
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
