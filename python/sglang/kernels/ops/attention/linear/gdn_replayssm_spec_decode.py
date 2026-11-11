@@ -39,14 +39,55 @@ mask, so this kernel is valid only for linear draft chains
 
 from __future__ import annotations
 
+import contextlib
+
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported
 
 _IS_GFX95 = is_gfx95_supported()
+
+
+# SGLANG_OPT_GDN_REPLAYSSM_TILED_COMMIT: the bit-identical tiled compact commit for supported shapes.
+_GDN_TILED_COMMIT = envs.SGLANG_OPT_GDN_REPLAYSSM_TILED_COMMIT.get()
+_TILED_COMMIT_BV = 32
+_TILED_COMMIT_HEADS_PER_PROGRAM = 4
+_TILED_COMMIT_STAGES = 2
+_TILED_COMMIT_WARPS = 1
+# Warps of the tiled commit while tiled_commit_warps is active; None keeps _TILED_COMMIT_WARPS. Each element's fold
+# order does not depend on the warp count.
+_TILED_COMMIT_WARPS_OVERRIDE = None
+
+
+@contextlib.contextmanager
+def tiled_commit_warps(num_warps: int):
+    global _TILED_COMMIT_WARPS_OVERRIDE
+    previous, _TILED_COMMIT_WARPS_OVERRIDE = _TILED_COMMIT_WARPS_OVERRIDE, num_warps
+    try:
+        yield
+    finally:
+        _TILED_COMMIT_WARPS_OVERRIDE = previous
+
+
+def _use_tiled_commit(checkpoint_state, d_cache, k_cache, H, HV, V, K) -> bool:
+    return (
+        _GDN_TILED_COMMIT
+        # FP32 state keeps the stock commit (the tiled fold differs there by an ULP).
+        and checkpoint_state.dtype in (torch.bfloat16, torch.float16)
+        and d_cache.is_cuda
+        and torch.version.hip is None
+        and d_cache.dtype in (torch.bfloat16, torch.float16)
+        and k_cache.dtype == d_cache.dtype
+        and K >= 16
+        and K == triton.next_power_of_2(K)
+        and V % _TILED_COMMIT_BV == 0
+        and HV % H == 0
+        and HV % _TILED_COMMIT_HEADS_PER_PROGRAM == 0
+    )
 
 
 @triton.jit
@@ -813,6 +854,254 @@ def gdn_replayssm_compact_commit_kernel(
 
 
 @triton.jit
+def _replayssm_mul_rn(a, b):
+    return tl.inline_asm_elementwise(
+        "mul.rn.f32 $0, $1, $2;",
+        "=r,r,r",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _compact_commit_tile(
+    old_state,  # [BV, K] checkpoint tile (h0 dtype)
+    dst,  # [BV, K] destination pointers
+    gates,  # [MAX_CACHE_LEN] fp32 ring gates in logical order
+    o_t,
+    n_active,
+    phys,
+    k_base,
+    k_residual_base,
+    d_base,
+    d_residual_base,
+    o_k,
+    o_v,
+    mask_v,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    SEPARATE_MUL: tl.constexpr,
+):
+    """Fold the first ``n_active`` ring records into one checkpoint tile with the
+    stock compact-commit math (same hi/lo dots in the same order, same decay and
+    product rounding); records past ``n_active`` are not read."""
+    ring = o_t < n_active
+    keys = tl.load(
+        k_base + phys[:, None] * K + o_k[None, :], mask=ring[:, None], other=0.0
+    )
+    if HAS_RESIDUAL:
+        key_residual = tl.load(
+            k_residual_base + phys[:, None] * K + o_k[None, :],
+            mask=ring[:, None],
+            other=0.0,
+        )
+    upd_mask = ring[:, None] & mask_v[None, :]
+    updates = tl.load(
+        d_base + phys[:, None] * V + o_v[None, :], mask=upd_mask, other=0.0
+    ).to(tl.float32)
+    if HAS_RESIDUAL:
+        updates += tl.load(
+            d_residual_base + phys[:, None] * V + o_v[None, :],
+            mask=upd_mask,
+            other=0.0,
+        ).to(tl.float32)
+    active_g = tl.where(ring, gates, 0.0)
+    active_prefix = tl.cumsum(active_g, axis=0)
+    active_total = tl.sum(active_g, axis=0)
+    active_decay = tl.where(ring, tl.exp(active_total - active_prefix), 0.0)
+    active_updates = updates * active_decay[:, None]
+    active_hi = active_updates.to(keys.dtype)
+    active_lo = (active_updates - active_hi.to(tl.float32)).to(keys.dtype)
+    # [BV, K] = D^T K: the stock dots with the operands swapped (same products, same
+    # k16 accumulation order), so the tile comes out in the checkpoint's row layout.
+    active_delta = tl.dot(tl.trans(active_hi), keys)
+    active_delta += tl.dot(tl.trans(active_lo), keys)
+    if HAS_RESIDUAL:
+        active_delta += tl.dot(tl.trans(active_hi), key_residual)
+        active_delta += tl.dot(tl.trans(active_lo), key_residual)
+    # The stock HAS_TRACK specialization shares/converts the old-state layout;
+    # its product is separately rounded in both fold and snapshot. The
+    # no-track specialization contracts the active fold product/add.
+    if SEPARATE_MUL:
+        combined = (
+            _replayssm_mul_rn(
+                old_state.to(tl.float32),
+                tl.zeros_like(active_delta) + tl.exp(active_total),
+            )
+            + active_delta
+        )
+    else:
+        combined = tl.fma(old_state.to(tl.float32), tl.exp(active_total), active_delta)
+    tl.store(dst, combined.to(dst.dtype.element_ty), mask=mask_v[:, None])
+
+
+@triton.jit
+def gdn_replayssm_compact_commit_tiled_kernel(
+    h0,
+    d_cache,
+    k_cache,
+    g_cache,
+    d_residual_cache,
+    k_residual_cache,
+    ssm_state_indices,
+    replay_indices,
+    write_pos,
+    cache_base,
+    is_flush_flags,
+    accept_lens,
+    mamba_track_indices,
+    mamba_steps_to_track,
+    stride_state_slot: tl.constexpr,
+    stride_d_slot: tl.constexpr,
+    stride_k_slot: tl.constexpr,
+    stride_g_slot: tl.constexpr,
+    stride_d_residual_slot: tl.constexpr,
+    stride_k_residual_slot: tl.constexpr,
+    stride_state_layer: tl.constexpr,
+    stride_d_layer: tl.constexpr,
+    stride_k_layer: tl.constexpr,
+    stride_g_layer: tl.constexpr,
+    stride_d_residual_layer: tl.constexpr,
+    stride_k_residual_layer: tl.constexpr,
+    stride_indices: tl.constexpr,
+    stride_replay_indices: tl.constexpr,
+    stride_accept: tl.constexpr,
+    stride_track: tl.constexpr,
+    stride_steps: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+    HEADS_PER_PROGRAM: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    MAX_CACHE_LEN: tl.constexpr,
+    NULL_BLOCK_ID: tl.constexpr,
+    HAS_TRACK: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    # Element strides between the replay rows of each cursor, as in the stock kernel.
+    STRIDE_WP: tl.constexpr = 1,
+    STRIDE_CB: tl.constexpr = 1,
+    STRIDE_FL: tl.constexpr = 1,
+):
+    """Bit-identical ``gdn_replayssm_compact_commit_kernel`` with a lighter tiling.
+
+    One program per (V tile, request, layer x group of HEADS_PER_PROGRAM value
+    heads) on [BV, K] row-major tiles; it reads only the active ring prefix, and
+    the track snapshot and the fold each read their own checkpoint copy so no
+    fp32 tile stays live across both. The stock kernel (four tcgen05 dot/wait
+    rounds and 248 registers per thread on a 128-thread program) is latency
+    bound at two programs per SM; small single-warp programs that pipeline
+    several heads keep many more checkpoint reads in flight.
+    """
+    i_v = tl.program_id(0)
+    i_n = tl.program_id(1)
+    i_g = tl.program_id(2)
+    i_layer = (i_g // (HV // HEADS_PER_PROGRAM)).to(tl.int64)
+    hv0 = (i_g % (HV // HEADS_PER_PROGRAM)) * HEADS_PER_PROGRAM
+
+    state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
+    replay_idx = tl.load(replay_indices + i_n * stride_replay_indices).to(tl.int64)
+    if state_idx <= NULL_BLOCK_ID:
+        return
+    n_history = tl.load(write_pos + replay_idx * STRIDE_WP).to(tl.int32)
+    fold_active = tl.load(is_flush_flags + replay_idx * STRIDE_FL) != 0
+    if HAS_TRACK:
+        track_idx = tl.load(mamba_track_indices + i_n * stride_track).to(tl.int64)
+        track_step = tl.load(mamba_steps_to_track + i_n * stride_steps).to(tl.int32)
+        has_track = (track_idx > NULL_BLOCK_ID) & (track_step >= 0)
+        n_accepted = tl.load(accept_lens + i_n * stride_accept).to(tl.int32)
+        track_len = n_history - n_accepted + track_step + 1
+    else:
+        track_idx = NULL_BLOCK_ID
+        has_track = False
+        track_len = 0
+    if (not fold_active) and (not has_track):
+        return
+
+    h0 += i_layer * stride_state_layer
+    state_base = h0 + state_idx * stride_state_slot
+    d_cache += i_layer * stride_d_layer + replay_idx * stride_d_slot
+    k_cache += i_layer * stride_k_layer + replay_idx * stride_k_slot
+    g_cache += i_layer * stride_g_layer + replay_idx * stride_g_slot
+    d_residual_cache += (
+        i_layer * stride_d_residual_layer + replay_idx * stride_d_residual_slot
+    )
+    k_residual_cache += (
+        i_layer * stride_k_residual_layer + replay_idx * stride_k_residual_slot
+    )
+    base = tl.load(cache_base + replay_idx * STRIDE_CB).to(tl.int32)
+    o_t = tl.arange(0, MAX_CACHE_LEN)
+    phys = (base + o_t) & (MAX_CACHE_LEN - 1)
+    o_k = tl.arange(0, K)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_v = o_v < V
+    tile = o_v[:, None] * K + o_k[None, :]
+
+    if HAS_TRACK:
+        if has_track:
+            track_base = h0 + track_idx * stride_state_slot
+            for j in range(HEADS_PER_PROGRAM):
+                i_hv = hv0 + j
+                i_h = i_hv // (HV // H)
+                gates = tl.load(g_cache + i_hv * MAX_CACHE_LEN + phys).to(tl.float32)
+                old_state = tl.load(
+                    state_base + i_hv * V * K + tile, mask=mask_v[:, None], other=0.0
+                )
+                _compact_commit_tile(
+                    old_state,
+                    track_base + i_hv * V * K + tile,
+                    gates,
+                    o_t,
+                    track_len,
+                    phys,
+                    k_cache + i_h * MAX_CACHE_LEN * K,
+                    k_residual_cache + i_h * MAX_CACHE_LEN * K,
+                    d_cache + i_hv * MAX_CACHE_LEN * V,
+                    d_residual_cache + i_hv * MAX_CACHE_LEN * V,
+                    o_k,
+                    o_v,
+                    mask_v,
+                    K,
+                    V,
+                    HAS_RESIDUAL,
+                    True,
+                )
+    if fold_active:
+        # Software-pipelined over the program's heads: the next head's checkpoint
+        # tile and ring records load while this one folds.
+        for j in tl.range(0, HEADS_PER_PROGRAM, num_stages=NUM_STAGES):
+            i_hv = hv0 + j
+            i_h = i_hv // (HV // H)
+            gates = tl.load(g_cache + i_hv * MAX_CACHE_LEN + phys).to(tl.float32)
+            old_state = tl.load(
+                state_base + i_hv * V * K + tile, mask=mask_v[:, None], other=0.0
+            )
+            _compact_commit_tile(
+                old_state,
+                state_base + i_hv * V * K + tile,
+                gates,
+                o_t,
+                n_history,
+                phys,
+                k_cache + i_h * MAX_CACHE_LEN * K,
+                k_residual_cache + i_h * MAX_CACHE_LEN * K,
+                d_cache + i_hv * MAX_CACHE_LEN * V,
+                d_residual_cache + i_hv * MAX_CACHE_LEN * V,
+                o_k,
+                o_v,
+                mask_v,
+                K,
+                V,
+                HAS_RESIDUAL,
+                HAS_TRACK,
+            )
+
+
+@triton.jit
 def _finish_gdn_replayssm_circular_fold_kernel(
     write_pos,
     cache_base,
@@ -1389,6 +1678,8 @@ def commit_gdn_replayssm_circular(
     k_residual_buf = k_residual_cache if has_residual else k_cache
     BV = min(triton.next_power_of_2(V), 64)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    # The tiled commit takes the shapes it supports.
+    tiled = _use_tiled_commit(checkpoint_state, d_cache, k_cache, H, HV, V, K)
     if has_track:
         track_indices = mamba_track_indices
         track_steps = mamba_steps_to_track
@@ -1399,8 +1690,22 @@ def commit_gdn_replayssm_circular(
         track_steps = accept_lens
         stride_track = 0
         stride_steps = 0
-    grid = (triton.cdiv(V, BV), B, HV * num_layers)
-    gdn_replayssm_compact_commit_kernel[grid](
+    if tiled:
+        grid = (
+            V // _TILED_COMMIT_BV,
+            B,
+            HV * num_layers // _TILED_COMMIT_HEADS_PER_PROGRAM,
+        )
+        kernel = gdn_replayssm_compact_commit_tiled_kernel
+        extra = dict(
+            HEADS_PER_PROGRAM=_TILED_COMMIT_HEADS_PER_PROGRAM,
+            NUM_STAGES=_TILED_COMMIT_STAGES,
+        )
+    else:
+        grid = (triton.cdiv(V, BV), B, HV * num_layers)
+        kernel = gdn_replayssm_compact_commit_kernel
+        extra = {}
+    kernel[grid](
         checkpoint_state,
         d_cache,
         k_cache,
@@ -1436,16 +1741,17 @@ def commit_gdn_replayssm_circular(
         HV=HV,
         K=K,
         V=V,
-        BV=BV,
+        BV=_TILED_COMMIT_BV if tiled else BV,
         MAX_CACHE_LEN=max_cache_len,
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
         HAS_RESIDUAL=has_residual,
-        num_warps=4,
-        num_stages=2,
+        num_warps=(_TILED_COMMIT_WARPS_OVERRIDE or _TILED_COMMIT_WARPS) if tiled else 4,
+        num_stages=1 if tiled else 2,
         STRIDE_WP=write_pos.stride(0),
         STRIDE_CB=cache_base.stride(0),
         STRIDE_FL=is_flush.stride(0),
+        **extra,
     )
     block = triton.next_power_of_2(max(1, B))
     _finish_gdn_replayssm_circular_fold_kernel[(1,)](

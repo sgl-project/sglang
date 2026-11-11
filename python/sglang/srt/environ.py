@@ -318,6 +318,10 @@ class Envs:
     SGLANG_OPT_OVERLAP_EVENT_REUSE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # GDN ReplaySSM verify commit: the tiled Triton compact commit (one single-warp program per
+    # [32-row V tile, request, layer x 4 value heads], software-pipelined over the heads), bit
+    # for bit the stock commit's math, for the shapes it supports. Opt-in.
+    SGLANG_OPT_GDN_REPLAYSSM_TILED_COMMIT = EnvRuntimeBool(False)
     # EAGLE verify target-only tree sampling (fp32, vocab >= 65536, <= 64 rows) as
     # multi-CTA kernels that keep the stock reduction orders (bitwise).
     SGLANG_OPT_MULTI_CTA_VERIFY_TREE_SAMPLING = EnvRuntimeBool(
