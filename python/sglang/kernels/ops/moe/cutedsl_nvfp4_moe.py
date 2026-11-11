@@ -43,6 +43,7 @@ def _get_c_quant_fn():
     if _C_QUANT_FN is not None:
         return _C_QUANT_FN
     try:
+        from flashinfer.quantization import fp4_quantization as _fp4_q
         from flashinfer.quantization import get_fp4_quantization_module
 
         mod = get_fp4_quantization_module("100")
@@ -51,9 +52,16 @@ def _get_c_quant_fn():
             if hasattr(
                 cell.cell_contents, "silu_and_mul_scaled_nvfp4_experts_quantize"
             ):
-                _C_QUANT_FN = (
-                    cell.cell_contents.silu_and_mul_scaled_nvfp4_experts_quantize
-                )
+                raw_fn = cell.cell_contents.silu_and_mul_scaled_nvfp4_experts_quantize
+                if hasattr(_fp4_q, "NVFP4_4OVER6_CODE_FROM_ENV"):
+                    code_default = int(_fp4_q.NVFP4_4OVER6_CODE_FROM_ENV)
+
+                    def _quant_fn(out, sf, inp, gs, msk, silu):
+                        return raw_fn(out, sf, inp, gs, msk, silu, code_default)
+
+                    _C_QUANT_FN = _quant_fn
+                else:
+                    _C_QUANT_FN = raw_fn
                 return _C_QUANT_FN
     except Exception:
         pass
