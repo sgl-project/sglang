@@ -20,9 +20,12 @@ ARG SG_LANG_KERNEL_SOURCE=wheel
 USER root
 
 # GPU driver stack and oneAPI toolchain from one versioned Intel OMIX release.
-ARG INTEL_OMIX_VERSION=0.5.0
-# oneAPI toolkit version shipped by INTEL_OMIX_VERSION; bump together.
-ARG ONEAPI_VERSION=2026.2
+ARG INTEL_OMIX_VERSION=0.4.1
+# oneAPI toolkit version shipped by INTEL_OMIX_VERSION (its install dir); bump together.
+ARG ONEAPI_VERSION=2026.1
+# Deep Learning Essentials release intel-omix-dev pulls in (the oneAPI of
+# intel/deep-learning-essentials:2026.1.3); the build checks it.
+ARG ONEAPI_DLE_VERSION=2026.1.3
 
 RUN apt-get update && apt-get install -y \
         ca-certificates curl gpg wget git file cmake build-essential pkg-config \
@@ -38,6 +41,7 @@ RUN apt-get update && apt-get install -y \
         intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo \
         ffmpeg && \
     test -x /opt/intel/oneapi/${ONEAPI_VERSION}/bin/icpx && \
+    dpkg-query -W -f '${Version}\n' intel-deep-learning-essentials-${ONEAPI_VERSION} | grep -q "^${ONEAPI_DLE_VERSION}-" && \
     rm -rf /var/lib/apt/lists/*
 
 # Static equivalent of setvars.sh for the unified oneAPI layout, so build steps,
