@@ -20,7 +20,7 @@ from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=70, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=70, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -37,7 +37,8 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
         obj.speculative_num_steps = steps
         obj.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
         obj.draft_window_size = obj.draft_sink_size = 0
-        obj.kv_index_translator = SimpleNamespace(
+        obj.window_rail = False
+        obj.runner_ids = SimpleNamespace(
             read_source=lambda plan, **kw: SimpleNamespace(
                 row_ids=kw["req_pool_indices"],
                 ids=pool,
@@ -58,7 +59,7 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
         host = torch.tensor(lengths, dtype=torch.int64)
         seq = host.cuda()
         fb = SimpleNamespace(
-            kv_loc_plan=None,
+            iteration_ids=None,
             batch_size=n,
             seq_lens=seq,
             seq_lens_cpu=host,
@@ -325,7 +326,7 @@ class TestFlashInferVerifyHostPlan(CustomTestCase):
                             )
 
                         updater.attn_backend = SimpleNamespace(
-                            kv_index_translator=SimpleNamespace(
+                            runner_ids=SimpleNamespace(
                                 reads_are_translated=False,
                                 pack_read_stream=pack_read_stream,
                             )

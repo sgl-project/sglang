@@ -9,6 +9,7 @@ from unittest import mock
 import torch
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -22,11 +23,11 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.pool_host import PoolEntry
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import (
+from sglang.srt.mem_cache.unified_cache.component_type import (
     BASE_COMPONENT_TYPE,
-    CacheTransferPhase,
     ComponentType,
 )
+from sglang.srt.mem_cache.unified_cache.components.base import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.server_args import (
     ServerArgs,
@@ -551,7 +552,7 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
             rid=req_id.rid,
             cache_request_handle=req_id,
             prefix_len=sib.device_prefix_len,
-            kv=SimpleNamespace(cache_protected_len=sib.device_prefix_len),
+            kv=ReqKvInfo(cache_protected_len=sib.device_prefix_len),
         )
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         self.assertEqual(req.host_hit_length, len(seq) - len(head))

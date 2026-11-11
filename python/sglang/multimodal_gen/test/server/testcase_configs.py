@@ -28,8 +28,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Sequence
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.sample.sampling_params import normalize_quality
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.registry import (
     get_model_info,
     get_pipeline_config_classes,
@@ -187,7 +187,13 @@ class BaselineConfig:
         for prefix, overrides in data.get("runner_overrides", {}).items():
             if runner_name.startswith(prefix):
                 for name, metrics in overrides.items():
-                    data["scenarios"][name].update(metrics)
+                    scenario = data["scenarios"][name]
+                    for key, value in metrics.items():
+                        # merge per-stage/per-step maps so unlisted entries keep their guard
+                        if isinstance(value, dict):
+                            scenario[key] = {**scenario[key], **value}
+                        else:
+                            scenario[key] = value
                 print(f"--- Performance Runner Baseline: {prefix} ---")
                 break
 

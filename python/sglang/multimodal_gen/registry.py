@@ -192,6 +192,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fastvideo/fastvideo-fasth3-8-step-v2": "FastH3Pipeline",
     "fastvideo/fastvideo-fasth3-omni-8-step-v1": "FastH3Pipeline",
     "openvdn/vdn-minimax-h3": "VDNH3Pipeline",
+    "pika-labs/pika-h3-flex": "PikaH3FlexPipeline",
     "lerobot/pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",
     "pi0.5": "Pi05Pipeline",
@@ -204,6 +205,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+    "hidream-ai/hidream-o1-image": "HiDreamO1ImagePipeline",
 }
 
 
@@ -714,10 +716,6 @@ def get_model_info(
 
 
 _discover_and_register_configs()
-
-
-def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
-    return get_non_diffusers_pipeline_name(model_path) is not None
 
 
 def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:

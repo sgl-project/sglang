@@ -22,6 +22,7 @@ from common_utils import (
 )
 from ray.experimental.tqdm_ray import tqdm
 
+from sglang.srt.hf_transformers import get_config
 from sglang.srt.layers.moe.fused_moe_triton import override_config
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
@@ -36,7 +37,6 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_device, is_hip, is_xpu
-from sglang.srt.utils.hf_transformers_utils import get_config
 
 _is_hip = is_hip()
 _is_xpu = is_xpu()

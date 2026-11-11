@@ -13,7 +13,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ def block_accept_skip_reason(
             "probabilities would be state-dependent"
         )
     if corrected_logits is None:
-        return "corrected_logits unavailable (greedy draft)"
+        return "corrected_logits unavailable (greedy draft or vocab-sharded)"
     return None
 
 

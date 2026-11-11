@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -11,13 +11,15 @@ import numpy.typing as npt
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.disaggregation.mode import DisaggregationMode
 
 
 class StateType(str, enum.Enum):
     MAMBA = "mamba"
     QSA_PENDING = "qsa_pending"
     QSA_COMPRESSED = "qsa_compressed"
+    # A window sub-pool's trailing pages; a unified pool registers one entry
+    # per window, told apart by its sub-pool.
     SWA = "swa"
     DSA = "dsa"
     # DSA kpool-compress tail: one per-request ring row. The indices encode
@@ -73,6 +75,15 @@ class KVArgs:
     aux_data_lens: List[int]
     aux_item_lens: List[int]
     state_types: List[StateType]
+    # The sub-pool each state entry carries, parallel to state_types: entries
+    # of one state type (every window travels as SWA) are told apart by it.
+    state_sub_pools: List[Optional[str]]
+    # The key PD peers tell entries of one state type apart by, parallel to
+    # state_types (a sub-pool's declared wire key; None for static pools).
+    state_wire_keys: List[Optional[str]]
+    # The tail a window entry carries (its window widened by readers reaching
+    # further back), parallel to state_types; None for other entries.
+    state_window_tails: List[Optional[int]]
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
     state_item_lens: List[List[int]]
@@ -89,11 +100,13 @@ class KVArgs:
     # Physical layout of the SWA sub-pool ("nhd", "hnd" or "vectorized_5d");
     # None when the SWA state is not held in an MHA sub-pool.
     swa_kv_cache_layout: Optional[str]
+    dsa_index_k_token_bytes: Optional[Tuple[int, int]] = None
     ib_device: str
     gpu_id: int
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
+    draft_rows_dcp_collapsed: bool = False
     # for system dp
     system_dp_rank: int
     # Local Rust /route registry port; None on scheduler ranks without a listener.

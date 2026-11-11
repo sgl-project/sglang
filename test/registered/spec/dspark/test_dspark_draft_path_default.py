@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.speculative_hook import (
     _target_checkpoint_bundles_dspark_draft,
     _target_checkpoint_dspark_subfolder,
 )
+from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -166,9 +167,13 @@ class TestTargetCheckpointDsparkSubfolderOnHub(CustomTestCase):
 class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
     """Gate contract for DSpark + dp attention + MoE a2a backends."""
 
-    def _dp_server_args(self, *, moe_a2a_backend: str) -> ServerArgs:
+    def _dp_server_args(
+        self, *, moe_a2a_backend: str, arch: str = "DeepseekV4ForCausalLM"
+    ) -> ServerArgs:
+        hf_config = _bundled_hf_config()
+        hf_config.architectures = [arch]
         server_args = _make_dspark_server_args(
-            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+            model_path=_BUNDLED_MODEL_PATH, hf_config=hf_config
         )
         server_args.enable_dp_lm_head = True
         server_args.attn_dp_size = 2
@@ -183,6 +188,18 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
             for backend in ("deepep", "pplx"):
                 with self.assertRaisesRegex(ValueError, backend):
                     _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
+
+    def test_ernie55_admits_deepep_and_rejects_megamoe(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(
+                self._dp_server_args(moe_a2a_backend="deepep", arch=ERNIE5_5_MOE_ARCH)
+            )
+            with self.assertRaisesRegex(ValueError, "megamoe"):
+                _handle_dspark(
+                    self._dp_server_args(
+                        moe_a2a_backend="megamoe", arch=ERNIE5_5_MOE_ARCH
+                    )
+                )
 
     def test_a2a_backend_with_compact_verify_mode_raises(self):
         server_args = self._dp_server_args(moe_a2a_backend="megamoe")

@@ -6,10 +6,6 @@ name: Build and Publish Multi-Arch Docker Images
 on:
   workflow_call:
     inputs:
-      docker_target:
-        description: "Dockerfile target stage (framework or runtime)"
-        required: true
-        type: string
       sgl_version:
         description: "Version string passed as SGL_VERSION build arg (empty to skip)"
         required: false
@@ -113,7 +109,7 @@ jobs:
           mapfile -t METADATA_ARGS < /tmp/docker-metadata-cu130.args
 
           docker buildx build \
-            --target ${{ inputs.docker_target }} \
+            --target framework_final \
             --platform linux/amd64 \
             --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
@@ -192,7 +188,7 @@ jobs:
           mapfile -t METADATA_ARGS < /tmp/docker-metadata-cu130.args
 
           docker buildx build \
-            --target ${{ inputs.docker_target }} \
+            --target framework_final \
             --platform linux/arm64 \
             --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \

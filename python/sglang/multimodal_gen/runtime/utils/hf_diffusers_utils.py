@@ -54,7 +54,7 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
 )
 from sglang.multimodal_gen.runtime.weights.source import resolve_weight
 from sglang.srt.environ import envs
-from sglang.srt.utils.hf_transformers import check_gguf_file
+from sglang.srt.hf_transformers import check_gguf_file
 from sglang.utils import is_in_ci
 
 logger = init_logger(__name__)

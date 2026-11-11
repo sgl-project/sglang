@@ -2,7 +2,6 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/math.cuh>
-#include <sgl_kernel/mbarrier.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -11,6 +10,7 @@
 
 #include <sgl_kernel/distributed/communicator.cuh>
 #include <sgl_kernel/distributed/ptx.cuh>
+#include <sgl_kernel/ptx/barrier.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/extra/stl.h>
@@ -49,24 +49,6 @@ SGL_DEVICE void fence_mbarrier_init() {
 }
 
 // ---- warp / warp-group sync (PTX ISA §9.7.4, §9.7.12.6, §9.7.13) -----------
-
-// Partial-CTA rendezvous. `id` must be in [1, 15]; pull 0 is reserved for
-// the full-CTA pull behind __syncthreads().
-SGL_DEVICE void named_barrier_sync(uint32_t id, uint32_t num_threads) {
-  asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(num_threads) : "memory");
-}
-
-// True on exactly one lane of the issuing warp — guards single-issuer sites
-// (mbar init, TMA issue, MMA issue, TMEM alloc) without gating on lane_id.
-SGL_DEVICE bool elect_one() {
-  uint32_t pred;
-  asm volatile(
-      "{\n\t.reg .pred p;\n\t"
-      "elect.sync _|p, 0xffffffff;\n\t"
-      "selp.b32 %0, 1, 0, p;\n\t}\n"
-      : "=r"(pred));
-  return pred != 0;
-}
 
 // Runtime warp-group register-budget reallocation: widen the epilogue's
 // per-thread budget (so it holds a larger primary array without spilling) by
@@ -290,7 +272,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
   if (warp_id >= kNumConsumerWarps) {  // producer warp (group); first warp works
     if constexpr (kConsumerRegs > 0) ptx::setmaxnreg_dec<kProducerRegs>();
     // TODO: reduce the register usage
-    if (warp_id == kNumConsumerWarps && ptx::elect_one()) {
+    if (warp_id == kNumConsumerWarps && warp::elect_one_lane()) {
       uint32_t global_chunks = 0;
       constexpr uint32_t kRowBytes = kDim * sizeof(bf16_t);
       for (auto token = blockIdx.x; token < params.num_tokens; token += gridDim.x) {
@@ -441,7 +423,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
             smem->warp_dot[warp_id][r] = acc_dot[r];
           }
         }
-        ptx::named_barrier_sync(kConsumerBarId, kNumConsumerThreads);
+        ptx::bar_sync(kConsumerBarId, kNumConsumerThreads);
         // Lane r totals row r, then broadcasts: an*16 smem loads per warp
         // instead of per thread.
         float lane_logit = 0.f;
@@ -520,7 +502,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
       }
       float acc_sq = warp::reduce_sum(acc_sq2.x + acc_sq2.y);
       if (lane_id == 0) smem->warp_ssq[warp_id] = acc_sq;
-      ptx::named_barrier_sync(kConsumerBarId, kNumConsumerThreads);
+      ptx::bar_sync(kConsumerBarId, kNumConsumerThreads);
       float total_sq = 0.f;
 #pragma unroll
       for (uint32_t w = 0; w < kNumConsumerWarps; ++w) {
@@ -553,7 +535,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
         }
       }
     }
-    ptx::named_barrier_sync(kConsumerBarId, kNumConsumerThreads);
+    ptx::bar_sync(kConsumerBarId, kNumConsumerThreads);
     if (warp_id == 1) {
       ptx::tcgen05_dealloc(smem->tmem_base, kTmemCols);
     }
