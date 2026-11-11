@@ -28,6 +28,9 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
 from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.request_list import (  # noqa: E402
+    move,
+)
 from sglang.srt.managers.scheduler_components.request_retirer import (  # noqa: E402
     RequestRetirer,
 )
@@ -116,6 +119,7 @@ def make_cpu_scheduler(send_output, *, cache_enabled=False, legacy_cache=False):
         hisparse_coordinator=None,
         uocr_runtime=None,
         send_abort_output=scheduler.send_abort_output,
+        stream_output=Mock(),
     )
     return scheduler
 
@@ -171,7 +175,7 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         self.assertFalse(get_memory().enable_unified_memory)
         target = self._req(scheduler)
         neighbor = self._req(scheduler, "target-neighbor", "instance-b")
-        scheduler.waiting_queue.join([target, neighbor])
+        move([target, neighbor], scheduler.waiting_queue)
 
         def on_terminal(req):
             self.assertIs(req, target)
@@ -204,7 +208,7 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         second.add_inflight_step()
         scheduler.running_batch = second
         scheduler.last_batch = first
-        scheduler.running_reqs.join([req])
+        move([req], scheduler.running_reqs)
         self._cancel(scheduler, req)
         self.assertIsInstance(req.to_finish, FINISH_ABORT)
         self.assertEqual(self.outputs, [])
@@ -212,22 +216,22 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         # Use the same real release path as finished result processing. The
         # prefix may remain cached, but the request row must be returned.
         req.finish_outside_step(FINISH_ABORT())
-        scheduler.request_retirer.release_finished(req, checkpoint=True)
+        scheduler.request_retirer.release(req, checkpoint=True)
         self.assertFalse(req.kv.holds_kv)
         self.assertEqual(scheduler.req_to_token_pool.available_size(), 8)
         self.assertEqual(scheduler.tree_cache.evictable_size(), 3)
         self.assertEqual(scheduler.token_to_kv_pool_allocator.available_size(), 29)
-        scheduler._on_step_processed(first)
+        scheduler._on_step_processed(first, None)
         self.assertEqual(req.inflight_steps, 1)
         self.assertEqual(self.outputs, [])
 
         # An unexpected live holder still forbids a positive receipt, even
         # when both step counters and allocation predicates are clear.
-        scheduler.grammar_manager.grammar_queue.join([req])
-        scheduler._on_step_processed(second)
+        move([req], scheduler.grammar_manager.grammar_queue)
+        scheduler._on_step_processed(second, None)
         self.assertEqual(req.inflight_steps, 0)
         self.assertEqual(self.outputs, [])
-        scheduler.grammar_manager.grammar_queue.leave([req])
+        scheduler.grammar_manager.grammar_queue._leave([req])
         scheduler._check_cancellation_retirements()
         self.assertEqual(self.outputs[-1][0].status, "retired")
         self.assertIsNone(scheduler._cancellation_retirements["operation-a"].req)
@@ -235,7 +239,7 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
     def test_parked_chunked_abort_releases_real_resources_before_receipt(self):
         scheduler = self._scheduler()
         req = self._req(scheduler)
-        scheduler.chunked_req = req
+        move([req], scheduler.chunked_reqs)
         self._cancel(scheduler, req)
         self.assertEqual(self.outputs, [])
         self.assertIs(scheduler._pending_chunked_abort_req, req)
@@ -253,7 +257,7 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
     def test_unknown_instance_and_cached_operation_do_not_abort_reused_rid(self):
         scheduler = self._scheduler()
         req = self._req(scheduler)
-        scheduler.waiting_queue.join([req])
+        move([req], scheduler.waiting_queue)
         control = CancellationRetirementReq(
             rid=req.rid, request_instance_id="stale", cancellation_id="same-operation"
         )
@@ -268,7 +272,7 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
     def test_unsupported_topology_and_grammar_queue_leave_request_untouched(self):
         scheduler = self._scheduler()
         req = self._req(scheduler)
-        scheduler.grammar_manager.grammar_queue.join([req])
+        move([req], scheduler.grammar_manager.grammar_queue)
         self._cancel(scheduler, req)
         self.assertEqual(self.outputs[-1][0].reason, "unsupported_request_queue")
         with get_parallel().override(dp_size=2):
@@ -283,7 +287,7 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
     def test_unified_receipts_reject_other_cache_owners_and_custom_cores(self):
         scheduler = self._scheduler()
         req = self._req(scheduler)
-        scheduler.waiting_queue.join([req])
+        move([req], scheduler.waiting_queue)
         cache = scheduler.tree_cache
         allocator = scheduler.token_to_kv_pool_allocator
         unsupported = (
@@ -310,7 +314,7 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
     def test_legacy_static_radix_cache_still_returns_resources(self):
         scheduler = make_cpu_scheduler(self._send_output, legacy_cache=True)
         req = self._req(scheduler)
-        scheduler.waiting_queue.join([req])
+        move([req], scheduler.waiting_queue)
         self._cancel(scheduler, req)
         self.assertEqual(self.outputs[-1][0].status, "retired")
         self.assertEqual(scheduler.req_to_token_pool.available_size(), 8)
@@ -319,7 +323,7 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
     def test_pending_duplicates_expiry_and_capacity_never_fabricate_release(self):
         scheduler = self._scheduler()
         req = self._req(scheduler)
-        scheduler.running_reqs.join([req])
+        move([req], scheduler.running_reqs)
         scheduler.running_batch = ScheduleBatch(reqs=[req])
         scheduler.running_batch.add_inflight_step()
         self._cancel(scheduler, req, http_worker_ipc="worker-a")
@@ -347,15 +351,16 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         scheduler = self._scheduler()
         old = self._req(scheduler)
         replacement = self._req(scheduler, instance="new-instance")
-        scheduler.chunked_req = old
+        move([old], scheduler.chunked_reqs)
         self._cancel(scheduler, old)
-        scheduler.chunked_req = None
+        scheduler.chunked_reqs._leave([old])
         scheduler.running_batch = ScheduleBatch(reqs=[replacement])
-        scheduler.running_reqs.join([replacement])
+        move([replacement], scheduler.running_reqs)
         scheduler.process_pending_chunked_abort()
         self.assertIsNone(replacement.to_finish)
-        scheduler.waiting_queue.join(
-            [old, self._req(scheduler, "target-suffix", "other")]
+        move(
+            [old, self._req(scheduler, "target-suffix", "other")],
+            scheduler.waiting_queue,
         )
         scheduler.abort_request(AbortReq(rid="target"))
         self.assertTrue(old.finished())

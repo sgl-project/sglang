@@ -818,6 +818,16 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "intermediate_size.*multiple of 256"):
             mega_moe.check_mega_moe_shapes(2048, 384, "nvfp4xnvfp4")
 
+    def test_shape_check_mxf4_takes_intermediate_multiples_of_128(self):
+        # The MXFP4 intermediate SFs are MN-major like fp8xfp4's, so DeepSeek-V4.1-Flash's
+        # 2304 (not a multiple of 512) is accepted; the input SF rows still need hidden % 512.
+        mega_moe.check_mega_moe_shapes(5120, 2304, "mxf4xmxf4")
+        mega_moe.check_mega_moe_shapes(512, 128, "mxf4xmxf4")
+        with self.assertRaisesRegex(ValueError, "intermediate_size.*multiple of 128"):
+            mega_moe.check_mega_moe_shapes(5120, 2240, "mxf4xmxf4")
+        with self.assertRaisesRegex(ValueError, "hidden_size.*multiple of 512"):
+            mega_moe.check_mega_moe_shapes(4864, 2304, "mxf4xmxf4")
+
     def test_mxf4_l1_uses_packed_gate_up_interleave(self):
         source = torch.arange(32).reshape(1, 32)
         expected = torch.tensor(

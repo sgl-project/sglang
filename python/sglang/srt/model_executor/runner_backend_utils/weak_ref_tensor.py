@@ -2,7 +2,7 @@ from typing import Any, Union
 
 import torch
 
-from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, is_xpu
+from sglang.srt.utils.device import is_cuda, is_hip, is_musa, is_npu, is_xpu
 
 if is_cuda() or is_hip() or is_musa() or is_xpu():
     from sgl_kernel import weak_ref_tensor

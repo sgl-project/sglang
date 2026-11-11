@@ -49,6 +49,8 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
         draft_backend, _ = attention_backends()
     if draft_backend is None:
         return platform_fallback
+    if algo_label == "DFLASH" and draft_backend == "cutedsl_mla":
+        return draft_backend
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
         fallback = platform_fallback
         if algo_label is not None:

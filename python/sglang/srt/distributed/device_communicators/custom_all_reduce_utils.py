@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import pickle
+import socket
 import subprocess
 import sys
 import tempfile
@@ -408,6 +409,10 @@ def is_one_nvlink_clique(
             "GPU fabric clique query failed (%r); custom-AR stays intra-node.", e
         )
         clique = None
+    if clique is not None and not any(clique[0]):
+        # A zero cluster UUID marks a fabric that ends at its node (an HGX
+        # NVSwitch baseboard), whose clique id repeats on every node.
+        clique = (*clique, socket.gethostname())
     # Always all-gather (every rank calls it once) so a failed query on any rank
     # resolves to a clean False rather than a collective mismatch.
     world_size = dist.get_world_size(group=group)
