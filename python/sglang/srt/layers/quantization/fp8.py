@@ -157,6 +157,11 @@ _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
+# SGLANG_OPT_BLOCK_FP8_DENSE_PTPC leaves a weight that only takes per-token
+# inputs. Other models (e.g. DeepSeek MLA, GLM-4.7-Flash) quantize some linear
+# inputs into 1x128 groups unconditionally, so the flag is limited to the
+# model types whose input producers are checked for it.
+_DENSE_PTPC_MODEL_TYPES = ("qwen3",)
 
 
 def _require_fp4_dtype():
@@ -277,8 +282,11 @@ class Fp8Config(QuantizationConfig):
         is_fp4_experts: bool = False,
         kv_cache_quant_algo: Optional[str] = None,
         scale_fmt: Optional[str] = None,
+        model_type: Optional[str] = None,
     ) -> None:
         super().__init__()
+        # The hf_config model_type, when the loader passes it; None otherwise.
+        self.model_type = model_type
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
         # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
@@ -392,6 +400,7 @@ class Fp8Config(QuantizationConfig):
             use_mxfp8=use_mxfp8,
             kv_cache_quant_algo=kv_cache_quant_algo,
             scale_fmt=scale_fmt,
+            model_type=getattr(config.get("hf_config"), "model_type", None),
         )
 
     def get_quant_method(
@@ -985,11 +994,20 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.weight_scale_inv.set_(scale_reordered)
 
     def _use_dense_ptpc(self, layer: Module) -> bool:
-        """SGLANG_OPT_BLOCK_FP8_DENSE_PTPC applies to a plain 128x128 block-FP8 layer:
-        not one converted from MXFP8 (it has its own rowwise copy) or served as MXFP8."""
+        """SGLANG_OPT_BLOCK_FP8_DENSE_PTPC applies to a plain 128x128 block-FP8 layer
+        of a model in _DENSE_PTPC_MODEL_TYPES: not one converted from MXFP8 (it has
+        its own rowwise copy) or served as MXFP8."""
+        if not envs.SGLANG_OPT_BLOCK_FP8_DENSE_PTPC.get():
+            return False
+        model_type = getattr(self.quant_config, "model_type", None)
+        if model_type not in _DENSE_PTPC_MODEL_TYPES:
+            print_warning_once(
+                f"SGLANG_OPT_BLOCK_FP8_DENSE_PTPC is ignored for model_type "
+                f"{model_type!r}: it supports {list(_DENSE_PTPC_MODEL_TYPES)}."
+            )
+            return False
         return (
-            envs.SGLANG_OPT_BLOCK_FP8_DENSE_PTPC.get()
-            and self.weight_block_size == [128, 128]
+            self.weight_block_size == [128, 128]
             and not self.block_fp8_as_mxfp8
             and layer.weight.dtype == torch.float8_e4m3fn
             and getattr(layer.weight, "_ptpc_weight", None) is None
