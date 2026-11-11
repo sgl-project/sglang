@@ -193,6 +193,10 @@ class FusedRMSNormGate(BaseFusedOp):
         object.__setattr__(self, "_effective_weight", effective_weight)
         object.__setattr__(self, "_weight_cached", True)
 
+    def refresh_cached_weight(self) -> None:
+        object.__setattr__(self, "_weight_cached", False)
+        self._ensure_cached_weight()
+
     def backend_eligible(
         self,
         backend: KernelBackend,

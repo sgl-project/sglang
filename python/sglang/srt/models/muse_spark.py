@@ -226,16 +226,32 @@ class MuseSpark1xRouter(nn.Module):
         self._split2_key = None
 
     @torch.no_grad()
+    def _split2_parts(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        w = self.weight.data
+        hi = w.to(torch.bfloat16)
+        lo = (w - hi.to(torch.float32)).to(torch.bfloat16)
+        return hi.t(), lo.t()
+
+    @torch.no_grad()
     def _build_split2(self) -> None:
         w = self.weight.data
         key = (w.data_ptr(), w.shape, w._version)
         if self._split2_key == key:
             return
-        hi = w.to(torch.bfloat16)
-        lo = (w - hi.to(torch.float32)).to(torch.bfloat16)
-        self._split2_hi = hi.t().contiguous()
-        self._split2_lo = lo.t().contiguous()
+        hi, lo = self._split2_parts()
+        self._split2_hi = hi.contiguous()
+        self._split2_lo = lo.contiguous()
         self._split2_key = key
+
+    @torch.no_grad()
+    def refresh_split2(self) -> None:
+        # A weight sync rewrites self.weight in place, which the _build_split2 key
+        # does not see; in place here because CUDA graphs hold these addresses.
+        if self._split2_hi is None:
+            return
+        hi, lo = self._split2_parts()
+        self._split2_hi.copy_(hi)
+        self._split2_lo.copy_(lo)
 
     def forward_split2(self, hidden_states: torch.Tensor) -> torch.Tensor:
         self._build_split2()
@@ -1627,6 +1643,15 @@ class MuseSparkTextForCausalLM(nn.Module):
         for module in self.modules():
             if isinstance(module, MuseSpark1xRMSNorm):
                 module.precompute_effective_weight()
+        # Kernel-side copies: a memory-saver pause/resume zeroes them,
+        # and a weight sync rewrites only the Parameters.
+        for layer in self.model.language_model.layers:
+            layer._fused_attn_boundary.refresh_cached_weights(layer.operator_dtype)
+            if layer._fused_ffn_boundary is not None:
+                layer._fused_ffn_boundary.refresh_cached_weights(layer.operator_dtype)
+            layer.self_attn._fused_o_norm_gate.refresh_cached_weight()
+            if layer.is_moe_layer:
+                layer.mlp.gate.refresh_split2()
         # Must follow precompute_effective_weight: the finalize op binds the weight.
         for module in self.modules():
             if (
