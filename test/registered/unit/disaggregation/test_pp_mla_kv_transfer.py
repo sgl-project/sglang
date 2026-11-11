@@ -32,6 +32,7 @@ class _StubKVManager:
 
     _mla_kv_entry_span_with_pp = CommonKVManager._mla_kv_entry_span_with_pp
     get_mla_kv_ptrs_with_pp = CommonKVManager.get_mla_kv_ptrs_with_pp
+    cp_layer_split = False
 
     def __init__(
         self,
