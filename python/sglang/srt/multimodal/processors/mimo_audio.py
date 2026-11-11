@@ -7,6 +7,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import pybase64
@@ -205,8 +206,12 @@ class MiMoAudioPipeline:
                             f"error={type(e).__name__}: {e}, url={audio}"
                         )
                         raise
+                elif audio.startswith("file://"):
+                    file = media_io.check_local_media_file(
+                        unquote(urlparse(audio).path)
+                    )
                 else:
-                    file = audio
+                    file = media_io.check_local_media_file(audio)
             if AudioDecoder is None:
                 raise RuntimeError(
                     "torchcodec is required for audio decoding; install with `pip install torchcodec`."

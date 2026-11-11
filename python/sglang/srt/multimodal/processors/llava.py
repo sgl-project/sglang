@@ -25,7 +25,6 @@ from sglang.srt.multimodal.media_io import (
     ImageData,
     get_image_bytes,
     load_image,
-    media_url_timeout,
 )
 from sglang.srt.multimodal.mm_utils import (
     ensure_numpy,
@@ -106,8 +105,8 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
 
     async def _fetch_remote_image_bytes(self, url):
         # Fetch a remote image's compressed bytes in the io thread pool, retrying
-        # only transient network failures. Each attempt is bounded by
-        # REQUEST_TIMEOUT inside download_remote_media, so total time is bounded.
+        # only transient network failures. Each attempt is bounded by the media
+        # URL timeout inside download_remote_media, so total time is bounded.
         loop = asyncio.get_running_loop()
         max_retries = max(0, int(os.environ.get("SGLANG_MM_LOAD_MAX_RETRIES", "2")))
         delay = 0.5
@@ -146,7 +145,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         if self.cpu_executor is not None:
             loop = asyncio.get_running_loop()
             executor = self.cpu_executor
-            timeout = media_url_timeout(10)
+            timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
             deadline = loop.time() + timeout
             try:
                 # ProcessPoolExecutor.submit() can itself block after a worker

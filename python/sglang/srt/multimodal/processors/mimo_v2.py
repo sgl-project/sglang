@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import List, Literal, Optional, Union
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import torch
@@ -26,8 +27,10 @@ from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
 from sglang.srt.multimodal.media_io import (
     ImageData,
     VideoData,
+    check_local_media_file,
     download_remote_media,
     media_url_timeout,
+    read_local_media_file,
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
@@ -487,6 +490,10 @@ class MiMoProcessor:
         else:
             source = path_or_data  # local path or file://
         try:
+            if isinstance(source, str):
+                if source.startswith("file://"):
+                    source = unquote(urlparse(source).path)
+                source = check_local_media_file(source)
             AudioDecoder(source)
             return True
         except Exception:
@@ -1429,10 +1436,13 @@ class MiMoProcessor:
             image_obj = image
         elif isinstance(image, str):
             if image.startswith("http://") or image.startswith("https://"):
-                with BytesIO(download_remote_media(image, timeout=3)) as bio:
+                timeout = media_url_timeout(3)
+                with BytesIO(download_remote_media(image, timeout=timeout)) as bio:
                     image_obj = copy.deepcopy(Image.open(bio))
             elif image.startswith("file://"):
-                image_obj = Image.open(image[7:])
+                image_obj = Image.open(
+                    BytesIO(read_local_media_file(unquote(urlparse(image).path)))
+                )
             elif image.startswith("data:image"):
                 if "base64," in image:
                     _, base64_data = image.split("base64,", 1)
@@ -1440,7 +1450,7 @@ class MiMoProcessor:
                     with BytesIO(data) as bio:
                         image_obj = copy.deepcopy(Image.open(bio))
             else:
-                image_obj = Image.open(image)
+                image_obj = Image.open(BytesIO(read_local_media_file(image)))
         else:
             image_obj = Image.open(BytesIO(image))
         if image_obj is None:
