@@ -1,6 +1,6 @@
 ---
 title: Ornith-1.0
-description: "Deploy DeepReinforce Ornith-1.0 with SGLang - a self-improving agentic-coding model family with 397B, 35B, and 9B checkpoints plus FP8 and GGUF variants, and BF16 9B/35B recipes for Intel Xeon CPUs."
+description: "Deploy DeepReinforce Ornith-1.0 with SGLang - a self-improving agentic-coding model family with 397B, 35B, and 9B checkpoints plus FP8 and GGUF variants."
 ---
 
 ## Deployment
@@ -40,8 +40,6 @@ For how to launch the image, see [Install -> Method 3: Using Docker](../../../do
 </Accordion>
 
 Pick an Ornith checkpoint to generate the launch command. The non-FP8 397B recipe requires an H200 single node in this matrix. The 397B-FP8 recipe is available on H100 and H200 with TP=8; H100 also supports the 35B and 9B checkpoints. The 35B recipes use tensor parallelism 2 in this matrix. The 9B checkpoint is dense and serves on a single GPU by default; the command panel makes that default explicit with `--tp 1`.
-
-The **XEON** Python recipes cover `deepreinforce-ai/Ornith-1.0-9B` and `deepreinforce-ai/Ornith-1.0-35B` in BF16. Basic chat generation passed on Intel Xeon CPUs (6972P, TP6) with unmodified SGLang revision `99fd01047d67bb249641a8e50282a1a5218afc63`. Each recipe pins its independently tested checkpoint and an 8,192-token cache; full-context capacity, dataset accuracy, and performance were not evaluated on CPU. Use an installed SGLang CPU environment with its OpenMP and allocator setup. CPU parser overrides and FP8 variants are not enabled because they did not pass this verification.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/deepreinforce-ai/ornith-1.0.jsx";
@@ -119,7 +117,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}><a href="https://huggingface.co/deepreinforce-ai/Ornith-1.0-9B">deepreinforce-ai/Ornith-1.0-9B</a></td>
       <td style={{padding: "9px 12px"}}>BF16</td>
-      <td style={{padding: "9px 12px"}}>H100 / H200 / XEON</td>
+      <td style={{padding: "9px 12px"}}>H100 / H200</td>
       <td style={{padding: "9px 12px"}}>Dense 9B checkpoint; the model card describes it as designed for efficient single-GPU deployment.</td>
     </tr>
     <tr>

@@ -54,15 +54,6 @@ import { benchmarks } from "/src/snippets/configs/meta-models/muse-glimmer-bench
 
 <Deployment config={config} benchmarks={benchmarks} />
 
-The **XEON / BF16 / Standard** recipe passed basic text generation on Intel
-Xeon CPUs (6972P, TP6) with unmodified SGLang revision
-`99fd01047d67bb249641a8e50282a1a5218afc63`. It pins checkpoint revision
-`cec94fcfd6512f2cfe708138c32533b346ea4f69`, uses BF16 and an 8,192-token cache,
-and requires a CPU-enabled environment with its OpenMP and allocator setup.
-The checkpoint is loaded intact; no language-only model override is added.
-Image inputs, parser separation, speculative decoding, full context, dataset
-accuracy and performance were not verified on CPU.
-
 ## Playground
 
 Use the Playground to test SGLang features that are not in the verified matrix. The Deploy panel above shows only combinations that the SGLang team has verified. The Playground lets you add more options to the command from the Deploy panel.

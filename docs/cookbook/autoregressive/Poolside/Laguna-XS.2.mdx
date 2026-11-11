@@ -78,16 +78,6 @@ import { LagunaXS2Deployment } from '/src/snippets/autoregressive/laguna-xs2-dep
 
 <LagunaXS2Deployment />
 
-The **XEON / BF16** recipe passed basic text generation on Intel Xeon CPUs
-(6972P, TP4) with unmodified SGLang revision
-`99fd01047d67bb249641a8e50282a1a5218afc63`. TP6 did not satisfy checkpoint
-sharding alignment. The CPU recipe pins revision
-`a397bde04501591d0ac3d74a5d9d0a4ec298ffb8` and an 8,192-token cache; use a
-CPU-enabled environment with its OpenMP and allocator setup rather than the
-CUDA installation commands above. Full context, dataset accuracy, performance,
-parser separation and DP attention were not verified on CPU. FP8 and NVFP4
-CPU checkpoints are not enabled.
-
 ### 3.2 Configuration Tips
 
 - **Trust remote code** (`--trust-remote-code`): Laguna-XS.2 ships custom modeling/config code on the Hugging Face Hub, so this flag is required for the server to load the model.

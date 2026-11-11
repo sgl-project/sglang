@@ -1,6 +1,6 @@
 ---
 title: Granite 4.2
-description: "Deploy Granite 4.2 3B, 8B, and 30B dense models with SGLang on NVIDIA H200 and B200, plus basic generation on Intel Xeon CPUs."
+description: "Deploy Granite 4.2 3B, 8B, and 30B dense models with SGLang on NVIDIA H200 and B200, including thinking modes and structured tool calling."
 tag: NEW
 ---
 
@@ -10,9 +10,7 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle for GPUs.
-
-For **XEON**, use a CPU-enabled environment with its CPU runtime libraries and `LD_PRELOAD` setup, instead of the GPU installation paths below. The Python-only 3B, 8B and 30B recipes were checked on Intel Xeon 6972P using upstream SGLang commit `99fd01047d67bb249641a8e50282a1a5218afc63`, PyTorch `2.14.0+cpu`, Transformers `5.19.0`, and `sglang-kernel-cpu` `0.4.10`; no runtime changes were required.
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
 
 <Tabs>
 
@@ -43,8 +41,6 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 </Accordion>
 
 Pick a Granite 4.2 checkpoint to generate the launch command. The verified matrix covers BF16 serving on one NVIDIA H200 or B200 with tensor parallelism 1.
-
-The **XEON** option covers `ibm-granite/granite-4.2-3b` at checkpoint revision `4e9c275e232f10211ec88644d106a1f6a1b60e06`, `ibm-granite/granite-4.2-8b` at revision `a7042144125ce5ae64f89610e8289647fc000b9a`, and `ibm-granite/granite-4.2-30b` at revision `9e668ce1c538387ef24d3644e9b0606647762636`, all at TP6 with BF16 weights and an 8,192-token cache. Each check covered one greedy text-generation request and a normal completion, not the full 131,072-token context, dataset accuracy, tools, parser behavior, or performance. Playground overrides are disabled because they were not separately validated.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/ibm-granite/granite-4.2.jsx";

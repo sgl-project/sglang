@@ -50,7 +50,6 @@ import { InternS2PreviewDeployment } from "/src/snippets/autoregressive/intern-s
 
 ### 3.2 Configuration Tips
 
-- Intel Xeon CPUs support the pinned BF16 text-generation recipe in the selector above. It was quick-verified on Intel Xeon 6972P with TP4 and an 8192-token KV-cache cap, using the CPU engine and its Intel OpenMP/allocator library environment. TP6 cannot divide the model's 16 attention heads. This check does not establish image-input, parser, MTP, maximum-context, or dataset accuracy support; those options remain disabled on Xeon. The Xeon recipe runs in Python, not the NVIDIA Docker image above.
 - Use `tp>=2` for the NVIDIA deployment commands.
 - Use `--reasoning-parser qwen3` to separate reasoning content from final content in streaming responses.
 - Use `--tool-call-parser qwen3_coder` when serving tool-calling workloads.
