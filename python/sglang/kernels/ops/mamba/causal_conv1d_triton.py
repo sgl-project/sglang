@@ -20,7 +20,7 @@ PAD_SLOT_ID = -1
 CAUSAL_CONV1D_FWD_BLOCK_M = 8
 
 
-@triton.jit()
+@triton.jit(do_not_specialize=["num_cache_lines"])
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
     x_ptr,  # (dim, cu_seqlen) holding `batch` of actual sequences + padded sequences
@@ -35,7 +35,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     # Matrix dimensions
     dim: tl.constexpr,
     total_tokens: tl.int32,  # cu_seqlen
-    num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
+    # Runtime and unspecialized: a staged copy of the state pool is sized by the
+    # batch, so a constexpr here recompiles for every batch size.
+    num_cache_lines,
     # Strides
     stride_x_seq: tl.constexpr,  # stride to get to next sequence,
     stride_x_dim: tl.constexpr,  # stride to get to next feature-value,
