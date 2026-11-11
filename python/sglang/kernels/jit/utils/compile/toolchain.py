@@ -13,6 +13,7 @@ and ``tvm_ffi.load_module`` for loading the result.
 
 from __future__ import annotations
 
+import glob
 import logging
 import os
 import pathlib
@@ -52,6 +53,20 @@ def cuda_home() -> str:
     if nvcc_path is not None:
         return os.path.dirname(os.path.dirname(nvcc_path))
     return "/usr/local/cuda"
+
+
+def cuda_lib_dir(home: str) -> str:
+    """Return the subdirectory of `home` that holds libcudart.
+
+    System CUDA toolkits use ``lib64/``; the ``nvidia-*`` pip wheels use ``lib/``.
+    Falls back to ``lib64`` when neither has libcudart, so behaviour on
+    machines without CUDA (CPU CI, tests) is unchanged.
+    """
+    for name in ("lib64", "lib"):
+        path = os.path.join(home, name)
+        if glob.glob(os.path.join(glob.escape(path), "libcudart.so*")):
+            return path
+    return os.path.join(home, "lib64")
 
 
 @cache_once
