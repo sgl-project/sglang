@@ -584,9 +584,14 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
     def test_queued_reads_do_not_evict_host_cache_before_io_is_ready(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
-        for cancel in (False, True):
+        for native, cancel in (
+            (False, False),
+            (False, True),
+            (True, False),
+            (True, True),
+        ):
             with (
-                self.subTest(cancel=cancel),
+                self.subTest(native=native, cancel=cancel),
                 hicache(self, namespace_keys=True) as owner,
             ):
                 _, cache, service, dma = owner
@@ -600,6 +605,22 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 requests = [
                     CacheRequestHandle(f"bounded-read-{i}", 0) for i in range(3)
                 ]
+                results = []
+
+                def submit(index):
+                    if native:
+                        result = self._restore(
+                            service, scopes[index], f"native-{index}"
+                        )
+                        results.append(result)
+                        reads = service.control.executor.storage_reads
+                        requests[index] = reads.interests[
+                            result.ref.operation_id
+                        ].job.handle
+                    else:
+                        self._ordinary_prefetch(
+                            cache, service, scopes[index], requests[index]
+                        )
 
                 def blocked_get(*args, **kwargs):
                     entered.set()
@@ -617,10 +638,10 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         patch.object(cache, "prefetch_threshold", 1),
                         patch.object(cache, "prefetch_stop_policy", "wait_complete"),
                     ):
-                        self._ordinary_prefetch(cache, service, scopes[0], requests[0])
+                        submit(0)
                         wait_for(service, started)
-                        for scope, request in zip(scopes[1:], requests[1:]):
-                            self._ordinary_prefetch(cache, service, scope, request)
+                        submit(1)
+                        submit(2)
 
                         def queried():
                             cache.drain_storage_control_queues()
@@ -642,10 +663,13 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                             cache.ongoing_prefetch[requests[2]].host_indices
                         )
                         if cancel:
-                            borrowed = self._restore(
-                                service, scopes[2], "deferred-owner"
-                            )
-                            cache.release_aborted_request(requests[2])
+                            if native:
+                                borrowed = results[2]
+                            else:
+                                borrowed = self._restore(
+                                    service, scopes[2], "deferred-owner"
+                                )
+                                cache.release_aborted_request(requests[2])
                             service.control.cancel(borrowed.ref)
                             self.assertEqual(
                                 wait(service, borrowed).status, Status.CANCELLED
@@ -653,13 +677,19 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                             self.assertFalse(release.is_set())
                             self.assertNotIn(requests[2], cache.ongoing_prefetch)
                         release.set()
-                        for request in requests[:2] if cancel else requests:
-                            self.assertEqual(
-                                self._consume_ordinary_prefetch(
-                                    cache, service, request
-                                ),
-                                (24, 0),
-                            )
+                        for index in range(2 if cancel else 3):
+                            if native:
+                                self.assertEqual(
+                                    wait(service, results[index]).status,
+                                    Status.COMPLETED,
+                                )
+                            else:
+                                self.assertEqual(
+                                    self._consume_ordinary_prefetch(
+                                        cache, service, requests[index]
+                                    ),
+                                    (24, 0),
+                                )
                         pool = cache.host_pool_group.anchor_entry.host_pool
                         for index, target in enumerate(
                             scopes[:2] if cancel else scopes
@@ -682,9 +712,13 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                                 )
                 finally:
                     release.set()
-                    for request in requests:
-                        if request in cache.ongoing_prefetch:
-                            self._consume_ordinary_prefetch(cache, service, request)
+                    if native:
+                        for result in results:
+                            wait(service, result)
+                    else:
+                        for request in requests:
+                            if request in cache.ongoing_prefetch:
+                                self._consume_ordinary_prefetch(cache, service, request)
                     if borrowed is not None:
                         wait(service, borrowed)
                 assert_retired(cache, service)
@@ -1095,8 +1129,12 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     patch.object(cache, "prefetch_stop_policy", "wait_complete"),
                 ):
                     queued = self._restore(service, target, "pinned-native")
-                    self.assertEqual(
-                        current(service, queued).update.code, "whole_scope_capacity"
+                    wait_for(
+                        service,
+                        lambda: (
+                            current(service, queued).update.code
+                            == "whole_scope_capacity"
+                        ),
                     )
                     self._ordinary_prefetch(cache, service, target, demand)
                     self.assertIn(
@@ -1105,7 +1143,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     done = wait(service, queued)
                     self.assertEqual(done.status, Status.DEFERRED)
                     self.assertEqual(done.update.code, "whole_scope_capacity")
-                    self.assertFalse(queries)
+                    self.assertEqual(len(queries), 1)
                     self.assertEqual(
                         self._consume_ordinary_prefetch(cache, service, demand),
                         (0, None),
@@ -1123,7 +1161,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         self._consume_ordinary_prefetch(cache, service, demand),
                         (0, None),
                     )
-                    self.assertEqual(len(queries), 1)
+                    self.assertEqual(len(queries), 2)
                     self.assertTrue(cache.check_prefetch_progress(demand))
                     self.assertFalse(cache.has_ongoing_prefetch(demand))
                     self.assertEqual(cc.mem_pool_host.available_size(), 0)
@@ -1487,9 +1525,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             assert_retired(cache, service)
             cache.sanity_check()
 
-    def test_query_stage_host_reservation_prevents_double_approval_and_cancellation_waits(
-        self,
-    ):
+    def test_query_stage_has_no_host_allocation_and_cancellation_drains(self):
         with hicache(self, namespace_keys=True) as owner:
             _, cache, service, _ = owner
             scopes = [
@@ -1501,8 +1537,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             self._pin_pressure(service, pressure)
             cc = cache.cache_controller
             entered, release = threading.Event(), threading.Event()
-            query = cc._storage_hit_query
-            queries = []
+            query, queries = cc._storage_hit_query, []
 
             def blocked_query(operation):
                 queries.append(operation)
@@ -1521,24 +1556,31 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     wait_for(service, entered.is_set)
                     second = self._restore(service, scopes[1], "capacity-second")
                     reads = service.control.executor.storage_reads
-                    second_job = reads.interests[second.ref.operation_id].job
-                    self.assertEqual(
-                        current(service, second).update.code, "whole_scope_capacity"
+                    self.assertEqual(reads.snapshot()["reserved_host_tokens"], 0)
+                    self.assertEqual(reads.snapshot()["inflight_tokens"], 80)
+                    self.assertTrue(
+                        all(
+                            info.host_indices is None
+                            for info in cache.ongoing_prefetch.values()
+                        )
                     )
-                    self.assertEqual(reads._unallocated_reservations(second_job), 40)
-                    self.assertEqual(evictions.call_args.args, (20,))
+                    self.assertEqual(cc.mem_pool_host.available_size(), 60)
                     self.assertEqual(
                         service.control.cancel(first.ref).status, Status.CANCELLING
                     )
                     for _ in range(10):
                         service.progress()
                     self.assertEqual(len(queries), 1)
-                    self.assertEqual(evictions.call_count, 1)
-                    self.assertEqual(reads._unallocated_reservations(second_job), 40)
+                    evictions.assert_not_called()
+                    self.assertEqual(
+                        cc.storage_read_stats_snapshot()["storage_read_get_batches"], 0
+                    )
                     release.set()
                     self.assertEqual(wait(service, first).status, Status.CANCELLED)
                     self.assertEqual(wait(service, second).status, Status.COMPLETED)
                     self.assertEqual(len(queries), 2)
+                    self.assertEqual(cc.mem_pool_host.available_size(), 20)
+                    evictions.assert_not_called()
             finally:
                 release.set()
                 self._pin_pressure(service, pressure, mode="release")
@@ -1829,6 +1871,106 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             assert_retired(cache, service)
             cache.sanity_check()
 
+    def test_missing_storage_hint_preserves_host_cache_before_query(self):
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            rows = self._host_pressure(owner)
+            indices = [node.component_data[FULL].host_value.clone() for node, _ in rows]
+            result = self._restore(service, cache_fixtures.target(), "absent")
+            done = wait(service, result)
+            self.assertEqual(done.status, Status.MISSING)
+            self.assertEqual(done.update.code, "missing_copy")
+            self.assertEqual(cache.cache_controller.mem_pool_host.available_size(), 0)
+            pool = cache.host_pool_group.anchor_entry.host_pool
+            for index, ((node, _), original) in enumerate(zip(rows, indices)):
+                self.assertTrue(
+                    torch.equal(node.component_data[FULL].host_value, original)
+                )
+                self.assertTrue(torch.all(pool.k_buffer[0][original] == 11 + index))
+                self.assertTrue(torch.all(pool.v_buffer[0][original] == 12 + index))
+            stats = cache.cache_controller.storage_read_stats_snapshot()
+            self.assertEqual(stats["storage_read_query_jobs"], 1)
+            self.assertEqual(stats["storage_read_get_batches"], 0)
+            assert_retired(cache, service)
+            cache.sanity_check()
+
+    def test_query_anchor_loss_defers_without_reading_into_stale_rows(self):
+        with hicache(self, namespace_keys=True) as owner:
+            cache, service, _ = cold_prefix(owner)
+            prefix = transfer(
+                service, src="storage", dst="host", tokens=(1, 2), message="prefix"
+            )
+            self.assertEqual(wait(service, prefix).status, Status.COMPLETED)
+            cc = cache.cache_controller
+            query = cc._storage_hit_query
+            entered, release = threading.Event(), threading.Event()
+
+            def blocked_query(operation):
+                entered.set()
+                assert release.wait(5)
+                return query(operation)
+
+            try:
+                with patch.object(cc, "_storage_hit_query", blocked_query):
+                    result = transfer(
+                        service, src="storage", dst="host", message="lost-anchor"
+                    )
+                    wait_for(service, entered.is_set)
+                    self.assertEqual(cache.evict_host(2), 2)
+                    release.set()
+                    done = wait(service, result)
+                    self.assertEqual(done.status, Status.DEFERRED)
+                    self.assertEqual(done.update.code, "source_changed")
+            finally:
+                release.set()
+            self.assertEqual(
+                cc.storage_read_stats_snapshot()["storage_read_get_batches"], 1
+            )
+            assert_retired(cache, service)
+            cache.sanity_check()
+
+    def test_capacity_wait_does_not_block_smaller_ordinary_read(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            large = cache_fixtures.target(tuple(range(1, 9)), cache_salt="large")
+            small = cache_fixtures.target(cache_salt="small")
+            self._cold_scopes(owner, [large, small])
+            pressure = self._host_pressure(owner, leave_free=4)
+            self._pin_pressure(service, pressure)
+            demand = CacheRequestHandle("small-read", 0)
+            try:
+                with (
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    result = self._restore(service, large, "large-wait")
+                    wait_for(
+                        service,
+                        lambda: (
+                            current(service, result).update.code
+                            == "whole_scope_capacity"
+                        ),
+                    )
+                    self._ordinary_prefetch(cache, service, small, demand)
+                    self.assertEqual(
+                        self._consume_ordinary_prefetch(cache, service, demand)[0], 4
+                    )
+                    self.assertEqual(
+                        current(service, result).update.code, "whole_scope_capacity"
+                    )
+                    self.assertEqual(
+                        cache.cache_controller.mem_pool_host.available_size(), 0
+                    )
+                    service.control.cancel(result.ref)
+                    self.assertEqual(wait(service, result).status, Status.CANCELLED)
+            finally:
+                cache.release_aborted_request(demand)
+                self._pin_pressure(service, pressure, mode="release")
+            assert_retired(cache, service)
+            cache.sanity_check()
+
     def _host_pressure(self, owner, *, leave_free=0):
         """Fill real host rows via native HiCache backup; keep GPU empty."""
         _, cache, service, dma = owner
@@ -1905,8 +2047,9 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                             iter(service.control.executor.storage_reads.jobs.values())
                         ).operation
                     )
-                    self.assertEqual(evictions.call_args_list[0].args, (2,))
+                    evictions.assert_not_called()
                     done = wait(service, result)
+                    self.assertEqual(evictions.call_args_list[0].args, (2,))
                 self.assertEqual(done.status, Status.COMPLETED)
                 self.assertEqual(evictions.call_count, 1)
                 self.assertIsNone(first.component_data[FULL].host_value)
@@ -1967,10 +2110,19 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     message="other",
                     tokens=(1, 2),
                 )
+                wait_for(
+                    service,
+                    lambda: (
+                        current(service, first).update.code == "whole_scope_capacity"
+                    ),
+                )
                 for _ in range(20):
                     service.progress()
                 self.assertEqual(evictions.call_count, 1)
-                self.assertEqual(queries.call_count, 0)
+                self.assertEqual(queries.call_count, 1)
+                self.assertEqual(
+                    cc.storage_read_stats_snapshot()["storage_read_get_batches"], 0
+                )
                 self.assertEqual(
                     current(service, first).update.code, "whole_scope_capacity"
                 )
@@ -2050,7 +2202,12 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             self._pin_pressure(service, rows)
             with patch.object(cache, "evict_host", wraps=cache.evict_host) as evictions:
                 result = transfer(service, src="storage", dst="host", message="waiting")
-                self.assertEqual(current(service, result).status, Status.QUEUED)
+                wait_for(
+                    service,
+                    lambda: (
+                        current(service, result).update.code == "whole_scope_capacity"
+                    ),
+                )
                 self.assertEqual(evictions.call_count, 1)
                 self._pin_pressure(service, rows[1:2], mode="release")
                 count = len(rows[1][1])
@@ -2073,11 +2230,17 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 result = public_transfer(
                     service, "prefetch", "storage", "host", "expired"
                 )
+                wait_for(
+                    service,
+                    lambda: (
+                        current(service, result).update.code == "whole_scope_capacity"
+                    ),
+                )
                 self.assertEqual(evictions.call_count, 1)
                 self._pin_pressure(service, rows, mode="release")
                 self.clock.now = 106
                 service.progress()
-                self.assertEqual(current(service, result).status, Status.CANCELLED)
+                self.assertEqual(wait(service, result).status, Status.CANCELLED)
                 self.assertEqual(evictions.call_count, 1)
             self.assertEqual(cache.cache_controller.mem_pool_host.available_size(), 0)
             self.assertTrue(
@@ -2285,6 +2448,10 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         wait_for(service, started)
                         hint = transfer(service, message="late")
                         self.assertEqual(hint.status, Status.RUNNING)
+                        self.assertEqual(hint.update.code, "storage_pending")
+                        self.assertEqual(
+                            reads.snapshot()["waiting_whole_scope_capacity"], 0
+                        )
                         self.assertIs(reads.jobs[demand].operation, operation)
                         if cancel is None:
                             longer = public_transfer(

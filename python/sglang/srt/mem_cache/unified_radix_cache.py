@@ -3293,7 +3293,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.revoke_pending_prefetch(request)
                 return True
 
+            operation.host_allocation_deferred = None
             if defer_read_staging and not cc.prefetch_buffer.empty():
+                operation.host_allocation_deferred = "io"
                 # The single I/O consumer needs at most one ready successor.
                 # Keep later hits allocation-free instead of evicting useful L2
                 # entries while they wait for storage I/O.
@@ -3351,15 +3353,24 @@ class UnifiedRadixCache(BasePrefixCache):
                     operation, info, hit_tokens, aux_hit_tokens
                 )
             aux_hit_tokens = hit_tokens
-            host_indices, alloc_len = cc.allocate_storage_hit(
-                operation,
-                hit_tokens,
-                allow_partial=not hasattr(operation, "native_prefetch_threshold"),
-                min_tokens=getattr(
-                    operation, "native_prefetch_threshold", self.prefetch_threshold
-                ),
-                evict_host=self.evict_host,
-            )
+            allocator = getattr(operation, "native_allocate_host", None)
+            if allocator is not None:
+                allocation = allocator(hit_tokens)
+                if allocation is None:
+                    operation.host_allocation_deferred = "host"
+                    return False
+                host_indices, alloc_len = allocation
+                info = self.ongoing_prefetch[request]
+            else:
+                host_indices, alloc_len = cc.allocate_storage_hit(
+                    operation,
+                    hit_tokens,
+                    allow_partial=not hasattr(operation, "native_prefetch_threshold"),
+                    min_tokens=getattr(
+                        operation, "native_prefetch_threshold", self.prefetch_threshold
+                    ),
+                    evict_host=self.evict_host,
+                )
             if host_indices is None:
                 self._finish_storage_prefetch(
                     request, fulfilled_tokens=0, reason="host_capacity"
@@ -3404,11 +3415,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 # separate queue may retain a retired request or its buffers.
                 for info in tuple(self.ongoing_prefetch.values()):
                     operation = info.operation
-                    if getattr(operation, "waiting_for_io_slot", False):
+                    if getattr(operation, "host_allocation_deferred", False):
                         if not _try_alloc_storage_hit(operation):
-                            deferred_ahead = True
-                            break
-                        operation.waiting_for_io_slot = False
+                            if operation.host_allocation_deferred == "io":
+                                deferred_ahead = True
+                                break
             # Parked hits first (FIFO fairness with retries; buffer only).
             if buffer_mode:
                 parked = self.buffer_pipeline.pending_hit_allocs
@@ -3469,14 +3480,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 parked_ahead = deferred_ahead or (
                     buffer_mode and bool(self.buffer_pipeline.pending_hit_allocs)
                 )
+                if parked_ahead:
+                    operation.host_allocation_deferred = "io"
                 if parked_ahead or not _try_alloc_storage_hit(operation):
                     # Counted once at first parking, not per retry tick.
                     self._prefetch_outcome_stats["declined_rate_limited"] += 1
                     if buffer_mode:
                         self.buffer_pipeline.pending_hit_allocs.append(operation)
                     else:
-                        operation.waiting_for_io_slot = True
-                        deferred_ahead = True
+                        deferred_ahead = operation.host_allocation_deferred == "io"
 
         def _drain_ack_prefetch():
             for ack in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):

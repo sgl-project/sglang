@@ -47,12 +47,12 @@ class _Read:
     failure: tuple[str, str] | None = None
     failure_status: Status = Status.FAILED
     cancel_requested: bool = False
-    waiting: str = "whole_scope_capacity"
+    waiting: str = ""
     demands: set[CacheRequestHandle] = field(default_factory=set)
     retired: bool = False
     loaded_span: tuple[int, int | None] = (0, None)
     published_host_node: int | None = None
-    reserved_host_tokens: int = 0
+    requested_tokens: int = 0
     created_at: float = field(default_factory=time.monotonic)
     started_at: float | None = None
 
@@ -133,10 +133,10 @@ class StorageCacheReads:
             queued_jobs=sum(job.operation is None for job in self.jobs.values()),
             demand_waiters=len(self.demands),
             admission_held_tokens=self._admission_tokens,
-            reserved_host_tokens=self._unallocated_reservations(None),
-            inflight_tokens=sum(job.reserved_host_tokens for job in active),
+            reserved_host_tokens=0,
+            inflight_tokens=sum(job.requested_tokens for job in active),
             speculative_inflight_tokens=sum(
-                job.reserved_host_tokens for job in active if not job.demands
+                job.requested_tokens for job in active if not job.demands
             ),
         )
         pool = self.cache.cache_controller.mem_pool_host
@@ -153,8 +153,7 @@ class StorageCacheReads:
             "source_pending",
         ):
             stats["waiting_" + reason] = sum(
-                job.operation is None and job.waiting == reason
-                for job in self.jobs.values()
+                job.waiting == reason for job in self.jobs.values()
             )
         return stats
 
@@ -481,6 +480,10 @@ class StorageCacheReads:
     def _observe_publication(self, job):
         job.operation.native_quiescent = False
         job.operation.native_on_publish = lambda node: self._published(job, node)
+        if not job.borrowed:
+            job.operation.native_allocate_host = lambda count: self._allocate_host(
+                job, count
+            )
 
     def start(self, work):
         tokens, compatibility = self._scope(work)
@@ -551,20 +554,8 @@ class StorageCacheReads:
             if self.cache.cache_controller.prefetch_rate_limited():
                 job.waiting = "storage_rate_limit"
                 return
-            self._hold(job, rows)
             needed = len(job.tokens) - host_length
-            if not self._host_capacity(job, needed):
-                job.waiting = "whole_scope_capacity"
-                if job.demands:
-                    # Ordinary demand must be able to continue computation
-                    # when PIN/host pressure prevents a complete cold restore.
-                    self._retire(job, status=Status.DEFERRED, code=job.waiting)
-                else:
-                    self._release(job)
-                return
-            # The query has not allocated rows yet. Charge its complete missing
-            # span until the owner observes real allocation or quiescence.
-            job.reserved_host_tokens = len(job.tokens) - host_length
+            job.requested_tokens = needed
             anchor = next(
                 (n for n, _, end in rows if end == host_length),
                 self.cache.tree_core.root_node,
@@ -584,15 +575,17 @@ class StorageCacheReads:
             )
             info = self.cache.ongoing_prefetch.get(job.handle)
             if info is None:
-                job.reserved_host_tokens = 0
+                job.requested_tokens = 0
                 job.waiting = "storage_rate_limit"
                 self._release(job)
                 return
             job.operation = info.operation
+            job.waiting = ""
+            self._release_query_anchor(job)
             job.started_at = time.monotonic()
             self.stats["jobs_started"] += 1
             self.stats["queue_seconds"] += job.started_at - job.created_at
-            self.stats["requested_tokens"] += job.reserved_host_tokens
+            self.stats["requested_tokens"] += job.requested_tokens
             self._observe_publication(job)
         except Exception as error:
             job.failure = (getattr(error, "code", "storage_error"), str(error)[:512])
@@ -633,46 +626,82 @@ class StorageCacheReads:
             for identity in job.interests
         )
 
-    def _unallocated_reservations(self, job):
-        # Allocated scratch is already absent from pool.available_size(). A
-        # cancelled query keeps its promise until its owner-observed drain.
-        return sum(
-            other.reserved_host_tokens
-            for other in self.jobs.values()
-            if other is not job
-            and other.operation is not None
-            and other.operation.host_indices is None
-            and not getattr(other.operation, "native_quiescent", False)
-        )
+    def _release_query_anchor(self, job):
+        self._release(job)
+        info = self.cache.ongoing_prefetch.get(job.handle)
+        if info is not None and info.anchor_lock_params is not None:
+            self.cache.dec_host_lock_ref(info.anchor_node_id, info.anchor_lock_params)
+            self.cache.ongoing_prefetch[job.handle] = info._replace(
+                anchor_lock_params=None
+            )
 
-    def _host_capacity(self, job, needed):
-        """Approve the full missing span, reclaiming only its current shortfall.
+    def _defer_host_allocation(self, job, needed):
+        self._release_query_anchor(job)
+        job.waiting = "whole_scope_capacity"
+        if job.demands:
+            # A real request can recompute instead of waiting behind hard PINs.
+            job.failure_status = Status.DEFERRED
+            job.failure = (
+                job.waiting,
+                "Host capacity cannot restore the complete span",
+            )
+            return None, needed
+        return None
 
-        The caller holds the existing prefix. Eviction honors PIN and transfer
-        references and may reclaim whole nodes beyond the shortfall.
+    def _allocate_host(self, job, needed):
+        """Owner-side allocation after the metadata verdict, never in the query worker.
+
+        None parks a live hint without retaining its source. A failed tuple
+        retires the operation so ordinary demand can fall back immediately.
         """
-        pool = self.cache.cache_controller.mem_pool_host
-        reserved = self._unallocated_reservations(job)
-        available = pool.available_size() - reserved
-        if needed <= available:
-            return True
-        control = self.cache.kv_control_service.control
-        now = control._clock()
-        if now < self._host_reclaim_retry_at:
-            return False
-        # begin_poll precedes controller deadline handling. Do not introduce
-        # host eviction for an expired caller; a live coalesced sibling or
-        # ordinary demand still authorizes the shared physical preparation.
         if not self._has_live_interest(job):
-            return False
-        self.cache.evict_host(needed - available)
-        if needed + reserved > pool.available_size():
-            # Shared across jobs on this host pool: pinned pressure must not
-            # cause a full eviction walk on every owner idle poll/joiner.
+            return None
+        pool = self.cache.cache_controller.mem_pool_host
+        now = self.cache.kv_control_service.control._clock()
+        if pool.available_size() < needed and now < self._host_reclaim_retry_at:
+            return self._defer_host_allocation(job, needed)
+        info = self.cache.ongoing_prefetch[job.handle]
+        if info.anchor_lock_params is None:
+            rows = self._rows(job)
+            start = job.operation.storage_start
+            valid = start == 0 or (
+                self._host_length(job, rows) >= start
+                and any(
+                    node.id == info.anchor_node_id and end == start
+                    for node, _, end in rows
+                )
+            )
+            if not valid:
+                job.failure_status = Status.DEFERRED
+                job.failure = (
+                    "source_changed",
+                    "The query's Host anchor is no longer resident",
+                )
+                return None, needed
+            self._hold(job, [row for row in rows if row[2] <= start])
+            locks = self.cache.inc_host_lock_ref(info.anchor_node_id).to_dec_params()
+            self.cache.ongoing_prefetch[job.handle] = info._replace(
+                anchor_lock_params=locks
+            )
+        shortfall = needed - pool.available_size()
+        if shortfall > 0:
+            self.cache.evict_host(shortfall)
+        if pool.available_size() < needed:
             self._host_reclaim_retry_at = now + 0.1
-            return False
+            return self._defer_host_allocation(job, needed)
+        allocation = self.cache.cache_controller.allocate_storage_hit(
+            job.operation,
+            needed,
+            allow_partial=False,
+            min_tokens=job.operation.native_prefetch_threshold,
+            evict_host=self.cache.evict_host,
+        )
+        if allocation[0] is None:
+            self._host_reclaim_retry_at = now + 0.1
+            return self._defer_host_allocation(job, needed)
         self._host_reclaim_retry_at = 0.0
-        return True
+        job.waiting = ""
+        return allocation
 
     def _observe_cold_result(self, job):
         if (
@@ -760,17 +789,18 @@ class StorageCacheReads:
                     target_outcomes=scopes[end],
                 )
         finally:
-            job.reserved_host_tokens = 0
+            job.requested_tokens = 0
             job.loaded_span = self.cache.pop_prefetch_loaded_span(job.handle)
             if not job.borrowed:
                 self.stats["loaded_tokens"] += job.loaded_span[0]
                 if job.started_at is not None:
                     self.stats["restore_seconds"] += time.monotonic() - job.started_at
             outcome = (
-                "failed"
-                if job.failure
-                else "deferred"
+                "deferred"
                 if status == Status.DEFERRED
+                or (job.failure and job.failure_status == Status.DEFERRED)
+                else "failed"
+                if job.failure
                 else "cancelled"
                 if job.cancel_requested
                 or all(self.interests[i].cancelled for i in job.interests)
@@ -831,11 +861,7 @@ class StorageCacheReads:
             if waiting
             else Status.RUNNING,
             quiescent=waiting,
-            code="draining"
-            if interest.cancelled
-            else job.waiting
-            if waiting
-            else "storage_pending",
+            code="draining" if interest.cancelled else job.waiting or "storage_pending",
         )
 
     def poll(self, ref):
