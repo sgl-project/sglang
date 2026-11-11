@@ -474,14 +474,6 @@ class DllmManager:
             return True
         return len(self.waiting_queue) == 0
 
-    def filter_finished_reqs(self) -> None:
-        self.take(lambda req: req.finished())
-
-    def take(self, pred: Callable[[Req], bool]) -> List[Req]:
-        taken = [req for req in self.waiting_queue if pred(req)]
-        self.waiting_queue._leave(taken)
-        return taken
-
     def _abort(self, recv_req: AbortReq) -> None:
-        for req in self.take(lambda req: recv_req.matches(req.rid)):
+        for req in [r for r in self.waiting_queue if recv_req.matches(r.rid)]:
             self._abort_one(req)
