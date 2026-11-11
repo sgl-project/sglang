@@ -201,3 +201,112 @@ def test_predictor_query_time_in_token_latencies(
     finally:
         state.reset()
         stats_manager.reset()
+
+
+def _run_one_offline_iteration(monkeypatch, predictor_delay, predicted_latency=0.1):
+    """Drive one OFFLINE run_batch+process_batch_result under a virtual clock and
+    return the recorded first-token latency. The predictor blocks the host thread
+    for ``predictor_delay`` (virtual-clock advancement) before returning."""
+    from sglang_simulator.simulation.sglang import scheduler
+    from sglang_simulator.simulation.types import SimulationMode
+
+    hook = scheduler.C_SchedulerHook
+    state = scheduler.StateManager
+    stats_manager = scheduler.request_stats_manager
+    clock = SimpleNamespace(now=100.0)
+
+    def advance(duration):
+        clock.now += duration
+
+    monkeypatch.setattr(
+        scheduler,
+        "time",
+        SimpleNamespace(
+            time=lambda: clock.now, perf_counter=lambda: clock.now, sleep=advance
+        ),
+    )
+    monkeypatch.setattr(hook, "SIM_MODE", SimulationMode.OFFLINE)
+    monkeypatch.setattr(hook, "OVERLAP_SCHEDULE", False)
+    monkeypatch.setattr(hook, "ITERATION_STATS", [])
+    monkeypatch.setattr(hook, "TOTAL_PREDICTOR_TIME_COST", 0.0)
+    monkeypatch.setattr(hook, "SIMULATION_BATCH", None)
+
+    def predict(_batch):
+        advance(predictor_delay)
+        return predicted_latency
+
+    monkeypatch.setattr(
+        hook, "INFERENCE_PREDICTOR", SimpleNamespace(predict_infer_time=predict)
+    )
+
+    req = SimpleNamespace(
+        rid="r1", extend_input_len=4, prefix_indices=[], output_ids=[]
+    )
+    batch = SimpleNamespace(
+        reqs=[req],
+        forward_mode=SimpleNamespace(
+            is_extend=lambda: not req.output_ids, is_decode=lambda: bool(req.output_ids)
+        ),
+    )
+    monkeypatch.setattr(scheduler, "get_obj_from_args", lambda _type_name, obj: obj)
+
+    class GenerationBatchResult:
+        pass
+
+    def run_batch(_self, _batch):
+        advance(0.03)
+        return GenerationBatchResult()
+
+    def process_batch_result(_self, _batch):
+        advance(0.04)
+        req.output_ids.append(1)
+
+    target = SimpleNamespace(
+        _prefetch_kvcache=Mock(),
+        get_new_batch_prefill=Mock(),
+        run_batch=run_batch,
+        process_batch_result=process_batch_result,
+        event_loop_normal=Mock(),
+        init_request_dispatcher=Mock(),
+    )
+    hook.hook(target)
+    state.reset()
+    stats_manager.reset()
+    state.set_last_real_time_ts(clock.now)
+    req_stats = stats_manager.get_req_stats(req.rid)
+    req_stats.created_time = 0.0
+    req_stats.input_length = 4
+    req_stats.output_length = 2
+    req_stats.queue_start = req_stats.queue_end = 0.0
+
+    try:
+        # prefill (extend); process flips the request to decode.
+        advance(0.02)
+        target.run_batch(None, batch)
+        target.process_batch_result(None, batch)
+        # decode: this iteration records the first token latency.
+        advance(0.02)
+        target.run_batch(None, batch)
+        target.process_batch_result(None, batch)
+        return req_stats.gen_token_latencies[0]
+    finally:
+        state.reset()
+        stats_manager.reset()
+
+
+@pytest.mark.parametrize("predictor_delay", [0.0, 0.1, 0.5, 1.0])
+def test_offline_ttft_invariant_to_predictor_query_cost(monkeypatch, predictor_delay):
+    """The recorded first-token latency must not track the predictor query cost (#39042).
+
+    The regression measured up to ~41% TTFT error: a slow predictor inflated the
+    simulated clock because its host-thread blocking was counted as scheduler CPU
+    overhead. With the fix, the decode iteration's recorded latency is the same
+    regardless of how long the predictor query takes.
+    """
+    ttft = _run_one_offline_iteration(monkeypatch, predictor_delay=predictor_delay)
+    # The expected TTFT is the decode iteration's simulated latency, independent of
+    # predictor_delay. Asserted as a constant here; the parametrization above
+    # verifies it does not move with the query cost.
+    assert ttft == pytest.approx(
+        _run_one_offline_iteration(monkeypatch, predictor_delay=0.0)
+    )
