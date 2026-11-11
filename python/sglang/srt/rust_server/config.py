@@ -413,6 +413,7 @@ def _build_metrics_config(ext: ModuleType):
         bucket_e2e_request_latency=obs.bucket_e2e_request_latency,
         bucket_prompt_tokens=token_buckets(obs.prompt_tokens_buckets),
         bucket_generation_tokens=token_buckets(obs.generation_tokens_buckets),
+        goodput_slo=obs.goodput_slo,
     )
 
 

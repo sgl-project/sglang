@@ -363,7 +363,9 @@ pub(crate) struct FrontendMetrics {
     priority_label: bool,
     /// A PD prefill server never observes TTFT, inter-token latency or TPOT.
     prefill: bool,
+    goodput_slo: Option<BTreeMap<String, f64>>,
     num_requests: CounterFamily,
+    num_good_requests: CounterFamily,
     prompt_tokens: CounterFamily,
     generation_tokens: CounterFamily,
     num_so_requests: CounterFamily,
@@ -406,9 +408,14 @@ impl FrontendMetrics {
                 .collect(),
             priority_label: config.priority_label,
             prefill: disaggregation_mode == DisaggregationMode::Prefill,
+            goodput_slo: config.goodput_slo.clone().filter(|slo| !slo.is_empty()),
             num_requests: CounterFamily::new(
                 "sglang:num_requests_total",
                 "Number of requests processed.",
+            ),
+            num_good_requests: CounterFamily::new(
+                "sglang:num_good_requests_total",
+                "Number of requests that finished normally and met every SLO in --goodput-slo.",
             ),
             prompt_tokens: CounterFamily::new(
                 "sglang:prompt_tokens_total",
@@ -566,9 +573,10 @@ impl FrontendMetrics {
             .clone()
     }
 
-    fn counters(&self) -> [&CounterFamily; 6] {
+    fn counters(&self) -> [&CounterFamily; 7] {
         [
             &self.num_requests,
+            &self.num_good_requests,
             &self.prompt_tokens,
             &self.generation_tokens,
             &self.num_so_requests,
@@ -786,20 +794,45 @@ impl RequestMetrics {
             }
         }
         series.num_requests.inc(1);
+        let e2e_latency = (now - self.created_at).as_secs_f64();
+        let decode = now.saturating_duration_since(first_token_at).as_secs_f64();
+        if matches!(finish_type, Some("stop" | "length"))
+            && let Some(slo) = &self.metrics.goodput_slo
+            && !self.metrics.prefill
+        {
+            let ttft = first_token_at
+                .saturating_duration_since(self.created_at)
+                .as_secs_f64();
+            let tpot = if self.completion_tokens > 1 {
+                decode / (self.completion_tokens - 1) as f64
+            } else {
+                0.0
+            };
+            let good = slo.iter().all(|(name, threshold)| {
+                let observed_ms = match name.as_str() {
+                    "ttft" => ttft * 1000.0,
+                    "tpot" => tpot * 1000.0,
+                    "e2el" => e2e_latency * 1000.0,
+                    _ => return false,
+                };
+                observed_ms <= *threshold
+            });
+            if good {
+                let mut labels = series.labels.clone();
+                labels.push(("is_streaming".into(), self.stream.to_string()));
+                self.metrics.num_good_requests.series(&labels).inc(1);
+            }
+        }
         if self.has_grammar {
             series.num_so_requests.inc(1);
         }
-        series
-            .e2e_request_latency
-            .observe((now - self.created_at).as_secs_f64());
+        series.e2e_request_latency.observe(e2e_latency);
         if let Some(histogram) = &series.time_per_output_token
             && matches!(finish_type, Some("stop" | "length"))
             && self.completion_tokens > 1
+            && decode > 0.0
         {
-            let decode = now.saturating_duration_since(first_token_at).as_secs_f64();
-            if decode > 0.0 {
-                histogram.observe(decode / (self.completion_tokens - 1) as f64);
-            }
+            histogram.observe(decode / (self.completion_tokens - 1) as f64);
         }
         series
             .prompt_tokens_histogram
@@ -895,6 +928,7 @@ mod tests {
         let label_names = |name: &str| {
             let extra = match name {
                 "sglang:num_requests_total"
+                | "sglang:num_good_requests_total"
                 | "sglang:prompt_tokens_total"
                 | "sglang:generation_tokens_total"
                 | "sglang:time_to_first_token_seconds"
@@ -1155,6 +1189,101 @@ mod tests {
             ),
             Some(2.0)
         );
+    }
+
+    /// The Rust fixture's new family must count exactly the requests that meet
+    /// its configured SLOs, not become an always-on or always-empty counter.
+    #[test]
+    fn goodput_counts_only_normal_requests_meeting_slos() {
+        let lenient = || {
+            BTreeMap::from([
+                ("ttft".to_string(), 100000.0),
+                ("tpot".to_string(), 100000.0),
+                ("e2el".to_string(), 100000.0),
+            ])
+        };
+        let abort = Some(FinishReason::Known(FinishKind::Abort(Box::new(
+            AbortReason {
+                message: None,
+                status_code: None,
+                err_type: None,
+            },
+        ))));
+        for (name, goodput_slo, mode, finish_reason, expected) in [
+            (
+                "met",
+                Some(lenient()),
+                DisaggregationMode::Null,
+                stop(),
+                Some(1.0),
+            ),
+            (
+                "ttft missed",
+                Some(BTreeMap::from([("ttft".to_string(), 0.000001)])),
+                DisaggregationMode::Null,
+                stop(),
+                None,
+            ),
+            (
+                "tpot missed",
+                Some(BTreeMap::from([("tpot".to_string(), 0.000001)])),
+                DisaggregationMode::Null,
+                stop(),
+                None,
+            ),
+            (
+                "e2el missed",
+                Some(BTreeMap::from([("e2el".to_string(), 0.000001)])),
+                DisaggregationMode::Null,
+                stop(),
+                None,
+            ),
+            ("disabled", None, DisaggregationMode::Null, stop(), None),
+            (
+                "empty",
+                Some(BTreeMap::new()),
+                DisaggregationMode::Null,
+                stop(),
+                None,
+            ),
+            (
+                "aborted",
+                Some(lenient()),
+                DisaggregationMode::Null,
+                abort,
+                None,
+            ),
+            (
+                "prefill",
+                Some(lenient()),
+                DisaggregationMode::Prefill,
+                stop(),
+                None,
+            ),
+        ] {
+            let dir = temp_dir(name);
+            let mut config = config(&dir, BTreeMap::new());
+            config.goodput_slo = goodput_slo;
+            let metrics = Arc::new(FrontendMetrics::new(&config, mode).unwrap());
+            let created = Instant::now() - Duration::from_millis(50);
+            let mut observed = metrics.start_request(&request(false, None), created);
+            observed.observe(Some(&ResponseItem::Done(terminal(
+                2,
+                finish_reason,
+                ChunkExtras {
+                    decode_latency: Some(0.02),
+                    ..Default::default()
+                },
+            ))));
+            observed.call_dropped();
+            let text = rendered(&metrics, &dir);
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert_eq!(
+                sample(&text, "sglang:num_good_requests_total{"),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     /// Each request of the fixture's cache-tier frames

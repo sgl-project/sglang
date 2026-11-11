@@ -252,6 +252,7 @@ def test_typed_config_carries_tokenizer_metrics(enable_metrics):
         # The default rule keeps the Rust side's defaults; others resolve here.
         bucket_prompt_tokens=None,
         bucket_generation_tokens=[1.0, 10.0],
+        goodput_slo=None,
     )
 
 

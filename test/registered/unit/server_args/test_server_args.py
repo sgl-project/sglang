@@ -884,6 +884,64 @@ class TestPrepareServerArgs(CustomTestCase):
                 ["--model-path", "dummy", "--sampling-mask-max-tokens", "0"]
             ).resolve_once()
 
+    @staticmethod
+    def _check_goodput_slo_json(goodput_slo):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--served-model-name",
+                "dummy",
+                "--device",
+                "cpu",
+                "--chunked-prefill-size",
+                "-1",
+                "--goodput-slo",
+                json.dumps(goodput_slo),
+            ]
+        )
+        args.check_server_args()
+
+    def test_goodput_slo_accepts_disabled_and_finite_positive_values(self):
+        """Null and empty objects deliberately disable the optional counter."""
+        for goodput_slo in (
+            None,
+            {},
+            {"ttft": 500, "tpot": 50, "e2el": 3000},
+            {"ttft": 0.5},
+        ):
+            with self.subTest(goodput_slo=goodput_slo):
+                self._check_goodput_slo_json(goodput_slo)
+
+    def test_goodput_slo_rejects_invalid_json_values(self):
+        """Booleans and infinity must not become budgets; non-objects must not
+        fail incidentally at dictionary iteration."""
+        for goodput_slo in ([], "ttft=500", 1, False):
+            with (
+                self.subTest(goodput_slo=goodput_slo),
+                self.assertRaisesRegex(ValueError, "--goodput-slo.*JSON object"),
+            ):
+                self._check_goodput_slo_json(goodput_slo)
+
+        invalid_thresholds = (
+            {"itl": 10},
+            {"ttft": True},
+            {"ttft": False},
+            {"ttft": "500"},
+            {"ttft": None},
+            {"ttft": 0},
+            {"ttft": -1},
+            {"ttft": float("inf")},
+            {"ttft": float("-inf")},
+            {"ttft": float("nan")},
+        )
+        for goodput_slo in invalid_thresholds:
+            with (
+                self.subTest(goodput_slo=goodput_slo),
+                self.assertRaisesRegex(ValueError, "--goodput-slo"),
+            ):
+                self._check_goodput_slo_json(goodput_slo)
+
     def test_legacy_sampling_mask_env_requires_migration(self):
         """Legacy configuration must not silently disable PD sampling masks."""
         for value in ("0", "128", "invalid", ""):

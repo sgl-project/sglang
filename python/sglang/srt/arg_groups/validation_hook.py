@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from typing import Any, Collection, Dict, List, Optional
 
@@ -25,6 +26,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     parse_ib_device_config,
 )
 from sglang.srt.environ import envs
+from sglang.srt.observability.utils import GOODPUT_SLO_METRICS
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
 from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
@@ -381,6 +383,7 @@ def check_server_args(server_args: Any):
     assert cfg.mm_io_worker_num >= 0, "Multimodal I/O worker num must >= 0"
     validate_buckets_rule("--prompt-tokens-buckets", cfg.prompt_tokens_buckets)
     validate_buckets_rule("--generation-tokens-buckets", cfg.generation_tokens_buckets)
+    validate_goodput_slo(cfg.goodput_slo)
 
     # Check scheduling policy
     if cfg.enable_priority_scheduling:
@@ -555,6 +558,34 @@ def validate_buckets_rule(arg_name: str, buckets_rule: List[str]):
         assert all(val >= 0 for val in bucket_values), (
             f"{arg_name} custom rule bucket values should be non-negative"
         )
+
+
+def validate_goodput_slo(goodput_slo: Optional[Dict[str, float]]):
+    if goodput_slo is None:
+        return
+    if not isinstance(goodput_slo, dict):
+        raise ValueError(
+            f"--goodput-slo must be a JSON object, null, or empty; got {goodput_slo!r}"
+        )
+    if not goodput_slo:
+        return
+
+    for name, slo_ms in goodput_slo.items():
+        if name not in GOODPUT_SLO_METRICS:
+            raise ValueError(
+                f"Unsupported --goodput-slo key: {name!r}. "
+                f"Must be one of: {', '.join(GOODPUT_SLO_METRICS)}"
+            )
+        if (
+            isinstance(slo_ms, bool)
+            or not isinstance(slo_ms, (int, float))
+            or (isinstance(slo_ms, float) and not math.isfinite(slo_ms))
+            or slo_ms <= 0
+        ):
+            raise ValueError(
+                f"--goodput-slo {name!r} must be a finite, non-boolean, "
+                f"strictly positive number; got {slo_ms!r}"
+            )
 
 
 def check_load_publish_args(server_args: Any):

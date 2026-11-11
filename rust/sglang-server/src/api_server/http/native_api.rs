@@ -1857,6 +1857,7 @@ mod tests {
                     bucket_e2e_request_latency: None,
                     bucket_prompt_tokens: None,
                     bucket_generation_tokens: None,
+                    goodput_slo: None,
                 }),
                 preferred_sampling_params: Some(crate::message::config::PreferredSamplingParams(
                     serde_json::json!({"top_k": 7}),
