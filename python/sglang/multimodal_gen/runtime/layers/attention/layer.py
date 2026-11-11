@@ -4,12 +4,10 @@
 import functools
 import os
 from collections.abc import Sequence
-from contextlib import nullcontext
 from typing import Type
 
 import torch
 import torch.nn as nn
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.kernels.ops.diffusion import (
@@ -47,6 +45,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     wrap_attention_impl_forward,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
+    cudnn_opt_in_sdpa_context,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
     get_request_skip_softmax_params,
 )
@@ -80,13 +81,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
-
-_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
-    SDPBackend.CUDNN_ATTENTION,
-    SDPBackend.FLASH_ATTENTION,
-    SDPBackend.EFFICIENT_ATTENTION,
-    SDPBackend.MATH,
-]
 
 # Set ``SGLANG_VARLEN_FA=0`` to disable the varlen FA fast path in
 # USPAttention masked branch and fall back to SDPA.
@@ -691,6 +685,9 @@ class UlyssesAttention_VSA(UlyssesAttention):
 class LocalAttention(nn.Module):
     """Attention layer."""
 
+    # Lowest request quality that may use the cuDNN SDPA opt-in; None = any.
+    cudnn_sdp_min_quality: str | None = None
+
     def __init__(
         self,
         num_heads: int,
@@ -727,6 +724,7 @@ class LocalAttention(nn.Module):
         )
         impl_cls = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
+        self.cudnn_sdp_min_quality = extra_impl_args.get("cudnn_sdp_min_quality")
         self._attn_impl_ctor_kwargs = dict(
             num_heads=num_heads,
             head_size=head_size,
@@ -794,10 +792,8 @@ class LocalAttention(nn.Module):
                 k_ = k_.repeat_interleave(repeat_factor, dim=1)
                 v_ = v_.repeat_interleave(repeat_factor, dim=1)
 
-            sdpa_context = (
-                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
-                if self.allow_cudnn_sdp and q_.device.type == "cuda"
-                else nullcontext()
+            sdpa_context = cudnn_opt_in_sdpa_context(
+                self.allow_cudnn_sdp, q_.device, self.cudnn_sdp_min_quality
             )
             attn_kwargs = {
                 "attn_mask": mask,
@@ -837,6 +833,8 @@ class USPAttention(nn.Module):
     """
 
     _usp_a2a_stream = None
+    # Lowest request quality that may use the cuDNN SDPA opt-in; None = any.
+    cudnn_sdp_min_quality: str | None = None
 
     def __init__(
         self,
@@ -900,6 +898,7 @@ class USPAttention(nn.Module):
                 )
         impl_cls: Type[AttentionImpl] = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
+        self.cudnn_sdp_min_quality = extra_impl_args.get("cudnn_sdp_min_quality")
         self._attn_impl_ctor_kwargs = dict(
             num_heads=num_heads,
             head_size=head_size,
@@ -1288,10 +1287,8 @@ class USPAttention(nn.Module):
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
                 mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
-                sdpa_context = (
-                    sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
-                    if self.allow_cudnn_sdp and q_.device.type == "cuda"
-                    else nullcontext()
+                sdpa_context = cudnn_opt_in_sdpa_context(
+                    self.allow_cudnn_sdp, q_.device, self.cudnn_sdp_min_quality
                 )
                 with sdpa_context:
                     return torch.nn.functional.scaled_dot_product_attention(
@@ -1469,10 +1466,8 @@ class USPAttention(nn.Module):
                 mask = prepare_sdpa_mask(
                     gathered_mask, dtype=q_.dtype, device=q_.device
                 )
-                sdpa_context = (
-                    sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
-                    if self.allow_cudnn_sdp and q_.device.type == "cuda"
-                    else nullcontext()
+                sdpa_context = cudnn_opt_in_sdpa_context(
+                    self.allow_cudnn_sdp, q_.device, self.cudnn_sdp_min_quality
                 )
                 with sdpa_context:
                     return torch.nn.functional.scaled_dot_product_attention(
@@ -1977,10 +1972,8 @@ class USPAttention(nn.Module):
             k_ = k_.repeat_interleave(repeat_factor, dim=1)
             v_ = v_.repeat_interleave(repeat_factor, dim=1)
 
-        sdpa_context = (
-            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
-            if self.allow_cudnn_sdp and q_.device.type == "cuda"
-            else nullcontext()
+        sdpa_context = cudnn_opt_in_sdpa_context(
+            self.allow_cudnn_sdp, q_.device, self.cudnn_sdp_min_quality
         )
         with sdpa_context:
             out = torch.nn.functional.scaled_dot_product_attention(
@@ -2216,10 +2209,8 @@ class USPAttention(nn.Module):
         k_ = k.transpose(1, 2)
         v_ = v.transpose(1, 2)
         mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
-        sdpa_context = (
-            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
-            if self.allow_cudnn_sdp and q_.device.type == "cuda"
-            else nullcontext()
+        sdpa_context = cudnn_opt_in_sdpa_context(
+            self.allow_cudnn_sdp, q_.device, self.cudnn_sdp_min_quality
         )
         with sdpa_context:
             return torch.nn.functional.scaled_dot_product_attention(

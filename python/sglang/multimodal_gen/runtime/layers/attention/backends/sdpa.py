@@ -38,6 +38,14 @@ _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
     SDPBackend.MATH,
 ]
 
+# cuDNN SDPA can run a different kernel in another process for the same inputs,
+# which moves BF16 rounding; these backends stay bit-stable across processes.
+_CUDA_SDP_BACKENDS_WITHOUT_CUDNN = [
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
+
 _MPS_VARLEN_QUERY_CHUNK_SIZE = 128
 
 
@@ -49,6 +57,27 @@ def torch_default_sdpa_backends():
     context can move disabled backends to the end of the ambient priority list,
     otherwise changing reference outputs after the first DiT forward.
     """
+    return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
+
+
+def cudnn_opt_in_sdpa_context(
+    allow_cudnn_sdp: bool,
+    device: torch.device,
+    min_quality: str | None = None,
+):
+    """SDPA backend context of a module that opted back into cuDNN SDPA.
+
+    ``min_quality`` is the lowest request quality that may run cuDNN. A request
+    below it keeps an explicit cuDNN-free priority list, so its outputs do not
+    depend on which kernel cuDNN selects in this process. Without a forward
+    context, or with ``min_quality=None``, the opt-in is unconditional.
+    """
+    if not allow_cudnn_sdp or device.type != "cuda":
+        return nullcontext()
+    if min_quality is not None:
+        context = get_forward_context_or_none()
+        if context is not None and not quality_allows(context.quality, min_quality):
+            return sdpa_kernel(_CUDA_SDP_BACKENDS_WITHOUT_CUDNN, set_priority=True)
     return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
 
 
@@ -87,11 +116,12 @@ class SDPAImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
         self.dropout = extra_impl_args.get("dropout_p", 0.0)
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
+        self.cudnn_sdp_min_quality = extra_impl_args.get("cudnn_sdp_min_quality")
 
     def _sdpa_context(self, query: torch.Tensor):
-        if self.allow_cudnn_sdp and query.device.type == "cuda":
-            return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
-        return nullcontext()
+        return cudnn_opt_in_sdpa_context(
+            self.allow_cudnn_sdp, query.device, self.cudnn_sdp_min_quality
+        )
 
     def forward(
         self,

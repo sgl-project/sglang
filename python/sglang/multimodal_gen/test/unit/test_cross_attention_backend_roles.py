@@ -75,6 +75,27 @@ def test_ltx2_derives_cross_attention_role_from_context(use_local_attention):
 
 
 @pytest.mark.parametrize("use_local_attention", [False, True])
+def test_ltx2_keeps_exact_requests_off_cudnn_sdpa(use_local_attention):
+    """cuDNN SDPA is the LTX-2 reference, but it is not bit-stable across processes."""
+    selected_layer = "LocalAttention" if use_local_attention else "USPAttention"
+    with (
+        mock.patch.object(ltx_2, "get_tp_world_size", return_value=1),
+        mock.patch.object(ltx_2, "ColumnParallelLinear", return_value=nn.Identity()),
+        mock.patch.object(ltx_2, "RowParallelLinear", return_value=nn.Identity()),
+        mock.patch.object(ltx_2, selected_layer) as attention,
+    ):
+        ltx_2.LTX2Attention(
+            query_dim=8,
+            heads=1,
+            dim_head=8,
+            use_local_attention=use_local_attention,
+        )
+
+    assert attention.call_args.kwargs["allow_cudnn_sdp"] is True
+    assert attention.call_args.kwargs["cudnn_sdp_min_quality"] == "lossless"
+
+
+@pytest.mark.parametrize("use_local_attention", [False, True])
 def test_ltx2_forwards_required_attention_backend(use_local_attention):
     selected_layer = "LocalAttention" if use_local_attention else "USPAttention"
     with (

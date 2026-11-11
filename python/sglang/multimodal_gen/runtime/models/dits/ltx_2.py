@@ -861,6 +861,8 @@ class LTX2Attention(nn.Module):
                 enable_packed_qkv_input_a2a=self.enable_packed_qkv_input_a2a,
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
                 allow_cudnn_sdp=True,
+                # cuDNN SDPA is not bit-stable across processes; exact requests skip it
+                cudnn_sdp_min_quality="lossless",
                 capture_dense_attention=True,
             )
         else:
@@ -877,6 +879,8 @@ class LTX2Attention(nn.Module):
                 prefix=f"{prefix}.attn",
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
                 allow_cudnn_sdp=True,
+                # cuDNN SDPA is not bit-stable across processes; exact requests skip it
+                cudnn_sdp_min_quality="lossless",
                 capture_dense_attention=True,
             )
 

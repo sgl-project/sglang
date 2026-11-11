@@ -23,6 +23,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
     SDPAImpl,
     torch_default_sdpa_backends,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    set_forward_context,
+)
 
 NUM_HEADS, HEAD_DIM, SEQ_LEN = 8, 128, 512
 
@@ -59,13 +62,14 @@ def _kernel_under(context, q, k, v) -> str:
     return "unknown"
 
 
-def _impl(allow_cudnn_sdp: bool) -> SDPAImpl:
+def _impl(allow_cudnn_sdp: bool, **extra_impl_args) -> SDPAImpl:
     return SDPAImpl(
         num_heads=NUM_HEADS,
         head_size=HEAD_DIM,
         causal=False,
         softmax_scale=HEAD_DIM**-0.5,
         allow_cudnn_sdp=allow_cudnn_sdp,
+        **extra_impl_args,
     )
 
 
@@ -109,3 +113,32 @@ def test_reference_sdpa_does_not_inherit_a_previous_attention_priority():
         ):
             with sdpa_kernel(priority, set_priority=True):
                 assert _kernel_under(torch_default_sdpa_backends(), q, k, v) == "cudnn"
+
+
+def _skip_without_cudnn_kernel(q, k, v):
+    try:
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            F.scaled_dot_product_attention(q, k, v)
+    except RuntimeError:
+        pytest.skip("no cuDNN attention kernel for this shape on this GPU")
+
+
+@pytest.mark.parametrize(
+    "quality,kernel", [("exact", "flash"), ("lossless", "cudnn"), ("high", "cudnn")]
+)
+def test_min_quality_keeps_stricter_requests_off_cudnn(quality, kernel):
+    """cuDNN can pick another kernel in another process; exact requests must not run it."""
+    q, k, v = _qkv()
+    _skip_without_cudnn_kernel(q, k, v)
+    impl = _impl(True, cudnn_sdp_min_quality="lossless")
+    with set_forward_context(current_timestep=0, attn_metadata=None, quality=quality):
+        assert _kernel_under(impl._sdpa_context(q), q, k, v) == kernel
+
+
+def test_min_quality_is_opt_in_and_needs_a_forward_context():
+    q, k, v = _qkv()
+    _skip_without_cudnn_kernel(q, k, v)
+    with set_forward_context(current_timestep=0, attn_metadata=None, quality="exact"):
+        assert _kernel_under(_impl(True)._sdpa_context(q), q, k, v) == "cudnn"
+    gated = _impl(True, cudnn_sdp_min_quality="lossless")
+    assert _kernel_under(gated._sdpa_context(q), q, k, v) == "cudnn"
