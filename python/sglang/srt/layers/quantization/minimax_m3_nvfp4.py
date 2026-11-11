@@ -24,6 +24,18 @@ if _is_hip:
 
 logger = logging.getLogger(__name__)
 
+_CUTILE_WEIGHT_UPDATE_ERROR = (
+    "Online weight updates are not supported with flashinfer_cutile: prepared "
+    "NVFP4 weights cannot be restored to the checkpoint layout. Restart the "
+    "engine to load a different checkpoint."
+)
+
+_CUTILE_WEIGHT_EXPORT_ERROR = (
+    "Weight export is not supported with flashinfer_cutile: prepared NVFP4 "
+    "expert weights cannot be serialized as a complete checkpoint. Use the "
+    "original checkpoint instead."
+)
+
 
 class MiniMaxM3Nvfp4Config(Fp8Config):
     """MXFP8 projections and NVFP4 routed experts in static M3.1 checkpoints."""
@@ -178,7 +190,7 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         hidden_size: int,
         intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
-        **extra_weight_attrs,
+        **extra_weight_attrs: object,
     ) -> None:
         super().create_weights(
             layer=layer,
@@ -189,11 +201,15 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
             **extra_weight_attrs,
         )
         if self.use_flashinfer_cutile:
+            # The updater and exporter check these model-owned constraints
+            # before any loader or transport. All ranks select them at startup.
+            setattr(layer, "_derived_weight_cache_error", _CUTILE_WEIGHT_UPDATE_ERROR)
+            setattr(layer, "_weight_export_error", _CUTILE_WEIGHT_EXPORT_ERROR)
             # Dynamic-activation checkpoints may omit these scales. Set their
             # defaults before loading, so explicit checkpoint values still win
             # and unsupported non-unit values are rejected during preparation.
-            layer.w13_input_global_scale.fill_(1.0)
-            layer.w2_input_global_scale.fill_(1.0)
+            layer.get_parameter("w13_input_global_scale").fill_(1.0)
+            layer.get_parameter("w2_input_global_scale").fill_(1.0)
 
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
@@ -290,15 +306,26 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
             global_num_experts=global_num_experts,
         )
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        # Keep the initial loading path legal, but never let a reload consume
+        # parameters that preparation replaced with the execution weight pack.
+        if self.use_flashinfer_cutile and hasattr(self, "cutile_quant_info"):
+            raise RuntimeError(_CUTILE_WEIGHT_UPDATE_ERROR)
+        super().restore_weights_before_loading(layer)
+
     def _process_cutile_weights(self, layer: torch.nn.Module) -> None:
         from sglang.srt.layers.moe.moe_runner.flashinfer_cutile import (
             prepare_flashinfer_cutile_nvfp4_weights,
         )
 
+        if hasattr(self, "cutile_quant_info"):
+            raise RuntimeError(_CUTILE_WEIGHT_UPDATE_ERROR)
         self.cutile_quant_info = prepare_flashinfer_cutile_nvfp4_weights(
             layer=layer, config=self.moe_runner_config
         )
-        # The prepared view owns the tensors needed at execution time.
+        # The pack owns the execution tensors for this model's lifetime.
+        # CPU offload is rejected at argument validation; online updates are
+        # rejected by the model-owned marker before any weight can be changed.
         # Do not retain the original gate/up and unswizzled scale copies.
         for name in (
             "w13_weight_packed",
@@ -307,8 +334,8 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
             "w2_weight_scale",
         ):
             layer.register_parameter(name, None)
-        layer._mega_moe_nvfp4 = False
-        layer._mega_moe_weights_built = False
+        setattr(layer, "_mega_moe_nvfp4", False)
+        setattr(layer, "_mega_moe_weights_built", False)
 
     def _process_trtllm_weights(self, layer: torch.nn.Module) -> None:
         if self.use_mega_moe_prefill:

@@ -7,12 +7,21 @@ the optional real-weight case. No model server or downloads are started.
 """
 
 import json
-import os
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_flags,
+    get_schedule,
+    reset_context,
+)
+from sglang.test.test_utils import CustomTestCase
 
 ALPHA, BETA, LIMIT = 1.702, 1.0, 7.0
 E2M1 = (0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6)
@@ -200,9 +209,10 @@ def _dispatch(layer, tokens):
     )
 
 
-class TestFlashInferCuTileNvfp4(unittest.TestCase):
+class TestFlashInferCuTileNvfp4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         if not torch.cuda.is_available():
             raise unittest.SkipTest("requires an SM120/SM121 GPU")
         if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
@@ -212,9 +222,21 @@ class TestFlashInferCuTileNvfp4(unittest.TestCase):
         cls.adapter = flashinfer_cutile
 
     def setUp(self):
+        super().setUp()
         torch.manual_seed(17)
-        self.capacity = self.enterContext(
-            patch.object(self.adapter, "_get_max_num_tokens", return_value=512)
+        reset_context()
+        self.addCleanup(reset_context)
+        self.enterContext(
+            get_context().override_server_args(
+                max_prefill_tokens=512, disable_cuda_graph=True
+            )
+        )
+        self.enterContext(get_exec().graph.override(cuda_graph_config=None))
+        self.enterContext(
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.FLASHINFER_CUTILE,
+                a2a_backend=MoeA2ABackend.NONE,
+            )
         )
 
     def _run_case(self, layer, tokens):
@@ -292,7 +314,6 @@ class TestFlashInferCuTileNvfp4(unittest.TestCase):
                 self._run_case(_synthetic_layer(), tokens)
 
     def test_scheme_loading_and_apply_use_cutile(self):
-        from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
         from sglang.srt.layers.quantization import minimax_m3_nvfp4
 
         layer = _synthetic_layer()
@@ -306,22 +327,10 @@ class TestFlashInferCuTileNvfp4(unittest.TestCase):
         expected = reference_runner.run_from_dispatch(
             dispatch, reference_weights, layer.moe_runner_config
         ).hidden_states.clone()
-        with (
-            patch.object(
-                minimax_m3_nvfp4,
-                "get_moe_runner_backend",
-                return_value=MoeRunnerBackend.FLASHINFER_CUTILE,
-            ),
-            patch.object(
-                minimax_m3_nvfp4,
-                "get_moe_a2a_backend",
-                return_value=MoeA2ABackend.NONE,
-            ),
-        ):
-            scheme = minimax_m3_nvfp4.MiniMaxM3Nvfp4MoE()
-            scheme.create_moe_runner(layer, layer.moe_runner_config)
-            scheme.process_weights_after_loading(layer)
-            actual = scheme.apply_weights(layer, dispatch).hidden_states
+        scheme = minimax_m3_nvfp4.MiniMaxM3Nvfp4MoE()
+        scheme.create_moe_runner(layer, layer.moe_runner_config)
+        scheme.process_weights_after_loading(layer)
+        actual = scheme.apply_weights(layer, dispatch).hidden_states
         self.assertTrue(scheme.use_flashinfer_cutile)
         self.assertFalse(scheme.use_marlin)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -383,7 +392,7 @@ class TestFlashInferCuTileNvfp4(unittest.TestCase):
         self.assertLess(relative.item(), 0.02)
 
     @unittest.skipUnless(
-        os.environ.get("SGLANG_TEST_CUTILE_LARGE_BATCH") == "1",
+        envs.SGLANG_TEST_CUTILE_LARGE_BATCH.get(),
         "set SGLANG_TEST_CUTILE_LARGE_BATCH=1 for workspace boundary measurements",
     )
     def test_workspace_bucket_boundary(self):
@@ -393,33 +402,93 @@ class TestFlashInferCuTileNvfp4(unittest.TestCase):
         )
         cfg = layer.moe_runner_config
         prepared = self.adapter.prepare_flashinfer_cutile_nvfp4_weights(layer, cfg)
-        for tokens in (8192, 8193):
-            with self.subTest(tokens=tokens):
-                self.capacity.return_value = tokens
-                runner = self.adapter.FlashInferCuTileRunnerCore(cfg)
-                dispatch = _dispatch(layer, tokens)
-                torch.cuda.synchronize()
-                baseline = torch.cuda.memory_allocated()
-                torch.cuda.reset_peak_memory_stats()
-                output = runner.run_from_dispatch(dispatch, prepared, cfg).hidden_states
-                torch.cuda.synchronize()
-                peak = torch.cuda.max_memory_allocated() - baseline
-                self.assertEqual(output.shape, (tokens, cfg.hidden_size))
-                self.assertTrue(torch.isfinite(output).all().item())
-                print(
-                    f"tokens={tokens} workspace_and_temporary_peak_mib={peak / 2**20:.2f}"
-                )
-                del output, dispatch, runner
-                torch.cuda.empty_cache()
+        # Keep one configured ceiling: 8193 must be allowed to use bucket 16384.
+        self.enterContext(get_schedule().override(max_prefill_tokens=16384))
+        self.assertEqual(self.adapter._get_max_num_tokens(), 16384)
+        runner = self.adapter.FlashInferCuTileRunnerCore(cfg)
+        dispatch = _dispatch(layer, 8193)
+        # Inputs are allocated once, so differences below include accumulated
+        # workspaces and temporaries rather than different-sized input tensors.
+        streams = (torch.cuda.current_stream(), torch.cuda.Stream())
+        torch.cuda.synchronize()
+        initial_allocated = torch.cuda.memory_allocated()
+        initial_reserved = torch.cuda.memory_reserved()
+        for stream_index, stream in enumerate(streams):
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for step, tokens in enumerate((8192, 8193, 8192)):
+                    with self.subTest(stream=stream_index, step=step, tokens=tokens):
+                        current = dispatch._replace(
+                            hidden_states=dispatch.hidden_states[:tokens],
+                            topk_output=dispatch.topk_output._replace(
+                                topk_ids=dispatch.topk_output.topk_ids[:tokens],
+                                topk_weights=dispatch.topk_output.topk_weights[:tokens],
+                            ),
+                        )
+                        torch.cuda.synchronize()
+                        allocated_before = torch.cuda.memory_allocated()
+                        reserved_before = torch.cuda.memory_reserved()
+                        torch.cuda.reset_peak_memory_stats()
+                        output = runner.run_from_dispatch(
+                            current, prepared, cfg
+                        ).hidden_states
+                        torch.cuda.synchronize()
+                        allocated_after = torch.cuda.memory_allocated()
+                        reserved_after = torch.cuda.memory_reserved()
+                        peak_allocated = torch.cuda.max_memory_allocated()
+                        peak_reserved = torch.cuda.max_memory_reserved()
+                        self.assertEqual(output.shape, (tokens, cfg.hidden_size))
+                        # Numerical checks live in the other cases: allocating
+                        # a finite-check tensor here would pollute the next
+                        # step's reserved-memory baseline.
+                        print(
+                            json.dumps(
+                                {
+                                    "stream": stream_index,
+                                    "step": step,
+                                    "tokens": tokens,
+                                    "capacity": 16384,
+                                    "allocated_mib": allocated_after / 2**20,
+                                    "reserved_mib": reserved_after / 2**20,
+                                    "step_allocated_delta_mib": (
+                                        allocated_after - allocated_before
+                                    )
+                                    / 2**20,
+                                    "step_reserved_delta_mib": (
+                                        reserved_after - reserved_before
+                                    )
+                                    / 2**20,
+                                    "cumulative_allocated_delta_mib": (
+                                        allocated_after - initial_allocated
+                                    )
+                                    / 2**20,
+                                    "cumulative_reserved_delta_mib": (
+                                        reserved_after - initial_reserved
+                                    )
+                                    / 2**20,
+                                    "peak_allocated_mib": peak_allocated / 2**20,
+                                    "peak_reserved_mib": peak_reserved / 2**20,
+                                    "step_peak_allocated_delta_mib": (
+                                        peak_allocated - allocated_before
+                                    )
+                                    / 2**20,
+                                },
+                                sort_keys=True,
+                            )
+                        )
+                        del output
+            torch.cuda.current_stream().wait_stream(stream)
+        # Do not empty the allocator or evict executions between steps: both
+        # bucket and stream allocations must remain visible in this experiment.
 
     @unittest.skipUnless(
-        os.environ.get("SGLANG_TEST_MINIMAX_LAYER30_DIR"),
+        envs.SGLANG_TEST_MINIMAX_LAYER30_DIR.get(),
         "set SGLANG_TEST_MINIMAX_LAYER30_DIR to test checkpoint weights",
     )
     def test_real_layer30_checkpoint(self):
         from safetensors import safe_open
 
-        directory = Path(os.environ["SGLANG_TEST_MINIMAX_LAYER30_DIR"])
+        directory = Path(envs.SGLANG_TEST_MINIMAX_LAYER30_DIR.get())
         config = json.loads((directory / "config.json").read_text())
         config = config.get("text_config", config)
         index = json.loads((directory / "model.safetensors.index.json").read_text())
