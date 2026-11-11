@@ -124,3 +124,37 @@ def test_one_live_sequence_matches_the_varlen_kernel(pad):
     else:
         assert torch.equal(out[:used], ref[:used])
     assert not out[used:].any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a ROCm GPU")
+def test_tail_rows_with_split_keys_match_one_launch():
+    """Rows past the last full mha_v4 wave run with their keys split and an
+    LSE merge; they match a single launch within BF16 rounding."""
+    impl = _impl_cls()(
+        num_heads=7,
+        head_size=HEAD_SIZE,
+        softmax_scale=HEAD_SIZE**-0.5,
+        packed_trailing_padding=True,
+    )
+    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
+
+    heads, device = 7, torch.device("cuda", torch.cuda.current_device())
+    rows = 4 * backend._num_cus(device.index) // heads * 256 + 300
+    total = rows + 64
+    torch.manual_seed(0)
+    packed = torch.randn(
+        total, heads, 3 * HEAD_SIZE, device=device, dtype=torch.bfloat16
+    )
+    q, k, v = packed.split(HEAD_SIZE, dim=-1)
+    if not backend._can_use_mha_v4_bf16(q, k, v, False, 0.0):
+        pytest.skip("needs aiter mha_v4")
+    assert backend._v4_tail_split_rows(rows, heads, device) is not None
+    bounds = (0, rows, total)
+    cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device=device)
+    out = impl.forward_varlen(
+        q, k, v, cu_seqlens=cu_seqlens, max_seqlen=rows, cu_seqlens_host=bounds
+    )
+    live = (t[None, :rows] for t in (q, k, v))
+    single = backend._mha_v4_bf16(*live, HEAD_SIZE**-0.5)[0]
+    torch.testing.assert_close(out[:rows], single, atol=2e-2, rtol=2e-2)
+    assert not out[rows:].any()
