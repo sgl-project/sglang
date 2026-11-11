@@ -1804,6 +1804,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ) -> torch.Tensor:
         """ReplaySSM GDN spec-verify (Part B of #28511).
 
+        BF16 DFLASH/DSPARK uses window-sized records and no cross-step history.
+        The generic circular protocol below remains unchanged otherwise.
         Reconstructs the verify output for the whole draft window from the frozen
         checkpoint (``temporal``) + the per-slot circular ``(d, k, g)`` ring, and
         appends this window's drafts to the compact ``(d, k, g)`` rings. BF16
@@ -1831,7 +1833,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         a = a.reshape(seq_len, HV)
         b = b.reshape(seq_len, HV)
         d_cache = layer_cache.replayssm_d  # [slots, HV, L, V]
-        max_cache_len = d_cache.shape[-2]  # ring length L
+        window_only = getattr(mamba_pool, "replayssm_window_only", False)
+        max_cache_len = (
+            mamba_pool.linear_replayssm_cache_len if window_only else d_cache.shape[-2]
+        )
         out = q.new_empty(seq_len, HV, V)
         gdn_replayssm_spec_decode(
             q=q,
@@ -1870,6 +1875,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
+            window_only=window_only,
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)

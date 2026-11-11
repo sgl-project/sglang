@@ -38,7 +38,7 @@ _GDN_COMMIT = f"{_KERNELS}.commit_gdn_replayssm_after_verify"
 DRAFT_TOKENS = 8
 
 
-def _gdn_cache_params(num_layers=2):
+def _gdn_cache_params(num_layers=2, temporal_dtype=torch.bfloat16):
     shape = Mamba2StateShape.create(
         tp_world_size=1,
         intermediate_size=64,
@@ -48,7 +48,7 @@ def _gdn_cache_params(num_layers=2):
         state_size=16,
         conv_kernel=4,
     )
-    dtype = Mamba2StateDType(conv=torch.bfloat16, temporal=torch.bfloat16)
+    dtype = Mamba2StateDType(conv=torch.bfloat16, temporal=temporal_dtype)
     return Mamba2CacheParams(shape=shape, dtype=dtype, layers=list(range(num_layers)))
 
 
@@ -98,18 +98,100 @@ def _hybrid_backend(mamba_pool, spec_state, cache_indices, track_slots=None):
 
 class TestGDNReplaySSMRingLength(CustomTestCase):
     @staticmethod
-    def _pool(ring_len, draft_tokens=DRAFT_TOKENS):
+    def _pool(
+        ring_len,
+        draft_tokens=DRAFT_TOKENS,
+        window_only=False,
+        temporal_dtype=torch.bfloat16,
+    ):
         return MambaPool(
             size=4,
             spec_state_size=3,
-            cache_params=_gdn_cache_params(),
+            cache_params=_gdn_cache_params(temporal_dtype=temporal_dtype),
             mamba_layer_ids=[0, 1],
             device="cpu",
             speculative_num_draft_tokens=draft_tokens,
             speculative_eagle_topk=None,
             linear_replayssm_cache_len=ring_len,
             enable_linear_replayssm_spec=True,
+            replayssm_window_only=window_only,
         )
+
+    def test_direct_algorithms_allocate_only_one_window(self):
+        for draft_tokens in (3, 4, 8, 16):
+            with self.subTest(draft_tokens=draft_tokens):
+                pool = self._pool(
+                    ring_len=16, draft_tokens=draft_tokens, window_only=True
+                )
+                state = pool.get_speculative_mamba2_params_all_layers()
+                self.assertTrue(pool.replayssm_window_only)
+                for name in (
+                    "replayssm_d",
+                    "replayssm_k",
+                    "replayssm_rawv",
+                    "replayssm_rawk",
+                ):
+                    self.assertEqual(getattr(state, name).shape[-2], draft_tokens)
+                self.assertEqual(state.replayssm_g.shape[-1], draft_tokens)
+                self.assertIsNone(state.intermediate_ssm)
+
+    def test_window_selection_is_limited_to_bf16_direct_decode(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        prefix = "sglang.srt.mem_cache.kv_cache_configurator"
+        for algorithm, dtype, mode, role_switch, expected in [
+            ("DFLASH", torch.bfloat16, "null", False, True),
+            ("DSPARK", torch.bfloat16, "null", False, True),
+            ("DFLASH", torch.float32, "null", False, False),
+            ("EAGLE", torch.bfloat16, "null", False, False),
+            ("DFLASH", torch.bfloat16, "decode", False, False),
+            ("DFLASH", torch.bfloat16, "prefill", False, False),
+            ("DFLASH", torch.bfloat16, "null", True, False),
+        ]:
+            with (
+                self.subTest(algorithm=algorithm, dtype=dtype, mode=mode),
+                patch(
+                    prefix + ".get_exec",
+                    return_value=SimpleNamespace(
+                        mamba=SimpleNamespace(
+                            # Use the resolved cache dtype, not this optional
+                            # CLI value: model config and env overrides apply.
+                            enable_linear_replayssm_spec=True,
+                            mamba_ssm_dtype=None,
+                        )
+                    ),
+                ),
+                patch(
+                    prefix + ".get_spec",
+                    return_value=SimpleNamespace(speculative_algorithm=algorithm),
+                ),
+                patch(
+                    prefix + ".get_disagg",
+                    return_value=SimpleNamespace(
+                        disaggregation_mode=mode, enable_pd_role_switch=role_switch
+                    ),
+                ),
+            ):
+                self.assertEqual(
+                    KVCacheConfigurator._gdn_replayssm_window_only(
+                        SimpleNamespace(
+                            hybrid_gdn_config=SimpleNamespace(
+                                mamba2_cache_params=_gdn_cache_params(
+                                    temporal_dtype=dtype
+                                )
+                            )
+                        )
+                    ),
+                    expected,
+                )
+
+    def test_fp32_keeps_the_circular_path(self):
+        pool = self._pool(
+            ring_len=16, draft_tokens=4, window_only=True, temporal_dtype=torch.float32
+        )
+        self.assertFalse(pool.replayssm_window_only)
+        state = pool.get_speculative_mamba2_params_all_layers()
+        self.assertEqual(state.replayssm_d.shape[-2], 16)
 
     def test_ring_must_hold_the_draft_window(self):
         with self.assertRaisesRegex(ValueError, "ring too small"):
