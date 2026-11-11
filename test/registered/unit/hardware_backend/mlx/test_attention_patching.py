@@ -1209,7 +1209,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             model_config=None,
             token_to_kv_pool_allocator=None,
             tree_cache=tree_cache,
-            hisparse_coordinator=SimpleNamespace(request_finished=lambda req: None),
+            hisparse_coordinator=SimpleNamespace(release_request=lambda req: None),
             req_to_token_pool=None,
             kv_weight_version_tracker=None,
             decode_offload_manager=None,
@@ -1226,10 +1226,11 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             beam_coordinator=None,
             request_retirer=release_only_retirer(
                 tree_cache=tree_cache,
-                hisparse_coordinator=SimpleNamespace(request_finished=lambda req: None),
+                hisparse_coordinator=SimpleNamespace(release_request=lambda req: None),
             ),
             abort_request=lambda req: None,
             still_in_batch=lambda req: True,
+            prefill_launched_reqs=None,
         )
         # Stub out the methods _handle_finish_state_updated_req calls that
         # are not relevant to this test.  SchedulerBatchResultProcessor is

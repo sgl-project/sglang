@@ -67,7 +67,8 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     empty_request_lists(sched)
     sched.enable_continuous_input_polling = False
     sched.result_queue = deque()
-    sched.chunked_req = chunked_req
+    if chunked_req is not None:
+        sched.chunked_reqs.join([chunked_req])
     sched._pending_chunked_abort_req = pending_req
     sched.disaggregation_mode = None
     sched.enable_hicache_storage = False
@@ -132,7 +133,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
         calls = []
         hisparse_coordinator = Mock()
-        hisparse_coordinator.request_finished.side_effect = lambda req: calls.append(
+        hisparse_coordinator.release_request.side_effect = lambda req: calls.append(
             ("hisparse", req)
         )
         sched.request_retirer.hisparse_coordinator = hisparse_coordinator
