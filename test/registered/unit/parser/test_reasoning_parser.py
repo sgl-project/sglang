@@ -1717,6 +1717,33 @@ class TestMuseSparkReasoningParser(CustomTestCase):
         )
 
 
+_ERNIE5_TOOL_CALL = (
+    "<ernie:tool_call>\n"
+    '<invoke name="get_weather">\n'
+    '<parameter name="city">Beijing</parameter>\n'
+    "</invoke>\n"
+    "</ernie:tool_call>"
+)
+
+
+class TestErnie5_5ReasoningParser(CustomTestCase):
+    def test_splits_the_think_block(self):
+        parser = ReasoningParser("ernie55")
+        reasoning, content = parser.parse_non_stream(
+            "<ernie:think>weighing it up</ernie:think>the answer"
+        )
+        self.assertEqual(reasoning.strip(), "weighing it up")
+        self.assertEqual(content.strip(), "the answer")
+
+    def test_a_tool_call_closes_an_open_think_block(self):
+        parser = ReasoningParser("ernie55")
+        reasoning, content = parser.parse_non_stream(
+            "<ernie:think>I need a tool" + _ERNIE5_TOOL_CALL
+        )
+        self.assertIn("I need a tool", reasoning)
+        self.assertIn("<ernie:tool_call>", content)
+
+
 class TestReasoningParserNames(CustomTestCase):
     def test_matches_registry(self):
         # `server_args` builds the --reasoning-parser choices from this list to

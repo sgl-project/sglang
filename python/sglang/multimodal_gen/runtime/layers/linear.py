@@ -44,10 +44,13 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # yapf: enable
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.utils import cpu_has_amx_support, use_intel_amx_backend
 
 logger = init_logger(__name__)
 
 IS_AMP_SUPPORTED = current_platform.is_amp_supported()
+USE_CPU_AMX = current_platform.is_cpu() and cpu_has_amx_support()
 _USE_AITER_TGEMM = current_platform.is_rocm() and envs.SGLANG_USE_ROCM_AITER_TGEMM
 if _USE_AITER_TGEMM:
     from aiter.tuned_gemm import tgemm
@@ -240,7 +243,9 @@ class LinearMethodBase(QuantizeMethodBase):
 
 
 def apply_unquantized_linear(
-    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply a plain linear projection with the runtime's reference semantics."""
     if x.device.type == "mps":
@@ -272,6 +277,53 @@ def apply_unquantized_linear(
     )
 
 
+def pack_rows_into_one_buffer(params: list[torch.Tensor]) -> None:
+    """Move the tensors into consecutive rows of one new buffer and leave each a
+    view of its rows, so one GEMM can read them all (``rows_of_one_buffer``).
+    Only the views hold the buffer: moving or offloading a layer frees it."""
+    with torch.no_grad():
+        packed = torch.cat([param.data for param in params])
+    offset = 0
+    for param in params:
+        rows = param.shape[0]
+        param.data = packed[offset : offset + rows]
+        offset += rows
+
+
+def rows_of_one_buffer(parts: list[torch.Tensor]) -> torch.Tensor | None:
+    """``torch.cat(parts)`` without a copy while the parts are still consecutive
+    rows of one buffer; None once a move, load or offload gave one its own."""
+    first = parts[0]
+    storage = first.untyped_storage().data_ptr()
+    offset = first.storage_offset()
+    for part in parts:
+        if (
+            not part.is_contiguous()
+            or part.untyped_storage().data_ptr() != storage
+            or part.storage_offset() != offset
+            or part.dtype != first.dtype
+            or part.shape[1:] != first.shape[1:]
+        ):
+            return None
+        offset += part.numel()
+    rows = sum(part.shape[0] for part in parts)
+    return first.as_strided(
+        (rows, *first.shape[1:]), first.stride(), first.storage_offset()
+    )
+
+
+def apply_amx_packed_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    output = torch.ops.sgl_kernel.weight_packed_linear(
+        x.reshape(-1, x.shape[-1]).to(weight.dtype),
+        weight,
+        bias,
+        True,  # is_vnni
+    )
+    return output.view(*x.shape[:-1], -1)
+
+
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
@@ -297,9 +349,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if USE_CPU_AMX:
+            _amx_process_weight_after_loading(layer, ["weight"])
+
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
+        if use_intel_amx_backend(layer):
+            return apply_amx_packed_linear(x=x, weight=layer.weight, bias=bias)
         return apply_unquantized_linear(x, layer.weight, bias)
 
 

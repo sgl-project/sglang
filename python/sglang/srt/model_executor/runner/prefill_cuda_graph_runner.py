@@ -74,19 +74,14 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_prefill_registry,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
-    create_chunked_prefix_cache_kv_indices,
-)
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     NgramEmbeddingInfo,
     PPProxyTensors,
     compute_local_num_token_non_padded,
@@ -99,6 +94,7 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -112,6 +108,43 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
 )
 from sglang.srt.model_executor.runner_backend.utils import (
     resolve_prefill_backend,
+)
+
+
+def _full_graph_backend_types() -> tuple[type, ...]:
+    from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
+        FullXPUGraphBackend,
+    )
+
+    return (FullCudaGraphBackend, FullXPUGraphBackend)
+
+
+def _is_full_graph_backend(backend: Any) -> bool:
+    return isinstance(backend, _full_graph_backend_types())
+
+
+def _is_full_or_bcg_backend(backend: Any) -> bool:
+    return isinstance(
+        backend, (BreakableCudaGraphBackend, *_full_graph_backend_types())
+    )
+
+
+def _has_chunked_local_attn(model_runner: Any) -> bool:
+    return any(
+        getattr(owner, "attention_chunk_size", None) is not None
+        for owner in (
+            model_runner,
+            getattr(model_runner, "model_config", None),
+            getattr(model_runner, "attn_backend", None),
+        )
+    )
+
+
+from sglang.srt.layers.dp_attention import (
+    get_cuda_graph_max_batch_size,
+    require_attn_tp_gather,
+    require_gathered_buffer,
+    require_mlp_tp_gather,
 )
 from sglang.srt.model_executor.runner_backend_utils import (
     PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -144,15 +177,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
-from sglang.srt.utils import (
-    get_available_gpu_memory,
-    get_cuda_graph_max_batch_size,
-    is_cuda,
-    is_npu,
-    require_attn_tp_gather,
-    require_gathered_buffer,
-    require_mlp_tp_gather,
-)
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_npu
 from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
 
 if TYPE_CHECKING:
@@ -341,7 +366,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         prefill_attn_backend = getattr(
             model_runner.attn_backend, "prefill_backend", model_runner.attn_backend
         )
-        self._fa4_prefill = getattr(prefill_attn_backend, "fa_impl_ver", None) == 4
+        self._fa4_prefill = getattr(
+            prefill_attn_backend, "fa_impl_ver", None
+        ) == 4 or getattr(prefill_attn_backend, "fa3_upgrades_to_fa4", False)
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -532,8 +559,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"{prefill_failure_msg(self.prefill_backend_name)}"
             ) from e
 
-        self._is_full_backend = isinstance(self.backend, FullCudaGraphBackend)
+        self._is_full_backend = _is_full_graph_backend(self.backend)
         if self._is_full_backend:
+            if not isinstance(
+                self.backend, FullCudaGraphBackend
+            ) and _has_chunked_local_attn(model_runner):
+                raise ValueError(
+                    "Full prefill XPU graph does not support models with "
+                    "attention_chunk_size or use_irope (chunked local attention / iRoPE)"
+                )
             max_req = prefill_config.full_prefill_max_req
             assert max_req is not None, "full_prefill_max_req must be resolved"
             self._capture_req_slots = max_req
@@ -545,9 +579,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG/Full record LoRA kernels, so the metadata they read must live in
         # static buffers refreshed in place per batch; unsupported LoRA
         # configs were already routed to the eager runner.
-        self._capture_lora = self.enable_lora and isinstance(
-            self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)
-        )
+        self._capture_lora = self.enable_lora and _is_full_or_bcg_backend(self.backend)
         if self._capture_lora:
             model_runner.lora_manager.init_prefill_cuda_graph_batch_info(
                 max_num_tokens=self.max_num_tokens,
@@ -608,7 +640,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     else "auto from chunked_prefill_size"
                 ),
             )
-        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
+        if _is_full_or_bcg_backend(self.backend):
             with torch.device(self.device):
                 self._prefill_static_buffers = {
                     name: torch.zeros((self.max_bs,), dtype=torch.int64)
@@ -681,7 +713,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG and Full CG capture only the transformer body (layer_model.forward),
         # not the LM head + logits_processor — the eager tail keeps the captured
         # graph bs-invariant so req_slots is not bound by an (req_slots, vocab) buffer.
-        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
+        if _is_full_or_bcg_backend(self.backend):
             try:
                 self.layer_model = _resolve_transformer_layer_model(
                     self.model_runner.model
@@ -824,9 +856,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         buffers = self.buffers.pp_proxy_tensors
         if buffers is None or self.model_runner.pp_group.is_first_rank:
             return None
-        return PPProxyTensors(
-            {name: buffer[:num_tokens] for name, buffer in buffers.items()}
-        )
+        rows = self._pp_proxy_rows(num_tokens)
+        return PPProxyTensors({name: buffer[:rows] for name, buffer in buffers.items()})
+
+    def _pp_proxy_rows(self, num_tokens: int) -> int:
+        """Rows of the stage-to-stage proxy for a global token bucket: CP
+        pipeline stages exchange CP-local rows (see execute_prefill_cp_bcg)."""
+        if getattr(self, "enable_cp_bcg_capture", False):
+            local_tokens = self.prefill_cp_bcg_input.bucket_local_tokens.get(num_tokens)
+            if local_tokens is not None:
+                return local_tokens
+        return num_tokens
 
     def _zero_padded_tail(self) -> bool:
         # The padded attention tail is uninitialized graph-pool memory. Skipping
@@ -1383,9 +1423,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         return attn_backend.resolve_prefill_shared_read_ends(
-            forward_batch,
-            num_qo_tokens=shape_key.size,
-            build_snapshot=build_snapshot,
+            forward_batch, build_snapshot=build_snapshot
         )
 
     @staticmethod
@@ -2212,6 +2250,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 capture=False,
             )
             metadata_forward_batch = static_forward_batch
+            self._zero_stale_cp_pp_proxy_rows(
+                kwargs.get("pp_proxy_tensors"), static_num_tokens
+            )
 
         shape_key = self._shape_key(static_num_tokens, forward_batch)
         shared_read_ends = self._prepare_forward_metadata_for_replay(
@@ -2219,6 +2260,25 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         return static_forward_batch, shared_read_ends
+
+    def _zero_stale_cp_pp_proxy_rows(
+        self, pp_proxy_tensors: Optional[PPProxyTensors], static_num_tokens: int
+    ) -> None:
+        """Clear CP-local proxy rows past the received shard.
+
+        The registry pads the proxy over the global token range, but a CP
+        stage reads ``bucket_local_tokens`` rows; rows beyond the sender's
+        shard would otherwise keep a previous replay's values.
+        """
+        buffers = self.buffers.pp_proxy_tensors
+        if pp_proxy_tensors is None or buffers is None:
+            return
+        captured_rows = self.prefill_cp_bcg_input.bucket_local_tokens[static_num_tokens]
+        for name, buffer in buffers.items():
+            received = pp_proxy_tensors.tensors.get(name)
+            received_rows = 0 if received is None else int(received.shape[0])
+            if received_rows < captured_rows:
+                buffer[received_rows:captured_rows].zero_()
 
     def _fill_input_embeds_slot(self, args, layer_kwargs, static_num_tokens: int):
         """A text-only batch would otherwise replay the captured input_embeds."""

@@ -105,25 +105,7 @@ __global__ void fused_qknorm_half_warp(const QKNormParams __grid_constant__ para
     auto vec = load_as<Storage>(input, row_lane);
     const auto weight_vec = load_as<Storage>(weight, row_lane);
 
-    // part[h] is the sum of warp-kernel lane 2 * row_lane + h, and reduce_sum below
-    // is that kernel's 16..2 xor steps; its final xor-1 step adds the pair.
-    float part[2] = {0.0f, 0.0f};
-#pragma unroll
-    for (auto i = 0u; i < kPacks; ++i) {
-      const auto x = cast<fp32x2_t>(vec[i]);
-      part[i / 2] += x.x * x.x;
-      part[i / 2] += x.y * x.y;
-    }
-    part[0] = warp::reduce_sum<kRowLanes>(part[0]);
-    part[1] = warp::reduce_sum<kRowLanes>(part[1]);
-    const float norm_factor = math::rsqrt((part[0] + part[1]) / kHeadDim + eps);
-
-#pragma unroll
-    for (auto i = 0u; i < kPacks; ++i) {
-      const auto x = cast<fp32x2_t>(vec[i]);
-      const auto w = cast<fp32x2_t>(weight_vec[i]);
-      vec[i] = cast<Packed, fp32x2_t>({x.x * norm_factor * w.x, x.y * norm_factor * w.y});
-    }
+    vec = norm::apply_norm_half_warp(vec, weight_vec, eps);
     if (wanted_row < num_rows) store_as<Storage>(input, vec, row_lane);
   }
 

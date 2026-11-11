@@ -577,6 +577,7 @@ class Sm120ForwardPolicy:
             split_qk_n=split_qk_n,
             num_splits=num_splits,
             num_n_blocks=split_num_n_blocks,
+            is_stream_capturing=is_stream_capturing,
         )
         return Sm120ForwardPlan(
             num_splits=num_splits,
@@ -854,8 +855,13 @@ class Sm120ForwardPolicy:
         split_qk_n: bool,
         num_splits: int,
         num_n_blocks: int,
+        is_stream_capturing: bool,
     ) -> int:
-        """Preserve the longest request's split grain for ragged decode."""
+        """Use live KV lengths during graph replay and preserve eager split grain."""
+        # The capture-time KV bound sizes the workspace, not the replay workload.
+        # A fixed grain based on that bound can leave all but one split idle.
+        if is_stream_capturing:
+            return 0
         if not (
             (head_dim, head_dim_v) == (256, 256)
             and batch_size > 1
