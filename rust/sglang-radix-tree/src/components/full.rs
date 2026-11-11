@@ -189,8 +189,8 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                 .evictable_device_leaves
                 .pop_next(|id| strategy.get_priority(arena.node(id)))?;
             if !tree_core.is_device_walk_candidate_(x) {
-                // A queued write-back victim stays a D-leaf; offer it again next walk.
-                tree_core.evictable_device_leaves.requeue(x);
+                // A queued write-back victim stays a D-leaf; `pop_next` already
+                // re-admitted it, so it is offered again next walk.
                 continue;
             }
             let last_node_parent = tree_core.arena.node(x).try_parent();

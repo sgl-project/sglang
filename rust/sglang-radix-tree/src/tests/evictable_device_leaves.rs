@@ -213,6 +213,36 @@ fn the_invariant_check_reports_a_missed_requeue() {
     assert_eq!(leaves.check_queue_invariant(|id| prio.of(id)), None);
 }
 
+#[test]
+fn a_member_handed_out_but_not_evicted_stays_queued() {
+    let prio = Priorities(HashMap::from([(1, 1), (2, 2)]));
+    let mut leaves = EvictableDeviceLeaves::new();
+    leaves.add(idx(1));
+    leaves.add(idx(2));
+    // The caller stops the walk after one pop without evicting the victim.
+    leaves.begin_walk(|id| prio.of(id));
+    assert_eq!(leaves.pop_next(|id| prio.of(id)), Some(idx(1)));
+    leaves.end_walk();
+    assert_eq!(leaves.check_queue_invariant(|id| prio.of(id)), None);
+    assert_eq!(drain_walk(&mut leaves, &prio), vec![1, 2]);
+}
+
+#[test]
+fn a_duplicate_entry_is_handed_out_once_per_walk() {
+    let prio = Priorities(HashMap::from([(1, 1)]));
+    let mut leaves = EvictableDeviceLeaves::new();
+    leaves.add(idx(1));
+    leaves.begin_walk(|id| prio.of(id));
+    leaves.end_walk();
+    // An unchanged-priority requeue leaves two equal-key entries.
+    leaves.requeue(idx(1));
+    leaves.begin_walk(|id| prio.of(id));
+    assert_eq!(leaves.pop_next(|id| prio.of(id)), Some(idx(1)));
+    assert_eq!(leaves.pop_next(|id| prio.of(id)), None);
+    leaves.end_walk();
+    assert_eq!(drain_walk(&mut leaves, &prio), vec![1]);
+}
+
 /// Deterministic xorshift so the fuzz needs no extra crate.
 struct Rng(u64);
 

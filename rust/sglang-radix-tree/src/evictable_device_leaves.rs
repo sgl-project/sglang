@@ -23,7 +23,8 @@ pub struct EvictableDeviceLeaves {
     /// Members that joined, or whose priority may have dropped, since the
     /// queue last absorbed them.
     admitted: Vec<NodeIdx_>,
-    /// Per arena slot: the walk generation in which the slot last joined.
+    /// Per arena slot: the walk generation in which the slot last joined or
+    /// was handed out. Either makes it ineligible for the rest of that walk.
     joined_walk: Vec<u64>,
     /// Bumped at every walk start. A slot that joins mid-walk is not eligible
     /// until the next walk, matching a snapshot taken at walk start.
@@ -160,6 +161,11 @@ impl EvictableDeviceLeaves {
             if key > current {
                 continue;
             }
+            // Popping consumed the entry, but the caller may stop the walk
+            // without evicting `id`. Re-admit it so it stays covered (an
+            // eviction drops it via `discard`), and hand it out once per walk.
+            self.joined_walk[id.0] = self.walk;
+            self.note_admitted(id);
             return Some(id);
         }
     }
