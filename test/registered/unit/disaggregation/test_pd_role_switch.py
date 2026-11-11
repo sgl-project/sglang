@@ -162,7 +162,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s = self._scheduler(DisaggregationMode.DECODE)
         # is_fully_idle skips held requests, so it still reports idle.
         held = IndexedReqList(ListKind.PD_HELD)
-        held.join([MagicMock()])
+        held.join([MagicMock(owner_list=None)])
         s.request_lists.return_value = {ListKind.PD_HELD: held}
         out = Scheduler.handle_pd_role_switch(
             s, PdRoleSwitchReqInput(new_role="prefill")

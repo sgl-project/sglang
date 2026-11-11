@@ -343,7 +343,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The maximum number of dispatched tokens on each GPU for --moe-a2a-backend=flashinfer</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The maximum number of dispatched tokens on each GPU for --moe-a2a-backend=flashinfer_nvlink_one_sided</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"1024"`</td>
     </tr>
     <tr>
@@ -354,6 +354,11 @@ SGLang supports various environment variables that can be used to configure its 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Per-rank FlashInfer MegaMOE symmetric-workspace token capacity. A value of <code>0</code> derives the capacity from the runtime token limits.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Per-rank token capacity of an extra, smaller FlashInfer MegaMOE workspace for decode-only forwards of ModelOpt NVFP4 MoE layers, including <code>nvfp4_online</code>; other MegaMOE quantizations ignore it with a startup warning. Either <code>0</code> (off) or <code>0 &lt; capacity &lt; main capacity</code>, where the main capacity is <code>SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK</code> or its derived value. Startup rejects a negative value, or one not below a positive <code>SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK</code>; when that variable is <code>0</code> or unset, the main capacity is derived and the check runs when the first MegaMOE layer is built. A forward uses it only when no DP rank extends and every EP rank's batch fits; otherwise it uses the main workspace. Unused (logged once) when MegaMoE startup autotuning runs, since the tuned capacity profiles already serve small batches; it takes effect with <code>--disable-flashinfer-autotune</code> or <code>--flashinfer-autotune-skip-ops flashinfer_megamoe</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
@@ -1461,7 +1466,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_WAR_BARRIER</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force-enable the write-after-read barrier for the overlap scheduler even when CUDA is not detected (e.g. AMD/ROCm). On CUDA the barrier is always enabled.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force-enable the write-after-read barrier for the overlap and pipeline-parallel schedulers even when CUDA is not detected (e.g. AMD/ROCm). On CUDA, and with <code>--enable-unified-memory</code> on any device, the barrier is always enabled.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>

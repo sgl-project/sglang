@@ -479,9 +479,12 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                     "CPU sequence lengths."
                 )
             hf_config = runner.model_runner.model_config.hf_config
-            needs_cpu_seq_lens = getattr(
-                getattr(runner, "attn_backend", None), "needs_cpu_seq_lens", True
-            )
+            attn_backend = getattr(runner, "attn_backend", None)
+            full_attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+            needs_cpu_seq_lens = getattr(attn_backend, "needs_cpu_seq_lens", True)
+            # QFA needs no FIA host rebinding even when GDN needs CPU lengths.
+            if getattr(full_attn_backend, "use_quant_flash_attn", False):
+                needs_cpu_seq_lens = False
             # The old multi-layer runner always updated Host lengths. Preserve
             # that contract independently of the generic DSA/V4 opt-out.
             if is_multi_layer_draft_extend or (

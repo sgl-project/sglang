@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative import eagle_utils, sharded_verify
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
@@ -85,15 +86,6 @@ def _verify_logits():
     )
 
 
-def _runtime_spec():
-    return SimpleNamespace(
-        speculative_use_rejection_sampling=False,
-        speculative_use_block_verification=False,
-        speculative_accept_threshold_single=1.0,
-        speculative_accept_threshold_acc=1.0,
-    )
-
-
 class _FakeGroup:
     """all_gather_into_tensor over shards held on one device, rank order."""
 
@@ -138,11 +130,11 @@ class TestShardedPolicy(CustomTestCase):
             kwargs["accept_token_num"].zero_()
 
         with (
+            get_context().override_server_args(),
             patch.object(eagle_utils, "_is_cuda", True),
             patch.object(eagle_utils, "_is_cpu", False),
             patch.object(eagle_utils, "_is_hip", False),
             patch.object(eagle_utils, "_is_xpu", False),
-            patch.object(eagle_utils, "get_spec", return_value=_runtime_spec()),
             patch.object(eagle_utils, "gather_full_logits", side_effect=gather),
             patch.object(
                 eagle_utils,

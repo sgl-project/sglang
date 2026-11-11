@@ -10,6 +10,8 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.srt.entrypoints.openai.protocol import OPENAI_MAX_N
+from sglang.srt.environ import envs
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
@@ -586,6 +588,40 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Check modalities
         self.assertEqual(req.modalities, [None, "image"])
 
+    def test_oversized_n_rejected_before_fan_out(self):
+        """An out-of-range n must be rejected before inputs are expanded n times."""
+        with envs.SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ.override(4096):
+            for n in (0, -1, 4097, True, "2", None, 2.0):
+                for sampling_params in ({"n": n}, [{"n": n}, {"n": n}]):
+                    with self.subTest(n=n, sampling_params=sampling_params):
+                        text = (
+                            "Hello" if isinstance(sampling_params, dict) else ["a", "b"]
+                        )
+                        req = GenerateReqInput(
+                            text=text, sampling_params=sampling_params
+                        )
+                        with self.assertRaisesRegex(ValueError, "n must be an integer"):
+                            req.normalize_batch_and_arguments()
+                        self.assertIsNone(req.rid)
+
+            # Native requests are not limited to OpenAI's n.
+            req = GenerateReqInput(
+                text="Hello", sampling_params={"n": OPENAI_MAX_N + 1}
+            )
+            req.normalize_batch_and_arguments()
+            self.assertEqual(len(req.text), OPENAI_MAX_N + 1)
+
+    def test_list_n_validated_for_every_element(self):
+        """A later element equal to the first by value must still be validated."""
+        for later in (True, 2.0):
+            first = 1 if later is True else 2
+            with self.subTest(later=later):
+                req = GenerateReqInput(
+                    text=["a", "b"], sampling_params=[{"n": first}, {"n": later}]
+                )
+                with self.assertRaisesRegex(ValueError, "n must be an integer"):
+                    req.normalize_batch_and_arguments()
+
     def test_expanding_parallel_sample_correlation(self):
         """Test that when expanding with parallel samples, prompts, images and modalities are properly correlated."""
         req = copy.deepcopy(self.base_req)
@@ -919,6 +955,13 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             [batch[i].rid for i in range(4)],
             ["batch_0", "batch_1", "batch_2", "batch_3"],
         )
+
+    def test_generate_rids_stay_unpadded(self):
+        # Clients and the Rust server rebuild unpadded `<rid>_<i>` for generate.
+        req = GenerateReqInput(text="x", rid="base", sampling_params={"n": 12})
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.rid[0], "base_0")
+        self.assertEqual(req.rid[11], "base_11")
 
     def test_audio_data_handling(self):
         """Test handling of audio_data."""
@@ -1619,6 +1662,29 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
         req = EmbeddingReqInput(text=["t0", "t1", "t2"], image_data=["a.jpg"])
         with self.assertRaisesRegex(ValueError, "image_data has 1 entries"):
             req.normalize_batch_and_arguments()
+
+
+class TestEmbeddingReqInputRid(CustomTestCase):
+    def test_expanded_rids_are_zero_padded(self):
+        # The scheduler aborts by rid prefix, so no sub-rid may prefix another.
+        req = EmbeddingReqInput(text=["t"] * 12, rid="base")
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.rid[0], "base_00")
+        self.assertEqual(req.rid[11], "base_11")
+        for a in req.rid:
+            for b in req.rid:
+                if a != b:
+                    self.assertFalse(b.startswith(a), f"{a!r} prefixes {b!r}")
+
+    def test_invalid_base_rid_rejected(self):
+        for bad, msg in (
+            ("", "non-empty"),
+            ("HEALTH_CHECK_1", "reserved prefix"),
+        ):
+            with self.subTest(rid=bad):
+                req = EmbeddingReqInput(text=["a", "b"], rid=bad)
+                with self.assertRaisesRegex(ValueError, msg):
+                    req.normalize_batch_and_arguments()
 
 
 if __name__ == "__main__":

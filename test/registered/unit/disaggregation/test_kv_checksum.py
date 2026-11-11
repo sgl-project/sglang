@@ -21,6 +21,10 @@ from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixi
 from sglang.srt.disaggregation.utils import MetadataBuffers, kv_layout_signature
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -258,6 +262,7 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.kv_checksum_computer = computer
         self.enable_overlap = False
         self.waiting_queue = []
+        self.running_reqs = KeyedReqList(ListKind.DECODING)
         # A static pool: no unified storage.
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=1, get_kvcache=_plain_kv_pool, storage=None
@@ -590,7 +595,7 @@ class TestKvChecksumMismatchHiSparse(unittest.TestCase):
         sched = _FakeScheduler(None, None)
         calls = []
         hisparse_coordinator = Mock()
-        hisparse_coordinator.request_finished.side_effect = lambda req: calls.append(
+        hisparse_coordinator.release_request.side_effect = lambda req: calls.append(
             ("hisparse", req)
         )
         sched.request_retirer = release_only_retirer(Mock(), hisparse_coordinator)
