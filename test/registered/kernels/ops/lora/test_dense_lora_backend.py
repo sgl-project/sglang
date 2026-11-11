@@ -163,6 +163,48 @@ def test_wrappers_match_legacy(kind, batch_name):
     torch.testing.assert_close(out.float(), expected.float(), rtol=2e-2, atol=2e-2)
 
 
+def _rows_backend(name):
+    if name == "triton":
+        return TritonLoRABackend(SLOTS, DEVICE)
+    if name == "csgmv":
+        from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
+
+        return ChunkedSgmvLoRABackend(SLOTS, DEVICE, server_args=None)
+    backend = TritonV2LoRABackend(SLOTS, DEVICE)
+    backend.validate_lora_targets(None, {"kv_b_proj"})
+    return backend
+
+
+@pytest.mark.parametrize("backend_name", ["triton", "csgmv", "triton_v2"])
+@pytest.mark.parametrize(
+    "row_lens", [[40, 0, 77, 3], [1, 2, 1, 1]], ids=["more_rows", "fewer_rows"]
+)
+def test_column_rows_take_their_requests_adapters(backend_name, row_lens):
+    """MLA cached-prefix rows are not the batch's tokens: each must still get its request's adapter."""
+    wrap, k = _layers("column")
+    slots = [1, 0, 2, 3]
+    batch = _batch([5, 17, 1, 9], slots, decode=False)
+    backend = _rows_backend(backend_name)
+    _prepare(backend, batch)
+    layer = wrap(backend)
+    x = torch.randn(sum(row_lens), k, device=DEVICE, dtype=DTYPE)
+
+    out = layer.forward_rows(x, row_lens)[0]
+
+    expected = []
+    for rows, slot in zip(x.split(row_lens), slots):
+        y = rows @ layer.base_layer.weight.T
+        rank = RANKS[slot]
+        if rank:
+            a = layer.A_buffer[slot, :rank].float()
+            b = layer.B_buffer[slot, :, :rank].float()
+            y = y + (SCALINGS[slot] * (rows.float() @ a.T) @ b.T).to(DTYPE)
+        expected.append(y)
+    torch.testing.assert_close(
+        out.float(), torch.cat(expected).float(), rtol=2e-2, atol=2e-2
+    )
+
+
 class _FixedPlanTable:
     def __init__(self, plan):
         self.plan = plan

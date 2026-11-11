@@ -1,12 +1,13 @@
-"""LoRA on kv_b_proj keeps cached prefixes off the MHA prefix paths.
+"""LoRA on kv_b_proj and the MHA cached-prefix paths.
 
 BUG REGRESSION. The DeepSeek/Kimi MHA prefix paths re-project the cached latent
-through kv_b_proj on prefix rows while the wrapped layer runs the adapter
-kernels with the batch's extend-token segments; on trtllm_mla every prefix hit
-took that path and faulted (flashinfer fmhaKernels.cuh:1338). Only the absorbed
-MLA path adds the kv_b_proj delta per token, so the LoRA hook disables the
-chunked prefix cache for kv_b_proj targets and rejects the backends that ignore
-the flag.
+through kv_b_proj on prefix rows; run with the batch's extend-token segments the
+adapter kernels faulted on trtllm_mla (flashinfer fmhaKernels.cuh:1338) and put
+the delta on the wrong rows elsewhere. LoRA backends that route those rows to
+their requests' adapters serve every attention backend unchanged. Without that
+routing (other LoRA backends, Full prefill CUDA graphs, ROCm) the hook keeps
+cached prefixes on the absorbed MLA path: it disables the chunked prefix cache
+for kv_b_proj targets and rejects the backends that ignore the flag.
 
     python -m pytest test/registered/unit/server_args/test_lora_kv_b_chunked_prefix.py -v
 """
@@ -18,6 +19,7 @@ from unittest.mock import patch
 from sglang.srt.arg_groups import lora_hook
 from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.lora.backend import lora_registry
 from sglang.srt.lora.utils import kv_b_lora_prefix_cache_error
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -36,6 +38,8 @@ _KIMI_TARGETS = [
 
 def _args(**fields):
     fields.setdefault("enable_lora", True)
+    # cannot route cached-prefix rows
+    fields.setdefault("lora_backend", "torch_native")
     fields.setdefault("max_lora_rank", 16)
     fields.setdefault("lora_target_modules", _KIMI_TARGETS)
     return ServerArgs(model_path="dummy", **fields)
@@ -150,6 +154,41 @@ class TestKvBLoraPrefixCacheHook(CustomTestCase):
             check_lora_server_args(
                 _args(attention_backend="trtllm_mla", enable_kv_cache_sharding=True)
             )
+
+
+class TestKvBLoraCachedRowsRouting(CustomTestCase):
+    def test_routing_backends_leave_every_attention_backend_alone(self):
+        for lora_backend in ("csgmv", "triton"):
+            for backend in ("trtllm_mla", "fa3", "dsa", "nsa", "fa4"):
+                with self.subTest(lora_backend=lora_backend, backend=backend):
+                    args = _args(lora_backend=lora_backend, attention_backend=backend)
+                    check_lora_server_args(args)
+                    self.assertFalse(
+                        resolution_result(args, "disable_chunked_prefix_cache")
+                    )
+
+    def test_full_prefill_graph_keeps_the_absorbed_path_rule(self):
+        args = _args(
+            lora_backend="csgmv",
+            attention_backend="trtllm_mla",
+            cuda_graph_backend_prefill="full",
+        )
+        check_lora_server_args(args)
+        self.assertTrue(resolution_result(args, "disable_chunked_prefix_cache"))
+        with self.assertRaisesRegex(ValueError, "nsa"):
+            check_lora_server_args(
+                _args(
+                    lora_backend="csgmv",
+                    attention_backend="nsa",
+                    cuda_graph_backend_prefill="full",
+                )
+            )
+
+    def test_rocm_keeps_the_absorbed_path_rule(self):
+        with patch.object(lora_registry, "is_hip", return_value=True):
+            args = _args(lora_backend="triton", attention_backend="trtllm_mla")
+            check_lora_server_args(args)
+        self.assertTrue(resolution_result(args, "disable_chunked_prefix_cache"))
 
 
 class TestKvBLoraPrefixCacheError(CustomTestCase):
