@@ -10,6 +10,12 @@ Correctness matches ``extend_attention_fwd`` for the topk==1 causal verify case.
 
 score(h,i,t) = q_nope[i,h] · c_KV[t]  +  q_pe[i,h] · k_pe[t]      # 512 dot + 64 dot
 out(h,i)     = Σ_t softmax_t · c_KV[t]                            # V = c_KV
+
+``verify_mla_draft_fwd`` (``DraftVerifyMLA``) runs the same kernel bodies for the
+gfx950 monokernel's DFLASH MLA draft, with constexpr options the other callers'
+launches leave off: BF16 prefix dots over an FP8 cache, a sliding window trimmed
+from the front of each rail, empty prefixes, and a combine over blocks of splits
+and row tiles.
 """
 
 import torch
@@ -54,7 +60,7 @@ def _active_splits(seqlen, num_splits, BLOCK_N: tl.constexpr):
 
 
 @triton.jit
-def _verify_mla_prefix_stage1(
+def _verify_mla_prefix_stage1_body(
     Q,
     K_Buffer,
     V_Buffer,
@@ -93,6 +99,11 @@ def _verify_mla_prefix_stage1(
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
     SLIDING_WINDOW_SIZE: tl.constexpr,
+    # prefix dots in q's dtype, upcasting the cached K/V (default: the cache dtype)
+    BF16_DOT: tl.constexpr = False,
+    # A sliding window applied by starting each rail at (length - TRIM_WINDOW). Unlike
+    # SLIDING_WINDOW_SIZE it needs no -inf guards: no split is ever fully masked.
+    TRIM_WINDOW: tl.constexpr = 0,
 ):
     cur_batch = tl.program_id(0)
     head_block = tl.program_id(1)
@@ -103,6 +114,12 @@ def _verify_mla_prefix_stage1(
 
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
+    if TRIM_WINDOW > 0:
+        # Keys before (length - TRIM_WINDOW) are outside every row's window: start
+        # the rail there, so the per-row mask below drops at most L_EXT - 1 keys.
+        skip = tl.maximum(cur_batch_seq_len - TRIM_WINDOW, 0)
+        cur_batch_kv_start_idx += skip
+        cur_batch_seq_len -= skip
     active = _active_splits(cur_batch_seq_len, num_splits, BLOCK_N)
 
     # skip idle workgroups
@@ -142,17 +159,20 @@ def _verify_mla_prefix_stage1(
             (cur_q_start + offs_l)[None, :] * stride_qbs + offs_h[:, None] * stride_qh,
             (R,),
         )
+        # q, the probabilities and the dots run in the cache dtype (FP8 dots over
+        # an FP8 cache), or with BF16_DOT in q's dtype, upcasting K/V instead.
+        dot_dtype = Q.dtype.element_ty if BF16_DOT else K_Buffer.dtype.element_ty
         q_nope = tl.load(
             Q + q_row[:, None] + offs_dn[None, :],
             mask=row_mask[:, None] & (offs_dn[None, :] < NOPE_DIM),
             other=0.0,
-        ).to(K_Buffer.dtype.element_ty)
+        ).to(dot_dtype)
         if PE_DIM > 0:
             q_pe = tl.load(
                 Q + q_row[:, None] + (NOPE_DIM + offs_dp)[None, :],
                 mask=row_mask[:, None] & (offs_dp[None, :] < PE_DIM),
                 other=0.0,
-            ).to(K_Buffer.dtype.element_ty)
+            ).to(dot_dtype)
 
         if SLIDING_WINDOW_SIZE > 0:
             # extend_attention_fwd's rule on the pre-windowed prefix list: draft query
@@ -177,19 +197,28 @@ def _verify_mla_prefix_stage1(
                 mask=(offs_dn[:, None] < NOPE_DIM) & n_mask[None, :],
                 other=0.0,
             )
-            qk = tl.dot(q_nope, k_nope)
+            qk = tl.dot(q_nope, k_nope.to(dot_dtype))
             if PE_DIM > 0:
                 k_pe = tl.load(
                     K_Buffer + base + (NOPE_DIM + offs_dp)[:, None],
                     mask=(offs_dp[:, None] < PE_DIM) & n_mask[None, :],
                     other=0.0,
                 )
-                qk += tl.dot(q_pe, k_pe)
+                qk += tl.dot(q_pe, k_pe.to(dot_dtype))
             qk *= sm_scale * k_scale
             qk = tl.where(n_mask[None, :], qk, float("-inf"))
             if SLIDING_WINDOW_SIZE > 0:
                 qk = tl.where(
                     offs_n[None, :] >= window_start[:, None], qk, float("-inf")
+                )
+            if TRIM_WINDOW > 0:
+                # extend_attention_fwd's window: row l at (rail length + l) keeps key n
+                # iff q <= n + TRIM_WINDOW; its masked keys sit in split 0's first tile
+                q_pos = cur_batch_seq_len + tl.reshape(
+                    offs_h[:, None] * 0 + offs_l[None, :], (R,)
+                )
+                qk = tl.where(
+                    q_pos[:, None] <= offs_n[None, :] + TRIM_WINDOW, qk, float("-inf")
                 )
 
             # MLA exposes its latent V through V_Buffer; ordinary shared-KV
@@ -202,6 +231,8 @@ def _verify_mla_prefix_stage1(
                 mask=n_mask[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
                 other=0.0,
             )
+            if BF16_DOT:
+                v = v.to(dot_dtype)
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
             if SLIDING_WINDOW_SIZE > 0:
                 # a row whose keys so far are all outside the window stays at -inf
@@ -245,8 +276,54 @@ def _verify_mla_prefix_stage1(
         tl.store(Att_Lse + lse_row, e_max + tl.log(e_sum), mask=row_mask)
 
 
+# The launched stage-1 kernels. Each keeps its own path's parameter list, since
+# Triton's launch path pays for every parameter it binds on every call.
+# fmt: off
 @triton.jit
-def _verify_mla_combine_stage2(
+def _verify_mla_prefix_stage1(
+    Q, K_Buffer, V_Buffer, sm_scale, k_scale, v_scale, qo_indptr, kv_indptr, kv_indices,
+    Att_Out, Att_Lse, num_splits, stride_qbs, stride_qh, stride_buf_kbs, stride_buf_vbs,
+    stride_buf_kh, stride_buf_vh, stride_ob, stride_oh, stride_os, stride_ol, stride_lb,
+    stride_lh, stride_ls,
+    H_Q: tl.constexpr, L_EXT: tl.constexpr, BLOCK_H: tl.constexpr,
+    KV_GROUP_NUM: tl.constexpr, HAS_KV_HEADS: tl.constexpr, NOPE_DIM: tl.constexpr,
+    PE_DIM: tl.constexpr, V_HEAD_DIM: tl.constexpr, BLOCK_DNOPE: tl.constexpr,
+    BLOCK_DPE: tl.constexpr, BLOCK_DV: tl.constexpr, BLOCK_N: tl.constexpr,
+    SLIDING_WINDOW_SIZE: tl.constexpr,
+):
+    _verify_mla_prefix_stage1_body(
+        Q, K_Buffer, V_Buffer, sm_scale, k_scale, v_scale, qo_indptr, kv_indptr, kv_indices,
+        Att_Out, Att_Lse, num_splits, stride_qbs, stride_qh, stride_buf_kbs, stride_buf_vbs,
+        stride_buf_kh, stride_buf_vh, stride_ob, stride_oh, stride_os, stride_ol, stride_lb,
+        stride_lh, stride_ls, H_Q, L_EXT, BLOCK_H, KV_GROUP_NUM, HAS_KV_HEADS, NOPE_DIM,
+        PE_DIM, V_HEAD_DIM, BLOCK_DNOPE, BLOCK_DPE, BLOCK_DV, BLOCK_N, SLIDING_WINDOW_SIZE,
+    )
+
+
+@triton.jit
+def _verify_mla_draft_prefix_stage1(
+    Q, K_Buffer, V_Buffer, sm_scale, k_scale, v_scale, qo_indptr, kv_indptr, kv_indices,
+    Att_Out, Att_Lse, num_splits, stride_qbs, stride_qh, stride_buf_kbs, stride_buf_vbs,
+    stride_buf_kh, stride_buf_vh, stride_ob, stride_oh, stride_os, stride_ol, stride_lb,
+    stride_lh, stride_ls,
+    H_Q: tl.constexpr, L_EXT: tl.constexpr, BLOCK_H: tl.constexpr,
+    KV_GROUP_NUM: tl.constexpr, HAS_KV_HEADS: tl.constexpr, NOPE_DIM: tl.constexpr,
+    PE_DIM: tl.constexpr, V_HEAD_DIM: tl.constexpr, BLOCK_DNOPE: tl.constexpr,
+    BLOCK_DPE: tl.constexpr, BLOCK_DV: tl.constexpr, BLOCK_N: tl.constexpr,
+    BF16_DOT: tl.constexpr = False, WINDOW: tl.constexpr = 0,
+):
+    _verify_mla_prefix_stage1_body(
+        Q, K_Buffer, V_Buffer, sm_scale, k_scale, v_scale, qo_indptr, kv_indptr, kv_indices,
+        Att_Out, Att_Lse, num_splits, stride_qbs, stride_qh, stride_buf_kbs, stride_buf_vbs,
+        stride_buf_kh, stride_buf_vh, stride_ob, stride_oh, stride_os, stride_ol, stride_lb,
+        stride_lh, stride_ls, H_Q, L_EXT, BLOCK_H, KV_GROUP_NUM, HAS_KV_HEADS, NOPE_DIM,
+        PE_DIM, V_HEAD_DIM, BLOCK_DNOPE, BLOCK_DPE, BLOCK_DV, BLOCK_N, -1, BF16_DOT, WINDOW,
+    )
+# fmt: on
+
+
+@triton.jit
+def _verify_mla_combine_stage2_body(
     Att_Out,
     Att_Lse,
     Q,
@@ -281,9 +358,20 @@ def _verify_mla_combine_stage2(
     KV_GROUP_NUM: tl.constexpr,
     HAS_KV_HEADS: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    # splits each step of a two-pass combine reads (1: an online loop over splits)
+    SPLIT_BLOCK: tl.constexpr = 1,
+    # query rows per program, on grid axis 2 (0: all L_EXT rows)
+    ROW_BLOCK: tl.constexpr = 0,
+    # stage 1's TRIM_WINDOW, which shortened each rail to at most that many keys
+    TRIM_WINDOW: tl.constexpr = 0,
+    # a request may have no prefix keys
+    EMPTY_PREFIX: tl.constexpr = False,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
+    ROWS: tl.constexpr = L_EXT if ROW_BLOCK == 0 else ROW_BLOCK
+    if ROW_BLOCK > 0:
+        row0 = tl.program_id(2) * ROWS
     if HAS_KV_HEADS:
         kv_head_off_ke = (cur_head // KV_GROUP_NUM) * stride_keh
         kv_head_off_ve = (cur_head // KV_GROUP_NUM) * stride_veh
@@ -293,50 +381,104 @@ def _verify_mla_combine_stage2(
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
-    offs_l = tl.arange(0, L_EXT)
+    # this program's query rows (offs_l) against every draft key (offs_k)
+    if ROW_BLOCK > 0:
+        offs_l = row0 + tl.arange(0, ROWS)
+    else:
+        offs_l = tl.arange(0, L_EXT)
+    offs_k = tl.arange(0, L_EXT)
 
     cur_q_start = tl.load(qo_indptr + cur_batch)
     l_ext = tl.load(qo_indptr + cur_batch + 1) - cur_q_start
     mask_l = offs_l < l_ext
+    mask_k = offs_k < l_ext
 
     # ---- (a) combine prefix splits (online logsumexp over active splits) ---
     seqlen = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
-    active = _active_splits(seqlen, num_splits, BLOCK_N)
+    if TRIM_WINDOW > 0:
+        seqlen = tl.minimum(seqlen, TRIM_WINDOW)  # stage 1's shortened rail
+    if EMPTY_PREFIX:
+        # Stage 1 still runs split 0 of an empty prefix and stores its 0/0 partial;
+        # skip it here so only the draft-draft part reaches the output.
+        active = tl.where(seqlen > 0, _active_splits(seqlen, num_splits, BLOCK_N), 0)
+    else:
+        active = _active_splits(seqlen, num_splits, BLOCK_N)
 
-    m = tl.zeros([L_EXT], dtype=tl.float32) - float("inf")
-    l_acc = tl.zeros([L_EXT], dtype=tl.float32)
-    acc = tl.zeros([L_EXT, BLOCK_DV], dtype=tl.float32)
-    for s in range(active):
-        lse_s = tl.load(
-            Att_Lse
-            + cur_batch * stride_lb
-            + cur_head * stride_lh
-            + s * stride_ls
-            + offs_l,
-            mask=mask_l,
-            other=float("-inf"),
-        )
-        o_s = tl.load(
-            Att_Out
-            + cur_batch * stride_ob
-            + cur_head * stride_oh
-            + s * stride_os
-            + offs_l[:, None] * stride_ol
-            + offs_dv[None, :],
-            mask=mask_l[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
-            other=0.0,
-        ).to(tl.float32)
-        new_m = tl.maximum(m, lse_s)
-        alpha = tl.exp(m - new_m)
-        beta = tl.exp(lse_s - new_m)
-        acc = acc * alpha[:, None] + o_s * beta[:, None]
-        l_acc = l_acc * alpha + beta
-        m = new_m
-    o_prefix = acc / l_acc[:, None]
+    m = tl.zeros([ROWS], dtype=tl.float32) - float("inf")
+    l_acc = tl.zeros([ROWS], dtype=tl.float32)
+    acc = tl.zeros([ROWS, BLOCK_DV], dtype=tl.float32)
+    if SPLIT_BLOCK > 1:
+        # the max lse over all splits first, then their weighted sum
+        offs_s = tl.arange(0, SPLIT_BLOCK)
+        lse_base = Att_Lse + cur_batch * stride_lb + cur_head * stride_lh
+        o_base = Att_Out + cur_batch * stride_ob + cur_head * stride_oh
+        for s0 in range(0, active, SPLIT_BLOCK):
+            s_mask = (s0 + offs_s) < active
+            lse_blk = tl.load(
+                lse_base + (s0 + offs_s)[:, None] * stride_ls + offs_l[None, :],
+                mask=s_mask[:, None] & mask_l[None, :],
+                other=float("-inf"),
+            )
+            m = tl.maximum(m, tl.max(lse_blk, 0))
+        m_ref = tl.where(m == float("-inf"), 0.0, m)
+        for s0 in range(0, active, SPLIT_BLOCK):
+            s_mask = (s0 + offs_s) < active
+            lse_blk = tl.load(
+                lse_base + (s0 + offs_s)[:, None] * stride_ls + offs_l[None, :],
+                mask=s_mask[:, None] & mask_l[None, :],
+                other=float("-inf"),
+            )
+            w = tl.exp(lse_blk - m_ref[None, :])
+            o_blk = tl.load(
+                o_base
+                + (s0 + offs_s)[:, None, None] * stride_os
+                + offs_l[None, :, None] * stride_ol
+                + offs_dv[None, None, :],
+                mask=s_mask[:, None, None]
+                & mask_l[None, :, None]
+                & (offs_dv[None, None, :] < V_HEAD_DIM),
+                other=0.0,
+            ).to(tl.float32)
+            acc += tl.sum(o_blk * w[:, :, None], 0)
+            l_acc += tl.sum(w, 0)
+        m = m_ref
+    else:
+        for s in range(active):
+            lse_s = tl.load(
+                Att_Lse
+                + cur_batch * stride_lb
+                + cur_head * stride_lh
+                + s * stride_ls
+                + offs_l,
+                mask=mask_l,
+                other=float("-inf"),
+            )
+            o_s = tl.load(
+                Att_Out
+                + cur_batch * stride_ob
+                + cur_head * stride_oh
+                + s * stride_os
+                + offs_l[:, None] * stride_ol
+                + offs_dv[None, :],
+                mask=mask_l[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
+                other=0.0,
+            ).to(tl.float32)
+            new_m = tl.maximum(m, lse_s)
+            alpha = tl.exp(m - new_m)
+            beta = tl.exp(lse_s - new_m)
+            acc = acc * alpha[:, None] + o_s * beta[:, None]
+            l_acc = l_acc * alpha + beta
+            m = new_m
+    if EMPTY_PREFIX:
+        # An empty prefix (no active split) leaves acc = l_acc = 0: keep o_prefix at
+        # 0 instead of 0/0, so its zero weight in the merge below drops it cleanly.
+        o_prefix = acc / tl.where(l_acc > 0, l_acc, 1.0)[:, None]
+    else:
+        o_prefix = acc / l_acc[:, None]
     lse_prefix = m + tl.log(l_acc)
 
-    # ---- (b) draft-draft causal attention (L_EXT x L_EXT) -----------------
-    # load draft queries [L_EXT, D], draft K/V [L_EXT, D]/[L_EXT, Dv]
+    # ---- (b) draft-draft causal attention (ROWS x L_EXT) ------------------
+    # load draft queries [ROWS, D], draft K/V [L_EXT, D]/[L_EXT, Dv]
     offs_q = (
         (cur_q_start + offs_l)[:, None] * stride_qbs
         + cur_head * stride_qh
@@ -346,31 +488,31 @@ def _verify_mla_combine_stage2(
         Q + offs_q, mask=mask_l[:, None] & (offs_d[None, :] < HEAD_DIM), other=0.0
     ).to(tl.float32)
     offs_ke = (
-        (cur_q_start + offs_l)[:, None] * stride_kebs + kv_head_off_ke + offs_d[None, :]
+        (cur_q_start + offs_k)[:, None] * stride_kebs + kv_head_off_ke + offs_d[None, :]
     )
     ke = tl.load(
         K_Extend + offs_ke,
-        mask=mask_l[:, None] & (offs_d[None, :] < HEAD_DIM),
+        mask=mask_k[:, None] & (offs_d[None, :] < HEAD_DIM),
         other=0.0,
     ).to(tl.float32)
     offs_ve = (
-        (cur_q_start + offs_l)[:, None] * stride_vebs
+        (cur_q_start + offs_k)[:, None] * stride_vebs
         + kv_head_off_ve
         + offs_dv[None, :]
     )
     ve = tl.load(
         V_Extend + offs_ve,
-        mask=mask_l[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
+        mask=mask_k[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
         other=0.0,
     ).to(tl.float32)
 
-    # scores[i,j] = q_i . k_j  (i query, j key)  -> [L_EXT, L_EXT]
+    # scores[i,j] = q_i . k_j  (i query, j key)  -> [ROWS, L_EXT]
     qk = tl.sum(q[:, None, :] * ke[None, :, :], 2) * sm_scale
     # causal: query i sees key j iff j <= i
     # non-causal: query i sees all keys
-    both_valid = mask_l[None, :] & mask_l[:, None]
+    both_valid = mask_k[None, :] & mask_l[:, None]
     if IS_CAUSAL:
-        vis = (offs_l[None, :] <= offs_l[:, None]) & both_valid
+        vis = (offs_k[None, :] <= offs_l[:, None]) & both_valid
     else:
         vis = both_valid
     qk = tl.where(vis, qk, float("-inf"))
@@ -396,6 +538,48 @@ def _verify_mla_combine_stage2(
         o.to(O_Out.dtype.element_ty),
         mask=mask_l[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
     )
+
+
+# The launched combine kernels, each with its own path's parameter list.
+# fmt: off
+@triton.jit
+def _verify_mla_combine_stage2(
+    Att_Out, Att_Lse, Q, K_Extend, V_Extend, O_Out, sm_scale, qo_indptr, kv_indptr,
+    num_splits, stride_ob, stride_oh, stride_os, stride_ol, stride_lb, stride_lh,
+    stride_ls, stride_qbs, stride_qh, stride_kebs, stride_vebs, stride_keh, stride_veh,
+    stride_oobs, stride_ooh,
+    L_EXT: tl.constexpr, HEAD_DIM: tl.constexpr, V_HEAD_DIM: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr, BLOCK_DV: tl.constexpr, BLOCK_N: tl.constexpr,
+    KV_GROUP_NUM: tl.constexpr, HAS_KV_HEADS: tl.constexpr, IS_CAUSAL: tl.constexpr,
+):
+    _verify_mla_combine_stage2_body(
+        Att_Out, Att_Lse, Q, K_Extend, V_Extend, O_Out, sm_scale, qo_indptr, kv_indptr,
+        num_splits, stride_ob, stride_oh, stride_os, stride_ol, stride_lb, stride_lh,
+        stride_ls, stride_qbs, stride_qh, stride_kebs, stride_vebs, stride_keh, stride_veh,
+        stride_oobs, stride_ooh, L_EXT, HEAD_DIM, V_HEAD_DIM, BLOCK_DMODEL, BLOCK_DV,
+        BLOCK_N, KV_GROUP_NUM, HAS_KV_HEADS, IS_CAUSAL,
+    )
+
+
+@triton.jit
+def _verify_mla_draft_combine_stage2(
+    Att_Out, Att_Lse, Q, K_Extend, V_Extend, O_Out, sm_scale, qo_indptr, kv_indptr,
+    num_splits, stride_ob, stride_oh, stride_os, stride_ol, stride_lb, stride_lh,
+    stride_ls, stride_qbs, stride_qh, stride_kebs, stride_vebs, stride_keh, stride_veh,
+    stride_oobs, stride_ooh,
+    L_EXT: tl.constexpr, HEAD_DIM: tl.constexpr, V_HEAD_DIM: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr, BLOCK_DV: tl.constexpr, BLOCK_N: tl.constexpr,
+    KV_GROUP_NUM: tl.constexpr, HAS_KV_HEADS: tl.constexpr, IS_CAUSAL: tl.constexpr,
+    SPLIT_BLOCK: tl.constexpr = 1, ROW_BLOCK: tl.constexpr = 0, WINDOW: tl.constexpr = 0,
+):
+    _verify_mla_combine_stage2_body(
+        Att_Out, Att_Lse, Q, K_Extend, V_Extend, O_Out, sm_scale, qo_indptr, kv_indptr,
+        num_splits, stride_ob, stride_oh, stride_os, stride_ol, stride_lb, stride_lh,
+        stride_ls, stride_qbs, stride_qh, stride_kebs, stride_vebs, stride_keh, stride_veh,
+        stride_oobs, stride_ooh, L_EXT, HEAD_DIM, V_HEAD_DIM, BLOCK_DMODEL, BLOCK_DV,
+        BLOCK_N, KV_GROUP_NUM, HAS_KV_HEADS, IS_CAUSAL, SPLIT_BLOCK, ROW_BLOCK, WINDOW, True,
+    )
+# fmt: on
 
 
 class VerifyMLA:
@@ -624,6 +808,275 @@ class VerifyMLA:
             kv_indptr,
             sm_scale,
             is_causal=is_causal,
+        )
+        return o_out
+
+
+# The MLA draft (Dv 512) splits further: at bs1 / 64K the 3 head blocks x 32 splits
+# walk 2K keys each and leave most MI350X CUs idle.
+MLA_MAX_N_SPLITS = 128
+# splits the combine reads per step; the per-split online loop pays one dependent
+# round trip per split
+MLA_SPLIT_BLOCK = 16
+# draft rows per combine program on the MLA path; the other path takes all L_EXT
+MLA_COMBINE_ROWS = 2
+# The shared launch's waves_per_eu 4 caps stage 1 at 128 VGPRs, where the MLA draft
+# tile spills on gfx950; 2 compiles it spill-free.
+DRAFT_STAGE1_WAVES_PER_EU = 2
+
+_DRAFT_BLOCK_CONFIG = {
+    # head_dim: (BLOCK_H, BLOCK_N, num_warps)
+    # 2 warps or 32/128-key tiles miscompute; 2 heads a tile fill more CUs on a 1K window
+    576: (2, 64, 4),  # K3 MLA (kv_lora_rank 512 + qk_rope 64)
+}
+
+
+class DraftVerifyMLA(VerifyMLA):
+    """``VerifyMLA`` for the gfx950 monokernel's DFLASH MLA draft.
+
+    It serves empty prefixes and a window trimmed from each rail. On the MLA shape
+    it also splits further, combines blocks of splits over row tiles, and compiles
+    stage 1 spill-free. Its partials are flat, sized for the largest bs x splits a
+    launch needs.
+    """
+
+    max_splits = MAX_N_SPLITS
+    split_block = 1
+    row_block = 0
+    stage1_launch = _AMD_LAUNCH_KWARGS
+
+    @staticmethod
+    def block_config(head_dim):
+        """Return (BLOCK_H, BLOCK_N, num_warps), with a power-of-two head tile."""
+        return _DRAFT_BLOCK_CONFIG.get(
+            head_dim, (DEFAULT_BLOCK_H, DEFAULT_BLOCK_N, DEFAULT_NUM_WARPS)
+        )
+
+    def __init__(self, max_bs, h_q, head_dim, v_head_dim, l_ext, **kwargs):
+        mla = head_dim > v_head_dim
+        if mla:
+            # the base constructor's _alloc sizes the partials by max_splits
+            self.max_splits, self.split_block = MLA_MAX_N_SPLITS, MLA_SPLIT_BLOCK
+            if _AMD_LAUNCH_KWARGS:
+                self.stage1_launch = dict(
+                    _AMD_LAUNCH_KWARGS, waves_per_eu=DRAFT_STAGE1_WAVES_PER_EU
+                )
+        super().__init__(max_bs, h_q, head_dim, v_head_dim, l_ext, **kwargs)
+        if mla:
+            self.row_block = min(MLA_COMBINE_ROWS, self.l_pad)
+
+    def _alloc(self, max_bs):
+        self.max_bs = max_bs
+        # (request, split) pairs a launch can need: bs x _num_splits(bs) peaks well
+        # below max_bs x max_splits, so the partials are flat and viewed per call.
+        pairs = max(bs * self._num_splits(bs) for bs in range(1, max_bs + 1))
+        self.att_out = torch.empty(
+            pairs * self.h_q * self.l_pad * self.v_head_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self.att_lse = torch.empty(
+            pairs * self.h_q * self.l_pad, dtype=torch.float32, device=self.device
+        )
+
+    def _partials(self, bs, num_splits):
+        """Views of the flat partials for one launch.
+
+        [bs, H_Q, num_splits, L_PAD, Dv] bf16 and [bs, H_Q, num_splits, L_PAD] fp32."""
+        n = bs * self.h_q * num_splits * self.l_pad
+        att_out = self.att_out[: n * self.v_head_dim].view(
+            bs, self.h_q, num_splits, self.l_pad, self.v_head_dim
+        )
+        att_lse = self.att_lse[:n].view(bs, self.h_q, num_splits, self.l_pad)
+        return att_out, att_lse
+
+    def _num_splits(self, bs):
+        budget = TARGET_PROGRAMS // max(1, bs * self.n_head_blocks)
+        return max(1, min(self.max_splits, budget))
+
+    def _run_prefix_kernel(
+        self,
+        bs,
+        num_splits,
+        att_out,
+        att_lse,
+        q_extend,
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        k_scale,
+        v_scale,
+        bf16_dot=False,
+        window=0,
+    ):
+        grid = (bs, self.n_head_blocks, num_splits)
+        _verify_mla_draft_prefix_stage1[grid](
+            q_extend,
+            k_buffer,
+            v_buffer,
+            sm_scale,
+            k_scale,
+            v_scale,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            att_out,
+            att_lse,
+            num_splits,
+            q_extend.stride(0),
+            q_extend.stride(1),
+            k_buffer.stride(0),
+            v_buffer.stride(0),
+            k_buffer.stride(1),
+            v_buffer.stride(1),
+            att_out.stride(0),
+            att_out.stride(1),
+            att_out.stride(2),
+            att_out.stride(3),
+            att_lse.stride(0),
+            att_lse.stride(1),
+            att_lse.stride(2),
+            H_Q=self.h_q,
+            L_EXT=self.l_pad,
+            BLOCK_H=self.block_h,
+            KV_GROUP_NUM=self.kv_group_num,
+            HAS_KV_HEADS=self.has_kv_heads,
+            NOPE_DIM=self.nope_dim,
+            PE_DIM=self.pe_dim,
+            V_HEAD_DIM=self.v_head_dim,
+            BLOCK_DNOPE=triton.next_power_of_2(self.nope_dim),
+            BLOCK_DPE=max(1, triton.next_power_of_2(self.pe_dim)),
+            BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
+            BLOCK_N=self.block_n,
+            BF16_DOT=bf16_dot,
+            WINDOW=window,
+            num_warps=self.num_warps,
+            # 2 stages spill on the MLA tile and miscompute
+            num_stages=1,
+            **self.stage1_launch,
+        )
+
+    def _run_combine_kernel(
+        self,
+        bs,
+        num_splits,
+        att_out,
+        att_lse,
+        q_extend,
+        k_extend,
+        v_extend,
+        o_out,
+        qo_indptr,
+        kv_indptr,
+        sm_scale,
+        is_causal=True,
+        window=0,
+    ):
+        grid = (bs, self.h_q, self.l_pad // self.row_block if self.row_block else 1)
+        _verify_mla_draft_combine_stage2[grid](
+            att_out,
+            att_lse,
+            q_extend,
+            k_extend,
+            v_extend,
+            o_out,
+            sm_scale,
+            qo_indptr,
+            kv_indptr,
+            num_splits,
+            att_out.stride(0),
+            att_out.stride(1),
+            att_out.stride(2),
+            att_out.stride(3),
+            att_lse.stride(0),
+            att_lse.stride(1),
+            att_lse.stride(2),
+            q_extend.stride(0),
+            q_extend.stride(1),
+            k_extend.stride(0),
+            v_extend.stride(0),
+            k_extend.stride(1),
+            v_extend.stride(1),
+            o_out.stride(0),
+            o_out.stride(1),
+            L_EXT=self.l_pad,
+            HEAD_DIM=self.head_dim,
+            V_HEAD_DIM=self.v_head_dim,
+            BLOCK_DMODEL=triton.next_power_of_2(self.head_dim),
+            BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
+            BLOCK_N=self.block_n,
+            KV_GROUP_NUM=self.kv_group_num,
+            HAS_KV_HEADS=self.has_kv_heads,
+            IS_CAUSAL=is_causal,
+            SPLIT_BLOCK=self.split_block,
+            ROW_BLOCK=self.row_block,
+            WINDOW=window,
+            num_warps=4,
+            num_stages=1,
+        )
+
+    def __call__(
+        self,
+        q_extend,
+        k_extend,
+        v_extend,
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        o_out=None,
+        k_scale=1.0,
+        v_scale=1.0,
+        is_causal=True,
+        bf16_dot=False,
+        window=0,
+    ):
+        if o_out is None:
+            o_out = torch.empty(
+                (q_extend.shape[0], self.h_q, self.v_head_dim),
+                dtype=q_extend.dtype,
+                device=q_extend.device,
+            )
+        bs = qo_indptr.shape[0] - 1
+        # One split count for both stages (they must agree on the active count).
+        num_splits = self._num_splits(bs)
+        att_out, att_lse = self._partials(bs, num_splits)
+        self._run_prefix_kernel(
+            bs,
+            num_splits,
+            att_out,
+            att_lse,
+            q_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            k_scale,
+            v_scale,
+            bf16_dot=bf16_dot,
+            window=window,
+        )
+        self._run_combine_kernel(
+            bs,
+            num_splits,
+            att_out,
+            att_lse,
+            q_extend,
+            k_extend,
+            v_extend,
+            o_out,
+            qo_indptr,
+            kv_indptr,
+            sm_scale,
+            is_causal=is_causal,
+            window=window,
         )
         return o_out
 
@@ -882,5 +1335,116 @@ def verify_shared_kv_fwd(
         v_scale=v_scale,
         is_causal=is_causal,
         sliding_window_size=sliding_window_size if windowed else -1,
+    )
+    return True
+
+
+def verify_mla_draft_fwd(
+    q_extend,
+    k_extend,
+    v_extend,
+    o_extend,
+    k_buffer,
+    v_buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    custom_mask,
+    is_causal,
+    mask_indptr,
+    max_len_extend,
+    k_scale,
+    v_scale,
+    sm_scale=None,
+    logit_cap=0.0,
+    skip_prefix_custom_mask=True,
+    sliding_window_size=-1,
+    sinks=None,
+    window_kv_offsets=None,
+    xai_temperature_len=-1,
+    max_bs=None,
+    bf16_dot=False,
+):
+    """``verify_shared_kv_fwd`` for the gfx950 monokernel's DFLASH MLA draft.
+
+    It runs ``DraftVerifyMLA``, which trims each rail to its sliding window, for a
+    causal block too. ``bf16_dot`` upcasts FP8 cached K/V for prefix dots in q's
+    dtype; draft-draft attention remains FP32, and a BF16 cache needs no upcast.
+    """
+    if not can_handle(
+        q_extend,
+        k_extend,
+        v_extend,
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        custom_mask,
+        is_causal,
+        mask_indptr,
+        max_len_extend,
+        sinks=sinks,
+        logit_cap=logit_cap,
+        xai_temperature_len=xai_temperature_len,
+    ):
+        return False
+    windowed = sliding_window_size is not None and sliding_window_size > 0
+    # the window trims the prefix only; draft-draft pairs must all be inside it
+    if windowed and sliding_window_size < int(max_len_extend):
+        return False
+    if q_extend.shape[2] < v_extend.shape[2]:
+        return False
+    if kv_indices.numel() == 0:
+        return False
+
+    bs = qo_indptr.shape[0] - 1
+    h_q = q_extend.shape[1]
+    h_kv = k_extend.shape[1]
+    head_dim = q_extend.shape[2]
+    v_head_dim = v_extend.shape[2]
+    l_ext = int(max_len_extend)
+    kv_group_num = h_q // h_kv
+
+    if sm_scale is None:
+        sm_scale = 1.0 / (head_dim**0.5)
+    try:
+        k_scale = float(k_scale)
+    except (TypeError, ValueError):
+        k_scale = 1.0
+    try:
+        v_scale = float(v_scale)
+    except (TypeError, ValueError):
+        v_scale = 1.0
+
+    if max_bs is None or max_bs < bs:
+        max_bs = bs
+    vk = _get_vmla(
+        max_bs,
+        h_q,
+        head_dim,
+        v_head_dim,
+        l_ext,
+        q_extend.device,
+        kv_group_num,
+        DraftVerifyMLA,
+    )
+    vk(
+        q_extend,
+        k_extend.contiguous(),
+        v_extend.contiguous(),
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        o_out=o_extend,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        is_causal=is_causal,
+        bf16_dot=bf16_dot,
+        # it starts each rail at its window instead of masking the keys before it
+        window=int(sliding_window_size) if windowed else 0,
     )
     return True

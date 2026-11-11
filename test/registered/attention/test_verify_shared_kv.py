@@ -7,9 +7,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
-from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
-from sglang.kernels.ops.attention.verify_mla_draft import (
-    verify_shared_kv_fwd as verify_draft_fwd,
+from sglang.kernels.ops.attention.verify_mla import (
+    verify_mla_draft_fwd,
+    verify_shared_kv_fwd,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.attention.triton_backend import (
@@ -569,7 +569,7 @@ class TestDraftAttention(CustomTestCase):
                     MLA, mla=False, prefix_lens=prefix_lens, l_ext=l_ext, window=window
                 )
                 inputs = _inputs(case, torch.float8_e4m3fn)
-                actual = _extend(case, inputs, bf16_dot, kernel=verify_draft_fwd)
+                actual = _extend(case, inputs, bf16_dot, kernel=verify_mla_draft_fwd)
                 expected = _extend(case, inputs, bf16_dot)
                 torch.testing.assert_close(actual, expected, atol=8e-2, rtol=2e-2)
 
@@ -579,7 +579,7 @@ class TestDraftAttention(CustomTestCase):
             case, torch.bfloat16
         )
         out = torch.empty(*q.shape[:2], case["dv"], dtype=q.dtype, device=q.device)
-        assert not verify_draft_fwd(
+        assert not verify_mla_draft_fwd(
             q, k, v, out, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices,
             None, True, None, 8, 1.0, 1.0, sliding_window_size=4,
         )  # fmt: skip
