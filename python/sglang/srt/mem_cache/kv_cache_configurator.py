@@ -98,6 +98,9 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
 )
+from sglang.srt.mem_cache.platform_kv_cache_dtype import (
+    registered_kv_cache_storage_dtype,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
@@ -1735,6 +1738,17 @@ class KVCacheConfigurator:
         dsa_pool_class = self._resolve_kv_pool_class(
             kind="dsa", default=DSATokenToKVPool
         )
+        if registered_kv_cache_storage_dtype(self.kv_cache_dtype_str) is not None:
+            # No in-tree pool stores a platform-registered dtype; building one
+            # would silently store something else.
+            kind = ("dsa" if is_dsa_model else "mla") if self.use_mla_backend else "mha"
+            if current_platform.get_kv_pool_cls(kind=kind) is None:
+                raise ValueError(
+                    f"--kv-cache-dtype {self.kv_cache_dtype_str} needs a platform KV "
+                    f"pool, but {type(current_platform).__name__}.get_kv_pool_cls("
+                    f"kind={kind!r}) returns None for this model. Choose another "
+                    "--kv-cache-dtype."
+                )
         if (
             is_float4_e2m1fn_x2(self.kv_cache_dtype)
             or self.kv_cache_dtype_str == "mxfp8"
