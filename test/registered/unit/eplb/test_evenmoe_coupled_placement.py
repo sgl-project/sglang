@@ -191,12 +191,14 @@ def test_current_batch_refresh_includes_idle_rank_and_commits_before_routing(emp
 
     payloads = []
 
-    def all_reduce(payload):
-        # Rank 1 contributes [4, 2] to its own row of the flattened rank rows.
+    def all_gather_into_tensor(output, payload):
+        # Rank 1 contributes [4, 2]; every rank's counts land in rank order.
         payloads.append(payload.clone())
-        peer = torch.zeros_like(payload)
-        peer.view(2, -1)[1] = payload.new_tensor([4, 2])
-        return payload + peer
+        output.view(2, -1)[0] = payload
+        output.view(2, -1)[1] = payload.new_tensor([4, 2])
+
+    def all_reduce(payload):
+        raise AssertionError("Per-source-rank counts are gathered, not all-reduced.")
 
     def init_raw(**kwargs):
         plan.mlb_routing_metadata = kwargs["mlb_routing_metadata"]
@@ -218,7 +220,10 @@ def test_current_batch_refresh_includes_idle_rank_and_commits_before_routing(emp
             moe_ep_rank=0,
             tp_rank=0,
             moe_ep_group=SimpleNamespace(
-                rank_in_group=0, world_size=2, all_reduce=all_reduce
+                rank_in_group=0,
+                world_size=2,
+                all_reduce=all_reduce,
+                all_gather_into_tensor=all_gather_into_tensor,
             ),
         ),
         patch("torch.cuda.is_current_stream_capturing", return_value=False),
@@ -230,9 +235,8 @@ def test_current_batch_refresh_includes_idle_rank_and_commits_before_routing(emp
         manager.refresh_layer(1, ids)  # batch 1 of 2: not due yet
         manager.refresh_layer(1, ids)  # due
         assert len(payloads) == 1
-        # One flat [ranks * experts] row per rank: a 2-D int tensor could reach
-        # SGLang's FlashInfer all-reduce, which assumes [tokens, hidden].
-        assert payloads[0].tolist() == ([0, 0] if empty else [2, 1]) + [0, 0]
+        # Only this rank's own counts go on the wire, gathered over the EP group.
+        assert payloads[0].tolist() == ([0, 0] if empty else [2, 1])
         manager.refresh_layer(1, ids)
         manager.refresh_layer(1, ids)
         assert len(payloads) == 2
