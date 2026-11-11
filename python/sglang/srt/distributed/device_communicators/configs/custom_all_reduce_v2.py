@@ -418,7 +418,9 @@ def _rocm_gfx1250_configs(
         0,
         two_shot_push_threshold=64 * MB,
         hier_2shot_push=Range(256 * KB, 64 * MB),
-        ring_simple=Range(64 * MB + 16, 4 * 1024 * MB),
+        # proxy-moe TP16 (h13-14/h13-15, 2026-11-11): two-node bench, ring_simple 1258 us vs RCCL 995 us at
+        # 256 MB (the 8k prefill chunk), tie at 128 MB, 0.70x RCCL at 512 MB -> ring only above 256 MB.
+        ring_simple=Range(256 * MB + 16, 4 * 1024 * MB),
     )
     configs[16] = configs[8]._replace(
         graph=tp16, eager=tp16, num_push_blocks=min(num_sm, 96)
