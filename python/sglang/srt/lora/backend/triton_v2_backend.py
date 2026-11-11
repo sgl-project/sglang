@@ -275,9 +275,7 @@ class TritonV2LoRABackend(BaseLoRABackend):
             max_len=max(lengths, default=0),
         )
 
-    def _runner_for(
-        self, pruned_batch_info: _RowsBatchInfo | None
-    ) -> DenseLoraRunner:
+    def _runner_for(self, pruned_batch_info: _RowsBatchInfo | None) -> DenseLoraRunner:
         if pruned_batch_info is None:
             return self.runner
         if self.rows_runner is None:
