@@ -3,7 +3,6 @@
 
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
-from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -11,14 +10,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     calculate_linear_shift,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
-    ProgressiveDenoisingStageRouter,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zimage_denoising import (
+    ZImageDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.zimage import (
     ZImageProgressiveDenoisingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.zimage_denoising import (
-    ZImageDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -49,38 +45,11 @@ class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         "scheduler",
     ]
 
-    def add_progressive_denoising_stage(
-        self,
-        progressive_stage_cls,
-        transformer_key="transformer",
-        transformer_2_key="transformer_2",
-        scheduler_key="scheduler",
-        vae_key="vae",
-        stage_name="denoising_stage",
-    ):
-        def create_stage():
-            kwargs = {
-                "transformer": self.get_module(transformer_key),
-                "scheduler": self.get_module(scheduler_key),
-                "pipeline": self,
-            }
-            if transformer_2_key:
-                transformer_2 = self.get_module(transformer_2_key, None)
-                if transformer_2 is not None:
-                    kwargs["transformer_2"] = transformer_2
-            if vae_key:
-                kwargs["vae"] = self.get_module(vae_key, None)
-            return ProgressiveDenoisingStageRouter(
-                standard_stage=ZImageDenoisingStage(**kwargs),
-                progressive_stage_factory=lambda: progressive_stage_cls(**kwargs),
-            )
-
-        return self.add_stage_factory(RoleType.DENOISER, create_stage, stage_name)
-
     def create_pipeline_stages(self, server_args: ServerArgs):
         self.add_standard_t2i_stages(
             prepare_extra_timestep_kwargs=[prepare_mu],
             progressive_denoising_stage_cls=ZImageProgressiveDenoisingStage,
+            standard_denoising_stage_cls=ZImageDenoisingStage,
         )
 
 
