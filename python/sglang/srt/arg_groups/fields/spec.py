@@ -77,7 +77,22 @@ class Spec(msgspec.Struct):
     ] = 2048
     speculative_dspark_block_size: A[
         Optional[int],
-        "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
+        "DSPARK only. Draft block size gamma (number of proposed draft tokens). "
+        "The verify window is gamma + 1 for a chain/non-tree; a tree with "
+        "--speculative-eagle-topk > 1 uses 1 + --speculative-dspark-tree-budget rows. "
+        "Omit to auto-infer gamma from the draft checkpoint block_size.",
+    ] = None
+    speculative_dspark_tree_enable: A[
+        bool,
+        "DSPARK only. Enable draft-tree topk>1 verification. Requires "
+        "--speculative-eagle-topk > 1 and --speculative-dspark-tree-budget; "
+        "the verify width is 1 + budget and the tree runs eager.",
+    ] = False
+    speculative_dspark_tree_budget: A[
+        Optional[int],
+        "DSPARK tree only. Number of non-root tree nodes. It may exceed gamma "
+        "up to topk * gamma; the verify width is 1 + budget. topk=1 (chain) "
+        "still requires budget == gamma.",
     ] = None
     speculative_dspark_sps_table_path: A[
         Optional[str],

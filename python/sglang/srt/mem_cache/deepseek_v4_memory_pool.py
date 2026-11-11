@@ -82,7 +82,13 @@ def get_compress_state_ring_size(compress_ratio: int, num_draft_tokens: int = 0)
             raise AssertionError("online c128 does not support MTP")
         return 1
     if is_speculative:
-        return 16 if compress_ratio == 4 else 256
+        if compress_ratio == 4:
+            # A verify batch writes its optimistic tail into the c4 ring. The
+            # write pad is ring_size - 6 for c4, so a tree verify width above
+            # 10 needs a larger ring (e.g. 13 rows -> 32).
+            needed = int(num_draft_tokens) + 6
+            return 1 << max(4, (needed - 1).bit_length())
+        return 256
     else:
         return 8 if compress_ratio == 4 else 128
 

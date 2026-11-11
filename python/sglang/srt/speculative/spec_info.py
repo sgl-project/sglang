@@ -296,6 +296,14 @@ class SpeculativeAlgorithm(Enum):
         # other cases which is not target verify but fixed length prefill.
         # Here, we expose this interface to allow the other use cases.
         if self.is_dspark() and is_draft_worker:
+            # A tree keeps its draft horizon (gamma) separate from the target
+            # verify width (1 + budget). Never derive the draft width from the
+            # verify width.
+            from sglang.srt.runtime_context import get_spec
+
+            gamma = get_spec().speculative_dspark_block_size
+            if gamma is not None:
+                return int(gamma)
             return num_draft_tokens - 1
         return num_draft_tokens
 

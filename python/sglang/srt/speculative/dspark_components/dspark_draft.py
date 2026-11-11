@@ -86,6 +86,9 @@ class DraftProposal(msgspec.Struct, frozen=True):
     # [bs, gamma + 1] ``[anchor | draft tokens]`` from the draft graph tail; None
     # when the caller builds them.
     verify_ids: Optional[torch.Tensor] = None
+    # [bs, gamma, vocab] pre-Markov logits for tree scoring; None on the folded
+    # graph path (tree v1 requires the eager path).
+    base_logits: Optional[torch.Tensor] = None
 
 
 def select_draft_hidden_without_anchor(
@@ -476,6 +479,7 @@ class DraftBlockProposer:
         draft_block_ids = fwd.draft_block_ids
 
         confidence = confidence_raw = verify_ids = None
+        base_logits = None
         folded = False
         if (
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
@@ -539,6 +543,7 @@ class DraftBlockProposer:
             confidence_raw=confidence_raw,
             folded=folded,
             verify_ids=verify_ids,
+            base_logits=base_logits,
         )
 
     def run_idle_participation(self, batch: ScheduleBatch) -> None:

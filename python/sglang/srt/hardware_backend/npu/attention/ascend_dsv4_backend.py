@@ -77,6 +77,51 @@ def _sparse_attn_ops(is_dspark=False):
     )
 
 
+def _op_supports_kwarg(op, name: str) -> bool:
+    try:
+        overloads = getattr(op, "overloads", None)
+        if overloads is not None:
+            for overload in overloads():
+                schema = getattr(getattr(op, overload), "_schema", None)
+                if schema is not None and any(
+                    arg.name == name for arg in schema.arguments
+                ):
+                    return True
+            return False
+        schema = getattr(op, "_schema", None)
+        return bool(
+            schema is not None
+            and any(arg.name == name for arg in schema.arguments)
+        )
+    except Exception:
+        return False
+
+
+def _tree_swa_ops():
+    """Base SAS ops that support tree SWA ``ori_sparse_indices``.
+
+    Uses sgl-kernel-npu's standalone ``npu::sparse_attn_sharedkv``. Its
+    tiling reads ``ori_sparse_indices`` directly and its metadata host has no
+    ``ori_topk`` argument. The custom vendor op is deliberately not used: its
+    metadata kernel rejects tree ``ori_sparse_indices``.
+    """
+    try:
+        import sgl_kernel_npu  # noqa: F401 - registers torch.ops.npu
+    except Exception:
+        pass
+    sgl_attn = getattr(torch.ops.npu, "sparse_attn_sharedkv", None)
+    sgl_meta = getattr(
+        torch.ops.npu, "sparse_attn_sharedkv_metadata_host", None
+    )
+    if (
+        sgl_attn is not None
+        and sgl_meta is not None
+        and _op_supports_kwarg(sgl_attn, "ori_sparse_indices")
+    ):
+        return sgl_meta, sgl_attn
+    return None
+
+
 def _sparse_attn_kv_quant_kwargs() -> dict:
     """Extra kwargs the Ascend 950 kv-quant kernels need to interpret the KV layout."""
     if not is_npu_arch35():
@@ -113,6 +158,53 @@ def _apply_hadamard(inp: torch.Tensor, hadamard_matrix: torch.Tensor) -> torch.T
     init_shape = inp.shape
     flat = inp.view(-1, hadamard_matrix.shape[0])
     return flat.matmul(hadamard_matrix).view(init_shape).to(torch.bfloat16)
+
+
+def _build_full_state_page_table(
+    *,
+    compress_ratio: int,
+    state_pool,
+    token_to_kv_pool,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    start_pos: torch.Tensor,
+    max_input_capacity: int,
+    max_prefix: int | None = None,
+) -> torch.Tensor:
+    """Absolute state page table for the tree compressor/commit kernels.
+
+    The tree `compressor_tree` and `freeze_node_pages` kernels index the
+    table by absolute position // page_rows.  `_build_explicit_state_block_table`
+    is a sliding-window table whose column zero is `start_pos - history`;
+    feeding it to those kernels shifts every page lookup.
+    """
+    state_cache = state_pool.state_cache_3d
+    rows = int(state_cache.shape[1])
+    if rows <= 1:
+        raise RuntimeError("tree state page table requires page_size > 1")
+    if max_prefix is None:
+        max_prefix = int(start_pos.max().item())
+    width = max(1, (int(max_prefix) + int(max_input_capacity) + rows - 1) // rows)
+    columns = torch.arange(width, dtype=torch.int64, device=req_to_token.device)
+    positions = columns.unsqueeze(0) * rows
+    positions = positions.expand(req_pool_indices.numel(), -1)
+    safe_positions = positions.clamp(0, req_to_token.shape[1] - 1)
+    valid = positions < req_to_token.shape[1]
+
+    if compress_ratio == 4:
+        full_locs = req_to_token[
+            req_pool_indices.to(torch.int64)[:, None], safe_positions
+        ]
+        valid &= full_locs >= 0
+        swa_locs = token_to_kv_pool.translate_loc_from_full_to_swa(full_locs)
+        state_locs = state_pool.translate_from_swa_loc_to_state_loc(swa_locs)
+    else:
+        state_locs = state_pool.translate_from_req_position_to_state_loc(
+            req_pool_indices.to(torch.int64)[:, None], positions
+        )
+    page = state_locs // rows
+    dummy_page = int(state_pool.dummy_state_loc) // rows
+    return torch.where(valid, page, dummy_page).to(torch.int32).contiguous()
 
 
 def _build_explicit_state_block_table(
@@ -220,6 +312,8 @@ class CompressorAscendBackendMixin:
         is_decode = forward_batch.forward_mode.is_decode()
         is_verify = forward_batch.forward_mode.is_target_verify()
         fm.dsv4_explicit_state_block_tables = {}
+        fm.dsv4_full_state_page_tables = {}
+        fm.dsv4_live_prefix_max = None
         fm.dsv4_max_input_capacity = 1 if is_decode else None
         _verify_compress = is_verify and bool(self._dsv4_compress_ratios)
         _seq_lens = forward_batch.seq_lens.to(torch.int32)
@@ -473,30 +567,151 @@ class CompressorAscendBackendMixin:
         pool = self.token_to_kv_pool
         state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
         state_cache = state_pool.state_cache_3d
-        table_cache = fm.dsv4_explicit_state_block_tables
-        if ratio not in table_cache:
-            table_cache[ratio] = _build_explicit_state_block_table(
-                compress_ratio=ratio,
-                coff=coff,
-                state_pool=state_pool,
-                token_to_kv_pool=pool,
-                req_to_token=self.req_to_token,
-                req_pool_indices=forward_batch.req_pool_indices,
-                start_pos=fm.start_pos,
-                cu_seqlens=fm.actual_seq_lengths_q_pa,
-                seqused=fm.seqused,
-                max_input_capacity=fm.dsv4_max_input_capacity,
-            )
-        state_block_table = table_cache[ratio]
-
-        cos, sin = Dsv4NpuRoPE.for_freqs(
-            compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
-        ).get_cos_sin(
-            getattr(fm, f"positions_cmp_padding_c{ratio}"),
-            torch.float32,
-            view_4d=False,
-            allow_build=False,
+        tree_plan = getattr(
+            getattr(forward_batch, "spec_info", None), "tree_plan", None
         )
+        if tree_plan is None or is_npu_arch35():
+            table_cache = fm.dsv4_explicit_state_block_tables
+            if ratio not in table_cache:
+                table_cache[ratio] = _build_explicit_state_block_table(
+                    compress_ratio=ratio,
+                    coff=coff,
+                    state_pool=state_pool,
+                    token_to_kv_pool=pool,
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    start_pos=fm.start_pos,
+                    cu_seqlens=fm.actual_seq_lengths_q_pa,
+                    seqused=fm.seqused,
+                    max_input_capacity=fm.dsv4_max_input_capacity,
+                )
+            state_block_table = table_cache[ratio]
+        else:
+            # The tree path replaces the window table with an absolute state
+            # page table below.  Building the explicit table here is pure waste.
+            state_block_table = None
+
+        rope = Dsv4NpuRoPE.for_freqs(
+            compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
+        )
+        if tree_plan is not None:
+            # compressor_tree indexes RoPE by absolute start+depth. It needs
+            # the full position table, not a chain-shaped gathered subset.
+            cos, sin = rope.ensure_tables(torch.float32, allow_build=False)
+        else:
+            cos, sin = rope.get_cos_sin(
+                getattr(fm, f"positions_cmp_padding_c{ratio}"),
+                torch.float32,
+                view_4d=False,
+                allow_build=False,
+            )
+
+        if tree_plan is not None and not is_npu_arch35():
+            # compressor_tree and the ratio=1 node commit index the state
+            # table by absolute position; replace the non-tree window table.
+            # Cache it per step: every layer with the same ratio and state-pool
+            # kind builds the identical table.  Keep the CPU-derived max prefix
+            # to avoid the per-layer device .item() sync.
+            full_tables = getattr(fm, "dsv4_full_state_page_tables", None)
+            if full_tables is None:
+                full_tables = {}
+                fm.dsv4_full_state_page_tables = full_tables
+            cache_key = (
+                int(ratio),
+                bool(getattr(compressor, "is_in_indexer", False)),
+                int(state_cache.shape[1]),
+            )
+            state_block_table = full_tables.get(cache_key)
+            if state_block_table is None:
+                state_block_table = _build_full_state_page_table(
+                    compress_ratio=ratio,
+                    state_pool=state_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    start_pos=fm.start_pos,
+                    max_input_capacity=fm.dsv4_max_input_capacity,
+                    max_prefix=getattr(fm, "dsv4_live_prefix_max", None),
+                )
+                full_tables[cache_key] = state_block_table
+
+        if tree_plan is not None and not bool(
+            getattr(compressor, "is_in_indexer", False)
+        ):
+            from sglang.srt.speculative.dspark_components.dspark_tree_ops import (
+                compress_nodes,
+                get_node_plan,
+            )
+
+            plan = get_node_plan(tree_plan)
+            node_kv, _ = compress_nodes(
+                compressor,
+                x,
+                state_cache,
+                state_block_table,
+                cos,
+                sin,
+                plan,
+                record_sink=getattr(tree_plan, "node_records", None),
+                kv_buffer=self.token_to_kv_pool.get_compress_buffer(
+                    compressor.layer_id, False
+                ),
+                kv_table=getattr(fm, f"c{ratio}_page_table"),
+            )
+            tree_plan.tree_node_kv[compressor.layer_id] = node_kv
+            return
+
+        if tree_plan is not None:
+            from sglang.srt.speculative.dspark_components.dspark_tree_ops import (
+                compress_nodes,
+                get_node_plan,
+                quantize_indexer_nodes,
+                record_compressed_nodes,
+            )
+
+            plan = get_node_plan(tree_plan)
+            records = getattr(tree_plan, "node_records", None)
+            node_kv, _ = compress_nodes(
+                compressor,
+                x,
+                state_cache,
+                state_block_table,
+                cos,
+                sin,
+                plan,
+                record_sink=records,
+            )
+            nodes_q, node_scale = quantize_indexer_nodes(node_kv)
+            tree_plan.tree_node_kv[compressor.layer_id] = nodes_q
+            tree_plan.tree_node_scale[compressor.layer_id] = node_scale
+            key_buffer = self.token_to_kv_pool.get_compress_buffer(
+                compressor.layer_id, True
+            )
+            scale_buffer = self.token_to_kv_pool.get_compress_dequant_scale_buffer(
+                compressor.layer_id, True
+            )
+            table = getattr(fm, f"c{ratio}_page_table")
+            if records is not None and key_buffer is not None:
+                records.append(
+                    record_compressed_nodes(
+                        plan,
+                        original=key_buffer,
+                        node_data=nodes_q,
+                        table=table,
+                        ratio=ratio,
+                    )
+                )
+            if records is not None and scale_buffer is not None:
+                records.append(
+                    record_compressed_nodes(
+                        plan,
+                        original=scale_buffer,
+                        node_data=node_scale.reshape(-1, 1),
+                        table=table,
+                        ratio=ratio,
+                    )
+                )
+            return
 
         compressor_op = torch.ops.npu.compressor
         cmp_kv = compressor_op(
@@ -852,6 +1067,64 @@ class C4IndexerAscendBackendMixin:
         )
         return _apply_hadamard(q, c4_indexer.hadamard_matrix)
 
+    def _forward_tree_indexer(
+        self,
+        c4_indexer,
+        q_quant: torch.Tensor,
+        q_scale: torch.Tensor,
+        k: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+        tree_plan,
+    ) -> torch.Tensor:
+        from sglang.srt.speculative.dspark_components.dspark_tree_ops import (
+            _cached_max_kv,
+            get_node_plan,
+            tree_indexer,
+            tree_indexer_select_all,
+        )
+
+        if k.dtype != torch.int8:
+            raise NotImplementedError(
+                "DSpark tree indexer supports INT8 A2/A3 indexer K only; "
+                f"got {k.dtype}."
+            )
+        plan = get_node_plan(tree_plan)
+        topk = self._dsv4_index_topk
+        n = plan.n
+        if q_quant.shape[0] < n:
+            raise ValueError(
+                f"tree indexer query rows {q_quant.shape[0]} < plan.n {n}"
+            )
+        if q_quant.shape[0] > n:
+            q_quant = q_quant[:n]
+            q_scale = q_scale[:n]
+            weights = weights[:n]
+        max_kv = _cached_max_kv(plan)
+        if max(1, max_kv // 4) <= topk:
+            return tree_indexer_select_all(plan, topk, q_quant.device).view(-1, topk)
+        nodes = tree_plan.tree_node_kv.get(c4_indexer.layer_id)
+        node_scale = tree_plan.tree_node_scale.get(c4_indexer.layer_id)
+        if nodes is None or node_scale is None:
+            raise RuntimeError(
+                "DSpark tree indexer requires the indexer compressor node K/scale; "
+                "no node K/scale was produced for this layer."
+            )
+        topk_idxs = tree_indexer(
+            query=q_quant,
+            weights=weights,
+            query_scale=q_scale,
+            history=k,
+            history_scale=k_scale.to(torch.float16),
+            nodes=nodes,
+            node_scale=node_scale,
+            table=self.forward_metadata.c4_page_table,
+            plan=plan,
+            topk=topk,
+        )
+        return topk_idxs.view(-1, topk)
+
     def _forward_npu_fused(
         self,
         c4_indexer,
@@ -874,6 +1147,23 @@ class C4IndexerAscendBackendMixin:
         else:
             q_quant, q_scale = torch_npu.npu_dynamic_quant(q)
             q_scale = q_scale.to(torch.float16)
+
+        tree_plan = getattr(
+            getattr(forward_batch, "spec_info", None), "tree_plan", None
+        )
+        if tree_plan is not None:
+            topk_idxs = self._forward_tree_indexer(
+                c4_indexer,
+                q_quant,
+                q_scale,
+                k,
+                k_scale,
+                weights,
+                forward_batch,
+                tree_plan,
+            )
+            self.forward_metadata.c4_topk_indices = topk_idxs
+            return topk_idxs
 
         fm = self.forward_metadata
         li_quant_metadata = fm.kernel_metadata["li_quant_metadata"]
@@ -1407,6 +1697,8 @@ class DeepseekV4AscendAttnBackend(
             )
             for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
         }
+        metadata.dsv4_full_state_page_tables = {}
+        metadata.dsv4_live_prefix_max = None
 
         metadata.positions_cmp_padding_c4 = torch.zeros(
             c4_pad, dtype=torch.int64, device=device
@@ -1741,6 +2033,14 @@ class DeepseekV4AscendAttnBackend(
     def _refresh_graph_target_verify_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
         fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
+        live_cpu = getattr(ctx, "live_seq_lens_cpu", None)
+        fm.dsv4_live_prefix_max = (
+            int(live_cpu.max())
+            if isinstance(live_cpu, torch.Tensor)
+            and live_cpu.device.type == "cpu"
+            and live_cpu.numel() > 0
+            else None
+        )
         if ctx.ragged_layout is not None:
             verify_seq_lens_cpu = ctx.final_seq_lens_cpu
             verify_seq_lens_cpu = torch.where(
@@ -2004,6 +2304,10 @@ class DeepseekV4AscendAttnBackend(
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         super().init_forward_metadata(forward_batch)
         fm = self.forward_metadata
+        tree_plan = getattr(
+            getattr(forward_batch, "spec_info", None), "tree_plan", None
+        )
+        fm.tree_plan = tree_plan
 
         # Idle DP-attention ranks have zero seq_lens, which the metadata kernel
         # cannot handle; skip it and leave the fields cleared but well-typed.
@@ -2108,6 +2412,14 @@ class DeepseekV4AscendAttnBackend(
                 fm.actual_seq_lengths_kv = forward_batch.seq_lens.to(torch.int32)
 
         self._init_dspark_sparse_metadata(forward_batch)
+        if tree_plan is not None:
+            # Tree verify needs the root's just-written KV, so the SAS
+            # workspace window must cover the draft width past W-1.
+            fm.ori_win_left = (
+                self._dsv4_sliding_window_size
+                + int(tree_plan.metadata.query_width)
+                - 2
+            )
         fm.kernel_metadata = self._compute_kernel_metadata(forward_batch)
 
         if self._dsv4_compress_ratios:
@@ -2119,6 +2431,11 @@ class DeepseekV4AscendAttnBackend(
             bs=forward_batch.batch_size,
             actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
             actual_seq_lengths_kv=fm.actual_seq_lengths_kv,
+            ori_topk=(
+                int(fm.tree_plan.ori_sparse_indices.shape[-1])
+                if getattr(fm, "tree_plan", None) is not None
+                else 0
+            ),
         )
 
     def _kernel_metadata_from_parts(
@@ -2127,6 +2444,7 @@ class DeepseekV4AscendAttnBackend(
         bs: int,
         actual_seq_lengths_q_pa: torch.Tensor,
         actual_seq_lengths_kv: torch.Tensor,
+        ori_topk: int = 0,
     ) -> dict:
         fm = self.forward_metadata
         common = {
@@ -2155,6 +2473,7 @@ class DeepseekV4AscendAttnBackend(
         # synchronization. Target verify/compressed attention keeps the device
         # metadata operator because its ragged geometry is refreshed in place.
         c1a_kwargs = base_kwargs | common
+        tree_swa = getattr(fm, "tree_plan", None) is not None
         if self._is_dspark_draft_worker:
             cu_q_cpu = fm.actual_seq_lengths_q_pa_cpu
             seq_kv_cpu = fm.seq_lens_cpu_int
@@ -2176,7 +2495,21 @@ class DeepseekV4AscendAttnBackend(
             metadata_op, _ = _sparse_attn_ops(is_dspark=True)
             c1a_metadata = metadata_op(**(c1a_kwargs | host_inputs))
         else:
-            metadata_op, _ = _sparse_attn_ops()
+            if tree_swa:
+                tree_ops = _tree_swa_ops()
+                if tree_ops is None:
+                    raise RuntimeError(
+                        "DSpark tree SWA requires sgl-kernel-npu's "
+                        "sparse_attn_sharedkv with ori_sparse_indices support."
+                    )
+                metadata_op, _ = tree_ops
+                c1a_kwargs = c1a_kwargs | {
+                    "cu_seqlens_q": fm.actual_seq_lengths_q_pa_cpu,
+                    "seqused_kv": fm.seq_lens_cpu_int[:bs].int(),
+                    "batch_size": bs,
+                }
+            else:
+                metadata_op, _ = _sparse_attn_ops()
             c1a_metadata = metadata_op(**c1a_kwargs)
         kernel_metadata = {"c1a_metadata": c1a_metadata}
 
@@ -2186,7 +2519,20 @@ class DeepseekV4AscendAttnBackend(
                 "has_cmp_kv": True,
                 "cmp_topk": self._dsv4_index_topk,
             }
-            c4a_kwargs = c1a_kwargs | c4a_overrides
+            c4a_kwargs = {
+                key: value
+                for key, value in c1a_kwargs.items()
+                if key not in ("ori_topk", "device")
+            } | c4a_overrides
+            if tree_swa:
+                c4a_kwargs.update(
+                    {
+                        "cu_seqlens_q": actual_seq_lengths_q_pa,
+                        "seqused_kv": actual_seq_lengths_kv,
+                        "ori_win_left": self._dsv4_sliding_window_size - 1,
+                        "ori_win_right": 0,
+                    }
+                )
             metadata_op, _ = _sparse_attn_ops()
             kernel_metadata["c4a_metadata"] = metadata_op(**c4a_kwargs)
 
@@ -2215,7 +2561,20 @@ class DeepseekV4AscendAttnBackend(
 
         if self._dsv4_has_c128:
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
-            c128a_kwargs = c1a_kwargs | c128a_overrides
+            c128a_kwargs = {
+                key: value
+                for key, value in c1a_kwargs.items()
+                if key not in ("ori_topk", "device")
+            } | c128a_overrides
+            if tree_swa:
+                c128a_kwargs.update(
+                    {
+                        "cu_seqlens_q": actual_seq_lengths_q_pa,
+                        "seqused_kv": actual_seq_lengths_kv,
+                        "ori_win_left": self._dsv4_sliding_window_size - 1,
+                        "ori_win_right": 0,
+                    }
+                )
             metadata_op, _ = _sparse_attn_ops()
             kernel_metadata["c128a_metadata"] = metadata_op(**c128a_kwargs)
 
@@ -2259,6 +2618,16 @@ class DeepseekV4AscendAttnBackend(
         attn_sink: Optional[torch.Tensor],
     ) -> torch.Tensor:
         fm = self.forward_metadata
+        if getattr(fm, "tree_plan", None) is not None:
+            # SparseAttnSharedkvTree only supports C4 Top-K or full C128 CFA.
+            # SWA-only layers have neither, so they must use the base sparse
+            # attention op with the tree's per-row original-KV indices.
+            return self._forward_tree_swa(
+                q=q,
+                layer=layer,
+                forward_batch=forward_batch,
+                attn_sink=attn_sink,
+            )
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
 
@@ -2286,6 +2655,76 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
         _, attn_op = _sparse_attn_ops(self._is_dspark_draft_worker)
+        out, _ = attn_op(q_arg, **attn_kwargs)
+        return out
+
+    def _forward_tree_swa(
+        self,
+        *,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        attn_sink: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """SWA-only tree attention through the base sparse-attention op.
+
+        ``SparseAttnSharedkvTree`` requires C4 Top-K or full C128 CFA. SWA
+        layers have neither; the tree's per-row ``ori_sparse_indices`` still
+        encode ancestor visibility, so the base op can serve them.
+        """
+        fm = self.forward_metadata
+        tree_plan = fm.tree_plan
+        pool = self.token_to_kv_pool
+        ori_sparse_indices = tree_plan.ori_sparse_indices
+        if ori_sparse_indices.shape[0] != q.shape[0]:
+            if ori_sparse_indices.shape[0] > q.shape[0]:
+                raise ValueError(
+                    "tree SWA sparse rows exceed query rows: "
+                    f"{ori_sparse_indices.shape[0]} > {q.shape[0]}"
+                )
+            pad = torch.full(
+                (
+                    q.shape[0] - ori_sparse_indices.shape[0],
+                    ori_sparse_indices.shape[1],
+                    ori_sparse_indices.shape[2],
+                ),
+                -1,
+                dtype=ori_sparse_indices.dtype,
+                device=ori_sparse_indices.device,
+            )
+            ori_sparse_indices = torch.cat([ori_sparse_indices, pad], dim=0)
+        attn_kwargs = dict(
+            **_sparse_attn_kv_quant_kwargs(),
+            cu_seqlens_q=fm.actual_seq_lengths_q_pa,
+            seqused_kv=fm.actual_seq_lengths_kv,
+            ori_mask_mode=4,
+            ori_win_left=getattr(
+                fm, "ori_win_left", self._dsv4_sliding_window_size - 1
+            ),
+            ori_win_right=getattr(fm, "ori_win_right", 0),
+            layout_q="TND",
+            layout_kv="PA_ND",
+            q=q,
+            ori_kv=pool.get_swa_buffer(layer.layer_id),
+            ori_block_table=fm.swa_page_table,
+            sinks=attn_sink,
+            metadata=fm.kernel_metadata["c1a_metadata"],
+            softmax_scale=layer.scaling,
+            cmp_ratio=1,
+            ori_sparse_indices=ori_sparse_indices,
+        )
+        tree_ops = _tree_swa_ops()
+        if tree_ops is None:
+            raise RuntimeError(
+                "DSpark tree SWA requires sgl-kernel-npu's "
+                "sparse_attn_sharedkv with ori_sparse_indices support."
+            )
+        _, attn_op = tree_ops
+        if self._is_dspark_draft_worker and _op_supports_kwarg(
+            attn_op, "cu_seqlens_ori_kv"
+        ):
+            attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
+        q_arg = attn_kwargs.pop("q")
         out, _ = attn_op(q_arg, **attn_kwargs)
         return out
 
@@ -2354,12 +2793,76 @@ class DeepseekV4AscendAttnBackend(
         # c4 attends via indexer topk; c128 reads the full compressed history
         if compress_ratio == 4:
             topk = fm.c4_topk_indices
-            attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
+            cmp_sparse_indices = topk.view(-1, 1, topk.shape[-1])
         else:
-            attn_kwargs["cmp_sparse_indices"] = None
+            cmp_sparse_indices = None
+        if getattr(fm, "tree_plan", None) is not None:
+            return self._forward_tree_attention(
+                q=q,
+                layer=layer,
+                forward_batch=forward_batch,
+                attn_sink=attn_sink,
+                compress_ratio=compress_ratio,
+                cmp_kv=cmp_kv,
+                cmp_sparse_indices=cmp_sparse_indices,
+                cmp_block_table=cmp_block_table,
+            )
+        attn_kwargs["cmp_sparse_indices"] = cmp_sparse_indices
         q_arg = attn_kwargs.pop("q")
         _, attn_op = _sparse_attn_ops()
         out, _ = attn_op(q_arg, **attn_kwargs)
+        return out
+
+    def _forward_tree_attention(
+        self,
+        *,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        attn_sink: Optional[torch.Tensor],
+        compress_ratio: int,
+        cmp_kv: Optional[torch.Tensor],
+        cmp_sparse_indices: Optional[torch.Tensor],
+        cmp_block_table: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        from sglang.srt.speculative.dspark_components.dspark_tree_ops import (
+            attend_nodes,
+            get_node_plan,
+        )
+
+        fm = self.forward_metadata
+        tree_plan = fm.tree_plan
+        node_kv = tree_plan.tree_node_kv.get(layer.layer_id)
+        if compress_ratio > 1 and node_kv is None:
+            raise RuntimeError(
+                f"tree compressed layer {layer.layer_id} has no node KV; "
+                "the compressor must run before attention."
+            )
+        plan = get_node_plan(tree_plan)
+        n = plan.n
+        if q.shape[0] < n:
+            raise ValueError(f"tree attention query rows {q.shape[0]} < plan.n {n}")
+        tree_q = q[:n]
+        out = attend_nodes(
+            query=tree_q,
+            original=self.token_to_kv_pool.get_swa_buffer(layer.layer_id),
+            compressed=cmp_kv,
+            node_kv=node_kv,
+            metadata=tree_plan.metadata,
+            plan=plan,
+            ori_sparse_indices=tree_plan.ori_sparse_indices,
+            cmp_sparse_indices=cmp_sparse_indices,
+            ori_block_table=fm.swa_page_table,
+            cmp_block_table=cmp_block_table,
+            sinks=attn_sink,
+            ratio=compress_ratio,
+            window=self._dsv4_sliding_window_size,
+            scale=layer.scaling,
+        )
+        if q.shape[0] > n:
+            out = torch.cat(
+                [out, out.new_zeros((q.shape[0] - n, *out.shape[1:]))], dim=0
+            )
         return out
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
@@ -2442,6 +2945,21 @@ class DeepseekV4AscendAttnBackend(
             valid = forward_batch.seq_lens[:bs] > 0
             fm.seqused = valid.to(torch.int32) * int(n_draft)
         fm.dsv4_max_input_capacity = max(1, n_draft)
+
+        live_cpu = getattr(
+            getattr(forward_batch, "spec_info", None),
+            "live_seq_lens_cpu",
+            None,
+        )
+        fm.dsv4_live_prefix_max = None
+        try:
+            if isinstance(live_cpu, torch.Tensor):
+                if live_cpu.device.type == "cpu" and live_cpu.numel() > 0:
+                    fm.dsv4_live_prefix_max = int(live_cpu.max())
+            elif live_cpu:
+                fm.dsv4_live_prefix_max = int(max(live_cpu))
+        except (TypeError, ValueError):
+            fm.dsv4_live_prefix_max = None
         _bundle = getattr(forward_batch, "out_cache_loc_dsv4", None)
         if _bundle is not None:
             for ratio in self._dsv4_unique_compress_ratios:

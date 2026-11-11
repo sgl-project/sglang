@@ -87,10 +87,17 @@ def resolve_runtime_config(
     draft_hf_config: Any,
     speculative_num_draft_tokens: Optional[int],
     target_vocab_size: int,
+    gamma: Optional[int] = None,
+    verify_num_draft_tokens: Optional[int] = None,
 ) -> DSparkRuntimeConfig:
-    """Resolve and validate the worker-facing DSpark runtime knobs (gamma,
-    verify window, mask token) from the draft checkpoint config, with
-    server_args.speculative_num_draft_tokens taking precedence for gamma."""
+    """Resolve the worker-facing DSpark runtime knobs (gamma, verify window, mask token).
+
+    ``gamma`` is the draft horizon (checkpoint block_size or
+    ``--speculative-dspark-block-size``). ``verify_num_draft_tokens`` is the
+    target-verify rows per request: ``gamma + 1`` for a chain/non-tree run and
+    ``1 + budget`` for a tree. The two are intentionally independent; deriving
+    gamma from ``verify_num_draft_tokens - 1`` is only a legacy fallback.
+    """
     draft_config = parse_dspark_draft_config(draft_hf_config=draft_hf_config)
     if not draft_config.require_markov():
         raise ValueError(
@@ -98,24 +105,46 @@ def resolve_runtime_config(
             f"markov_rank={draft_config.markov_rank}."
         )
 
-    if speculative_num_draft_tokens is None:
+    if verify_num_draft_tokens is None:
+        verify_num_draft_tokens = speculative_num_draft_tokens
+
+    if verify_num_draft_tokens is not None:
+        verify_width = int(verify_num_draft_tokens)
+        resolved_gamma = (
+            int(gamma)
+            if gamma is not None
+            else draft_config.resolve_gamma(default=None)
+        )
+        if resolved_gamma is None:
+            resolved_gamma = verify_width - 1
+        resolved_gamma = int(resolved_gamma)
+        if resolved_gamma < 1:
+            raise ValueError(
+                "DSpark gamma must be >= 1, got "
+                f"{resolved_gamma} (verify_num_draft_tokens={verify_width})."
+            )
+        if verify_width < resolved_gamma + 1:
+            raise ValueError(
+                "DSpark verify width must be >= gamma + 1, got "
+                f"verify_num_draft_tokens={verify_width} and gamma={resolved_gamma}."
+            )
+        config_gamma = draft_config.resolve_gamma(default=None)
+        if config_gamma is not None and int(config_gamma) != resolved_gamma:
+            logger.warning(
+                "DSpark gamma mismatch: using gamma=%s (from block size or "
+                "verify width) but draft config block_size=%s.",
+                resolved_gamma,
+                config_gamma,
+            )
+        gamma = resolved_gamma
+    else:
         gamma = int(draft_config.resolve_gamma(default=None) or 0)
         if gamma < 1:
             raise ValueError(
                 "DSpark could not resolve gamma from the draft config and "
                 "speculative_num_draft_tokens is unset."
             )
-    else:
-        gamma = dspark_gamma_from_num_draft_tokens(int(speculative_num_draft_tokens))
-        config_gamma = draft_config.resolve_gamma(default=None)
-        if config_gamma is not None and int(config_gamma) != gamma:
-            logger.warning(
-                "DSpark gamma mismatch: using gamma=%s (from "
-                "speculative_num_draft_tokens=%s) but draft config block_size=%s.",
-                gamma,
-                speculative_num_draft_tokens,
-                config_gamma,
-            )
+        verify_width = gamma + 1
 
     if draft_config.mask_token_id is None:
         raise ValueError(
@@ -130,7 +159,7 @@ def resolve_runtime_config(
 
     return DSparkRuntimeConfig(
         gamma=gamma,
-        verify_num_draft_tokens=gamma + 1,
+        verify_num_draft_tokens=verify_width,
         mask_token_id=mask_token_id,
     )
 

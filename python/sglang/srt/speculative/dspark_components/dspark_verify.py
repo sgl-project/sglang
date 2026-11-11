@@ -308,9 +308,12 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        tree_plan=None,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
+        if tree_plan is not None:
+            positions_2d = tree_plan.metadata.positions.reshape(verify_ids_2d.shape)
         verify_cache_loc = verify_window.verify_cache_loc
 
         verify_input = DFlashVerifyInput(
@@ -321,6 +324,7 @@ class TargetVerifyExecutor:
             capture_hidden_mode=CaptureHiddenMode.FULL,
             live_seq_lens_cpu=batch.seq_lens_cpu,
             iteration_ids=verify_window.iteration_ids,
+            tree_plan=tree_plan,
         )
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -394,6 +398,9 @@ class TargetVerifyExecutor:
         commit_lens: torch.Tensor,
         bs: int,
         run_compact: bool,
+        accept_index: Optional[torch.Tensor] = None,
+        tree_positions: Optional[torch.Tensor] = None,
+        tree_commit=None,
     ) -> None:
         if run_compact:
             self.kv_injector.inject_ragged(
@@ -409,22 +416,69 @@ class TargetVerifyExecutor:
         if hidden is None:
             raise RuntimeError("DSpark verify requires target hidden states, got None.")
         hidden = hidden.view(bs, self.verify_num_draft_tokens, -1)
-        state_slot = None
-        if self.kv_injector.swa_ring_size is not None:
-            # A SWA ring needs the per-token draft req slot to address it
-            # (state_slot * ring + pos % ring). Verify tokens are the latest in each
-            # req so they always fall in the window; the commit gate (via commit_lens
-            # + cache_loc_2d) drops rejected tokens, so no final_pos skip is needed.
-            vlen = verify_window.verify_cache_loc_2d.shape[1]
-            state_slot = (
-                batch.req_pool_indices[:bs].view(-1, 1).expand(bs, vlen).reshape(-1)
+        if tree_commit is not None:
+            if accept_index is None:
+                raise ValueError("tree_commit requires accept_index")
+            # Tree KV is committed to root + depth columns. Rebuild the hidden
+            # path in that same order instead of writing source node slots.
+            max_rows = int(tree_commit.dest_slots.shape[1])
+            path = torch.zeros(
+                (bs, max_rows), dtype=torch.long, device=hidden.device
             )
-        cache_loc = self.kv_injector.ids_for(verify_window.iteration_ids)
+            if max_rows > 1:
+                node_ids = accept_index[:, : max_rows - 1] % hidden.shape[1]
+                valid = accept_index[:, : max_rows - 1] >= 0
+                path[:, 1:] = torch.where(valid, node_ids, torch.zeros_like(node_ids))
+            hidden = torch.gather(
+                hidden,
+                1,
+                path.unsqueeze(-1).expand(-1, -1, hidden.shape[-1]),
+            )
+            positions = tree_commit.dest_positions
+            cache_loc_2d = tree_commit.dest_slots
+            cache_loc = cache_loc_2d.reshape(-1)
+            state_slot = None
+            if self.kv_injector.swa_ring_size is not None:
+                state_slot = (
+                    batch.req_pool_indices[:bs]
+                    .view(-1, 1)
+                    .expand(bs, max_rows)
+                    .reshape(-1)
+                )
+        else:
+            positions = (
+                tree_positions.reshape(bs, -1)
+                if tree_positions is not None
+                else verify_window.positions_2d
+            )
+            cache_loc = self.kv_injector.ids_for(verify_window.iteration_ids)
+            cache_loc_2d = cache_loc.view(verify_window.verify_cache_loc_2d.shape)
+            if accept_index is not None:
+                from sglang.srt.speculative.dspark_components.dspark_tree import (
+                    gather_accepted_rows,
+                )
+
+                hidden = gather_accepted_rows(hidden, accept_index)
+                positions = gather_accepted_rows(positions, accept_index)
+                cache_loc_2d = gather_accepted_rows(cache_loc_2d, accept_index)
+                local = (accept_index % cache_loc_2d.shape[1]).clamp_min(0).long()
+                rows = torch.arange(bs, device=accept_index.device).unsqueeze(1)
+                cache_loc = cache_loc.view(bs, -1)[rows, local].reshape(-1)
+            state_slot = None
+            if self.kv_injector.swa_ring_size is not None:
+                # A SWA ring needs the per-token draft req slot to address it
+                # (state_slot * ring + pos % ring). Verify tokens are the latest in each
+                # req so they always fall in the window; the commit gate (via commit_lens
+                # + cache_loc_2d) drops rejected tokens, so no final_pos skip is needed.
+                vlen = cache_loc_2d.shape[1]
+                state_slot = (
+                    batch.req_pool_indices[:bs].view(-1, 1).expand(bs, vlen).reshape(-1)
+                )
         self.kv_injector.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
-            cache_loc_2d=cache_loc.view(verify_window.verify_cache_loc_2d.shape),
-            positions=verify_window.positions_2d.reshape(-1),
+            cache_loc_2d=cache_loc_2d,
+            positions=positions.reshape(-1),
             commit_lens=commit_lens,
             state_slot=state_slot,
             iteration_ids=verify_window.iteration_ids,

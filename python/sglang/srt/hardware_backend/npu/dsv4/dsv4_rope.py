@@ -135,8 +135,11 @@ class Dsv4NpuRoPE:
         # or MTP decode reuses the previous step's RoPE when only positions change.
         cache_dtype = dtype if cache_dtype is None else cache_dtype
         cos_cache, sin_cache = self.ensure_tables(cache_dtype, allow_build=allow_build)
-        cos = cos_cache.index_select(0, positions)
-        sin = sin_cache.index_select(0, positions)
+        # Speculative padding rows carry position=-1. They are discarded
+        # downstream, but index_select must never see a negative index.
+        safe_positions = positions.clamp_min(0).to(torch.long)
+        cos = cos_cache.index_select(0, safe_positions)
+        sin = sin_cache.index_select(0, safe_positions)
         if inverse:
             sin = -sin
         if cos.dtype != dtype:

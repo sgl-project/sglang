@@ -795,7 +795,15 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             speculative_num_steps=1,
         )
 
-    if cfg.speculative_eagle_topk is None:
+    tree_enable = bool(getattr(cfg, "speculative_dspark_tree_enable", False))
+    if tree_enable:
+        if cfg.speculative_eagle_topk is None:
+            declare_resolution(
+                server_args,
+                "_handle_dspark",
+                speculative_eagle_topk=2,
+            )
+    elif cfg.speculative_eagle_topk is None:
         declare_resolution(
             server_args,
             "_handle_dspark",
@@ -829,51 +837,59 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if draft_config is not None:
         _publish_dspark_mla_draft_backend(server_args, draft_config)
 
-    gamma: Optional[int] = None
-    if cfg.speculative_dspark_block_size is not None:
-        if int(cfg.speculative_dspark_block_size) <= 0:
-            raise ValueError(
-                "DSpark requires --speculative-dspark-block-size to be positive, "
-                f"got {cfg.speculative_dspark_block_size}."
-            )
-        gamma = int(cfg.speculative_dspark_block_size)
-    else:
-        if draft_config is not None:
-            gamma = draft_config.resolve_gamma(default=None)
-        if gamma is None and cfg.speculative_num_draft_tokens is None:
-            gamma = DEFAULT_DSPARK_GAMMA
-            logger.warning(
-                "DSpark gamma is not set; defaulting to %d.",
-                gamma,
-            )
+    from sglang.srt.speculative.dspark_components.dspark_tree import (
+        resolve_dspark_widths,
+    )
+    from sglang.srt.speculative.ragged_verify import read_ragged_verify_mode
 
-    if gamma is not None:
-        verify_window = int(gamma) + 1
-        if (
-            cfg.speculative_num_draft_tokens is not None
-            and int(cfg.speculative_num_draft_tokens) != verify_window
-        ):
-            raise ValueError(
-                "DSpark speculative_num_draft_tokens must equal gamma + 1 "
-                f"(= {verify_window} for gamma={gamma}), but got "
-                f"speculative_num_draft_tokens={cfg.speculative_num_draft_tokens}."
-            )
+    ragged_mode_value = read_ragged_verify_mode().value
+    widths = resolve_dspark_widths(
+        explicit_block_size=cfg.speculative_dspark_block_size,
+        checkpoint_gamma=(
+            draft_config.resolve_gamma(default=None)
+            if draft_config is not None
+            else None
+        ),
+        num_draft_tokens=cfg.speculative_num_draft_tokens,
+        tree_enable=tree_enable,
+        tree_topk=cfg.speculative_eagle_topk,
+        tree_budget=getattr(cfg, "speculative_dspark_tree_budget", None),
+        ragged_mode=ragged_mode_value,
+        default_gamma=DEFAULT_DSPARK_GAMMA,
+    )
+    declare_resolution(
+        server_args,
+        "_handle_dspark",
+        speculative_num_draft_tokens=widths.verify_width,
+    )
+    if cfg.speculative_dspark_block_size is None:
         declare_resolution(
             server_args,
             "_handle_dspark",
-            speculative_num_draft_tokens=verify_window,
+            speculative_dspark_block_size=widths.gamma,
         )
-
-    if cfg.speculative_num_draft_tokens is None:
+    if widths.verify_width < 2:
         raise ValueError(
-            "DSpark could not resolve speculative_num_draft_tokens; set "
-            "--speculative-dspark-block-size (= gamma)."
+            "DSpark speculative_num_draft_tokens must be >= 2, got "
+            f"{widths.verify_width}."
         )
-    if int(cfg.speculative_num_draft_tokens) < 2:
-        raise ValueError(
-            "DSpark speculative_num_draft_tokens must be >= 2 (= gamma + 1), "
-            f"got {cfg.speculative_num_draft_tokens}."
+    if widths.tree is not None and widths.tree.topk > 1:
+        logger.warning("DSpark tree runs eager; disabling decode CUDA graphs.")
+        declare_resolution(
+            server_args,
+            "_handle_dspark",
+            disable_decode_cuda_graph=True,
         )
+        if (
+            getattr(cfg, "cuda_graph_bs_decode", None) is not None
+            or getattr(cfg, "cuda_graph_bs_prefill", None) is not None
+        ):
+            declare_resolution(
+                server_args,
+                "_handle_dspark",
+                cuda_graph_bs_decode=None,
+                cuda_graph_bs_prefill=None,
+            )
 
     if cfg.max_running_requests is None:
         declare_resolution(

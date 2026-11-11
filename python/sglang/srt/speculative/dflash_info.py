@@ -56,6 +56,8 @@ class DFlashVerifyInput(SpecInput):
     # part of it this verify writes (`IterationIds.write_ids`).
     iteration_ids: Optional[IterationIds] = None
     iteration_cols: Optional[Cols] = None
+    # DSpark tree pre-plan (layout/metadata/sparse slots); None for chain/DFlash.
+    tree_plan: Optional[object] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
