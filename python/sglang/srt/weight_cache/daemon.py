@@ -254,7 +254,7 @@ class WeightCacheDaemon:
         # Zero-copy weight sharing needs a transport that can export this
         # device's tensors. Fail loud here instead of dying deep inside the
         # export with an opaque error.
-        if not current_platform.capabilities.weight_cache_transports:
+        if not current_platform.weight_cache_transports():
             raise RuntimeError(
                 f"[WeightCacheDaemon] the weight cache daemon requires a platform "
                 f"that declares a weight cache transport, but the active platform "

@@ -39,5 +39,4 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
         graph_capture=True,
         piecewise_graph=True,
         supports_pynccl=True,
-        weight_cache_transports=("vmm_fd", "torch_ipc"),
     )

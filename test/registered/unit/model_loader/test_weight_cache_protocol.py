@@ -193,16 +193,16 @@ class TestTransportBackend(CustomTestCase):
 class TestTransportSelection(CustomTestCase):
     """The daemon picks a transport from what the platform declares.
 
-    Selection reads ``capabilities.weight_cache_transports`` instead of asking
-    which platform family this is, so a device becomes serveable by declaring a
-    transport rather than by being added to a condition in the daemon.
+    Selection reads ``weight_cache_transports()`` instead of asking which
+    platform family this is, so a device becomes serveable by overriding that
+    method rather than by being added to a condition in the daemon.
     """
 
     @staticmethod
     def _platform(transports):
         return SimpleNamespace(
             device_type="fake",
-            capabilities=SimpleNamespace(weight_cache_transports=transports),
+            weight_cache_transports=lambda: transports,
         )
 
     def _choose(self, transports, state_tensors=None):
@@ -212,11 +212,10 @@ class TestTransportSelection(CustomTestCase):
             return choose_daemon_transport_backend(state_tensors or {})
 
     def test_every_declared_transport_is_registered(self):
-        # A capability string is a plain literal in each platform file, so a
-        # typo or a renamed backend would otherwise surface only when a daemon
-        # starts on that hardware.
+        # The names are plain string literals, so a typo or a renamed backend
+        # would otherwise surface only when a daemon starts on that hardware.
         for platform_cls in _ALL_SRT_PLATFORMS:
-            for name in platform_cls.capabilities.weight_cache_transports:
+            for name in platform_cls().weight_cache_transports():
                 self.assertIn(
                     name,
                     TRANSPORT_BACKENDS,

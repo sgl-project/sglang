@@ -215,7 +215,7 @@ def choose_daemon_transport_backend(
     state_tensors: Mapping[str, Tuple[torch.Tensor, bool]],
 ) -> WeightCacheTransportBackend:
     """Pick the first transport this platform declares that can export these tensors."""
-    declared = current_platform.capabilities.weight_cache_transports
+    declared = current_platform.weight_cache_transports()
     if not declared:
         raise RuntimeError(
             f"Platform {current_platform.device_type!r} declares no weight cache "
