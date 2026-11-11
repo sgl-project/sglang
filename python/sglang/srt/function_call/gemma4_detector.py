@@ -42,9 +42,29 @@ def _parse_gemma4_value(value_str: str) -> object:
     return value_str
 
 
+def _closing_brackets(text: str) -> dict[int, int]:
+    closing: dict[int, int] = {}
+    unclosed: list[int] = []
+    delim_len = len(STRING_DELIM)
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i : i + delim_len] == STRING_DELIM:
+            next_delim = text.find(STRING_DELIM, i + delim_len)
+            i = next_delim + delim_len if next_delim != -1 else n
+            continue
+        if text[i] == "[":
+            unclosed.append(i)
+        elif text[i] == "]" and unclosed:
+            closing[unclosed.pop()] = i
+        i += 1
+    return closing
+
+
 def _parse_gemma4_array(arr_str: str) -> list:
     """Parse a Gemma4 array content string into a Python list."""
     items: list = []
+    closing: Optional[dict[int, int]] = None
     i = 0
     n = len(arr_str)
 
@@ -105,6 +125,11 @@ def _parse_gemma4_array(arr_str: str) -> list:
         else:
             val_start = i
             while i < n and arr_str[i] not in (",", "]"):
+                if arr_str[i] == "[":
+                    if closing is None:
+                        closing = _closing_brackets(arr_str)
+                    # An unclosed "[" is plain text.
+                    i = closing.get(i, i)
                 i += 1
             if i == val_start:
                 # Stray ']' (malformed model output): skip it so the loop always

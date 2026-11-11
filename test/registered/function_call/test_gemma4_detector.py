@@ -65,6 +65,22 @@ class TestGemma4ArrayParsing(unittest.TestCase):
         # Used to loop forever: the bare-value branch made no progress on "]".
         self.assertEqual(_bounded(_parse_gemma4_array, "1,],2"), [1, 2])
 
+    def test_bare_element_keeps_closed_bracket_pairs(self):
+        """An undelimited element keeps its closed bracket pairs, commas included."""
+        self.assertEqual(
+            _bounded(_parse_gemma4_args, "t:[y, dict[str, list[int]], a[0].b]"),
+            {"t": ["y", "dict[str, list[int]]", "a[0].b"]},
+        )
+
+    def test_bare_element_unclosed_bracket_is_plain_text(self):
+        """A "[" with no "]" outside a string does not join the elements after it."""
+        self.assertEqual(
+            _bounded(_parse_gemma4_array, "Ctrl+[, a[0]"), ["Ctrl+[", "a[0]"]
+        )
+        self.assertEqual(
+            _bounded(_parse_gemma4_array, f"a[0, {D}]{D}, 1"), ["a[0", "]", 1]
+        )
+
     def test_object_in_array_with_bracket_in_string(self):
         self.assertEqual(
             _bounded(_parse_gemma4_args, f"x:[{{k:{D}v]{D}}}]"),
@@ -79,6 +95,7 @@ class TestGemma4ArrayParsing(unittest.TestCase):
             "[[",
             f"[{D}",
             f"[{D}]",
+            f"abc[{D}",
             ",,]",
             "[]]",
             "[[]]]",
