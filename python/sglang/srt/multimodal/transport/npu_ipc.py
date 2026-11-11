@@ -18,6 +18,10 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import torch
 
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
+from sglang.srt.multimodal.transport.memory_pool import (
+    get_mm_feature_consumer_count,
+    resolve_consumer_rank,
+)
 from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
@@ -113,6 +117,12 @@ def bind_keepalive(rid: str, mm_inputs) -> None:
     if not tensors:
         return
 
+    # One request's features are views over one storage that was exported once,
+    # on the first ``wrap_tensor`` call.  Later views are written after that
+    # export, so the per-export sync does not cover them: without this barrier
+    # consumers can rebuild slices while they are still being produced.
+    torch.npu.synchronize()
+
     nbytes = sum(t.numel() * t.element_size() for t in tensors)
     # wrap_tensor already reserved these bytes; only move the accounting.
     with _keepalive_lock:
@@ -185,53 +195,65 @@ def _pack_tensor(tensor: torch.Tensor) -> tuple:
     return reduce_tensor(tensor)
 
 
-# Export granularity is the storage, not the view.  One request ships several
-# views over a single allocation; exporting each view would keep the whole block
-# pinned in torch_npu's limbo.  Export it once, then rewrite the payload's copy
-# of shape / stride / nbytes / storage_offset so every view rebuilds from it.
+# Export granularity is the storage, not the view, and each export is consumed
+# by exactly one open (see ``_export_storage_per_consumer``).  Cached per
+# storage so a request's many views share one export round.
 _export_lock = threading.Lock()
-_export_cache: Dict[int, Tuple[tuple, tuple, "weakref.ReferenceType"]] = {}
+_export_cache: Dict[
+    int, Tuple[List[bytes], "weakref.ReferenceType", int]
+] = {}
 
 
-def _export_storage_once(tensor: torch.Tensor) -> Tuple[tuple, tuple]:
-    """Export *tensor*'s storage once and return a per-view ``(func, args)``.
+def _export_storage_per_consumer(
+    tensor: torch.Tensor, consumer_count: int
+) -> List[bytes]:
+    """Export *tensor*'s whole storage once per consumer and return the payloads.
 
-    The cached payload is copied and its view geometry patched: 1/2 shape and
-    stride, 3 storage offset, 8 byte span, 9 offset in bytes.
+    torch_npu refcounts one export per open: the payload's counter starts at 1
+    and every ``_new_shared_npu`` close decrements it.  One payload broadcast to
+    N processes is therefore driven negative by the second consumer, so each
+    consumer gets its own export.
+
+    The payload describes the *whole storage* (offset 0), never a single view.
+    A request ships 64 views over one allocation; exporting per view would make
+    the consumer open the same storage 64 times against one counter, which
+    pins the producer's block forever.  Consumers slice views with
+    ``as_strided`` instead, so one export pairs with exactly one open.
     """
     storage = tensor.untyped_storage()
     base_ptr = storage.data_ptr()
+    storage_nbytes = storage.nbytes()
     elem_size = tensor.element_size()
+    span_elems = storage_nbytes // elem_size
 
     with _export_lock:
         cached = _export_cache.get(base_ptr)
-    reused = cached is not None and cached[2]() is not None
-    if reused:
-        func, base_args, _ = cached
-    else:
-        func, raw_args = _pack_tensor(tensor)
-        base_args = _flush_before_export(raw_args)
-        with _export_lock:
-            if len(_export_cache) > 64:
-                for key in [k for k, v in _export_cache.items() if v[2]() is None]:
-                    _export_cache.pop(key, None)
-            _export_cache[base_ptr] = (func, base_args, weakref.ref(tensor))
+    if (
+        cached is not None
+        and cached[1]() is not None
+        and cached[2] == storage_nbytes
+    ):
+        return cached[0]
 
-    # The payload mirrors the positional args of ``rebuild_npu_tensor`` (see
-    # ``torch_npu.multiprocessing.reductions``); only the view geometry differs
-    # between slices of one storage.  Copy first: ``base_args`` is shared.
-    patched = list(base_args)
-    patched[1] = tensor.size()  # shape
-    patched[2] = tensor.stride()  # stride
-    patched[3] = 0  # element offset; the byte offset at [9] carries it instead
-    # Byte span this view covers: 1 + (size - 1) * stride per dim.  Using stride
-    # rather than numel keeps padded / non-contiguous views correct.
-    span = 1 + sum(
-        (size - 1) * stride for size, stride in zip(tensor.size(), tensor.stride())
-    )
-    patched[8] = span * elem_size  # storage_size_bytes: this view's span only
-    patched[9] = tensor.storage_offset() * elem_size  # where the view starts
-    return func, tuple(patched)
+    payloads: List[bytes] = []
+    for _ in range(consumer_count):
+        func, raw_args = _pack_tensor(tensor)
+        args = list(_flush_before_export(raw_args))
+        args[1] = (span_elems,)  # 1-D base tensor covering the whole storage
+        args[2] = (1,)
+        args[3] = 0  # views add their own element offset on the consumer side
+        args[8] = storage_nbytes  # storage_size_bytes
+        # args[9] (storage_offset_bytes) must stay as exported: the storage lives
+        # at a nonzero offset inside the allocator's shared block, and zeroing it
+        # makes consumers read that many bytes before the tensor.
+        payloads.append(pickle.dumps((func, tuple(args))))
+
+    with _export_lock:
+        if len(_export_cache) > 64:
+            for key in [k for k, v in _export_cache.items() if v[1]() is None]:
+                _export_cache.pop(key, None)
+        _export_cache[base_ptr] = (payloads, weakref.ref(tensor), storage_nbytes)
+    return payloads
 
 
 def _flush_before_export(args: tuple) -> tuple:
@@ -247,7 +269,10 @@ def _flush_before_export(args: tuple) -> tuple:
         return args
     if not args[_NPU_IPC_EVENT_ARG_INDEX + 1]:
         return args
-    torch.npu.current_stream().synchronize()
+    # Device-wide, not ``current_stream()``: the vision tower may enqueue its
+    # output on a stream of its own, and exporting before that stream drains
+    # ships a half-written buffer (consumers then see the fill value).
+    torch.npu.synchronize()
     patched = list(args)
     patched[_NPU_IPC_EVENT_ARG_INDEX + 1] = False
     return tuple(patched)
@@ -289,14 +314,52 @@ def _rebuild_tensor(func, args: tuple, rebuild_device_idx: int) -> torch.Tensor:
     return tensor
 
 
+# Consumer-side mapping cache.  One export must pair with exactly one open, so
+# every view of a request's storage shares a single rebuilt base tensor and is
+# sliced with ``as_strided``.  The base is dropped when the last proxy that used
+# it dies, which is what releases the exported ref-counter.
+_base_lock = threading.Lock()
+_base_cache: Dict[Tuple[bytes, int], List] = {}  # key -> [base tensor, refs]
+
+
+def _acquire_base_tensor(key, rebuild) -> torch.Tensor:
+    """Return the shared base tensor for *key*, opening the mapping once."""
+    with _base_lock:
+        entry = _base_cache.get(key)
+        if entry is not None:
+            entry[1] += 1
+            return entry[0]
+    tensor = rebuild()
+    with _base_lock:
+        entry = _base_cache.get(key)
+        if entry is None:
+            _base_cache[key] = [tensor, 1]
+            return tensor
+        entry[1] += 1
+        return entry[0]
+
+
+def _release_base_tensor(key) -> None:
+    """Drop one reference; the last one closes the mapping."""
+    with _base_lock:
+        entry = _base_cache.get(key)
+        if entry is None:
+            return
+        entry[1] -= 1
+        if entry[1] > 0:
+            return
+        _base_cache.pop(key, None)
+
+
 class NpuIpcTensorTransportProxy(CudaIpcTensorTransportProxy):
     """Consumer-side proxy for one tensor shipped through torch_npu IPC."""
 
-    def __init__(self, payload: bytes):
+    def __init__(self, payloads: List[bytes], view: Optional[tuple] = None):
         self.proxy_state = {
             "ipc_extra": {
                 "transport_mode": "npu_ipc",
-                "npu_ipc_payload": payload,
+                "npu_ipc_payloads": payloads,
+                "npu_ipc_view": view,
             },
             "tensor_data": None,
         }
@@ -312,7 +375,8 @@ class NpuIpcTensorTransportProxy(CudaIpcTensorTransportProxy):
     def _restore_npu_ipc_proxy_state(self) -> None:
         """Restore attributes from ``proxy_state`` after unpickling."""
         ipc_extra = self.proxy_state["ipc_extra"]
-        self.npu_ipc_payload = ipc_extra["npu_ipc_payload"]
+        self.npu_ipc_payloads = ipc_extra["npu_ipc_payloads"]
+        self.npu_ipc_view = ipc_extra.get("npu_ipc_view")
         self.reconstruct_tensor = None
         self._consumer_acknowledged = True
         # No pool, but the msgpack proxy encoder still serializes these.
@@ -322,6 +386,17 @@ class NpuIpcTensorTransportProxy(CudaIpcTensorTransportProxy):
         self._borrowed_storage = None
         self._borrowed_base_address = None
         self._borrowed_device_id = None
+
+    def _payload_for_rank(self, consumer_rank: Optional[int]) -> Tuple[int, bytes]:
+        """Pick the payload reserved for this consumer rank."""
+        count = len(self.npu_ipc_payloads)
+        if count == 1:
+            return 0, self.npu_ipc_payloads[0]
+        try:
+            index = resolve_consumer_rank(count, consumer_rank, "NPU IPC")
+        except Exception:
+            index = 0
+        return index, self.npu_ipc_payloads[index]
 
     def borrow_on_target_device(
         self, rebuild_device_idx: int
@@ -350,10 +425,40 @@ class NpuIpcTensorTransportProxy(CudaIpcTensorTransportProxy):
         ):
             return self.reconstruct_tensor
 
-        func, args = pickle.loads(self.npu_ipc_payload)
-        self.reconstruct_tensor = _rebuild_tensor(func, args, rebuild_device_idx)
+        index, payload = self._payload_for_rank(consumer_rank)
+        key = (payload, rebuild_device_idx)
+
+        def _rebuild_base() -> torch.Tensor:
+            func, args = pickle.loads(payload)
+            return _rebuild_tensor(func, args, rebuild_device_idx)
+
+        if self.npu_ipc_view is None:
+            # Legacy payload without view geometry: no sharing to manage.
+            return _rebuild_base()
+
+        base = _acquire_base_tensor(key, _rebuild_base)
+        view_shape, view_stride, view_offset = self.npu_ipc_view
+        tensor = base.as_strided(view_shape, view_stride, view_offset)
+        # The mapping has to outlive the proxy, which is dropped as soon as the
+        # caller has the slice; tie the reference to the slice the request keeps.
+        weakref.finalize(tensor, _release_base_tensor, key)
+        self.reconstruct_tensor = tensor
         _rebuild_count += 1
-        if _rebuild_count == 1 or _rebuild_count % _REBUILD_LOG_INTERVAL == 0:
+        if _rebuild_count == 1:
+            # One line per consumer process: which exported slot this rank used.
+            logger.info(
+                "NPU IPC rebuild #%d on %s from payload %d/%d: shape=%s, dtype=%s, "
+                "nbytes=%d.",
+                _rebuild_count,
+                rebuild_device,
+                index,
+                len(self.npu_ipc_payloads),
+                tuple(self.reconstruct_tensor.shape),
+                self.reconstruct_tensor.dtype,
+                self.reconstruct_tensor.numel()
+                * self.reconstruct_tensor.element_size(),
+            )
+        elif _rebuild_count % _REBUILD_LOG_INTERVAL == 0:
             logger.debug(
                 "NPU IPC rebuild success on device %s: shape=%s, dtype=%s, "
                 "nbytes=%d, rebuilds=%d.",
@@ -372,9 +477,12 @@ class NpuIpcFeatureTransport:
 
     def __init__(self):
         """Log the transport choice once at startup."""
+        self.consumer_count = max(1, get_mm_feature_consumer_count())
         logger.info(
             "NPU IPC transport uses torch_npu reduce_tensor/rebuild memory "
-            "sharing; no feature pool is reserved."
+            "sharing; no feature pool is reserved. Exports %d payload(s) per "
+            "storage, one per consuming rank.",
+            self.consumer_count,
         )
 
     def wrap_tensor(
@@ -383,7 +491,8 @@ class NpuIpcFeatureTransport:
         """Export *tensor* over IPC, or return ``None`` to use CPU transport.
 
         Reserves keepalive budget first (over budget => ``None``), exports the
-        storage once, then holds the source until it is bound to a request.
+        storage once per consumer, then holds the source until it is bound to a
+        request.
         """
         global _pending_bytes, _fallback_count
         nbytes = tensor.numel() * tensor.element_size()
@@ -412,7 +521,7 @@ class NpuIpcFeatureTransport:
                 return None
             _pending_bytes += nbytes
         try:
-            func, args = _export_storage_once(tensor)
+            payloads = _export_storage_per_consumer(tensor, self.consumer_count)
         except Exception as exc:
             with _keepalive_lock:
                 _pending_bytes -= nbytes
@@ -421,7 +530,10 @@ class NpuIpcFeatureTransport:
                 exc,
             )
             return None
-        proxy = NpuIpcTensorTransportProxy(pickle.dumps((func, args)))
+        proxy = NpuIpcTensorTransportProxy(
+            payloads,
+            (tuple(tensor.size()), tuple(tensor.stride()), tensor.storage_offset()),
+        )
         with _keepalive_lock:
             # Bound to the request later; the source must live until then.
             _pending_source_tensors[id(proxy)] = tensor
