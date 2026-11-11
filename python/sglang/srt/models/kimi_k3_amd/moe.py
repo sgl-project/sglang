@@ -21,7 +21,10 @@ from sglang.srt.layers.activation import SituAndMul
 from sglang.srt.layers.communication import k3_ar_fusion
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.layer_boundary.residual.attn_bank import AttnBank
-from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import row_shard
+from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import (
+    RowShardRead,
+    row_shard,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.moe.topk import TopKOutputChecker
@@ -749,9 +752,11 @@ def row_shard_bank_hooks_hip(layer) -> dict:
             o_proj, tp_size=get_parallel().attn_tp_size, row_shards=row_shards
         )
     return dict(
-        ffn_row_shards=row_shards,
-        ffn_shard_front=layer.mlp.shard_front,
-        ffn_attn_rows=partial(_o_proj_row_shard, layer),
+        ffn_row_shard=RowShardRead(
+            row_shards,
+            shard_front=layer.mlp.shard_front,
+            attn_rows=partial(_o_proj_row_shard, layer),
+        )
     )
 
 
