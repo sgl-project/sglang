@@ -22,9 +22,10 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import get_moe_runner_backend
-from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalDispatchOutput
 from sglang.srt.layers.moe.utils import is_sbo_enabled
 from sglang.srt.utils import is_blackwell, is_sail
+
+_is_sail = is_sail()
 
 
 class SboFlags:
@@ -91,17 +92,17 @@ def compute_overlap_args(dispatch_output, alt_stream):
     # produces, (num_local_experts, num_tokens, hidden). Normal mode dispatches
     # a plain (num_tokens, hidden) tensor, which would not even unpack, and it
     # has its own receive layout anyway, so there is nothing to overlap.
-    if isinstance(dispatch_output, DeepEPNormalDispatchOutput):
+    if dispatch_output.format.is_deepep_normal():
         return None, None, {}
 
     hidden_states = dispatch_output.hidden_states
 
     num_local_experts, num_tokens_static, hidden_dim = hidden_states.shape
 
-    # DeepGEMM reports the SM count its grouped GEMMs may schedule on, which is
-    # exactly the budget this overlap hands out. Some devices under-report the
-    # count through their torch properties, so prefer DeepGEMM when it is built.
-    if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+    # SAIL under-reports the SM count through its torch properties; DeepGEMM
+    # reports the count its grouped GEMMs may schedule on, which is exactly the
+    # budget this overlap hands out.
+    if _is_sail and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         import deep_gemm
 
         total_num_sms = deep_gemm.get_num_sms()
@@ -141,7 +142,7 @@ def compute_overlap_args(dispatch_output, alt_stream):
             # MIN_BLOCK_M must equal to kMinBlockM in DeepEP
             # TODO: get MIN_BLOCK_M from deepep interface
             # </NOTE>
-            MIN_BLOCK_M = 64 if not is_sail() else 16
+            MIN_BLOCK_M = 64 if not _is_sail else 16
             combine_signal_size = num_local_experts * (
                 (num_tokens_static + MIN_BLOCK_M - 1) // MIN_BLOCK_M
             )

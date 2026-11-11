@@ -12,6 +12,8 @@ platform keeps using ``_DeepEPDispatcherImplNormal`` /
 ``_DeepEPDispatcherImplLowLatency`` unchanged.
 """
 
+import inspect
+
 import torch
 
 from sglang.srt.environ import envs
@@ -31,6 +33,23 @@ DEEPEP_SUPPORT_TIMEOUT_CONTROL = deepep.use_deepep and hasattr(
 )
 
 
+def _buffer_supports_use_fabric(buffer_type) -> bool:
+    """Only pass the fabric flag to vendor constructors that explicitly accept it."""
+    try:
+        return "use_fabric" in inspect.signature(buffer_type.__init__).parameters
+    except (TypeError, ValueError):
+        # Extensions without an inspectable signature keep the vendor default; this
+        # must not block importing non-DeepEP models.
+        return False
+
+
+# SAIL's DeepEP build is not keyed on the CUDA major version the way the
+# upstream builds are, so probe the constructor instead.
+DEEPEP_SUPPORT_USE_FABRIC = deepep.use_deepep and _buffer_supports_use_fabric(
+    deepep.Buffer
+)
+
+
 class SailDeepEPBuffer(DeepEPBuffer):
     """DeepEP comm buffer with SAIL's fabric flag and dispatch timeout."""
 
@@ -39,6 +58,10 @@ class SailDeepEPBuffer(DeepEPBuffer):
         # SAIL advertises fabric support itself; the MNNVL probe behind the
         # shared implementation is NVIDIA-only and always fails here.
         return envs.SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED.get()
+
+    @classmethod
+    def buffer_accepts_use_fabric(cls) -> bool:
+        return DEEPEP_SUPPORT_USE_FABRIC
 
     @classmethod
     def _configure_buffer(cls, buffer) -> None:

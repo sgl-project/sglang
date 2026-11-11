@@ -61,10 +61,10 @@ def _compute_enable_deep_gemm():
         return False
     # SM120/SM121 support (mma.sync block-scale, no TMEM) landed in DeepGEMM#324;
     # probe every API used by the SM120 DSV4 paths since installed builds may
-    # expose fp8_einsum but still predate the SM120 kernels. Only the CUDA build
-    # tracks upstream DeepGEMM, so the SAIL build is exempt.
+    # expose fp8_einsum but still predate the SM120 kernels. The SAIL build does
+    # not track upstream DeepGEMM, so it is exempt.
     if (
-        build == "cuda"
+        build != "sail"
         and sm_version in (120, 121)
         and not _sm120_deep_gemm_apis_available()
     ):

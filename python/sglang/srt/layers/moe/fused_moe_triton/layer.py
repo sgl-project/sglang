@@ -240,7 +240,8 @@ def create_moe_dispatcher(
         or a2a_backend.is_nixl()
         or a2a_backend.is_pplx()
     ):
-        use_recv_hook = envs.SGLANG_SAIL_DEEPEP_RECV_HOOK.get()
+        # A SAIL-only knob; every other platform keeps the upstream default.
+        use_recv_hook = envs.SGLANG_SAIL_DEEPEP_RECV_HOOK.get() if _is_sail else True
         return MaybeTboDeepEPDispatcher(
             runner_backend=moe_runner_config.runner_backend,
             group=_get_deepep_comm_group(a2a_backend),

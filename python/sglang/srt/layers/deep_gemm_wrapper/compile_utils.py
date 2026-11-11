@@ -34,11 +34,13 @@ from sglang.srt.utils import (
     ceil_div,
     get_available_gpu_memory,
     is_musa,
+    is_sail,
 )
 
 logger = logging.getLogger(__name__)
 
 _is_musa = is_musa()
+_is_sail = is_sail()
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
@@ -178,7 +180,9 @@ def _maybe_compile_deep_gemm_one_type_all(
     if (
         _ENABLE_JIT_DEEPGEMM_PRECOMPILE
         and _DO_COMPILE_ALL
-        and not torch.cuda.is_current_stream_capturing()
+        # SAIL defers a shape first seen under graph capture to a later eager
+        # call, since the warmup allocates and launches outside the graph.
+        and not (_is_sail and torch.cuda.is_current_stream_capturing())
         and _INITIALIZATION_DICT.get(query_key) is None
     ):
         _INITIALIZATION_DICT[query_key] = True
@@ -304,12 +308,11 @@ def _compile_deep_gemm_one_type_all(
             old_compile_mode = deep_gemm.get_compile_mode()
             deep_gemm.set_compile_mode(1)
 
-        try:
-            for m in tqdm(m_list, desc="DeepGEMM warmup"):
-                executor.execute(m=m)
-        finally:
-            if has_compile_mode_api:
-                deep_gemm.set_compile_mode(old_compile_mode)
+        # TODO can use multi thread
+        for m in tqdm(m_list, desc="DeepGEMM warmup"):
+            executor.execute(m=m)
+        if has_compile_mode_api:
+            deep_gemm.set_compile_mode(old_compile_mode)
 
         # clean up input buffers
         torch.cuda.current_stream().synchronize()
@@ -440,7 +443,8 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 self.setup_tensors(self.max_m, n, k, num_groups)
                 break
             except torch.OutOfMemoryError:
-                if self.max_m <= 1:
+                # Only SAIL shrinks M on OOM; other builds keep failing loudly.
+                if not _is_sail or self.max_m <= 1:
                     raise
                 # Drop the partially allocated tensors but keep executor config
                 # such as the recipe, then shrink M.
@@ -588,7 +592,7 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             (self.rhs_q, self.rhs_s),
             self.out,
             masked_m=self.masked_m,
-            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
+            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
             expected_m=m,
         )
 
@@ -623,7 +627,7 @@ class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             self.b,
             self.out,
             masked_m=self.masked_m,
-            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
+            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
             expected_m=m,
         )
 

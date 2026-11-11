@@ -1,5 +1,6 @@
 """Check SAIL DeepEP FABRIC isolation and the dispatch dtype state switch."""
 
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -17,85 +18,119 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+class _PlainBuffer:
+    @staticmethod
+    def get_low_latency_rdma_size_hint(tokens, hidden, ranks, experts):
+        return tokens * hidden * ranks * experts
+
+    def __init__(
+        self,
+        group,
+        nvl_bytes,
+        rdma_bytes,
+        *,
+        low_latency_mode,
+        num_qps_per_rank,
+        allow_mnnvl,
+    ):
+        self.group = group
+        self.nvl_bytes = nvl_bytes
+        self.rdma_bytes = rdma_bytes
+        self.low_latency_mode = low_latency_mode
+        self.num_qps_per_rank = num_qps_per_rank
+        self.allow_mnnvl = allow_mnnvl
+
+
+class _FabricBuffer(_PlainBuffer):
+    def __init__(self, *args, use_fabric=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_fabric = use_fabric
+
+
 class TestDeepEPFabric(CustomTestCase):
-    def test_buffer_kwargs_follow_installed_signature_and_device_capability(self):
-        """A vendor without a use_fabric parameter must still be able to create an LL
-        buffer, even when FABRIC is advertised."""
-
-        class PlainBuffer:
-            @staticmethod
-            def get_low_latency_rdma_size_hint(tokens, hidden, ranks, experts):
-                return tokens * hidden * ranks * experts
-
-            def __init__(
-                self,
-                group,
-                nvl_bytes,
-                rdma_bytes,
-                *,
-                low_latency_mode,
-                num_qps_per_rank,
-                allow_mnnvl,
-            ):
-                self.group = group
-                self.nvl_bytes = nvl_bytes
-                self.rdma_bytes = rdma_bytes
-                self.low_latency_mode = low_latency_mode
-                self.num_qps_per_rank = num_qps_per_rank
-                self.allow_mnnvl = allow_mnnvl
-
-        class FabricBuffer(PlainBuffer):
-            def __init__(self, *args, use_fabric=False, **kwargs):
-                super().__init__(*args, **kwargs)
-                self.use_fabric = use_fabric
-
+    def _build_ll_buffer(self, buffer_facade, buffer_type, *extra_patches):
         group = SimpleNamespace(size=lambda: 2)
-        for buffer_type in (PlainBuffer, FabricBuffer):
-            supports_fabric = deepep._buffer_supports_use_fabric(buffer_type)
-            self.assertEqual(supports_fabric, buffer_type is FabricBuffer)
+        with ExitStack() as stack:
+            for context in (
+                patch.dict(get_resources().buffers, {}, clear=True),
+                patch.object(deepep, "Buffer", buffer_type, create=True),
+                patch.object(deepep, "_is_npu", False),
+                patch.object(deepep, "_set_nvshmem_qp_depth"),
+                patch.object(
+                    torch.cuda,
+                    "get_device_properties",
+                    return_value=SimpleNamespace(multi_processor_count=32),
+                ),
+                *extra_patches,
+            ):
+                stack.enter_context(context)
+            buffer = buffer_facade.get_deepep_buffer(
+                group,
+                hidden_size=128,
+                param_bytes=2,
+                deepep_mode=DeepEPMode.LOW_LATENCY,
+                num_max_dispatch_tokens_per_rank=64,
+                num_experts=4,
+            )
+            self.assertIs(buffer.group, group)
+            self.assertEqual(buffer.nvl_bytes, 0)
+            self.assertEqual(buffer.rdma_bytes, 64 * 128 * 2 * 4)
+            self.assertEqual(buffer.num_qps_per_rank, 2)
+            self.assertTrue(buffer.low_latency_mode)
+            # The cache stays in the runtime resources; it is not rebuilt for
+            # later call arguments.
+            self.assertIs(
+                buffer_facade.get_deepep_buffer(None, 0, 0, DeepEPMode.NORMAL),
+                buffer,
+            )
+        return buffer
+
+    def test_shared_buffer_keys_use_fabric_on_the_cuda_major_version(self):
+        """Upstream builds: cu13 hybrid-ep takes use_fabric, cu12 fzyzcjy/DeepEP
+        has no such kwarg and enables fabric in C++."""
+        for cuda_major, buffer_type in ((12, _PlainBuffer), (13, _FabricBuffer)):
             for advertised in (False, True):
-                with (
-                    self.subTest(
-                        buffer_type=buffer_type.__name__, advertised=advertised
-                    ),
-                    patch.dict(get_resources().buffers, {}, clear=True),
-                    patch.object(deepep, "Buffer", buffer_type, create=True),
-                    patch.object(deepep, "DEEPEP_SUPPORT_USE_FABRIC", supports_fabric),
-                    patch.object(deepep, "_is_npu", False),
-                    patch.object(deepep, "_set_nvshmem_qp_depth"),
-                    patch.object(
-                        deepep, "_is_mnnvl_fabric_supported", return_value=advertised
-                    ),
-                    patch.object(
-                        torch.cuda,
-                        "get_device_properties",
-                        return_value=SimpleNamespace(multi_processor_count=32),
-                    ),
-                ):
-                    buffer = deepep.DeepEPBuffer.get_deepep_buffer(
-                        group,
-                        hidden_size=128,
-                        param_bytes=2,
-                        deepep_mode=DeepEPMode.LOW_LATENCY,
-                        num_max_dispatch_tokens_per_rank=64,
-                        num_experts=4,
+                with self.subTest(cuda_major=cuda_major, advertised=advertised):
+                    buffer = self._build_ll_buffer(
+                        deepep.DeepEPBuffer,
+                        buffer_type,
+                        patch.object(
+                            deepep, "get_cuda_version", return_value=(cuda_major, 0)
+                        ),
+                        patch.object(
+                            deepep,
+                            "_is_mnnvl_fabric_supported",
+                            return_value=advertised,
+                        ),
                     )
-                    self.assertIs(buffer.group, group)
-                    self.assertEqual(buffer.nvl_bytes, 0)
-                    self.assertEqual(buffer.rdma_bytes, 64 * 128 * 2 * 4)
-                    self.assertEqual(buffer.num_qps_per_rank, 2)
-                    self.assertTrue(buffer.low_latency_mode)
+                    self.assertEqual(buffer.allow_mnnvl, advertised)
+                    if cuda_major != 12:
+                        self.assertEqual(buffer.use_fabric, advertised)
+
+    def test_sail_buffer_kwargs_follow_installed_signature(self):
+        """A SAIL vendor without a use_fabric parameter must still be able to create
+        an LL buffer, even when FABRIC is advertised."""
+        for buffer_type in (_PlainBuffer, _FabricBuffer):
+            supports_fabric = sail_deepep._buffer_supports_use_fabric(buffer_type)
+            self.assertEqual(supports_fabric, buffer_type is _FabricBuffer)
+            for advertised in (False, True):
+                with self.subTest(
+                    buffer_type=buffer_type.__name__, advertised=advertised
+                ):
+                    buffer = self._build_ll_buffer(
+                        sail_deepep.SailDeepEPBuffer,
+                        buffer_type,
+                        patch.object(
+                            sail_deepep, "DEEPEP_SUPPORT_USE_FABRIC", supports_fabric
+                        ),
+                        patch.object(
+                            sail_deepep, "DEEPEP_SUPPORT_TIMEOUT_CONTROL", False
+                        ),
+                        envs.SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED.override(advertised),
+                    )
                     self.assertEqual(buffer.allow_mnnvl, advertised)
                     if supports_fabric:
                         self.assertEqual(buffer.use_fabric, advertised)
-                    # The cache stays in the runtime resources; it is not rebuilt
-                    # for later call arguments.
-                    self.assertIs(
-                        deepep.DeepEPBuffer.get_deepep_buffer(
-                            None, 0, 0, DeepEPMode.NORMAL
-                        ),
-                        buffer,
-                    )
 
     def test_uninspectable_vendor_signature_keeps_default_behavior(self):
         """An optional extension that cannot be inspected must neither block the module
@@ -103,9 +138,9 @@ class TestDeepEPFabric(CustomTestCase):
         for error in (TypeError, ValueError):
             with (
                 self.subTest(error=error),
-                patch.object(deepep.inspect, "signature", side_effect=error),
+                patch.object(sail_deepep.inspect, "signature", side_effect=error),
             ):
-                self.assertFalse(deepep._buffer_supports_use_fabric(object))
+                self.assertFalse(sail_deepep._buffer_supports_use_fabric(object))
 
     def test_sail_override_without_flashinfer(self):
         """SAIL reads its own fabric flag instead of probing NVIDIA FABRIC."""
