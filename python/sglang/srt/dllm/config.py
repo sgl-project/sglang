@@ -16,9 +16,9 @@ class DllmConfig:
         first_done_first_out_mode: bool = False,
         requires_separate_context_encoding: bool = False,
         capture_input_preparation: bool = False,
+        inherits_next_token: bool = False,
         delete_token_id: int | None = None,
         split_token_id: int | None = None,
-        carries_block_state: bool = False,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
@@ -28,9 +28,9 @@ class DllmConfig:
         self.first_done_first_out_mode = first_done_first_out_mode
         self.requires_separate_context_encoding = requires_separate_context_encoding
         self.capture_input_preparation = capture_input_preparation
+        self.inherits_next_token = inherits_next_token
         self.delete_token_id = delete_token_id
         self.split_token_id = split_token_id
-        self.carries_block_state = carries_block_state
 
     def validate_request(self, req) -> str | None:
         from sglang.srt.dllm.algorithm import get_algorithm_cls
@@ -187,7 +187,7 @@ class DllmConfig:
                 algorithm_cls.capture_input_preparation
                 and algorithm_config.get("capture_input_preparation", True)
             ),
+            inherits_next_token=algorithm_cls.inherits_next_token,
             delete_token_id=delete_token_id,
             split_token_id=split_token_id,
-            carries_block_state=algorithm_cls.carries_block_state,
         )

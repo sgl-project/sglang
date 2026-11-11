@@ -45,7 +45,7 @@ def _algorithm(block_size=8, sub_block_size=4, threshold=0.9):
         block_size=block_size,
         mask_id=MASK,
         max_running_requests=4,
-        carries_block_state=True,
+        inherits_next_token=True,
     )
     return HierarchyBlock(config)
 
@@ -344,7 +344,7 @@ class TestHierarchyBlockLaunch(unittest.TestCase):
         )
 
 
-def _req(prompt, algorithm="HierarchyBlock", carries=True):
+def _req(prompt, algorithm="HierarchyBlock", inherits=True):
     sampling_params = SamplingParams(max_new_tokens=16, temperature=0)
     sampling_params.normalize(None)
     return Req(
@@ -353,7 +353,7 @@ def _req(prompt, algorithm="HierarchyBlock", carries=True):
         origin_input_ids=array("q", prompt),
         sampling_params=sampling_params,
         vocab_size=VOCAB,
-        dllm_config=DllmConfig(algorithm, {}, 4, MASK, 4, carries_block_state=carries),
+        dllm_config=DllmConfig(algorithm, {}, 4, MASK, 4, inherits_next_token=inherits),
     )
 
 
@@ -366,9 +366,9 @@ def _cache_with(tokens):
 
 
 class TestHierarchyBlockPrefixReuse(unittest.TestCase):
-    def test_new_request_recomputes_its_last_cached_block(self):
-        """The carried token comes from the causal forward over the last
-        committed block, so a new request cannot take that block from cache."""
+    def test_last_committed_block_is_recomputed(self):
+        """The inherited token comes from the forward over the last committed
+        block, so a cache hit must not skip that block."""
         prompt = [1, 2, 3, 4, 5, 6, 7, 8]
         req = _req(prompt)
 
@@ -377,19 +377,9 @@ class TestHierarchyBlockPrefixReuse(unittest.TestCase):
         self.assertEqual(req.prefix_len, 4)
         self.assertTrue(req.is_dllm_prefill())
 
-    def test_request_with_carried_state_reuses_the_whole_prefix(self):
+    def test_algorithms_without_inherited_token_keep_upstream_reuse(self):
         prompt = [1, 2, 3, 4, 5, 6, 7, 8]
-        req = _req(prompt)
-        req.dllm_algo_state = 42  # e.g. kept across a retraction
-
-        req.init_next_round_input(_cache_with(prompt))
-
-        self.assertEqual(req.prefix_len, 8)
-        self.assertFalse(req.is_dllm_prefill())
-
-    def test_algorithms_without_carried_state_keep_upstream_reuse(self):
-        prompt = [1, 2, 3, 4, 5, 6, 7, 8]
-        req = _req(prompt, algorithm="LowConfidence", carries=False)
+        req = _req(prompt, algorithm="LowConfidence", inherits=False)
 
         req.init_next_round_input(_cache_with(prompt))
 
@@ -397,20 +387,19 @@ class TestHierarchyBlockPrefixReuse(unittest.TestCase):
 
 
 class TestHierarchyBlockResultProcessing(unittest.TestCase):
-    def _scheduler(self, carries):
+    def _scheduler(self, inherits):
         return SimpleNamespace(
             dllm_config=SimpleNamespace(
                 block_size=4,
                 requires_separate_context_encoding=False,
                 first_done_first_out_mode=False,
-                carries_block_state=carries,
+                inherits_next_token=inherits,
             ),
             token_to_kv_pool_allocator=Mock(),
             metrics_reporter=SimpleNamespace(
                 num_generated_tokens=0, report_prefill_stats=Mock()
             ),
             output_streamer=Mock(),
-            _store_dllm_block_state=SchedulerDllmMixin._store_dllm_block_state,
             _finish_dllm_request_if_needed=Mock(),
         )
 
@@ -479,9 +468,9 @@ class TestHierarchyBlockResultProcessing(unittest.TestCase):
             DecodeCudaGraphRunner.can_run_graph(SimpleNamespace(), forward_batch)
         )
 
-    def test_worker_passes_carried_state_into_sync_runs(self):
-        def worker(carries):
-            algorithm = Mock(fdfo=False, carries_block_state=carries)
+    def test_worker_passes_inherited_tokens_into_sync_runs(self):
+        def worker(inherits):
+            algorithm = Mock(fdfo=False, inherits_next_token=inherits)
             algorithm.run.return_value = (None, [], None, None, False)
             return SimpleNamespace(dllm_algorithm=algorithm, model_runner=Mock())
 
@@ -491,8 +480,8 @@ class TestHierarchyBlockResultProcessing(unittest.TestCase):
                 SimpleNamespace(dllm_algo_state=None),
             ]
         )
-        for carries, expected in ((True, [5, None]), (False, None)):
-            tp_worker = worker(carries)
+        for inherits, expected in ((True, [5, None]), (False, None)):
+            tp_worker = worker(inherits)
             TpModelWorker._forward_batch_generation_dllm(tp_worker, Mock(), batch)
             self.assertEqual(tp_worker.dllm_algorithm.run.call_args.args[2], expected)
 

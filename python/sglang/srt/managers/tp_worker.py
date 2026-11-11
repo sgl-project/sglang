@@ -597,10 +597,9 @@ class TpModelWorker(BaseTpWorker):
         batch: Optional[ScheduleBatch] = None,
     ) -> GenerationBatchResult:
         algo_states = None
-        carries_state = (
-            self.dllm_algorithm.fdfo or self.dllm_algorithm.carries_block_state
-        )
-        if carries_state and batch is not None:
+        if (
+            self.dllm_algorithm.fdfo or self.dllm_algorithm.inherits_next_token
+        ) and batch is not None:
             algo_states = [req.dllm_algo_state for req in batch.reqs]
 
         (

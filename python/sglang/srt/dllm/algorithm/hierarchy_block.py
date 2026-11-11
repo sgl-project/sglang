@@ -31,7 +31,7 @@ class HierarchyBlock(DllmAlgorithm):
     """
 
     supported_architectures = ("Fast_dVLMForConditionalGeneration",)
-    carries_block_state = True
+    inherits_next_token = True
     # Backends that read each layer's attn_type on every forward, which the
     # switch between denoising and the final causal forward relies on.
     supported_attention_backends = ("flashinfer", "triton", "fa3")
