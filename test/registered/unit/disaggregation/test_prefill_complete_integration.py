@@ -398,7 +398,6 @@ class TestAllocationIntegration(CustomTestCase):
             with get_context().override_server_args(
                 disaggregation_decode_allocation_policy="early"
             ):
-                scheduler.waiting_queue._drop_all()
                 move([req], launched)
                 SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
                     scheduler, req
@@ -625,11 +624,11 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler = self.inflight_scheduler(reqs)
         pool = scheduler.req_to_token_pool = ReqToTokenPool(2, 2, "cpu", False)
         pool.alloc(reqs)
-        scheduler.waiting_queue = []
+        waiting = scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
-        # The requeue moves the request out of the transfer queue.
+        # The requeue frees the request's slot and moves it to the waiting queue.
         scheduler.optimistic_release_and_requeue = Mock(
-            side_effect=lambda req: (pool.free(req), req.owner_list._leave([req]))
+            side_effect=lambda req: (pool.free(req), move([req], waiting, at=0))
         )
         with get_context().override_server_args(
             disaggregation_decode_allocation_policy="early"
@@ -637,7 +636,7 @@ class TestAllocationIntegration(CustomTestCase):
             scheduler.process_disagg_prefill_transfer_queue()
             self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), reqs)
 
-            scheduler.waiting_queue.append(object())
+            move([FakeReq(rid="waiting")], waiting)
             scheduler.process_disagg_prefill_transfer_queue()
             self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), reqs[1:])
             self.assertEqual(pool.available_size(), 1)
