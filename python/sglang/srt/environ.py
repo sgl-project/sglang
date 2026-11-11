@@ -1163,6 +1163,16 @@ class Envs:
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_BS = EnvBool(True)
+    # Fused Kimi-K3 KDA decode kernel: "gfx950" (SGLang HIP) or "aiter" (FlyDSL);
+    # any other value keeps the unfused KDA decode.
+    SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND = EnvStrWithAlias(
+        "gfx950", deprecated_name="SGLANG_ROCM_K3_KDA_FUSED_BACKEND"
+    )
+    # FlyDSL kernel behind the "aiter" fused KDA decode: "sglang" or "aiter" pins one;
+    # "auto" prefers the vendored copy, and AITER's for a state dtype only it takes.
+    SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(
+        "auto", deprecated_name="SGLANG_K3_FLYDSL_SOURCE"
+    )
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
@@ -1171,11 +1181,6 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    # Kimi-K3 fused KDA decode on ROCm: "gfx950" (in-tree kernel) or "aiter";
-    # any other value keeps the unfused decode.
-    SGLANG_ROCM_K3_KDA_FUSED_BACKEND = EnvStr("gfx950")
-    # Kimi-K3 FlyDSL operators: "auto" (in-tree, then aiter), "sglang" or "aiter".
-    SGLANG_K3_FLYDSL_SOURCE = EnvStr("auto")
     # Kimi-K3 MLA decode: write the identity-RoPE Q and latent KV cache in one launch,
     # AITER on gfx950 and AITER Triton elsewhere, instead of the split chain.
     SGLANG_OPT_HIP_K3_MLA_Q_CACHE_FUSION = EnvBool(False)
