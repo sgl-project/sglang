@@ -1494,6 +1494,54 @@ async fn feedback_engine() -> Engine {
 }
 
 #[tokio::test]
+async fn completed_prefetch_observes_residency_only_on_query() {
+    let engine = feedback_engine().await;
+    let router = router(&[&engine], false, true).await;
+    start(&router, "task").await;
+    submit(
+        &router,
+        "task",
+        "prepare",
+        prefix(vec![1, 2, 3, 4]),
+        &engine,
+    )
+    .await;
+    let prepared = ready(&router, "task", "prepare").await;
+    let operation = &prepared["operations"][0];
+    assert_eq!(operation["result"]["update"]["status"], "completed");
+    let count = |kind: &str| {
+        engine
+            .state
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .filter(|command| command["kind"] == kind)
+            .count()
+    };
+    let before = count("residency");
+    let events = count("events");
+    // Let the worker observe several feedback ticks with no scope queries.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while count("events") < events + 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(count("residency"), before);
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.cache_version += 1;
+        state.resident = 0;
+    }
+    let queried = query(&router, "task", "prepare").await;
+    assert_eq!(count("residency"), before + 1);
+    assert_eq!(queried["operations"][0]["result"], operation["result"]);
+    assert!(queried["operations"][0]["ready_scope"].is_null());
+}
+
+#[tokio::test]
 async fn newer_native_removal_fences_a_delayed_query_and_late_completed_operation() {
     let engine = feedback_engine().await;
     let router = router(&[&engine], false, true).await;

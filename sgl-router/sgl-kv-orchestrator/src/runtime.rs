@@ -318,6 +318,7 @@ struct Job {
     cache_watermark: Value,
     ready_end: u64,
     ready_at: Option<Instant>,
+    terminal_residency_checked: bool,
     polls: u64,
 }
 impl Job {
@@ -772,7 +773,11 @@ impl Actor {
             return;
         }
         // A busy tick must still get a turn before further first submissions.
-        if let Some(id) = self.deferred_polls.remove(worker) {
+        if let Some(id) = self.deferred_polls.remove(worker).filter(|id| {
+            self.jobs
+                .get(id)
+                .is_some_and(|job| self.needs_background_poll(job))
+        }) {
             self.request_poll(&id);
             if self.busy.contains_key(worker) {
                 return;
@@ -833,6 +838,11 @@ impl Actor {
         job.has_final_receipt()
             && (job.action == "sglang.demote"
                 || self.book.job(&job.id).is_some_and(|b| b.cancel_requested))
+    }
+    fn needs_background_poll(&self, job: &Job) -> bool {
+        // After the terminal observation, an explicit query can refresh the
+        // scope. Worker-wide feedback continues to invalidate old evidence.
+        !self.needs_receipt_only(job) && !job.terminal_residency_checked
     }
     fn drained(&self, job: &Job) -> bool {
         if job.has_final_receipt() {
@@ -1471,6 +1481,7 @@ impl Actor {
                         cache_watermark: Value::Null,
                         ready_end: 0,
                         ready_at: None,
+                        terminal_residency_checked: false,
                         polls: 0,
                     },
                 );
@@ -1611,7 +1622,7 @@ impl Actor {
         let mut sampled = BTreeSet::new();
         for id in ids[offset..].iter().chain(&ids[..offset]) {
             let job = &self.jobs[id];
-            if !self.needs_receipt_only(job) && sampled.insert(job.url.clone()) {
+            if self.needs_background_poll(job) && sampled.insert(job.url.clone()) {
                 let url = job.url.clone();
                 self.deferred_polls
                     .entry(url.clone())
@@ -1817,6 +1828,7 @@ impl WorkerPoll {
                 .unwrap_or(Value::Null);
             job.ready_end = confirmed_end(&snapshot, &live, &job.prefix, tier)?;
             job.ready_at = Some(Instant::now());
+            job.terminal_residency_checked = job.has_final_receipt();
         }
         job.last_error = None;
         Ok(())
