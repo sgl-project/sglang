@@ -140,6 +140,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers import uniboost
 from sglang.srt.managers.decode_preemption import (
     DecodePreemptor,
     available_and_evictable_tokens,
@@ -253,6 +254,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    CacheAwarePolicy,
     PrefillAdder,
     SchedulePolicy,
     mamba_prefill_chunk_grid,
@@ -4545,7 +4547,6 @@ class Scheduler(
                     if self.disagg_prefill_bootstrap_queue is not None
                     else []
                 ),
-                chunked_req=self.chunked_req,
             )
         )
         if self.decode_preemptor is not None:
@@ -4649,8 +4650,11 @@ class Scheduler(
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
-            # Set by the uniboost commit gate for this pass only.
-            if req.uniboost_commit_hold:
+            if self.policy.policy == CacheAwarePolicy.UNIBOOST and uniboost.commit_held(
+                req,
+                extenders=[self.chunked_req, *adder.can_run_list],
+                now_s=time.perf_counter(),
+            ):
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests

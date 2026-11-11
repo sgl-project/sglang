@@ -338,44 +338,26 @@ def sort_waiting_queue(
     waiting_queue.sort(key=key)
 
 
-def mark_commit_holds(
-    waiting_queue: Sequence[Req], *, chunked_req: Optional[Req], now_s: float
-) -> None:
-    """Holds a request out of this admission pass while an earlier extender
-    will extend its matched prefix by at least one frontier page.
-
-    The extender is the in-flight chunked prefill or a waiting request that
-    sorts (and so admits) before it. Admitting first would prefill, uncached,
-    the tokens the extender is about to commit to the radix tree. The hold
-    ends with that one extender; COMMIT_GATE_MAX_HOLD_S bounds the total.
-    waiting_queue must already be in admission order.
-    """
-    frontier = COMMIT_GATE_FRONTIER_TOKENS
-
-    def extends_match(extender: Optional[Req], k: int, ids) -> bool:
-        if extender is None:
-            return False
-        e_ids = extender.origin_input_ids
-        return (
-            len(e_ids) >= k + frontier
-            and e_ids[k : k + frontier] == ids[k : k + frontier]
-        )
-
-    for i, r in enumerate(waiting_queue):
-        r.uniboost_commit_hold = False
-        k = r.num_matched_prefix_tokens
-        if k <= 0:
-            continue
-        ids = r.origin_input_ids
-        if not (
-            extends_match(chunked_req, k, ids)
-            or any(extends_match(w, k, ids) for w in waiting_queue[:i])
-        ):
-            continue
-        if r.uniboost_commit_hold_first_s is None:
-            r.uniboost_commit_hold_first_s = now_s
-        if now_s - r.uniboost_commit_hold_first_s <= COMMIT_GATE_MAX_HOLD_S:
-            r.uniboost_commit_hold = True
+def commit_held(req: Req, *, extenders: Iterable[Optional[Req]], now_s: float) -> bool:
+    """Whether req waits this admission pass for an extender, the in-flight
+    chunked prefill or a request admitted before it in this pass, to commit at
+    least one frontier page past req's matched prefix; admitting req first
+    would prefill those tokens uncached. COMMIT_GATE_MAX_HOLD_S bounds the
+    cumulative hold."""
+    k = req.num_matched_prefix_tokens
+    if k <= 0:
+        return False
+    ids = req.origin_input_ids[k : k + COMMIT_GATE_FRONTIER_TOKENS]
+    if not any(
+        e is not None
+        and len(e.origin_input_ids) >= k + COMMIT_GATE_FRONTIER_TOKENS
+        and e.origin_input_ids[k : k + COMMIT_GATE_FRONTIER_TOKENS] == ids
+        for e in extenders
+    ):
+        return False
+    if req.uniboost_commit_hold_first_s is None:
+        req.uniboost_commit_hold_first_s = now_s
+    return now_s - req.uniboost_commit_hold_first_s <= COMMIT_GATE_MAX_HOLD_S
 
 
 def completed_response_times(reqs: Sequence[Req]) -> tuple[List[float], List[int]]:

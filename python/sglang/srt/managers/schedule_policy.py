@@ -258,11 +258,13 @@ class SchedulePolicy:
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
         bootstrap_queue: Iterable[Req] = (),
-        chunked_req: Optional[Req] = None,
     ) -> List[Req]:
         """The waiting requests in the order the policy admits them."""
         waiting_queue = list(waiting)
         policy = self._determine_active_policy(waiting_queue)
+        if self.policy == CacheAwarePolicy.UNIBOOST:
+            # Also on the long-queue FCFS fallback, so A(r) stays the first sighting.
+            self._stamp_uniboost_arrivals(waiting_queue, processed_tokens)
 
         # Cache-agnostic policies sort without matching; match anyway so the load
         # snapshot sees num_matched_prefix_tokens. Decode never prefills.
@@ -280,7 +282,7 @@ class SchedulePolicy:
                     waiting_queue, self.priority_sign
                 )
         elif policy == CacheAwarePolicy.UNIBOOST:
-            self._sort_by_uniboost(waiting_queue, processed_tokens, chunked_req)
+            self._sort_by_uniboost(waiting_queue)
         elif isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
@@ -359,11 +361,8 @@ class SchedulePolicy:
         for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
 
-    def _sort_by_uniboost(
-        self,
-        waiting_queue: List[Req],
-        processed_tokens: int,
-        chunked_req: Optional[Req],
+    def _stamp_uniboost_arrivals(
+        self, waiting_queue: List[Req], processed_tokens: int
     ) -> None:
         now_s = time.perf_counter()
         if self.uniboost_rate is not None:
@@ -371,6 +370,8 @@ class SchedulePolicy:
         uniboost.stamp_arrivals(
             waiting_queue, processed_tokens=processed_tokens, now_s=now_s
         )
+
+    def _sort_by_uniboost(self, waiting_queue: List[Req]) -> None:
         leader_of: Dict[str, str] = {}
         temporary_deprioritized = self._compute_prefix_matches(
             waiting_queue, CacheAwarePolicy.UNIBOOST, leader_of=leader_of
@@ -390,8 +391,6 @@ class SchedulePolicy:
             enable_priority_scheduling=self.enable_priority_scheduling,
             priority_sign=self.priority_sign,
         )
-        # Reads the admission order, so it runs after the sort.
-        uniboost.mark_commit_holds(waiting_queue, chunked_req=chunked_req, now_s=now_s)
 
     def record_completed_requests(self, reqs: List[Req]) -> None:
         """Feeds finished requests' response times to adaptive uniboost gamma."""
@@ -418,6 +417,7 @@ class SchedulePolicy:
             in (
                 CacheAwarePolicy.LPM,
                 CacheAwarePolicy.HRRN,
+                CacheAwarePolicy.UNIBOOST,
             )
             and len(waiting_queue) > WAITING_QUEUE_PREFIX_MATCH_MAX
         ):
