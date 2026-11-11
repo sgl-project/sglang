@@ -1665,8 +1665,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_pool = self.linear_attn_backend.state_pool
         mamba_caches = mamba_pool.get_speculative_mamba2_params_all_layers()
 
-        # ReplaySSM-KDA: the accepted drafts live in the per-slot ring (written
-        # during verify); no intermediate_ssm is allocated. Replay the accepted
+        # ReplaySSM-KDA: the accepted drafts live in the ring (written during
+        # verify); no intermediate_ssm is allocated. Replay the accepted
         # prefix into `temporal` instead of scattering an intermediate state.
         # dspark/dflash call this method directly; the generic spec_utils commit
         # handles replayssm before reaching here (returns early), so this branch is
@@ -1679,7 +1679,8 @@ class HybridLinearAttnBackend(AttentionBackend):
 
             ring_indices = None
             if mamba_pool.replayssm_request_ring:
-                ring_indices = req_pool_indices[:request_number]
+                assert state_slots.ring is not None, "request-scoped ring without rows"
+                ring_indices = state_slots.ring[:request_number]
             commit_kda_replayssm_after_verify(
                 spec_state=mamba_caches,
                 state_batch_indices=state_indices_tensor,
