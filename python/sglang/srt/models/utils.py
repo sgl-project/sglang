@@ -444,11 +444,12 @@ def can_run_silu_fp4_quant_fusion(
         mlp._enable_silu_fp4_quant_fusion
         and not isinstance(gate_up, tuple)
         and gate_up.dim() == 2
-        # down_proj outputs its params_dtype for the tuple, and gate_up's dtype
-        # for an activation; fuse only where the two agree.
-        and gate_up.dtype == mlp.down_proj.params_dtype
         and not get_forward().sp_active  # the SP g-bar matmul needs a tensor
         and not hasattr(mlp.down_proj, "base_layer")  # LoRA reads the activation
+        # down_proj outputs its params_dtype for the tuple, and gate_up's dtype
+        # for an activation; fuse only where the two agree. After the LoRA check:
+        # the LoRA wrapper has no params_dtype.
+        and gate_up.dtype == mlp.down_proj.params_dtype
     )
 
 

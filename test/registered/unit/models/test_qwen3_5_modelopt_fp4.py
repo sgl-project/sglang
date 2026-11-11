@@ -185,9 +185,8 @@ class TestSiluFp4QuantFusionGates(CustomTestCase):
         self.assertTrue(can_run_silu_fp4_quant_fusion(mlp, torch.empty(2, 32)))
 
     def test_skips_a_lora_wrapped_down_proj(self):
-        mlp = self._enabled_mlp(
-            SimpleNamespace(params_dtype=torch.float32, base_layer=SimpleNamespace())
-        )
+        # Like RowParallelLinearWithLoRA: a base_layer, no params_dtype.
+        mlp = self._enabled_mlp(SimpleNamespace(base_layer=SimpleNamespace()))
         self.assertFalse(can_run_silu_fp4_quant_fusion(mlp, torch.empty(2, 32)))
 
     def test_skips_an_activation_of_another_dtype(self):
