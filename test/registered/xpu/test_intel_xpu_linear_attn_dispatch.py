@@ -6,11 +6,17 @@ behavior from the platform-agnostic linear-attn dispatch tests.
 """
 
 import unittest
-from unittest.mock import patch, sentinel
+from types import SimpleNamespace
+from unittest.mock import Mock, patch, sentinel
+
+import torch
 
 from sglang.srt.arg_groups.choices import LINEAR_ATTN_KERNEL_BACKEND_CHOICES
 from sglang.srt.layers.attention.linear import gdn_backend
-from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
+from sglang.srt.layers.attention.linear.gdn_backend import (
+    GDNAttnBackend,
+    GDNKernelDispatcher,
+)
 from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
 from sglang.srt.layers.attention.linear.kernels import gdn_xpu
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
