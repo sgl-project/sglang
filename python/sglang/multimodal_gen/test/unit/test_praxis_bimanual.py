@@ -5,7 +5,6 @@ CPU only, no weights. A small encoder stands in for the VAE.
 """
 
 import json
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -26,11 +25,188 @@ from sglang.multimodal_gen.runtime.vla.praxis_geometry import (
 )
 from sglang.multimodal_gen.runtime.vla.praxis_policy import PolicyLayout
 
-YAM = json.loads((Path(__file__).parent / "data" / "praxis-1-yam.json").read_text())
-# config.json of runwayml/praxis-1-yam-lerobot as published.
-YAM_LEROBOT = json.loads(
-    (Path(__file__).parent / "data" / "praxis-1-yam-lerobot.json").read_text()
-)
+# fmt: off
+_YAM_NORMALIZATION = {
+    "domain": "yam",
+    "action_q01": [
+        -0.1886110007762909, -0.20701800286769867, -0.1853650063276291, 0.46403300762176514,
+        -0.6509090065956116, -0.5104100108146667, -0.6505290269851685, 0.45507800579071045,
+        -0.5614719986915588, 0.0, -0.1999340057373047, -0.2358579933643341,
+        -0.19992700219154358, 0.4093570113182068, -0.6830520033836365, -0.5568550229072571,
+        -0.6869149804115295, 0.386911004781723, -0.5972689986228943, 2.6584199730450564e-08,
+    ],
+    "action_q99": [
+        0.18301700055599213, 0.21209199726581573, 0.24737399816513062, 0.9999740123748779,
+        0.6522240042686462, 0.6246020197868347, 0.6568049788475037, 0.9999849796295166,
+        0.5758579969406128, 1.0, 0.19842800498008728, 0.23249000310897827,
+        0.264055997133255, 0.9999549984931946, 0.6877639889717102, 0.6456959843635559,
+        0.7018439769744873, 0.9999679923057556, 0.6033779978752136, 1.0,
+    ],
+    "q99_normed_dims": [
+        0, 1, 2, 9,
+        10, 11, 12, 19,
+    ],
+    "proprio_mean": [
+        0.6068599820137024, 0.11715299636125565, 0.5181000232696533, -0.5109819769859314,
+        -0.09493310004472733, -0.626579999923706, 0.28054600954055786, 0.6581140160560608,
+        -0.32249701023101807, 0.5067939758300781, 0.6114770174026489, -0.0875713974237442,
+        0.5070589780807495, -0.5247989892959595, -0.0035038399510085583, -0.6334450244903564,
+        -0.34640300273895264, 0.6654509902000427, 0.26510700583457947, 0.5514330267906189,
+    ],
+    "proprio_std": [
+        0.1022690013051033, 0.12186499685049057, 0.12526200711727142, 0.34149599075317383,
+        0.3882420063018799, 0.2644459903240204, 0.422432005405426, 0.29476499557495117,
+        0.34473198652267456, 0.3757230043411255, 0.1051969975233078, 0.12511099874973297,
+        0.12934400141239166, 0.34685298800468445, 0.37283799052238464, 0.25299400091171265,
+        0.3947789967060089, 0.30974599719047546, 0.33927100896835327, 0.3449360132217407,
+    ],
+    "action_formula": 'clip(2 * (a - q01) / (q99 - q01 + 1e-8) - 1, -1, 1) on q99_normed_dims, identity on the other dims',
+    "proprio_formula": '(p - mean) / max(std, 1e-6) on all dims',
+}
+# fmt: on
+
+# model_config of runwayml/praxis-1-yam-lerobot, reduced to the keys the code reads.
+YAM = {
+    "embodiment": "bimanual",
+    "backbone": {
+        "dim": 3072,
+        "timestep_dim": 128,
+        "num_registers": 4,
+        "modulation_dtype": "mixed",
+        "dense_ffn_hidden": 11520,
+        "layout": "chunk_causal",
+        "attention": {
+            "head_dim": 128,
+            "num_kv_heads": 8,
+            "backend": "flash",
+            "rope_after_norm": False,
+        },
+        "rope": {"base": 26000000, "effective_dim": 64, "efficient_cache_max": 1000000},
+        "moe": {
+            "num_routed_experts": 128,
+            "top_k_routed": 8,
+            "expert_hidden": 1280,
+            "routed_scaling_factor": 2.5,
+            "router_activation": "sigmoid",
+        },
+        "encoder": {
+            "depth": 14,
+            "dense_blocks": [0, 1],
+            "tap_blocks": [0, 2, 4, 6, 7, 9, 11, 13],
+            "positive_zero_residual_add": True,
+            "input_projections": {
+                "TextEncodingTensor": {"c_in": 2048},
+                "VideoTensor": {"c_in": 192},
+            },
+        },
+        "decoder": {
+            "depth": 6,
+            "dense_blocks": [0],
+            "unpatch_factor": [1, 2, 2],
+            "positive_zero_residual_add": True,
+            "input_projections": {"VideoTensor": {"c_in": 48}},
+        },
+    },
+    "action_expert": {
+        "dim": 1024,
+        "num_layers": 16,
+        "num_heads": 16,
+        "head_dim": 64,
+        "trunk_dim": 3072,
+        "action_patch_dim": 80,
+        "proprio_patch_dim": 20,
+        "num_future_per_chunk": 8,
+        "max_chunks": 16,
+        "tap_norm": True,
+        "clean_only_conditioning": False,
+        "head_plus_zero": True,
+        "global_order": ["register", "anchor", "text"],
+        "rope": {
+            "kind": "trunk",
+            "order": "before_norm",
+            "dim": 64,
+            "effective_dim": 64,
+            "base": 26000000,
+            "table_size": 1000000,
+        },
+    },
+    "chunking": {
+        "n_chunks": 4,
+        "action_chunk": 24,
+        "action_frames_per_token": 4,
+        "latents_per_chunk": 6,
+        "past_frames": 15,
+        "future_frames": 24,
+        "window_frames": 93,
+        "chunk_geometry": [[0, 21], [21, 24], [45, 24], [69, 24]],
+        "grid_hz": 15.0,
+        "global_frame_anchor": True,
+        "contiguous_chunks": True,
+        "context_format": "vxt",
+        "proprio_frames": 1,
+    },
+    "video": {
+        "height": 256,
+        "width": 1248,
+        "views": ["top_left", "wrist_left", "wrist_right"],
+        "canvas": "tiles",
+        "layout": "hstack",
+        "keep_aspect": True,
+        "antialias": True,
+        "tile_bounds_rows_cols": {
+            "top_left": [0, 256, 0, 416],
+            "wrist_left": [0, 256, 416, 832],
+            "wrist_right": [0, 256, 832, 1248],
+        },
+        "vae": "Wan2.2",
+        "vae_encode_chunk_frames": 4,
+        "latent_channels": 48,
+        "vae_stride": [4, 16, 16],
+        "patch_size": [1, 2, 2],
+        "tile_height": 256,
+        "tile_width": 416,
+        "aspect_tol": 0.03,
+        "vae_encode_impl": "megakernel",
+        "vae_megakernel_chunk_frames": 16,
+    },
+    "text_encoder": {
+        "model": "Qwen3.5-2B",
+        "hidden_layer": -3,
+        "pad_to_multiple_of": 32,
+        "trim_padding": True,
+        "hidden_dim": 2048,
+        "uncond": "blank_caption",
+        "blank_caption": " ",
+    },
+    "action_space": {
+        "dim": 20,
+        "layout": "[L: xyz(3) rot6d(6) grip(1) | R: xyz(3) rot6d(6) grip(1)]",
+        "pose_layout": "[L: xyz(3) quat_wxyz(4) grip(1) | R: same]",
+    },
+    "normalization": _YAM_NORMALIZATION,
+    "pose_frame": "rig",
+}
+
+# The outer LeRobot config of the same checkpoint, reduced to the keys the code reads.
+YAM_LEROBOT = {
+    "type": "praxis",
+    "camera_keys": [
+        "observation.images.top_left",
+        "observation.images.wrist_left",
+        "observation.images.wrist_right",
+    ],
+    "chunk_size": 24,
+    "n_action_steps": 24,
+    "max_context_chunks": 1,
+    "num_steps": 2,
+    "t_shift": 1.0,
+    "cfg_scale": 1.0,
+    "cfg_video_scale": 1.0,
+    "seed": 0,
+    "vae_id": "Wan-AI/Wan2.2-TI2V-5B:Wan2.2_VAE.pth",
+    "text_encoder_id": "Qwen/Qwen3.5-2B",
+    "model_config": YAM,
+}
 
 
 def _stats() -> NormStats:
