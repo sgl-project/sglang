@@ -419,7 +419,7 @@ def _get_processor(
                 )
 
     except TypeError as e:
-        if "audio_compression_rate" not in str(e):
+        if config.model_type != "phi4mm":
             raise
         logger.info("Building Phi4MM processor manually for %s", tokenizer_name)
         processor = _build_phi4mm_processor(tokenizer_name, trust_remote_code, revision)
