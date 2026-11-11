@@ -349,6 +349,15 @@ def handle_prefill_only_disable_kv_cache(server_args: Any) -> None:
 
 def handle_cache_compatibility(server_args: Any) -> None:
     cfg = resolving_view(server_args)
+    if get_platform().is_hip and "fp8_e5m2" in (
+        cfg.kv_cache_dtype,
+        cfg.speculative_draft_kv_cache_dtype,
+    ):
+        raise ValueError(
+            "FP8 E5M2 KV cache is not supported on HIP. "
+            "Use fp8_e4m3 instead for --kv-cache-dtype and "
+            "--speculative-draft-kv-cache-dtype."
+        )
     if (
         cfg.disaggregation_decode_retraction_backup == "host_pool"
         and cfg.disaggregation_mode != "decode"
