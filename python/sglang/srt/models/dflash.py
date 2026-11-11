@@ -538,16 +538,17 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         sliding_window_size, attn_type = _get_dflash_layer_attention_params(
             config, layer_id
         )
-        if sliding_window_size > -1:
+        if sliding_window_size > -1 or attn_type != AttentionType.DECODER:
+            # Deferred as on main: draft_worker_common pulls in tp_worker.
             from sglang.srt.speculative.draft_worker_common import (
                 resolve_draft_worker_attention_backend,
             )
 
-            # The other MLA backends ignore a layer's sliding window.
             draft_attention_backend = resolve_draft_worker_attention_backend(
                 algo_label="DFLASH"
             )
-            if draft_attention_backend not in (
+            # The other MLA backends ignore a layer's sliding window.
+            if sliding_window_size > -1 and draft_attention_backend not in (
                 "triton",
                 *DFLASH_MLA_ONLY_DRAFT_BACKENDS,
             ):
@@ -556,13 +557,18 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
                     "--speculative-draft-attention-backend triton, trtllm_mla or "
                     f"cutedsl_mla, got {draft_attention_backend!r}."
                 )
-            if (
-                draft_attention_backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS
-                and attn_type != AttentionType.DECODER
+            # Both verify causally. cutedsl_mla keeps main's behavior for
+            # full_attention layers, which serve the shipped full-attention drafts.
+            if attn_type != AttentionType.DECODER and (
+                draft_attention_backend == "trtllm_mla"
+                or (
+                    sliding_window_size > -1
+                    and draft_attention_backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS
+                )
             ):
                 raise ValueError(
-                    f"{draft_attention_backend} applies an MLA sliding window "
-                    "causally; this DFLASH draft sets is_causal=False."
+                    f"{draft_attention_backend} runs DFLASH MLA draft attention "
+                    "causally; this draft sets is_causal=False."
                 )
         rope_theta, rope_scaling = get_rope_config(config)
         if rope_scaling is not None and rope_scaling.get(

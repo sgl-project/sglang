@@ -15,9 +15,11 @@
 """Pure index math for decode context parallel (DCP): per-rank lengths and
 the owner-rule local-index filter."""
 
+from typing import Optional
+
 import torch
 
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 # NOTE(yhyang201): under DCP, Kimi-K3.1 shards the DSA index-K cache by token like
 # the MLA KV instead of replicating it; the indexer merges per-rank top-k exactly.
@@ -32,6 +34,13 @@ def set_dsa_shards_index_k() -> None:
 
 def dsa_shards_index_k() -> bool:
     return _dsa_shards_index_k and get_parallel().attn_dcp_size > 1
+
+
+def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
+    if attention_backend == "dsa":
+        # trtllm-gen partials carry a base-2 LSE.
+        return dsa_shards_index_k() and get_exec().kernel.dsa_decode_backend != "trtllm"
+    return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
 
 
 def dsa_index_k_page_tokens(page_size: int) -> int:

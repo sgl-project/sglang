@@ -309,6 +309,18 @@ class TestDFlashMLA(CustomTestCase):
                     with self.assertRaisesRegex(ValueError, "causally"):
                         DFlashMLAAttention(config, layer_id=0)
 
+    def test_bidirectional_full_attention_layers_reject_trtllm_mla(self):
+        """trtllm_mla verifies causally; cutedsl_mla keeps main's behavior for
+        full_attention layers."""
+        config = Qwen3Config(**_export_fields(), layer_types=["full_attention"])
+        config.is_causal = False
+        resolve = "sglang.srt.speculative.draft_worker_common.resolve_draft_worker_attention_backend"
+        with patch(resolve, return_value="trtllm_mla"):
+            with self.assertRaisesRegex(ValueError, "causally"):
+                DFlashMLAAttention(config, layer_id=0)
+        with patch(resolve, return_value="cutedsl_mla"):
+            DFlashMLAAttention(config, layer_id=0)
+
     def test_matches_specforge_reference(self):
         """Context-KV materialization and the block forward reproduce SpecForge's
         expanded attention: partial RoPE, pair convention, K/V of different width."""
