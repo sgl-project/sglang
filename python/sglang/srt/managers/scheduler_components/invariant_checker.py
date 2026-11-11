@@ -11,6 +11,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Sequence,
     Set,
     Tuple,
 )
@@ -23,6 +24,7 @@ from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
+    WindowPoolStats,
     kv_private_tokens,
     kv_private_window_tokens,
 )
@@ -36,7 +38,8 @@ from sglang.srt.managers.scheduler_components.state_check import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, window_sub_pool_of
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.kv.requests import RequestTable, RowState
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_SANITY_CHECK_CACHE,
@@ -186,13 +189,13 @@ class SchedulerInvariantChecker:
 
     def _check_full_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         allocator = self.token_to_kv_pool_allocator
-        if ps.is_hybrid_swa and not ps.full_capacity:
+        if ps.windows and not ps.full_capacity:
             return False, ""
         # The token sub-pool's capacity as the stats report it: the sized cap
         # with a window, the schedulable token count with state.
         total = ps.full_capacity
         session_held = self.pool_stats_observer.session_held_tokens()
-        if ps.is_hybrid_swa or ps.is_hybrid_ssm:
+        if ps.windows or ps.is_hybrid_ssm:
             protected = self.tree_cache.full_protected_size()
         else:
             protected = self.tree_cache.protected_size()
@@ -254,25 +257,28 @@ class SchedulerInvariantChecker:
             return False, f"{msg}, dcp_physical_page_slack_allowed=True"
         return leak, msg
 
-    def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
+    def _check_window_pool(
+        self, window: WindowPoolStats, uncached: int = 0
+    ) -> Tuple[bool, str]:
+        """Conservation of one window sub-pool, by the counts of the tree slot
+        that keeps it."""
         allocator = self.token_to_kv_pool_allocator
-        window = window_sub_pool_of(allocator)
         if is_swa_req_ring(allocator):
-            # Per-request SWA ring: there is no token pool to conserve; ring-slot
-            # leaks are caught by the req_to_token check instead.
+            # Per-request window ring: there is no token pool to conserve;
+            # ring-slot leaks are caught by the req_to_token check instead.
             return False, (
-                "[swa] unified ring (leak-check skipped): "
-                f"available={ps.swa_available_size}, "
-                f"evictable={ps.swa_evictable_size}, "
-                f"total={ps.swa_capacity}"
+                f"[{window.name}] unified ring (leak-check skipped): "
+                f"available={window.available_size}, "
+                f"evictable={window.evictable_size}, "
+                f"total={window.capacity}"
             )
         return self._check_pool_invariant(
-            "swa",
-            ps.swa_available_size,
-            ps.swa_evictable_size,
-            self.tree_cache.window_protected_size(window),
-            self.pool_stats_observer.session_held_window_tokens(window),
-            ps.swa_capacity,
+            window.name,
+            window.available_size,
+            window.evictable_size,
+            self.tree_cache.window_protected_size(window.sub_pool),
+            self.pool_stats_observer.session_held_window_tokens(window.sub_pool),
+            window.capacity,
             uncached,
         )
 
@@ -368,11 +374,13 @@ class SchedulerInvariantChecker:
                 owners.append(req)
         return owners
 
-    def _get_total_uncached_sizes(self, has_window: bool) -> Tuple[int, int]:
-        """(full, swa) footprint of the KV rows requests own; 0 swa without a window."""
+    def _get_total_uncached_sizes(
+        self, windows: Sequence[str] = ()
+    ) -> Tuple[int, Dict[str, int]]:
+        """The full footprint of the KV rows requests own, and each window
+        slot's in ``windows``."""
         full_uncached = 0
-        swa_uncached = 0
-        window = window_sub_pool_of(self.token_to_kv_pool_allocator)
+        window_uncached = {sub_pool: 0 for sub_pool in windows}
         for req in self._requests_owning_rows():
             if req.kv.cache_protected_len % self.page_size != 0:
                 self.reporter.report(
@@ -382,39 +390,43 @@ class SchedulerInvariantChecker:
                     f"page_size={self.page_size}",
                 )
             full_uncached += kv_private_tokens(req.kv, self.page_size)
-            if has_window:
-                swa_uncached += kv_private_window_tokens(req.kv, self.page_size, window)
+            for sub_pool in windows:
+                window_uncached[sub_pool] += kv_private_window_tokens(
+                    req.kv, self.page_size, sub_pool
+                )
 
             if req.beam_group is not None:
                 full_uncached += req.beam_group.extra_uncached_tokens()
 
-        return full_uncached, swa_uncached
+        return full_uncached, window_uncached
 
     def _check_busy_pools(self):
         ps = self.pool_stats_observer.get_pool_stats()
-        full_uncached, swa_uncached = self._get_total_uncached_sizes(ps.is_hybrid_swa)
+        full_uncached, window_uncached = self._get_total_uncached_sizes(
+            tuple(window.sub_pool for window in ps.windows)
+        )
 
         full_leak, full_msg = self._check_full_pool(ps, uncached=full_uncached)
 
-        swa_leak, swa_msg = False, ""
-        if ps.is_hybrid_swa:
-            swa_leak, swa_msg = self._check_swa_pool(ps, uncached=swa_uncached)
+        window_checks = [
+            self._check_window_pool(window, uncached=window_uncached[window.sub_pool])
+            for window in ps.windows
+        ]
+        window_leaks = [msg for leak, msg in window_checks if leak]
 
         level = envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
-        full_line = f"[Mem Check (BUSY)] {full_msg}"
-        swa_line = f"[Mem Check (BUSY)] {swa_msg}" if swa_msg else None
+        lines = [f"[Mem Check (BUSY)] {full_msg}"] + [
+            f"[Mem Check (BUSY)] {msg}" for _, msg in window_checks if msg
+        ]
 
         if level > 1:
             # Verbose: log every iteration.
-            logger.info(full_line)
-            if swa_line:
-                logger.info(swa_line)
+            for line in lines:
+                logger.info(line)
         elif level == 1:
             # Quiet: buffer and stay silent; flush the recent ones only on a leak.
-            self.recent_busy_msgs.append(full_line)
-            if swa_line:
-                self.recent_busy_msgs.append(swa_line)
-            if full_leak or swa_leak:
+            self.recent_busy_msgs.extend(lines)
+            if full_leak or window_leaks:
                 for msg in self.recent_busy_msgs:
                     logger.info(msg)
 
@@ -422,9 +434,9 @@ class SchedulerInvariantChecker:
             self.reporter.report(
                 Severity.LEAK, f"Full Pool Mem Leak Detected! {full_msg}"
             )
-        if swa_leak:
+        if window_leaks:
             self.reporter.report(
-                Severity.LEAK, f"SWA Pool Mem Leak Detected! {swa_msg}"
+                Severity.LEAK, f"Window Pool Mem Leak Detected! {window_leaks}"
             )
 
     def _check_kv_page_invariants(self):
@@ -532,23 +544,57 @@ class SchedulerInvariantChecker:
             )
 
     def _check_req_pool(self):
+        pool = self.req_to_token_pool
+        session_req_count = self.pool_stats_observer.session_held_req_count()
+        if isinstance(pool, RequestTable):
+            msg = self._row_state_violation(pool, session_req_count)
+        else:
+            msg = self._row_count_violation(pool, session_req_count)
+        if msg is not None:
+            self.reporter.report(Severity.LEAK, msg)
+
+    @staticmethod
+    def _row_state_violation(
+        table: RequestTable, session_req_count: int
+    ) -> Optional[str]:
+        """Idle, every row is FREE, PARKED by a session or HELD by a retained
+        window, and PARKED + HELD is what sessions hold."""
+        counts = {state.name: table.count(state) for state in RowState}
+        problems = []
+        if table.count(RowState.FREE) != len(table.free_slots):
+            problems.append("FREE differs from the free list")
+        if table.count(RowState.ACTIVE) != 0:
+            problems.append("ACTIVE rows while idle")
+        if (
+            table.count(RowState.PARKED) + table.count(RowState.HELD)
+            != session_req_count
+        ):
+            problems.append("PARKED + HELD differs from session_held")
+        if not problems:
+            return None
+        return (
+            "req_to_token_pool memory leak detected! "
+            f"{'; '.join(problems)}: rows={counts}, "
+            f"free_list={len(table.free_slots)}, session_held={session_req_count}\n"
+        )
+
+    @staticmethod
+    def _row_count_violation(
+        pool: ReqToTokenPool, session_req_count: int
+    ) -> Optional[str]:
         # Account for pre-alloc headroom whenever the pool has it. The decode
         # pool always does; with runtime P<->D role switching a prefill instance
         # may also hold a decode-flavored (pre-alloc) pool, so key off the pool
         # itself rather than the current role.
-        req_total_size = (
-            self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
+        req_total_size = pool.size + pool.pre_alloc_size
+        if len(pool.free_slots) + session_req_count == req_total_size:
+            return None
+        return (
+            "req_to_token_pool memory leak detected!"
+            f"available_size={len(pool.free_slots)}, "
+            f"session_held={session_req_count}, "
+            f"total_size={pool.size}\n"
         )
-
-        session_req_count = self.pool_stats_observer.session_held_req_count()
-        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
-            msg = (
-                "req_to_token_pool memory leak detected!"
-                f"available_size={len(self.req_to_token_pool.free_slots)}, "
-                f"session_held={session_req_count}, "
-                f"total_size={self.req_to_token_pool.size}\n"
-            )
-            self.reporter.report(Severity.LEAK, msg)
 
     def _check_all_pools(
         self, ps: PoolStats, uncached: int = 0
@@ -561,10 +607,10 @@ class SchedulerInvariantChecker:
         has_leak |= full_leak
         messages.append(full_msg)
 
-        if ps.is_hybrid_swa:
-            swa_leak, swa_msg = self._check_swa_pool(ps)
-            has_leak |= swa_leak
-            messages.append(swa_msg)
+        for window in ps.windows:
+            window_leak, window_msg = self._check_window_pool(window)
+            has_leak |= window_leak
+            messages.append(window_msg)
 
         if ps.is_hybrid_ssm and self.tree_cache.supports_mamba():
             mamba_leak, mamba_msg = self._check_mamba_pool(ps)
@@ -587,7 +633,7 @@ class SchedulerInvariantChecker:
 
     def _check_request_lists(self, batch: ScheduleBatch) -> None:
         """At the launch of `batch`: each live request is in exactly one list,
-        one that matches its state."""
+        the one its `owner_list` names, and that list matches its state."""
         lists = self.get_request_lists()
         owners: Dict[Req, ListKind] = {}
         for kind, reqs in lists.items():
@@ -596,6 +642,13 @@ class SchedulerInvariantChecker:
                     self.reporter.report(
                         Severity.CORRUPTION,
                         f"Request {req.rid} is in both {owners[req].name} and {kind.name}",
+                    )
+                if req.owner_list is not reqs:
+                    owner = req.owner_list
+                    self.reporter.report(
+                        Severity.CORRUPTION,
+                        f"Request {req.rid} is in {kind.name} but owned by "
+                        f"{None if owner is None else owner.kind.name}",
                     )
                 owners[req] = kind
 
@@ -671,7 +724,7 @@ class SchedulerInvariantChecker:
     def _check_tree_cache(self):
         ps = self.pool_stats_observer.get_pool_stats()
         if self.tree_cache.supports_prefix_sharing() and (
-            (ps.is_hybrid_swa and self.tree_cache.supports_swa())
+            (ps.windows and self.tree_cache.supports_swa())
             or (ps.is_hybrid_ssm and self.tree_cache.supports_mamba())
         ):
             self.tree_cache.sanity_check()
@@ -703,7 +756,8 @@ def create_scheduler_watchdog(
 
     return WatchdogRaw(
         debug_name="Scheduler",
-        get_counter=lambda: scheduler.forward_ct,
+        # A step or a heartbeat while it waits (`Scheduler.feed_watchdog`).
+        get_counter=lambda: (scheduler.forward_ct, scheduler.watchdog_heartbeats),
         is_active=lambda: (
             scheduler.is_initializing or scheduler.cur_batch_for_debug is not None
         ),

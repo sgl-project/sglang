@@ -27,7 +27,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
-    get_schedule,
     get_spec,
 )
 
@@ -513,7 +512,6 @@ def _validate_flashmla_sparse_q8_backend(
     qk_rope_head_dim: int,
     device_sm_major: int,
     hisparse_enabled: bool = False,
-    mixed_chunk_enabled: bool = False,
 ) -> None:
     # flashmla_sparse_q8 casts q and KV to fp8 per call, so the KV cache may be
     # bfloat16 or fp8_e4m3.
@@ -547,16 +545,6 @@ def _validate_flashmla_sparse_q8_backend(
             raise ValueError(
                 "--dsa-prefill-backend flashmla_sparse_q8 is SM90-only; got compute "
                 f"capability sm_{device_sm_major}x."
-            )
-        # A mixed batch takes the PAGED top-k transform, which belongs to the
-        # bf16 kernel. forward_extend refuses it, but the flag is readable here,
-        # so the refusal belongs at launch rather than on the first mixed batch
-        # formed under load.
-        if mixed_chunk_enabled:
-            raise ValueError(
-                "--dsa-prefill-backend flashmla_sparse_q8 does not support "
-                "--enable-mixed-chunk: q8 prefill runs on RAGGED extend batches "
-                "only."
             )
         # The q8 route hands top-k to the kernel as ragged ids and never binds the
         # page table HiSparse would translate, so the two cannot be combined.
@@ -825,7 +813,6 @@ class DeepseekSparseAttnBackend(
             qk_rope_head_dim=self.qk_rope_head_dim,
             device_sm_major=self.device_sm_major,
             hisparse_enabled=self.hisparse_coordinator is not None,
-            mixed_chunk_enabled=get_schedule().enable_mixed_chunk,
         )
 
         if self.dsa_prefill_impl == "triton_sparse_mla":
@@ -1766,16 +1753,6 @@ class DeepseekSparseAttnBackend(
                     device=self.device,
                 )
             )
-            flashmla_metadata = (
-                self._compute_flashmla_metadata(
-                    cache_seqlens=torch.ones(
-                        max_num_tokens, dtype=torch.int32, device=self.device
-                    ),
-                    seq_len_q=1,
-                )
-                if self.dsa_decode_impl == "flashmla_kv"
-                else None
-            )
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -1803,7 +1780,6 @@ class DeepseekSparseAttnBackend(
                 else None
             ),
             "page_table": page_table,
-            "flashmla_metadata": flashmla_metadata,
         }
 
         # Sized by query rows, not requests: target verify captures
@@ -1883,18 +1859,6 @@ class DeepseekSparseAttnBackend(
 
             seqlens_expanded = cache_seqlens_int32
             dsa_extend_seq_lens_list = [1] * bs
-            if self.dsa_decode_impl == "flashmla_kv":
-                flashmla_metadata = self.decode_cuda_graph_metadata[
-                    "flashmla_metadata"
-                ].slice(slice(0, bs + 1))
-                flashmla_metadata.copy_(
-                    self._compute_flashmla_metadata(
-                        cache_seqlens=dsa_cache_seqlens_int32,
-                        seq_len_q=1,
-                    )
-                )
-            else:
-                flashmla_metadata = None
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
                 torch.int32
@@ -1947,20 +1911,16 @@ class DeepseekSparseAttnBackend(
             )
             dsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
 
-            if self.dsa_decode_impl == "flashmla_kv":
-                flashmla_metadata = self.decode_cuda_graph_metadata[
-                    "flashmla_metadata"
-                ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
-
-                flashmla_metadata.copy_(
-                    self._compute_flashmla_metadata(
-                        cache_seqlens=dsa_cache_seqlens_int32,
-                        seq_len_q=1,
-                    )
-                )
-            else:
-                flashmla_metadata = None
-
+        # Native-head FlashMLA changes its partition count with the query-row
+        # count. Each graph therefore owns its schedule, which replay updates
+        # in place without changing the captured shape or address.
+        flashmla_metadata = (
+            self._compute_flashmla_metadata(
+                cache_seqlens=dsa_cache_seqlens_int32, seq_len_q=1
+            )
+            if self.dsa_decode_impl == "flashmla_kv"
+            else None
+        )
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
         if self.dsa_drop_wide_page_table:
@@ -2510,10 +2470,9 @@ class DeepseekSparseAttnBackend(
             and topk_transform_method != TopkTransformMethod.RAGGED
         ):
             raise NotImplementedError(
-                "--dsa-prefill-backend flashmla_sparse_q8 supports EXTEND prefill "
-                f"batches only; got forward_mode={forward_batch.forward_mode.name} "
-                "(DLLM_EXTEND under --dllm-algorithm; --enable-mixed-chunk is "
-                "rejected at launch)."
+                "--dsa-prefill-backend flashmla_sparse_q8 supports EXTEND and MIXED "
+                f"prefill batches only; got forward_mode={forward_batch.forward_mode.name} "
+                "(DLLM_EXTEND under --dllm-algorithm)."
             )
 
         if self.use_fused_topk:
@@ -3156,8 +3115,9 @@ class DeepseekSparseAttnBackend(
         """
         if self.dsa_prefill_impl != "flashmla_sparse_q8":
             return False
-        # RAGGED routing requires exactly EXTEND (excludes decode/idle, MIXED,
-        # target-verify and draft-extend, which use dsa_decode_impl anyway).
+        # Born-fp8 q is EXTEND-only. MIXED routes RAGGED as well but stays on
+        # the bf16-q hand-off (the helper casts); decode/idle, target-verify and
+        # draft-extend use dsa_decode_impl.
         if forward_batch.forward_mode != ForwardMode.EXTEND:
             return False
         # Per-batch dense fallback (il <= threshold) reads bf16 q directly.
@@ -4567,7 +4527,9 @@ class DeepseekSparseAttnBackend(
             # dequantizes inside the RAGGED branch and its kernel is bf16-only.
             and self.dsa_prefill_impl
             in ("flashmla_sparse", "flashmla_sparse_q8", "triton_sparse_mla")
-            and forward_mode == ForwardMode.EXTEND
+            # MIXED matches EXTEND: the prefill graph runner builds metadata from
+            # MIXED but replays EXTEND graphs.
+            and forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
         elif self.dsa_shards_index_k and forward_mode == ForwardMode.EXTEND:
