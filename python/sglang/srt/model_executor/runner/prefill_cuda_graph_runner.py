@@ -743,10 +743,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._dcp_extend_active = get_parallel().attn_dcp_size > 1 and hasattr(
             model_runner.model, "prepare_context_parallel_metadata_for_dcp"
         )
-        self._kimi_k31_rocm_bcg = is_hip() and is_kimi_k31(
-            model_runner.model_config.hf_config
-        )
-        if self._kimi_k31_rocm_bcg:
+        if is_hip() and is_kimi_k31(model_runner.model_config.hf_config):
+            self._kimi_k31_rocm_bcg = True
             # Kimi-K3.1's DSA layers never read it: prefix extends keep replaying.
             self._dcp_extend_active = False
         self._dcp_kv_buffers: Dict[ShapeKey, torch.Tensor] = {}

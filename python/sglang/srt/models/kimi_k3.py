@@ -132,12 +132,10 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
 from sglang.srt.models.kimi_k3_amd.moe import (
     KimiK3MoEHipMixin,
     link_hip_paths,
+    prepare_hip_paths,
     row_shard_bank_hooks_hip,
 )
-from sglang.srt.models.kimi_k3_amd.row_shard_o_proj import (
-    gather_full_o_proj,
-    row_shard_o_proj,
-)
+from sglang.srt.models.kimi_k3_amd.row_shard_o_proj import row_shard_o_proj
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -1679,8 +1677,6 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 and isinstance(self.shared_experts.down_proj.weight, torch.Tensor)
                 and self.routed_expert_up_proj is not None
             )
-        if _is_hip:
-            return self._forward_fused_hip(hidden_states, prefix_sum=prefix_sum)
 
         num_tokens, hidden_size = hidden_states.shape
         sharded = self._sharded_front_covers(num_tokens)
@@ -1854,6 +1850,8 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         if cp_shard_rows:
             return self._forward_cp_shard_rows(hidden_states)
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
+            if _is_hip:  # its row-sharded tail may return this rank's rows
+                return self._forward_fused_hip(hidden_states, prefix_sum=prefix_sum)
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
             out = self._forward_unfused(
@@ -1861,8 +1859,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 prefix_sum=prefix_sum,
                 valid_token_count=valid_token_count,
             )
-        # a row-sharded tail may leave the stream on this rank's rows
-        return out.view(-1, hidden_size)
+        return out.view(num_tokens, hidden_size)
 
 
 class KimiK3DeltaAttention(nn.Module):
@@ -4005,15 +4002,13 @@ class KimiK3LinearForCausalLM(nn.Module):
                     # workspace taken from the non-static slack, as on main.
                     layer.mlp._mega_moe_buffer()
                 if _is_hip:
-                    layer.mlp._prepare_hip_paths()
+                    prepare_hip_paths(layer)
                 # Convert the correction bias to fp32 once so the per-call
                 # .to(float32) in topk is a no-op, not one upcast kernel per
                 # MoE layer per step.
                 bias = layer.mlp.gate.e_score_correction_bias
                 if bias.dtype != torch.float32:
                     bias.data = bias.data.to(torch.float32)
-            if layer._o_proj_row_sharded:
-                gather_full_o_proj(layer.self_attn.o_proj)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()

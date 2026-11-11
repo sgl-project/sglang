@@ -32,6 +32,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.models.kimi_k3_amd.row_shard_o_proj import (
+    gather_full_o_proj,
     pad_o_proj_rows,
     take_o_proj_row_shard,
 )
@@ -762,6 +763,15 @@ def row_shard_bank_hooks_hip(layer) -> dict:
             attn_rows=partial(_o_proj_row_shard, layer),
         )
     )
+
+
+def prepare_hip_paths(layer) -> None:
+    """Post-load, after _merge_front_weights: a MoE KimiK3DecoderLayer's ROCm
+    paths, and the full o_proj weight its row-sharded o_proj applies (only
+    a MoE layer has row shards, see ffn_row_shards_hip)."""
+    layer.mlp._prepare_hip_paths()
+    if layer._o_proj_row_sharded:
+        gather_full_o_proj(layer.self_attn.o_proj)
 
 
 def link_row_sharded_stream_hip(model) -> None:
