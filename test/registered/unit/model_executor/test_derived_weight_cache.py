@@ -9,6 +9,7 @@ import torch
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
     WeightUpdater,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
@@ -44,6 +45,23 @@ class TestDerivedWeightCache(unittest.TestCase):
                 (False, "derived scales require restart"),
             )
         self.assertTrue(torch.equal(model[0].weight, original))
+
+    def test_direct_update_error_only_blocks_the_direct_format(self):
+        model = torch.nn.Sequential(torch.nn.Module())
+        model[0]._direct_weight_update_error = "no direct"
+        loaded = []
+        model.load_weights = loaded.append
+        stub = SimpleNamespace(
+            get_model=lambda: model,
+            device="cpu",
+            custom_weight_loaders={},
+            _assert_weight_cache_inactive=lambda _: None,
+        )
+        update = WeightUpdater.update_weights_from_tensor
+        self.assertEqual(update(stub, [], load_format="direct"), (False, "no direct"))
+        with get_parallel().override(tp_rank=0):
+            self.assertTrue(update(stub, [], load_format=None)[0])
+        self.assertEqual(loaded, [[]])
 
 
 if __name__ == "__main__":

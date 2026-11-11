@@ -18,7 +18,7 @@
 
 namespace sglang {
 
-using device::distributed::Counter;
+using device::distributed::EpochCounter;
 using host::distributed::CommunicatorObj, host::distributed::CommunicatorRef;
 
 struct ParallelQKNormParams {
@@ -33,7 +33,6 @@ struct ParallelQKNormParams {
   uint32_t rank;
   uint32_t num_tokens;
   uint32_t epoch_bytes;
-  uint32_t num_clean_up_count = 0;
 };
 
 [[maybe_unused]]
@@ -84,7 +83,7 @@ struct KernelTrait {
 
 template <typename Trait>
 __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel_qknorm_across_head(
-    const ParallelQKNormParams __grid_constant__ params, Counter* const __restrict__ counters) {
+    const ParallelQKNormParams __grid_constant__ params, EpochCounter* const __restrict__ counter) {
   using namespace device;
 
   // each cta will handle exactly 1 token
@@ -92,7 +91,7 @@ __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel
   using DType2 = typename Trait::DType2;
   const auto &[
       buffer, q_ptr, k_ptr, q_weight, k_weight, q_stride_bytes, k_stride_bytes, //
-      eps, rank, num_tokens, epoch_bytes, num_clean_up_count
+      eps, rank, num_tokens, epoch_bytes
   ] = params;
 
   using Package = AlignedVector<float, 2>;
@@ -116,18 +115,9 @@ __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel
   const auto input_stride_bytes = load_q ? q_stride_bytes : k_stride_bytes;
   PDLWaitPrimary<Trait::kUsePDL>();
   PDLTriggerSecondary<Trait::kUsePDL>();
-  if (bx >= num_tokens) {
-    [[unlikely]];
-    // In this case, we use the last few blocks to clean up other controllers
-    const auto start = (bx - num_tokens) * blockDim.x + threadIdx.x;
-    const auto stride = (gridDim.x - num_tokens) * blockDim.x;
-    for (uint32_t i = start; i < num_clean_up_count; i += stride)
-      counters[num_tokens + i].inc(1);
-    return;
-  }
-  const auto epoch_offset = (counters[bx].get() % 2) * epoch_bytes;  // only for comm
+  const auto epoch_offset = counter->load() * epoch_bytes;  // only for comm
 
-  __builtin_assume(bx < num_tokens);  // since we have `bx >= num_tokens`
+  __builtin_assume(bx < num_tokens);  // the host launches min(num_tokens, default_blocks) blocks
   Storage next_input;
   void* input_i_ptr = pointer::offset(input_ptr, bx * input_stride_bytes);
   if (is_valid) next_input.load(input_i_ptr, offset);
@@ -209,9 +199,7 @@ __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel
     input_i_ptr = input_next_ptr;
   }
   __syncthreads();
-  if (threadIdx.x == 0) {
-    counters[bx].inc(1);  // NOTE: u32 overflow is safe under mod 2
-  }
+  if (threadIdx.x == 0) counter->commit();
 }
 
 template <typename DType, uint32_t kNumGPU, int64_t kQDim, int64_t kKDim, bool kUsePDL>
@@ -255,16 +243,9 @@ struct FusedParallelQKNormAcrossHead {
         .verify(k_weight);
     const auto device = device_.unwrap();
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
-    // use at most `world_size` blocks to clean up,
-    // this is based on the observation that occupancy is usually linear
-    // with respect to the world size
-    const auto max_num_blocks = push.num_blocks;
-    const bool need_clean = num_tokens < max_num_blocks;
-    const auto num_clean = need_clean ? (max_num_blocks - num_tokens) : 0;
-    const auto num_blocks = need_clean ? num_tokens + div_ceil(num_clean, Trait::kBlockSize)  //
-                                       : max_num_blocks;                                      //
+    if (num_tokens == 0) return;  // nothing pushed, so the epoch need not advance
+    const auto num_blocks = std::min(num_tokens, push.default_blocks);
     const auto num_threads = Trait::kBlockSize;
-    RuntimeCheck(num_blocks <= max_num_blocks, "internal error");
     ParallelQKNormParams params;
     for (uint32_t i = 0; i < kNumGPU; ++i) {
       params.buffer[i] = push.workspaces[i];
@@ -279,7 +260,6 @@ struct FusedParallelQKNormAcrossHead {
     params.rank = push.rank;
     params.num_tokens = num_tokens;
     params.epoch_bytes = static_cast<uint32_t>(push.slot_bytes);
-    params.num_clean_up_count = num_clean;
 
     const auto needed_buffer_bytes = static_cast<int64_t>(num_tokens) * 2 * sizeof(float);
     RuntimeCheck(push.world_size == kNumGPU, "Number of GPUs mismatch");

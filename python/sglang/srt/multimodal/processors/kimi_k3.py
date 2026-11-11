@@ -19,7 +19,10 @@ from PIL import Image
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
-from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+from sglang.srt.models.kimi_k3 import (
+    KimiK3ForConditionalGeneration,
+    KimiK31ForConditionalGeneration,
+)
 from sglang.srt.multimodal.cache import resolve_multimodal_item_hash, snapshot_media
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
@@ -354,7 +357,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         grids = [tuple(int(value) for value in grid) for grid in grid_thws.tolist()]
         patch_counts = [math.prod(grid) for grid in grids]
         if sum(patch_counts) != pixel_values.shape[0]:
-            raise ValueError(
+            raise RuntimeError(
                 "Kimi-K3 processor feature length does not match image grids: "
                 f"{pixel_values.shape[0]} != {sum(patch_counts)}"
             )
@@ -371,7 +374,7 @@ class KimiK3ImageProcessor(
     MediaArtifactCacheMixin,
     SGLangBaseProcessor,
 ):
-    models = [KimiK3ForConditionalGeneration]
+    models = [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
     artifact_modality = Modality.IMAGE
     # K3 accuracy is sensitive to the chroma upsampling used for common 4:2:0
     # JPEG inputs. This mode uses interpolated nvJPEG upsampling when the K3
@@ -471,7 +474,7 @@ class KimiK3ImageProcessor(
             input_ids.flatten(), self.mm_tokens.image_token_id
         )
         if len(offsets) != len(base_output.images):
-            raise ValueError("Expected one Kimi-K3 image span for each image")
+            raise RuntimeError("Expected one Kimi-K3 image span for each image")
 
         items = []
         for image, resize_config, offset in zip(images, resize_configs, offsets):
@@ -633,7 +636,7 @@ class KimiK3ImageProcessor(
         ).flatten()
         offsets = self.get_mm_items_offset(input_ids, self.mm_tokens.image_token_id)
         if len(offsets) != len(artifacts):
-            raise ValueError("Expected one Kimi-K3 image span for each image")
+            raise RuntimeError("Expected one Kimi-K3 image span for each image")
 
         # 2. build request-owned items from prompt-independent artifacts
         items = []

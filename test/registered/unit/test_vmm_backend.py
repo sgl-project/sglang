@@ -19,7 +19,7 @@ import torch.distributed as dist
 
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import get_device, get_device_module
-from sglang.srt.utils.common import get_available_gpu_memory
+from sglang.srt.utils.device import get_available_gpu_memory
 from sglang.srt.utils.vmm_backend import get_vmm_backend
 from sglang.srt.utils.vmm_common import exchange_posix_fds
 from sglang.test.ci.ci_register import register_cuda_ci

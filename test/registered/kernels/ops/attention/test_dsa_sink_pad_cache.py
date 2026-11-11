@@ -13,6 +13,8 @@ register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-la
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_sparse_flashmla_sink_padding_refreshes_reused_buffer(monkeypatch):
     backend = object.__new__(DeepseekSparseAttnBackend)
+    backend.dsa_shards_index_k = False
+    backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
     backend.device_sm_major = 10
     backend.dsa_index_topk = 2
     backend._sink_pad_cache = {}

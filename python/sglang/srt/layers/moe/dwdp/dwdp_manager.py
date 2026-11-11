@@ -19,7 +19,7 @@ from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer, fill_edge_exp
 from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import get_device_module
+from sglang.srt.utils.device import get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
