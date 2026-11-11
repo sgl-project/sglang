@@ -74,10 +74,6 @@ try:
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
 
-    # Muse Spark's opt-in unified-attention tiles (3rdparty/amd/muse_spark aiter patch 05).
-    _unified_attention_has_muse_tiles = (
-        "verify_block_m" in inspect.signature(unified_attention).parameters
-    )
     # Upstream aiter's equal-length query flag (every sequence has max_seqlen_q rows, e.g. a verify).
     _unified_attention_has_equal_seqlen_q = (
         "equal_seqlen_q" in inspect.signature(unified_attention).parameters
@@ -90,7 +86,6 @@ try:
         unified_attention_3d_mtp_ragged_func,
     )
 except ImportError:
-    _unified_attention_has_muse_tiles = False
     _unified_attention_has_equal_seqlen_q = False
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
@@ -232,13 +227,6 @@ _KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
 
 # Muse Spark extend: FP8 Q on full layers from this many query tokens.
 _MUSE_EXTEND_FP8_MIN_Q = 256
-# Muse Spark long-prefill 2D tile config (BLOCK_M, num_warps, num_stages, TILE_SIZE,
-# waves_per_eu) for 256+ query tokens: 90K cached + 5K new 5.57 -> 4.08 ms.
-_MUSE_PREFILL_2D_CONFIG = (128, 4, 2, 128, 2)
-# Muse Spark 8-token verify on the unified 3D kernel: one 64-row tile per
-# (request, KV head) and 256 split-KV segments (C1-tuned).
-_MUSE_VERIFY_BLOCK_M = 64
-_MUSE_VERIFY_NUM_SEGMENTS = 256
 # Full-layer GQA-folded verify (when the two-KV-head kernel is off): batch
 # floor, splits, BN, warps. 12 x 20K-120K contexts: 166 us vs 238 us for the 3D path.
 _MUSE_VERIFY_FULL_GQA = (8, 64, 64, 4)
@@ -984,30 +972,14 @@ class AiterAttnBackend(AttentionBackend):
             )
             if self.use_muse_attention_paths and self._use_unified_verify and env.get()
         )
-        # Extra unified_attention() arguments for Muse extend / verify calls.
-        self.muse_unified_attention_kwargs = {}
-        if self.use_muse_attention_paths and _unified_attention_has_muse_tiles:
-            if envs.SGLANG_ROCM_MUSE_PREFILL_2D_TILES.get():
-                self.muse_unified_attention_kwargs["prefill_2d_config"] = (
-                    _MUSE_PREFILL_2D_CONFIG
-                )
-            if envs.SGLANG_ROCM_MUSE_UNMASKED_INTERIOR.get():
-                self.muse_unified_attention_kwargs["unmasked_interior"] = True
-            if envs.SGLANG_ROCM_MUSE_VERIFY_BM64.get():
-                self.muse_unified_attention_kwargs.update(
-                    verify_block_m=_MUSE_VERIFY_BLOCK_M,
-                    verify_num_segments=_MUSE_VERIFY_NUM_SEGMENTS,
-                )
         if self.use_muse_attention_paths:
             logger.info(
                 "Muse Spark attention paths: reuse_extend_metadata=%s "
-                "reuse_verify_lengths=%s extend_fp8_q=%s verify_kernels=%s "
-                "unified_attention_tiles=%s",
+                "reuse_verify_lengths=%s extend_fp8_q=%s verify_kernels=%s",
                 self.muse_reuse_extend_metadata,
                 self.muse_reuse_verify_lengths,
                 self.muse_extend_fp8_q,
                 sorted(self.muse_verify_kernels),
-                sorted(self.muse_unified_attention_kwargs),
             )
 
         # aiter kernel related initialization
@@ -1873,7 +1845,6 @@ class AiterAttnBackend(AttentionBackend):
             k_descale=k_descale,
             v_descale=v_descale,
             sinks=sinks,
-            **self.muse_unified_attention_kwargs,
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -5086,12 +5057,10 @@ class AiterAttnBackend(AttentionBackend):
                         k_descale=k_descale,
                         v_descale=v_descale,
                         sinks=sinks,
-                        **self.muse_unified_attention_kwargs,
                         **(
                             {"equal_seqlen_q": True}
                             if self.use_muse_attention_paths
                             and _unified_attention_has_equal_seqlen_q
-                            and not _unified_attention_has_muse_tiles
                             and q_unified.shape[0]
                             == self.forward_metadata.max_q_len * seqused_k.shape[0]
                             else {}

@@ -2284,11 +2284,6 @@ class Envs:
     # Sliding-layer verify on the FlyDSL kernel (fixed splits over the window), from 16 requests at 4 KV heads per
     # rank and 48 at 2; Triton below.
     SGLANG_ROCM_MUSE_VERIFY_SWA_FLYDSL = EnvBool(True)
-    # aiter patch 05 tiles: long-prefill 2D config, unmasked interior 2D tiles,
-    # 64-row verify tiles with an exact q-block grid and 256 split-KV segments.
-    SGLANG_ROCM_MUSE_PREFILL_2D_TILES = EnvBool(True)
-    SGLANG_ROCM_MUSE_UNMASKED_INTERIOR = EnvBool(True)
-    SGLANG_ROCM_MUSE_VERIFY_BM64 = EnvBool(True)
     # Verify kernels: sliding layers split-KV (<= 8 requests) / GQA-folded
     # (> 8); full layers two-KV-head kernel, else GQA-folded from 8 requests.
     SGLANG_ROCM_MUSE_VERIFY_SWA_SPLITKV = EnvBool(True)
