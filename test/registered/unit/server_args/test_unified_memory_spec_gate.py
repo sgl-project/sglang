@@ -56,6 +56,7 @@ def _accepts(
     draft_backend: str | None = None,
     dcp_size: int = 1,
     attention_arch: AttentionArch = AttentionArch.MHA,
+    **fields,
 ) -> bool:
     """Run just `handle_unified_memory_pool` on a ServerArgs whose fields are
     restated with `force_setattr` (ServerArgs is a msgspec Struct)."""
@@ -74,6 +75,7 @@ def _accepts(
         "attention_backend": backend,
         "prefill_attention_backend": None,
         "decode_attention_backend": None,
+        **fields,
     }.items():
         msgspec.structs.force_setattr(sa, name, value)
     sa._model_config = SimpleNamespace(
@@ -162,6 +164,33 @@ class TestUnifiedMemorySpecGate(CustomTestCase):
         for algorithm in ("DSPARK", "EAGLE"):
             for topk in (2, 4):
                 self.assertFalse(_accepts(algorithm, topk=topk), f"{algorithm} {topk}")
+
+    def test_buffer_only_hicache_refused_under_pipeline_parallelism(self):
+        """Unified memory with more than one pipeline stage refuses buffer_only
+        HiCache; one stage, or cache mode, is accepted."""
+        hicache = dict(enable_hierarchical_cache=True)
+        buffer_only = dict(hicache, hicache_host_memory_mode="buffer_only")
+        self.assertFalse(_accepts(None, pp_size=2, **buffer_only))
+        self.assertTrue(_accepts(None, pp_size=1, **buffer_only))
+        self.assertTrue(
+            _accepts(None, pp_size=2, hicache_host_memory_mode="cache", **hicache)
+        )
+
+    def test_sessions_refused_under_pipeline_parallelism(self):
+        """Unified memory with more than one pipeline stage refuses streaming
+        sessions and the session radix cache; one stage is accepted."""
+        for flag in ("enable_streaming_session", "enable_session_radix_cache"):
+            with self.subTest(flag=flag):
+                self.assertFalse(_accepts(None, pp_size=2, **{flag: True}))
+                self.assertTrue(_accepts(None, pp_size=1, **{flag: True}))
+        self.assertTrue(
+            _accepts(
+                None,
+                pp_size=2,
+                enable_streaming_session=False,
+                enable_session_radix_cache=False,
+            )
+        )
 
 
 if __name__ == "__main__":
