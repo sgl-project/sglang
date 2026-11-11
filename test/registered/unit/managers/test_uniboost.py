@@ -19,6 +19,7 @@ from sglang.srt.managers.uniboost import (
     sort_waiting_queue,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -387,6 +388,9 @@ class TestSchedulePolicyUniBoost(CustomTestCase):
     def test_long_queue_falls_back_to_fcfs_but_still_stamps(self):
         # FCFS lets no newcomer overtake, so the wait bound holds; the stamps
         # must still be taken, or A(r) would be the end of the fallback.
+        override = get_context().override_server_args(schedule_policy="uniboost")
+        override.install()
+        self.addCleanup(override.restore)
         queue = [_make_req(f"r{i}", [i]) for i in range(200)]
         policy = _policy()
         self.assertEqual(policy.calc_priority(queue, processed_tokens=7), queue)
