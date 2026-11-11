@@ -15,9 +15,6 @@ import torch.multiprocessing as mp
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu import dspark_dp
-from sglang.srt.hardware_backend.npu.attention.dspark_compact import (
-    NpuCompactGraphMetadata,
-)
 from sglang.srt.model_executor import forward_batch_info as fbi
 from sglang.srt.speculative.dspark_components import dspark_planner
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
@@ -152,32 +149,6 @@ def test_packed_dp_mlp_padding_preserves_local_request_rows(lens):
     batch.post_forward_mlp_sync_batch(output)
     assert output.next_token_logits.shape[0] == 32
     assert output.hidden_states.shape[0] == 32
-
-
-def test_idle_glm_metadata_uses_only_sink_page():
-    state = NpuCompactGraphMetadata(
-        num_slots=4, num_tokens=8, table_width=8, device="cpu"
-    )
-    state.update(
-        prefix_lens=torch.zeros(1, dtype=torch.long),
-        req_pool_indices=torch.zeros(1, dtype=torch.long),
-        req_to_token=torch.full((2, 8), 99, dtype=torch.long),
-        verify_lens=torch.zeros(1, dtype=torch.int32),
-        page_size=1,
-    )
-    assert state.query_ends.tolist() == [0, 0, 0, 0, 8]
-    assert state.kv_lens.tolist() == [0, 0, 0, 0, 8]
-    assert torch.count_nonzero(state.block_tables) == 0
-    # Busy replay after idle must replace all previous metadata.
-    state.update(
-        prefix_lens=torch.tensor([3, 2]),
-        req_pool_indices=torch.tensor([0, 1]),
-        req_to_token=torch.arange(16).view(2, 8),
-        verify_lens=torch.tensor([2, 1]),
-        page_size=1,
-    )
-    assert state.query_ends.tolist() == [2, 3, 3, 3, 8]
-    assert state.kv_lens.tolist() == [5, 3, 0, 0, 5]
 
 
 def _collective_worker(rank, init_path, graph):

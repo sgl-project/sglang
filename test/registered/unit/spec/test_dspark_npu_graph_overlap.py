@@ -9,9 +9,6 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from sglang.srt.hardware_backend.npu.attention.dspark_compact import (
-    NpuCompactGraphMetadata,
-)
 from sglang.srt.managers.overlap_utils import (
     CONFIDENCE_RELAY_RING_DEPTH,
     CONFIDENCE_RELAY_RING_LAG,
@@ -48,75 +45,6 @@ def method(path, cls, name, **namespace):
         scope,
     )
     return scope[name]
-
-
-def test_graph_buffers_reused_without_changing_live_causal_positions():
-    state = NpuCompactGraphMetadata(
-        num_slots=3, num_tokens=16, table_width=4, device="cpu"
-    )
-    ptrs = [t.data_ptr() for t in (state.query_ends, state.kv_lens, state.block_tables)]
-    table = torch.arange(16, 16 + 4 * 16).view(4, 16)
-    for lens, prefixes, reqs in (
-        ([2, 4, 1], [3, 7, 8], [2, 0, 3]),
-        ([1, 2], [5, 9], [3, 2]),
-        ([4, 4, 4], [4, 8, 12], [1, 3, 0]),
-    ):
-        state.update(
-            prefix_lens=torch.tensor(prefixes),
-            req_pool_indices=torch.tensor(reqs),
-            req_to_token=table,
-            verify_lens=torch.tensor(lens),
-            page_size=4,
-        )
-        assert ptrs == [
-            t.data_ptr() for t in (state.query_ends, state.kv_lens, state.block_tables)
-        ]
-        assert state.query_ends[-1] == 16
-        assert (
-            state.query_ends[: len(lens)].tolist()
-            == torch.tensor(lens).cumsum(0).tolist()
-        )
-        assert state.kv_lens[: len(lens)].tolist() == [
-            p + v for p, v in zip(prefixes, lens)
-        ]
-        assert not state.block_tables[-1].any()
-        assert not state.kv_lens[len(lens) : -1].any()
-        # In right-aligned causal attention, q row j sees prefix+j+1 keys.
-        starts = [0] + state.query_ends[: len(lens) - 1].tolist()
-        for i, (p, v) in enumerate(zip(prefixes, lens)):
-            q_len = int(state.query_ends[i]) - starts[i]
-            assert int(state.kv_lens[i]) - q_len == p
-            assert q_len == v
-
-
-def test_metadata_capture_tiers_with_same_slot_count_do_not_alias():
-    init = method(
-        "hardware_backend/npu/attention/ascend_backend.py",
-        "AscendAttnBackend",
-        "_init_compact_graph_metadata",
-        NpuCompactGraphMetadata=NpuCompactGraphMetadata,
-        ForwardMetadata=SimpleNamespace,
-    )
-    backend = SimpleNamespace(
-        graph_metadata={},
-        req_to_token=torch.arange(256).view(4, 64),
-        page_size=8,
-        device="cpu",
-    )
-    pointers = []
-    for total in (8, 16, 8):
-        layout = RaggedVerifyLayout.from_verify_lens_device(
-            verify_lens=torch.tensor([1, 3]), graph_num_tokens=total
-        )
-        fb = SimpleNamespace(
-            batch_size=2,
-            seq_lens=torch.tensor([7, 15]),
-            req_pool_indices=torch.tensor([2, 1]),
-        )
-        init(backend, fb, layout)
-        pointers.append(backend.forward_metadata.actual_seq_lengths_q.data_ptr())
-        assert backend.forward_metadata.actual_seq_lengths_q.tolist() == [1, 4, total]
-    assert pointers[0] == pointers[2] != pointers[1]
 
 
 def test_npu_runner_defers_compact_to_common_token_tier_loader():
@@ -322,26 +250,6 @@ def test_confidence_relay_not_ready_generation_and_source_fence():
         stream.wait_event.assert_called_with(
             events[(relay.ring_pos - 1) % CONFIDENCE_RELAY_RING_DEPTH]
         )
-
-
-def test_device_metadata_update_has_no_host_reads():
-    state = NpuCompactGraphMetadata(
-        num_slots=3, num_tokens=16, table_width=8, device="cpu"
-    )
-    args = dict(
-        prefix_lens=torch.tensor([7, 17]),
-        req_pool_indices=torch.tensor([1, 2]),
-        req_to_token=torch.arange(256).view(4, 64),
-        verify_lens=torch.tensor([1, 4]),
-        page_size=8,
-    )
-    with (
-        patch.object(torch.Tensor, "cpu", side_effect=AssertionError("D2H")),
-        patch.object(torch.Tensor, "item", side_effect=AssertionError("scalar sync")),
-        patch.object(torch.Tensor, "tolist", side_effect=AssertionError("host read")),
-    ):
-        state.update(**args)
-    assert state.query_ends.tolist() == [1, 5, 5, 16]
 
 
 def test_npu_executor_keeps_host_prefix_and_device_only_layout():

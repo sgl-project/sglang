@@ -17,7 +17,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_ragged_verify_window,
     scatter_compact_to_strided,
 )
-from sglang.srt.hardware_backend.npu.attention import dspark_compact
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components import dspark_verify
@@ -72,7 +71,10 @@ def _backend_method(name="init_forward_metadata", **extra):
     # Execute the production method with CPU tensors while avoiding imports of
     # torch_npu / sgl_kernel_npu on CPU CI. Only the device boundary is replaced;
     # no copy of the metadata implementation is maintained in this test.
-    path = Path(dspark_compact.__file__).with_name("ascend_backend.py")
+    path = (
+        Path(__file__).resolve().parents[4]
+        / "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py"
+    )
     tree = ast.parse(path.read_text())
     backend = next(
         node
@@ -96,13 +98,26 @@ def _backend_method(name="init_forward_metadata", **extra):
     namespace = dict(
         torch=torch,
         np=np,
-        ForwardMetadata=lambda: SimpleNamespace(seq_lens_cpu_int=None),
-        build_compact_verify_metadata=dspark_compact.build_compact_verify_metadata,
+        ForwardMetadata=lambda **fields: SimpleNamespace(
+            **({"seq_lens_cpu_int": None, "block_tables": None} | fields)
+        ),
         get_parallel=lambda: SimpleNamespace(dcp_enabled=False, attn_dp_enabled=False),
     )
     namespace.update(extra)
     exec(compile(module, str(path), "exec"), namespace)
     return namespace[name]
+
+
+def _bind_metadata_methods(backend):
+    for name in (
+        "_glm_compact_layout",
+        "_gather_block_tables",
+        "_allocate_padded_verify_metadata",
+        "_update_ragged_verify_metadata",
+        "_init_cuda_graph_metadata",
+        "_apply_cuda_graph_metadata",
+    ):
+        setattr(backend, name, MethodType(_backend_method(name), backend))
 
 
 class TestNpuCompactMetadata(CustomTestCase):
@@ -114,16 +129,7 @@ class TestNpuCompactMetadata(CustomTestCase):
             device="cpu",
             _dspark_dsa_ragged_verify=True,
         )
-        backend._glm_compact_layout = MethodType(
-            _backend_method("_glm_compact_layout"), backend
-        )
-        backend._init_compact_graph_metadata = MethodType(
-            _backend_method(
-                "_init_compact_graph_metadata",
-                NpuCompactGraphMetadata=dspark_compact.NpuCompactGraphMetadata,
-            ),
-            backend,
-        )
+        _bind_metadata_methods(backend)
         init = _backend_method(
             get_parallel=lambda: SimpleNamespace(attn_dp_enabled=True)
         )
@@ -143,6 +149,8 @@ class TestNpuCompactMetadata(CustomTestCase):
             expected_q = torch.tensor(lens).cumsum(0).tolist() + [8]
             self.assertEqual(metadata.actual_seq_lengths_q.tolist(), expected_q)
             self.assertFalse(metadata.block_tables[-1].any())
+            self.assertFalse(backend.graph_mode)
+            self.assertFalse(backend.graph_metadata)
             if lens == [0]:
                 self.assertFalse(metadata.block_tables.any())
 
@@ -164,54 +172,87 @@ class TestNpuCompactMetadata(CustomTestCase):
             expected = request_layout if enabled and mode.is_target_verify() else None
             self.assertIs(select(backend, batch), expected)
 
-    def test_mixed_windows_and_page_boundary(self):
-        prefix = torch.tensor([127, 255, 513])
-        layout = layout_for([1, 3, 8])
-        result = dspark_compact.build_compact_verify_metadata(
-            prefix_lens=prefix, layout=layout, max_verify_len=8, num_tokens=12
-        )
-        self.assertEqual(result.query_ends.tolist(), [1, 4, 12])
-        self.assertEqual(result.kv_lens.tolist(), [128, 258, 521])
-        self.assertEqual(result.max_kv_len, 521)
-        self.assertEqual(prefix.tolist(), [127, 255, 513])
-
-    def test_device_only_layout(self):
-        layout = layout_for([2, 1])
-        layout = RaggedVerifyLayout.from_verify_lens_device(
-            verify_lens=layout.verify_lens, graph_num_tokens=3
-        )
-        result = dspark_compact.build_compact_verify_metadata(
-            prefix_lens=torch.tensor([8, 16]),
-            layout=layout,
-            max_verify_len=4,
-            num_tokens=3,
-        )
-        self.assertEqual(result.query_ends.tolist(), [2, 3])
-
-    def test_reject_invalid_layout(self):
-        for lens, prefixes, token_count, max_len in (
-            ([2], [10, 20], 2, 4),
-            ([5], [10], 5, 4),
-            ([1, 3], [10, 20], 8, 4),
-        ):
-            with self.subTest(lens=lens, token_count=token_count):
-                with self.assertRaises(ValueError):
-                    dspark_compact.build_compact_verify_metadata(
-                        prefix_lens=torch.tensor(prefixes),
-                        layout=layout_for(lens),
-                        max_verify_len=max_len,
-                        num_tokens=token_count,
-                    )
+    def test_eager_rejects_padded_layout_without_dp(self):
+        backend = SimpleNamespace(_dspark_dsa_ragged_verify=True)
+        _bind_metadata_methods(backend)
         layout = RaggedVerifyLayout.from_verify_lens(
             verify_lens_cpu=[1, 3], device=torch.device("cpu"), grid=[8]
         )
-        with self.assertRaisesRegex(ValueError, "padded"):
-            dspark_compact.build_compact_verify_metadata(
-                prefix_lens=torch.tensor([10, 20]),
-                layout=layout,
-                max_verify_len=4,
-                num_tokens=8,
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=SimpleNamespace(ragged_verify_layout=layout),
+            seq_lens=torch.tensor([10, 20]),
+            input_ids=torch.zeros(8, dtype=torch.int64),
+        )
+        with self.assertRaisesRegex(ValueError, "unpadded"):
+            _backend_method()(backend, batch)
+
+    def test_graph_capture_and_replay_refresh_token_tier_buffers(self):
+        backend = SimpleNamespace(
+            graph_metadata={},
+            req_to_token=torch.arange(8, 8 + 4 * 64).view(4, 64),
+            page_size=8,
+            device="cpu",
+            _dspark_dsa_ragged_verify=True,
+            needs_cpu_seq_lens=True,
+        )
+        _bind_metadata_methods(backend)
+        init = _backend_method("init_forward_metadata_out_graph")
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=3,
+            req_pool_indices=torch.tensor([2, 1, 0]),
+            seq_lens=torch.tensor([7, 15, 1]),
+            out_cache_loc=None,
+            spec_info=SimpleNamespace(),
+        )
+
+        def set_layout(lens, tokens):
+            batch.spec_info.ragged_verify_layout = (
+                RaggedVerifyLayout.from_verify_lens_device(
+                    verify_lens=torch.tensor(lens), graph_num_tokens=tokens
+                )
             )
+
+        fields = ("actual_seq_lengths_q", "actual_seq_lengths_kv", "block_tables")
+        set_layout([3, 3, 2], 8)
+        init(backend, batch, in_capture=True)
+        tier8 = backend.forward_metadata
+        captured_ptrs = [getattr(tier8, field).data_ptr() for field in fields]
+        set_layout([6, 5, 5], 16)
+        init(backend, batch, in_capture=True)
+        tier16 = backend.forward_metadata
+        for field, ptr in zip(fields, captured_ptrs):
+            self.assertNotEqual(getattr(tier16, field).data_ptr(), ptr)
+
+        # A live batch can use fewer request rows than its captured tier.
+        set_layout([1, 3], 8)
+        with (
+            patch.object(torch.Tensor, "cpu", side_effect=AssertionError("D2H")),
+            patch.object(torch.Tensor, "item", side_effect=AssertionError("host sync")),
+            patch.object(
+                torch.Tensor, "tolist", side_effect=AssertionError("host read")
+            ),
+        ):
+            init(backend, batch)
+        self.assertIs(backend.forward_metadata, tier8)
+        self.assertEqual(
+            [getattr(tier8, field).data_ptr() for field in fields], captured_ptrs
+        )
+        self.assertEqual(tier8.actual_seq_lengths_q.tolist(), [1, 4, 4, 8])
+        self.assertEqual(tier8.actual_seq_lengths_kv.tolist(), [8, 18, 0, 4])
+        self.assertEqual(tier8.block_tables[0].tolist(), [17, 0, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(tier8.block_tables[1].tolist(), [9, 10, 11, 0, 0, 0, 0, 0])
+        self.assertFalse(tier8.block_tables[2:].any())
+        self.assertEqual(tier16.actual_seq_lengths_q.tolist(), [6, 11, 16, 16])
+
+        set_layout([0], 8)
+        init(backend, batch)
+        self.assertIs(backend.forward_metadata, tier8)
+        self.assertEqual(tier8.actual_seq_lengths_q.tolist(), [0, 0, 0, 8])
+        self.assertEqual(tier8.actual_seq_lengths_kv.tolist(), [0, 0, 0, 8])
+        self.assertFalse(tier8.block_tables.any())
+        self.assertEqual(batch.seq_lens.tolist(), [7, 15, 1])
 
     def test_real_backend_metadata_does_not_double_extend_cpu_lengths(self):
         method = _backend_method()
@@ -228,9 +269,7 @@ class TestNpuCompactMetadata(CustomTestCase):
             use_sliding_window_kv_pool=False,
             device="cpu",
         )
-        backend._glm_compact_layout = MethodType(
-            _backend_method("_glm_compact_layout"), backend
-        )
+        _bind_metadata_methods(backend)
         for lens in ([1, 3, 8], [8, 8, 8], [1, 1, 1]):
             with self.subTest(lens=lens):
                 prefix = torch.tensor([127, 255, 513])
@@ -277,6 +316,7 @@ class TestNpuCompactMetadata(CustomTestCase):
             use_sliding_window_kv_pool=False,
             device="cpu",
         )
+        backend.req_to_token = backend.req_to_token_pool.req_to_token
         backend.dsa_dcp_target = False
         backend.use_paged_mtp = False
         backend.use_flash_mla = False
@@ -285,9 +325,7 @@ class TestNpuCompactMetadata(CustomTestCase):
         backend.dense_mla_dcp_target = False
         backend.needs_cpu_seq_lens = True
         backend._dspark_dsa_ragged_verify = False
-        backend._glm_compact_layout = MethodType(
-            _backend_method("_glm_compact_layout"), backend
-        )
+        _bind_metadata_methods(backend)
         for algorithm, expected, pages in (
             (SpeculativeAlgorithm.DSPARK, [128, 256], 3),
             (SpeculativeAlgorithm.DFLASH, [128, 256], 2),
@@ -330,9 +368,7 @@ class TestNpuCompactExecution(CustomTestCase):
             use_sliding_window_kv_pool=False,
             device="cpu",
         )
-        backend._glm_compact_layout = MethodType(
-            _backend_method("_glm_compact_layout"), backend
-        )
+        _bind_metadata_methods(backend)
         runner = SimpleNamespace(
             req_to_token_pool=backend.req_to_token_pool,
             attn_backend=backend,
@@ -508,10 +544,13 @@ class TestNpuCompactExecution(CustomTestCase):
         )
         self.assertEqual(packed.verify_ids.cpu().tolist(), [1, 2, 3, 5])
         self.assertEqual(packed.verify_cache_loc.cpu().tolist(), [143, 144, 145, 31])
-        result = dspark_compact.build_compact_verify_metadata(
-            prefix_lens=prefix, layout=layout, max_verify_len=4, num_tokens=4
+        backend = SimpleNamespace(req_to_token=table, page_size=16)
+        _bind_metadata_methods(backend)
+        metadata = SimpleNamespace(block_tables=None)
+        backend._update_ragged_verify_metadata(
+            metadata, layout, prefix, torch.tensor([2, 0], device="npu")
         )
-        self.assertEqual(result.kv_lens.tolist(), [18, 32])
+        self.assertEqual(metadata.actual_seq_lengths_kv.tolist(), [18, 32])
         rows = scatter_compact_to_strided(
             compact=packed.verify_ids[:, None],
             layout=layout,

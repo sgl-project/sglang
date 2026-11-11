@@ -26,10 +26,6 @@ from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
 from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
     forward_dcp_sparse_attention,
 )
-from sglang.srt.hardware_backend.npu.attention.dspark_compact import (
-    NpuCompactGraphMetadata,
-    build_compact_verify_metadata,
-)
 from sglang.srt.hardware_backend.npu.attention.mla_cache import (
     build_mla_prefix_token_indices,
     gather_mla_cache_tokens,
@@ -69,6 +65,7 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 import logging
 
@@ -625,9 +622,6 @@ class AscendAttnBackend(AttentionBackend):
         in_capture: bool = False,
     ):
         layout = self._glm_compact_layout(forward_batch)
-        if layout is not None:
-            self._init_compact_graph_metadata(forward_batch, layout)
-            return
         bs = forward_batch.batch_size
         if in_capture:
             self._init_cuda_graph_metadata(
@@ -635,8 +629,9 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.forward_mode,
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
+                ragged_layout=layout,
             )
-        if self.needs_cpu_seq_lens:
+        if layout is None and self.needs_cpu_seq_lens:
             seq_lens_cpu = (
                 forward_batch.seq_lens.cpu()
                 if in_capture
@@ -654,47 +649,83 @@ class AscendAttnBackend(AttentionBackend):
             out_cache_loc=forward_batch.out_cache_loc,
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
             max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
+            ragged_layout=layout,
         )
 
     def _glm_compact_layout(self, forward_batch):
         if (
-            self._dspark_dsa_ragged_verify
-            and forward_batch.forward_mode.is_target_verify()
+            forward_batch.forward_mode.is_target_verify()
+            and self._dspark_dsa_ragged_verify
         ):
             return getattr(forward_batch.spec_info, "ragged_verify_layout", None)
         return None
 
-    def _init_compact_graph_metadata(self, forward_batch, layout):
-        slots = forward_batch.batch_size
-        key = ("dspark", slots, layout.graph_num_tokens)
-        if key not in self.graph_metadata:
-            self.graph_metadata[key] = NpuCompactGraphMetadata(
-                num_slots=slots,
-                num_tokens=layout.graph_num_tokens,
-                table_width=(
-                    max(self.req_to_token.shape[1], layout.graph_num_tokens)
-                    + self.page_size
-                    - 1
-                )
-                // self.page_size,
-                device=self.device,
-            )
-        state = self.graph_metadata[key]
-        state.update(
-            prefix_lens=forward_batch.seq_lens,
-            req_pool_indices=forward_batch.req_pool_indices,
-            req_to_token=self.req_to_token,
-            verify_lens=layout.verify_lens,
-            page_size=self.page_size,
+    def _gather_block_tables(
+        self, req_pool_indices: torch.Tensor, max_seq_len: Optional[int] = None
+    ) -> torch.Tensor:
+        return (
+            self.req_to_token[req_pool_indices, : max_seq_len : self.page_size]
+            // self.page_size
         )
-        metadata = ForwardMetadata()
-        metadata.seq_lens = state.kv_lens
-        metadata.actual_seq_lengths_kv = state.kv_lens
-        metadata.actual_seq_lengths_q = state.query_ends
-        metadata.block_tables = state.block_tables
-        # No host mirror: indexer/sparse attention read device tensors directly.
-        self.forward_metadata = metadata
-        self.graph_mode = True
+
+    def _allocate_padded_verify_metadata(
+        self, bs: int, num_tokens: int
+    ) -> ForwardMetadata:
+        # The last row covers padding queries. Keep a row even when capture's
+        # synthetic requests use the entire token tier.
+        rows = bs + 1
+        table_width = (
+            max(self.req_to_token.shape[1], num_tokens) + self.page_size - 1
+        ) // self.page_size
+        q_ends = torch.empty(rows, dtype=torch.int32, device=self.device)
+        kv_lens = torch.empty_like(q_ends)
+        return ForwardMetadata(
+            seq_lens=kv_lens,
+            actual_seq_lengths_kv=kv_lens,
+            actual_seq_lengths_q=q_ends,
+            block_tables=torch.empty(
+                (rows, table_width), dtype=torch.int32, device=self.device
+            ),
+        )
+
+    def _update_ragged_verify_metadata(
+        self,
+        metadata: ForwardMetadata,
+        layout: RaggedVerifyLayout,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> None:
+        bs = layout.bs
+        if not 0 < bs <= min(seq_lens.numel(), req_pool_indices.numel()):
+            raise ValueError("NPU ragged verify requires metadata for every request")
+        verify_lens = layout.verify_lens
+        q_ends = layout.qo_indptr_device[1:]
+        # Device lengths hold the committed prefix even when the CPU mirror
+        # has already been advanced for a speculative step.
+        kv_lens = seq_lens[:bs].int() + verify_lens
+        if metadata.block_tables is None:
+            metadata.actual_seq_lengths_q = q_ends
+            metadata.seq_lens = kv_lens
+            metadata.actual_seq_lengths_kv = kv_lens
+            metadata.block_tables = self._gather_block_tables(
+                req_pool_indices[:bs], int(kv_lens.max().item())
+            ).int()
+            return
+
+        # Graph replay and DP eager fallback both include token-tier padding.
+        # Assign it to a separate row mapped to the reserved KV page 0.
+        metadata.actual_seq_lengths_q[:bs].copy_(q_ends)
+        metadata.actual_seq_lengths_q[bs:-1].copy_(q_ends[-1])
+        metadata.actual_seq_lengths_q[-1].fill_(layout.graph_num_tokens)
+        metadata.seq_lens.zero_()
+        metadata.seq_lens[:bs].copy_(torch.where(verify_lens > 0, kv_lens, 0))
+        metadata.seq_lens[-1].copy_((layout.graph_num_tokens - q_ends[-1]).clamp(min=1))
+        pages = self._gather_block_tables(req_pool_indices[:bs])
+        page_starts = torch.arange(pages.shape[1], device=pages.device) * self.page_size
+        metadata.block_tables.zero_()
+        metadata.block_tables[:bs, : pages.shape[1]].copy_(
+            torch.where(page_starts < metadata.seq_lens[:bs, None], pages, 0)
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -702,27 +733,29 @@ class AscendAttnBackend(AttentionBackend):
         layout = self._glm_compact_layout(forward_batch)
         if layout is not None:
             if get_parallel().attn_dp_enabled:
-                # DP eager fallback uses the same agreed token padding as
-                # replay. The separate sink slot owns all padding queries.
-                self._init_compact_graph_metadata(forward_batch, layout)
-                return
-            compact = build_compact_verify_metadata(
-                prefix_lens=forward_batch.seq_lens,
-                layout=layout,
-                max_verify_len=int(forward_batch.spec_info.draft_token_num),
-                num_tokens=forward_batch.input_ids.numel(),
+                self.forward_metadata = self._allocate_padded_verify_metadata(
+                    forward_batch.batch_size, layout.graph_num_tokens
+                )
+            else:
+                # Without DP or a graph, request rows and input tokens are unpadded.
+                if layout.bs != forward_batch.seq_lens.numel():
+                    raise ValueError(
+                        "NPU eager ragged verify requires one length per request"
+                    )
+                total = layout.total_verify_tokens
+                if total is None:
+                    total = int(layout.qo_indptr_device[-1].item())
+                if (
+                    total != layout.graph_num_tokens
+                    or total != forward_batch.input_ids.numel()
+                ):
+                    raise ValueError("NPU eager ragged verify requires unpadded inputs")
+            self._update_ragged_verify_metadata(
+                self.forward_metadata,
+                layout,
+                forward_batch.seq_lens,
+                forward_batch.req_pool_indices,
             )
-            # Both the lightning indexer and sparse attention consume these
-            # device tensors. The caller's CPU mirror may already include Q.
-            self.forward_metadata.seq_lens = compact.kv_lens
-            self.forward_metadata.actual_seq_lengths_kv = compact.kv_lens
-            self.forward_metadata.actual_seq_lengths_q = compact.query_ends
-            self.forward_metadata.block_tables = (
-                self.req_to_token[forward_batch.req_pool_indices, : compact.max_kv_len][
-                    :, :: self.page_size
-                ]
-                // self.page_size
-            ).to(torch.int32)
             self.graph_mode = False
             return
         dense_mla_dcp_partial = self.dense_mla_dcp_target and (
@@ -766,11 +799,8 @@ class AscendAttnBackend(AttentionBackend):
                 seq_lens_max += self.speculative_step_id + 1
             else:
                 seq_lens_max = forward_batch.seq_lens.max()
-            self.forward_metadata.block_tables = (
-                self.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, :seq_lens_max
-                ][:, :: self.page_size]
-                // self.page_size
+            self.forward_metadata.block_tables = self._gather_block_tables(
+                forward_batch.req_pool_indices, seq_lens_max
             )
             if self.is_hybrid_swa:
                 self.forward_metadata.block_tables_swa = (
@@ -786,11 +816,8 @@ class AscendAttnBackend(AttentionBackend):
                     .contiguous()
                 )
         elif not dense_mla_dcp_partial:
-            self.forward_metadata.block_tables = (
-                self.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, :: self.page_size
-                ]
-                // self.page_size
+            self.forward_metadata.block_tables = self._gather_block_tables(
+                forward_batch.req_pool_indices
             )
         if self.use_quant_flash_attn:
             metadata = self.forward_metadata
@@ -1199,8 +1226,18 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         seq_lens: torch.Tensor,
         out_cache_loc: Optional[torch.Tensor] = None,
+        *,
+        ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> ForwardMetadata:
-        """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
+        """Create the ForwardMetadata buffers bound by graph capture."""
+        if ragged_layout is not None:
+            key = (bs, ragged_layout.graph_num_tokens)
+            if key not in self.graph_metadata:
+                self.graph_metadata[key] = self._allocate_padded_verify_metadata(
+                    bs, ragged_layout.graph_num_tokens
+                )
+            return self.graph_metadata[key]
+
         metadata = ForwardMetadata()
         if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_callback import (
@@ -1317,11 +1354,22 @@ class AscendAttnBackend(AttentionBackend):
         out_cache_loc: Optional[torch.Tensor] = None,
         origin_out_cache_loc: Optional[torch.Tensor] = None,
         max_seq_len_host: Optional[int] = None,
+        *,
+        ragged_layout: Optional[RaggedVerifyLayout] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
+        if ragged_layout is not None:
+            metadata = self.graph_metadata[(bs, ragged_layout.graph_num_tokens)]
+            self._update_ragged_verify_metadata(
+                metadata, ragged_layout, seq_lens, req_pool_indices
+            )
+            self.forward_metadata = metadata
+            self.graph_mode = True
+            return
+
         metadata = self.graph_metadata[bs]
 
         # refill the captured SWA write-target buffer in place from the live loc
@@ -1384,10 +1432,7 @@ class AscendAttnBackend(AttentionBackend):
 
             if not self.dense_mla_dcp_target:
                 metadata.block_tables[:bs, :max_seq_pages].copy_(
-                    self.req_to_token[
-                        req_pool_indices[:bs], 0 : max_len : self.page_size
-                    ]
-                    // self.page_size
+                    self._gather_block_tables(req_pool_indices[:bs], max_len)
                 )
                 metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         elif max_seq_len_host is not None and not self.dense_mla_dcp_target:
@@ -1404,8 +1449,7 @@ class AscendAttnBackend(AttentionBackend):
                 max_len = max_seq_len_host + self.speculative_num_draft_tokens
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
             metadata.block_tables[:bs, :max_seq_pages].copy_(
-                self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
-                // self.page_size
+                self._gather_block_tables(req_pool_indices[:bs], max_len)
             )
             metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         elif not self.dense_mla_dcp_target:
@@ -1414,11 +1458,9 @@ class AscendAttnBackend(AttentionBackend):
                 (self.req_to_token.shape[1] + self.page_size - 1) // self.page_size,
             )
             metadata.block_tables[:bs, :total_pages].copy_(
-                self.req_to_token[
-                    req_pool_indices[:bs],
-                    0 : total_pages * self.page_size : self.page_size,
-                ]
-                // self.page_size
+                self._gather_block_tables(
+                    req_pool_indices[:bs], total_pages * self.page_size
+                )
             )
             metadata.block_tables[:bs, total_pages:].fill_(0)
 
