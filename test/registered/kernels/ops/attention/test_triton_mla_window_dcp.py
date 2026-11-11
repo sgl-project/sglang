@@ -355,7 +355,7 @@ def test_verify_metadata_builds_no_rail():
     backend.init_forward_metadata(forward_batch)
     metadata = backend.forward_metadata
     assert metadata.kv_indptr is None
-    assert metadata.window_kv_indices is None
+    assert not metadata.windows
 
     # The graph path packs none either (no plan to pack one from).
     backend._update_target_verify_buffers(None, bs, seq_lens, spec_info, pool_idx)
