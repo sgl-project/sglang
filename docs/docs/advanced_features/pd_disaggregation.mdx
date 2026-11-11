@@ -113,31 +113,15 @@ On Intel XPU, the PyPI wheel has no XPU support. Use the XPU Docker image (`dock
 
 ### AWS EFA
 
-#### EFA Docker images
+#### EFA in the Docker images
 
-Each published CUDA 13 image has an EFA variant for EFA-enabled AWS EC2 instances, built from the same SGLang commit with `docker/efa.Dockerfile`:
+All CUDA 13 images include the AWS EFA userspace (libfabric with the EFA provider, the aws-ofi-nccl plugin, and hwloc) and a Mooncake build with the EFA transport, so the host does not need its own EFA userspace install. The host still needs the EFA kernel driver.
 
-| Base image | EFA image |
-|---|---|
-| `latest`, `v<version>` | `latest-efa`, `v<version>-efa` |
-| `nightly-dev-<date>-<sha>` | `nightly-dev-efa-<date>-<sha>`, plus the moving `dev-efa` |
+To use EFA, pass the EFA devices into the container, lift the locked-memory limit, and set:
 
-Each EFA image matches its base and adds:
-
-- The AWS EFA userspace stack: libfabric with the EFA provider, the aws-ofi-nccl plugin, and hwloc. The host does not need its own EFA userspace install.
-- On x86_64, the EFA build of Mooncake with `MOONCAKE_PROTOCOL=efa`. On arm64 the standard Mooncake package is kept and `MOONCAKE_PROTOCOL=tcp` is set, because the EFA build is x86_64-only.
-- `SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC`, so NIXL transfers use EFA on both architectures.
+- `MOONCAKE_PROTOCOL=efa`, so Mooncake uses EFA.
+- `SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC`, so NIXL transfers use EFA.
 - `NCCL_NET_PLUGIN=ofi` and `NCCL_TUNER_PLUGIN=ofi`, so NCCL uses aws-ofi-nccl.
-
-To add EFA to another CUDA 13 SGLang image, build `docker/efa.Dockerfile` on top of it:
-
-```bash
-docker build -f docker/efa.Dockerfile \
-  --build-arg BASE_IMAGE=lmsysorg/sglang:latest \
-  -t sglang:efa docker/
-```
-
-The host still needs the EFA kernel driver. Pass the EFA devices into the container and lift the locked-memory limit:
 
 ```bash
 HF_CACHE_DIR="/path/to/huggingface-cache"
@@ -148,23 +132,22 @@ docker run -it --gpus all \
   --ulimit memlock=-1 \
   -v "$HF_CACHE_DIR:/root/.cache/huggingface" \
   --env HF_TOKEN \
-  lmsysorg/sglang:latest-efa bash
+  --env MOONCAKE_PROTOCOL=efa \
+  --env SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC \
+  --env NCCL_NET_PLUGIN=ofi \
+  --env NCCL_TUNER_PLUGIN=ofi \
+  lmsysorg/sglang:latest bash
 ```
 
 Inside the container, `fi_info -p efa -t FI_EP_RDM` lists the EFA devices.
 
 #### Install into your own environment
 
-On an x86_64 AWS EFA instance, replace the standard CUDA 13 Mooncake package with the EFA build. The two packages install the same `mooncake` Python module, so do not install them side by side.
-
-The following commands replace the package in an SGLang CUDA 13 environment while preserving its existing Python dependencies:
+`mooncake-transfer-engine-cuda13` 0.3.14 and later include the EFA transport on x86_64 and aarch64, so no separate EFA package is needed. If an environment still has `mooncake-transfer-engine-efa-cuda13`, uninstall it first: both packages install the same `mooncake` Python module.
 
 ```bash
-python3 -m pip uninstall -y \
-  mooncake-transfer-engine-cuda13 \
-  mooncake-transfer-engine-efa-cuda13
-python3 -m pip install --no-deps \
-  mooncake-transfer-engine-efa-cuda13==0.3.13.post1
+python3 -m pip uninstall -y mooncake-transfer-engine-efa-cuda13
+python3 -m pip install --no-deps "mooncake-transfer-engine-cuda13>=0.3.14"
 
 export LD_LIBRARY_PATH="/opt/amazon/efa/lib:/opt/amazon/efa/lib64:${LD_LIBRARY_PATH:-}"
 export MOONCAKE_PROTOCOL=efa
@@ -173,7 +156,7 @@ python3 -c 'from mooncake import engine; assert engine.SUPPORT_EFA'
 fi_info -p efa -t FI_EP_RDM
 ```
 
-The EFA wheel expects a compatible AWS EFA userspace installation on the host and does not bundle `libfabric` or `libefa`. The current wheel is available only for x86_64. It is built without Mooncake EP/PG and the NVLink/MNNVL components, so use the standard Mooncake CUDA package for those features.
+The Mooncake wheel does not bundle `libfabric` or `libefa`, so the host needs a compatible AWS EFA userspace installation.
 
 #### CUDA VMM limitations
 

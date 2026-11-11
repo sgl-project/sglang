@@ -24,6 +24,9 @@ ARG SGL_DEEP_EP_VERSION=0.1.2.post1
 ARG MSA_COMMIT=1e7bf76f26a5f53cfc2d4d297e1ec2e40955e431
 
 ARG CUDA_VERSION=13.4.1
+# AWS EFA userspace (libfabric, aws-ofi-nccl), see scripts/install_efa.sh.
+ARG EFA_INSTALLER_VERSION=1.51.0
+ARG EFA_INSTALLER_SHA256=83993044fa4df3dc2f8b5c2f7051d61b9689441be023a2c92ea51d3f53f2465c
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
 ARG TARGETARCH
@@ -33,13 +36,13 @@ ARG SGL_KERNEL_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
-ARG SGL_NCCL_VERSION=2.30.7
+ARG SGL_NCCL_VERSION=2.31.2
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=1
 ARG FLASHINFER_VERSION=0.7.3
-ARG MOONCAKE_VERSION=0.3.13.post1
+ARG MOONCAKE_VERSION=0.3.14
 ARG MSCCLPP_VERSION=sglang-v0.10.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -102,7 +105,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     ccache \
     git-lfs \
     # MPI and NUMA
-    libopenmpi-dev \
     libnuma1 \
     libnuma-dev \
     numactl \
@@ -125,7 +127,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libgtest-dev \
     libjsoncpp-dev \
     libunwind-dev \
-    libboost-all-dev \
+    libboost-dev \
     libssl-dev \
     libgrpc-dev \
     libgrpc++-dev \
@@ -137,7 +139,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libcurl4-openssl-dev \
     libczmq4 \
     libczmq-dev \
-    libfabric-dev \
     linux-libc-dev \
     # Package building tools
     devscripts \
@@ -332,7 +333,7 @@ ARG GDRCOPY_VERSION=2.5.1
 ARG MAX_JOBS=8
 
 RUN yum install -y --nogpgcheck --enablerepo=powertools \
-        cmake curl gcc gcc-c++ git infiniband-diags libfabric libfabric-devel \
+        cmake curl gcc gcc-c++ git infiniband-diags \
         libibverbs libibverbs-devel libibverbs-utils librdmacm librdmacm-devel \
         make patchelf perftest pkgconfig rdma-core wget \
  && yum clean all && rm -rf /var/cache/yum
@@ -501,8 +502,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            TORCH_INDEX="https://download.pytorch.org/whl/cu${CUINDEX}"; \
        fi \
     && python3 -m pip install --extra-index-url "${TORCH_INDEX}" ".${BUILD_TYPE:+[${BUILD_TYPE}]}" \
-    && python3 -m pip install --force-reinstall --no-deps \
-           "nvidia-nccl-cu13==${SGL_NCCL_VERSION}" \
     && if [ "$CUDA_VERSION" = "13.4.1" ]; then \
            python3 -m pip install --force-reinstall --no-deps /tmp/cu134_wheels/*.whl; \
        fi \
@@ -838,6 +837,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
+# DeepEP needs SGL_NCCL_VERSION at runtime even if torch pins another version;
+# install it after the constrained dependency solve so the solve cannot revert it.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --force-reinstall --no-deps \
+    "nvidia-nccl-cu13==${SGL_NCCL_VERSION}"
+
 # The `nixl` stub package is needed (it owns the `nixl` import path) but
 # unconditionally requires nixl-cu12, so install it with --no-deps and pair it
 # with the nixl-cu13 binary to avoid shipping wrong-CUDA libs.
@@ -851,6 +856,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "${INSTALL_AI_DYNAMO}" = "1" ]; then \
         python3 -m pip install --pre --extra-index-url https://pypi.nvidia.com/ ai-dynamo; \
     fi
+
+# Install the AWS EFA userspace for NIXL's LIBFABRIC backend, Mooncake's EFA
+# transport and NCCL over aws-ofi-nccl.
+ARG EFA_INSTALLER_VERSION
+ARG EFA_INSTALLER_SHA256
+RUN --mount=type=bind,source=scripts/install_efa.sh,target=/tmp/install_efa.sh \
+    bash /tmp/install_efa.sh
+# LD_LIBRARY_PATH is required: under `--gpus` the NVIDIA toolkit reruns
+# ldconfig, which puts the distro libfabric first in the cache.
+ENV LD_LIBRARY_PATH="/opt/amazon/efa/lib:${LD_LIBRARY_PATH}" \
+    PATH="/opt/amazon/efa/bin:${PATH}"
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank

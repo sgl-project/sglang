@@ -5,6 +5,9 @@ ARG ENABLE_SGL_NVIDIA_MEGA=1
 ARG CUDA_VERSION=13.0.3
 ARG UV_VERSION=latest
 ARG PYTHON_VERSION=3.12
+# AWS EFA userspace (libfabric, aws-ofi-nccl), see scripts/install_efa.sh.
+ARG EFA_INSTALLER_VERSION=1.51.0
+ARG EFA_INSTALLER_SHA256=83993044fa4df3dc2f8b5c2f7051d61b9689441be023a2c92ea51d3f53f2465c
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
@@ -17,7 +20,7 @@ ARG SGL_KERNEL_VERSION=0.4.9
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
-ARG SGL_NCCL_VERSION=2.30.7
+ARG SGL_NCCL_VERSION=2.31.2
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
@@ -83,8 +86,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     patchelf \
     ccache \
     git-lfs \
-    # MPI and NUMA
-    libopenmpi-dev \
+    # NUMA
     libnuma1 \
     libnuma-dev \
     numactl \
@@ -107,7 +109,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libgtest-dev \
     libjsoncpp-dev \
     libunwind-dev \
-    libboost-all-dev \
+    libboost-dev \
     libssl-dev \
     libgrpc-dev \
     libgrpc++-dev \
@@ -119,7 +121,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libcurl4-openssl-dev \
     libczmq4 \
     libczmq-dev \
-    libfabric-dev \
     linux-libc-dev \
     # Package building tools
     devscripts \
@@ -558,6 +559,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --prerelease=allow --index-strategy unsafe-best-match \
         --extra-index-url https://pypi.nvidia.com/ ai-dynamo
+
+# Install the AWS EFA userspace for NIXL's LIBFABRIC backend, Mooncake's EFA
+# transport and NCCL over aws-ofi-nccl.
+ARG EFA_INSTALLER_VERSION
+ARG EFA_INSTALLER_SHA256
+RUN --mount=type=bind,source=scripts/install_efa.sh,target=/tmp/install_efa.sh \
+    bash /tmp/install_efa.sh
+# LD_LIBRARY_PATH is required: under `--gpus` the NVIDIA toolkit reruns
+# ldconfig, which puts the distro libfabric first in the cache.
+ENV LD_LIBRARY_PATH="/opt/amazon/efa/lib:${LD_LIBRARY_PATH}" \
+    PATH="/opt/amazon/efa/bin:${PATH}"
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
