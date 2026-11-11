@@ -570,8 +570,13 @@ class TestXpuMoeWna16(CustomTestCase):
         self.assertFalse(can_use_xpu_fp8_moe(non_local_config, None))
 
         # Architecture checks
+        from sglang.srt.layers.quantization.fp8_utils import is_xe2_supported
+
         with patch("sgl_kernel.is_xe2_arch", return_value=False):
-            self.assertFalse(can_use_xpu_fp8_moe(default_config, None))
+            is_xe2_supported.cache_clear()
+            self.assertFalse(is_xe2_supported())
+        is_xe2_supported.cache_clear()
+        self.assertTrue(is_xe2_supported())
 
     def test_compressed_tensors_runner_config_fallback(self):
         from sgl_kernel import fused_experts

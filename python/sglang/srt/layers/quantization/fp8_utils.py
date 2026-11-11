@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import sys
 from enum import Enum
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -75,6 +74,25 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
+
+
+@lru_cache(maxsize=1)
+def is_xe2_supported() -> bool:
+    """Whether the current platform is an Intel Xe2 GPU (Battlemage / BMG).
+
+    False on every non-XPU platform, so callers do not need their own is_xpu().
+    """
+    if _is_xpu:
+        try:
+            import sgl_kernel
+
+            return getattr(sgl_kernel, "is_xe2_arch", lambda: False)()
+        except Exception:
+            return False
+    return False
+
+
+_is_xe2_supported = is_xe2_supported()
 
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
@@ -860,12 +878,6 @@ def can_use_xpu_fp8_moe(
             return False
     except (RuntimeError, ValueError):
         pass
-
-    kernel = sys.modules.get("sgl_kernel")
-    if kernel is not None:
-        is_xe2 = getattr(kernel, "is_xe2_arch", None)
-        if is_xe2 is not None and not is_xe2():
-            return False
 
     return True
 
