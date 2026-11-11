@@ -8,6 +8,8 @@ Whisper special tokens. Covers both streaming modes — cumulative
 
 The tests mock ``TokenizerManager.generate_request`` to yield synthetic
 ``text`` chunks for each of the happy, abort, and boundary cases.
+Realtime session tests also cover preserving omitted transcription settings
+when the client sends a partial update.
 """
 
 from sglang.test.test_utils import enter_override, maybe_stub_sgl_kernel
@@ -28,8 +30,13 @@ from sglang.srt.entrypoints.openai.protocol import (
     TranscriptionRequest,
     TranscriptionResponse,
 )
+from sglang.srt.entrypoints.openai.realtime.protocol import SessionUpdateEvent
+from sglang.srt.entrypoints.openai.realtime.session import RealtimeConnection
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
+)
+from sglang.srt.entrypoints.openai.transcription_adapters.qwen3_asr import (
+    Qwen3ASRAdapter,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -772,6 +779,56 @@ class TestStreamingIncrementalOutputMode(CustomTestCase):
         self.assertFalse(any("<|" in d for d in emitted))
         self.assertEqual("".join(emitted), "Hello world")
         self.assertEqual(request.language, "en")
+
+
+class TestRealtimeTranscriptionSessionUpdates(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        self.server_args = ServerArgs(model_path="dummy")
+        publish(self.server_args, role="tokenizer")
+
+    def _update(self, connection, transcription):
+        event = SessionUpdateEvent.model_validate(
+            {
+                "type": "session.update",
+                "session": {
+                    "type": "transcription",
+                    "audio": {"input": {"transcription": transcription}},
+                },
+            }
+        )
+        get_or_create_event_loop().run_until_complete(
+            connection._on_session_update(event)
+        )
+        response = json.loads(connection.websocket.send_text.call_args.args[0])
+        self.assertEqual(response["type"], "session.updated")
+        return response["session"]["audio"]["input"]["transcription"]
+
+    def test_partial_updates_preserve_omitted_transcription_fields(self):
+        """Updating one setting or sending an empty block erased other settings."""
+        cases = (
+            ({"model": "local-asr"}, "fr", "local-asr"),
+            ({"language": "de"}, "de", "local-asr"),
+            ({}, "fr", "local-asr"),
+            ({"language": None}, None, "local-asr"),
+            ({"model": None}, "fr", None),
+        )
+        for update, expected_language, expected_model in cases:
+            with self.subTest(update=update):
+                connection = RealtimeConnection(
+                    websocket=Mock(send_text=AsyncMock()),
+                    tokenizer_manager=Mock(served_model_name="local-asr"),
+                    adapter=Qwen3ASRAdapter(),
+                    server_args=self.server_args,
+                )
+                self._update(connection, {"language": "fr", "model": "local-asr"})
+                response = self._update(connection, update)
+
+                self.assertEqual(connection.config.language, expected_language)
+                self.assertEqual(connection.config.client_model, expected_model)
+                self.assertEqual(response["language"], expected_language)
+                self.assertEqual(response["model"], expected_model)
 
 
 if __name__ == "__main__":

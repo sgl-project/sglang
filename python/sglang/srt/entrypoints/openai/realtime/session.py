@@ -386,8 +386,10 @@ class RealtimeConnection:
         # Mutation pass — no early returns past this point.
         self.config.input_sample_rate = new_rate
         if transcription is not None:
-            self.config.client_model = transcription.model
-            self.config.language = transcription.language
+            if "model" in transcription.model_fields_set:
+                self.config.client_model = transcription.model
+            if "language" in transcription.model_fields_set:
+                self.config.language = transcription.language
         self.config.sampling_params = self.adapter.build_sampling_params(
             TranscriptionRequest(language=self.config.language)
         )
