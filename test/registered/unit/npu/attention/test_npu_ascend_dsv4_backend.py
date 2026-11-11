@@ -446,6 +446,46 @@ class TestC4StateTransferLayout(unittest.TestCase):
                     self.assertEqual(len(rows), len(set(rows)))
 
     @patch("sglang.srt.hardware_backend.npu.utils.is_npu_arch35", return_value=False)
+    def test_a3_payload_pairs_history_across_different_peer_rings(self, _):
+        from sglang.srt.disaggregation.ascend.conn import AscendStateType
+
+        for src_ring, dst_ring in ((8, 16), (16, 8)):
+            src_pages, dst_pages = [7, 3, 9], [2, 8, 5]
+            src_req = self._a3_req_pool(src_ring, src_pages)
+            dst_req = self._a3_req_pool(dst_ring, dst_pages)
+            for seq_len in (0, 1, 7, 8, 9, 127, 128, 129, 255, 256, 257):
+                for width in (2048, 512):  # Attention and indexer FP32 rows.
+                    with self.subTest(
+                        rings=(src_ring, dst_ring), seq_len=seq_len, width=width
+                    ):
+                        src = torch.full((10 * src_ring, width), -1.0)
+                        dst = torch.full((10 * dst_ring, width), -2.0)
+                        expected = dst.clone()
+                        # Populate by logical position, independently of the
+                        # payload callbacks whose pairing is under test.
+                        for pos in range(max(0, seq_len - 8), seq_len):
+                            value = pos + torch.arange(width) / width
+                            src[src_pages[pos // 128] * src_ring + pos % src_ring] = (
+                                value
+                            )
+                            expected[
+                                dst_pages[pos // 128] * dst_ring + pos % dst_ring
+                            ] = value
+                        src_rows = dsv4_state_payloads(src_req, 2, seq_len, 128)[
+                            AscendStateType.DSV4_C4_STATE
+                        ]()
+                        dst_rows = dsv4_state_payloads(dst_req, 2, seq_len, 128)[
+                            AscendStateType.DSV4_C4_STATE
+                        ]()
+                        self.assertEqual(src_rows.dtype.name, "int32")
+                        self.assertEqual(dst_rows.dtype.name, "int32")
+                        dst[torch.from_numpy(dst_rows).long()] = src[
+                            torch.from_numpy(src_rows).long()
+                        ]
+                        # Full-buffer equality also checks untouched rows.
+                        self.assertTrue(torch.equal(dst, expected))
+
+    @patch("sglang.srt.hardware_backend.npu.utils.is_npu_arch35", return_value=False)
     def test_a3_transfer_rows_match_the_compressor_history(self, _):
         from sglang.srt.disaggregation.ascend.conn import AscendStateType
         from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
