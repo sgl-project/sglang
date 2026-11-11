@@ -12,6 +12,7 @@ pub mod buckets_reorg;
 pub mod config;
 pub mod discovery;
 pub mod health;
+pub(crate) mod off_worker;
 pub mod policies;
 pub mod policies_reorg;
 pub(crate) mod protocol;

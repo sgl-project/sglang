@@ -30,6 +30,7 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_layer_ids,
     get_unlimited_ocr_v2_sparse_config,
     is_deepseek_dsa,
+    is_deepseek_v4,
     is_minimax_sparse,
     is_unlimited_ocr_v2,
     uses_compressed_kv_attention,
@@ -118,6 +119,9 @@ class MemoryPoolConfig:
     # instead of re-summing token counts; None when a user token cap is the budget.
     unified_total_bytes: Optional[int] = None
 
+    # The target priced a compact DFLASH draft pool per sliding-window token: the
+    # draft pool holds swa_max_total_num_tokens rows indexed by the target's SWA ids.
+    dflash_draft_follows_swa: bool = False
     # Live owner-token ceiling (user or PP), distinct from the arena's share.
     # None allows token KV to borrow unused state/window capacity.
     unified_full_cap_tokens: Optional[int] = None
@@ -144,6 +148,42 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     if cell_size is None or int(cell_size) <= 0:
         return 0
     return int(cell_size) * kvc.dflash_draft_loc_space_scale
+
+
+def dflash_draft_kv_follows_target_swa(kvc: KVCacheConfigurator) -> bool:
+    """Whether the target sizes its compact-window DFLASH draft pool per
+    sliding-window token (SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV). The draft's whole
+    read window must stay inside what the target's SWA eviction retains. ROCm only."""
+    if not _is_hip or not envs.SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV.get():
+        return False
+    if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
+        return False
+    draft_window = get_spec().speculative_draft_window_size
+    # The target's sliding_window_size counts the tokens before the current one
+    # (Muse: config window 2048 -> 2047); its SWA eviction keeps window + 1.
+    target_window = kvc.sliding_window_size
+    reasons = []
+    if draft_window is None:
+        reasons.append("no --speculative-draft-window-size (non-compact draft)")
+    elif target_window is None or int(draft_window) > int(target_window) + 1:
+        reasons.append(
+            f"draft window {draft_window} exceeds the target's retained window "
+            f"{None if target_window is None else int(target_window) + 1}"
+        )
+    if not kvc.is_hybrid_swa or not kvc.layer_info.full_attention_layer_ids:
+        reasons.append("the target is not a hybrid full/SWA model")
+    if is_deepseek_v4(kvc.model_config.hf_config):
+        reasons.append("DeepSeek-V4 pools are not supported")
+    if get_memory().enable_unified_memory:
+        reasons.append("--enable-unified-memory is set")
+    if get_parallel().attn_dcp_size > 1:
+        reasons.append("DCP widens the draft id space")
+    if reasons:
+        logger.warning(
+            "SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV ignored: %s", "; ".join(reasons)
+        )
+        return False
+    return True
 
 
 def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
@@ -405,7 +445,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if dcp_size is None:
             dcp_size = get_parallel().attn_dcp_size
 
-        if kvc.use_mla_backend:
+        if kvc.modelslim_cache_layout is not None:
+            cell_size = (
+                kvc.modelslim_cache_layout.bytes_per_token * effective_num_layers
+            )
+        elif kvc.use_mla_backend:
             if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
                 # NPU sparse KV offload uses an index-only device pool.
                 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
@@ -427,16 +471,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim,
             )
 
-            if kvc.modelslim_cache_layout is not None:
-                per_layer_bytes = kvc.modelslim_cache_layout.bytes_per_token
-            else:
-                per_layer_bytes = (
-                    calculate_mla_kv_cache_dim(
-                        model_config=model_config,
-                        kv_cache_dtype=kv_cache_dtype,
-                    )
-                    * kv_size
+            per_layer_bytes = (
+                calculate_mla_kv_cache_dim(
+                    model_config=model_config,
+                    kv_cache_dtype=kv_cache_dtype,
                 )
+                * kv_size
+            )
             cell_size = per_layer_bytes * effective_num_layers
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
@@ -843,6 +884,15 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._draft_swa_layers_num = 0
             self._draft_swa_full_layers_num = 0
             self._draft_cell_size = 0
+        # A DFLASH draft pool that follows the target's SWA ids costs its bytes
+        # per SWA token, not per full token.
+        self._draft_follows_swa = (
+            self._draft_cell_size > 0 and dflash_draft_kv_follows_target_swa(kvc)
+        )
+        self._draft_swa_cell_size = 0
+        if self._draft_follows_swa:
+            self._draft_swa_cell_size = self._draft_cell_size
+            self._draft_cell_size = 0
 
         self._recompute_cell_size()
 
@@ -858,7 +908,10 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     def _swa_cell_bytes(self) -> int:
         if self._fused_swa_entry is not None:
             return self._fused_swa_entry
-        return self._swa_per_token * (self._swa_layers_num + self._draft_swa_layers_num)
+        return (
+            self._swa_per_token * (self._swa_layers_num + self._draft_swa_layers_num)
+            + self._draft_swa_cell_size
+        )
 
     def _recompute_cell_size(self) -> None:
         # Bytes per token of max_total_num_tokens: full_tokens when hybrid, else
@@ -979,6 +1032,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 if self._enable_unified_memory
                 else None
             ),
+            dflash_draft_follows_swa=self._draft_follows_swa,
         )
 
     def calculate_pool_sizes(

@@ -143,6 +143,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
             request_retirer=release_only_retirer(tree_cache=scheduler.tree_cache),
             abort_request=lambda *args, **kwargs: None,
             still_in_batch=lambda req: True,
+            prefill_launched_reqs=scheduler.prefill_launched_reqs,
         )
         for name, value in (
             ("get_observability", SimpleNamespace(enable_metrics=False)),

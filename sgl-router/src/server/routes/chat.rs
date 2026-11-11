@@ -11,6 +11,7 @@ pub(super) use preparation::enforce_minimax_m31_thinking;
 use crate::buckets_reorg::BucketResolver;
 use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
+use crate::off_worker;
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
@@ -191,7 +192,19 @@ impl Endpoint {
 }
 
 /// Validate the body and resolve its routing policy, as `endpoint` does over HTTP.
+/// Parsing and rebuilding a large body is CPU work too, so the whole step runs
+/// through [`off_worker::run`] (render and tokenize also do so on their own).
 async fn prepare<'a>(
+    ctx: &'a AppContext,
+    endpoint: Endpoint,
+    headers: &HeaderMap,
+    body: Bytes,
+    grpc: bool,
+) -> Result<(PreparedRequest, ModelRouting<'a>), ApiError> {
+    off_worker::run(|| prepare_now(ctx, endpoint, headers, body, grpc))
+}
+
+fn prepare_now<'a>(
     ctx: &'a AppContext,
     endpoint: Endpoint,
     headers: &HeaderMap,
@@ -761,6 +774,9 @@ fn parse_optional_positive_f64_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::off_worker::test_support::{slow_chat_body, slow_template_dir, time_beside_a_timer};
+    use crate::tokenizer::TokenizerRegistry;
+    use std::time::Duration;
 
     #[test]
     fn aliases_match_whole_names_and_the_longest_lora_prefix() {
@@ -850,5 +866,51 @@ mod tests {
             ),
             Err(ApiError::PolicySelectionFailed { .. })
         ));
+    }
+
+    /// A routable context over [`slow_template_dir`] that tokenizes chat
+    /// requests in `prepare`. The directory must outlive the registry load.
+    fn slow_render_ctx(dir: &std::path::Path) -> AppContext {
+        let mut ctx = AppContext::stub();
+        ctx.config.model.tokenizer_path = Some(dir.join("tokenizer.json").to_str().unwrap().into());
+        // A token-aware route, so `prepare` renders and tokenizes the chat.
+        ctx.config.model.dp_aware = true;
+        ctx.tokenizers = Arc::new(TokenizerRegistry::load_from_config(&ctx.config).unwrap());
+        ctx.policies.insert(
+            ModelId("stub-model".into()),
+            Arc::new(crate::policies::round_robin::RoundRobinPolicy::new()),
+        );
+        ctx
+    }
+
+    /// With ONE worker, a slow chat render in `prepare` must not keep another
+    /// task's timer from firing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_slow_chat_render_leaves_the_runtime_serving() {
+        let dir = slow_template_dir();
+        let ctx = Arc::new(slow_render_ctx(dir.path()));
+        let body = slow_chat_body(
+            |b| assert!(ctx.tokenizers.encode_chat("stub-model", b).is_some()),
+            Duration::from_millis(400),
+        );
+        let body = Bytes::from(body.to_string());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (took, ticked_after) = time_beside_a_timer(move || async move {
+            let tokens = prepare(&ctx, Endpoint::Chat, &HeaderMap::new(), body, false)
+                .await
+                .map(|(request, _)| request.tokens.is_some())
+                .map_err(|e| format!("{e:?}"));
+            tx.send(tokens).unwrap();
+        })
+        .await;
+        assert_eq!(
+            rx.await.unwrap(),
+            Ok(true),
+            "prepare must have rendered and tokenized the chat"
+        );
+        assert!(
+            ticked_after < took / 2,
+            "timer task waited {ticked_after:?} while prepare took {took:?}"
+        );
     }
 }
