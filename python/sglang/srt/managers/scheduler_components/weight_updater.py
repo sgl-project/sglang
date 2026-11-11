@@ -56,6 +56,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    PD_KINDS,
+    ListKind,
+    assert_empty,
+)
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
@@ -485,6 +490,8 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
+                # Held requests keep no KV and wait out the release.
+                assert_empty(scheduler.request_lists(), PD_KINDS - {ListKind.PD_HELD})
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
                     queue = getattr(scheduler, "disagg_decode_prealloc_queue", None)
                     if queue is not None:

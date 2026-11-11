@@ -10,6 +10,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Mapping,
     Optional,
 )
 
@@ -39,6 +40,27 @@ class ListKind(enum.Enum):
     UOCR_PARKED = enum.auto()
     UOCR_RELEASED = enum.auto()
     DEFERRED = enum.auto()
+
+
+# The PD queues, which a role switch drops.
+PD_KINDS = frozenset(
+    {
+        ListKind.PD_BOOTSTRAP,
+        ListKind.PD_SENDING,
+        ListKind.PD_PREALLOC,
+        ListKind.PD_RETRACTED,
+        ListKind.PD_HELD,
+        ListKind.PD_RECEIVING,
+        ListKind.PD_RELEASING,
+    }
+)
+
+
+def assert_empty(lists: Mapping[ListKind, ReqList], kinds: Iterable[ListKind]) -> None:
+    """A teardown runs behind an idle gate that leaves these lists empty; a
+    request still in one would be dropped and never answered."""
+    nonempty = sorted(kind.name for kind in kinds if lists.get(kind))
+    assert not nonempty, f"Requests still in {nonempty} at teardown"
 
 
 class ReqList(ABC):

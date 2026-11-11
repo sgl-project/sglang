@@ -22,9 +22,11 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    PD_KINDS,
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    assert_empty,
     move,
 )
 from sglang.srt.models.unlimited_ocr_v2_support.document_prefetch import DocPrefetch
@@ -219,6 +221,21 @@ class TestMove(CustomTestCase):
 
         self.assertEqual(list(queue), [b, a])
         self.assertIsNone(c.owner_list)
+
+
+class TestAssertEmpty(CustomTestCase):
+    def test_names_the_lists_a_request_is_still_in(self):
+        a, b = _reqs("ab")
+        sending = IndexedReqList(ListKind.PD_SENDING)
+        prealloc = IndexedReqList(ListKind.PD_PREALLOC)
+        move([a], sending)
+        move([b], prealloc)
+        lists = {ListKind.PD_SENDING: sending, ListKind.PD_PREALLOC: prealloc}
+
+        sending._leave([a])
+        with self.assertRaisesRegex(AssertionError, r"\['PD_PREALLOC'\]"):
+            assert_empty(lists, PD_KINDS)
+        assert_empty(lists, {ListKind.PD_SENDING})
 
 
 if __name__ == "__main__":
