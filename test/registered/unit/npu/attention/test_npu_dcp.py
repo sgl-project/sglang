@@ -36,6 +36,7 @@ _device_utils.is_npu = lambda: False
 _utils.is_npu = _device_utils.is_npu
 try:
     from sglang.srt import runtime_context as rc
+    from sglang.srt.hardware_backend.npu.attention import dsa_indexer_v2
     from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
         forward_dcp_sparse_attention,
     )
@@ -224,6 +225,37 @@ class TestNpuDcpSparseIndexRemap(unittest.TestCase):
             got.tolist(),
             [-1] * 4 + [0, 1, 2, 3] + [-1] * 8 + [4, 5, 6, 7] + [-1] * 4,
         )
+
+
+class TestNpuDcpIndexerV2Metadata(unittest.TestCase):
+    def test_replay_refreshes_the_captured_plan_from_live_kv_lengths(self):
+        query_ends = torch.tensor([4, 8], dtype=torch.int32)
+        kv_lens = torch.tensor([128, 257], dtype=torch.int32)
+        dims = dict(num_heads=32, head_dim=128, topk=2048, max_seqlen_q=4)
+
+        def make_plan(*args, cu_seqlens_q, seqused_k, **kwargs):
+            self.assertEqual(cu_seqlens_q.tolist(), [0, 4, 8])
+            self.assertEqual(kwargs["layout_k"], "PA_BBND")
+            return seqused_k.clone()
+
+        with patch.object(
+            dsa_indexer_v2,
+            "load_dsa_indexer_v2_ops",
+            return_value=(None, make_plan),
+        ):
+            captured = dsa_indexer_v2.prepare_dsa_indexer_v2_metadata(
+                query_ends, kv_lens, **dims
+            )
+            plan_address = captured.plan.data_ptr()
+            self.assertEqual(captured.plan.tolist(), [128, 257])
+            kv_lens.add_(1)
+            replay = dsa_indexer_v2.prepare_dsa_indexer_v2_metadata(
+                query_ends, kv_lens, existing=captured, **dims
+            )
+
+        self.assertIs(replay, captured)
+        self.assertEqual(replay.plan.data_ptr(), plan_address)
+        self.assertEqual(replay.plan.tolist(), [129, 258])
 
 
 class TestNpuDcpSparseAttentionContract(unittest.TestCase):

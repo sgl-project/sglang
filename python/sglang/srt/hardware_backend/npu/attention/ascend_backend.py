@@ -10,7 +10,13 @@ from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_triton,
 )
 
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    get_dsa_index_head_dim,
+    get_dsa_index_n_heads,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
@@ -21,6 +27,11 @@ from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
 )
 from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
     forward_dcp_sparse_attention,
+)
+from sglang.srt.hardware_backend.npu.attention.dsa_indexer_v2 import (
+    DsaIndexerV2Metadata,
+    load_dsa_indexer_v2_ops,
+    prepare_dsa_indexer_v2_metadata,
 )
 from sglang.srt.hardware_backend.npu.attention.mla_cache import (
     build_mla_prefix_token_indices,
@@ -119,6 +130,7 @@ class ForwardMetadata:
     actual_seq_lengths_q_pa_cpu: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
     seqused_q: Optional[torch.Tensor] = None  # Valid query counts; padding is 0.
+    dsa_indexer_v2: Optional[DsaIndexerV2Metadata] = None
     flash_mla_metadata: Optional[torch.Tensor] = None
     dcp_mtp_attn_mask: Optional[torch.Tensor] = None
 
@@ -422,6 +434,20 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.dcp_indexer_v2_shape = None
+        if (
+            self.use_dsa
+            and getattr(self.token_to_kv_pool, "index_k_scale_buffer", None) is not None
+        ):
+            if self.dsa_dcp_target or is_dsa_enable_prefill_cp():
+                load_dsa_indexer_v2_ops()
+            if self.dsa_dcp_target:
+                hf_config = model_runner.model_config.hf_config
+                self.dcp_indexer_v2_shape = (
+                    get_dsa_index_n_heads(hf_config),
+                    get_dsa_index_head_dim(hf_config),
+                    get_dsa_index_topk(hf_config),
+                )
         self.dcp_fp8_sparse_attention = None
         if self.dsa_dcp_target and self.kv_cache_dtype == torch.float8_e4m3fn:
             if not self.token_to_kv_pool.dsa_kv_cache_store_fp8:
@@ -1465,6 +1491,26 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.seq_lens_cpu_list = kv_lens.cpu().int().tolist()
         if not self.dense_mla_dcp_target:
             metadata.seq_lens[:bs].copy_(device_kv_lens[:bs])
+
+        if self.dcp_indexer_v2_shape is not None and (
+            forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+        ):
+            # Indexer K is replicated. Plan from the global lengths, outside the
+            # graph, once per batch for all layers that compute top-k.
+            num_heads, head_dim, topk = self.dcp_indexer_v2_shape
+            metadata.dsa_indexer_v2 = prepare_dsa_indexer_v2_metadata(
+                metadata.actual_seq_lengths_q,
+                metadata.seq_lens[:bs],
+                num_heads=num_heads,
+                head_dim=head_dim,
+                topk=topk,
+                max_seqlen_q=(
+                    self.speculative_num_draft_tokens
+                    if forward_mode.is_target_verify()
+                    else 1
+                ),
+                existing=metadata.dsa_indexer_v2,
+            )
 
         self.forward_metadata = metadata
 
