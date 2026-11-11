@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.managers import overlap_utils
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import overlap_events, scheduler_affinity
+from sglang.srt.utils import overlap_events, round_outputs, scheduler_affinity
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -89,6 +89,34 @@ class TestFutureMapIndexOps(unittest.TestCase):
         self.assertTrue(torch.equal(results[0][1], results[1][1]))
         self.assertEqual(results[1][1].tolist(), [9, 3, 17])
         self.assertEqual(results[1][1].dtype, torch.int64)
+
+
+class TestRoundOutputRing(unittest.TestCase):
+    def test_ring_wraps_after_eight_tensors_of_a_shape(self):
+        with patch.object(round_outputs, "_rings", {}):
+            first = [
+                round_outputs.round_empty((4,), torch.int64, "cpu") for _ in range(8)
+            ]
+            self.assertEqual(len({id(t) for t in first}), 8)
+            self.assertIs(round_outputs.round_empty((4,), torch.int64, "cpu"), first[0])
+            other = round_outputs.round_empty((4,), torch.int32, "cpu")
+            self.assertNotIn(id(other), {id(t) for t in first})
+            self.assertEqual(other.dtype, torch.int32)
+
+    def test_index_kernels_take_their_outputs_from_the_ring_only_when_enabled(self):
+        from sglang.kernels.ops.speculative.eagle import prepare_draft_extend_layout
+
+        seq_lens = torch.empty((0,), dtype=torch.int64)
+        for enabled in (False, True):
+            with (
+                patch.object(round_outputs, "ENABLED", enabled),
+                patch.object(round_outputs, "_rings", {}),
+            ):
+                prefix, *_ = prepare_draft_extend_layout(seq_lens, 4, False)
+                pooled = round_outputs._rings.get(((0,), torch.int32, seq_lens.device))
+                self.assertEqual(pooled is not None, enabled)
+                if enabled:
+                    self.assertIs(prefix, pooled[0][0])
 
 
 class TestSchedulerMainThreadAffinity(unittest.TestCase):

@@ -38,7 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, round_outputs
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -482,19 +482,18 @@ def prepare_for_draft(
         # window in the same launch.
         window_cols = num_draft_tokens if plans_window else num_steps
         if page_size == 1 or topk == 1:
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * window_cols,),
-                dtype=torch.int64,
-                device=batch.device,
+            empty = round_outputs.empty_fn()
+            batch.out_cache_loc = empty(
+                (bs * topk * window_cols,), torch.int64, batch.device
             )
             if batch.seq_lens.is_cuda and topk == 1:
-                prepared_positions = torch.empty_like(batch.seq_lens)
+                prepared_positions = empty(
+                    (bs,), batch.seq_lens.dtype, batch.seq_lens.device
+                )
                 if draft_model_runner.model_config.model_is_mrope and all(
                     x is None for x in batch.multimodal_inputs
                 ):
-                    prepared_mrope_positions = torch.empty(
-                        (3, bs), dtype=torch.int64, device=batch.device
-                    )
+                    prepared_mrope_positions = empty((3, bs), torch.int64, batch.device)
             # TODO(lsyin): align with the default code path
             assign_draft_cache_locs_contiguous_func(
                 batch.req_pool_indices,

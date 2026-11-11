@@ -412,6 +412,12 @@ class Envs:
     SGLANG_OPT_SPEC_DRAFT_GRAPH_INPUT_PLAN = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # The decode round's index outputs (draft cache locations, chain-tree verify inputs,
+    # draft-extend layout) come from rings of 8 tensors per shape instead of torch.empty;
+    # each is written whole by its kernel and read within the round.
+    SGLANG_OPT_SPEC_INDEX_OUTPUT_RING = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
