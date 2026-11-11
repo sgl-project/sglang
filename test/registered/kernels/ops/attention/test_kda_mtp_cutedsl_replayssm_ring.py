@@ -44,7 +44,7 @@ K = 128
 W = 4  # KERNEL_WIDTH
 
 
-def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False):
+def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False, ring_rows=None):
     torch.manual_seed(seed)
     T = N * (1 + num_spec)
     num_slots = N + 2
@@ -115,16 +115,19 @@ def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False):
         inter = torch.zeros(N, 1 + num_spec, H, K, K, device=DEV, dtype=torch.float32)
         out = fused_kda_decode_mtp_dspark(intermediate_ssm=inter, **kwargs)
         return out, dict(inter=inter, slots=slots, scratch=scratch, **norm)
-    rawv = torch.zeros(num_slots, H, L, K, device=DEV, dtype=torch.bfloat16)
+    # With ring_rows, the rings have rows of their own: ring_rows[j] for request j.
+    rows = num_slots if ring_rows is None else int(ring_rows.max()) + 1
+    rawv = torch.zeros(rows, H, L, K, device=DEV, dtype=torch.bfloat16)
     rawk = torch.zeros_like(rawv)
-    gring = torch.zeros(num_slots, H, L, K, device=DEV, dtype=torch.float32)
-    betar = torch.zeros(num_slots, H, L, device=DEV, dtype=torch.float32)
+    gring = torch.zeros(rows, H, L, K, device=DEV, dtype=torch.float32)
+    betar = torch.zeros(rows, H, L, device=DEV, dtype=torch.float32)
     out = fused_kda_decode_mtp_dspark(
         intermediate_ssm=None,
         replayssm_rawv=rawv,
         replayssm_rawk=rawk,
         replayssm_g=gring,
         replayssm_beta=betar,
+        replayssm_ring_indices=ring_rows,
         **kwargs,
     )
     return out, dict(rawv=rawv, rawk=rawk, gring=gring, betar=betar, h0=h0, slots=slots)
@@ -163,6 +166,30 @@ def test_cutedsl_ring_fold_parity(N, H, num_spec):
             (fold - base_state).abs().max() / base_state.abs().max().clamp_min(1e-6)
         ).item()
         assert rel < 2e-2, f"req={j}: rel={rel:.3e}"
+
+
+@pytest.mark.parametrize("N", [4, 32], ids=["small-grid", "large-grid"])
+def test_cutedsl_ring_rows_follow_their_own_index(N):
+    """A request-scoped ring (unified memory) has rows apart from the state
+    slots: each request's records land in its own ring row, as they would in
+    its slot's, and no other row is written."""
+    H, num_spec, seed = 2, 3, 5
+    out_slot, by_slot = _run("ring", N=N, H=H, num_spec=num_spec, seed=seed)
+    ring_rows = torch.arange(2 * N + 2, N + 2, -1, device=DEV, dtype=torch.int32)
+    out_row, by_row = _run(
+        "ring", N=N, H=H, num_spec=num_spec, seed=seed, ring_rows=ring_rows
+    )
+    torch.testing.assert_close(out_row, out_slot, rtol=0, atol=0)
+    written = torch.zeros(by_row["rawv"].shape[0], dtype=torch.bool, device=DEV)
+    written[ring_rows.long()] = True
+    for name in ("rawv", "rawk", "gring", "betar"):
+        torch.testing.assert_close(
+            by_row[name][ring_rows.long()],
+            by_slot[name][by_slot["slots"].long()],
+            rtol=0,
+            atol=0,
+        )
+        assert torch.count_nonzero(by_row[name][~written]).item() == 0
 
 
 @pytest.mark.parametrize("N", [4, 32], ids=["small-grid", "large-grid"])

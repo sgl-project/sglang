@@ -668,7 +668,7 @@ class TestDeclaredParts(CustomTestCase):
                 cfg._unified_config_from_budget(1 << 20).max_total_num_tokens, 0
             )
 
-    def test_kda_spec_replay_pd_is_rejected_before_state_allocation(self):
+    def test_kda_spec_replay_keeps_pd_state_entries_alike(self):
         from unittest.mock import patch
 
         from sglang.srt.configs.mamba_utils import (
@@ -709,8 +709,17 @@ class TestDeclaredParts(CustomTestCase):
                 speculative_algorithm="DFLASH",
             ),
         ):
-            with self.assertRaisesRegex(ValueError, "different state entry layouts"):
-                cfg._kv_layer_decls()
+            # The verify ring is request memory, so prefill (no ring) and
+            # decode declare the same state entries.
+            decls = cfg._kv_layer_decls()
+            (state,) = {
+                part.geometry
+                for decl in decls
+                for part in decl.parts
+                if isinstance(part.geometry, StateGeometry)
+            }
+            self.assertIn("replayssm_rawv", {p.name for p in state.request_parts})
+            self.assertNotIn("replayssm_rawv", {p.name for p in state.extra_parts})
 
         with (
             patch(
@@ -1720,38 +1729,53 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(view.replayssm_spec_write_pos.stride(0) * 4, entry)
         self.assertEqual(view.replayssm_is_flush.stride(0), entry)
 
-    def test_replay_state_records_and_cursor_move_together(self):
-        for speculative in (False, True):
-            with self.subTest(speculative=speculative):
-                storage, plan, _ = _build(
-                    state=True,
-                    gamma=3 if speculative else None,
-                    replay=StateReplay(
-                        decode=True,
-                        speculative=speculative,
-                        is_kda=speculative,
-                        cache_len=8,
-                        key_heads=1,
-                    ),
-                )
-                view = storage.view("mamba")
-                self.assertFalse(plan.requests())
-                self.assertEqual(len(view.extra_parts), 7 if speculative else 4)
-                for part in view.extra_parts:
-                    view.extra_views[part.name].select(part.row_axis, 3).fill_(5)
-                view.copy_from(torch.tensor([3]), torch.tensor([7]))
-                saved = view.get_cpu_copy(torch.tensor([7]))
-                view.clear_slots(torch.tensor([7]))
-                view.load_cpu_copy(saved, torch.tensor([7]))
-                for part in view.extra_parts:
-                    self.assertTrue(
-                        torch.all(
-                            view.extra_views[part.name].select(part.row_axis, 7) == 5
-                        )
-                    )
-                self.assertIs(
-                    view.replayssm_write_pos, view.extra_views["replayssm_write_pos"]
-                )
+    def test_decode_replay_records_and_cursor_move_together(self):
+        """The decode ring and its cursor lag the slot's state, so they are the
+        slot's: copied, cleared and backed up with its entry."""
+        storage, plan, _ = _build(
+            state=True,
+            replay=StateReplay(
+                decode=True, speculative=False, is_kda=False, cache_len=8, key_heads=1
+            ),
+        )
+        view = storage.view("mamba")
+        self.assertFalse(plan.requests())
+        self.assertEqual(len(view.extra_parts), 4)
+        for part in view.extra_parts:
+            view.extra_views[part.name].select(part.row_axis, 3).fill_(5)
+        view.copy_from(torch.tensor([3]), torch.tensor([7]))
+        saved = view.get_cpu_copy(torch.tensor([7]))
+        view.clear_slots(torch.tensor([7]))
+        view.load_cpu_copy(saved, torch.tensor([7]))
+        for part in view.extra_parts:
+            self.assertTrue(
+                torch.all(view.extra_views[part.name].select(part.row_axis, 7) == 5)
+            )
+        self.assertIs(view.replayssm_write_pos, view.extra_views["replayssm_write_pos"])
+
+    def test_kda_spec_ring_is_request_memory(self):
+        """A KDA verify ring is folded into the state at every commit, so no
+        checkpoint needs it: it lives in the request sub-pool, not the slot."""
+        storage, plan, _ = _build(
+            state=True,
+            gamma=3,
+            replay=StateReplay(
+                decode=False, speculative=True, is_kda=True, cache_len=8, key_heads=1
+            ),
+        )
+        view = storage.view("mamba")
+        (request,) = plan.requests()
+        self.assertEqual(
+            {p.name for p in request.geometry.parts},
+            {
+                f"mamba.replayssm_{name}"
+                for name in ("d", "k", "g", "rawv", "rawk", "beta")
+            },
+        )
+        self.assertEqual(view.extra_parts, ())
+        self.assertEqual(view._checkpoint_extra_buffers, ())
+        self.assertTrue(view.replayssm_request_ring)
+        self.assertIsNone(view.replayssm_spec_write_pos)
 
     def test_window_resume_keeps_the_handoff_boundary(self):
         storage, _, _ = _build()
