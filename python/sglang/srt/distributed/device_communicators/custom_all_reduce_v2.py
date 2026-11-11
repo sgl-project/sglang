@@ -111,6 +111,29 @@ class AllReduceChoice(NamedTuple):
     use_hier: bool = False
 
 
+def choose_algo(
+    config: AllReduceConfig, nbytes: int, *, can_use_graph: bool
+) -> Optional[AllReduceChoice]:
+    """The tuned algorithm for an all-reduce of ``nbytes``; None leaves it to NCCL."""
+    # TODO: refactor this along with the config file
+    heuristic = config.graph if can_use_graph else config.eager
+    can_use_multicast = config.num_mc_blocks is not None
+    if nbytes <= heuristic.one_shot_push_threshold:
+        return AllReduceChoice(AllReduceAlgo.ONE_SHOT_PUSH)
+    # the pair halves must stay whole 16 B vectors
+    if nbytes % 32 == 0 and heuristic.hier_2shot_push.contains(nbytes):
+        return AllReduceChoice(AllReduceAlgo.TWO_SHOT_PUSH, use_hier=True)
+    if nbytes <= heuristic.two_shot_push_threshold:
+        return AllReduceChoice(AllReduceAlgo.TWO_SHOT_PUSH)
+    if nbytes <= heuristic.one_shot_pull_threshold:
+        return AllReduceChoice(AllReduceAlgo.ONE_SHOT_PULL, use_graph=can_use_graph)
+    if can_use_multicast and heuristic.mc.contains(nbytes):
+        return AllReduceChoice(AllReduceAlgo.TWO_SHOT_PULL, use_multicast=True)
+    if nbytes <= heuristic.two_shot_pull_threshold:
+        return AllReduceChoice(AllReduceAlgo.TWO_SHOT_PULL, use_graph=can_use_graph)
+    return None
+
+
 class CustomAllReduceV2:
     def __init__(
         self,
@@ -330,25 +353,6 @@ class CustomAllReduceV2:
             and torch.cuda.is_current_stream_capturing()
         )
 
-    def _choose_algo(self, nbytes: int, can_use_graph: bool) -> AllReduceChoice | None:
-        # TODO: refactor this along with the config file
-        heuristic = self.config.graph if can_use_graph else self.config.eager
-        can_use_multicast = self.config.num_mc_blocks is not None
-        if nbytes <= heuristic.one_shot_push_threshold:
-            return AllReduceChoice(AllReduceAlgo.ONE_SHOT_PUSH)
-        # the pair halves must stay whole 16 B vectors
-        if nbytes % 32 == 0 and heuristic.hier_2shot_push.contains(nbytes):
-            return AllReduceChoice(AllReduceAlgo.TWO_SHOT_PUSH, use_hier=True)
-        if nbytes <= heuristic.two_shot_push_threshold:
-            return AllReduceChoice(AllReduceAlgo.TWO_SHOT_PUSH)
-        if nbytes <= heuristic.one_shot_pull_threshold:
-            return AllReduceChoice(AllReduceAlgo.ONE_SHOT_PULL, use_graph=can_use_graph)
-        if can_use_multicast and heuristic.mc.contains(nbytes):
-            return AllReduceChoice(AllReduceAlgo.TWO_SHOT_PULL, use_multicast=True)
-        if nbytes <= heuristic.two_shot_pull_threshold:
-            return AllReduceChoice(AllReduceAlgo.TWO_SHOT_PULL, use_graph=can_use_graph)
-        return None
-
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         """Check if the input tensor is suitable for custom all-reduce."""
         if self.disabled:
@@ -365,13 +369,16 @@ class CustomAllReduceV2:
             return inp_size <= self.max_size
         if not self._zero_copy_inputs():
             return self._eager_plan(inp_size, inp.dtype) is not None
-        return self._choose_algo(inp_size, self._can_use_graph()) is not None
+        return (
+            choose_algo(self.config, inp_size, can_use_graph=self._can_use_graph())
+            is not None
+        )
 
     def _eager_plan(self, nbytes: int, dtype: torch.dtype):
         """The launch an eager all-reduce of this size takes, resolved once."""
         key = (nbytes, dtype)
         if key not in self._eager_plan_cache:
-            choice = self._choose_algo(nbytes, False)
+            choice = choose_algo(self.config, nbytes, can_use_graph=False)
             if choice is None:
                 self._eager_plan_cache[key] = None
             elif choice.use_hier:
@@ -395,7 +402,7 @@ class CustomAllReduceV2:
             return False
         if self.forced_algo is not None:
             return self.forced_algo == AllReduceAlgo.ONE_SHOT_PUSH
-        choice = self._choose_algo(nbytes, self._can_use_graph())
+        choice = choose_algo(self.config, nbytes, can_use_graph=self._can_use_graph())
         return choice is not None and choice.algo == AllReduceAlgo.ONE_SHOT_PUSH
 
     def uses_two_shot_push(self, nbytes: int) -> bool:
@@ -403,7 +410,7 @@ class CustomAllReduceV2:
             return False
         if self.forced_algo is not None:
             return self.forced_algo == AllReduceAlgo.TWO_SHOT_PUSH
-        choice = self._choose_algo(nbytes, self._can_use_graph())
+        choice = choose_algo(self.config, nbytes, can_use_graph=self._can_use_graph())
         return choice is not None and choice.algo == AllReduceAlgo.TWO_SHOT_PUSH
 
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor:
@@ -426,7 +433,9 @@ class CustomAllReduceV2:
             use_graph = self._can_use_graph() and not algo.is_push()
             use_multicast = use_hier = False
         else:
-            choice = self._choose_algo(nbytes, self._can_use_graph())
+            choice = choose_algo(
+                self.config, nbytes, can_use_graph=self._can_use_graph()
+            )
             assert choice is not None, f"No algorithm for {nbytes = }"
             algo, use_graph, use_multicast, use_hier = choice
         if use_hier:

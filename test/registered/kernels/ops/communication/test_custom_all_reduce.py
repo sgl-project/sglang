@@ -36,6 +36,7 @@ from sglang.kernels.ops.communication.all_reduce import (
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
+    choose_algo,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -282,7 +283,7 @@ def test_custom_all_reduce_tuned_eager(size: int, dtype: torch.dtype) -> None:
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
     nbytes = inp[0].numel() * inp.element_size()
-    tuned = comm._pick_config(nbytes, False) is not None
+    tuned = choose_algo(comm.config, nbytes, can_use_graph=False) is not None
     assert comm.should_custom_ar(inp[0]) == tuned
     if not tuned:
         return

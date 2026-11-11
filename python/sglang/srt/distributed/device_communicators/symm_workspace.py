@@ -7,9 +7,9 @@ pull staging buffer); the synchronization state forms the control plane (the pha
 word and the semaphores).
 
 Consumers declare what they need with :func:`request_symm_workspace` and get a
-:class:`WorkspaceLease`. Requests accumulate until the workspace is finalized, which
-allocates once at the largest size requested in each dimension:
-workspace itself on first use if nothing did before. A request that arrives after
+:class:`WorkspaceLease`. Requests accumulate until the workspace is finalized on first use (the first
+access to its capacity, data, control or a communicator), which allocates once at
+the largest size requested in each dimension. A request that arrives after
 finalization attaches to the first workspace it fits, and otherwise opens a
 new one. Every rank must issue the same requests in the same order.
 
@@ -192,9 +192,13 @@ class _Workspace:
             semaphores=num_semaphores,
         )
         if self.rank == 0:
+            # a group's later workspaces come from requests that arrived after it was
+            # finalized and did not fit
+            index = _WORKSPACES[self.group.group_name].index(self)
             logger.info(
-                "Symmetric workspace (%s, world_size=%d): %.2f MB, slot = %d B, "
-                "pull = %d B, semaphores = %d, multicast = %s, owners = %s",
+                "Symmetric workspace #%d (%s, world_size=%d): %.2f MB, slot = %d B, "
+                "pull = %d B, semaphores = %d, multicast = %s, requests:%s",
+                index,
                 self.group.group_name,
                 self.world_size,
                 total_bytes / MB,
@@ -202,7 +206,11 @@ class _Workspace:
                 pull_bytes,
                 num_semaphores,
                 self.has_multicast,
-                sorted({r.owner for r in self._requests}),
+                "".join(
+                    f"\n  {r.owner}: slot = {r.push_slot_bytes} B, "
+                    f"pull = {r.pull_bytes} B, semaphores = {r.semaphores}"
+                    for r in self._requests
+                ),
             )
         dist.barrier(group=self.group)
 

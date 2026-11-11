@@ -38,10 +38,6 @@ def default_min_tokens(world_size: int) -> int:
 
 GROUP = 128
 
-# The fused sites' grid: the SM90 custom all-reduce v2 table's pull width, which
-# they were tuned with.
-_SM90_PULL_BLOCKS = 64
-
 
 def requested() -> bool:
     return bool(envs.SGLANG_GEMMA4_AR_FUSION.get())
@@ -85,9 +81,14 @@ def _get_state() -> Optional[_State]:
         )
         return None
     from sglang.kernels.ops.communication import gemma4_ar_fusion as mod
+    from sglang.srt.distributed.device_communicators.configs.custom_all_reduce_v2 import (
+        get_all_reduce_config,
+    )
 
+    # the fused sites' grid: the custom all-reduce's pull width, which they were tuned with
+    pull_blocks = get_all_reduce_config(lease.world_size).num_pull_blocks
     mod.register_comm(
-        lambda: lease.get_communicator(pull_blocks=_SM90_PULL_BLOCKS),
+        lambda: lease.get_communicator(pull_blocks=pull_blocks),
         world_size=lease.world_size,
     )
     return _State(lease.group, lease.world_size, lease.rank, group.cpu_group.group_name)

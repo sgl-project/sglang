@@ -117,7 +117,13 @@ class NVLinkVocabGather(VocabGather):
     # the shared workspace is allocated on first use, not at construction
     @cached_property
     def comm(self):
-        return self._lease.get_communicator()
+        from .configs.custom_all_reduce_v2 import get_all_reduce_config
+
+        # the custom all-reduce's tuned widths, which these kernels launch with
+        config = get_all_reduce_config(self._lease.world_size)
+        return self._lease.get_communicator(
+            push_blocks=config.num_push_blocks, pull_blocks=config.num_pull_blocks
+        )
 
     @property
     def slot_bytes(self) -> int:

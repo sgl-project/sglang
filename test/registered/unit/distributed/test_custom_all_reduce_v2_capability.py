@@ -194,11 +194,9 @@ def test_pick_config_hier_at_default_cap(nbytes, expected):
     hier_max = dpx_hier_all_reduce._hier_max_bytes(
         config, 16 * _MB, sizes_own_push=False
     )
-    comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
-    comm._eager_plan_cache = {}  # the config setter clears it
-    comm.disabled = True
-    comm.config = dpx_hier_all_reduce._fit_hier(config, hier_max)
-    assert _choice_name(comm._choose_algo(nbytes, False)) == expected
+    fitted = dpx_hier_all_reduce._fit_hier(config, hier_max)
+    choice = custom_all_reduce_v2.choose_algo(fitted, nbytes, can_use_graph=False)
+    assert _choice_name(choice) == expected
 
 
 @pytest.mark.parametrize(
@@ -226,11 +224,7 @@ def test_pick_config_hier_2shot_push(nbytes, expected):
         two_shot_push_threshold=256 * _KB,
         hier_2shot_push=cfg.Range(256 * _KB, 64 * _MB),
     )
-    comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
-    comm._eager_plan_cache = {}  # the config setter clears it
-    # dispatch does not look at it; close() at teardown does
-    comm.disabled = True
-    comm.config = cfg.AllReduceConfig(
+    config = cfg.AllReduceConfig(
         graph=heuristic,
         eager=heuristic,
         num_push_blocks=96,
@@ -238,7 +232,10 @@ def test_pick_config_hier_2shot_push(nbytes, expected):
         num_mc_blocks=None,
     )
     for use_graph in (False, True):
-        assert _choice_name(comm._choose_algo(nbytes, use_graph)) == expected
+        choice = custom_all_reduce_v2.choose_algo(
+            config, nbytes, can_use_graph=use_graph
+        )
+        assert _choice_name(choice) == expected
 
 
 @pytest.mark.parametrize(
