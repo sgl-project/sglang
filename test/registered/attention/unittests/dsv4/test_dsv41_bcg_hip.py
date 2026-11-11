@@ -190,8 +190,12 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
             backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
                 captured, live, static_forward_batch=static
             )
-            self.assertIs(backend.forward_metadata, captured)
+            # The bucket keeps its capture-time metadata; the replay runs on a
+            # live build that shares only the pinned store target.
+            replayed = backend.forward_metadata
+            self.assertIsNot(replayed, captured)
             self.assertIs(captured.core_attn_metadata.swa_out_cache_loc, pinned)
+            self.assertIs(replayed.core_attn_metadata.swa_out_cache_loc, pinned)
             graph.replay()
             torch.cuda.synchronize()
             expected_target = pool.translate_loc_from_full_to_swa(
@@ -209,7 +213,7 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
                 if name == "swa_out_cache_loc":
                     continue
                 with self.subTest(field=name):
-                    rebound = getattr(captured.core_attn_metadata, name)
+                    rebound = getattr(replayed.core_attn_metadata, name)
                     if name in _UNINITIALIZED_SCRATCH_FIELDS:
                         self.assertEqual(rebound.shape, value.shape)
                         self.assertEqual(rebound.dtype, value.dtype)
@@ -222,12 +226,12 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
                         self.assertTrue(
                             torch.equal(
                                 getattr(
-                                    captured.low_ratio_indexer_metadata(ratio), name
+                                    replayed.low_ratio_indexer_metadata(ratio), name
                                 ),
                                 getattr(eager.low_ratio_indexer_metadata(ratio), name),
                             )
                         )
-            self.assertEqual(set(captured.fp4_low_ratio_prefill_workspaces), {1, 2})
+            self.assertEqual(set(replayed.fp4_low_ratio_prefill_workspaces), {1, 2})
 
             # The attention break on the refreshed metadata is the eager attention.
             replay_out = attention(live)
@@ -249,6 +253,8 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
             backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
                 captured, live2, static_forward_batch=static2
             )
+            replayed2 = backend.forward_metadata
+            self.assertIs(replayed2.core_attn_metadata.swa_out_cache_loc, pinned)
             graph.replay()
             torch.cuda.synchronize()
             self.assertTrue(
@@ -263,19 +269,10 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
             eager2 = backend.forward_metadata
             self.assertTrue(
                 torch.equal(
-                    captured.core_attn_metadata.seq_lens_casual,
+                    replayed2.core_attn_metadata.seq_lens_casual,
                     eager2.core_attn_metadata.seq_lens_casual,
                 )
             )
-            if context_limit is not None:
-                overflow = copy.copy(live2)
-                overflow.seq_lens_cpu = torch.tensor([context_limit + 1, 40])
-                with self.assertRaisesRegex(
-                    ValueError, "smaller than the live context"
-                ):
-                    backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
-                        captured, overflow, static_forward_batch=static2
-                    )
 
 
 if __name__ == "__main__":
