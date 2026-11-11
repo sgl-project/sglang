@@ -348,7 +348,7 @@ def test_verify_metadata_builds_no_rail():
         req_pool_indices=pool_idx,
         seq_lens=seq_lens,
         seq_lens_sum=3300,
-        kv_loc_plan=None,
+        iteration_ids=None,
         out_cache_loc=None,
     )
 
