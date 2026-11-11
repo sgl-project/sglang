@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import time
 import uuid
 from array import array
@@ -27,9 +26,16 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 FULL = ComponentType.FULL
 
 
+class _ReadKey(msgspec.Struct, frozen=True, cache_hash=True):
+    """Owner-local exact prefix identity; reuse the hash when rotating jobs."""
+
+    tokens: tuple[int, ...]
+    compatibility: CacheCompatibility
+
+
 @dataclass
 class _Read:
-    key: bytes | CacheRequestHandle
+    key: _ReadKey | CacheRequestHandle
     tokens: tuple
     compatibility: object
     handle: CacheRequestHandle = field(
@@ -89,7 +95,7 @@ class StorageCacheReads:
 
     def __init__(self, executor):
         self.executor, self.cache = executor, executor.cache
-        self.jobs: dict[bytes | CacheRequestHandle, _Read] = {}
+        self.jobs: dict[_ReadKey | CacheRequestHandle, _Read] = {}
         self.interests: dict[str, _Interest] = {}
         self.demands: dict[CacheRequestHandle, _Demand] = {}
         self._joinable: dict[tuple, _Read] = {}
@@ -454,7 +460,7 @@ class StorageCacheReads:
 
     def start(self, work):
         tokens, compatibility = self._scope(work)
-        key = hashlib.sha256(msgspec.json.encode((tokens, compatibility))).digest()
+        key = _ReadKey(tokens, compatibility)
         job = self.jobs.get(key)
         if job is None:
             job = self._borrow_ordinary(tokens, compatibility)
