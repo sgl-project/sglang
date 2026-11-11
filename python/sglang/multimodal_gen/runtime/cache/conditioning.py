@@ -6,6 +6,7 @@ import hashlib
 import pickle
 import weakref
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields, is_dataclass
@@ -37,6 +38,9 @@ _cross_request_cache: ContextVar[bool] = ContextVar(
     "cross_request_conditioning_cache", default=True
 )
 _prefer_cache: ContextVar[bool] = ContextVar("prefer_conditioning_cache", default=False)
+_prefetched_digests: ContextVar[dict | None] = ContextVar(
+    "prefetched_tensor_digests", default=None
+)
 _stage_encoder: ContextVar[object | None] = ContextVar("stage_encoder", default=None)
 _container_types: set[type] = {DiagonalGaussianDistribution}
 _live_caches = weakref.WeakSet()
@@ -95,6 +99,9 @@ def prefer_conditioning_cache():
 # those blocks still identifies every byte, without copying the zeros to host.
 _SPARSE_HASH_BLOCK_BYTES = 64 * 1024
 _SPARSE_HASH_MIN_BYTES = 16 * 1024 * 1024
+# Arbitrary; hashlib releases the GIL, so threads hash prefetched inputs in parallel.
+_PREFETCH_HASH_THREADS = 8
+_prefetch_pool: ThreadPoolExecutor | None = None
 # Bound on bookkeeping, not memory: the byte budget normally binds first, even
 # for tiled VAE references that store one small entry per tile.
 DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES = 4096
@@ -116,6 +123,68 @@ def _tensor_digest(tensor):
     return digest.digest()
 
 
+def _view_identity(tensor):
+    return (
+        tensor.untyped_storage().data_ptr(),
+        tensor.storage_offset(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.dtype,
+    )
+
+
+def _prefetchable(tensor):
+    return (
+        type(tensor) is torch.Tensor
+        and tensor.is_cuda
+        and tensor.layout == torch.strided
+        and not tensor.requires_grad
+        and tensor.numel() * tensor.element_size() < _SPARSE_HASH_MIN_BYTES
+    )
+
+
+def _hash_when_copied(host, ready):
+    ready.synchronize()
+    return hashlib.sha256(host.numpy()).digest()
+
+
+# Per-tile keys copy each tile behind the encodes queued ahead of it; queuing every
+# copy first and hashing on a pool overlaps the encodes. Tiles must not change inside.
+@contextmanager
+def prefetch_vae_tile_digests(vae, tiles):
+    tensors = [t for t in tiles if _prefetchable(t)]
+    if not tensors or _vae_encode_cache(vae) is None:
+        yield
+        return
+    global _prefetch_pool
+    if _prefetch_pool is None:
+        _prefetch_pool = ThreadPoolExecutor(
+            max_workers=_PREFETCH_HASH_THREADS, thread_name_prefix="conditioning-hash"
+        )
+    sizes = [t.numel() * t.element_size() for t in tensors]
+    host = torch.empty(sum(sizes), dtype=torch.uint8, pin_memory=True)
+    prefetched, offset = {}, 0
+    for tensor, size in zip(tensors, sizes):
+        target = host[offset : offset + size]
+        offset += size
+        target.copy_(
+            tensor.detach().contiguous().reshape(-1).view(torch.uint8),
+            non_blocking=True,
+        )
+        ready = torch.cuda.Event()
+        ready.record()
+        future = _prefetch_pool.submit(_hash_when_copied, host=target, ready=ready)
+        # Holding the tensor keeps its storage alive, so no other view reuses its address.
+        prefetched[_view_identity(tensor)] = (tensor, future)
+    token = _prefetched_digests.set(prefetched)
+    try:
+        yield
+    finally:
+        _prefetched_digests.reset(token)
+        for _, future in prefetched.values():
+            future.cancel()
+
+
 def _fingerprint(value):
     if isinstance(value, torch.Tensor):
         if (
@@ -124,13 +193,18 @@ def _fingerprint(value):
             or value.requires_grad
         ):
             raise Uncacheable("only dense inference tensors can be cached")
+        prefetched = (_prefetched_digests.get() or {}).get(_view_identity(value))
         return (
             "tensor",
             str(value.dtype),
             str(value.device),
             tuple(value.shape),
             tuple(value.stride()),
-            _tensor_digest(value.detach().contiguous()),
+            (
+                prefetched[1].result()
+                if prefetched is not None
+                else _tensor_digest(value.detach().contiguous())
+            ),
         )
     if isinstance(value, Image.Image):
         return (
@@ -759,12 +833,8 @@ def cached_vae_encode(fn):
 
     @wraps(fn)
     def wrapped(self, *args, **kwargs):
-        cache = _inference_cache(self)
-        if cache is None or (
-            model_parallel_is_initialized()
-            and get_world_size() > 1
-            and not getattr(self, "conditioning_encode_is_rank_local", False)
-        ):
+        cache = _vae_encode_cache(self)
+        if cache is None:
             return fn(self, *args, **kwargs)
         return cache.run(
             self,
@@ -775,6 +845,17 @@ def cached_vae_encode(fn):
         )
 
     return wrapped
+
+
+def _vae_encode_cache(vae):
+    cache = _inference_cache(vae)
+    if cache is None or (
+        model_parallel_is_initialized()
+        and get_world_size() > 1
+        and not getattr(vae, "conditioning_encode_is_rank_local", False)
+    ):
+        return None
+    return cache
 
 
 def _vae_numeric_settings(vae):

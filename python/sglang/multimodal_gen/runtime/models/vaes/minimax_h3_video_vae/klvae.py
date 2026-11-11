@@ -21,7 +21,10 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    cached_vae_encode,
+    prefetch_vae_tile_digests,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_group_coordinator,
     get_decode_parallel_rank,
@@ -413,10 +416,15 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 tile = x[..., i_pos : i_pos + i_len, j_pos : j_pos + j_len]
                 x_tiles.append(tile)
 
-        with ClsTokenAggregator(self) as agg:
-            local_tile_indices = self._local_tile_indices(
-                num_tiles, tile_rank, tile_world_size
-            )
+        local_tile_indices = self._local_tile_indices(
+            num_tiles, tile_rank, tile_world_size
+        )
+        with (
+            ClsTokenAggregator(self) as agg,
+            prefetch_vae_tile_digests(
+                self, [x_tiles[index] for index in local_tile_indices]
+            ),
+        ):
             encoded_tasks = self._run_tile_tasks(
                 x_tiles, local_tile_indices, self.encode, agg
             )
