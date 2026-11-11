@@ -271,6 +271,9 @@ def _mha_v4_bf16(q, k, v, softmax_scale, out=None, return_lse=False):
 # every CU and the partial results merged by LSE: 5.00 -> 4.57 ms per call.
 _V4_TILE_ROWS = 256
 _V4_TAIL_MAX_TILES = 96
+# Pika measured no gain at 8+ waves: a nearly idle last wave runs at a higher
+# clock under the power cap.
+_V4_TAIL_MAX_WAVES = 6
 _V4_TAIL_KEY_CHUNKS = 8
 
 
@@ -283,7 +286,7 @@ def _v4_tail_split_rows(rows: int, heads: int, device: torch.device) -> int | No
     """Query rows of the full waves when the last wave is mostly idle, else None."""
     cus = _num_cus(device.index)
     waves, rem = divmod(heads * -(-rows // _V4_TILE_ROWS), cus)
-    if waves == 0 or rem == 0 or rem > _V4_TAIL_MAX_TILES:
+    if not 0 < waves <= _V4_TAIL_MAX_WAVES or rem == 0 or rem > _V4_TAIL_MAX_TILES:
         return None
     return waves * cus // heads * _V4_TILE_ROWS
 
