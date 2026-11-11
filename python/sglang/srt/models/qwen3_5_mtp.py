@@ -27,6 +27,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils.common import add_prefix
@@ -130,7 +131,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
 
-        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         RMSNorm_cls = GemmaRMSNorm
         self.pre_fc_norm_embedding = RMSNorm_cls(
             config.hidden_size, config.rms_norm_eps
@@ -144,6 +144,14 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             quant_config,
             prefix=add_prefix("mtp", prefix),
             is_nextn=True,
+        )
+        self.fc = ColumnParallelLinear(
+            2 * config.hidden_size,
+            config.hidden_size,
+            bias=False,
+            gather_output=True,
+            quant_config=quant_config,
+            prefix=add_prefix("mtp.fc", prefix),
         )
 
         if get_parallel().pp_group.is_last_rank:
@@ -246,7 +254,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
-            hidden_states = self.fc(hidden_states)
+            hidden_states, _ = self.fc(hidden_states)
 
             with get_global_expert_distribution_recorder().disable_this_region():
                 hidden_states = self.model(
