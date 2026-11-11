@@ -4,6 +4,9 @@ import unittest
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyMultiNodePdSepTestCaseBase,
 )
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+    build_meta_service_config,
+)
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     assert_metrics,
@@ -81,15 +84,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS = {
     "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
-META_SERVICE_PORT = 5007
-CONFIG_STORE_PORT = 6007
-META_METRICS_PORT = 8007
-
-METASERVICE_CONFIG = {
-    "meta_service_url": f"tcp://127.0.0.1:{META_SERVICE_PORT}",
-    "config_store_url": f"tcp://127.0.0.1:{CONFIG_STORE_PORT}",
-    "metrics_url": f"http://127.0.0.1:{META_METRICS_PORT}",
-}
+METASERVICE_CONFIG = build_meta_service_config()
 
 
 HICACHE_STORAGE_EXTRA_CONFIG = json.dumps(

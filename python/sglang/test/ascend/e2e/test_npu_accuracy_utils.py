@@ -7,7 +7,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from datetime import datetime
@@ -16,12 +15,12 @@ from urllib.parse import urlparse
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     SERVICE_PORT,
-    check_port_availability,
     check_role,
     kill_process_group,
     launch_pd_mix_node,
     launch_pd_separation_node,
     launch_router,
+    start_meta_service,
     wait_server_ready,
 )
 from sglang.test.test_utils import (
@@ -50,10 +49,6 @@ logger.info(f"PYTHON_FOR_TEST_TOOL: {PYTHON_FOR_TEST_TOOL}")
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
 MAX_SERVER_KEEP_ALIVE_TIME = 3600
-
-# npu_memcache L3 backend MetaService readiness.
-META_SERVICE_READY_TIMEOUT = 300
-META_SERVICE_READY_POLL_INTERVAL = 5
 
 ACCURACY_TOLERANCE = 0.99
 
@@ -109,6 +104,48 @@ def get_max_retries(datasets):
     if dataset in DATASET_FLUCTUATION:
         return MAX_RETRY_COUNT
     return 1
+
+
+# Exported by the nightly pipeline to pick the dataset of multi-node accuracy
+# cases: gsm8k on weekdays (Mon-Fri) and gpqa_diamond on weekends.
+ACCURACY_DATASET_ENV = "NPU_ACCURACY_DATASET"
+
+# Sample cap kept for the overridden gsm8k run, to stay inside the step budget.
+ACCURACY_DATASET_LIMITS = {"gsm8k": 200}
+
+
+def apply_accuracy_dataset_override(test_cls):
+    """Apply the pipeline-selected dataset on `test_cls`.
+
+    No-op when NPU_ACCURACY_DATASET is unset or selects the dataset the case
+    already declares. Cases opt in to the other dataset by declaring its
+    baseline in `dataset_baselines`; uncalibrated cases keep their own dataset.
+    """
+    dataset = os.environ.get(ACCURACY_DATASET_ENV, "").strip()
+    if not dataset or dataset in test_cls.datasets:
+        return
+
+    baselines = getattr(test_cls, "dataset_baselines", None) or {}
+    if dataset not in baselines:
+        logger.warning(
+            f"[accuracy-dataset] {ACCURACY_DATASET_ENV}={dataset} ignored for "
+            f"{test_cls.__name__}: no dataset_baselines['{dataset}'], keeping "
+            f"datasets={test_cls.datasets}."
+        )
+        return
+
+    test_cls.datasets = [dataset]
+    test_cls.accuracy = baselines[dataset]
+    test_cls.limit = ACCURACY_DATASET_LIMITS.get(dataset, test_cls.limit)
+    # dataset_args is keyed by dataset name; keep the selected entry only.
+    if test_cls.dataset_args:
+        entry = test_cls.dataset_args.get(dataset)
+        test_cls.dataset_args = {dataset: entry} if entry else None
+    logger.info(
+        f"[accuracy-dataset] {ACCURACY_DATASET_ENV}={dataset}: "
+        f"datasets={test_cls.datasets} accuracy={test_cls.accuracy} "
+        f"limit={test_cls.limit}"
+    )
 
 
 def run_evalscope(
@@ -286,16 +323,14 @@ def assert_metrics(self, metrics):
 
     if self.accuracy is not None:
         threshold = get_accuracy_threshold(self.datasets, self.accuracy)
-        dump_metric(
-            "accuracy",
-            float(metrics["accuracy"]),
-            labels={"test_case": self.__class__.__name__, "type": "accuracy"},
-        )
-        dump_metric(
-            "accuracy_baseline",
-            float(self.accuracy),
-            labels={"test_case": self.__class__.__name__, "type": "accuracy"},
-        )
+        # Keep weekday gsm8k and weekend gpqa_diamond in separate series.
+        labels = {
+            "test_case": self.__class__.__name__,
+            "type": "accuracy",
+            "dataset": (self.datasets or ["unknown"])[0],
+        }
+        dump_metric("accuracy", float(metrics["accuracy"]), labels=labels)
+        dump_metric("accuracy_baseline", float(self.accuracy), labels=labels)
         self.assertGreaterEqual(
             float(metrics["accuracy"]),
             threshold,
@@ -572,6 +607,7 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        apply_accuracy_dataset_override(cls)
         cls.local_ip = "127.0.0.1"
         cls.host = os.getenv("POD_IP")
         cls.port = SERVICE_PORT
@@ -649,6 +685,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        apply_accuracy_dataset_override(cls)
         cls.process = None
         cls.meta_service_process = None
         cls.local_ip = "127.0.0.1"
@@ -665,6 +702,15 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
         )
         logger.info(f"Init {cls.host} {cls.role=}!")
 
+        # The L3 storage backend must be reachable before the model server
+        # starts, so bring up the MetaService first (prefill node only). A
+        # multi-pod prefill instance hosts it on its master pod, which every
+        # pod of the instance has to target.
+        cls.meta_service_process = start_meta_service(
+            cls.meta_service_config,
+            cls.role,
+            (cls.model_config or {}).get("prefill_args"),
+        )
         cls.start_pd_server()
         cls.start_router_server()
 
@@ -701,9 +747,6 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     @classmethod
     @check_role(allowed_roles=["prefill", "decode"])
     def start_pd_server(cls):
-        # The L3 storage backend must be reachable before the model server
-        # starts, so bring up the MetaService first.
-        cls.start_meta_service()
         logger.info(f"Starting pd separation node...")
         cls.process = launch_pd_separation_node(cls.model_config)
         logger.info(f"Pd separation node started with PID: {cls.process.pid}")
@@ -716,55 +759,6 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                 raise Exception(
                     f"Sglang process exited on node {cls.host} {cls.hostname} with exit code: {exit_code}"
                 )
-
-    @classmethod
-    def start_meta_service(cls):
-        """Start the npu_memcache MetaService before the model server.
-
-        The L3 npu_memcache backend connects to the Ascend MemCache
-        MetaService at startup, so it must already be listening. In PD
-        separation only the prefill node enables the L3 backend.
-        """
-        if not cls.meta_service_config or cls.role != "prefill":
-            return
-
-        # Materialize the config on the pod-local temp dir so runtime ports
-        # (chosen by the test case) are not baked into a checked-in file.
-        config_path = os.path.join(
-            tempfile.gettempdir(), "npu_memcache_metaservice_config.json"
-        )
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(cls.meta_service_config, f, indent=4)
-
-        cmd = [
-            sys.executable,
-            "-m",
-            "sglang.srt.mem_cache.storage.npu_memcache.start_meta_service",
-            "--config_path",
-            config_path,
-        ]
-        logger.info(f"Starting npu_memcache MetaService: {' '.join(cmd)}")
-        cls.meta_service_process = subprocess.Popen(cmd, start_new_session=True)
-
-        parsed_url = urlparse(cls.meta_service_config["meta_service_url"])
-        host, port = parsed_url.hostname, parsed_url.port
-
-        start_time = time.time()
-        while time.time() - start_time < META_SERVICE_READY_TIMEOUT:
-            if cls.meta_service_process.poll() is not None:
-                raise RuntimeError(
-                    f"npu_memcache MetaService exited with code "
-                    f"{cls.meta_service_process.returncode} before it was ready"
-                )
-            if check_port_availability(host, port):
-                logger.info(f"npu_memcache MetaService is ready at {host}:{port}")
-                return
-            time.sleep(META_SERVICE_READY_POLL_INTERVAL)
-
-        raise RuntimeError(
-            f"Timed out after {META_SERVICE_READY_TIMEOUT}s waiting for "
-            f"npu_memcache MetaService at {host}:{port}"
-        )
 
     @check_role(allowed_roles=["router"])
     def run_accuracy(self):

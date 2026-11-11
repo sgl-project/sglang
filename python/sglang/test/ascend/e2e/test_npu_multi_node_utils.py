@@ -1,14 +1,18 @@
+import json
 import logging
 import os
 import re
 import signal
 import socket
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from functools import wraps
 from types import SimpleNamespace
-from typing import Iterable, Union
+from typing import Iterable, Optional, Union
+from urllib.parse import urlparse
 
 import requests
 
@@ -40,10 +44,19 @@ SERVICE_PORT = (
 PREFILL_DECODE_PORT = 8000
 BOOTSTRAP_INIT_PORT = 8995
 
+# npu_memcache L3 backend MetaService ports.
+META_SERVICE_PORT = 5007
+CONFIG_STORE_PORT = 6007
+META_METRICS_PORT = 8007
+
 # Timeouts and delays
 ROUTER_CONFIGMAP_TIMEOUT = 300
 SERVER_INITIALIZATION_DELAY = 30
 SERVICE_EXIT_WAIT_SECONDS = 120
+
+# npu_memcache L3 backend MetaService readiness.
+META_SERVICE_READY_TIMEOUT = 300
+META_SERVICE_READY_POLL_INTERVAL = 5
 
 
 def get_nic_name():
@@ -157,6 +170,24 @@ def get_host_ip():
     if not host_ip:
         raise RuntimeError(f"Missing required environment variables: POD_IP={host_ip}")
     return host_ip
+
+
+def build_meta_service_config(host: Optional[str] = None):
+    """Return the npu_memcache MetaService endpoints for the current pod.
+
+    Uses the pod's real IP (POD_IP) instead of loopback so a multi-pod
+    prefill instance can reach the MetaService across nodes; falls back to
+    loopback when POD_IP is unset (e.g. local test collection outside k8s).
+
+    ``host`` overrides the endpoint IP, e.g. the prefill instance master IP
+    resolved from the ConfigMap; when omitted the local POD_IP is used.
+    """
+    host = host or os.getenv("POD_IP", "127.0.0.1")
+    return {
+        "meta_service_url": f"tcp://{host}:{META_SERVICE_PORT}",
+        "config_store_url": f"tcp://{host}:{CONFIG_STORE_PORT}",
+        "metrics_url": f"http://{host}:{META_METRICS_PORT}",
+    }
 
 
 def get_k8s_api():
@@ -395,6 +426,92 @@ def _get_pod_ip_by_keyword(configmap_data, keyword):
         if keyword in pod_name:
             return pod_ip
     return None
+
+
+def resolve_prefill_instance_master_ip(
+    pod_index, prefill_args, timeout=LOCAL_TIMEOUT, poll_interval=15
+):
+    """Resolve the master pod IP of this prefill instance from the ConfigMap.
+
+    The master index follows the same rule as ``launch_pd_separation_node``
+    (``(pod_index // nnodes) * nnodes``), so all pods of a multi-pod prefill
+    instance can share one npu_memcache MetaService hosted on the master.
+
+    Returns None when not running in k8s (no NAMESPACE / KUBE_CONFIG_MAP), so
+    callers keep the local POD_IP fallback.
+    """
+    if not (NAMESPACE and CONFIGMAP_NAME):
+        return None
+
+    nnodes = _get_nnodes_from_args(prefill_args) or 1
+    master_index = (pod_index // nnodes) * nnodes
+    # ConfigMap data is {pod_name: pod_ip}; match the exact index so that
+    # e.g. "prefill-1" does not match "prefill-10".
+    suffix = f"prefill-{master_index}"
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
+        if configmap and configmap.data:
+            for pod_name, pod_ip in configmap.data.items():
+                if pod_name.endswith(suffix):
+                    logger.info(
+                        f"Resolved prefill master {suffix} from ConfigMap: {pod_ip}"
+                    )
+                    return pod_ip
+        logger.info(f"Waiting for ConfigMap entry ending with {suffix} ...")
+        time.sleep(poll_interval)
+
+    raise RuntimeError(
+        f"Timeout: failed to find {suffix} in ConfigMap {CONFIGMAP_NAME} "
+        f"after {timeout} seconds"
+    )
+
+
+def resolve_meta_service_config(meta_service_config, prefill_args, role):
+    """Point every pod of a multi-pod prefill instance at its instance master.
+
+    The MetaService is hosted by the first pod of the instance, so the other
+    pods must talk to the master's IP instead of their own POD_IP. The L3
+    backend extra config baked into ``prefill_args`` is rewritten as well, so
+    the model server and the test agree on the same endpoints.
+
+    Returns the effective config for this pod: the input config for decode
+    pods, single-pod prefill instances or runs outside k8s.
+    """
+    if (
+        not meta_service_config
+        or role != "prefill"
+        or not (NAMESPACE and CONFIGMAP_NAME)
+    ):
+        return meta_service_config
+
+    last_part = os.getenv("HOSTNAME", "").rsplit("-", 1)[-1]
+    if not last_part.isdigit():
+        return meta_service_config
+
+    nnodes = _get_nnodes_from_args(prefill_args or []) or 1
+    if nnodes <= 1:
+        return meta_service_config
+
+    master_ip = resolve_prefill_instance_master_ip(int(last_part), prefill_args)
+    resolved = build_meta_service_config(master_ip)
+    _rewrite_storage_extra_config(prefill_args, resolved)
+    return resolved
+
+
+def _rewrite_storage_extra_config(prefill_args, meta_service_config):
+    """Replace the MetaService endpoints in the L3 backend extra config."""
+    flag = "--hicache-storage-backend-extra-config"
+    if flag not in prefill_args:
+        return
+
+    value_index = prefill_args.index(flag) + 1
+    extra_config = json.loads(prefill_args[value_index])
+    for key in ("meta_service_url", "config_store_url", "metrics_url"):
+        if key in extra_config and key in meta_service_config:
+            extra_config[key] = meta_service_config[key]
+    prefill_args[value_index] = json.dumps(extra_config)
 
 
 def check_role(allowed_roles: Union[str, Iterable[str]]):
@@ -832,6 +949,71 @@ def launch_router(model_config):
         logger.info(f"Router process started with PID: {router_process.pid}")
     except Exception as e:
         raise RuntimeError(f"Failed to start router process: {e}")
+
+
+def start_meta_service(meta_service_config, role, prefill_args=None):
+    """Start the npu_memcache MetaService before the model server.
+
+    The L3 npu_memcache backend connects to the Ascend MemCache MetaService
+    at startup, so it must already be listening. In PD separation only the
+    prefill node enables the L3 backend. On a multi-pod prefill instance the
+    endpoints are retargeted at the instance master (see
+    ``resolve_meta_service_config``), which is also the only pod hosting it.
+
+    Returns the MetaService process, or None when this pod does not host it.
+    """
+    meta_service_config = resolve_meta_service_config(
+        meta_service_config, prefill_args or [], role
+    )
+    if not meta_service_config or role != "prefill":
+        return None
+
+    # In a multi-pod prefill instance every pod is configured with the
+    # instance master's endpoint, but only the master pod hosts the
+    # MetaService itself.
+    parsed_url = urlparse(meta_service_config["meta_service_url"])
+    host, port = parsed_url.hostname, parsed_url.port
+    if host not in (os.getenv("POD_IP"), "127.0.0.1"):
+        logger.info(
+            f"npu_memcache MetaService is hosted on {host}, "
+            f"skip starting it on this pod"
+        )
+        return None
+
+    # Materialize the config on the pod-local temp dir so runtime ports
+    # (chosen by the test case) are not baked into a checked-in file.
+    config_path = os.path.join(
+        tempfile.gettempdir(), "npu_memcache_metaservice_config.json"
+    )
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(meta_service_config, f, indent=4)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "sglang.srt.mem_cache.storage.npu_memcache.start_meta_service",
+        "--config_path",
+        config_path,
+    ]
+    logger.info(f"Starting npu_memcache MetaService: {' '.join(cmd)}")
+    process = subprocess.Popen(cmd, start_new_session=True)
+
+    start_time = time.time()
+    while time.time() - start_time < META_SERVICE_READY_TIMEOUT:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"npu_memcache MetaService exited with code "
+                f"{process.returncode} before it was ready"
+            )
+        if check_port_availability(host, port):
+            logger.info(f"npu_memcache MetaService is ready at {host}:{port}")
+            return process
+        time.sleep(META_SERVICE_READY_POLL_INTERVAL)
+
+    raise RuntimeError(
+        f"Timed out after {META_SERVICE_READY_TIMEOUT}s waiting for "
+        f"npu_memcache MetaService at {host}:{port}"
+    )
 
 
 def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
