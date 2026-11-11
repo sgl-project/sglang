@@ -13,7 +13,6 @@ from sglang.kernels.ops.kv_canary.write import WritePlan
 from sglang.srt.utils import get_device
 from sglang.test.kernels.kv_canary._constants import DEFAULT_NUM_SLOTS
 
-
 LutKind = Literal["identity", "shift", "permutation", "with_oob"]
 
 
