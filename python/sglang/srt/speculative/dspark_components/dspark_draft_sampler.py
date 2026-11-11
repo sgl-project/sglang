@@ -18,7 +18,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     step_logits_width,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
-from sglang.srt.utils import is_device_stream_capturing, is_npu, is_xpu
+from sglang.srt.utils import is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +118,7 @@ class DsparkDraftSampler:
         if self.step_logits is None:
             # The runner's warmup calls the tail eagerly before capture.
             if _is_npu:
-                capturing = is_device_stream_capturing(base_logits.device)
+                capturing = torch.npu.is_current_stream_capturing()
             else:
                 # torch.cuda's capture query raises on XPU builds.
                 capturing = (

@@ -68,7 +68,7 @@ from sglang.srt.speculative.spec_utils import (
     sample_simulated_acc_len,
     simulated_acc_len_generator,
 )
-from sglang.srt.utils import is_device_stream_capturing, is_npu
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 logger = logging.getLogger(__name__)
@@ -998,7 +998,7 @@ class DsparkVerifyEpilogue:
         ):
             return buf
         capturing = (
-            is_device_stream_capturing(compact.device)
+            torch.npu.is_current_stream_capturing()
             if _is_npu
             else torch.get_device_module().is_current_stream_capturing()
         )
