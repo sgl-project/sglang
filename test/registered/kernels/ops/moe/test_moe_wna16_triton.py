@@ -198,7 +198,6 @@ def test_w2_block_shape_reaches_both_runner_paths(path, inplace):
     assert (result.data_ptr() == x.data_ptr()) == inplace
 
 
-
 if __name__ == "__main__":
     args = ["-x" if arg == "-f" else arg for arg in sys.argv[1:]]
     sys.exit(pytest.main([__file__, *args]))
