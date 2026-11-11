@@ -1029,5 +1029,7 @@
   "registered.unit.mem_cache.test_unified_radix_cache_unittest.Test_FULL_ps64.test_swa_unfinished_req_preserves_existing_eviction_boundary",
   "registered.unit.mem_cache.test_unified_radix_cache_unittest.Test_FULL_ps64.test_tp_swa_prefetch_adopted_when_peer_present",
   "registered.unit.mem_cache.test_unified_radix_cache_unittest.Test_FULL_ps64.test_tp_swa_prefetch_drop_frees_host_pool",
-  "registered.unit.mem_cache.test_unified_radix_cache_unittest.Test_FULL_ps64.test_tp_swa_prefetch_dropped_when_peer_misses"
+  "registered.unit.mem_cache.test_unified_radix_cache_unittest.Test_FULL_ps64.test_tp_swa_prefetch_dropped_when_peer_misses",
+  "registered.utils.test_numa_utils.TestB200NumaTopology.test_gpu_numa_mapping",
+  "registered.utils.test_numa_utils.TestGraceBlackwellNumaTopology.test_gpu_numa_mapping"
 ]

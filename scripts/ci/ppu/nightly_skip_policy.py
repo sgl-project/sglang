@@ -60,9 +60,10 @@ def allowed_skips():
 
 
 def deselected_nodes():
-    # This bare function was never executed by the legacy unittest runner.
+    # These bare functions were never executed by the legacy unittest runner.
     return [
-        "registered/rl/test_update_weights_from_tensor.py::test_update_weights_from_tensor"
+        "registered/rl/test_update_weights_from_tensor.py::test_update_weights_from_tensor",
+        "registered/rl/test_update_weights_from_distributed.py::test_update_weights_from_distributed",
     ]
 
 

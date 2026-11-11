@@ -8,7 +8,7 @@ from nightly_skip_policy import allowed_skips, deselected_nodes
 class TestNightlySkipPolicy(unittest.TestCase):
     def test_exact_policy_is_bounded_and_unique(self):
         skips = allowed_skips()
-        self.assertEqual(len(skips), 1211)
+        self.assertEqual(len(skips), 1213)
         self.assertEqual(len(set(skips)), len(skips))
         self.assertEqual(
             skips[0],
@@ -56,16 +56,22 @@ class TestNightlySkipPolicy(unittest.TestCase):
         prefixes = (
             "registered.radix_cache.test_radix_attention.",
             "registered.unit.mem_cache.test_unified_radix_cache_unittest.",
+            "registered.utils.test_numa_utils.",
         )
-        self.assertEqual(sum(node.startswith(prefixes) for node in skips), 1031)
+        self.assertEqual(sum(node.startswith(prefixes) for node in skips), 1033)
         self.assertIn(
             "registered.radix_cache.test_radix_attention.TestRadixCacheLPM.test_radix_attention",
+            skips,
+        )
+        self.assertIn(
+            "registered.utils.test_numa_utils.TestB200NumaTopology.test_gpu_numa_mapping",
             skips,
         )
         self.assertEqual(
             deselected_nodes(),
             [
-                "registered/rl/test_update_weights_from_tensor.py::test_update_weights_from_tensor"
+                "registered/rl/test_update_weights_from_tensor.py::test_update_weights_from_tensor",
+                "registered/rl/test_update_weights_from_distributed.py::test_update_weights_from_distributed",
             ],
         )
 
