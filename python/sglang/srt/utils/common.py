@@ -2194,15 +2194,9 @@ def load_image(
         image = _fully_load_pil_image(image_file)
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
-        image = _load_image(
-            image_bytes=image_file,
-            gpu_image_decode=gpu_image_decode,
-        )
+        image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
-        image = _load_image(
-            image_file=image_file,
-            gpu_image_decode=gpu_image_decode,
-        )
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(image_file, str) and image_file.startswith("file://"):
         image = _load_image(
             image_file=unquote(urlparse(image_file).path),
@@ -2211,22 +2205,13 @@ def load_image(
     elif isinstance(image_file, str) and image_file.lower().endswith(
         image_extension_names
     ):
-        image = _load_image(
-            image_file=image_file,
-            gpu_image_decode=gpu_image_decode,
-        )
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(image_file, str) and image_file.startswith("data:"):
-        image = _load_image(
-            image_file=image_file,
-            gpu_image_decode=gpu_image_decode,
-        )
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(
         image_file, str
     ):  # Other formats, try to decode as base64 by default
-        image = _load_image(
-            image_file=image_file,
-            gpu_image_decode=gpu_image_decode,
-        )
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
     if image_size is not None and isinstance(image, Image.Image):
