@@ -1710,9 +1710,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
             padding_size = get_moe_padding_size(_use_aiter)
+            # weight_block_size describes the FP8 tensors only: MXFP4 routed experts
+            # carry 32-wide scale groups, so a 128-unaligned TP shard is fine for them.
             if not (
                 (_use_aiter and padding_size == block_n == block_k)
                 or allow_fp8_blockwise_tail
+                or is_fp4_expert
             ):
                 # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
                 # Required by column parallel or enabling merged weights
