@@ -380,6 +380,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Write-back device-eviction fences (see _wb_evict_overlap_stream).
         self._wb_evict_pd_prefill = False  # Set by init_hicache.
         self._wb_evict_relaxed_fence_logged = False
+        self._wb_overlap_scope_logged = False
         # ChainAllocator relocates pages; SWA trees evict older windows of
         # in-flight checkpoints.
         self._wb_overlap_in_scope = not self.is_swa_enabled and not isinstance(
@@ -389,7 +390,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._wb_overlap_max_seen_id = -1
         self._wb_overlap_watermark = -1
         self._wb_overlap_barrier_seq = 0
-        self._wb_overlap_counts = {"overlap": 0, "fresh": 0, "scope": 0}
+        self._wb_overlap_counts = {"overlap": 0, "fresh": 0}
         # Streams the queued device-eviction backups were built on.
         self._wb_batch_on_overlap = False
         self._wb_batch_on_current = False
@@ -4084,6 +4085,8 @@ class UnifiedRadixCache(BasePrefixCache):
             cc is not None
             and cc.write_policy == "write_back"
             and self._wb_evict_pd_prefill
+            # Re-read: a PD role switch keeps this cache and flips the mode.
+            and get_disagg().disaggregation_mode == "prefill"
         )
 
     def _wb_evict_relaxed_fence(self) -> bool:
@@ -4101,7 +4104,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         return (
             self._is_pd_prefill_write_back()
-            and envs.SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE.get()
+            and envs.SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE.get()
             and self.cache_controller.forward_start_event is not None
         )
 
@@ -4185,10 +4188,16 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         if not cc.war_barrier_after_forward or cc.war_barrier_event is None:
             return None
-        counts = self._wb_overlap_counts
         if not self._wb_overlap_in_scope:
-            counts["scope"] += 1
+            if not self._wb_overlap_scope_logged:
+                self._wb_overlap_scope_logged = True
+                logger.info(
+                    "HiCache write_back eviction: device-eviction backups after "
+                    "a WAR barrier stay on the current stream (SWA tree or "
+                    "ChainAllocator)."
+                )
             return None
+        counts = self._wb_overlap_counts
         if self._wb_overlap_chain_is_fresh(backup_kv.node_ids):
             counts["fresh"] += 1
             stream = None
@@ -4200,10 +4209,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if sum(counts.values()) % 1024 == 0:
             logger.info(
                 "HiCache write_back eviction overlap: %d overlapped, "
-                "%d fenced (fresh chain), %d out of scope.",
+                "%d fenced (fresh chain).",
                 counts["overlap"],
                 counts["fresh"],
-                counts["scope"],
             )
         return stream
 
@@ -4276,7 +4284,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     logger.info(
                         "HiCache write_back eviction: relaxed D2H fence for "
                         "device-eviction victims "
-                        "(SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE)."
+                        "(SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE)."
                     )
             cc.start_writing(fence_event=fence_event)
             while self.ongoing_write_through:

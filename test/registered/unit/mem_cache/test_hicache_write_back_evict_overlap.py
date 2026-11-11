@@ -189,7 +189,7 @@ class _OverlapCases(UnifiedRadixCacheFixtures):
         with contextlib.ExitStack() as stack:
             if kill_switch:
                 stack.enter_context(
-                    envs.SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE.override(False)
+                    envs.SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE.override(False)
                 )
             if not overlap_stream:
                 stack.enter_context(

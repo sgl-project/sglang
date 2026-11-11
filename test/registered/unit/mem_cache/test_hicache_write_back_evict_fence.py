@@ -37,9 +37,23 @@ def _controller(write_policy="write_back", forward_start_event="F"):
     return cc
 
 
+def _disagg(mode):
+    return patch.object(
+        urc_mod, "get_disagg", return_value=SimpleNamespace(disaggregation_mode=mode)
+    )
+
+
+class _PrefillTestCase(CustomTestCase):
+    """Runs on a PD prefill server unless a case switches the mode."""
+
+    def setUp(self):
+        p = _disagg("prefill")
+        p.start()
+        self.addCleanup(p.stop)
+
+
 def _cache(
     *,
-    pd_prefill=True,
     write_policy="write_back",
     forward_start_event="F",
     in_scope=True,
@@ -65,14 +79,15 @@ def _cache(
     cache.tree_core = MagicMock()
     cache.tree_core.collect_path_info.side_effect = collect_path_info
     cache.is_write_back = write_policy == "write_back"
-    cache._wb_evict_pd_prefill = pd_prefill
+    cache._wb_evict_pd_prefill = True  # init_hicache on a PD prefill launch.
     cache._wb_evict_relaxed_fence_logged = False
+    cache._wb_overlap_scope_logged = False
     cache._wb_overlap_in_scope = in_scope
     cache._wb_overlap_stream = None
     cache._wb_overlap_max_seen_id = -1
     cache._wb_overlap_watermark = -1
     cache._wb_overlap_barrier_seq = 0
-    cache._wb_overlap_counts = {"overlap": 0, "fresh": 0, "scope": 0}
+    cache._wb_overlap_counts = {"overlap": 0, "fresh": 0}
     cache._wb_batch_on_overlap = False
     cache._wb_batch_on_current = False
     return cache
@@ -87,21 +102,30 @@ def _after_barrier(paths=None, **kwargs):
     return cache
 
 
-class TestRelaxedFencePredicate(CustomTestCase):
+class TestRelaxedFencePredicate(_PrefillTestCase):
     def test_requires_pd_prefill_write_back_forward_event_and_env(self):
-        self.assertTrue(envs.SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE.get())
+        self.assertTrue(envs.SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE.get())
         self.assertTrue(_cache()._wb_evict_relaxed_fence())
-        self.assertFalse(_cache(pd_prefill=False)._wb_evict_relaxed_fence())
+        with _disagg("null"):
+            self.assertFalse(_cache()._wb_evict_relaxed_fence())
         self.assertFalse(_cache(write_policy="write_through")._wb_evict_relaxed_fence())
         self.assertFalse(_cache(forward_start_event=None)._wb_evict_relaxed_fence())
-        with envs.SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE.override(False):
+        with envs.SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE.override(False):
             self.assertFalse(_cache()._wb_evict_relaxed_fence())
         cache = _cache()
         cache.cache_controller = None
         self.assertFalse(cache._wb_evict_relaxed_fence())
 
+    def test_follows_a_runtime_pd_role_switch(self):
+        """A PD role switch keeps the cache; after prefill -> decode, victims
+        must wait for the in-flight forward again."""
+        cache = _cache()
+        self.assertTrue(cache._wb_evict_relaxed_fence())
+        with _disagg("decode"):
+            self.assertFalse(cache._wb_evict_relaxed_fence())
 
-class TestWritingCheckFence(CustomTestCase):
+
+class TestWritingCheckFence(_PrefillTestCase):
     def test_victim_opt_in_fences_on_forward_start_and_logs_once(self):
         cache = _cache()
         with self.assertLogs(urc_mod.logger, level=logging.INFO) as logs:
@@ -114,22 +138,23 @@ class TestWritingCheckFence(CustomTestCase):
         self.assertEqual(sum("relaxed D2H fence" in m for m in logs.output), 1)
 
     def test_full_fence_without_opt_in_or_outside_scope(self):
-        for cache, relaxed_fence in (
-            (_cache(), False),
-            (_cache(pd_prefill=False), True),
-            (_cache(forward_start_event=None), True),
+        for mode, cache, relaxed_fence in (
+            ("prefill", _cache(), False),
+            ("null", _cache(), True),
+            ("prefill", _cache(forward_start_event=None), True),
         ):
-            cache.writing_check(write_back=True, relaxed_fence=relaxed_fence)
+            with _disagg(mode):
+                cache.writing_check(write_back=True, relaxed_fence=relaxed_fence)
             cache.cache_controller.start_writing.assert_called_once_with(
                 fence_event=None
             )
         cache = _cache()
-        with envs.SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE.override(False):
+        with envs.SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE.override(False):
             cache.writing_check(write_back=True, relaxed_fence=True)
         cache.cache_controller.start_writing.assert_called_once_with(fence_event=None)
 
 
-class TestEvictionCallSites(CustomTestCase):
+class TestEvictionCallSites(_PrefillTestCase):
     def test_internal_state_backup_keeps_full_fence(self):
         # An older SWA window of the in-flight checkpoint is evictable here.
         cache = _after_barrier()
@@ -180,7 +205,8 @@ class TestEvictionCallSites(CustomTestCase):
         self.assertEqual(calls[-1], call.writing_check(write_back=True))
 
     def test_evict_without_relaxed_fence_does_not_presubmit(self):
-        calls = self._evict(_cache(pd_prefill=False))
+        with _disagg("null"):
+            calls = self._evict(_cache())
         self.assertNotIn("start_writing", [name for name, _, _ in calls])
 
 
@@ -212,7 +238,7 @@ class TestStartWritingFence(CustomTestCase):
         d2h.wait_event.assert_not_called()
 
 
-class TestFreshnessGuard(CustomTestCase):
+class TestFreshnessGuard(_PrefillTestCase):
     def test_watermark_is_the_largest_id_seen_before_the_barrier(self):
         cache = _cache()
         cc = cache.cache_controller
@@ -247,7 +273,7 @@ class TestFreshnessGuard(CustomTestCase):
         self.assertTrue(cache._wb_overlap_chain_is_fresh([]))
 
 
-class TestOverlapStream(CustomTestCase):
+class TestOverlapStream(_PrefillTestCase):
     def _decide(self, cache, node_ids=(4,)):
         stream = MagicMock()
         with patch.object(cache, "_wb_overlap_get_stream", return_value=stream):
@@ -263,13 +289,17 @@ class TestOverlapStream(CustomTestCase):
         cache = _after_barrier()
         cache.cache_controller.record_forward_start("F2")  # no barrier since
         self.assertIsNone(self._decide(cache)[0])
-        with envs.SGLANG_HICACHE_WB_EVICT_RELAXED_FENCE.override(False):
+        with envs.SGLANG_ENABLE_HICACHE_WB_EVICT_RELAXED_FENCE.override(False):
             self.assertIsNone(self._decide(_after_barrier())[0])
-        self.assertIsNone(self._decide(_after_barrier(pd_prefill=False))[0])
-        # SWA tree or page-relocating allocator.
+        cache = _after_barrier()
+        with _disagg("null"):
+            self.assertIsNone(self._decide(cache)[0])
+        # SWA tree or page-relocating allocator: logged once, not per victim.
         cache = _after_barrier(in_scope=False)
-        self.assertIsNone(self._decide(cache)[0])
-        self.assertEqual(cache._wb_overlap_counts["scope"], 1)
+        with self.assertLogs(urc_mod.logger, level=logging.INFO) as logs:
+            self.assertIsNone(self._decide(cache)[0])
+            self.assertIsNone(self._decide(cache)[0])
+        self.assertEqual(sum("stay on the current" in m for m in logs.output), 1)
         # Leaf 9 was not seen before the barrier.
         cache = _after_barrier(paths={9: ((9, 0),)})
         self.assertIsNone(self._decide(cache, node_ids=(9,))[0])
