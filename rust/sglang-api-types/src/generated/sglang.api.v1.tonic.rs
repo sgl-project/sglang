@@ -1249,6 +1249,89 @@ pub mod sglang_service_client {
             ));
             self.inner.unary(req, path, codec).await
         }
+        /// OpenAI data plane. The schema is the interface the OpenAI adapter is
+        /// being refactored onto; until then these answer UNIMPLEMENTED. Streamed
+        /// routes are separate RPCs whose frame is the SSE frame.
+        pub async fn open_ai_completions(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenAiCompletionRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiCompletionResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/OpenAiCompletions",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OpenAiCompletions",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn open_ai_stream_completions(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenAiCompletionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::OpenAiCompletionStreamResponse>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/OpenAiStreamCompletions",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OpenAiStreamCompletions",
+            ));
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn open_ai_chat_completions(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenAiChatCompletionRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiChatCompletionResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/OpenAiChatCompletions",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OpenAiChatCompletions",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn open_ai_stream_chat_completions(
+            &mut self,
+            request: impl tonic::IntoRequest<super::OpenAiChatCompletionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::OpenAiChatCompletionStreamResponse>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/OpenAiStreamChatCompletions",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "OpenAiStreamChatCompletions",
+            ));
+            self.inner.server_streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1587,6 +1670,41 @@ pub mod sglang_service_server {
             &self,
             request: tonic::Request<super::AnthropicCountTokensRequest>,
         ) -> std::result::Result<tonic::Response<super::AnthropicCountTokensResponse>, tonic::Status>;
+        /// OpenAI data plane. The schema is the interface the OpenAI adapter is
+        /// being refactored onto; until then these answer UNIMPLEMENTED. Streamed
+        /// routes are separate RPCs whose frame is the SSE frame.
+        async fn open_ai_completions(
+            &self,
+            request: tonic::Request<super::OpenAiCompletionRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiCompletionResponse>, tonic::Status>;
+        /// Server streaming response type for the OpenAiStreamCompletions method.
+        type OpenAiStreamCompletionsStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::OpenAiCompletionStreamResponse, tonic::Status>,
+            > + std::marker::Send
+            + 'static;
+        async fn open_ai_stream_completions(
+            &self,
+            request: tonic::Request<super::OpenAiCompletionRequest>,
+        ) -> std::result::Result<tonic::Response<Self::OpenAiStreamCompletionsStream>, tonic::Status>;
+        async fn open_ai_chat_completions(
+            &self,
+            request: tonic::Request<super::OpenAiChatCompletionRequest>,
+        ) -> std::result::Result<tonic::Response<super::OpenAiChatCompletionResponse>, tonic::Status>;
+        /// Server streaming response type for the OpenAiStreamChatCompletions method.
+        type OpenAiStreamChatCompletionsStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<
+                    super::OpenAiChatCompletionStreamResponse,
+                    tonic::Status,
+                >,
+            > + std::marker::Send
+            + 'static;
+        async fn open_ai_stream_chat_completions(
+            &self,
+            request: tonic::Request<super::OpenAiChatCompletionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::OpenAiStreamChatCompletionsStream>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct SglangServiceServer<T> {
@@ -4187,6 +4305,183 @@ pub mod sglang_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OpenAiCompletions" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenAiCompletionsSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::OpenAiCompletionRequest>
+                        for OpenAiCompletionsSvc<T>
+                    {
+                        type Response = super::OpenAiCompletionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenAiCompletionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::open_ai_completions(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenAiCompletionsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OpenAiStreamCompletions" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenAiStreamCompletionsSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::ServerStreamingService<super::OpenAiCompletionRequest>
+                        for OpenAiStreamCompletionsSvc<T>
+                    {
+                        type Response = super::OpenAiCompletionStreamResponse;
+                        type ResponseStream = T::OpenAiStreamCompletionsStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenAiCompletionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::open_ai_stream_completions(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenAiStreamCompletionsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OpenAiChatCompletions" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenAiChatCompletionsSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::OpenAiChatCompletionRequest>
+                        for OpenAiChatCompletionsSvc<T>
+                    {
+                        type Response = super::OpenAiChatCompletionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenAiChatCompletionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::open_ai_chat_completions(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenAiChatCompletionsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/OpenAiStreamChatCompletions" => {
+                    #[allow(non_camel_case_types)]
+                    struct OpenAiStreamChatCompletionsSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::ServerStreamingService<super::OpenAiChatCompletionRequest>
+                        for OpenAiStreamChatCompletionsSvc<T>
+                    {
+                        type Response = super::OpenAiChatCompletionStreamResponse;
+                        type ResponseStream = T::OpenAiStreamChatCompletionsStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::OpenAiChatCompletionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::open_ai_stream_chat_completions(
+                                    &inner, request,
+                                )
+                                .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = OpenAiStreamChatCompletionsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

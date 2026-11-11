@@ -2073,6 +2073,1170 @@ class OllamaShowResponse(msgspec.Struct, kw_only=True, frozen=True):
         return encode_OllamaShowResponse(self)
 
 
+class OpenAiErrorResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiErrorResponse: JSON object (unknown keys ignored)."""
+
+    object: str = ""
+    message: str = ""
+    type: str = ""
+    param: Optional[str] = None
+    code: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiErrorResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiErrorResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiErrorResponse(self)
+
+
+class OpenAiCachedTokensDetails(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiCachedTokensDetails: JSON object (unknown keys ignored)."""
+
+    device: int = 0
+    host: int = 0
+    storage: Optional[int] = None
+    storage_backend: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiCachedTokensDetails":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiCachedTokensDetails(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiCachedTokensDetails(self)
+
+
+class OpenAiPromptTokensDetails(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiPromptTokensDetails: JSON object (unknown keys ignored)."""
+
+    cached_tokens: int = 0
+    image_tokens: Optional[int] = None
+    audio_tokens: Optional[int] = None
+    video_tokens: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiPromptTokensDetails":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiPromptTokensDetails(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiPromptTokensDetails(self)
+
+
+class OpenAiCompletionTokensDetails(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiCompletionTokensDetails: JSON object (unknown keys ignored)."""
+
+    reasoning_tokens: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiCompletionTokensDetails":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiCompletionTokensDetails(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiCompletionTokensDetails(self)
+
+
+class OpenAiUsage(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiUsage: JSON object (unknown keys ignored)."""
+
+    prompt_tokens: int = 0
+    total_tokens: int = 0
+    completion_tokens: Optional[int] = 0
+    prompt_tokens_details: Optional[OpenAiPromptTokensDetails] = None
+    reasoning_tokens: Optional[int] = 0
+    completion_tokens_details: Optional[OpenAiCompletionTokensDetails] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiUsage":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiUsage(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiUsage(self)
+
+
+class OpenAiSpecTokensDetails(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiSpecTokensDetails: JSON object (unknown keys ignored)."""
+
+    spec_accept_rate: float = 0.0
+    spec_accept_length: float = 0.0
+    spec_cap_length: float = 0.0
+    spec_block_accept_length: float = 0.0
+    spec_num_correct_drafts: int = 0
+    spec_num_proposed_drafts: int = 0
+    spec_verify_ct: int = 0
+    spec_correct_drafts_histogram: List[int] = []
+    spec_cap_lens_histogram: List[int] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiSpecTokensDetails":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiSpecTokensDetails(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiSpecTokensDetails(self)
+
+
+class OpenAiSglExt(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiSglExt: JSON object (unknown keys ignored)."""
+
+    routed_experts: Optional[str] = None
+    cached_tokens_details: Optional[OpenAiCachedTokensDetails] = None
+    spec_tokens_details: Optional[OpenAiSpecTokensDetailsOrList] = None
+    input_ids: Optional[Int64List] = None
+    output_ids: Optional[TokenIdsList] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiSglExt":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiSglExt(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiSglExt(self)
+
+
+class OpenAiStreamOptions(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiStreamOptions: JSON object (unknown keys ignored)."""
+
+    include_usage: Optional[bool] = False
+    continuous_usage_stats: Optional[bool] = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiStreamOptions":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiStreamOptions(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiStreamOptions(self)
+
+
+class OpenAiJsonSchemaResponseFormat(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiJsonSchemaResponseFormat: JSON object (unknown keys ignored)."""
+
+    name: str = ""
+    description: Optional[str] = None
+    schema: Optional[Any] = None
+    strict: Optional[bool] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiJsonSchemaResponseFormat":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiJsonSchemaResponseFormat(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiJsonSchemaResponseFormat(self)
+
+
+class OpenAiStructureResponseFormat(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiStructureResponseFormat: JSON object (unknown keys ignored)."""
+
+    begin: str = ""
+    schema: Optional[Any] = None
+    end: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiStructureResponseFormat":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiStructureResponseFormat(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiStructureResponseFormat(self)
+
+
+class OpenAiResponseFormat(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiResponseFormat: JSON object (unknown keys ignored)."""
+
+    type: str = ""
+    json_schema: Optional[OpenAiJsonSchemaResponseFormat] = None
+    structures: List[OpenAiStructureResponseFormat] = []
+    triggers: List[str] = []
+    at_least_one: Optional[bool] = None
+    format: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiResponseFormat":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiResponseFormat(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiResponseFormat(self)
+
+
+class OpenAiLogProbs(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiLogProbs: JSON object (unknown keys ignored)."""
+
+    text_offset: List[int] = []
+    token_logprobs: List[OptionalDouble] = []
+    tokens: List[str] = []
+    top_logprobs: List[Any] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiLogProbs":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiLogProbs(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiLogProbs(self)
+
+
+class OpenAiTopLogprob(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiTopLogprob: JSON object (unknown keys ignored)."""
+
+    token: str = ""
+    bytes: List[int] = []
+    logprob: float = 0.0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiTopLogprob":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiTopLogprob(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiTopLogprob(self)
+
+
+class OpenAiChatCompletionTokenLogprob(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiChatCompletionTokenLogprob: JSON object (unknown keys ignored)."""
+
+    token: str = ""
+    bytes: List[int] = []
+    logprob: float = 0.0
+    top_logprobs: List[OpenAiTopLogprob] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiChatCompletionTokenLogprob":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiChatCompletionTokenLogprob(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiChatCompletionTokenLogprob(self)
+
+
+class OpenAiChoiceLogprobs(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiChoiceLogprobs: JSON object (unknown keys ignored)."""
+
+    content: List[OpenAiChatCompletionTokenLogprob] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiChoiceLogprobs":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiChoiceLogprobs(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiChoiceLogprobs(self)
+
+
+class OpenAiCompletionRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiCompletionRequest: JSON object (unknown keys ignored)."""
+
+    model: Optional[str] = "default"
+    prompt: Optional[OpenAiCompletionPrompt] = None
+    best_of: Optional[int] = None
+    echo: bool = False
+    frequency_penalty: float = 0.0
+    logit_bias: Dict[str, float] = {}
+    logprobs: Optional[int] = None
+    max_tokens: Optional[int] = 16
+    n: Optional[int] = 1
+    presence_penalty: float = 0.0
+    seed: Optional[int] = None
+    stop: Optional[StringOrList] = None
+    stream: bool = False
+    stream_options: Optional[OpenAiStreamOptions] = None
+    suffix: Optional[str] = None
+    temperature: Optional[float] = 1.0
+    top_p: Optional[float] = 1.0
+    user: Optional[str] = None
+    return_hidden_states: Optional[OpenAiReturnHiddenStates] = None
+    return_routed_experts: bool = False
+    routed_experts_start_len: int = 0
+    return_cached_tokens_details: bool = False
+    return_spec_tokens_details: bool = False
+    return_token_ids: bool = False
+    top_k: Optional[int] = -1
+    min_p: float = 0.0
+    min_tokens: int = 0
+    json_schema: Optional[str] = None
+    regex: Optional[str] = None
+    ebnf: Optional[str] = None
+    repetition_penalty: Optional[float] = 1.0
+    stop_token_ids: Optional[Int64List] = None
+    stop_regex: Optional[StringOrList] = None
+    no_stop_trim: bool = False
+    ignore_eos: bool = False
+    skip_special_tokens: Optional[bool] = True
+    lora_path: Optional[OptionalStringOrList] = None
+    session_id: Optional[str] = None
+    session_params: Optional[Any] = None
+    response_format: Optional[OpenAiResponseFormat] = None
+    custom_params: Optional[Any] = None
+    custom_logit_processor: Optional[str] = None
+    watermark: Optional[Any] = None
+    images_config: Optional[Any] = None
+    mm_processor_kwargs: Optional[Any] = None
+    data_parallel_rank: Optional[int] = None
+    rid: Optional[StringOrList] = None
+    extra_key: Optional[StringOrList] = None
+    cache_salt: Optional[StringOrList] = None
+    priority: Optional[int] = None
+    custom_labels: Dict[str, str] = {}
+    bootstrap_host: Optional[StringOrList] = None
+    bootstrap_port: Optional[OptionalInt64OrList] = None
+    bootstrap_room: Optional[Int64OrList] = None
+    routed_dp_rank: Optional[int] = None
+    disagg_prefill_dp_rank: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiCompletionRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiCompletionRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiCompletionRequest(self)
+
+
+class OpenAiCompletionChoice(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiCompletionChoice: JSON object (unknown keys ignored)."""
+
+    index: int = 0
+    text: str = ""
+    logprobs: Optional[OpenAiLogProbs] = None
+    finish_reason: Optional[str] = None
+    matched_stop: Optional[Matched] = None
+    hidden_states: Optional[Any] = None
+    token_ids: Optional[Int64List] = None
+    prompt_token_ids: Optional[Int64List] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiCompletionChoice":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiCompletionChoice(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiCompletionChoice(self)
+
+
+class OpenAiCompletionResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiCompletionResponse: JSON object (unknown keys ignored)."""
+
+    id: str = ""
+    object: str = ""
+    created: int = 0
+    model: str = ""
+    choices: List[OpenAiCompletionChoice] = []
+    usage: Optional[OpenAiUsage] = None
+    metadata: Optional[Any] = None
+    sglext: Optional[OpenAiSglExt] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiCompletionResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiCompletionResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiCompletionResponse(self)
+
+
+class OpenAiCompletionStreamResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiCompletionStreamResponse: JSON object (unknown keys ignored)."""
+
+    id: str = ""
+    object: str = ""
+    created: int = 0
+    model: str = ""
+    choices: List[OpenAiCompletionChoice] = []
+    usage: Optional[OpenAiUsage] = None
+    sglext: Optional[OpenAiSglExt] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiCompletionStreamResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiCompletionStreamResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiCompletionStreamResponse(self)
+
+
+class OpenAiImageUrl(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiImageUrl: JSON object (unknown keys ignored)."""
+
+    url: str = ""
+    detail: Optional[str] = "auto"
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
+    content_hash: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiImageUrl":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiImageUrl(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiImageUrl(self)
+
+
+class OpenAiVideoUrl(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiVideoUrl: JSON object (unknown keys ignored)."""
+
+    url: str = ""
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
+    fps: Optional[float] = None
+    max_frames: Optional[int] = None
+    max_tokens_per_frame: Optional[int] = None
+    max_image_tokens: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiVideoUrl":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiVideoUrl(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiVideoUrl(self)
+
+
+class OpenAiAudioUrl(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiAudioUrl: JSON object (unknown keys ignored)."""
+
+    url: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiAudioUrl":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiAudioUrl(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiAudioUrl(self)
+
+
+class OpenAiInputAudio(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiInputAudio: JSON object (unknown keys ignored)."""
+
+    data: str = ""
+    format: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiInputAudio":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiInputAudio(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiInputAudio(self)
+
+
+class OpenAiTextPart(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiTextPart: JSON object (unknown keys ignored)."""
+
+    text: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiTextPart":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiTextPart(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiTextPart(self)
+
+
+class OpenAiThinkingPart(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiThinkingPart: JSON object (unknown keys ignored)."""
+
+    thinking: Optional[str] = None
+    text: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiThinkingPart":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiThinkingPart(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiThinkingPart(self)
+
+
+class OpenAiImagePart(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiImagePart: JSON object (unknown keys ignored)."""
+
+    image_url: Optional[OpenAiImageUrl] = None
+    modalities: Optional[str] = "image"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiImagePart":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiImagePart(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiImagePart(self)
+
+
+class OpenAiVideoPart(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiVideoPart: JSON object (unknown keys ignored)."""
+
+    video_url: Optional[OpenAiVideoUrl] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiVideoPart":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiVideoPart(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiVideoPart(self)
+
+
+class OpenAiAudioUrlPart(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiAudioUrlPart: JSON object (unknown keys ignored)."""
+
+    audio_url: Optional[OpenAiAudioUrl] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiAudioUrlPart":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiAudioUrlPart(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiAudioUrlPart(self)
+
+
+class OpenAiInputAudioPart(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiInputAudioPart: JSON object (unknown keys ignored)."""
+
+    input_audio: Optional[OpenAiInputAudio] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiInputAudioPart":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiInputAudioPart(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiInputAudioPart(self)
+
+
+class OpenAiToolReferencePart(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiToolReferencePart: JSON object (unknown keys ignored)."""
+
+    name: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiToolReferencePart":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiToolReferencePart(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiToolReferencePart(self)
+
+
+class OpenAiFunctionCall(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiFunctionCall: JSON object (unknown keys ignored)."""
+
+    name: Optional[str] = None
+    arguments: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiFunctionCall":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiFunctionCall(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiFunctionCall(self)
+
+
+class OpenAiToolCall(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiToolCall: JSON object (unknown keys ignored)."""
+
+    id: Optional[str] = None
+    index: Optional[int] = None
+    type: Optional[str] = "function"
+    function: Optional[OpenAiFunctionCall] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiToolCall":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiToolCall(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiToolCall(self)
+
+
+class OpenAiFunction(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiFunction: JSON object (unknown keys ignored)."""
+
+    description: Optional[str] = None
+    name: str = ""
+    parameters: Optional[Any] = None
+    strict: Optional[bool] = None
+    defer_loading: Optional[bool] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiFunction":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiFunction(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiFunction(self)
+
+
+class OpenAiTool(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiTool: JSON object (unknown keys ignored)."""
+
+    type: Optional[str] = "function"
+    function: Optional[OpenAiFunction] = None
+    defer_loading: Optional[bool] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiTool":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiTool(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiTool(self)
+
+
+class OpenAiToolChoiceFunction(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiToolChoiceFunction: JSON object (unknown keys ignored)."""
+
+    name: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiToolChoiceFunction":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiToolChoiceFunction(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiToolChoiceFunction(self)
+
+
+class OpenAiNamedToolChoice(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiNamedToolChoice: JSON object (unknown keys ignored)."""
+
+    function: Optional[OpenAiToolChoiceFunction] = None
+    type: Optional[str] = "function"
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiNamedToolChoice":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiNamedToolChoice(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiNamedToolChoice(self)
+
+
+class OpenAiChatMessage(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiChatMessage: JSON object (unknown keys ignored)."""
+
+    role: str = ""
+    content: Optional[OpenAiChatContent] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+    phase: Optional[str] = None
+    reasoning_content: Optional[str] = None
+    tool_calls: List[OpenAiToolCall] = []
+    tools: List[OpenAiTool] = []
+    prefix: Optional[bool] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiChatMessage":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiChatMessage(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiChatMessage(self)
+
+
+class OpenAiChatCompletionRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiChatCompletionRequest: JSON object (unknown keys ignored)."""
+
+    messages: List[OpenAiChatMessage] = []
+    model: Optional[str] = "default"
+    frequency_penalty: float = 0.0
+    logit_bias: Dict[str, float] = {}
+    logprobs: bool = False
+    top_logprobs: Optional[int] = None
+    max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
+    n: Optional[int] = 1
+    presence_penalty: float = 0.0
+    response_format: Optional[OpenAiResponseFormat] = None
+    seed: Optional[int] = None
+    stop: Optional[StringOrList] = None
+    stream: bool = False
+    stream_options: Optional[OpenAiStreamOptions] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    user: Optional[str] = None
+    tools: List[OpenAiTool] = []
+    tool_choice: Optional[OpenAiToolChoice] = None
+    parallel_tool_calls: Optional[bool] = True
+    return_hidden_states: Optional[OpenAiReturnHiddenStates] = None
+    return_routed_experts: bool = False
+    routed_experts_start_len: int = 0
+    return_cached_tokens_details: bool = False
+    return_spec_tokens_details: bool = False
+    return_prompt_token_ids: bool = False
+    return_token_ids: bool = False
+    return_meta_info: bool = False
+    return_input_ids_in_sglext: bool = False
+    return_output_ids_in_sglext: bool = False
+    return_sampling_mask: bool = False
+    sampling_logprobs_mode: Optional[str] = None
+    return_flat_raw_output_top_logprobs: bool = False
+    return_flat_raw_top_logprobs_b64: Optional[bool] = True
+    reasoning_effort: Optional[OpenAiReasoningEffort] = None
+    thinking: Optional[Any] = None
+    task: Optional[str] = None
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    min_tokens: int = 0
+    regex: Optional[str] = None
+    ebnf: Optional[str] = None
+    repetition_penalty: Optional[float] = None
+    stop_token_ids: Optional[Int64List] = None
+    stop_regex: Optional[StringOrList] = None
+    no_stop_trim: bool = False
+    ignore_eos: bool = False
+    continue_final_message: bool = False
+    skip_special_tokens: Optional[bool] = True
+    lora_path: Optional[OptionalStringOrList] = None
+    session_id: Optional[str] = None
+    session_params: Optional[Any] = None
+    separate_reasoning: Optional[bool] = True
+    stream_reasoning: Optional[bool] = True
+    chat_template_kwargs: Optional[Any] = None
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
+    use_audio_in_video: bool = False
+    images_config: Optional[Any] = None
+    video_config: Optional[Any] = None
+    mm_processor_kwargs: Optional[Any] = None
+    custom_logit_processor: Optional[OptionalStringOrList] = None
+    custom_params: Optional[Any] = None
+    watermark: Optional[Any] = None
+    input_ids: Optional[Int64List] = None
+    rid: Optional[StringOrList] = None
+    extra_key: Optional[StringOrList] = None
+    cache_salt: Optional[StringOrList] = None
+    priority: Optional[int] = None
+    data_parallel_rank: Optional[int] = None
+    bootstrap_host: Optional[StringOrList] = None
+    bootstrap_port: Optional[OptionalInt64OrList] = None
+    bootstrap_room: Optional[Int64OrList] = None
+    routed_dp_rank: Optional[int] = None
+    disagg_prefill_dp_rank: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiChatCompletionRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiChatCompletionRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiChatCompletionRequest(self)
+
+
+class OpenAiChatMessageResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiChatMessageResponse: JSON object (unknown keys ignored)."""
+
+    role: Optional[str] = None
+    content: Optional[str] = None
+    reasoning_content: Optional[str] = None
+    tool_calls: List[OpenAiToolCall] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiChatMessageResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiChatMessageResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiChatMessageResponse(self)
+
+
+class OpenAiChatCompletionChoice(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiChatCompletionChoice: JSON object (unknown keys ignored)."""
+
+    index: int = 0
+    message: Optional[OpenAiChatMessageResponse] = None
+    logprobs: Optional[OpenAiChoiceLogprobs] = None
+    finish_reason: Optional[str] = None
+    matched_stop: Optional[Matched] = None
+    hidden_states: Optional[Any] = None
+    prompt_token_ids: Optional[Int64List] = None
+    response_token_ids: Optional[Int64List] = None
+    meta_info: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiChatCompletionChoice":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiChatCompletionChoice(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiChatCompletionChoice(self)
+
+
+class OpenAiChatCompletionResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiChatCompletionResponse: JSON object (unknown keys ignored)."""
+
+    id: str = ""
+    object: str = ""
+    created: int = 0
+    model: str = ""
+    choices: List[OpenAiChatCompletionChoice] = []
+    usage: Optional[OpenAiUsage] = None
+    metadata: Optional[Any] = None
+    sglext: Optional[OpenAiSglExt] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiChatCompletionResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiChatCompletionResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiChatCompletionResponse(self)
+
+
+class OpenAiDeltaMessage(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiDeltaMessage: JSON object (unknown keys ignored)."""
+
+    role: Optional[str] = None
+    content: Optional[str] = None
+    reasoning_content: Optional[str] = None
+    tool_calls: List[OpenAiToolCall] = []
+    hidden_states: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiDeltaMessage":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiDeltaMessage(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiDeltaMessage(self)
+
+
+class OpenAiChatCompletionStreamChoice(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiChatCompletionStreamChoice: JSON object (unknown keys ignored)."""
+
+    index: int = 0
+    delta: Optional[OpenAiDeltaMessage] = None
+    logprobs: Optional[OpenAiChoiceLogprobs] = None
+    finish_reason: Optional[str] = None
+    matched_stop: Optional[Matched] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiChatCompletionStreamChoice":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiChatCompletionStreamChoice(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiChatCompletionStreamChoice(self)
+
+
+class OpenAiChatCompletionStreamResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiChatCompletionStreamResponse: JSON object (unknown keys ignored)."""
+
+    id: str = ""
+    object: str = ""
+    created: int = 0
+    model: str = ""
+    choices: List[OpenAiChatCompletionStreamChoice] = []
+    usage: Optional[OpenAiUsage] = None
+    sglext: Optional[OpenAiSglExt] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiChatCompletionStreamResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiChatCompletionStreamResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiChatCompletionStreamResponse(self)
+
+
+class OpenAiResponseReasoning(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiResponseReasoning: JSON object (unknown keys ignored)."""
+
+    effort: Optional[str] = "medium"
+    summary: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiResponseReasoning":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiResponseReasoning(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiResponseReasoning(self)
+
+
+class OpenAiResponseTool(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiResponseTool: JSON object (unknown keys ignored)."""
+
+    type: str = ""
+    name: Optional[str] = None
+    description: Optional[str] = None
+    parameters: Optional[Any] = None
+    strict: bool = False
+    tools: List[Any] = []
+    defer_loading: Optional[bool] = None
+    format: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiResponseTool":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiResponseTool(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiResponseTool(self)
+
+
+class OpenAiResponsesRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiResponsesRequest: JSON object (unknown keys ignored)."""
+
+    background: Optional[bool] = False
+    include: List[str] = []
+    input: Optional[Any] = None
+    instructions: Optional[str] = None
+    max_output_tokens: Optional[int] = None
+    max_tool_calls: Optional[int] = None
+    metadata: Optional[Any] = None
+    model: Optional[str] = None
+    parallel_tool_calls: Optional[bool] = True
+    previous_response_id: Optional[str] = None
+    reasoning: Optional[OpenAiResponseReasoning] = None
+    service_tier: Optional[str] = "auto"
+    store: Optional[bool] = True
+    stream: Optional[bool] = False
+    temperature: Optional[float] = None
+    text: Optional[Any] = None
+    tool_choice: Optional[Any] = None
+    tools: List[OpenAiResponseTool] = []
+    top_logprobs: Optional[int] = 0
+    top_p: Optional[float] = None
+    truncation: Optional[str] = "disabled"
+    user: Optional[str] = None
+    chat_template_kwargs: Optional[Any] = None
+    request_id: Optional[str] = None
+    session_id: Optional[str] = None
+    priority: int = 0
+    extra_key: Optional[str] = None
+    cache_salt: Optional[str] = None
+    data_parallel_rank: Optional[int] = None
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    stop: Optional[StringOrList] = None
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    bootstrap_host: Optional[StringOrList] = None
+    bootstrap_port: Optional[OptionalInt64OrList] = None
+    bootstrap_room: Optional[Int64OrList] = None
+    routed_dp_rank: Optional[int] = None
+    disagg_prefill_dp_rank: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiResponsesRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiResponsesRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiResponsesRequest(self)
+
+
+class OpenAiResponsesInputTokensDetails(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiResponsesInputTokensDetails: JSON object (unknown keys ignored)."""
+
+    cached_tokens: int = 0
+    cache_write_tokens: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiResponsesInputTokensDetails":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiResponsesInputTokensDetails(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiResponsesInputTokensDetails(self)
+
+
+class OpenAiResponsesOutputTokensDetails(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiResponsesOutputTokensDetails: JSON object (unknown keys ignored)."""
+
+    reasoning_tokens: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiResponsesOutputTokensDetails":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiResponsesOutputTokensDetails(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiResponsesOutputTokensDetails(self)
+
+
+class OpenAiResponsesUsage(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiResponsesUsage: JSON object (unknown keys ignored)."""
+
+    input_tokens: int = 0
+    input_tokens_details: Optional[OpenAiResponsesInputTokensDetails] = None
+    output_tokens: int = 0
+    output_tokens_details: Optional[OpenAiResponsesOutputTokensDetails] = None
+    total_tokens: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiResponsesUsage":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiResponsesUsage(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiResponsesUsage(self)
+
+
+class OpenAiResponsesResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiResponsesResponse: JSON object (unknown keys ignored)."""
+
+    id: str = ""
+    object: str = ""
+    created_at: int = 0
+    model: str = ""
+    output: List[Any] = []
+    status: str = ""
+    usage: Optional[OpenAiResponsesUsage] = None
+    parallel_tool_calls: bool = False
+    tool_choice: Optional[Any] = None
+    tools: List[OpenAiResponseTool] = []
+    error: Optional[Any] = None
+    incomplete_details: Optional[Any] = None
+    instructions: Optional[str] = None
+    max_output_tokens: Optional[int] = None
+    previous_response_id: Optional[str] = None
+    reasoning: Optional[Any] = None
+    store: Optional[bool] = None
+    temperature: Optional[float] = None
+    text: Optional[Any] = None
+    top_p: Optional[float] = None
+    truncation: Optional[str] = None
+    user: Optional[str] = None
+    metadata: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiResponsesResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiResponsesResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiResponsesResponse(self)
+
+
+class OpenAiModelCard(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiModelCard: JSON object (unknown keys ignored)."""
+
+    id: str = ""
+    object: str = ""
+    created: int = 0
+    owned_by: str = ""
+    root: Optional[str] = None
+    parent: Optional[str] = None
+    max_model_len: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiModelCard":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiModelCard(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiModelCard(self)
+
+
+class OpenAiModelList(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiModelList: JSON object (unknown keys ignored)."""
+
+    object: str = ""
+    data: List[OpenAiModelCard] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiModelList":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiModelList(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiModelList(self)
+
+
+class OpenAiListModelsRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiListModelsRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiListModelsRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiListModelsRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiListModelsRequest(self)
+
+
+class OpenAiRetrieveModelRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiRetrieveModelRequest: JSON object (unknown keys ignored)."""
+
+    model: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiRetrieveModelRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiRetrieveModelRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiRetrieveModelRequest(self)
+
+
 class ParseFunctionCallRequest(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.ParseFunctionCallRequest: JSON object (unknown keys ignored)."""
 
@@ -2991,6 +4155,33 @@ MediaItemsList = List[OptionalMediaItems]
 
 # sglang.api.v1.MediaInput: JSON: the value's shape picks the arm.
 MediaInput = Union[MediaItem, MediaItems, MediaItemsList]
+
+# sglang.api.v1.OpenAiSpecTokensDetailsList: JSON bare array.
+OpenAiSpecTokensDetailsList = List[OpenAiSpecTokensDetails]
+
+# sglang.api.v1.OpenAiSpecTokensDetailsOrList: JSON: one value or an array of values.
+OpenAiSpecTokensDetailsOrList = Union[OpenAiSpecTokensDetails, OpenAiSpecTokensDetailsList]
+
+# sglang.api.v1.OpenAiReturnHiddenStates: JSON: the value's shape picks the arm.
+OpenAiReturnHiddenStates = Union[bool, str]
+
+# sglang.api.v1.OpenAiCompletionPrompt: JSON: the value's shape picks the arm.
+OpenAiCompletionPrompt = Union[str, StringList, TokenIds, TokenIdsList]
+
+# sglang.api.v1.OpenAiChatContentPart: JSON object tagged by its type key.
+OpenAiChatContentPart = Union[OpenAiTextPart, OpenAiThinkingPart, OpenAiThinkingPart, OpenAiImagePart, OpenAiVideoPart, OpenAiAudioUrlPart, OpenAiInputAudioPart, OpenAiToolReferencePart]
+
+# sglang.api.v1.OpenAiChatContentPartList: JSON bare array.
+OpenAiChatContentPartList = List[OpenAiChatContentPart]
+
+# sglang.api.v1.OpenAiChatContent: JSON: the value's shape picks the arm.
+OpenAiChatContent = Union[str, OpenAiChatContentPartList]
+
+# sglang.api.v1.OpenAiToolChoice: JSON: the value's shape picks the arm.
+OpenAiToolChoice = Union[str, OpenAiNamedToolChoice]
+
+# sglang.api.v1.OpenAiReasoningEffort: JSON: the value's shape picks the arm.
+OpenAiReasoningEffort = Union[str, float]
 
 # sglang.api.v1.StringOrList: JSON: one value or an array of values.
 StringOrList = Union[str, StringList]
@@ -6645,6 +7836,2326 @@ def encode_OllamaShowResponse(v: OllamaShowResponse) -> Dict[str, Any]:
         d["model_info"] = v.model_info
     if v.capabilities:
         d["capabilities"] = list(v.capabilities)
+    return d
+
+
+def decode_OpenAiErrorResponse(value: Any) -> OpenAiErrorResponse:
+    m = _expect_map(value, expected="struct OpenAiErrorResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "object":
+            kw["object"] = _expect_str(x, expected="a string")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "type":
+            kw["type"] = _expect_str(x, expected="a string")
+        elif key == "param":
+            kw["param"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "code":
+            kw["code"] = _expect_int(x, expected="i64")
+    return OpenAiErrorResponse(**kw)
+
+
+def encode_OpenAiErrorResponse(v: OpenAiErrorResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["object"] = v.object
+    d["message"] = v.message
+    d["type"] = v.type
+    d["param"] = v.param
+    d["code"] = v.code
+    return d
+
+
+def decode_OpenAiCachedTokensDetails(value: Any) -> OpenAiCachedTokensDetails:
+    m = _expect_map(value, expected="struct OpenAiCachedTokensDetails")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "device":
+            kw["device"] = _expect_int(x, expected="i64")
+        elif key == "host":
+            kw["host"] = _expect_int(x, expected="i64")
+        elif key == "storage":
+            kw["storage"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "storage_backend":
+            kw["storage_backend"] = None if x is None else _expect_str(x, expected="a string")
+    return OpenAiCachedTokensDetails(**kw)
+
+
+def encode_OpenAiCachedTokensDetails(v: OpenAiCachedTokensDetails) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["device"] = v.device
+    d["host"] = v.host
+    if v.storage is not None:
+        d["storage"] = v.storage
+    if v.storage_backend is not None:
+        d["storage_backend"] = v.storage_backend
+    return d
+
+
+def decode_OpenAiPromptTokensDetails(value: Any) -> OpenAiPromptTokensDetails:
+    m = _expect_map(value, expected="struct OpenAiPromptTokensDetails")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "cached_tokens":
+            kw["cached_tokens"] = _expect_int(x, expected="i64")
+        elif key == "image_tokens":
+            kw["image_tokens"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "audio_tokens":
+            kw["audio_tokens"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "video_tokens":
+            kw["video_tokens"] = None if x is None else _expect_int(x, expected="i64")
+    return OpenAiPromptTokensDetails(**kw)
+
+
+def encode_OpenAiPromptTokensDetails(v: OpenAiPromptTokensDetails) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["cached_tokens"] = v.cached_tokens
+    if v.image_tokens is not None:
+        d["image_tokens"] = v.image_tokens
+    if v.audio_tokens is not None:
+        d["audio_tokens"] = v.audio_tokens
+    if v.video_tokens is not None:
+        d["video_tokens"] = v.video_tokens
+    return d
+
+
+def decode_OpenAiCompletionTokensDetails(value: Any) -> OpenAiCompletionTokensDetails:
+    m = _expect_map(value, expected="struct OpenAiCompletionTokensDetails")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "reasoning_tokens":
+            kw["reasoning_tokens"] = _expect_int(x, expected="i64")
+    return OpenAiCompletionTokensDetails(**kw)
+
+
+def encode_OpenAiCompletionTokensDetails(v: OpenAiCompletionTokensDetails) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["reasoning_tokens"] = v.reasoning_tokens
+    return d
+
+
+def decode_OpenAiUsage(value: Any) -> OpenAiUsage:
+    m = _expect_map(value, expected="struct OpenAiUsage")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "prompt_tokens":
+            kw["prompt_tokens"] = _expect_int(x, expected="i64")
+        elif key == "total_tokens":
+            kw["total_tokens"] = _expect_int(x, expected="i64")
+        elif key == "completion_tokens":
+            kw["completion_tokens"] = 0 if x is None else _expect_int(x, expected="i64")
+        elif key == "prompt_tokens_details":
+            kw["prompt_tokens_details"] = None if x is None else decode_OpenAiPromptTokensDetails(x)
+        elif key == "reasoning_tokens":
+            kw["reasoning_tokens"] = 0 if x is None else _expect_int(x, expected="i64")
+        elif key == "completion_tokens_details":
+            kw["completion_tokens_details"] = None if x is None else decode_OpenAiCompletionTokensDetails(x)
+    return OpenAiUsage(**kw)
+
+
+def encode_OpenAiUsage(v: OpenAiUsage) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["prompt_tokens"] = v.prompt_tokens
+    d["total_tokens"] = v.total_tokens
+    if v.completion_tokens is not None:
+        d["completion_tokens"] = v.completion_tokens
+    d["prompt_tokens_details"] = None if v.prompt_tokens_details is None else encode_OpenAiPromptTokensDetails(v.prompt_tokens_details)
+    if v.reasoning_tokens is not None:
+        d["reasoning_tokens"] = v.reasoning_tokens
+    d["completion_tokens_details"] = None if v.completion_tokens_details is None else encode_OpenAiCompletionTokensDetails(v.completion_tokens_details)
+    return d
+
+
+def decode_OpenAiSpecTokensDetails(value: Any) -> OpenAiSpecTokensDetails:
+    m = _expect_map(value, expected="struct OpenAiSpecTokensDetails")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "spec_accept_rate":
+            kw["spec_accept_rate"] = _expect_float(x, expected="f64")
+        elif key == "spec_accept_length":
+            kw["spec_accept_length"] = _expect_float(x, expected="f64")
+        elif key == "spec_cap_length":
+            kw["spec_cap_length"] = _expect_float(x, expected="f64")
+        elif key == "spec_block_accept_length":
+            kw["spec_block_accept_length"] = _expect_float(x, expected="f64")
+        elif key == "spec_num_correct_drafts":
+            kw["spec_num_correct_drafts"] = _expect_int(x, expected="i64")
+        elif key == "spec_num_proposed_drafts":
+            kw["spec_num_proposed_drafts"] = _expect_int(x, expected="i64")
+        elif key == "spec_verify_ct":
+            kw["spec_verify_ct"] = _expect_int(x, expected="i64")
+        elif key == "spec_correct_drafts_histogram":
+            kw["spec_correct_drafts_histogram"] = [] if x is None else [_expect_int(e, expected="i64") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "spec_cap_lens_histogram":
+            kw["spec_cap_lens_histogram"] = [] if x is None else [_expect_int(e, expected="i64") for e in _expect_seq(x, expected="a sequence")]
+    return OpenAiSpecTokensDetails(**kw)
+
+
+def encode_OpenAiSpecTokensDetails(v: OpenAiSpecTokensDetails) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["spec_accept_rate"] = float(v.spec_accept_rate)
+    d["spec_accept_length"] = float(v.spec_accept_length)
+    d["spec_cap_length"] = float(v.spec_cap_length)
+    d["spec_block_accept_length"] = float(v.spec_block_accept_length)
+    d["spec_num_correct_drafts"] = v.spec_num_correct_drafts
+    d["spec_num_proposed_drafts"] = v.spec_num_proposed_drafts
+    d["spec_verify_ct"] = v.spec_verify_ct
+    if v.spec_correct_drafts_histogram:
+        d["spec_correct_drafts_histogram"] = list(v.spec_correct_drafts_histogram)
+    if v.spec_cap_lens_histogram:
+        d["spec_cap_lens_histogram"] = list(v.spec_cap_lens_histogram)
+    return d
+
+
+def decode_OpenAiSpecTokensDetailsList(value: Any) -> OpenAiSpecTokensDetailsList:
+    return [decode_OpenAiSpecTokensDetails(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_OpenAiSpecTokensDetailsList(v: OpenAiSpecTokensDetailsList) -> List[Any]:
+    return [encode_OpenAiSpecTokensDetails(e) for e in v]
+
+
+def decode_OpenAiSpecTokensDetailsOrList(value: Any) -> OpenAiSpecTokensDetailsOrList:
+    if isinstance(value, list):
+        return decode_OpenAiSpecTokensDetailsList(value)
+    return decode_OpenAiSpecTokensDetails(_expect_map(value, expected="a value or an array of values for OpenAiSpecTokensDetailsOrList"))
+
+
+def encode_OpenAiSpecTokensDetailsOrList(v: OpenAiSpecTokensDetailsOrList) -> Any:
+    if isinstance(v, list):
+        return encode_OpenAiSpecTokensDetailsList(v)
+    return encode_OpenAiSpecTokensDetails(v)
+
+
+def decode_OpenAiSglExt(value: Any) -> OpenAiSglExt:
+    m = _expect_map(value, expected="struct OpenAiSglExt")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "routed_experts":
+            kw["routed_experts"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "cached_tokens_details":
+            kw["cached_tokens_details"] = None if x is None else decode_OpenAiCachedTokensDetails(x)
+        elif key == "spec_tokens_details":
+            kw["spec_tokens_details"] = None if x is None else decode_OpenAiSpecTokensDetailsOrList(x)
+        elif key == "input_ids":
+            kw["input_ids"] = None if x is None else decode_Int64List(x)
+        elif key == "output_ids":
+            kw["output_ids"] = None if x is None else decode_TokenIdsList(x)
+    return OpenAiSglExt(**kw)
+
+
+def encode_OpenAiSglExt(v: OpenAiSglExt) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.routed_experts is not None:
+        d["routed_experts"] = v.routed_experts
+    if v.cached_tokens_details is not None:
+        d["cached_tokens_details"] = encode_OpenAiCachedTokensDetails(v.cached_tokens_details)
+    if v.spec_tokens_details is not None:
+        d["spec_tokens_details"] = encode_OpenAiSpecTokensDetailsOrList(v.spec_tokens_details)
+    if v.input_ids is not None:
+        d["input_ids"] = encode_Int64List(v.input_ids)
+    if v.output_ids is not None:
+        d["output_ids"] = encode_TokenIdsList(v.output_ids)
+    return d
+
+
+def decode_OpenAiStreamOptions(value: Any) -> OpenAiStreamOptions:
+    m = _expect_map(value, expected="struct OpenAiStreamOptions")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "include_usage":
+            kw["include_usage"] = False if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "continuous_usage_stats":
+            kw["continuous_usage_stats"] = False if x is None else _expect_bool(x, expected="a boolean")
+    return OpenAiStreamOptions(**kw)
+
+
+def encode_OpenAiStreamOptions(v: OpenAiStreamOptions) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.include_usage is not None:
+        d["include_usage"] = v.include_usage
+    if v.continuous_usage_stats is not None:
+        d["continuous_usage_stats"] = v.continuous_usage_stats
+    return d
+
+
+def decode_OpenAiJsonSchemaResponseFormat(value: Any) -> OpenAiJsonSchemaResponseFormat:
+    m = _expect_map(value, expected="struct OpenAiJsonSchemaResponseFormat")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "name":
+            kw["name"] = _expect_str(x, expected="a string")
+        elif key == "description":
+            kw["description"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "schema":
+            kw["schema"] = x
+        elif key == "strict":
+            kw["strict"] = None if x is None else _expect_bool(x, expected="a boolean")
+    return OpenAiJsonSchemaResponseFormat(**kw)
+
+
+def encode_OpenAiJsonSchemaResponseFormat(v: OpenAiJsonSchemaResponseFormat) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["name"] = v.name
+    if v.description is not None:
+        d["description"] = v.description
+    if v.schema is not None:
+        d["schema"] = v.schema
+    if v.strict is not None:
+        d["strict"] = v.strict
+    return d
+
+
+def decode_OpenAiStructureResponseFormat(value: Any) -> OpenAiStructureResponseFormat:
+    m = _expect_map(value, expected="struct OpenAiStructureResponseFormat")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "begin":
+            kw["begin"] = _expect_str(x, expected="a string")
+        elif key == "schema":
+            kw["schema"] = x
+        elif key == "end":
+            kw["end"] = _expect_str(x, expected="a string")
+    return OpenAiStructureResponseFormat(**kw)
+
+
+def encode_OpenAiStructureResponseFormat(v: OpenAiStructureResponseFormat) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["begin"] = v.begin
+    if v.schema is not None:
+        d["schema"] = v.schema
+    d["end"] = v.end
+    return d
+
+
+def decode_OpenAiResponseFormat(value: Any) -> OpenAiResponseFormat:
+    m = _expect_map(value, expected="struct OpenAiResponseFormat")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "type":
+            kw["type"] = _expect_str(x, expected="a string")
+        elif key == "json_schema":
+            kw["json_schema"] = None if x is None else decode_OpenAiJsonSchemaResponseFormat(x)
+        elif key == "structures":
+            kw["structures"] = [] if x is None else [decode_OpenAiStructureResponseFormat(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "triggers":
+            kw["triggers"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "at_least_one":
+            kw["at_least_one"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "format":
+            kw["format"] = x
+    return OpenAiResponseFormat(**kw)
+
+
+def encode_OpenAiResponseFormat(v: OpenAiResponseFormat) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["type"] = v.type
+    if v.json_schema is not None:
+        d["json_schema"] = encode_OpenAiJsonSchemaResponseFormat(v.json_schema)
+    if v.structures:
+        d["structures"] = [encode_OpenAiStructureResponseFormat(e) for e in v.structures]
+    if v.triggers:
+        d["triggers"] = list(v.triggers)
+    if v.at_least_one is not None:
+        d["at_least_one"] = v.at_least_one
+    if v.format is not None:
+        d["format"] = v.format
+    return d
+
+
+def decode_OpenAiReturnHiddenStates(value: Any) -> OpenAiReturnHiddenStates:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value
+    raise _invalid_type(value, expected="one of the OpenAiReturnHiddenStates shapes")
+
+
+def encode_OpenAiReturnHiddenStates(v: OpenAiReturnHiddenStates) -> Any:
+    if isinstance(v, (bool,)):
+        return v
+    if isinstance(v, (str,)):
+        return v
+    return v
+
+
+def decode_OpenAiLogProbs(value: Any) -> OpenAiLogProbs:
+    m = _expect_map(value, expected="struct OpenAiLogProbs")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "text_offset":
+            kw["text_offset"] = [] if x is None else [_expect_int(e, expected="i64") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "token_logprobs":
+            kw["token_logprobs"] = [] if x is None else [decode_OptionalDouble(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "tokens":
+            kw["tokens"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "top_logprobs":
+            kw["top_logprobs"] = [] if x is None else list(_expect_seq(x, expected="a sequence"))
+    return OpenAiLogProbs(**kw)
+
+
+def encode_OpenAiLogProbs(v: OpenAiLogProbs) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.text_offset:
+        d["text_offset"] = list(v.text_offset)
+    if v.token_logprobs:
+        d["token_logprobs"] = [encode_OptionalDouble(e) for e in v.token_logprobs]
+    if v.tokens:
+        d["tokens"] = list(v.tokens)
+    if v.top_logprobs:
+        d["top_logprobs"] = list(v.top_logprobs)
+    return d
+
+
+def decode_OpenAiTopLogprob(value: Any) -> OpenAiTopLogprob:
+    m = _expect_map(value, expected="struct OpenAiTopLogprob")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "token":
+            kw["token"] = _expect_str(x, expected="a string")
+        elif key == "bytes":
+            kw["bytes"] = [] if x is None else [_expect_int(e, expected="i64") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "logprob":
+            kw["logprob"] = _expect_float(x, expected="f64")
+    return OpenAiTopLogprob(**kw)
+
+
+def encode_OpenAiTopLogprob(v: OpenAiTopLogprob) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["token"] = v.token
+    if v.bytes:
+        d["bytes"] = list(v.bytes)
+    d["logprob"] = float(v.logprob)
+    return d
+
+
+def decode_OpenAiChatCompletionTokenLogprob(value: Any) -> OpenAiChatCompletionTokenLogprob:
+    m = _expect_map(value, expected="struct OpenAiChatCompletionTokenLogprob")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "token":
+            kw["token"] = _expect_str(x, expected="a string")
+        elif key == "bytes":
+            kw["bytes"] = [] if x is None else [_expect_int(e, expected="i64") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "logprob":
+            kw["logprob"] = _expect_float(x, expected="f64")
+        elif key == "top_logprobs":
+            kw["top_logprobs"] = [] if x is None else [decode_OpenAiTopLogprob(e) for e in _expect_seq(x, expected="a sequence")]
+    return OpenAiChatCompletionTokenLogprob(**kw)
+
+
+def encode_OpenAiChatCompletionTokenLogprob(v: OpenAiChatCompletionTokenLogprob) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["token"] = v.token
+    if v.bytes:
+        d["bytes"] = list(v.bytes)
+    d["logprob"] = float(v.logprob)
+    if v.top_logprobs:
+        d["top_logprobs"] = [encode_OpenAiTopLogprob(e) for e in v.top_logprobs]
+    return d
+
+
+def decode_OpenAiChoiceLogprobs(value: Any) -> OpenAiChoiceLogprobs:
+    m = _expect_map(value, expected="struct OpenAiChoiceLogprobs")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "content":
+            kw["content"] = [] if x is None else [decode_OpenAiChatCompletionTokenLogprob(e) for e in _expect_seq(x, expected="a sequence")]
+    return OpenAiChoiceLogprobs(**kw)
+
+
+def encode_OpenAiChoiceLogprobs(v: OpenAiChoiceLogprobs) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.content:
+        d["content"] = [encode_OpenAiChatCompletionTokenLogprob(e) for e in v.content]
+    return d
+
+
+def decode_OpenAiCompletionPrompt(value: Any) -> OpenAiCompletionPrompt:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        if not value:
+            return decode_StringList(value)
+        if isinstance(value[0], str):
+            return decode_StringList(value)
+        if _is_int(value[0]):
+            return decode_TokenIds(value)
+        if isinstance(value[0], list):
+            return decode_TokenIdsList(value)
+        raise _invalid_type(value, expected="one of the OpenAiCompletionPrompt list shapes")
+    raise _invalid_type(value, expected="one of the OpenAiCompletionPrompt shapes")
+
+
+def encode_OpenAiCompletionPrompt(v: OpenAiCompletionPrompt) -> Any:
+    if isinstance(v, (str,)):
+        return v
+    if isinstance(v, list) and (not v or isinstance(v[0], str)):
+        return encode_StringList(v)
+    if isinstance(v, list) and bool(v) and (_is_int(v[0])):
+        return encode_TokenIds(v)
+    if isinstance(v, list) and bool(v) and (isinstance(v[0], list)):
+        return encode_TokenIdsList(v)
+    return v
+
+
+def decode_OpenAiCompletionRequest(value: Any) -> OpenAiCompletionRequest:
+    m = _expect_map(value, expected="struct OpenAiCompletionRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model":
+            kw["model"] = "default" if x is None else _expect_str(x, expected="a string")
+        elif key == "prompt":
+            kw["prompt"] = None if x is None else decode_OpenAiCompletionPrompt(x)
+        elif key == "best_of":
+            kw["best_of"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "echo":
+            kw["echo"] = _expect_bool(x, expected="a boolean")
+        elif key == "frequency_penalty":
+            kw["frequency_penalty"] = _expect_float(x, expected="f64")
+        elif key == "logit_bias":
+            kw["logit_bias"] = {} if x is None else {k: _expect_float(e, expected="f64") for k, e in _expect_map(x, expected="a map").items()}
+        elif key == "logprobs":
+            kw["logprobs"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "max_tokens":
+            kw["max_tokens"] = 16 if x is None else _expect_int(x, expected="i64")
+        elif key == "n":
+            kw["n"] = 1 if x is None else _expect_int(x, expected="i64")
+        elif key == "presence_penalty":
+            kw["presence_penalty"] = _expect_float(x, expected="f64")
+        elif key == "seed":
+            kw["seed"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "stop":
+            kw["stop"] = None if x is None else decode_StringOrList(x)
+        elif key == "stream":
+            kw["stream"] = _expect_bool(x, expected="a boolean")
+        elif key == "stream_options":
+            kw["stream_options"] = None if x is None else decode_OpenAiStreamOptions(x)
+        elif key == "suffix":
+            kw["suffix"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "temperature":
+            kw["temperature"] = 1.0 if x is None else _expect_float(x, expected="f64")
+        elif key == "top_p":
+            kw["top_p"] = 1.0 if x is None else _expect_float(x, expected="f64")
+        elif key == "user":
+            kw["user"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "return_hidden_states":
+            kw["return_hidden_states"] = None if x is None else decode_OpenAiReturnHiddenStates(x)
+        elif key == "return_routed_experts":
+            kw["return_routed_experts"] = _expect_bool(x, expected="a boolean")
+        elif key == "routed_experts_start_len":
+            kw["routed_experts_start_len"] = _expect_int(x, expected="i64")
+        elif key == "return_cached_tokens_details":
+            kw["return_cached_tokens_details"] = _expect_bool(x, expected="a boolean")
+        elif key == "return_spec_tokens_details":
+            kw["return_spec_tokens_details"] = _expect_bool(x, expected="a boolean")
+        elif key == "return_token_ids":
+            kw["return_token_ids"] = _expect_bool(x, expected="a boolean")
+        elif key == "top_k":
+            kw["top_k"] = -1 if x is None else _expect_int(x, expected="i64")
+        elif key == "min_p":
+            kw["min_p"] = _expect_float(x, expected="f64")
+        elif key == "min_tokens":
+            kw["min_tokens"] = _expect_int(x, expected="i64")
+        elif key == "json_schema":
+            kw["json_schema"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "regex":
+            kw["regex"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "ebnf":
+            kw["ebnf"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "repetition_penalty":
+            kw["repetition_penalty"] = 1.0 if x is None else _expect_float(x, expected="f64")
+        elif key == "stop_token_ids":
+            kw["stop_token_ids"] = None if x is None else decode_Int64List(x)
+        elif key == "stop_regex":
+            kw["stop_regex"] = None if x is None else decode_StringOrList(x)
+        elif key == "no_stop_trim":
+            kw["no_stop_trim"] = _expect_bool(x, expected="a boolean")
+        elif key == "ignore_eos":
+            kw["ignore_eos"] = _expect_bool(x, expected="a boolean")
+        elif key == "skip_special_tokens":
+            kw["skip_special_tokens"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "lora_path":
+            kw["lora_path"] = None if x is None else decode_OptionalStringOrList(x)
+        elif key == "session_id":
+            kw["session_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "session_params":
+            kw["session_params"] = x
+        elif key == "response_format":
+            kw["response_format"] = None if x is None else decode_OpenAiResponseFormat(x)
+        elif key == "custom_params":
+            kw["custom_params"] = x
+        elif key == "custom_logit_processor":
+            kw["custom_logit_processor"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "watermark":
+            kw["watermark"] = x
+        elif key == "images_config":
+            kw["images_config"] = x
+        elif key == "mm_processor_kwargs":
+            kw["mm_processor_kwargs"] = x
+        elif key == "data_parallel_rank":
+            kw["data_parallel_rank"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "rid":
+            kw["rid"] = None if x is None else decode_StringOrList(x)
+        elif key == "extra_key":
+            kw["extra_key"] = None if x is None else decode_StringOrList(x)
+        elif key == "cache_salt":
+            kw["cache_salt"] = None if x is None else decode_StringOrList(x)
+        elif key == "priority":
+            kw["priority"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "custom_labels":
+            kw["custom_labels"] = {} if x is None else {k: _expect_str(e, expected="a string") for k, e in _expect_map(x, expected="a map").items()}
+        elif key == "bootstrap_host":
+            kw["bootstrap_host"] = None if x is None else decode_StringOrList(x)
+        elif key == "bootstrap_port":
+            kw["bootstrap_port"] = None if x is None else decode_OptionalInt64OrList(x)
+        elif key == "bootstrap_room":
+            kw["bootstrap_room"] = None if x is None else decode_Int64OrList(x)
+        elif key == "routed_dp_rank":
+            kw["routed_dp_rank"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "disagg_prefill_dp_rank":
+            kw["disagg_prefill_dp_rank"] = None if x is None else _expect_int(x, expected="i64")
+    return OpenAiCompletionRequest(**kw)
+
+
+def encode_OpenAiCompletionRequest(v: OpenAiCompletionRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.model is not None:
+        d["model"] = v.model
+    if v.prompt is not None:
+        d["prompt"] = encode_OpenAiCompletionPrompt(v.prompt)
+    if v.best_of is not None:
+        d["best_of"] = v.best_of
+    d["echo"] = v.echo
+    d["frequency_penalty"] = float(v.frequency_penalty)
+    if v.logit_bias:
+        d["logit_bias"] = {k: float(e) for k, e in v.logit_bias.items()}
+    if v.logprobs is not None:
+        d["logprobs"] = v.logprobs
+    if v.max_tokens is not None:
+        d["max_tokens"] = v.max_tokens
+    if v.n is not None:
+        d["n"] = v.n
+    d["presence_penalty"] = float(v.presence_penalty)
+    if v.seed is not None:
+        d["seed"] = v.seed
+    if v.stop is not None:
+        d["stop"] = encode_StringOrList(v.stop)
+    d["stream"] = v.stream
+    if v.stream_options is not None:
+        d["stream_options"] = encode_OpenAiStreamOptions(v.stream_options)
+    if v.suffix is not None:
+        d["suffix"] = v.suffix
+    if v.temperature is not None:
+        d["temperature"] = float(v.temperature)
+    if v.top_p is not None:
+        d["top_p"] = float(v.top_p)
+    if v.user is not None:
+        d["user"] = v.user
+    if v.return_hidden_states is not None:
+        d["return_hidden_states"] = encode_OpenAiReturnHiddenStates(v.return_hidden_states)
+    d["return_routed_experts"] = v.return_routed_experts
+    d["routed_experts_start_len"] = v.routed_experts_start_len
+    d["return_cached_tokens_details"] = v.return_cached_tokens_details
+    d["return_spec_tokens_details"] = v.return_spec_tokens_details
+    d["return_token_ids"] = v.return_token_ids
+    if v.top_k is not None:
+        d["top_k"] = v.top_k
+    d["min_p"] = float(v.min_p)
+    d["min_tokens"] = v.min_tokens
+    if v.json_schema is not None:
+        d["json_schema"] = v.json_schema
+    if v.regex is not None:
+        d["regex"] = v.regex
+    if v.ebnf is not None:
+        d["ebnf"] = v.ebnf
+    if v.repetition_penalty is not None:
+        d["repetition_penalty"] = float(v.repetition_penalty)
+    if v.stop_token_ids is not None:
+        d["stop_token_ids"] = encode_Int64List(v.stop_token_ids)
+    if v.stop_regex is not None:
+        d["stop_regex"] = encode_StringOrList(v.stop_regex)
+    d["no_stop_trim"] = v.no_stop_trim
+    d["ignore_eos"] = v.ignore_eos
+    if v.skip_special_tokens is not None:
+        d["skip_special_tokens"] = v.skip_special_tokens
+    if v.lora_path is not None:
+        d["lora_path"] = encode_OptionalStringOrList(v.lora_path)
+    if v.session_id is not None:
+        d["session_id"] = v.session_id
+    if v.session_params is not None:
+        d["session_params"] = v.session_params
+    if v.response_format is not None:
+        d["response_format"] = encode_OpenAiResponseFormat(v.response_format)
+    if v.custom_params is not None:
+        d["custom_params"] = v.custom_params
+    if v.custom_logit_processor is not None:
+        d["custom_logit_processor"] = v.custom_logit_processor
+    if v.watermark is not None:
+        d["watermark"] = v.watermark
+    if v.images_config is not None:
+        d["images_config"] = v.images_config
+    if v.mm_processor_kwargs is not None:
+        d["mm_processor_kwargs"] = v.mm_processor_kwargs
+    if v.data_parallel_rank is not None:
+        d["data_parallel_rank"] = v.data_parallel_rank
+    if v.rid is not None:
+        d["rid"] = encode_StringOrList(v.rid)
+    if v.extra_key is not None:
+        d["extra_key"] = encode_StringOrList(v.extra_key)
+    if v.cache_salt is not None:
+        d["cache_salt"] = encode_StringOrList(v.cache_salt)
+    if v.priority is not None:
+        d["priority"] = v.priority
+    if v.custom_labels:
+        d["custom_labels"] = dict(v.custom_labels)
+    if v.bootstrap_host is not None:
+        d["bootstrap_host"] = encode_StringOrList(v.bootstrap_host)
+    if v.bootstrap_port is not None:
+        d["bootstrap_port"] = encode_OptionalInt64OrList(v.bootstrap_port)
+    if v.bootstrap_room is not None:
+        d["bootstrap_room"] = encode_Int64OrList(v.bootstrap_room)
+    if v.routed_dp_rank is not None:
+        d["routed_dp_rank"] = v.routed_dp_rank
+    if v.disagg_prefill_dp_rank is not None:
+        d["disagg_prefill_dp_rank"] = v.disagg_prefill_dp_rank
+    return d
+
+
+def decode_OpenAiCompletionChoice(value: Any) -> OpenAiCompletionChoice:
+    m = _expect_map(value, expected="struct OpenAiCompletionChoice")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "index":
+            kw["index"] = _expect_int(x, expected="i64")
+        elif key == "text":
+            kw["text"] = _expect_str(x, expected="a string")
+        elif key == "logprobs":
+            kw["logprobs"] = None if x is None else decode_OpenAiLogProbs(x)
+        elif key == "finish_reason":
+            kw["finish_reason"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "matched_stop":
+            kw["matched_stop"] = None if x is None else decode_Matched(x)
+        elif key == "hidden_states":
+            kw["hidden_states"] = x
+        elif key == "token_ids":
+            kw["token_ids"] = None if x is None else decode_Int64List(x)
+        elif key == "prompt_token_ids":
+            kw["prompt_token_ids"] = None if x is None else decode_Int64List(x)
+    return OpenAiCompletionChoice(**kw)
+
+
+def encode_OpenAiCompletionChoice(v: OpenAiCompletionChoice) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["index"] = v.index
+    d["text"] = v.text
+    d["logprobs"] = None if v.logprobs is None else encode_OpenAiLogProbs(v.logprobs)
+    d["finish_reason"] = v.finish_reason
+    d["matched_stop"] = None if v.matched_stop is None else encode_Matched(v.matched_stop)
+    if v.hidden_states is not None:
+        d["hidden_states"] = v.hidden_states
+    if v.token_ids is not None:
+        d["token_ids"] = encode_Int64List(v.token_ids)
+    if v.prompt_token_ids is not None:
+        d["prompt_token_ids"] = encode_Int64List(v.prompt_token_ids)
+    return d
+
+
+def decode_OpenAiCompletionResponse(value: Any) -> OpenAiCompletionResponse:
+    m = _expect_map(value, expected="struct OpenAiCompletionResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "id":
+            kw["id"] = _expect_str(x, expected="a string")
+        elif key == "object":
+            kw["object"] = _expect_str(x, expected="a string")
+        elif key == "created":
+            kw["created"] = _expect_int(x, expected="i64")
+        elif key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "choices":
+            kw["choices"] = [] if x is None else [decode_OpenAiCompletionChoice(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "usage":
+            kw["usage"] = None if x is None else decode_OpenAiUsage(x)
+        elif key == "metadata":
+            kw["metadata"] = x
+        elif key == "sglext":
+            kw["sglext"] = None if x is None else decode_OpenAiSglExt(x)
+    return OpenAiCompletionResponse(**kw)
+
+
+def encode_OpenAiCompletionResponse(v: OpenAiCompletionResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["id"] = v.id
+    d["object"] = v.object
+    d["created"] = v.created
+    d["model"] = v.model
+    if v.choices:
+        d["choices"] = [encode_OpenAiCompletionChoice(e) for e in v.choices]
+    if v.usage is not None:
+        d["usage"] = encode_OpenAiUsage(v.usage)
+    d["metadata"] = v.metadata
+    if v.sglext is not None:
+        d["sglext"] = encode_OpenAiSglExt(v.sglext)
+    return d
+
+
+def decode_OpenAiCompletionStreamResponse(value: Any) -> OpenAiCompletionStreamResponse:
+    m = _expect_map(value, expected="struct OpenAiCompletionStreamResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "id":
+            kw["id"] = _expect_str(x, expected="a string")
+        elif key == "object":
+            kw["object"] = _expect_str(x, expected="a string")
+        elif key == "created":
+            kw["created"] = _expect_int(x, expected="i64")
+        elif key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "choices":
+            kw["choices"] = [] if x is None else [decode_OpenAiCompletionChoice(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "usage":
+            kw["usage"] = None if x is None else decode_OpenAiUsage(x)
+        elif key == "sglext":
+            kw["sglext"] = None if x is None else decode_OpenAiSglExt(x)
+    return OpenAiCompletionStreamResponse(**kw)
+
+
+def encode_OpenAiCompletionStreamResponse(v: OpenAiCompletionStreamResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["id"] = v.id
+    d["object"] = v.object
+    d["created"] = v.created
+    d["model"] = v.model
+    if v.choices:
+        d["choices"] = [encode_OpenAiCompletionChoice(e) for e in v.choices]
+    d["usage"] = None if v.usage is None else encode_OpenAiUsage(v.usage)
+    if v.sglext is not None:
+        d["sglext"] = encode_OpenAiSglExt(v.sglext)
+    return d
+
+
+def decode_OpenAiImageUrl(value: Any) -> OpenAiImageUrl:
+    m = _expect_map(value, expected="struct OpenAiImageUrl")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "url":
+            kw["url"] = _expect_str(x, expected="a string")
+        elif key == "detail":
+            kw["detail"] = "auto" if x is None else _expect_str(x, expected="a string")
+        elif key == "max_dynamic_patch":
+            kw["max_dynamic_patch"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "min_dynamic_patch":
+            kw["min_dynamic_patch"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "content_hash":
+            kw["content_hash"] = None if x is None else _expect_str(x, expected="a string")
+    return OpenAiImageUrl(**kw)
+
+
+def encode_OpenAiImageUrl(v: OpenAiImageUrl) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["url"] = v.url
+    if v.detail is not None:
+        d["detail"] = v.detail
+    if v.max_dynamic_patch is not None:
+        d["max_dynamic_patch"] = v.max_dynamic_patch
+    if v.min_dynamic_patch is not None:
+        d["min_dynamic_patch"] = v.min_dynamic_patch
+    if v.content_hash is not None:
+        d["content_hash"] = v.content_hash
+    return d
+
+
+def decode_OpenAiVideoUrl(value: Any) -> OpenAiVideoUrl:
+    m = _expect_map(value, expected="struct OpenAiVideoUrl")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "url":
+            kw["url"] = _expect_str(x, expected="a string")
+        elif key == "max_dynamic_patch":
+            kw["max_dynamic_patch"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "min_dynamic_patch":
+            kw["min_dynamic_patch"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "fps":
+            kw["fps"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "max_frames":
+            kw["max_frames"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "max_tokens_per_frame":
+            kw["max_tokens_per_frame"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "max_image_tokens":
+            kw["max_image_tokens"] = None if x is None else _expect_int(x, expected="i64")
+    return OpenAiVideoUrl(**kw)
+
+
+def encode_OpenAiVideoUrl(v: OpenAiVideoUrl) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["url"] = v.url
+    if v.max_dynamic_patch is not None:
+        d["max_dynamic_patch"] = v.max_dynamic_patch
+    if v.min_dynamic_patch is not None:
+        d["min_dynamic_patch"] = v.min_dynamic_patch
+    if v.fps is not None:
+        d["fps"] = float(v.fps)
+    if v.max_frames is not None:
+        d["max_frames"] = v.max_frames
+    if v.max_tokens_per_frame is not None:
+        d["max_tokens_per_frame"] = v.max_tokens_per_frame
+    if v.max_image_tokens is not None:
+        d["max_image_tokens"] = v.max_image_tokens
+    return d
+
+
+def decode_OpenAiAudioUrl(value: Any) -> OpenAiAudioUrl:
+    m = _expect_map(value, expected="struct OpenAiAudioUrl")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "url":
+            kw["url"] = _expect_str(x, expected="a string")
+    return OpenAiAudioUrl(**kw)
+
+
+def encode_OpenAiAudioUrl(v: OpenAiAudioUrl) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["url"] = v.url
+    return d
+
+
+def decode_OpenAiInputAudio(value: Any) -> OpenAiInputAudio:
+    m = _expect_map(value, expected="struct OpenAiInputAudio")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "data":
+            kw["data"] = _expect_str(x, expected="a string")
+        elif key == "format":
+            kw["format"] = _expect_str(x, expected="a string")
+    return OpenAiInputAudio(**kw)
+
+
+def encode_OpenAiInputAudio(v: OpenAiInputAudio) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["data"] = v.data
+    d["format"] = v.format
+    return d
+
+
+def decode_OpenAiTextPart(value: Any) -> OpenAiTextPart:
+    m = _expect_map(value, expected="struct OpenAiTextPart")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "text":
+            kw["text"] = _expect_str(x, expected="a string")
+    return OpenAiTextPart(**kw)
+
+
+def encode_OpenAiTextPart(v: OpenAiTextPart) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["text"] = v.text
+    return d
+
+
+def decode_OpenAiThinkingPart(value: Any) -> OpenAiThinkingPart:
+    m = _expect_map(value, expected="struct OpenAiThinkingPart")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "thinking":
+            kw["thinking"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "text":
+            kw["text"] = None if x is None else _expect_str(x, expected="a string")
+    return OpenAiThinkingPart(**kw)
+
+
+def encode_OpenAiThinkingPart(v: OpenAiThinkingPart) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.thinking is not None:
+        d["thinking"] = v.thinking
+    if v.text is not None:
+        d["text"] = v.text
+    return d
+
+
+def decode_OpenAiImagePart(value: Any) -> OpenAiImagePart:
+    m = _expect_map(value, expected="struct OpenAiImagePart")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "image_url":
+            kw["image_url"] = None if x is None else decode_OpenAiImageUrl(x)
+        elif key == "modalities":
+            kw["modalities"] = "image" if x is None else _expect_str(x, expected="a string")
+    return OpenAiImagePart(**kw)
+
+
+def encode_OpenAiImagePart(v: OpenAiImagePart) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.image_url is not None:
+        d["image_url"] = encode_OpenAiImageUrl(v.image_url)
+    if v.modalities is not None:
+        d["modalities"] = v.modalities
+    return d
+
+
+def decode_OpenAiVideoPart(value: Any) -> OpenAiVideoPart:
+    m = _expect_map(value, expected="struct OpenAiVideoPart")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "video_url":
+            kw["video_url"] = None if x is None else decode_OpenAiVideoUrl(x)
+    return OpenAiVideoPart(**kw)
+
+
+def encode_OpenAiVideoPart(v: OpenAiVideoPart) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.video_url is not None:
+        d["video_url"] = encode_OpenAiVideoUrl(v.video_url)
+    return d
+
+
+def decode_OpenAiAudioUrlPart(value: Any) -> OpenAiAudioUrlPart:
+    m = _expect_map(value, expected="struct OpenAiAudioUrlPart")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "audio_url":
+            kw["audio_url"] = None if x is None else decode_OpenAiAudioUrl(x)
+    return OpenAiAudioUrlPart(**kw)
+
+
+def encode_OpenAiAudioUrlPart(v: OpenAiAudioUrlPart) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.audio_url is not None:
+        d["audio_url"] = encode_OpenAiAudioUrl(v.audio_url)
+    return d
+
+
+def decode_OpenAiInputAudioPart(value: Any) -> OpenAiInputAudioPart:
+    m = _expect_map(value, expected="struct OpenAiInputAudioPart")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "input_audio":
+            kw["input_audio"] = None if x is None else decode_OpenAiInputAudio(x)
+    return OpenAiInputAudioPart(**kw)
+
+
+def encode_OpenAiInputAudioPart(v: OpenAiInputAudioPart) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.input_audio is not None:
+        d["input_audio"] = encode_OpenAiInputAudio(v.input_audio)
+    return d
+
+
+def decode_OpenAiToolReferencePart(value: Any) -> OpenAiToolReferencePart:
+    m = _expect_map(value, expected="struct OpenAiToolReferencePart")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "name":
+            kw["name"] = _expect_str(x, expected="a string")
+    return OpenAiToolReferencePart(**kw)
+
+
+def encode_OpenAiToolReferencePart(v: OpenAiToolReferencePart) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["name"] = v.name
+    return d
+
+
+def decode_OpenAiChatContentPart(value: Any) -> OpenAiChatContentPart:
+    raw = _expect_map(value, expected="map")
+    tag = raw.get("type")
+    if tag == "text":
+        try:
+            return OpenAiTextPart(
+                text="" if "text" not in raw else _expect_str(raw["text"], expected="a string"),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "thinking":
+        try:
+            return OpenAiThinkingPart(
+                thinking=None if raw.get("thinking") is None else _expect_str(raw.get("thinking"), expected="a string"),
+                text=None if raw.get("text") is None else _expect_str(raw.get("text"), expected="a string"),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "reasoning":
+        try:
+            return OpenAiThinkingPart(
+                thinking=None if raw.get("thinking") is None else _expect_str(raw.get("thinking"), expected="a string"),
+                text=None if raw.get("text") is None else _expect_str(raw.get("text"), expected="a string"),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "image_url":
+        try:
+            return OpenAiImagePart(
+                image_url=None if raw.get("image_url") is None else decode_OpenAiImageUrl(raw.get("image_url")),
+                modalities="image" if raw.get("modalities") is None else _expect_str(raw.get("modalities"), expected="a string"),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "video_url":
+        try:
+            return OpenAiVideoPart(
+                video_url=None if raw.get("video_url") is None else decode_OpenAiVideoUrl(raw.get("video_url")),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "audio_url":
+        try:
+            return OpenAiAudioUrlPart(
+                audio_url=None if raw.get("audio_url") is None else decode_OpenAiAudioUrl(raw.get("audio_url")),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "input_audio":
+        try:
+            return OpenAiInputAudioPart(
+                input_audio=None if raw.get("input_audio") is None else decode_OpenAiInputAudio(raw.get("input_audio")),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "tool_reference":
+        try:
+            return OpenAiToolReferencePart(
+                name="" if "name" not in raw else _expect_str(raw["name"], expected="a string"),
+            )
+        except JsonContractError:
+            raise
+    raise JsonContractError("unknown type for OpenAiChatContentPart")
+
+
+def encode_OpenAiChatContentPart(v: OpenAiChatContentPart) -> Any:
+    if isinstance(v, OpenAiTextPart):
+        d: Dict[str, Any] = {"type": "text"}
+        d["text"] = v.text
+        return d
+    if isinstance(v, OpenAiThinkingPart):
+        d: Dict[str, Any] = {"type": "thinking"}
+        if v.thinking is not None:
+            d["thinking"] = v.thinking
+        if v.text is not None:
+            d["text"] = v.text
+        return d
+    if isinstance(v, OpenAiThinkingPart):
+        d: Dict[str, Any] = {"type": "reasoning"}
+        if v.thinking is not None:
+            d["thinking"] = v.thinking
+        if v.text is not None:
+            d["text"] = v.text
+        return d
+    if isinstance(v, OpenAiImagePart):
+        d: Dict[str, Any] = {"type": "image_url"}
+        if v.image_url is not None:
+            d["image_url"] = encode_OpenAiImageUrl(v.image_url)
+        if v.modalities is not None:
+            d["modalities"] = v.modalities
+        return d
+    if isinstance(v, OpenAiVideoPart):
+        d: Dict[str, Any] = {"type": "video_url"}
+        if v.video_url is not None:
+            d["video_url"] = encode_OpenAiVideoUrl(v.video_url)
+        return d
+    if isinstance(v, OpenAiAudioUrlPart):
+        d: Dict[str, Any] = {"type": "audio_url"}
+        if v.audio_url is not None:
+            d["audio_url"] = encode_OpenAiAudioUrl(v.audio_url)
+        return d
+    if isinstance(v, OpenAiInputAudioPart):
+        d: Dict[str, Any] = {"type": "input_audio"}
+        if v.input_audio is not None:
+            d["input_audio"] = encode_OpenAiInputAudio(v.input_audio)
+        return d
+    if isinstance(v, OpenAiToolReferencePart):
+        d: Dict[str, Any] = {"type": "tool_reference"}
+        d["name"] = v.name
+        return d
+    raise TypeError(f"OpenAiChatContentPart: unsupported value {type(v).__name__}")
+
+
+def decode_OpenAiChatContentPartList(value: Any) -> OpenAiChatContentPartList:
+    return [decode_OpenAiChatContentPart(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_OpenAiChatContentPartList(v: OpenAiChatContentPartList) -> List[Any]:
+    return [encode_OpenAiChatContentPart(e) for e in v]
+
+
+def decode_OpenAiChatContent(value: Any) -> OpenAiChatContent:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return decode_OpenAiChatContentPartList(value)
+    raise _invalid_type(value, expected="one of the OpenAiChatContent shapes")
+
+
+def encode_OpenAiChatContent(v: OpenAiChatContent) -> Any:
+    if isinstance(v, (str,)):
+        return v
+    if isinstance(v, (list,)):
+        return encode_OpenAiChatContentPartList(v)
+    return v
+
+
+def decode_OpenAiFunctionCall(value: Any) -> OpenAiFunctionCall:
+    m = _expect_map(value, expected="struct OpenAiFunctionCall")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "name":
+            kw["name"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "arguments":
+            kw["arguments"] = x
+    return OpenAiFunctionCall(**kw)
+
+
+def encode_OpenAiFunctionCall(v: OpenAiFunctionCall) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["name"] = v.name
+    d["arguments"] = v.arguments
+    return d
+
+
+def decode_OpenAiToolCall(value: Any) -> OpenAiToolCall:
+    m = _expect_map(value, expected="struct OpenAiToolCall")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "id":
+            kw["id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "index":
+            kw["index"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "type":
+            kw["type"] = "function" if x is None else _expect_str(x, expected="a string")
+        elif key == "function":
+            kw["function"] = None if x is None else decode_OpenAiFunctionCall(x)
+    return OpenAiToolCall(**kw)
+
+
+def encode_OpenAiToolCall(v: OpenAiToolCall) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["id"] = v.id
+    d["index"] = v.index
+    if v.type is not None:
+        d["type"] = v.type
+    if v.function is not None:
+        d["function"] = encode_OpenAiFunctionCall(v.function)
+    return d
+
+
+def decode_OpenAiFunction(value: Any) -> OpenAiFunction:
+    m = _expect_map(value, expected="struct OpenAiFunction")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "description":
+            kw["description"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "name":
+            kw["name"] = _expect_str(x, expected="a string")
+        elif key == "parameters":
+            kw["parameters"] = x
+        elif key == "strict":
+            kw["strict"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "defer_loading":
+            kw["defer_loading"] = None if x is None else _expect_bool(x, expected="a boolean")
+    return OpenAiFunction(**kw)
+
+
+def encode_OpenAiFunction(v: OpenAiFunction) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.description is not None:
+        d["description"] = v.description
+    d["name"] = v.name
+    if v.parameters is not None:
+        d["parameters"] = v.parameters
+    if v.strict is not None:
+        d["strict"] = v.strict
+    if v.defer_loading is not None:
+        d["defer_loading"] = v.defer_loading
+    return d
+
+
+def decode_OpenAiTool(value: Any) -> OpenAiTool:
+    m = _expect_map(value, expected="struct OpenAiTool")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "type":
+            kw["type"] = "function" if x is None else _expect_str(x, expected="a string")
+        elif key == "function":
+            kw["function"] = None if x is None else decode_OpenAiFunction(x)
+        elif key == "defer_loading":
+            kw["defer_loading"] = None if x is None else _expect_bool(x, expected="a boolean")
+    return OpenAiTool(**kw)
+
+
+def encode_OpenAiTool(v: OpenAiTool) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.type is not None:
+        d["type"] = v.type
+    if v.function is not None:
+        d["function"] = encode_OpenAiFunction(v.function)
+    if v.defer_loading is not None:
+        d["defer_loading"] = v.defer_loading
+    return d
+
+
+def decode_OpenAiToolChoiceFunction(value: Any) -> OpenAiToolChoiceFunction:
+    m = _expect_map(value, expected="struct OpenAiToolChoiceFunction")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "name":
+            kw["name"] = None if x is None else _expect_str(x, expected="a string")
+    return OpenAiToolChoiceFunction(**kw)
+
+
+def encode_OpenAiToolChoiceFunction(v: OpenAiToolChoiceFunction) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.name is not None:
+        d["name"] = v.name
+    return d
+
+
+def decode_OpenAiNamedToolChoice(value: Any) -> OpenAiNamedToolChoice:
+    m = _expect_map(value, expected="struct OpenAiNamedToolChoice")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "function":
+            kw["function"] = None if x is None else decode_OpenAiToolChoiceFunction(x)
+        elif key == "type":
+            kw["type"] = "function" if x is None else _expect_str(x, expected="a string")
+    return OpenAiNamedToolChoice(**kw)
+
+
+def encode_OpenAiNamedToolChoice(v: OpenAiNamedToolChoice) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.function is not None:
+        d["function"] = encode_OpenAiToolChoiceFunction(v.function)
+    if v.type is not None:
+        d["type"] = v.type
+    return d
+
+
+def decode_OpenAiToolChoice(value: Any) -> OpenAiToolChoice:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return decode_OpenAiNamedToolChoice(value)
+    raise _invalid_type(value, expected="one of the OpenAiToolChoice shapes")
+
+
+def encode_OpenAiToolChoice(v: OpenAiToolChoice) -> Any:
+    if isinstance(v, (str,)):
+        return v
+    if isinstance(v, (OpenAiNamedToolChoice,)):
+        return encode_OpenAiNamedToolChoice(v)
+    return v
+
+
+def decode_OpenAiReasoningEffort(value: Any) -> OpenAiReasoningEffort:
+    if isinstance(value, str):
+        return value
+    if _is_int(value):
+        return value
+    if _is_number(value):
+        return value
+    raise _invalid_type(value, expected="one of the OpenAiReasoningEffort shapes")
+
+
+def encode_OpenAiReasoningEffort(v: OpenAiReasoningEffort) -> Any:
+    if isinstance(v, (str,)):
+        return v
+    if isinstance(v, (int, float,)):
+        return v
+    return v
+
+
+def decode_OpenAiChatMessage(value: Any) -> OpenAiChatMessage:
+    m = _expect_map(value, expected="struct OpenAiChatMessage")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "role":
+            kw["role"] = _expect_str(x, expected="a string")
+        elif key == "content":
+            kw["content"] = None if x is None else decode_OpenAiChatContent(x)
+        elif key == "tool_call_id":
+            kw["tool_call_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "name":
+            kw["name"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "phase":
+            kw["phase"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "reasoning_content":
+            kw["reasoning_content"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "tool_calls":
+            kw["tool_calls"] = [] if x is None else [decode_OpenAiToolCall(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "tools":
+            kw["tools"] = [] if x is None else [decode_OpenAiTool(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "prefix":
+            kw["prefix"] = None if x is None else _expect_bool(x, expected="a boolean")
+    return OpenAiChatMessage(**kw)
+
+
+def encode_OpenAiChatMessage(v: OpenAiChatMessage) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["role"] = v.role
+    if v.content is not None:
+        d["content"] = encode_OpenAiChatContent(v.content)
+    if v.tool_call_id is not None:
+        d["tool_call_id"] = v.tool_call_id
+    if v.name is not None:
+        d["name"] = v.name
+    if v.phase is not None:
+        d["phase"] = v.phase
+    if v.reasoning_content is not None:
+        d["reasoning_content"] = v.reasoning_content
+    if v.tool_calls:
+        d["tool_calls"] = [encode_OpenAiToolCall(e) for e in v.tool_calls]
+    if v.tools:
+        d["tools"] = [encode_OpenAiTool(e) for e in v.tools]
+    if v.prefix is not None:
+        d["prefix"] = v.prefix
+    return d
+
+
+def decode_OpenAiChatCompletionRequest(value: Any) -> OpenAiChatCompletionRequest:
+    m = _expect_map(value, expected="struct OpenAiChatCompletionRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "messages":
+            kw["messages"] = [] if x is None else [decode_OpenAiChatMessage(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "model":
+            kw["model"] = "default" if x is None else _expect_str(x, expected="a string")
+        elif key == "frequency_penalty":
+            kw["frequency_penalty"] = _expect_float(x, expected="f64")
+        elif key == "logit_bias":
+            kw["logit_bias"] = {} if x is None else {k: _expect_float(e, expected="f64") for k, e in _expect_map(x, expected="a map").items()}
+        elif key == "logprobs":
+            kw["logprobs"] = _expect_bool(x, expected="a boolean")
+        elif key == "top_logprobs":
+            kw["top_logprobs"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "max_tokens":
+            kw["max_tokens"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "max_completion_tokens":
+            kw["max_completion_tokens"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "n":
+            kw["n"] = 1 if x is None else _expect_int(x, expected="i64")
+        elif key == "presence_penalty":
+            kw["presence_penalty"] = _expect_float(x, expected="f64")
+        elif key == "response_format":
+            kw["response_format"] = None if x is None else decode_OpenAiResponseFormat(x)
+        elif key == "seed":
+            kw["seed"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "stop":
+            kw["stop"] = None if x is None else decode_StringOrList(x)
+        elif key == "stream":
+            kw["stream"] = _expect_bool(x, expected="a boolean")
+        elif key == "stream_options":
+            kw["stream_options"] = None if x is None else decode_OpenAiStreamOptions(x)
+        elif key == "temperature":
+            kw["temperature"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "top_p":
+            kw["top_p"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "user":
+            kw["user"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "tools":
+            kw["tools"] = [] if x is None else [decode_OpenAiTool(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "tool_choice":
+            kw["tool_choice"] = None if x is None else decode_OpenAiToolChoice(x)
+        elif key == "parallel_tool_calls":
+            kw["parallel_tool_calls"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "return_hidden_states":
+            kw["return_hidden_states"] = None if x is None else decode_OpenAiReturnHiddenStates(x)
+        elif key == "return_routed_experts":
+            kw["return_routed_experts"] = _expect_bool(x, expected="a boolean")
+        elif key == "routed_experts_start_len":
+            kw["routed_experts_start_len"] = _expect_int(x, expected="i64")
+        elif key == "return_cached_tokens_details":
+            kw["return_cached_tokens_details"] = _expect_bool(x, expected="a boolean")
+        elif key == "return_spec_tokens_details":
+            kw["return_spec_tokens_details"] = _expect_bool(x, expected="a boolean")
+        elif key == "return_prompt_token_ids":
+            kw["return_prompt_token_ids"] = _expect_bool(x, expected="a boolean")
+        elif key == "return_token_ids":
+            kw["return_token_ids"] = _expect_bool(x, expected="a boolean")
+        elif key == "return_meta_info":
+            kw["return_meta_info"] = _expect_bool(x, expected="a boolean")
+        elif key == "return_input_ids_in_sglext":
+            kw["return_input_ids_in_sglext"] = _expect_bool(x, expected="a boolean")
+        elif key == "return_output_ids_in_sglext":
+            kw["return_output_ids_in_sglext"] = _expect_bool(x, expected="a boolean")
+        elif key == "return_sampling_mask":
+            kw["return_sampling_mask"] = _expect_bool(x, expected="a boolean")
+        elif key == "sampling_logprobs_mode":
+            kw["sampling_logprobs_mode"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "return_flat_raw_output_top_logprobs":
+            kw["return_flat_raw_output_top_logprobs"] = _expect_bool(x, expected="a boolean")
+        elif key == "return_flat_raw_top_logprobs_b64":
+            kw["return_flat_raw_top_logprobs_b64"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "reasoning_effort":
+            kw["reasoning_effort"] = None if x is None else decode_OpenAiReasoningEffort(x)
+        elif key == "thinking":
+            kw["thinking"] = x
+        elif key == "task":
+            kw["task"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "top_k":
+            kw["top_k"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "min_p":
+            kw["min_p"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "min_tokens":
+            kw["min_tokens"] = _expect_int(x, expected="i64")
+        elif key == "regex":
+            kw["regex"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "ebnf":
+            kw["ebnf"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "repetition_penalty":
+            kw["repetition_penalty"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "stop_token_ids":
+            kw["stop_token_ids"] = None if x is None else decode_Int64List(x)
+        elif key == "stop_regex":
+            kw["stop_regex"] = None if x is None else decode_StringOrList(x)
+        elif key == "no_stop_trim":
+            kw["no_stop_trim"] = _expect_bool(x, expected="a boolean")
+        elif key == "ignore_eos":
+            kw["ignore_eos"] = _expect_bool(x, expected="a boolean")
+        elif key == "continue_final_message":
+            kw["continue_final_message"] = _expect_bool(x, expected="a boolean")
+        elif key == "skip_special_tokens":
+            kw["skip_special_tokens"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "lora_path":
+            kw["lora_path"] = None if x is None else decode_OptionalStringOrList(x)
+        elif key == "session_id":
+            kw["session_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "session_params":
+            kw["session_params"] = x
+        elif key == "separate_reasoning":
+            kw["separate_reasoning"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "stream_reasoning":
+            kw["stream_reasoning"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "chat_template_kwargs":
+            kw["chat_template_kwargs"] = x
+        elif key == "max_dynamic_patch":
+            kw["max_dynamic_patch"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "min_dynamic_patch":
+            kw["min_dynamic_patch"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "use_audio_in_video":
+            kw["use_audio_in_video"] = _expect_bool(x, expected="a boolean")
+        elif key == "images_config":
+            kw["images_config"] = x
+        elif key == "video_config":
+            kw["video_config"] = x
+        elif key == "mm_processor_kwargs":
+            kw["mm_processor_kwargs"] = x
+        elif key == "custom_logit_processor":
+            kw["custom_logit_processor"] = None if x is None else decode_OptionalStringOrList(x)
+        elif key == "custom_params":
+            kw["custom_params"] = x
+        elif key == "watermark":
+            kw["watermark"] = x
+        elif key == "input_ids":
+            kw["input_ids"] = None if x is None else decode_Int64List(x)
+        elif key == "rid":
+            kw["rid"] = None if x is None else decode_StringOrList(x)
+        elif key == "extra_key":
+            kw["extra_key"] = None if x is None else decode_StringOrList(x)
+        elif key == "cache_salt":
+            kw["cache_salt"] = None if x is None else decode_StringOrList(x)
+        elif key == "priority":
+            kw["priority"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "data_parallel_rank":
+            kw["data_parallel_rank"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "bootstrap_host":
+            kw["bootstrap_host"] = None if x is None else decode_StringOrList(x)
+        elif key == "bootstrap_port":
+            kw["bootstrap_port"] = None if x is None else decode_OptionalInt64OrList(x)
+        elif key == "bootstrap_room":
+            kw["bootstrap_room"] = None if x is None else decode_Int64OrList(x)
+        elif key == "routed_dp_rank":
+            kw["routed_dp_rank"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "disagg_prefill_dp_rank":
+            kw["disagg_prefill_dp_rank"] = None if x is None else _expect_int(x, expected="i64")
+    return OpenAiChatCompletionRequest(**kw)
+
+
+def encode_OpenAiChatCompletionRequest(v: OpenAiChatCompletionRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.messages:
+        d["messages"] = [encode_OpenAiChatMessage(e) for e in v.messages]
+    if v.model is not None:
+        d["model"] = v.model
+    d["frequency_penalty"] = float(v.frequency_penalty)
+    if v.logit_bias:
+        d["logit_bias"] = {k: float(e) for k, e in v.logit_bias.items()}
+    d["logprobs"] = v.logprobs
+    if v.top_logprobs is not None:
+        d["top_logprobs"] = v.top_logprobs
+    if v.max_tokens is not None:
+        d["max_tokens"] = v.max_tokens
+    if v.max_completion_tokens is not None:
+        d["max_completion_tokens"] = v.max_completion_tokens
+    if v.n is not None:
+        d["n"] = v.n
+    d["presence_penalty"] = float(v.presence_penalty)
+    if v.response_format is not None:
+        d["response_format"] = encode_OpenAiResponseFormat(v.response_format)
+    if v.seed is not None:
+        d["seed"] = v.seed
+    if v.stop is not None:
+        d["stop"] = encode_StringOrList(v.stop)
+    d["stream"] = v.stream
+    if v.stream_options is not None:
+        d["stream_options"] = encode_OpenAiStreamOptions(v.stream_options)
+    if v.temperature is not None:
+        d["temperature"] = float(v.temperature)
+    if v.top_p is not None:
+        d["top_p"] = float(v.top_p)
+    if v.user is not None:
+        d["user"] = v.user
+    if v.tools:
+        d["tools"] = [encode_OpenAiTool(e) for e in v.tools]
+    if v.tool_choice is not None:
+        d["tool_choice"] = encode_OpenAiToolChoice(v.tool_choice)
+    if v.parallel_tool_calls is not None:
+        d["parallel_tool_calls"] = v.parallel_tool_calls
+    if v.return_hidden_states is not None:
+        d["return_hidden_states"] = encode_OpenAiReturnHiddenStates(v.return_hidden_states)
+    d["return_routed_experts"] = v.return_routed_experts
+    d["routed_experts_start_len"] = v.routed_experts_start_len
+    d["return_cached_tokens_details"] = v.return_cached_tokens_details
+    d["return_spec_tokens_details"] = v.return_spec_tokens_details
+    d["return_prompt_token_ids"] = v.return_prompt_token_ids
+    d["return_token_ids"] = v.return_token_ids
+    d["return_meta_info"] = v.return_meta_info
+    d["return_input_ids_in_sglext"] = v.return_input_ids_in_sglext
+    d["return_output_ids_in_sglext"] = v.return_output_ids_in_sglext
+    d["return_sampling_mask"] = v.return_sampling_mask
+    if v.sampling_logprobs_mode is not None:
+        d["sampling_logprobs_mode"] = v.sampling_logprobs_mode
+    d["return_flat_raw_output_top_logprobs"] = v.return_flat_raw_output_top_logprobs
+    if v.return_flat_raw_top_logprobs_b64 is not None:
+        d["return_flat_raw_top_logprobs_b64"] = v.return_flat_raw_top_logprobs_b64
+    if v.reasoning_effort is not None:
+        d["reasoning_effort"] = encode_OpenAiReasoningEffort(v.reasoning_effort)
+    if v.thinking is not None:
+        d["thinking"] = v.thinking
+    if v.task is not None:
+        d["task"] = v.task
+    if v.top_k is not None:
+        d["top_k"] = v.top_k
+    if v.min_p is not None:
+        d["min_p"] = float(v.min_p)
+    d["min_tokens"] = v.min_tokens
+    if v.regex is not None:
+        d["regex"] = v.regex
+    if v.ebnf is not None:
+        d["ebnf"] = v.ebnf
+    if v.repetition_penalty is not None:
+        d["repetition_penalty"] = float(v.repetition_penalty)
+    if v.stop_token_ids is not None:
+        d["stop_token_ids"] = encode_Int64List(v.stop_token_ids)
+    if v.stop_regex is not None:
+        d["stop_regex"] = encode_StringOrList(v.stop_regex)
+    d["no_stop_trim"] = v.no_stop_trim
+    d["ignore_eos"] = v.ignore_eos
+    d["continue_final_message"] = v.continue_final_message
+    if v.skip_special_tokens is not None:
+        d["skip_special_tokens"] = v.skip_special_tokens
+    if v.lora_path is not None:
+        d["lora_path"] = encode_OptionalStringOrList(v.lora_path)
+    if v.session_id is not None:
+        d["session_id"] = v.session_id
+    if v.session_params is not None:
+        d["session_params"] = v.session_params
+    if v.separate_reasoning is not None:
+        d["separate_reasoning"] = v.separate_reasoning
+    if v.stream_reasoning is not None:
+        d["stream_reasoning"] = v.stream_reasoning
+    if v.chat_template_kwargs is not None:
+        d["chat_template_kwargs"] = v.chat_template_kwargs
+    if v.max_dynamic_patch is not None:
+        d["max_dynamic_patch"] = v.max_dynamic_patch
+    if v.min_dynamic_patch is not None:
+        d["min_dynamic_patch"] = v.min_dynamic_patch
+    d["use_audio_in_video"] = v.use_audio_in_video
+    if v.images_config is not None:
+        d["images_config"] = v.images_config
+    if v.video_config is not None:
+        d["video_config"] = v.video_config
+    if v.mm_processor_kwargs is not None:
+        d["mm_processor_kwargs"] = v.mm_processor_kwargs
+    if v.custom_logit_processor is not None:
+        d["custom_logit_processor"] = encode_OptionalStringOrList(v.custom_logit_processor)
+    if v.custom_params is not None:
+        d["custom_params"] = v.custom_params
+    if v.watermark is not None:
+        d["watermark"] = v.watermark
+    if v.input_ids is not None:
+        d["input_ids"] = encode_Int64List(v.input_ids)
+    if v.rid is not None:
+        d["rid"] = encode_StringOrList(v.rid)
+    if v.extra_key is not None:
+        d["extra_key"] = encode_StringOrList(v.extra_key)
+    if v.cache_salt is not None:
+        d["cache_salt"] = encode_StringOrList(v.cache_salt)
+    if v.priority is not None:
+        d["priority"] = v.priority
+    if v.data_parallel_rank is not None:
+        d["data_parallel_rank"] = v.data_parallel_rank
+    if v.bootstrap_host is not None:
+        d["bootstrap_host"] = encode_StringOrList(v.bootstrap_host)
+    if v.bootstrap_port is not None:
+        d["bootstrap_port"] = encode_OptionalInt64OrList(v.bootstrap_port)
+    if v.bootstrap_room is not None:
+        d["bootstrap_room"] = encode_Int64OrList(v.bootstrap_room)
+    if v.routed_dp_rank is not None:
+        d["routed_dp_rank"] = v.routed_dp_rank
+    if v.disagg_prefill_dp_rank is not None:
+        d["disagg_prefill_dp_rank"] = v.disagg_prefill_dp_rank
+    return d
+
+
+def decode_OpenAiChatMessageResponse(value: Any) -> OpenAiChatMessageResponse:
+    m = _expect_map(value, expected="struct OpenAiChatMessageResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "role":
+            kw["role"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "content":
+            kw["content"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "reasoning_content":
+            kw["reasoning_content"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "tool_calls":
+            kw["tool_calls"] = [] if x is None else [decode_OpenAiToolCall(e) for e in _expect_seq(x, expected="a sequence")]
+    return OpenAiChatMessageResponse(**kw)
+
+
+def encode_OpenAiChatMessageResponse(v: OpenAiChatMessageResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["role"] = v.role
+    d["content"] = v.content
+    d["reasoning_content"] = v.reasoning_content
+    if v.tool_calls:
+        d["tool_calls"] = [encode_OpenAiToolCall(e) for e in v.tool_calls]
+    return d
+
+
+def decode_OpenAiChatCompletionChoice(value: Any) -> OpenAiChatCompletionChoice:
+    m = _expect_map(value, expected="struct OpenAiChatCompletionChoice")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "index":
+            kw["index"] = _expect_int(x, expected="i64")
+        elif key == "message":
+            kw["message"] = None if x is None else decode_OpenAiChatMessageResponse(x)
+        elif key == "logprobs":
+            kw["logprobs"] = None if x is None else decode_OpenAiChoiceLogprobs(x)
+        elif key == "finish_reason":
+            kw["finish_reason"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "matched_stop":
+            kw["matched_stop"] = None if x is None else decode_Matched(x)
+        elif key == "hidden_states":
+            kw["hidden_states"] = x
+        elif key == "prompt_token_ids":
+            kw["prompt_token_ids"] = None if x is None else decode_Int64List(x)
+        elif key == "response_token_ids":
+            kw["response_token_ids"] = None if x is None else decode_Int64List(x)
+        elif key == "meta_info":
+            kw["meta_info"] = x
+    return OpenAiChatCompletionChoice(**kw)
+
+
+def encode_OpenAiChatCompletionChoice(v: OpenAiChatCompletionChoice) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["index"] = v.index
+    if v.message is not None:
+        d["message"] = encode_OpenAiChatMessageResponse(v.message)
+    d["logprobs"] = None if v.logprobs is None else encode_OpenAiChoiceLogprobs(v.logprobs)
+    d["finish_reason"] = v.finish_reason
+    d["matched_stop"] = None if v.matched_stop is None else encode_Matched(v.matched_stop)
+    if v.hidden_states is not None:
+        d["hidden_states"] = v.hidden_states
+    if v.prompt_token_ids is not None:
+        d["prompt_token_ids"] = encode_Int64List(v.prompt_token_ids)
+    if v.response_token_ids is not None:
+        d["response_token_ids"] = encode_Int64List(v.response_token_ids)
+    if v.meta_info is not None:
+        d["meta_info"] = v.meta_info
+    return d
+
+
+def decode_OpenAiChatCompletionResponse(value: Any) -> OpenAiChatCompletionResponse:
+    m = _expect_map(value, expected="struct OpenAiChatCompletionResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "id":
+            kw["id"] = _expect_str(x, expected="a string")
+        elif key == "object":
+            kw["object"] = _expect_str(x, expected="a string")
+        elif key == "created":
+            kw["created"] = _expect_int(x, expected="i64")
+        elif key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "choices":
+            kw["choices"] = [] if x is None else [decode_OpenAiChatCompletionChoice(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "usage":
+            kw["usage"] = None if x is None else decode_OpenAiUsage(x)
+        elif key == "metadata":
+            kw["metadata"] = x
+        elif key == "sglext":
+            kw["sglext"] = None if x is None else decode_OpenAiSglExt(x)
+    return OpenAiChatCompletionResponse(**kw)
+
+
+def encode_OpenAiChatCompletionResponse(v: OpenAiChatCompletionResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["id"] = v.id
+    d["object"] = v.object
+    d["created"] = v.created
+    d["model"] = v.model
+    if v.choices:
+        d["choices"] = [encode_OpenAiChatCompletionChoice(e) for e in v.choices]
+    if v.usage is not None:
+        d["usage"] = encode_OpenAiUsage(v.usage)
+    d["metadata"] = v.metadata
+    if v.sglext is not None:
+        d["sglext"] = encode_OpenAiSglExt(v.sglext)
+    return d
+
+
+def decode_OpenAiDeltaMessage(value: Any) -> OpenAiDeltaMessage:
+    m = _expect_map(value, expected="struct OpenAiDeltaMessage")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "role":
+            kw["role"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "content":
+            kw["content"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "reasoning_content":
+            kw["reasoning_content"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "tool_calls":
+            kw["tool_calls"] = [] if x is None else [decode_OpenAiToolCall(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "hidden_states":
+            kw["hidden_states"] = x
+    return OpenAiDeltaMessage(**kw)
+
+
+def encode_OpenAiDeltaMessage(v: OpenAiDeltaMessage) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["role"] = v.role
+    d["content"] = v.content
+    d["reasoning_content"] = v.reasoning_content
+    if v.tool_calls:
+        d["tool_calls"] = [encode_OpenAiToolCall(e) for e in v.tool_calls]
+    if v.hidden_states is not None:
+        d["hidden_states"] = v.hidden_states
+    return d
+
+
+def decode_OpenAiChatCompletionStreamChoice(value: Any) -> OpenAiChatCompletionStreamChoice:
+    m = _expect_map(value, expected="struct OpenAiChatCompletionStreamChoice")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "index":
+            kw["index"] = _expect_int(x, expected="i64")
+        elif key == "delta":
+            kw["delta"] = None if x is None else decode_OpenAiDeltaMessage(x)
+        elif key == "logprobs":
+            kw["logprobs"] = None if x is None else decode_OpenAiChoiceLogprobs(x)
+        elif key == "finish_reason":
+            kw["finish_reason"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "matched_stop":
+            kw["matched_stop"] = None if x is None else decode_Matched(x)
+    return OpenAiChatCompletionStreamChoice(**kw)
+
+
+def encode_OpenAiChatCompletionStreamChoice(v: OpenAiChatCompletionStreamChoice) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["index"] = v.index
+    if v.delta is not None:
+        d["delta"] = encode_OpenAiDeltaMessage(v.delta)
+    d["logprobs"] = None if v.logprobs is None else encode_OpenAiChoiceLogprobs(v.logprobs)
+    d["finish_reason"] = v.finish_reason
+    d["matched_stop"] = None if v.matched_stop is None else encode_Matched(v.matched_stop)
+    return d
+
+
+def decode_OpenAiChatCompletionStreamResponse(value: Any) -> OpenAiChatCompletionStreamResponse:
+    m = _expect_map(value, expected="struct OpenAiChatCompletionStreamResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "id":
+            kw["id"] = _expect_str(x, expected="a string")
+        elif key == "object":
+            kw["object"] = _expect_str(x, expected="a string")
+        elif key == "created":
+            kw["created"] = _expect_int(x, expected="i64")
+        elif key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "choices":
+            kw["choices"] = [] if x is None else [decode_OpenAiChatCompletionStreamChoice(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "usage":
+            kw["usage"] = None if x is None else decode_OpenAiUsage(x)
+        elif key == "sglext":
+            kw["sglext"] = None if x is None else decode_OpenAiSglExt(x)
+    return OpenAiChatCompletionStreamResponse(**kw)
+
+
+def encode_OpenAiChatCompletionStreamResponse(v: OpenAiChatCompletionStreamResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["id"] = v.id
+    d["object"] = v.object
+    d["created"] = v.created
+    d["model"] = v.model
+    if v.choices:
+        d["choices"] = [encode_OpenAiChatCompletionStreamChoice(e) for e in v.choices]
+    d["usage"] = None if v.usage is None else encode_OpenAiUsage(v.usage)
+    if v.sglext is not None:
+        d["sglext"] = encode_OpenAiSglExt(v.sglext)
+    return d
+
+
+def decode_OpenAiResponseReasoning(value: Any) -> OpenAiResponseReasoning:
+    m = _expect_map(value, expected="struct OpenAiResponseReasoning")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "effort":
+            kw["effort"] = "medium" if x is None else _expect_str(x, expected="a string")
+        elif key == "summary":
+            kw["summary"] = None if x is None else _expect_str(x, expected="a string")
+    return OpenAiResponseReasoning(**kw)
+
+
+def encode_OpenAiResponseReasoning(v: OpenAiResponseReasoning) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.effort is not None:
+        d["effort"] = v.effort
+    if v.summary is not None:
+        d["summary"] = v.summary
+    return d
+
+
+def decode_OpenAiResponseTool(value: Any) -> OpenAiResponseTool:
+    m = _expect_map(value, expected="struct OpenAiResponseTool")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "type":
+            kw["type"] = _expect_str(x, expected="a string")
+        elif key == "name":
+            kw["name"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "description":
+            kw["description"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "parameters":
+            kw["parameters"] = x
+        elif key == "strict":
+            kw["strict"] = _expect_bool(x, expected="a boolean")
+        elif key == "tools":
+            kw["tools"] = [] if x is None else list(_expect_seq(x, expected="a sequence"))
+        elif key == "defer_loading":
+            kw["defer_loading"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "format":
+            kw["format"] = x
+    return OpenAiResponseTool(**kw)
+
+
+def encode_OpenAiResponseTool(v: OpenAiResponseTool) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["type"] = v.type
+    if v.name is not None:
+        d["name"] = v.name
+    if v.description is not None:
+        d["description"] = v.description
+    if v.parameters is not None:
+        d["parameters"] = v.parameters
+    d["strict"] = v.strict
+    if v.tools:
+        d["tools"] = list(v.tools)
+    if v.defer_loading is not None:
+        d["defer_loading"] = v.defer_loading
+    if v.format is not None:
+        d["format"] = v.format
+    return d
+
+
+def decode_OpenAiResponsesRequest(value: Any) -> OpenAiResponsesRequest:
+    m = _expect_map(value, expected="struct OpenAiResponsesRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "background":
+            kw["background"] = False if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "include":
+            kw["include"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "input":
+            kw["input"] = x
+        elif key == "instructions":
+            kw["instructions"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "max_output_tokens":
+            kw["max_output_tokens"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "max_tool_calls":
+            kw["max_tool_calls"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "metadata":
+            kw["metadata"] = x
+        elif key == "model":
+            kw["model"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "parallel_tool_calls":
+            kw["parallel_tool_calls"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "previous_response_id":
+            kw["previous_response_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "reasoning":
+            kw["reasoning"] = None if x is None else decode_OpenAiResponseReasoning(x)
+        elif key == "service_tier":
+            kw["service_tier"] = "auto" if x is None else _expect_str(x, expected="a string")
+        elif key == "store":
+            kw["store"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "stream":
+            kw["stream"] = False if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "temperature":
+            kw["temperature"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "text":
+            kw["text"] = x
+        elif key == "tool_choice":
+            kw["tool_choice"] = x
+        elif key == "tools":
+            kw["tools"] = [] if x is None else [decode_OpenAiResponseTool(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "top_logprobs":
+            kw["top_logprobs"] = 0 if x is None else _expect_int(x, expected="i64")
+        elif key == "top_p":
+            kw["top_p"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "truncation":
+            kw["truncation"] = "disabled" if x is None else _expect_str(x, expected="a string")
+        elif key == "user":
+            kw["user"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "chat_template_kwargs":
+            kw["chat_template_kwargs"] = x
+        elif key == "request_id":
+            kw["request_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "session_id":
+            kw["session_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "priority":
+            kw["priority"] = _expect_int(x, expected="i64")
+        elif key == "extra_key":
+            kw["extra_key"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "cache_salt":
+            kw["cache_salt"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "data_parallel_rank":
+            kw["data_parallel_rank"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "frequency_penalty":
+            kw["frequency_penalty"] = _expect_float(x, expected="f64")
+        elif key == "presence_penalty":
+            kw["presence_penalty"] = _expect_float(x, expected="f64")
+        elif key == "stop":
+            kw["stop"] = None if x is None else decode_StringOrList(x)
+        elif key == "top_k":
+            kw["top_k"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "min_p":
+            kw["min_p"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "repetition_penalty":
+            kw["repetition_penalty"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "bootstrap_host":
+            kw["bootstrap_host"] = None if x is None else decode_StringOrList(x)
+        elif key == "bootstrap_port":
+            kw["bootstrap_port"] = None if x is None else decode_OptionalInt64OrList(x)
+        elif key == "bootstrap_room":
+            kw["bootstrap_room"] = None if x is None else decode_Int64OrList(x)
+        elif key == "routed_dp_rank":
+            kw["routed_dp_rank"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "disagg_prefill_dp_rank":
+            kw["disagg_prefill_dp_rank"] = None if x is None else _expect_int(x, expected="i64")
+    return OpenAiResponsesRequest(**kw)
+
+
+def encode_OpenAiResponsesRequest(v: OpenAiResponsesRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.background is not None:
+        d["background"] = v.background
+    if v.include:
+        d["include"] = list(v.include)
+    if v.input is not None:
+        d["input"] = v.input
+    if v.instructions is not None:
+        d["instructions"] = v.instructions
+    if v.max_output_tokens is not None:
+        d["max_output_tokens"] = v.max_output_tokens
+    if v.max_tool_calls is not None:
+        d["max_tool_calls"] = v.max_tool_calls
+    if v.metadata is not None:
+        d["metadata"] = v.metadata
+    if v.model is not None:
+        d["model"] = v.model
+    if v.parallel_tool_calls is not None:
+        d["parallel_tool_calls"] = v.parallel_tool_calls
+    if v.previous_response_id is not None:
+        d["previous_response_id"] = v.previous_response_id
+    if v.reasoning is not None:
+        d["reasoning"] = encode_OpenAiResponseReasoning(v.reasoning)
+    if v.service_tier is not None:
+        d["service_tier"] = v.service_tier
+    if v.store is not None:
+        d["store"] = v.store
+    if v.stream is not None:
+        d["stream"] = v.stream
+    if v.temperature is not None:
+        d["temperature"] = float(v.temperature)
+    if v.text is not None:
+        d["text"] = v.text
+    if v.tool_choice is not None:
+        d["tool_choice"] = v.tool_choice
+    if v.tools:
+        d["tools"] = [encode_OpenAiResponseTool(e) for e in v.tools]
+    if v.top_logprobs is not None:
+        d["top_logprobs"] = v.top_logprobs
+    if v.top_p is not None:
+        d["top_p"] = float(v.top_p)
+    if v.truncation is not None:
+        d["truncation"] = v.truncation
+    if v.user is not None:
+        d["user"] = v.user
+    if v.chat_template_kwargs is not None:
+        d["chat_template_kwargs"] = v.chat_template_kwargs
+    if v.request_id is not None:
+        d["request_id"] = v.request_id
+    if v.session_id is not None:
+        d["session_id"] = v.session_id
+    d["priority"] = v.priority
+    if v.extra_key is not None:
+        d["extra_key"] = v.extra_key
+    if v.cache_salt is not None:
+        d["cache_salt"] = v.cache_salt
+    if v.data_parallel_rank is not None:
+        d["data_parallel_rank"] = v.data_parallel_rank
+    d["frequency_penalty"] = float(v.frequency_penalty)
+    d["presence_penalty"] = float(v.presence_penalty)
+    if v.stop is not None:
+        d["stop"] = encode_StringOrList(v.stop)
+    if v.top_k is not None:
+        d["top_k"] = v.top_k
+    if v.min_p is not None:
+        d["min_p"] = float(v.min_p)
+    if v.repetition_penalty is not None:
+        d["repetition_penalty"] = float(v.repetition_penalty)
+    if v.bootstrap_host is not None:
+        d["bootstrap_host"] = encode_StringOrList(v.bootstrap_host)
+    if v.bootstrap_port is not None:
+        d["bootstrap_port"] = encode_OptionalInt64OrList(v.bootstrap_port)
+    if v.bootstrap_room is not None:
+        d["bootstrap_room"] = encode_Int64OrList(v.bootstrap_room)
+    if v.routed_dp_rank is not None:
+        d["routed_dp_rank"] = v.routed_dp_rank
+    if v.disagg_prefill_dp_rank is not None:
+        d["disagg_prefill_dp_rank"] = v.disagg_prefill_dp_rank
+    return d
+
+
+def decode_OpenAiResponsesInputTokensDetails(value: Any) -> OpenAiResponsesInputTokensDetails:
+    m = _expect_map(value, expected="struct OpenAiResponsesInputTokensDetails")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "cached_tokens":
+            kw["cached_tokens"] = _expect_int(x, expected="i64")
+        elif key == "cache_write_tokens":
+            kw["cache_write_tokens"] = _expect_int(x, expected="i64")
+    return OpenAiResponsesInputTokensDetails(**kw)
+
+
+def encode_OpenAiResponsesInputTokensDetails(v: OpenAiResponsesInputTokensDetails) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["cached_tokens"] = v.cached_tokens
+    d["cache_write_tokens"] = v.cache_write_tokens
+    return d
+
+
+def decode_OpenAiResponsesOutputTokensDetails(value: Any) -> OpenAiResponsesOutputTokensDetails:
+    m = _expect_map(value, expected="struct OpenAiResponsesOutputTokensDetails")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "reasoning_tokens":
+            kw["reasoning_tokens"] = _expect_int(x, expected="i64")
+    return OpenAiResponsesOutputTokensDetails(**kw)
+
+
+def encode_OpenAiResponsesOutputTokensDetails(v: OpenAiResponsesOutputTokensDetails) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["reasoning_tokens"] = v.reasoning_tokens
+    return d
+
+
+def decode_OpenAiResponsesUsage(value: Any) -> OpenAiResponsesUsage:
+    m = _expect_map(value, expected="struct OpenAiResponsesUsage")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "input_tokens":
+            kw["input_tokens"] = _expect_int(x, expected="i64")
+        elif key == "input_tokens_details":
+            kw["input_tokens_details"] = None if x is None else decode_OpenAiResponsesInputTokensDetails(x)
+        elif key == "output_tokens":
+            kw["output_tokens"] = _expect_int(x, expected="i64")
+        elif key == "output_tokens_details":
+            kw["output_tokens_details"] = None if x is None else decode_OpenAiResponsesOutputTokensDetails(x)
+        elif key == "total_tokens":
+            kw["total_tokens"] = _expect_int(x, expected="i64")
+    return OpenAiResponsesUsage(**kw)
+
+
+def encode_OpenAiResponsesUsage(v: OpenAiResponsesUsage) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["input_tokens"] = v.input_tokens
+    if v.input_tokens_details is not None:
+        d["input_tokens_details"] = encode_OpenAiResponsesInputTokensDetails(v.input_tokens_details)
+    d["output_tokens"] = v.output_tokens
+    if v.output_tokens_details is not None:
+        d["output_tokens_details"] = encode_OpenAiResponsesOutputTokensDetails(v.output_tokens_details)
+    d["total_tokens"] = v.total_tokens
+    return d
+
+
+def decode_OpenAiResponsesResponse(value: Any) -> OpenAiResponsesResponse:
+    m = _expect_map(value, expected="struct OpenAiResponsesResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "id":
+            kw["id"] = _expect_str(x, expected="a string")
+        elif key == "object":
+            kw["object"] = _expect_str(x, expected="a string")
+        elif key == "created_at":
+            kw["created_at"] = _expect_int(x, expected="i64")
+        elif key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "output":
+            kw["output"] = [] if x is None else list(_expect_seq(x, expected="a sequence"))
+        elif key == "status":
+            kw["status"] = _expect_str(x, expected="a string")
+        elif key == "usage":
+            kw["usage"] = None if x is None else decode_OpenAiResponsesUsage(x)
+        elif key == "parallel_tool_calls":
+            kw["parallel_tool_calls"] = _expect_bool(x, expected="a boolean")
+        elif key == "tool_choice":
+            kw["tool_choice"] = x
+        elif key == "tools":
+            kw["tools"] = [] if x is None else [decode_OpenAiResponseTool(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "error":
+            kw["error"] = x
+        elif key == "incomplete_details":
+            kw["incomplete_details"] = x
+        elif key == "instructions":
+            kw["instructions"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "max_output_tokens":
+            kw["max_output_tokens"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "previous_response_id":
+            kw["previous_response_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "reasoning":
+            kw["reasoning"] = x
+        elif key == "store":
+            kw["store"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "temperature":
+            kw["temperature"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "text":
+            kw["text"] = x
+        elif key == "top_p":
+            kw["top_p"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "truncation":
+            kw["truncation"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "user":
+            kw["user"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "metadata":
+            kw["metadata"] = x
+    return OpenAiResponsesResponse(**kw)
+
+
+def encode_OpenAiResponsesResponse(v: OpenAiResponsesResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["id"] = v.id
+    d["object"] = v.object
+    d["created_at"] = v.created_at
+    d["model"] = v.model
+    if v.output:
+        d["output"] = list(v.output)
+    d["status"] = v.status
+    d["usage"] = None if v.usage is None else encode_OpenAiResponsesUsage(v.usage)
+    d["parallel_tool_calls"] = v.parallel_tool_calls
+    if v.tool_choice is not None:
+        d["tool_choice"] = v.tool_choice
+    if v.tools:
+        d["tools"] = [encode_OpenAiResponseTool(e) for e in v.tools]
+    d["error"] = v.error
+    d["incomplete_details"] = v.incomplete_details
+    d["instructions"] = v.instructions
+    d["max_output_tokens"] = v.max_output_tokens
+    d["previous_response_id"] = v.previous_response_id
+    d["reasoning"] = v.reasoning
+    d["store"] = v.store
+    d["temperature"] = None if v.temperature is None else float(v.temperature)
+    d["text"] = v.text
+    d["top_p"] = None if v.top_p is None else float(v.top_p)
+    d["truncation"] = v.truncation
+    d["user"] = v.user
+    d["metadata"] = v.metadata
+    return d
+
+
+def decode_OpenAiModelCard(value: Any) -> OpenAiModelCard:
+    m = _expect_map(value, expected="struct OpenAiModelCard")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "id":
+            kw["id"] = _expect_str(x, expected="a string")
+        elif key == "object":
+            kw["object"] = _expect_str(x, expected="a string")
+        elif key == "created":
+            kw["created"] = _expect_int(x, expected="i64")
+        elif key == "owned_by":
+            kw["owned_by"] = _expect_str(x, expected="a string")
+        elif key == "root":
+            kw["root"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "parent":
+            kw["parent"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "max_model_len":
+            kw["max_model_len"] = None if x is None else _expect_int(x, expected="i64")
+    return OpenAiModelCard(**kw)
+
+
+def encode_OpenAiModelCard(v: OpenAiModelCard) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["id"] = v.id
+    d["object"] = v.object
+    d["created"] = v.created
+    d["owned_by"] = v.owned_by
+    d["root"] = v.root
+    d["parent"] = v.parent
+    d["max_model_len"] = v.max_model_len
+    return d
+
+
+def decode_OpenAiModelList(value: Any) -> OpenAiModelList:
+    m = _expect_map(value, expected="struct OpenAiModelList")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "object":
+            kw["object"] = _expect_str(x, expected="a string")
+        elif key == "data":
+            kw["data"] = [] if x is None else [decode_OpenAiModelCard(e) for e in _expect_seq(x, expected="a sequence")]
+    return OpenAiModelList(**kw)
+
+
+def encode_OpenAiModelList(v: OpenAiModelList) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["object"] = v.object
+    if v.data:
+        d["data"] = [encode_OpenAiModelCard(e) for e in v.data]
+    return d
+
+
+def decode_OpenAiListModelsRequest(value: Any) -> OpenAiListModelsRequest:
+    m = _expect_map(value, expected="struct OpenAiListModelsRequest")
+    return OpenAiListModelsRequest()
+
+
+def encode_OpenAiListModelsRequest(v: OpenAiListModelsRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_OpenAiRetrieveModelRequest(value: Any) -> OpenAiRetrieveModelRequest:
+    m = _expect_map(value, expected="struct OpenAiRetrieveModelRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+    return OpenAiRetrieveModelRequest(**kw)
+
+
+def encode_OpenAiRetrieveModelRequest(v: OpenAiRetrieveModelRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model"] = v.model
     return d
 
 

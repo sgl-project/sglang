@@ -104,6 +104,22 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "AnthropicCountTokensResponse" => {
                 check::<api::AnthropicCountTokensResponse>(&name, input, canonical)
             }
+            "OpenAiCompletionRequest" => {
+                check::<api::OpenAiCompletionRequest>(&name, input, canonical)
+            }
+            "OpenAiCompletionResponse" => {
+                check::<api::OpenAiCompletionResponse>(&name, input, canonical)
+            }
+            "OpenAiChatCompletionRequest" => {
+                check::<api::OpenAiChatCompletionRequest>(&name, input, canonical)
+            }
+            "OpenAiChatCompletionResponse" => {
+                check::<api::OpenAiChatCompletionResponse>(&name, input, canonical)
+            }
+            "OpenAiChatCompletionStreamResponse" => {
+                check::<api::OpenAiChatCompletionStreamResponse>(&name, input, canonical)
+            }
+            "OpenAiErrorResponse" => check::<api::OpenAiErrorResponse>(&name, input, canonical),
             "OllamaChatRequest" => check::<api::OllamaChatRequest>(&name, input, canonical),
             "OllamaChatResponse" => check::<api::OllamaChatResponse>(&name, input, canonical),
             "OllamaGenerateRequest" => check::<api::OllamaGenerateRequest>(&name, input, canonical),

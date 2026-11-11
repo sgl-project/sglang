@@ -1279,6 +1279,239 @@
       "canonical": "{\"input_tokens\":12}"
     },
     {
+      "type": "OpenAiCompletionRequest",
+      "name": "defaults bake in and the prompt may be text, texts, ids, or id lists",
+      "input": {
+        "prompt": "hi",
+        "logit_bias": {
+          "42": 1.5
+        },
+        "stop": [
+          "a"
+        ],
+        "lora_path": [
+          null,
+          "x"
+        ]
+      },
+      "canonical": "{\"model\":\"default\",\"prompt\":\"hi\",\"echo\":false,\"frequency_penalty\":0.0,\"logit_bias\":{\"42\":1.5},\"max_tokens\":16,\"n\":1,\"presence_penalty\":0.0,\"stop\":[\"a\"],\"stream\":false,\"temperature\":1.0,\"top_p\":1.0,\"return_routed_experts\":false,\"routed_experts_start_len\":0,\"return_cached_tokens_details\":false,\"return_spec_tokens_details\":false,\"return_token_ids\":false,\"top_k\":-1,\"min_p\":0.0,\"min_tokens\":0,\"repetition_penalty\":1.0,\"no_stop_trim\":false,\"ignore_eos\":false,\"skip_special_tokens\":true,\"lora_path\":[null,\"x\"]}"
+    },
+    {
+      "type": "OpenAiCompletionRequest",
+      "name": "an id-list prompt and the structural-tag response format",
+      "input": {
+        "model": "m",
+        "prompt": [
+          [
+            1,
+            2
+          ],
+          [
+            3
+          ]
+        ],
+        "response_format": {
+          "type": "structural_tag",
+          "structures": [
+            {
+              "begin": "<f>",
+              "schema": {
+                "type": "object"
+              },
+              "end": "</f>"
+            }
+          ],
+          "triggers": [
+            "<f>"
+          ]
+        },
+        "return_hidden_states": "last"
+      },
+      "canonical": "{\"model\":\"m\",\"prompt\":[[1,2],[3]],\"echo\":false,\"frequency_penalty\":0.0,\"max_tokens\":16,\"n\":1,\"presence_penalty\":0.0,\"stream\":false,\"temperature\":1.0,\"top_p\":1.0,\"return_hidden_states\":\"last\",\"return_routed_experts\":false,\"routed_experts_start_len\":0,\"return_cached_tokens_details\":false,\"return_spec_tokens_details\":false,\"return_token_ids\":false,\"top_k\":-1,\"min_p\":0.0,\"min_tokens\":0,\"repetition_penalty\":1.0,\"no_stop_trim\":false,\"ignore_eos\":false,\"skip_special_tokens\":true,\"response_format\":{\"type\":\"structural_tag\",\"structures\":[{\"begin\":\"<f>\",\"schema\":{\"type\":\"object\"},\"end\":\"</f>\"}],\"triggers\":[\"<f>\"]}}"
+    },
+    {
+      "type": "OpenAiCompletionResponse",
+      "name": "a choice with its null columns and the usage block",
+      "input": {
+        "id": "cmpl-1",
+        "object": "text_completion",
+        "created": 1,
+        "model": "m",
+        "choices": [
+          {
+            "index": 0,
+            "text": "ok",
+            "logprobs": null,
+            "finish_reason": "stop",
+            "matched_stop": 2
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 3,
+          "total_tokens": 4,
+          "completion_tokens": 1,
+          "prompt_tokens_details": {
+            "cached_tokens": 2
+          }
+        },
+        "metadata": null
+      },
+      "canonical": "{\"id\":\"cmpl-1\",\"object\":\"text_completion\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"text\":\"ok\",\"logprobs\":null,\"finish_reason\":\"stop\",\"matched_stop\":2}],\"usage\":{\"prompt_tokens\":3,\"total_tokens\":4,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":2},\"reasoning_tokens\":0,\"completion_tokens_details\":null},\"metadata\":null}"
+    },
+    {
+      "type": "OpenAiChatCompletionRequest",
+      "name": "messages with string and part content, tools, a named tool choice, and a float reasoning effort",
+      "input": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "s"
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "hi"
+              },
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:x"
+                }
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "id": "c1",
+                "type": "function",
+                "function": {
+                  "name": "f",
+                  "arguments": "{\"x\":1}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": "42"
+          }
+        ],
+        "model": "m",
+        "max_completion_tokens": 8,
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "f",
+              "parameters": {
+                "type": "object"
+              }
+            }
+          }
+        ],
+        "tool_choice": {
+          "type": "function",
+          "function": {
+            "name": "f"
+          }
+        },
+        "reasoning_effort": 0.5,
+        "chat_template_kwargs": {
+          "enable_thinking": true
+        },
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "canonical": "{\"messages\":[{\"role\":\"system\",\"content\":\"s\"},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:x\",\"detail\":\"auto\"},\"modalities\":\"image\"}]},{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"c1\",\"index\":null,\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"x\\\":1}\"}}]},{\"role\":\"tool\",\"content\":\"42\",\"tool_call_id\":\"c1\"}],\"model\":\"m\",\"frequency_penalty\":0.0,\"logprobs\":false,\"max_completion_tokens\":8,\"n\":1,\"presence_penalty\":0.0,\"stream\":false,\"stream_options\":{\"include_usage\":true,\"continuous_usage_stats\":false},\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\"}}}],\"tool_choice\":{\"function\":{\"name\":\"f\"},\"type\":\"function\"},\"parallel_tool_calls\":true,\"return_routed_experts\":false,\"routed_experts_start_len\":0,\"return_cached_tokens_details\":false,\"return_spec_tokens_details\":false,\"return_prompt_token_ids\":false,\"return_token_ids\":false,\"return_meta_info\":false,\"return_input_ids_in_sglext\":false,\"return_output_ids_in_sglext\":false,\"return_sampling_mask\":false,\"return_flat_raw_output_top_logprobs\":false,\"return_flat_raw_top_logprobs_b64\":true,\"reasoning_effort\":0.5,\"min_tokens\":0,\"no_stop_trim\":false,\"ignore_eos\":false,\"continue_final_message\":false,\"skip_special_tokens\":true,\"separate_reasoning\":true,\"stream_reasoning\":true,\"chat_template_kwargs\":{\"enable_thinking\":true},\"use_audio_in_video\":false}"
+    },
+    {
+      "type": "OpenAiChatCompletionResponse",
+      "name": "the unary reply with reasoning, a tool call, and sglext",
+      "input": {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "m",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": null,
+              "reasoning_content": "r",
+              "tool_calls": [
+                {
+                  "id": "c1",
+                  "type": "function",
+                  "function": {
+                    "name": "f",
+                    "arguments": "{}"
+                  }
+                }
+              ]
+            },
+            "logprobs": null,
+            "finish_reason": "tool_calls",
+            "matched_stop": null
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 3,
+          "total_tokens": 5,
+          "completion_tokens": 2
+        },
+        "sglext": {
+          "cached_tokens_details": {
+            "device": 1,
+            "host": 0
+          }
+        }
+      },
+      "canonical": "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"r\",\"tool_calls\":[{\"id\":\"c1\",\"index\":null,\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]},\"logprobs\":null,\"finish_reason\":\"tool_calls\",\"matched_stop\":null}],\"usage\":{\"prompt_tokens\":3,\"total_tokens\":5,\"completion_tokens\":2,\"prompt_tokens_details\":null,\"reasoning_tokens\":0,\"completion_tokens_details\":null},\"metadata\":null,\"sglext\":{\"cached_tokens_details\":{\"device\":1,\"host\":0}}}"
+    },
+    {
+      "type": "OpenAiChatCompletionStreamResponse",
+      "name": "a delta frame with its null columns",
+      "input": {
+        "id": "chatcmpl-1",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "m",
+        "choices": [
+          {
+            "index": 0,
+            "delta": {
+              "role": null,
+              "content": "hi",
+              "reasoning_content": null
+            },
+            "logprobs": null,
+            "finish_reason": null,
+            "matched_stop": null
+          }
+        ],
+        "usage": null
+      },
+      "canonical": "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":null,\"content\":\"hi\",\"reasoning_content\":null},\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}"
+    },
+    {
+      "type": "OpenAiErrorResponse",
+      "name": "the OpenAI error body",
+      "input": {
+        "object": "error",
+        "message": "bad",
+        "type": "BadRequestError",
+        "code": 400
+      },
+      "canonical": "{\"object\":\"error\",\"message\":\"bad\",\"type\":\"BadRequestError\",\"param\":null,\"code\":400}"
+    },
+    {
       "type": "UpdateWeightsFromDiskRequest",
       "name": "flush_cache defaults on and null resets it; unread fields keep Python's defaults",
       "input": {
