@@ -12,6 +12,9 @@ from sglang.multimodal_gen.configs.models.dits.hidream_o1_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.base import ImagePipelineConfig
 from sglang.multimodal_gen.configs.sample.hidream_o1_image import _resolve_variant
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 # Key under which the before-denoising stage stashes the per-branch backbone
 # inputs, since HiDream-O1 conditions on token ids rather than text embeddings.
@@ -37,7 +40,9 @@ class HiDreamO1ImagePipelineConfig(ImagePipelineConfig):
     )
 
     dit_config: DiTConfig = field(default_factory=HiDreamO1ImageDitConfig)
-    dit_precision: str = "bf16"
+    # None = not requested; update_config_from_args skips None values, so the
+    # field keeps this default unless the user passes --dit-precision.
+    dit_precision: str | None = None
 
     # No VAE and no separate text encoder: the backbone embeds the prompt and
     # the "latents" are raw 32x32 pixel patches.
@@ -56,11 +61,15 @@ class HiDreamO1ImagePipelineConfig(ImagePipelineConfig):
         super().update_config_from_dict(args, prefix)
         # model_path is only populated here in the serving path. The weight
         # dtype is fixed by the checkpoint -- fp32 for the distilled Dev
-        # variants, bf16 for the full model -- so a CLI --dit-precision value
-        # cannot move it in either direction.
-        self.dit_precision = (
-            "fp32" if _resolve_variant(self.model_path) != "full" else "bf16"
-        )
+        # variants, bf16 for the full model -- so the CLI value cannot move
+        # it in either direction.
+        pinned = "fp32" if _resolve_variant(self.model_path) != "full" else "bf16"
+        if self.dit_precision is not None and self.dit_precision != pinned:
+            logger.warning(
+                f"--dit-precision {self.dit_precision} is ignored for HiDream-O1-Image; "
+                f"the weight dtype is fixed by the checkpoint ({pinned})."
+            )
+        self.dit_precision = pinned
 
     def validate_server_args(self, server_args: Any) -> None:
         # The pipeline builds its scheduler with the reference flow shift, so
