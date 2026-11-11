@@ -574,9 +574,7 @@ def update_expert_weights_single_layer(
                         p2p_op_infos[i] = (logical_expert_id, [])
 
     def _execute_p2p_ops(p2p_op_infos):
-        sorted_infos = sorted(p2p_op_infos, key=lambda info: info[0])
-        p2p_ops = [op for _, ops in sorted_infos for op in ops]
-        if len(p2p_ops) == 0:
+        if not any(ops for _, ops in p2p_op_infos):
             return
 
         # Submit P2P ops in batches to prevent NCCL/RCCL GPU-side accumulation
@@ -584,7 +582,7 @@ def update_expert_weights_single_layer(
         # (based on num_physical_experts) so matching send/recv pairs land in
         # the same batch. Set batch_chunk_size >= num_physical_experts to disable.
         batch_chunk_size = envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get()
-        ops_by_expert = {eid: ops for eid, ops in sorted_infos}
+        ops_by_expert = dict(p2p_op_infos)
         for start in range(0, num_physical_experts, batch_chunk_size):
             batch_ops = []
             for eid in range(
