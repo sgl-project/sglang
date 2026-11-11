@@ -285,12 +285,9 @@ fn tool_dump(tool: &Value) -> Result<Value, String> {
         dump.insert("type".into(), kind.clone());
     }
     dump.insert("function".into(), function.into());
-    if let Some(defer) = tool.get("defer_loading") {
-        let defer = match defer {
-            Value::Null => Value::Null,
-            defer => pydantic_bool(defer)?.into(),
-        };
-        dump.insert("defer_loading".into(), defer);
+    // `Tool._serialize` drops an unset `defer_loading`, null included.
+    if let Some(defer) = tool.get("defer_loading").filter(|v| !v.is_null()) {
+        dump.insert("defer_loading".into(), pydantic_bool(defer)?.into());
     }
     Ok(dump.into())
 }

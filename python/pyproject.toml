@@ -38,7 +38,7 @@ dependencies = [
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "einops",
   "fastapi",
-  "flashinfer_python[cu13]==0.7.2", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_python[cu13]==0.7.3", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
   "humming-kernels[cu13]==0.1.18",
   "interegular",
@@ -77,8 +77,8 @@ dependencies = [
   "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
   "sgl-deep-ep==0.1.2.post1",
-  "sgl-deep-gemm==0.2.6",
-  "sgl-flash-mla==1.0.2",
+  "sgl-deep-gemm==0.2.7",
+  "sgl-flash-mla==1.0.4",
   "sglang-kernel==0.4.10",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
@@ -219,6 +219,7 @@ killall_sglang = "sglang.cli.killall:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
+  "cli/_commands/*.json",
   "srt/**/*",
   "kernels/**/*",
   "multimodal_gen/apps/realtime_webui/**/*"

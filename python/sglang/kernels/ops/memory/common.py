@@ -56,7 +56,8 @@ def write_req_to_token_pool_triton(
         )
 
 
-@triton.jit
+# Same num_tokens rationale as get_last_loc_kernel below.
+@triton.jit(do_not_specialize=["num_tokens", "req_to_token_stride"])
 def _get_last_loc_safe_kernel(
     req_to_token,
     req_pool_indices_tensor,
@@ -117,7 +118,9 @@ def get_last_loc_triton_safe(
     return result_i32.to(prefix_lens_tensor.dtype)
 
 
-@triton.jit
+# num_tokens is the batch size; value specialization (==1, %16==0) compiled a
+# new variant mid-serving whenever the batch first reached such a size.
+@triton.jit(do_not_specialize=["num_tokens", "req_to_token_stride"])
 def get_last_loc_kernel(
     req_to_token,
     req_pool_indices_tensor,
