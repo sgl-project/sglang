@@ -486,6 +486,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[KDAPrefillGraphMetadata] = None
 
+    # gfx950's one-kernel chain verify (kda_backend_hip), set in __init__.
+    _hip_chain_verify_fn = None
+
     def _create_kernel_dispatcher(self, backends):
         return KDAKernelDispatcher(backends.decode, backends.prefill, backends.verify)
 
@@ -538,7 +541,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
             self._fused_chain_verify_fn = fused_kda_conv_gating_verify
             rank0_log("KDA fused chain-verify kernel enabled (topk==1 path).")
-        self._hip_chain_verify_fn = None
         if is_gfx95_supported() and verify_backend.is_triton():
             from sglang.srt.layers.attention.linear.kda_backend_hip import (
                 kda_chain_verify_gfx950,
