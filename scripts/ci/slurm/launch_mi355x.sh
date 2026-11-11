@@ -1882,13 +1882,17 @@ EOF
     spur_cleanup_on_exit() {
         [[ "${SPUR_LEG_JOB_ID:-}" =~ ^[0-9]+$ ]] || return 0
         local _nodes
-        _nodes=$(scontrol show job "$SPUR_LEG_JOB_ID" 2>/dev/null \
-            | tr ' ' '\n' | sed -n 's/^NodeList=//p' | tr ',' '\n' | grep -vx '(null)' || true)
+        if ! _nodes=$(scontrol show job "$SPUR_LEG_JOB_ID" 2>/dev/null \
+            | tr ' ' '\n' | sed -n 's/^NodeList=//p' \
+            | python3 "$SCRIPT_DIR/expand_slurm_nodelist.py"); then
+            echo "WARN: could not resolve cleanup nodes for job $SPUR_LEG_JOB_ID" >&2
+            _nodes=""
+        fi
         for _n in $_nodes; do
             echo "[launch] reaping containers on $_n for spur job $SPUR_LEG_JOB_ID" >&2
             ssh -o BatchMode=yes -o ConnectTimeout=10 -n "$_n" \
-                'docker rm -f mi355x_prefill mi355x_decode mi355x_bench' \
-                >/dev/null 2>&1 || true
+                "bash -o pipefail -c 'docker ps -aq --filter label=spur_job_id=$SPUR_LEG_JOB_ID | xargs -r docker rm -f'" \
+                >/dev/null 2>&1 || echo "WARN: container cleanup failed on $_n for job $SPUR_LEG_JOB_ID" >&2
         done
         scancel "$SPUR_LEG_JOB_ID" 2>/dev/null || true
     }
