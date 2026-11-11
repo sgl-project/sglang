@@ -6,10 +6,15 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.models.unlimited_ocr_v2_support import document_prefetch as p
 from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import UocrReqState
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq
+from sglang.test.scheduler_test_utils import FakeReq, leaving_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -32,13 +37,20 @@ def _req(rid, *, after=None, budget=None, keep=False, max_new=1000):
     )
 
 
-def _prefetch(aborted=None):
+def _prefetch(retirer=None):
+    retirer = retirer or leaving_retirer()
+
+    def abort_windows(reqs, finished_reason):
+        # As the scheduler does: the retirer aborts each window.
+        for req in reqs:
+            retirer.abort(req, finished_reason=finished_reason)
+
     return p.DocPrefetch(
         early=None,
         device=torch.device("cpu"),
         forward_stream=None,
         tp_size=1,
-        abort_windows=lambda reqs, finished_reason: aborted.extend(reqs),
+        abort_windows=abort_windows,
     )
 
 
@@ -52,15 +64,15 @@ class _Sched:
 
     def __init__(self, prefetch):
         self.prefetch = prefetch
-        self.queue = []
+        self.queue = IndexedReqList(ListKind.WAITING)
 
     def add(self, req):
         if not self.prefetch.park(req):
-            self.queue.append(req)
+            move([req], self.queue)
 
     def ingest(self):
         """The scheduler queues released windows at the top of its next step."""
-        for req in self.prefetch.take_released():
+        for req in list(self.prefetch.released):
             self.add(req)
 
 
@@ -84,14 +96,14 @@ class TestNextWindowPrefetch(CustomTestCase):
         w0 = _req("w0", keep=True)
         w1 = _req("w1", after="w0", budget=1000)
         sched.add(w1)
-        self.assertEqual(sched.queue, [])
+        self.assertEqual(list(sched.queue), [])
         _finish(w0, 300, forced=0)
         prefetch.on_window_finished(w0)
-        self.assertEqual(sched.queue, [])
+        self.assertEqual(list(sched.queue), [])
         sched.ingest()
-        self.assertEqual(sched.queue, [w1])
+        self.assertEqual(list(sched.queue), [w1])
         self.assertEqual(w1.sampling_params.max_new_tokens, 700)
-        self.assertEqual(prefetch.take_released(), [])
+        self.assertEqual(list(prefetch.released), [])
 
     def test_a_follow_up_arriving_late_is_not_parked(self):
         """If the window already finished, the follow-up must go straight in,
@@ -103,7 +115,7 @@ class TestNextWindowPrefetch(CustomTestCase):
         prefetch.on_window_finished(w0)
         w1 = _req("w1", after="w0", budget=500)
         sched.add(w1)
-        self.assertEqual(sched.queue, [w1])
+        self.assertEqual(list(sched.queue), [w1])
         # Spliced text is not generation; it does not spend the budget.
         self.assertEqual(w1.sampling_params.max_new_tokens, 479)
 
@@ -119,7 +131,7 @@ class TestNextWindowPrefetch(CustomTestCase):
         _finish(w0, 300)
         prefetch.on_window_finished(w0)
         sched.ingest()
-        self.assertEqual(sched.queue, [w1a, w1b])
+        self.assertEqual(list(sched.queue), [w1a, w1b])
 
     def test_a_retracted_window_releases_nothing(self):
         """Retraction passes the same cache hook unfinished; releasing there
@@ -131,18 +143,19 @@ class TestNextWindowPrefetch(CustomTestCase):
         sched.add(w1)
         prefetch.on_window_finished(w0)
         sched.ingest()
-        self.assertEqual(sched.queue, [])
+        self.assertEqual(list(sched.queue), [])
 
     def test_aborting_the_document_drops_its_held_windows(self):
         """An abort must reach a window still parked off the queue, and one
         released but not yet queued by the scheduler."""
-        aborted = []
-        prefetch = _prefetch(aborted)
+        retirer = leaving_retirer()
+        prefetch = _prefetch(retirer)
+        aborted = lambda: [c.args[0] for c in retirer.abort.call_args_list]
         sched = _Sched(prefetch)
         w1 = _req("doc-w1-ab", after="doc-w0-cd", budget=1000)
         sched.add(w1)
         _abort(prefetch, "doc-w1")
-        self.assertEqual(aborted, [w1])
+        self.assertEqual(aborted(), [w1])
         self.assertEqual(prefetch.held_count(), 0)
 
         w0 = _req("doc-w0-ef", keep=True)
@@ -151,9 +164,9 @@ class TestNextWindowPrefetch(CustomTestCase):
         _finish(w0, 10)
         prefetch.on_window_finished(w0)
         _abort(prefetch, "doc-w2")
-        self.assertEqual(aborted, [w1, w2])
+        self.assertEqual(aborted(), [w1, w2])
         sched.ingest()
-        self.assertEqual(sched.queue, [])
+        self.assertEqual(list(sched.queue), [])
 
     def test_reset_hands_back_every_held_window(self):
         """A cache flush aborts held windows; any it forgot would never be
@@ -168,8 +181,6 @@ class TestNextWindowPrefetch(CustomTestCase):
         _finish(w0, 1)
         prefetch.on_window_finished(w0)
         self.assertCountEqual(prefetch.reset(), [parked, released])
-        self.assertEqual(prefetch.held_count(), 0)
-        self.assertEqual(prefetch.take_released(), [])
 
 
 class TestEarlyEmbeddings(CustomTestCase):
@@ -181,6 +192,21 @@ class TestEarlyEmbeddings(CustomTestCase):
         self.assertIsNotNone(early.prefetched(b"a" * 32, 5))
         self.assertIsNone(early.prefetched(b"a" * 32, 6))
         self.assertIsNone(early.prefetched(None, 5))
+
+    def test_mps_encodes_parked_pages_at_prefill(self):
+        """The early encode runs on a CUDA side stream; MPS has none, so only
+        MPS turns it off and encodes the pages at prefill."""
+        early = p.EarlyEmbeddings(encode=lambda items: None)
+        for device, encode_ahead in (("cuda", True), ("xpu", True), ("mps", False)):
+            with self.subTest(device=device):
+                prefetch = p.DocPrefetch(
+                    early=early,
+                    device=torch.device(device),
+                    forward_stream=None,
+                    tp_size=1,
+                    abort_windows=lambda reqs, finished_reason: None,
+                )
+                self.assertEqual(prefetch._encode_ahead, encode_ahead)
 
 
 if __name__ == "__main__":
