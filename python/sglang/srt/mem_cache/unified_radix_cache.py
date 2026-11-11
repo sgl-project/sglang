@@ -4170,9 +4170,6 @@ class UnifiedRadixCache(BasePrefixCache):
             collector.log_backuped_tokens(
                 min(operation.completed_tokens, agreed_tokens)
             )
-            self.storage_metrics_collector.observe_backup_storage_duration(
-                time.perf_counter() - operation.enqueue_time
-            )
             # L2->L3 outcome: write_storage_failed is set by the backup IO
             if operation.write_storage_failed:
                 self._account_transfer_outcome(
