@@ -127,3 +127,7 @@ def test_scratch_is_never_replaced_and_counters_return_to_zero(monkeypatch):
     (scratch,) = reject_sampling._SPLIT_SCRATCH.values()
     assert [t.data_ptr() for t in scratch] == pointers
     assert int(arrived.max()) == 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
