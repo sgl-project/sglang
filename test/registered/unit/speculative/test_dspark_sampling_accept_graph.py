@@ -163,7 +163,6 @@ def _graph(epi, sampler, monkeypatch, rejection_noise=None):
         epilogue=epi,
         resolve_draft_sampler=lambda: sampler,
         tp_sync=_tp_sync(),
-        fused_argmax=False,
         block_verification=False,
         device="cuda",
         rejection_noise=rejection_noise,
@@ -235,12 +234,12 @@ def test_replay_acceptance_distribution_matches_eager(monkeypatch):
     assert (p_graph - p_eager).abs().max().item() < 0.042, (p_graph, p_eager)
 
 
-def test_region_stages_the_deferred_commit_from_the_joined_projection():
-    """The verify graph replayed this step already joined the deferred commit's
+def test_region_stages_the_deferred_draft_kv_from_the_joined_projection():
+    """The verify graph replayed this step already joined the deferred store's
     projection (its host flag is spent), so the region must stage from it instead of
     joining again, which would find nothing and fall back to an unprojected inject."""
     calls = []
-    commit = SimpleNamespace(
+    deferred_draft_kv = SimpleNamespace(
         join_projection=lambda: calls.append("join") or False,
         stage=lambda **k: calls.append(("stage", int(k["commit_lens"].sum()))),
     )
@@ -249,7 +248,7 @@ def test_region_stages_the_deferred_commit_from_the_joined_projection():
     epi.verify_lens_buf = torch.full((2,), STRIDE, dtype=torch.int64)
     epi.commit_lens_buf = torch.tensor([3, 4], dtype=torch.int32)
     epi._post_fold = False
-    epi.deferred_commit = commit
+    epi.deferred_draft_kv = deferred_draft_kv
     epi.commit_ctx = SimpleNamespace(
         resolve_engram_hasher=None,
         resolve_pool=lambda: SimpleNamespace(
