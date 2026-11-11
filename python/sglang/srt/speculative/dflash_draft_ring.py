@@ -23,7 +23,7 @@ Under PD disaggregation prefill sends a request's last window of ring rows
 """
 
 from contextlib import nullcontext
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
