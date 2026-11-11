@@ -166,6 +166,12 @@ def _publish(x, weights, ids, packed, x_q, x_s):
     return weights, ids
 
 
+def publish_quant(x: torch.Tensor, x_q: torch.Tensor, x_s: torch.Tensor) -> None:
+    """Publish an MXFP8 quant of x's rows made elsewhere, for the runner's take(x)."""
+    clear()
+    _publish(x, None, None, None, x_q, x_s)
+
+
 def take_prepared_routing(ids: torch.Tensor) -> Optional[Tuple[Any, Any]]:
     if _handoff.prepared_ids is not ids:
         return None

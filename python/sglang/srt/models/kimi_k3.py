@@ -86,6 +86,7 @@ from sglang.srt.layers.moe import route_quant_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
     TopK,
     TopKOutputFormat,
     build_precomputed_topk_output,
@@ -1771,6 +1772,58 @@ class KimiK3MoE(nn.Module):
             and k3_ar_fusion.enabled()
         )
 
+    @cached_property
+    def _sp_routes_own_rows(self) -> bool:
+        return self._route_quant_fuse_eligible and not self._moe_front_needs_dense_bf16
+
+    def _sp_route_own_rows(self, normed: torch.Tensor, num_tokens: int):
+        from sglang.srt.layers.quantization.mxfp4 import (
+            _prepare_flashinfer_mxfp8_activations,
+        )
+
+        front = _k3_bf16_gemm(
+            normed,
+            self._front_w[self._front_sizes[0] :],
+            out_dtype=torch.float32 if self._front_fp32 else None,
+        )
+        router_logits, routed_input = torch.split(front, self._front_sizes[1:], dim=-1)
+        route_quant_handoff.clear()
+        topk_output = self.topk(normed, router_logits)
+        _, _, x_q, x_s = _prepare_flashinfer_mxfp8_activations(
+            routed_input, self.experts.quant_method.hidden_size
+        )
+        weights, ids, x_q, x_s = get_parallel().tp_group.all_gatherv(
+            [
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                x_q.view(torch.uint8),
+                x_s.view(torch.uint8),
+            ]
+        )
+        return (
+            weights[:num_tokens],
+            ids[:num_tokens],
+            x_q[:num_tokens].view(torch.float8_e4m3fn),
+            x_s[:num_tokens],
+        )
+
+    def _forward_routed_gathered(self, weights, ids, x_q, x_s, latent):
+        # The runner reads only this tensor's shape: route_quant_handoff hands it
+        # the gathered quant.
+        x = latent.new_empty((1, 1)).expand(
+            x_q.shape[0], self.experts.quant_method.hidden_size
+        )
+        route_quant_handoff.publish_quant(x, x_q, x_s)
+        try:
+            with zero_copy_context.set_moe_output(latent):
+                expert_output = self.experts(x, StandardTopKOutput(weights, ids, None))
+            if route_quant_handoff.take(x) is not None:
+                raise RuntimeError("The MoE runner did not take the gathered SP quant.")
+        finally:
+            route_quant_handoff.clear()
+        if expert_output.data_ptr() != latent.data_ptr():
+            latent.copy_(expert_output)
+
     def forward_prefill_sp(
         self,
         normed: torch.Tensor,
@@ -1784,13 +1837,17 @@ class KimiK3MoE(nn.Module):
         hidden_size = normed.shape[1]
         latent_size = self.moe_hidden_size
         num_tokens, padded = sp.num_tokens, sp.padded
-        hidden_states = sp.gather(normed)
-        gate_up, router_logits, routed_input = self._fused_front(hidden_states)
+        own_rows = self._sp_routes_own_rows
+        if own_rows:
+            routed = self._sp_route_own_rows(normed, num_tokens)
+        else:
+            hidden_states = sp.gather(normed)
+            gate_up, router_logits, routed_input = self._fused_front(hidden_states)
         buf = k3_ar_fusion.symm_buffer(
             k3_ar_fusion.MOE_LATENT_SHARED,
             padded,
             latent_size + hidden_size,
-            hidden_states.dtype,
+            normed.dtype,
         ).view(-1)
         latent_full = buf[: padded * latent_size].view(padded, latent_size)
         shared_full = buf[padded * latent_size :].view(padded, hidden_size)
@@ -1803,8 +1860,17 @@ class KimiK3MoE(nn.Module):
 
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        self._forward_routed(hidden_states, router_logits, routed_input, latent)
+        if own_rows:
+            self._forward_routed_gathered(*routed, latent)
+        else:
+            self._forward_routed(hidden_states, router_logits, routed_input, latent)
         with torch.cuda.stream(self.alt_stream):
+            if own_rows:
+                gate_up = _k3_bf16_gemm(
+                    sp.gather(normed),
+                    self._front_w[: self._front_sizes[0]],
+                    out_dtype=torch.float32 if self._front_fp32 else None,
+                )
             self._forward_shared(gate_up, shared_output)
             sp.reduce_scatter(
                 shared_full, shared_local, num_blocks=_PREFILL_SP_SHARED_RS_BLOCKS
