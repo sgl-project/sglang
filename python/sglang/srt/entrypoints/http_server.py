@@ -21,6 +21,7 @@ import asyncio
 import dataclasses
 import errno
 import inspect
+import ipaddress
 import logging
 import os
 import signal
@@ -2743,10 +2744,17 @@ class _SigquitForwardingMultiprocess(Multiprocess):
             kill_process_tree(os.getpid())
 
 
-def _run_uvicorn_workers(app_path: str, **uvicorn_options) -> None:
+def _run_uvicorn_workers(
+    app_path: str, reserved_socket: Optional[socket.socket] = None, **uvicorn_options
+) -> None:
     """What ``uvicorn.run()`` does for workers > 1, minus its SIGQUIT trap."""
     config = uvicorn.Config(app_path, **uvicorn_options)
-    sockets = [config.bind_socket()]
+    if reserved_socket is None:
+        sockets = [config.bind_socket()]
+    else:
+        # The workers take the listener as bind_socket() leaves it.
+        reserved_socket.set_inheritable(True)
+        sockets = _reserved_sockets(config, reserved_socket)
     if "target" in inspect.signature(Multiprocess.__init__).parameters:
         # uvicorn < 0.51 (not pinned on every platform): the supervisor is
         # given the server's run().
@@ -2964,6 +2972,57 @@ def _run_granian_server(
         server.serve()
 
 
+def _reserve_http_socket(server_args: ServerArgs) -> Optional[socket.socket]:
+    """Bind host:port before the model load, for the HTTP server to listen on.
+
+    connect() never picks an explicitly bound port as its source port, so the
+    load cannot take it; until uvicorn listens, clients are refused at once.
+    """
+    if server_args.node_rank >= 1 or envs.SGLANG_RUST_SERVER.get():
+        # Those serve host:port from another process.
+        return None
+    try:
+        version = ipaddress.ip_address(server_args.host).version
+    except ValueError:
+        # uvicorn binds every address a host name resolves to.
+        return None
+
+    family = socket.AF_INET6 if version == 6 else socket.AF_INET
+    sock = socket.socket(family=family)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6 and server_args.tokenizer_worker_num == 1:
+            # uvloop's create_server sets it; uvicorn's worker listener does not.
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        sock.bind((server_args.host, server_args.port))
+    except OSError as error:
+        sock.close()
+        # The port may still free up during the load, so the server's own bind
+        # decides, as before.
+        logger.warning(
+            f"Could not reserve {server_args.host}:{server_args.port} for the HTTP "
+            f"server: {error}"
+        )
+        return None
+    return sock
+
+
+def _reserved_sockets(
+    config: uvicorn.Config, reserved_socket: Optional[socket.socket]
+) -> Optional[List[socket.socket]]:
+    if reserved_socket is None:
+        return None
+    # uvicorn logs this only for a listener it binds itself.
+    address = f"[{config.host}]" if ":" in config.host else config.host
+    logging.getLogger("uvicorn.error").info(
+        "Uvicorn running on %s://%s:%d (Press CTRL+C to quit)",
+        "https" if config.is_ssl else "http",
+        address,
+        config.port,
+    )
+    return [reserved_socket]
+
+
 def _setup_and_run_http_server(
     server_args: ServerArgs,
     tokenizer_manager,
@@ -2973,10 +3032,13 @@ def _setup_and_run_http_server(
     subprocess_watchdog: Optional[SubprocessWatchdog],
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
+    reserved_socket: Optional[socket.socket] = None,
 ):
     """Set up global state, configure middleware, and run uvicorn.
 
-    Called by launch_server after subprocesses have been launched.
+    Called by launch_server after subprocesses have been launched. reserved_socket,
+    if any, is bound to host:port; servers that bind host:port themselves get it
+    closed first.
     """
     # Set global states
     set_global_state(
@@ -3032,6 +3094,8 @@ def _setup_and_run_http_server(
                     f"Starting embedded Granian HTTP/2 server on "
                     f"{get_serving().host}:{get_serving().port}"
                 )
+                if reserved_socket is not None:
+                    reserved_socket.close()
                 _run_granian_server(
                     host=get_serving().host,
                     port=get_serving().port,
@@ -3084,7 +3148,9 @@ def _setup_and_run_http_server(
                     )
                     logger.info("SSL certificate auto-refresh enabled.")
                     try:
-                        await server.serve()
+                        await server.serve(
+                            sockets=_reserved_sockets(config, reserved_socket)
+                        )
                     finally:
                         refresher.stop()
 
@@ -3113,7 +3179,7 @@ def _setup_and_run_http_server(
                 tokenizer_manager.set_server_stop_hook(
                     lambda: setattr(server, "should_exit", True)
                 )
-                server.run()
+                server.run(sockets=_reserved_sockets(server.config, reserved_socket))
         else:
             # Multiple tokenizer and http processes.
             # Child processes re-import the app, so no stop hook here.
@@ -3137,6 +3203,8 @@ def _setup_and_run_http_server(
                     f"Starting embedded Granian HTTP/2 server on "
                     f"{get_serving().host}:{get_serving().port}"
                 )
+                if reserved_socket is not None:
+                    reserved_socket.close()
                 _run_granian_server(
                     host=get_serving().host,
                     port=get_serving().port,
@@ -3172,6 +3240,8 @@ def _setup_and_run_http_server(
                     "ssl_keyfile_password": get_serving().ssl_keyfile_password,
                 }
                 if get_serving().enable_http_worker_reuseport:
+                    if reserved_socket is not None:
+                        reserved_socket.close()
                     config = uvicorn.Config(app_path, **uvicorn_options)
                     supervisor = _ReusePortMultiprocess(config)
                     logger.info(
@@ -3180,7 +3250,9 @@ def _setup_and_run_http_server(
                     )
                     supervisor.run()
                 else:
-                    _run_uvicorn_workers(app_path, **uvicorn_options)
+                    _run_uvicorn_workers(
+                        app_path, reserved_socket=reserved_socket, **uvicorn_options
+                    )
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
@@ -3251,63 +3323,69 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    # Launch subprocesses
-    (
-        tokenizer_manager,
-        template_manager,
-        port_args,
-        scheduler_init_result,
-        subprocess_watchdog,
-        _weight_cache_daemon_procs,
-    ) = Engine._launch_subprocesses(
-        server_args=server_args,
-        init_tokenizer_manager_func=init_tokenizer_manager_func,
-        run_scheduler_process_func=run_scheduler_process_func,
-        run_detokenizer_process_func=run_detokenizer_process_func,
-    )
-
-    if get_parallel().node_rank >= 1:
-        # _launch_subprocesses already blocked until the schedulers exited.
-        return
-
-    if envs.SGLANG_RUST_SERVER.get():
-        # The Rust server serves api-server, tokenizer, and detokenizer, so the
-        # main process has no Python HTTP server / tokenizer manager to run.
-        # Each Rust listener runs its own startup warmup and keeps /health at
-        # 503 until it succeeds, so the main process does not warm up here. A
-        # failed warmup signals this process as a crashed scheduler does.
-        from sglang.srt.rust_server.server import drain_notify_name
-        from sglang.srt.rust_server.shutdown import RustServerSigtermDrain
-
-        drain = None
-        # Without a local listener (the DP controller starts the schedulers),
-        # SIGTERM keeps its previous effect. Installed before the sidecar
-        # block, so SIGTERM stops the sidecar first and then reaches the drain.
-        if scheduler_init_result.rust_listener_procs:
-            drain = RustServerSigtermDrain(
-                scheduler_init_result.scheduler_procs,
-                scheduler_init_result.rust_listener_procs,
-                subprocess_watchdog,
-                drain_notify_name(port_args.instance_id),
-            )
-            drain.install()
-        # Every listener is bound before its scheduler reports ready, so the
-        # sidecar can connect at once.
-        with rust_server_sidecar(node_hosts_rust_server()):
-            if launch_callback is not None:
-                launch_callback()
-            if drain is not None:
-                drain.wait()
-            else:
-                scheduler_init_result.block_until_scheduler_exits()
-    else:
-        _setup_and_run_http_server(
-            server_args,
+    reserved_socket = _reserve_http_socket(server_args)
+    try:
+        # Launch subprocesses
+        (
             tokenizer_manager,
             template_manager,
             port_args,
-            scheduler_init_result.scheduler_infos,
+            scheduler_init_result,
             subprocess_watchdog,
-            execute_warmup_func=execute_warmup_func,
-            launch_callback=launch_callback,
+            _weight_cache_daemon_procs,
+        ) = Engine._launch_subprocesses(
+            server_args=server_args,
+            init_tokenizer_manager_func=init_tokenizer_manager_func,
+            run_scheduler_process_func=run_scheduler_process_func,
+            run_detokenizer_process_func=run_detokenizer_process_func,
         )
+
+        if get_parallel().node_rank >= 1:
+            # _launch_subprocesses already blocked until the schedulers exited.
+            return
+
+        if envs.SGLANG_RUST_SERVER.get():
+            # The Rust server serves api-server, tokenizer, and detokenizer, so the
+            # main process has no Python HTTP server / tokenizer manager to run.
+            # Each Rust listener runs its own startup warmup and keeps /health at
+            # 503 until it succeeds, so the main process does not warm up here. A
+            # failed warmup signals this process as a crashed scheduler does.
+            from sglang.srt.rust_server.server import drain_notify_name
+            from sglang.srt.rust_server.shutdown import RustServerSigtermDrain
+
+            drain = None
+            # Without a local listener (the DP controller starts the schedulers),
+            # SIGTERM keeps its previous effect. Installed before the sidecar
+            # block, so SIGTERM stops the sidecar first and then reaches the drain.
+            if scheduler_init_result.rust_listener_procs:
+                drain = RustServerSigtermDrain(
+                    scheduler_init_result.scheduler_procs,
+                    scheduler_init_result.rust_listener_procs,
+                    subprocess_watchdog,
+                    drain_notify_name(port_args.instance_id),
+                )
+                drain.install()
+            # Every listener is bound before its scheduler reports ready, so the
+            # sidecar can connect at once.
+            with rust_server_sidecar(node_hosts_rust_server()):
+                if launch_callback is not None:
+                    launch_callback()
+                if drain is not None:
+                    drain.wait()
+                else:
+                    scheduler_init_result.block_until_scheduler_exits()
+        else:
+            _setup_and_run_http_server(
+                server_args,
+                tokenizer_manager,
+                template_manager,
+                port_args,
+                scheduler_init_result.scheduler_infos,
+                subprocess_watchdog,
+                execute_warmup_func=execute_warmup_func,
+                launch_callback=launch_callback,
+                reserved_socket=reserved_socket,
+            )
+    finally:
+        if reserved_socket is not None:
+            reserved_socket.close()
