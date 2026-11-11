@@ -16,6 +16,7 @@ use crate::api_server::handlers::{AbortEnding, CoreHandle, HiCacheError, HiCache
 use crate::message::config::{
     DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS, PreferredSamplingParams, ServerArgs,
 };
+use crate::message::io_struct::{ExpertDistributionAction, ProfileOptions};
 use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
 use crate::utils::environ;
@@ -107,7 +108,18 @@ fn response_timeout(secs: u64) -> Duration {
     Duration::from_secs(secs)
 }
 
-impl GrpcService {}
+impl GrpcService {
+    async fn expert_distribution_record(
+        &self,
+        action: ExpertDistributionAction,
+    ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        self.core
+            .expert_distribution_record(action)
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::ExpertDistributionRecordResponse {}))
+    }
+}
 
 #[tonic::async_trait]
 impl SglangService for GrpcService {
@@ -195,6 +207,116 @@ impl SglangService for GrpcService {
         info::server_info(server_info)
             .map(Response::new)
             .map_err(Status::internal)
+    }
+
+    async fn set_internal_state(
+        &self,
+        request: Request<api::SetInternalStateRequest>,
+    ) -> Result<Response<api::SetInternalStateResponse>, Status> {
+        let updated = self
+            .core
+            .set_internal_state(request.into_inner().server_args.as_deref())
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::SetInternalStateResponse { updated }))
+    }
+
+    async fn start_profile(
+        &self,
+        request: Request<api::StartProfileRequest>,
+    ) -> Result<Response<api::ProfileResponse>, Status> {
+        let request = request.into_inner();
+        let options = ProfileOptions {
+            output_dir: request.output_dir,
+            start_step: request.start_step,
+            num_steps: request.num_steps,
+            activities: request.activities.map(|list| list.items),
+            profile_by_stage: request.profile_by_stage,
+            with_stack: request.with_stack,
+            record_shapes: request.record_shapes,
+            profile_id: request.profile_id,
+            merge_profiles: request.merge_profiles,
+            profile_prefix: request.profile_prefix,
+            profile_stages: request.profile_stages.map(|list| list.items),
+            detailed_annotations: request.detailed_annotations,
+        };
+        let outcome = self
+            .core
+            .start_profile(options)
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::ProfileResponse {
+            success: outcome.success,
+            message: outcome.message,
+        }))
+    }
+
+    async fn stop_profile(
+        &self,
+        _request: Request<api::StopProfileRequest>,
+    ) -> Result<Response<api::ProfileResponse>, Status> {
+        let outcome = self.core.stop_profile().await.map_err(native_api::status)?;
+        Ok(Response::new(api::ProfileResponse {
+            success: outcome.success,
+            message: outcome.message,
+        }))
+    }
+
+    async fn start_expert_distribution_record(
+        &self,
+        _request: Request<api::ExpertDistributionRecordRequest>,
+    ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        self.expert_distribution_record(ExpertDistributionAction::Start)
+            .await
+    }
+
+    async fn stop_expert_distribution_record(
+        &self,
+        _request: Request<api::ExpertDistributionRecordRequest>,
+    ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        self.expert_distribution_record(ExpertDistributionAction::Stop)
+            .await
+    }
+
+    async fn dump_expert_distribution_record(
+        &self,
+        _request: Request<api::ExpertDistributionRecordRequest>,
+    ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        self.expert_distribution_record(ExpertDistributionAction::Dump)
+            .await
+    }
+
+    async fn slow_down(
+        &self,
+        request: Request<api::SlowDownRequest>,
+    ) -> Result<Response<api::SlowDownResponse>, Status> {
+        self.core
+            .slow_down(request.into_inner().forward_sleep_time)
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::SlowDownResponse {}))
+    }
+
+    async fn release_memory_occupation(
+        &self,
+        request: Request<api::ReleaseMemoryOccupationRequest>,
+    ) -> Result<Response<api::MemoryOccupationResponse>, Status> {
+        self.core
+            .release_memory_occupation(request.into_inner().tags.map(|list| list.items))
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::MemoryOccupationResponse {}))
+    }
+
+    async fn resume_memory_occupation(
+        &self,
+        request: Request<api::ResumeMemoryOccupationRequest>,
+    ) -> Result<Response<api::MemoryOccupationResponse>, Status> {
+        self.core
+            .resume_memory_occupation(request.into_inner().tags.map(|list| list.items))
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::MemoryOccupationResponse {}))
     }
 
     async fn freeze_gc(
