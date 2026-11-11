@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.verify_mla_draft import (
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.attention.triton_backend import (
     TritonAttnBackend,
+    WindowRail,
     _should_use_verify_shared_kv,
 )
 from sglang.srt.layers.attention.triton_draft_hip import init_draft_backend
@@ -445,6 +446,7 @@ def _backend_extend(case, inputs, bf16_dot):
     backend.use_dense_fp8_chunked_prefill = False
     backend.use_verify_shared_kv = False
     backend.use_verify_splitkv = False
+    backend.use_verify_gfx115 = False
     backend.verify_mla_draft_fwd = None
     backend.extend_attention_fwd = extend_attention_fwd
     backend.dcp_size = 1
@@ -466,9 +468,7 @@ def _backend_extend(case, inputs, bf16_dot):
     backend.forward_metadata = SimpleNamespace(
         kv_indptr=kv_indptr,
         kv_indices=kv_indices,
-        window_kv_indptr=kv_indptr,
-        window_kv_indices=kv_indices,
-        window_kv_offsets=None,
+        windows={None: WindowRail(kv_indptr=kv_indptr, kv_indices=kv_indices)},
         qo_indptr=qo_indptr,
         custom_mask=None,
         mask_indptr=None,
