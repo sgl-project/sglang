@@ -17,10 +17,6 @@ import pytest
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.wan_animate_2 import WanAnimate2Config
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.models.dits import wan_animate_2_block
 from sglang.multimodal_gen.runtime.models.dits.wan_animate_2 import (
     WanAnimate2Transformer3DModel,
@@ -45,9 +41,6 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.denoising import (
     WanAnimate2DenoisingStage,
-)
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
 )
 
 _DIT = "sglang.multimodal_gen.runtime.models.dits.wan_animate_2"
@@ -1088,19 +1081,11 @@ def test_dit_work_of_a_clip_runs_inside_one_declared_transformer_use():
     ]
 
 
-def _ensure_single_process_parallel_runtime() -> None:
-    # The DiT's parallel linear layers need the TP group even on a meta device.
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
-
-
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_dit_constructs_only_its_own_blocks():
     """Every block the DiT constructs is the in-context block; the parent's block set is not
     built and then replaced (40 block objects per construction, allocated on whatever device
     the loader initializes on)."""
-    _ensure_single_process_parallel_runtime()
     config = WanAnimate2Config()
     config.arch_config.num_layers = 2
     constructed: list[type] = []

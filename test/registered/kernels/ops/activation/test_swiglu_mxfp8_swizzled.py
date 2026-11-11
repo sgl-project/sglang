@@ -19,20 +19,11 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     swiglu_no_interleaved_with_alpha_and_limit,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.mxfp8 import assert_matches_flashinfer_mxfp8
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 ROWS, HIDDEN = 333, 5376  # rows and scale columns both need padding
-
-
-def _assert_matches_flashinfer(
-    got: tuple[torch.Tensor, torch.Tensor], bf16: torch.Tensor
-) -> None:
-    import flashinfer
-
-    q, s = flashinfer.mxfp8_quantize(bf16.contiguous(), True)
-    assert torch.equal(got[0].view(torch.uint8), q.view(torch.uint8))
-    assert torch.equal(got[1].view(torch.uint8), s.view(torch.uint8))
 
 
 def test_silu_mul_mxfp8_is_byte_exact(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -43,7 +34,7 @@ def test_silu_mul_mxfp8_is_byte_exact(monkeypatch: pytest.MonkeyPatch) -> None:
     assert can_use_silu_mul_mxfp8(x)
     ref = torch.nn.functional.silu(x[:, :HIDDEN]) * x[:, HIDDEN:]
     _poison_scale_alloc(monkeypatch)
-    _assert_matches_flashinfer(silu_mul_mxfp8(x), ref)
+    assert_matches_flashinfer_mxfp8(silu_mul_mxfp8(x), ref)
 
 
 def _poison_scale_alloc(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -68,7 +59,7 @@ def test_swiglu_oai_mxfp8_matches_eager_chain(
     )[:, : 2 * n]
     ref = swiglu_no_interleaved_with_alpha_and_limit(x, 1.702, 7.0)
     _poison_scale_alloc(monkeypatch)
-    _assert_matches_flashinfer(swiglu_oai_mxfp8(x, 1.702, 7.0), ref)
+    assert_matches_flashinfer_mxfp8(swiglu_oai_mxfp8(x, 1.702, 7.0), ref)
 
 
 def test_swiglu_oai_mxfp8_cuda_graph_replay() -> None:
@@ -84,7 +75,7 @@ def test_swiglu_oai_mxfp8_cuda_graph_replay() -> None:
         graph.replay()
         assert torch.equal(x, snapshot)
         ref = swiglu_no_interleaved_with_alpha_and_limit(x, 1.702, 7.0)
-        _assert_matches_flashinfer(got, ref)
+        assert_matches_flashinfer_mxfp8(got, ref)
 
 
 @pytest.mark.parametrize("rows", [1, 7, 128, 333, 2050])

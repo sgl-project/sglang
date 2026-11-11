@@ -54,6 +54,14 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 /// encoded output. Errors are plain text so the relaying side can carry the
 /// message into its own merged error.
 async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    // Without an admin key, `HiCacheManager` refuses attach and detach before
+    // relaying them, so only a request sent straight to this route carries
+    // one; refuse it too, or the peer route would bypass that refusal.
+    if state.server_args.api_keys.admin_api_key.is_none()
+        && forwarded_tag(&body).is_some_and(|tag| HICACHE_ADMIN_TAGS.contains(&tag.as_str()))
+    {
+        return super::hicache::admin_key_missing();
+    }
     match state.core.forward_control_req(body).await {
         Ok(reply) => (
             StatusCode::OK,
@@ -62,6 +70,20 @@ async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) ->
         )
             .into_response(),
         Err(error) => (error.http_status(), error.to_string()).into_response(),
+    }
+}
+
+/// The forwarded control messages of a HiCache attach and detach.
+const HICACHE_ADMIN_TAGS: &[&str] = &[
+    "AttachHiCacheStorageReqInput",
+    "DetachHiCacheStorageReqInput",
+];
+
+/// A forwarded control message's type tag, the first element of its array.
+fn forwarded_tag(body: &[u8]) -> Option<String> {
+    match rmpv::decode::read_value(&mut &body[..]).ok()? {
+        rmpv::Value::Array(items) => items.first()?.as_str().map(str::to_owned),
+        _ => None,
     }
 }
 
@@ -457,14 +479,15 @@ mod tests {
         flume::Receiver<TmEvent>,
         flume::Receiver<crate::tokenizer_manager::wiring::AbortSource>,
     ) {
-        test_state_with_peers(server_args, Vec::new())
+        test_state_with_peers(server_args, Vec::new(), Vec::new())
     }
 
     /// A state whose core answers for the DP ranks `peer_endpoints` reach as
-    /// well as its own.
+    /// well as its own, and reports `server_info_state_keys` on `/server_info`.
     fn test_state_with_peers(
         server_args: ServerArgs,
         peer_endpoints: Vec<Arc<dyn ControlTarget>>,
+        server_info_state_keys: Vec<String>,
     ) -> (
         Arc<AppState>,
         flume::Receiver<TmEvent>,
@@ -484,8 +507,11 @@ mod tests {
                 mm_limits: Default::default(),
                 multimodal: false,
                 peer_endpoints,
-                metadata: CoreMetadata::from(server_args.as_ref()),
+                metadata: CoreMetadata::from(server_args.as_ref())
+                    .with_server_info_state_keys(server_info_state_keys),
                 metrics: None,
+                request_log: None,
+                generate_validator: None,
             },
         );
         (
@@ -611,27 +637,32 @@ mod tests {
             Some(_) => vec![endpoint(1, listeners[1]), endpoint(0, listeners[0])],
             None => Vec::new(),
         };
-        let (state, intake_rx, abort_rx) = test_state(ServerArgs {
-            deployment_info: DeploymentInfo {
-                dp_rank,
-                rust_server_endpoints,
+        // An embedding package registers its own scheduler fields by name.
+        let (state, intake_rx, abort_rx) = test_state_with_peers(
+            ServerArgs {
+                deployment_info: DeploymentInfo {
+                    dp_rank,
+                    rust_server_endpoints,
+                    ..Default::default()
+                },
+                model_path: "/model".into(),
+                served_model_name: "served".into(),
+                tokenizer_path: "/local-tokenizer-copy".into(),
+                public_tokenizer_path: "/tokenizer".into(),
+                model_config: ModelConfig {
+                    context_len: 4096,
+                    ..Default::default()
+                },
+                max_total_num_tokens: 8192,
+                version: "1.2.3".into(),
+                launch_server_info: crate::message::config::JsonObject(Arc::new(
+                    launch_fields.as_object().unwrap().clone(),
+                )),
                 ..Default::default()
             },
-            model_path: "/model".into(),
-            served_model_name: "served".into(),
-            tokenizer_path: "/local-tokenizer-copy".into(),
-            public_tokenizer_path: "/tokenizer".into(),
-            model_config: ModelConfig {
-                context_len: 4096,
-                ..Default::default()
-            },
-            max_total_num_tokens: 8192,
-            version: "1.2.3".into(),
-            launch_server_info: crate::message::config::JsonObject(Arc::new(
-                launch_fields.as_object().unwrap().clone(),
-            )),
-            ..Default::default()
-        });
+            Vec::new(),
+            vec!["package_state".into(), "unset_package_state".into()],
+        );
         let request = tokio::spawn(
             routes().with_state(state).oneshot(
                 HttpRequest::builder()
@@ -664,6 +695,13 @@ mod tests {
                 rmpv::Value::from("must-not-leak"),
             ),
             (
+                rmpv::Value::from("package_state"),
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::from("tokens_per_owner"),
+                    rmpv::Value::Map(vec![(rmpv::Value::from(0), rmpv::Value::from(7))]),
+                )]),
+            ),
+            (
                 rmpv::Value::from("last_gen_throughput"),
                 rmpv::Value::from(1.5),
             ),
@@ -680,6 +718,13 @@ mod tests {
                     (rmpv::Value::from("kvcache"), kvcache),
                     (rmpv::Value::from("token_capacity"), rmpv::Value::from(8192)),
                     (rmpv::Value::from("token_capacity_swa"), rmpv::Value::Nil),
+                    (
+                        rmpv::Value::from("token_capacity_window"),
+                        rmpv::Value::Map(vec![(
+                            rmpv::Value::from("window_4096"),
+                            rmpv::Value::from(2048),
+                        )]),
+                    ),
                     (
                         rmpv::Value::from("future_uncontracted_metric"),
                         rmpv::Value::from(99),
@@ -747,6 +792,27 @@ mod tests {
             3
         );
         assert_eq!(body["internal_states"][0]["last_gen_throughput"], 1.5);
+        // A registered field passes through after the typed ones, its integer
+        // keys stringified as Python's are; one the scheduler did not set
+        // stays absent.
+        assert_eq!(
+            body["internal_states"][0]["package_state"],
+            serde_json::json!({"tokens_per_owner": {"0": 7}})
+        );
+        assert_eq!(
+            body["internal_states"][0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .next_back()
+                .unwrap(),
+            "package_state"
+        );
+        assert!(
+            body["internal_states"][0]
+                .get("unset_package_state")
+                .is_none()
+        );
         assert_eq!(
             body["internal_states"][0]["memory_usage"]["kvcache"],
             expected_kvcache
@@ -758,6 +824,10 @@ mod tests {
         assert_eq!(
             body["internal_states"][0]["memory_usage"]["token_capacity_swa"],
             serde_json::Value::Null
+        );
+        assert_eq!(
+            body["internal_states"][0]["memory_usage"]["token_capacity_window"],
+            serde_json::json!({"window_4096": 2048})
         );
         assert_eq!(
             body["internal_states"][0]["step_time_dict"]["4"],
@@ -922,13 +992,14 @@ mod tests {
             ],
             ..Default::default()
         };
-        let peers = peer_endpoints(&info, 0).unwrap();
+        let peers = peer_endpoints(&info, 0, &Default::default()).unwrap();
         let (state, intake_rx, abort_rx) = test_state_with_peers(
             ServerArgs {
                 deployment_info: info,
                 ..Default::default()
             },
             peers,
+            Vec::new(),
         );
         let core = state.core.clone();
         let app = routes().with_state(state);
@@ -967,10 +1038,13 @@ mod tests {
             let case = format!("{uri} {}", String::from_utf8_lossy(&body));
             // A live generation each abort but the no-op one names.
             let call = core
-                .generate(GenerateRequest {
-                    rid: Rid::from_client("client-rid"),
-                    ..Default::default()
-                })
+                .generate(
+                    GenerateRequest {
+                        rid: Rid::from_client("client-rid"),
+                        ..Default::default()
+                    },
+                    crate::api_server::core::ReceivedAs::without_headers(),
+                )
                 .await
                 .unwrap();
             let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
@@ -1031,13 +1105,14 @@ mod tests {
             rust_server_endpoints: vec![endpoint(0, &own), endpoint(1, &own)],
             ..Default::default()
         };
-        let peers = peer_endpoints(&info, 0).unwrap();
+        let peers = peer_endpoints(&info, 0, &Default::default()).unwrap();
         let (state, _intake_rx, _abort_rx) = test_state_with_peers(
             ServerArgs {
                 deployment_info: info,
                 ..Default::default()
             },
             peers,
+            Vec::new(),
         );
         // Aborts are idempotent in the core, so count the requests served.
         let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1483,10 +1558,13 @@ mod tests {
             let (state, intake_rx, abort_rx) = test_state(ServerArgs::default());
             let mut call = state
                 .core
-                .generate(GenerateRequest {
-                    rid: Rid::from_client("client-rid"),
-                    ..Default::default()
-                })
+                .generate(
+                    GenerateRequest {
+                        rid: Rid::from_client("client-rid"),
+                        ..Default::default()
+                    },
+                    crate::api_server::core::ReceivedAs::without_headers(),
+                )
                 .await
                 .unwrap();
             let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
@@ -1737,6 +1815,54 @@ mod tests {
         let last: serde_json::Value = serde_json::from_str(last).unwrap();
         assert_eq!(last["choices"][0]["finish_reason"], "abort", "{last}");
         assert_eq!(done, "[DONE]");
+    }
+
+    /// Without an admin key, the peer route refuses the HiCache attach and
+    /// detach `/hicache/storage-backend` refuses, before they reach the
+    /// scheduler; other control messages still go through.
+    #[tokio::test]
+    async fn peer_route_refuses_hicache_storage_changes_without_an_admin_key() {
+        use crate::message::io_struct::{ControlRequest, DetachHiCacheStorageReqInput};
+        let detach = ControlRequest::DetachHiCacheStorageReqInput(
+            DetachHiCacheStorageReqInput::new("sender-rid".into()),
+        )
+        .encode()
+        .unwrap();
+        let post = |state: Arc<AppState>| {
+            routes().with_state(state).oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(FORWARD_PEER_PATH)
+                    .body(Body::from(detach.clone()))
+                    .unwrap(),
+            )
+        };
+
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        // A relayed detach would wait on the scheduler's reply forever.
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), post(state))
+            .await
+            .expect("refused without waiting on the scheduler")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("requires admin API key"),
+            "{body:?}"
+        );
+        assert!(intake_rx.is_empty(), "refused before the scheduler");
+
+        // With an admin key, the relayed detach reaches the scheduler.
+        let mut args = ServerArgs::default();
+        args.api_keys.admin_api_key = Some("sk-admin".into());
+        let (state, intake_rx, _abort_rx) = test_state(args);
+        let response = tokio::spawn(post(state));
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("the detach must reach the scheduler");
+        };
+        assert!(admission.try_accept());
+        drop(request);
+        let _ = response.await;
     }
 
     /// A forwarded control request reaches the local scheduler under the rid

@@ -9,7 +9,7 @@ import regex as re
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.linear import LinearBase, set_weight_attrs
+from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
@@ -36,6 +36,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput

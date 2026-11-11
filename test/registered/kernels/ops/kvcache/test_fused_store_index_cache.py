@@ -48,7 +48,7 @@ try:
 except ImportError:
     _is_fp8_fnuz = False
 
-register_cuda_ci(est_time=24, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=24, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=24, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 PAGE_SIZE = 64
@@ -454,6 +454,38 @@ def test_reference_writes_nonzero():
 
     assert deq.abs().sum().item() > 0, "Reference buffer is all zeros — error!"
     torch.testing.assert_close(deq, key.float(), rtol=0.15, atol=5e-2)
+
+
+@pytest.mark.parametrize("dcp_size,dcp_rank", [(2, 1), (4, 0)])
+def test_dcp_store_keeps_owned_slots(dcp_size: int, dcp_rank: int):
+    """Under DCP a rank stores only the slots it owns, at slot // dcp_size, and
+    skips the others and negative slots: the buffer equals a plain store of the
+    owned tokens at their remapped rows."""
+    _skip_if_unavailable()
+    device = torch.device("cuda")
+
+    num_tokens = 96
+    key = torch.randn((num_tokens, HEAD_DIM), device=device, dtype=torch.bfloat16)
+    loc = torch.randperm(4 * PAGE_SIZE * dcp_size, device=device)[:num_tokens]
+    loc[::7] = -1
+    num_pages = _num_pages(loc // dcp_size, PAGE_SIZE)
+
+    out_buf = _make_buffer(num_pages)
+    fused_store_index_k_cache(
+        key, out_buf, loc, page_size=PAGE_SIZE, dcp_size=dcp_size, dcp_rank=dcp_rank
+    )
+    owned = (loc >= 0) & (loc % dcp_size == dcp_rank)
+    ref_buf = _make_buffer(num_pages)
+    fused_store_index_k_cache(
+        key[owned].contiguous(),
+        ref_buf,
+        (loc[owned] // dcp_size).contiguous(),
+        page_size=PAGE_SIZE,
+    )
+    torch.cuda.synchronize()
+
+    assert owned.any() and (~owned & (loc >= 0)).any() and (loc < 0).any()
+    assert torch.equal(out_buf, ref_buf)
 
 
 if __name__ == "__main__":

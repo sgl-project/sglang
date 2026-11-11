@@ -1,23 +1,17 @@
 ---
 name: add-jit-kernel
-description: Step-by-step tutorial for adding a new lightweight JIT CUDA kernel to sglang.kernels JIT infrastructure and public operator groups
+description: Step-by-step tutorial for adding a new lightweight JIT CUDA kernel to sglang.kernels JIT infrastructure and public operator groups, plus the header-library helpers and guidance for making the kernel fast
 ---
 
 # Tutorial: Adding a New JIT Kernel to SGLang
 
 Apply [kernel-organization](../kernel-organization/SKILL.md) for the public
-operator namespace, logical grouping, lazy registry metadata, and test placement.
-The implementation tutorial below does not replace that API contract.
+operator namespace, logical grouping, lazy registry metadata, test placement,
+and, before writing a kernel, the search for other implementations of the same
+contract ("One implementation per contract"). The implementation tutorial below
+does not replace that API contract.
 
-This tutorial walks through adding a simple element-wise scale operation as a JIT kernel. We'll implement `scale(x, factor) = x * factor` to demonstrate the complete workflow.
-
-## Goal
-
-Add a new operation that scales each element of a tensor by a scalar factor:
-
-- Input: tensor `x` (CUDA) and scalar `factor` (float, passed at runtime)
-- Output: `x * factor` (element-wise), allocated internally
-- Supported dtypes: **FP16 (`torch.float16`), BF16 (`torch.bfloat16`), FP32 (`torch.float32`)**
+For performance work beyond the mechanics, read the guide for your platform: [performance-cuda.md](performance-cuda.md) (estimating before implementing, SASS checks, SM100 notes, fair comparisons).
 
 ## When to use JIT vs AOT (`sgl-kernel`)
 
@@ -34,13 +28,23 @@ These hold for every step below.
 - **`namespace sglang` is where JIT code lives.** Open it after the include block and close it at the end of the file, with the device kernels, traits and host wrapper inside. The shared `host::` / `device::` helpers are nested in it too, so they resolve unqualified. `load_jit` emits the `TVM_FFI_DLL_EXPORT_TYPED_FUNC` wrapper inside `namespace sglang` as well, so the `kernel_name` you pass from Python needs no `sglang::` prefix.
 - **Tuning policy belongs in Python; C++ gets the answer, not the decision.** For a hyperparameter — split factor, threads per item, block size, vector width, an algorithm variant — prefer (not required) making it a **template parameter** and letting the `@cache_once` module factory choose the value, over a runtime `if`/`switch` in the launcher that picks among pre-instantiated kernels. The kernel then compiles exactly one specialisation and asserts its own preconditions with `static_assert`, while the heuristic that produced the value sits in Python where it is readable, adjustable, and inspectable without recompiling CUDA. `store_cache`'s `num_threads` is the worked example: a `get_kernel(num_split)` ladder guarded by byte-alignment `if constexpr`s became one template argument plus a heuristic in `_jit_kvcache_module`. The exception is a knob that genuinely varies per call with the runtime shape — that has to stay a kernel argument.
 - **Check where the check is cheapest: `static_assert` > C++ host check > cached Python > per-call Python.** Anything fixed at compile time is a `static_assert`. Anything about the tensors is a `TensorMatcher` / `CHECK_HOST` in the C++ launcher, free next to a kernel launch. A check Python cannot delegate goes inside the `@cache_once` module factory, where it runs once per specialisation. What remains in the per-call entry point costs interpreter time on *every* forward, so it should be nothing but picking the module and allocating `out`.
+- **State implicit assumptions as `static_assert` where they are used.** A layout or thread-count assumption the code relies on (a loop's chunks fit in one block, a tile divides the CTA's threads) gets a `static_assert` where the code relies on it, even when no current configuration breaks it.
+- **Keep compile-time and runtime conditions apart.** Write `if constexpr (kFlag) { if (cond) { ... } }`, not `if (kFlag && cond)`, so the body is not instantiated where `kFlag` is false. A single-statement body may stay mixed.
+- **A C++ `enum class` that selects a kernel variant crosses into Python by name.** Declare it once in a header (`enum class Mode { A, B };`) and take it as a template parameter; the integer values never cross the boundary, so they need not be pinned. Mirror it in Python as an `enum.Enum` whose member names equal the enumerators, with a docstring naming the header. Pass `member.name` to `make_cpp_args`, so it becomes the template argument and part of the module name; the `.cuh` brings the enumerators into scope with `using enum <namespace>::Mode;` inside `namespace sglang`. No integer casts on either side.
+- **No device guard in launchers.** Do not add `tvm::ffi::CUDADeviceGuard` or `cudaSetDevice` to a JIT launcher: the engine always calls with its tensors on the current device, so a per-call guard only adds driver calls to every launch.
 - **Fixed-width integer types.** Prefer `int32_t` / `int64_t` / `uint32_t` / `size_t` over `int`, `long`, or `long long`, so an index has the same width on both sides of the FFI boundary. Bare `int` is fine only where the width plainly cannot matter — an unrolled loop counter over a `constexpr` bound, a template `int` parameter. Shapes arrive as `int64_t` (`SymbolicSize::unwrap()`); narrowing to `uint32_t` for in-kernel indexing is a deliberate act, so write the `static_cast` explicitly and only where the range is known.
-- **Doxygen comments in C++.** Document exported entities with `///` or `/** ... */` blocks using `\brief`, `\param`, `\tparam`, `\return`, the way `include/sgl_kernel/` does. `python -m sglang.kernels.jit` writes `CommentFormat: Doxygen` into `.clangd` when clangd is 21 or newer, so these render on hover in the editor. Plain `//` remains fine for implementation notes inside a function body.
+- **Doxygen comments in the header library.** Document helpers in `include/sgl_kernel/` with `///` or `/** ... */` blocks using `\brief`, `\param`, `\tparam`, `\return`. Inside kernel sources under `csrc/`, use short plain comments; only exported entities take a Doxygen block (`.claude/rules/comment-style.md`). `python -m sglang.kernels.jit` writes `CommentFormat: Doxygen` into `.clangd` when clangd is 21 or newer, so these render on hover in the editor. Plain `//` remains fine for implementation notes inside a function body.
 - **ASCII only in C++ and CUDA sources.** Write `--`, `->`, `<=` instead of `—`, `→`, `≤`, including in comments. `grep -nP '[^\x00-\x7F]' <file>` before committing.
 - **`namespace details` is private.** Anything inside one is an implementation detail of its own header, free to change without notice. Do not name `details::` from another module, and never `using namespace details`. If you find yourself wanting something in there, that is the signal to promote it to a documented name instead.
 - **`const T* __restrict__` for read-only pointers.** This is what `csrc/` does throughout, and it lets the compiler emit non-coherent (`LDG`) loads.
 - **Watch the register budget.** For memory-bound kernels, keep to roughly 64 registers per thread so occupancy does not become the limit; prefer recomputing a value over letting it spill. Run `SGLANG_JIT_LOG_RESOURCE_USAGE=1 SGLANG_JIT_FORCE_RECOMPILE=1` to log per-kernel registers, spills and shared memory at INFO. Both halves are load-bearing: a cache hit has no compiler output to report, and passing `-Xptxas -v` by hand does nothing on its own because the build captures compiler output and replays it only on failure.
 - **Alignment is a contract you enforce, not a property you hope for.** A vectorized copy derives its access width from the row *size* (`load_bytes` picks 16B for a 1024B row), but the address it lands on is `base + index * row_stride` — and a stride is not constrained by the size. `TensorMatcher` admits any stride unless you say otherwise, so a padded cache row silently produces `misaligned address`. Every kernel that vectorizes is highly recommended to end its validation with `.ensure_alignment(w)`, where `w` is the width the kernel actually uses.
+- **Reuse the header library before writing a helper.** Many helpers carry arch-specific code paths (on SM100 a full-warp float `warp::reduce_max` is a single `redux.sync.max.f32`), so read the implementation rather than guessing from the name. A helper written once or twice may stay local; once the same pattern appears in three or more kernels, move it into `include/sgl_kernel/`.
+- **Other values are template arguments only when that changes the generated code** (unrolled loops, register arrays sized by it, branches removed). A tuning knob above qualifies; a value that only feeds arithmetic (a scale factor, a stride) is passed at run time, so one module serves every value and nothing extra is compiled.
+- **`TensorMatcher` style.** It is a temporary (it holds spans into its initializer lists), so never store it in a variable; write one builder call per line, with `//` after `TensorMatcher({...})` to keep the break. Omitting `with_strides` means contiguous, so write strides only for what is not. Name a `SymbolicSize` / `SymbolicDType` / `SymbolicDevice` only when it ties at least two places together; for a value used once, write `-1` and read it from the verified tensor. Every input names its dtype and device.
+- **Host checks use `CHECK_HOST(...) << ...` and `CHECK_CUDA(...) << ...`.** Older code using `RuntimeCheck` / `RuntimeDeviceCheck` is not a reference. Keep messages short; a check that a misconfiguration can easily trigger should print enough to reproduce it.
+- **Inline PTX lives in a `device::...::ptx` namespace**, one wrapper per instruction, named after it (`mbar_arrive_expect_tx` for `mbarrier.arrive.expect_tx`), and is called as `ptx::name(...)`. Check the instruction's semantics in the PTX ISA first.
+- **Comments state what the code cannot show:** a hardware or PTX constraint, where a magic number comes from, an ordering that looks incidental. They do not restate the code.
 
 ---
 
@@ -61,6 +65,11 @@ These hold for every step below.
 - **`host::irange(n)`** / **`host::irange(start, end)`** — Range views for cleaner loops.
 - **`host::pointer::offset(ptr, offsets...)`** — Byte-safe pointer arithmetic on `void*`. Use this instead of raw casts.
 
+### `once.h` / `logging.h` — One-time host initialization and logging
+
+- **`host::init_once([&] { ... })`** — `std::call_once` without a caller-owned flag; runs the lambda once per call site and returns a stable reference to its result. **`host::init_once(key, [&] { ... })`** does the same once per `(call site, key)`. Use these instead of hand-rolled `static` caches in launchers. The lambda type must be unique (pass a `Tag` type otherwise), and it must not re-enter the same instantiation.
+- **`SGL_LOG_INFO << ...`** / `SGL_LOG_DEBUG` / `SGL_LOG_WARNING` — host-side stream logging, filtered by `SGLANG_JIT_LOG_LEVEL` (default `WARNING`).
+
 ### `utils.cuh` — Device-side utilities + `LaunchKernel`
 
 ```cpp
@@ -73,11 +82,15 @@ These hold for every step below.
 - **`device::kWarpThreads`** — Constant `32` (the codebase's *logical* warp width). `kWarpSize` is an alias. Note this is a group size, not the hardware wave: on gfx950 `warpSize` is 64, and `warp::kFullWidth` reflects that.
 - **`device::get_lane_id<kNumThreads = kWarpThreads>()`** — this thread's index within its logical group. **Prefer it over `threadIdx.x % kNumThreads` whenever the value feeds an address.** On CUDA the lane register is one read that folds into the address computation, whereas the modulo is a derived value the compiler re-materialises at *every* address scale — 8 instructions and 2 registers on a two-tile warp copy, measured on sm_100a. It picks the cheaper form per platform, so callers never need to care. Only equals the true in-warp lane when `blockDim.x` is a multiple of `kNumThreads`.
 - **`device::load_as<T>(ptr, offset)`** / **`device::store_as<T>(ptr, val, offset)`** — Type-safe loads/stores from `void*`.
+- **`device::assume_global(ptr)`** / **`device::assume_shared(ptr)`** — return `ptr` and tell the compiler which address space it points to (no-ops on ROCm). After an asm with a `"memory"` clobber such as `PDLWaitPrimary`, loads through `__grid_constant__` pointer fields become generic `LD.E` (a 32-byte access splits in two); wrap the pointer right before the access. nvcc 13.4 honors the hint on sm_100+ and ignores it on sm_90a.
 - **`device::pointer::offset(ptr, offsets...)`** — Pointer arithmetic on device.
+- **`device::enable_smem_spilling()`** — emits the CUDA 13 `enable_smem_spilling` pragma, so register spills go to shared memory instead of local memory. Spills then no longer show up as stack bytes in the resource log, so check the shared-memory size too.
+- **`device::get_tmem_cols(n)`** — rounds a TMEM column count up to a legal allocation size (32..512, power of two).
 - **`host::LaunchKernel(grid, block, device_or_stream [, smem])`** — RAII kernel launcher that:
   - Resolves the CUDA stream from a `DLDevice` via TVM-FFI automatically.
   - Checks the CUDA error with file/line info after launch via `operator()(kernel, args...)`.
   - Supports `.enable_pdl(bool)` for PDL (Programmatic Dependent Launch, SM90+).
+  - Supports `.enable_cooperative(bool)` for grids whose CTAs wait on each other: the launch fails instead of hanging when the grid cannot be co-resident.
 - **`device::PDLWaitPrimary<kUsePDL>()`** / **`device::PDLTriggerSecondary<kUsePDL>()`** — The two halves of PDL, on sm_90+ (no-ops on older archs and ROCm). Their guarantees are **not** symmetric:
   - `PDLTriggerSecondary` (`griddepcontrol.launch_dependents`) only lets the next kernel in the stream *start* early. It carries no memory ordering and publishes nothing — matching that, the header's asm has no `"memory"` clobber.
   - `PDLWaitPrimary` (`griddepcontrol.wait`) is the ordering point: it waits until the preceding kernel has fully finished and its writes are visible.
@@ -200,6 +213,18 @@ For a **2D tile**, either flatten `(row, col)` into a linear tile index first, o
 
 - `device::math::max/min<T>(a, b)` — type-dispatched binary math via `DTypeTrait`
 - `device::math::abs/sqrt/rsqrt/exp/sin/cos<T>(x)` — type-dispatched unary math via `DTypeTrait`
+- `device::math::fma_f32_bf16(a, b, acc)` — bf16 x bf16 (or bf16 x fp32) -> fp32 FMA. On Blackwell it is one `fma.rn.f32.bf16` with no explicit converts; elsewhere a bit-identical fallback. Use it for mixed-precision dot products so every kernel rounds the same way.
+- `device::math::fma_f32x2/mul_f32x2/add_f32x2(a, b[, c])` — packed fp32 ops (`FFMA2` / `FMUL2` / `FADD2` on SM100+, bit-identical fallback elsewhere). They halve the issue slots, not the FMA throughput, so they help only issue-bound code.
+- **`device::math::fast_mod_div_u32_t`** — division and modulo by a divisor fixed at launch time (a runtime value passed into the kernel, e.g. a head count), via a multiply-high and a shift instead of a software division. Build it on the host (`fast_mod_div_u32_t{d}`) and pass it by value; then `n / d`, `n % d` or `math::div(n, d)` for both. Only exact for divisors below 2^31 and unsigned dividends of at most 32 bits.
+
+### `activation.cuh` — FP32 activations (`device::activation::`)
+
+```cpp
+#include <sgl_kernel/activation.cuh>
+```
+
+- `sigmoid/silu/gelu/gelu_tanh/softplus/sqrt_softplus/relu2<kFastMath = true>(x)` — one implementation per activation, independent of `--use_fast_math`. `kFastMath = true` is approximate PTX without slow-path branches (sigmoid / SiLU as `rcp.approx(1 + ex2.approx(...))`, relative error around 1e-6); `kFastMath = false` reproduces eager PyTorch (ATen formula and order, libdevice transcendentals, IEEE division). Use the precise mode where a test compares against torch bit for bit.
+- The fast `gelu_tanh` uses one `tanh.approx`; `1 + tanh` cancels for negative x, so its relative error grows there. Use it only for outputs stored in bf16 / fp8.
 
 ### `warp.cuh` — Warp-level primitives
 
@@ -236,6 +261,7 @@ For a **2D tile**, either flatten `(row, col)` into a linear tile index first, o
 ```
 
 - `device::atomic::max(float* addr, float value)` — float atomic max (handles negative values correctly via bit tricks).
+- `device::atomic::ptx::red_release_add_u32` / `red_relaxed_add_u32` / `atom_acquire_add_u32` / `atom_acquire_cas_b32` / `load_acquire_u32` — GPU-scope global atomics with explicit memory ordering, for hand-written cross-CTA protocols (a release add after writing a partial, an acquire load before reading the others).
 - **`device::atomic::Event`** — a cross-CTA arrive/wait counter in one 32-bit word. Producers call `arrive()`; consumers call `wait(num_producers)` (exactly one consumer) or `wait_multi<kConsumerBits>(num_producers, num_consumers, n)` (several). The last released consumer resets the word, so one `Event` is reusable across launches with no host re-zero. Preconditions, all of them load-bearing:
   - the word must be **zeroed by the host** before first use, and must live in **global** memory — a shared or local `Event` is an illegal address;
   - `arrive()` is a release and the waits are acquires, so a producer's writes before `arrive()` are visible after the wait;
@@ -251,8 +277,12 @@ For a **2D tile**, either flatten `(row, col)` into a linear tile index first, o
 - `host::runtime::get_blocks_per_sm(kernel, block_dim)` — max active blocks per SM (occupancy)
 - `host::runtime::get_sm_count(device_id [, use_cache])` — number of SMs on the device. Memoized per device ordinal, so it is cheap enough to call on a launch path; pass `use_cache=false` to force a driver query.
 - `host::runtime::get_cc_major` / `get_cc_minor` / `get_sm_version` — compute capability, same caching.
+- `host::runtime::get_max_smem_per_block(device_id, opt_in = true)` — the per-block shared-memory limit (the opt-in limit by default), cached per device.
+- `host::runtime::set_max_dynamic_smem_per_device<kernel>(device, bytes)` — opt a kernel into more than 48 KB of dynamic shared memory, once per device. Prefer it over calling `cudaFuncSetAttribute` on every launch, which costs host time and races when several modules build in parallel.
+- `host::runtime::init_per_device(device, [&] { ... })` — run an idempotent setup (a function attribute) once per device. The general form behind the helper above.
+- `host::runtime::set_prefer_l1_carveout(kernel, block_threads, dyn_smem)` — prefer the largest L1 carveout that keeps the kernel's default occupancy. It helps kernels that use little shared memory but reuse data through L1. Wrap it in `init_per_device`.
 
-**Do not query the architecture at runtime.** The JIT compiles for the exact local GPU, so the arch is a *compile-time* fact: `SGL_CUDA_ARCH` is injected by `load_jit`, and `SGL_ARCH_HOPPER_OR_GREATER` / `SGL_ARCH_BLACKWELL_OR_GREATER` / `device::kMaxVecBytes` are derived from it. Reach for `get_cc_*` only for something the arch genuinely does not determine. SM *count* is the opposite case — it varies within an arch (B200 vs B300 vs a MIG slice), so it has to stay a runtime query.
+**Do not query the architecture at runtime in C++.** The JIT compiles for the exact local GPU, so the arch is a *compile-time* fact: `SGL_CUDA_ARCH` is injected by `load_jit`, and `SGL_ARCH_HOPPER_OR_GREATER` / `SGL_ARCH_BLACKWELL_OR_GREATER` / `device::kMaxVecBytes` are derived from it. Reach for `get_cc_*` only for something the arch genuinely does not determine. (Python-side gating, before `load_jit`, uses `current_arch()`; see Step 3.) SM *count* is the opposite case — it varies within an arch (B200 vs B300 vs a MIG slice), so it has to stay a runtime query.
 
 **Persistent kernel pattern** (cap blocks to SM count × occupancy):
 ```cpp
@@ -261,6 +291,19 @@ static const uint32_t num_sm  = runtime::get_sm_count(device.unwrap().device_id)
 const auto num_blocks = std::min(num_sm * max_occ, div_ceil(n, kBlockSize));
 LaunchKernel(num_blocks, kBlockSize, device.unwrap())(kernel, params);
 ```
+
+### `mbarrier.cuh` — mbarrier wrappers (`device::ptx::`)
+
+- `ptx::mbar_init(bar, count)`, `ptx::mbar_arrive(bar)`, `ptx::mbar_arrive_expect_tx(bar, bytes)` (arrive plus TMA byte count), `ptx::mbar_wait_parity(bar, parity)`, and `ptx::to_shared(ptr)` for the 32-bit shared address that inline PTX expects.
+- Only parity waits are wrapped. The caller owns the phase bit and flips it when the stage ring wraps. Start a consumer-first wait at parity 0 and a producer-first wait (waiting for a slot nobody has used yet) at parity 1; getting this wrong hangs on the second round. The header comment explains the rule.
+
+### `algorithm.cuh` — Small sorting networks
+
+- `device::merge_sort<N>(a)` — sorts a register array of `N` keys in descending order with a fully unrolled Batcher merge network built at compile time. It suits small per-thread top-k or sort steps where `N` is a template constant.
+
+### `gemm/dot_product.cuh` — Shared dot-product kernel
+
+- `device::dot_product_vec(a, b, acc)` — accumulates `sum a[i] * b[i]` over two `AlignedVector`s of `bf16x2_t` (or bf16 x fp32) into an fp32 `acc`, in element order, one rounding per product. Small-GEMM and GEMV kernels share it, so they agree bitwise where their ranges overlap. Reuse it rather than writing another dot-product loop.
 
 ---
 
@@ -366,8 +409,9 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
   TensorMatcher({N})  //
       .with_dtype<T>()
       .with_device<kDLGPU>(device_)
+      .ensure_alignment(16)  // the kernel uses 16-byte vectors
       .verify(dst)
-      .verify(src);  // same shape / dtype / device as dst
+      .verify(src);  // same shape / dtype / device / alignment as dst
 
   const uint32_t n = static_cast<uint32_t>(N.unwrap());
   const DLDevice device = device_.unwrap();
@@ -486,7 +530,7 @@ def scale(src: torch.Tensor, factor: float, out: torch.Tensor | None = None) -> 
 **Key points:**
 
 - Use `cache_once` — **not** `functools.lru_cache` (incompatible with `torch.compile`)
-- `load_jit` first arg(s) form the unique build marker; same marker = same cached binary
+- `load_jit` first arg(s) form the unique build marker (the module name). The build cache also keys on the contents of the source files and of every header they transitively include, so after editing a `.cuh` a new process recompiles by itself; there is no need to delete the cache. A running process does not notice edits (file hashes are memoized per process, and wrappers are `@cache_once`), so restart it
 - Only include compile-time specialisation knobs in the build marker; runtime values like `factor` should stay runtime unless the kernel truly needs templating
 - `cuda_wrappers`: `(export_name, kernel_symbol)` — `export_name` is called from Python
 - `make_cpp_args(dtype, ...)` converts `torch.dtype` to C++ type alias:
@@ -537,16 +581,22 @@ return load_jit(
     *args,
     cuda_files=["elementwise/scale.cuh"],
     cuda_wrappers=[("scale", f"scale<{args}>")],
-    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    extra_cuda_cflags=["--use_fast_math"],  # -O3 is already a default flag
 )
 ```
 
 If your kernel requires SM90+, raise a clear Python error before calling `load_jit`. Arch gating is one of the checks that has to live in Python — it decides whether to compile at all, so the C++ launcher never gets to run:
 
 ```python
-if torch.cuda.get_device_capability()[0] < 9:
+from sglang.kernels.arch import current_arch
+
+if not current_arch().is_sm_at_least(9):
     raise RuntimeError("This kernel requires SM90 (Hopper) or later")
 ```
+
+Query the GPU through `sglang.kernels.arch.current_arch()` (`.is_sm(...)`, `.is_sm_at_least(...)`, `.num_sms`, `.supports_pdl`, `.smem_per_block_optin`, and `.cuda` / `.hip` to narrow by platform), not `torch.cuda.get_device_*` directly. Call it at call time, not import time.
+
+Name the family the kernel was built for. `is_sm_at_least(10)` also admits SM120/SM121, which have no tcgen05/TMEM, so an SM100-only kernel gates on `is_sm(10)`; an SM120 kernel on `is_sm(12)` (SM121 included). Use `is_sm_at_least` only when every later architecture really supports the path.
 
 ---
 
@@ -554,7 +604,7 @@ if torch.cuda.get_device_capability()[0] < 9:
 
 JIT kernel correctness tests and benchmarks live under `test/registered/kernels/ops/<group>/` and `test/registered/kernels/benchmark/<group>/`, mirroring the wrapper's group under `python/sglang/kernels/ops/` (NOT inside the `sglang` package -- a `register_*_ci(...)` call anywhere under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook). Only their test-only helpers (e.g. `benchmark/marker.py`) stay alongside the kernel source under `python/sglang/kernels/jit/` and are imported by absolute path. **CI does not run `pytest` in those directories directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` and `bench_*.py` under `test/registered/`, collects `register_*_ci(...)` calls by **statically parsing each file's AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
 
-- **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `base-b-kernel-unit-test-1-gpu-large` on H100 and `base-b-kernel-unit-test-4-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`). Multi-GPU JIT tests use `base-b-kernel-unit-test-8-gpu-h200`.
+- **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `base-b-kernel-unit-test-1-gpu-large` on H100 and `base-b-kernel-unit-test-4-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`).
 - **Nightly kernel suite**: register with `stage="nightly"` plus the `runner_config` of the machine it needs (e.g. `1-gpu-large`), giving the `nightly-test-1-gpu-large` suite. `.github/workflows/nightly-test-nvidia.yml` sets `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` for the whole nightly run, so the expanded parameter grids apply automatically (see `python/sglang/kernels/jit/utils/common.py` → `should_run_full_tests` / `get_ci_test_range`). There is no separate kernel-only nightly job: every nightly test on one machine type shares that machine's suite.
 
 Registration pattern (module level, **literal** `est_time`, `stage`, and `runner_config` values — required for AST parsing):
@@ -585,6 +635,24 @@ Use `register_cuda_ci(..., disabled="reason")` if the file must stay in-tree but
 ```
 
 For fast iteration you can still run `pytest` on a single file locally; CI coverage is via `run_suite.py`.
+
+When a test or benchmark reaches several template instantiations, build them all up front with `parallel_compile` (`sglang.kernels.jit.utils.compile.parallel`) over the `cache_once` module factories. In pytest, do this in a module-scoped autouse fixture, honouring the reduced parameter set CI uses; in a benchmark, before the timing loop. Serial first-use compiles otherwise dominate the run time:
+
+```python
+import functools
+
+from sglang.kernels.jit.utils.compile.parallel import parallel_compile
+from sglang.kernels.ops.elementwise.scale import _jit_scale_module
+
+DTYPES = [torch.float16, torch.bfloat16, torch.float32]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _build_all():
+    parallel_compile(
+        functools.partial(_jit_scale_module, dtype) for dtype in DTYPES
+    )
+```
 
 Create `test/registered/kernels/ops/elementwise/test_scale.py`:
 
@@ -754,8 +822,14 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 - `python/sglang/kernels/jit/include/sgl_kernel/math.cuh` — `device::math::`
 - `python/sglang/kernels/jit/include/sgl_kernel/warp.cuh` — `warp::reduce<Op>` and `reduce_sum/max/min` wrappers
 - `python/sglang/kernels/jit/include/sgl_kernel/cta.cuh` — `cta::reduce_max`
-- `python/sglang/kernels/jit/include/sgl_kernel/atomic.cuh` — `atomic::max`
-- `python/sglang/kernels/jit/include/sgl_kernel/runtime.cuh` — occupancy / SM count helpers
+- `python/sglang/kernels/jit/include/sgl_kernel/atomic.cuh` — `atomic::max`, `atomic::Event`, ordered `atomic::ptx::` atomics
+- `python/sglang/kernels/jit/include/sgl_kernel/runtime.cuh` — occupancy / SM count / shared-memory limits, per-device attribute setup, L1 carveout
+- `python/sglang/kernels/jit/include/sgl_kernel/once.h` — `init_once`
+- `python/sglang/kernels/jit/include/sgl_kernel/mbarrier.cuh` — mbarrier wrappers and the parity convention
+- `python/sglang/kernels/jit/include/sgl_kernel/algorithm.cuh` — `merge_sort`
+- `python/sglang/kernels/jit/include/sgl_kernel/gemm/dot_product.cuh` — `dot_product_vec`
+- `python/sglang/kernels/arch/` — `current_arch()`
+- `python/sglang/kernels/jit/utils/compile/parallel.py` — `parallel_compile`
 - `python/sglang/kernels/jit/csrc/elementwise/add_constant.cuh` — minimal runnable reference
 - `python/sglang/kernels/jit/csrc/elementwise/rmsnorm.cuh` — real example using `TensorMatcher` + `LaunchKernel` + `tile::Memory`
 - `python/sglang/kernels/jit/csrc/elementwise/qknorm.cuh` — real example using `runtime::get_blocks_per_sm` + persistent kernel pattern
