@@ -89,9 +89,9 @@ def _c2_decode_pool_kernel(
     e1 = libdevice.exp(score - m)
     denom = e0 + e1
     # The + 0.0 below prevents FMA contraction: torch rounds both products first.
-    # libdevice.div_rn matches torch division; Triton's / is an approximate reciprocal.
-    t0 = p_kv * libdevice.div_rn(e0, denom)
-    t1 = kv * libdevice.div_rn(e1, denom)
+    # tl.div_rn matches torch division; Triton's / is an approximate reciprocal on CUDA.
+    t0 = p_kv * tl.div_rn(e0, denom)
+    t1 = kv * tl.div_rn(e1, denom)
     t0 = t0 + 0.0
     t1 = t1 + 0.0
     pooled = t0 + t1

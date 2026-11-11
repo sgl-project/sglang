@@ -4,19 +4,25 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
-from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
+from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
+    dequantize_k_cache_paged_dsa,
+)
+from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.index_topk_share import write_mtp_seed
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
 )
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
+    get_kv_layers,
     get_token_to_kv_pool,
 )
 from sglang.srt.models.deepseek_common.utils import (
@@ -89,23 +95,21 @@ def use_fused_prefix_extend(backend, forward_batch: ForwardBatch) -> bool:
 
 
 def forward_dsa_indexer_for_mha(
-    indexer,
+    run_indexer,
     *,
     hidden_states: torch.Tensor,
     q_lora: torch.Tensor,
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
-    layer_id: int,
 ) -> None:
     """Fill the indexer K cache and publish an MTP seed when requested."""
     spec_info = forward_batch.spec_info
     seed_buf = spec_info.dsa_seed_topk_capture if spec_info is not None else None
-    topk_indices = indexer(
-        x=hidden_states,
+    topk_indices = run_indexer(
+        hidden_states=hidden_states,
         q_lora=q_lora,
         positions=positions,
         forward_batch=forward_batch,
-        layer_id=layer_id,
         return_indices=seed_buf is not None,
     )
     if seed_buf is None:
@@ -113,9 +117,7 @@ def forward_dsa_indexer_for_mha(
     if topk_indices is None:
         raise RuntimeError("DSA MHA indexer did not produce the requested MTP seed")
 
-    select = spec_info.dsa_seed_topk_select
-    src = topk_indices if select is None else topk_indices[select]
-    seed_buf[: src.shape[0]].copy_(src)
+    write_mtp_seed(forward_batch, seed_buf, topk_indices)
 
 
 # Configs for DeepSeek-V3:
@@ -202,12 +204,11 @@ class DeepseekMHAForwardMixin:
                 )
                 if self.should_run_indexer():
                     forward_dsa_indexer_for_mha(
-                        self.indexer,
+                        self.run_mla_indexer,
                         hidden_states=hidden_states,
                         q_lora=q_lora,
                         positions=positions,
                         forward_batch=forward_batch,
-                        layer_id=self.layer_id,
                     )
             else:
                 q = self.q_a_layernorm(q)
@@ -265,7 +266,7 @@ class DeepseekMHAForwardMixin:
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
-                if get_parallel().dcp_enabled:
+                if self.dcp_size > 1:
                     kv_a, k_pe = all_gather_kv_cache_for_mha_extend(
                         get_token_to_kv_pool(),
                         self.attn_mha,
@@ -298,8 +299,16 @@ class DeepseekMHAForwardMixin:
         v: torch.Tensor,
         forward_batch: ForwardBatch,
         gate: Optional[torch.Tensor] = None,
+        key_value_num_tokens: Optional[int] = None,
     ) -> torch.Tensor:
-        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+        attn_output = self.attn_mha(
+            q,
+            k,
+            v,
+            forward_batch,
+            save_kv_cache=False,
+            key_value_num_tokens=key_value_num_tokens,
+        )
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         if gate is not None:
             attn_output = self._apply_gated(attn_output, gate)
@@ -421,7 +430,10 @@ class DeepseekMHAForwardMixin:
         forward_batch.mha_return_lse = False
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
-        return self.forward_normal_core(q, k, v, forward_batch, gate)
+        # K and V cover every token of the sequences, the cached prefix too.
+        return self.forward_normal_core(
+            q, k, v, forward_batch, gate, key_value_num_tokens=k.shape[0]
+        )
 
     def _fused_prefix_extend_attn_mha(
         self: DeepseekV2AttentionMLA,
@@ -589,21 +601,27 @@ class DeepseekMHAForwardMixin:
     ):
         if _is_cuda:
             # Save latent cache
-            get_token_to_kv_pool().set_mla_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            get_kv_layers().layer(self.attn_mha.layer_id).store_mla(
+                self.attn_mha,
+                KVWriteLoc.for_batch(forward_batch),
+                kv_a.unsqueeze(1),
+                k_pe,
             )
         elif _is_npu:
             # To reduce a time-costing split operation
-            get_token_to_kv_pool().set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            get_kv_layers().layer(self.attn_mha.layer_id).store(
+                self.attn_mha,
+                KVWriteLoc.for_batch(forward_batch),
+                kv_a.unsqueeze(1),
+                k_pe,
             )
         else:
             latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
             latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
 
             # Save latent cache
-            get_token_to_kv_pool().set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+            get_kv_layers().layer(self.attn_mha.layer_id).store(
+                self.attn_mha, KVWriteLoc.for_batch(forward_batch), latent_cache, None
             )
 
     def _get_mla_kv_buffer(
@@ -613,14 +631,14 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _is_cuda or _use_aiter_gfx95:
-            kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
-                self.attn_mha, kv_indices, dst_dtype
+            kv_a, k_pe = (
+                get_kv_layers()
+                .read(self.attn_mha.layer_id)
+                .read_mla(self.attn_mha, kv_indices, dst_dtype)
             )
             kv_a = kv_a.squeeze(1)
         else:
-            latent_cache_buf = get_token_to_kv_pool().get_key_buffer(
-                self.attn_mha.layer_id
-            )
+            latent_cache_buf = get_kv_layers().read(self.attn_mha.layer_id).key()
             latent_cache = latent_cache_buf[kv_indices].contiguous().to(dst_dtype)
 
             kv_a, k_pe = latent_cache.split(
@@ -638,41 +656,48 @@ class DeepseekMHAForwardMixin:
 
         Returns: (kv_a, k_pe) both in BF16
         """
-        backend = get_attn_backend()
-        if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
-            backend = backend.primary
+        backend = resolve_attn_backend(forward_batch)
         kv_indices = backend.forward_metadata.page_table_1_flattened
         assert kv_indices is not None, (
             "page_table_1_flattened should have been generated for FP8 MHA path"
         )
 
-        if _use_aiter_gfx95:
+        if _use_aiter_gfx95 and not get_token_to_kv_pool().dsa_kv_cache_store_fp8:
             # ROCm (gfx950) stores the FP8 MLA KV in the raw
             # (kv_lora_rank + qk_rope_head_dim) layout, not the scaled 656-byte
-            # layout that dequantize_k_cache_paged expects (it asserts dim==656).
+            # layout that dequantize_k_cache_paged_dsa expects (it asserts dim==656).
             # Dequantize the raw layout via the pool's HIP-aware path instead —
             # the same routine _get_mla_kv_buffer uses for the BF16 MHA path.
             # Without this, a chunked-prefill split (extend_prefix_lens != 0) that
             # reads cached prefix KV crashes with "576 != 656".
             kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             # Read door: the pool never translates, so the production site does.
-            # Only the FlashAttention/FlashInfer backends bind a translator; the
+            # Only the FlashAttention/FlashInfer backends bind a `RunnerIds`; the
             # base class documents its None default as "no translate", and the DSA
             # backend the EAGLE draft model runs on keeps that default. With no
-            # translator the ids never went VIRTUAL, so there is nothing to
+            # `RunnerIds` the ids never went VIRTUAL, so there is nothing to
             # collapse.
-            translator = get_attn_backend().kv_index_translator
-            if translator is not None:
-                kv_indices = translator.translate_dcp_read_ids(kv_indices)
-            kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
-                self.attn_mha, kv_indices, torch.bfloat16
+            runner_ids = get_attn_backend().runner_ids
+            if runner_ids is not None:
+                kv_indices = runner_ids.translate_dcp_read_ids(kv_indices)
+            kv_a, k_pe = (
+                get_kv_layers()
+                .read(self.attn_mha.layer_id)
+                .read_mla(self.attn_mha, kv_indices, torch.bfloat16)
             )
             kv_a = kv_a.squeeze(1).contiguous()
             return kv_a, k_pe
 
-        kv_cache_fp8 = get_token_to_kv_pool().get_key_buffer(self.attn_mha.layer_id)
+        kv_cache_fp8 = get_kv_layers().read(self.attn_mha.layer_id).key()
+        if dsa_shards_index_k():
+            kv_cache_fp8 = backend.dcp_gather_kv_cache(
+                kv_cache_fp8, forward_batch, backend.forward_metadata
+            )
+            kv_indices = torch.arange(
+                kv_indices.shape[0], dtype=kv_indices.dtype, device=kv_indices.device
+            )
 
-        kv_latent_bf16 = dequantize_k_cache_paged(kv_cache_fp8, kv_indices)
+        kv_latent_bf16 = dequantize_k_cache_paged_dsa(kv_cache_fp8, kv_indices)
 
         kv_a = kv_latent_bf16[:, :, : self.kv_lora_rank].squeeze(1).contiguous()
         k_pe = kv_latent_bf16[:, :, self.kv_lora_rank :]
@@ -710,10 +735,11 @@ class DeepseekMHAForwardMixin:
             concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
         elif (
             _is_cuda
-            and next_power_of_2(self.num_local_heads) == self.num_local_heads
             and next_power_of_2(self.qk_nope_head_dim) == self.qk_nope_head_dim
             and next_power_of_2(self.qk_rope_head_dim) == self.qk_rope_head_dim
         ):
+            # The Triton helper masks padded heads, including Kimi-K3's 12
+            # local heads at TP8; only the feature dimensions need powers of two.
             # fa3 mha support fp8 inputs
             if (
                 self.current_attention_backend == "fa3"

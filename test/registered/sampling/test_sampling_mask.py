@@ -16,6 +16,7 @@ from sglang.srt.layers.sampler import Sampler, _SamplingMaskCapture
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.custom_logit_processor import (
     DisallowedTokensLogitsProcessor,
     Qwen3ThinkingBudgetLogitProcessor,
@@ -34,8 +35,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=250, stage="base-b", runner_config="2-gpu-large")
-register_amd_ci(est_time=320, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=221, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=320, suite="extra-a-test-1-gpu-small-amd")
 
 _MAX_NEW_TOKENS = 4
 _TOP_P = 0.99
@@ -56,6 +57,12 @@ _INVALID_SAMPLING_MASK_ERROR = (
 
 class TestSamplingMaskCapture(CustomTestCase):
     def setUp(self):
+        # The renorm policy (sampling_renorm.py) reads the published parallel /
+        # exec config on every call; the sampler's own get_exec is patched per
+        # test below for the sampling backend only.
+        override = get_context().override_server_args(tp_size=1)
+        override.install()
+        self.addCleanup(override.restore)
         self.sampler = Sampler.__new__(Sampler)
         torch.nn.Module.__init__(self.sampler)
         self.sampler.sampling_mask_max_tokens = 4096
@@ -91,6 +98,7 @@ class TestSamplingMaskCapture(CustomTestCase):
             top_ks=torch.full((batch_size,), top_k, dtype=torch.int32, device="cuda"),
             top_ps=torch.full((batch_size,), top_p, device="cuda"),
             min_ps=torch.full((batch_size,), min_p, device="cuda"),
+            max_top_k=top_k,
             sampling_mask_batch_indices=torch.tensor(requested_rows, device="cuda"),
         )
         with patch.object(
@@ -156,6 +164,34 @@ class TestSamplingMaskCapture(CustomTestCase):
                     places=6,
                 )
 
+    def test_min_p_capture_preserves_original_top_p_nucleus(self):
+        """Token 3 must survive joint filtering: its original preceding mass
+        is 0.80 < 0.82, while its top-k-normalized mass exceeds 0.82."""
+        backends = ("pytorch",) if is_hip() else ("pytorch", "flashinfer")
+        for backend in backends:
+            with self.subTest(backend=backend):
+                probs = torch.tensor(
+                    [[0.35, 0.25, 0.20, 0.05, 0.03, 0.03, 0.03, 0.03, 0.03]],
+                    device="cuda",
+                )
+                sampled, capture = self._sample(
+                    probs, backend, top_k=4, top_p=0.82, min_p=0.1
+                )
+                output = self.sampler._build_sampling_mask_output(
+                    sampled,
+                    capture,
+                    support_capture_indices=torch.tensor([0], device="cuda"),
+                )
+                self.assertEqual(output.statuses.tolist(), [SamplingMaskStatus.OK])
+                self.assertEqual(output.lengths.tolist(), [4])
+                support = output.token_ids[0, :4].tolist()
+                self.assertEqual(set(support), {0, 1, 2, 3})
+                self.assertIn(sampled.item(), support)
+                expected_probs = probs[0, support] / probs[0, :4].sum()
+                torch.testing.assert_close(
+                    output.support_logprobs[0, :4], expected_probs.log()
+                )
+
     def test_hard_exclusion_replay_in_mixed_batch(self):
         backends = ["pytorch"] if is_hip() else ["pytorch", "flashinfer"]
         for backend in backends:
@@ -203,8 +239,8 @@ class TestSamplingMaskCapture(CustomTestCase):
                         simple_sampling_case=False,
                     )
                 output = self._materialize(sampled, capture, requested_rows=[0, 1])
-                support = output.next_token_sampling_mask_idx[0]
-                sampling_logprobs = output.next_token_sampling_logprobs[0]
+                support = output.next_token_sampling_mask_idx[0].tolist()
+                sampling_logprobs = output.next_token_sampling_logprobs[0].tolist()
                 self.assertEqual(set(support), {0, 1, 3})
                 self.assertIn(int(sampled[0]), support)
                 expected = original[0, sampled[0]] - original[0, support].logsumexp(0)
@@ -280,9 +316,13 @@ class TestSamplingMaskCapture(CustomTestCase):
 
         output = self._materialize(sampled, capture, requested_rows)
         self.assertIsNone(output.next_token_sampling_mask_idx[0])
-        self.assertEqual(set(output.next_token_sampling_mask_idx[1]), {0, 1, 2})
+        self.assertEqual(
+            set(output.next_token_sampling_mask_idx[1].tolist()), {0, 1, 2}
+        )
         self.assertIsNone(output.next_token_sampling_mask_idx[2])
-        self.assertEqual(set(output.next_token_sampling_mask_idx[3]), {0, 1, 2})
+        self.assertEqual(
+            set(output.next_token_sampling_mask_idx[3].tolist()), {0, 1, 2}
+        )
         self.assertIsNone(output.next_token_sampling_logprobs[0])
         self.assertIsNotNone(output.next_token_sampling_logprobs[1])
         self.assertIsNone(output.next_token_sampling_logprobs[2])
@@ -714,8 +754,20 @@ class TestSamplingMaskPacking(CustomTestCase):
             ],
             output,
         )
-        self.assertEqual(output.next_token_sampling_mask_idx, [[3], None, [5]])
-        self.assertEqual(output.next_token_sampling_logprobs, [[0.0], None, [0.0]])
+        self.assertEqual(
+            [
+                None if row is None else row.tolist()
+                for row in output.next_token_sampling_mask_idx
+            ],
+            [[3], None, [5]],
+        )
+        self.assertEqual(
+            [
+                None if row is None else row.tolist()
+                for row in output.next_token_sampling_logprobs
+            ],
+            [[0.0], None, [0.0]],
+        )
 
     def test_overflow_never_materializes_a_partial_mask(self):
         # Simulate a top-k cutoff tie: a nominal top_k below the cap can still
@@ -779,6 +831,61 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
             output = response.json()
             outputs.append((output["output_ids"], output["text"]))
         self.assertEqual(outputs[0], outputs[1])
+
+    def test_modes_and_streaming_return_identical_sampling_masks(self):
+        """For the same seeded tokens, selected and support mode report the same
+        supports, each selected logprob is the sampled token's support logprob, and a
+        stream that emits every token matches the response emitted every 50 tokens."""
+        sampling_params = {
+            "top_k": _TOP_K,
+            "top_p": 1.0,
+            "sampling_seed": _SAMPLING_SEED,
+            "max_new_tokens": 64,
+        }
+        responses = {}
+        for mode, stream in (
+            ("support", False),
+            ("selected", False),
+            ("support", True),
+        ):
+            response = self._post_generate(
+                sampling_params, sampling_logprobs_mode=mode, stream=stream
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            if stream:
+                chunks = [
+                    json.loads(line[6:])
+                    for line in response.iter_lines()
+                    if line.startswith(b"data: ") and line[6:] != b"[DONE]"
+                ]
+                responses[mode, stream] = chunks[-1]
+            else:
+                responses[mode, stream] = response.json()
+
+        support = responses["support", False]
+        output_ids = support["output_ids"]
+        masks = self._assert_sampling_masks(output_ids, support["meta_info"])
+        support_logprobs = support["meta_info"]["output_token_sampling_logprobs"]
+
+        selected = responses["selected", False]
+        self.assertEqual(selected["output_ids"], output_ids)
+        self.assertEqual(selected["meta_info"]["output_token_sampling_mask"], masks)
+        self.assertEqual(
+            selected["meta_info"]["output_token_sampling_logprobs"],
+            [
+                logprobs[mask.index(token)]
+                for token, mask, logprobs in zip(output_ids, masks, support_logprobs)
+            ],
+        )
+
+        streamed = responses["support", True]
+        self.assertEqual(streamed["output_ids"], output_ids)
+        for key in (
+            "output_token_sampling_mask",
+            "output_token_sampling_logprobs",
+            "output_token_sampling_mask_length",
+        ):
+            self.assertEqual(streamed["meta_info"][key], support["meta_info"][key])
 
 
 class TestSamplingMaskPytorch(TestSamplingMask):

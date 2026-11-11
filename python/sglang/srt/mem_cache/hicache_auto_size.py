@@ -6,20 +6,23 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
-    HybridLinearKVPool,
-    HybridReqToTokenPool,
     MHATokenToKVPool,
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.pool_host.base import (
-    host_memory_budget_bytes,
+    host_memory_budget_from_plain_hugetlb,
+    host_memory_budget_plain_hugetlb,
     host_memory_budget_scope,
     ranks_per_host,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.pool_host.common import (
+    get_allocator_class_from_storage,
+    get_allocator_type,
+)
 from sglang.srt.runtime_context import get_context, get_memory, get_parallel
 
 if TYPE_CHECKING:
@@ -32,28 +35,46 @@ logger = logging.getLogger(__name__)
 # byte counts the ratio is derived from.
 _ALLOCATION_SLACK_FRACTION = 0.05
 
+# Leaf pools; a pool wrapping sub-pool views is sized by its views.
 _SIZEABLE_POOLS = (
     MHATokenToKVPool,
     MLATokenToKVPool,
-    SWAKVPool,
-    HybridLinearKVPool,
     MiniMaxSparseKVPool,
 )
 
 
+def _sub_pool_views(pool) -> list:
+    """The token KV views a pool wraps; empty for a pool that is its own view."""
+    router = pool.layer_router
+    views = [router.view(sub_pool.name) for sub_pool in router.sub_pools()]
+    return [] if len(views) == 1 and views[0] is pool else views
+
+
 def _pool_bytes(pool) -> int:
-    if isinstance(pool, SWAKVPool):
-        return _pool_bytes(pool.full_kv_pool) + _pool_bytes(pool.swa_kv_pool)
-    if isinstance(pool, HybridLinearKVPool):
-        return _pool_bytes(pool.full_kv_pool)
-    sizes = pool.get_kv_size_bytes()
+    views = _sub_pool_views(pool)
+    if views:
+        return sum(_pool_bytes(view) for view in views)
+    return _leaf_bytes(pool)
+
+
+def _leaf_bytes(pool) -> int:
+    sizes = getattr(pool, "host_capacity_bytes", None)
+    if sizes is None:
+        sizes = pool.get_kv_size_bytes()
     return sum(sizes) if isinstance(sizes, tuple) else sizes
 
 
 def _draft_bytes(target, draft) -> int:
-    if isinstance(draft, BaseSWAKVPool):
+    if draft.layer_router.sub_pool(
+        IdSpaceKind.SLIDING_WINDOW
+    ) is not None or isinstance(draft, DeepSeekV4TokenToKVPool):
         # Match sidecar construction: only SWA drafts follow target SWA slots.
-        target, draft = target.swa_kv_pool, draft.swa_kv_pool
+        target = (
+            target.layer_router.view(IdSpaceKind.SLIDING_WINDOW)
+            if target.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+            else target.swa_kv_pool
+        )
+        draft = draft.swa_kv_pool
     # A sidecar has one host slot per target slot, however few slots the draft has.
     return _pool_bytes(draft) * target.size // draft.size
 
@@ -62,15 +83,16 @@ def _estimate_hicache_bytes(
     params: CacheInitParams, draft_plan: HiCacheDraftPlan | None
 ) -> int:
     """Device bytes whose host mirrors scale with the HiCache ratio."""
+    # Every token KV view the pool routes to, and the recurrent state beside it.
     pool = params.token_to_kv_pool_allocator.get_kvcache()
-    if not isinstance(pool, _SIZEABLE_POOLS):
+    if not (isinstance(pool, _SIZEABLE_POOLS) or _sub_pool_views(pool)):
         raise ValueError(
             f"HiCache auto-sizing does not support {type(pool).__name__}; "
             "set --hicache-ratio or --hicache-size explicitly."
         )
     total = _pool_bytes(pool)
-    if isinstance(params.req_to_token_pool, HybridReqToTokenPool):
-        total += _pool_bytes(params.req_to_token_pool.mamba_pool)
+    if params.req_to_token_pool.holds_state_slots:
+        total += _leaf_bytes(params.token_to_kv_pool_allocator.state.pool)
     drafts = params.mtp_draft_device_pools
     if draft_plan is not None and draft_plan.mode == "sidecar":
         drafts = draft_plan.device_pools
@@ -91,7 +113,19 @@ def auto_size_hicache(
         return
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)
-    budget = int(host_memory_budget_bytes() * fraction)
+    kvcache_device = getattr(
+        params.token_to_kv_pool_allocator.get_kvcache(), "device", None
+    )
+    allocator = get_allocator_class_from_storage(get_allocator_type())
+    plain_budget, hugetlb_budget = host_memory_budget_plain_hugetlb(
+        allocator, kvcache_device, auto_size=True
+    )
+    budget = int(
+        host_memory_budget_from_plain_hugetlb(
+            plain_budget, hugetlb_budget, allocator, kvcache_device
+        )
+        * fraction
+    )
     ratio = min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
     # One collective before any pool is built: PP stages own different pool
     # counts, so a per-pool collective could deadlock.
@@ -119,5 +153,7 @@ def auto_size_hicache(
         ranks_per_host(),
         device_bytes * ratio / 1024**3,
     )
-    with host_memory_budget_scope(budget):
+    with host_memory_budget_scope(
+        (int(plain_budget * fraction), int(hugetlb_budget * fraction))
+    ):
         yield

@@ -1,15 +1,25 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
+from sglang.srt.layers.attention.linear import gdn_backend, kda_backend
+from sglang.srt.layers.attention.linear.gdn_backend import (
+    GDNAttnBackend,
+    GDNKernelDispatcher,
+)
+from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 # Above the fp16 midpoint 1 + 2^-11 (single-rounds up to 1 + 2^-10) but below
 # the bf16 midpoint 1 + 2^-8 (rounds to 1.0, which then stays 1.0 in fp16):
@@ -88,6 +98,283 @@ class TestTrackMambaStateDtype(CustomTestCase):
             torch.float16, h_track_buf, dst_slots=[], batch_rows=[]
         )
         self.assertTrue(torch.all(ssm_states == 0))
+
+    def test_default_prefill_convolution_hooks_preserve_arguments(self):
+        """GDN returns packed tokens; KDA returns Q/K/V in either conv layout."""
+        batch = SimpleNamespace(
+            extend_prefix_lens=torch.tensor([0, 64]), extend_seq_lens_cpu=[2, 2]
+        )
+        qkv = torch.arange(24).view(4, 6)
+        convolved = qkv + 100
+        states = torch.zeros(8, 6, 2)
+        indices = torch.tensor([6, 2])
+        for backend_type, module, prefill_backend, dims, split_size in (
+            (GDNAttnBackend, gdn_backend, None, (2, 2, 2), 0),
+            (KDAAttnBackend, kda_backend, LinearAttnKernelBackend.TRITON, (2, 2, 2), 0),
+            (
+                KDAAttnBackend,
+                kda_backend,
+                LinearAttnKernelBackend.FLASHINFER,
+                (2, 2, 2),
+                2,
+            ),
+            (
+                KDAAttnBackend,
+                kda_backend,
+                LinearAttnKernelBackend.FLASHINFER,
+                (1, 2, 3),
+                0,
+            ),
+        ):
+            with self.subTest(
+                backend=backend_type.__name__, prefill=prefill_backend, dims=dims
+            ):
+                layer = SimpleNamespace(
+                    conv_weights=object(),
+                    bias=None,
+                    activation="silu",
+                    q_dim=dims[0],
+                    k_dim=dims[1],
+                    v_dim=dims[2],
+                )
+                backend = object.__new__(backend_type)
+                if backend_type is KDAAttnBackend:
+                    backend.kernel_dispatcher = SimpleNamespace(
+                        prefill_backend=prefill_backend
+                    )
+                starts = torch.tensor([0, 2, 4])
+                backend.forward_metadata = SimpleNamespace(
+                    query_start_loc=starts, conv_block_table=None
+                )
+                expected = convolved.split(dims, dim=-1)
+                conv_output = torch.stack(expected) if split_size else convolved.T
+                with patch.object(
+                    module, "causal_conv1d_fn", return_value=conv_output
+                ) as conv:
+                    output = backend._convolve_prefill(
+                        layer, batch, qkv, states, indices
+                    )
+                if backend_type is KDAAttnBackend:
+                    self.assertIsInstance(output, tuple)
+                    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                    if split_size:
+                        self.assertTrue(all(plane.is_contiguous() for plane in output))
+                    self.assertEqual(
+                        conv.call_args.kwargs["output_split_size"], split_size
+                    )
+                else:
+                    torch.testing.assert_close(output, convolved, rtol=0, atol=0)
+                args, kwargs = conv.call_args
+                torch.testing.assert_close(args[0], qkv.T)
+                self.assertIs(args[1], layer.conv_weights)
+                self.assertIsNone(args[2])
+                self.assertEqual(kwargs["activation"], "silu")
+                self.assertIs(kwargs["conv_states"], states)
+                self.assertIs(kwargs["cache_indices"], indices)
+                self.assertIs(kwargs["query_start_loc"], starts)
+                self.assertEqual(kwargs["seq_lens_cpu"], [2, 2])
+                torch.testing.assert_close(
+                    kwargs["has_initial_state"], torch.tensor([False, True])
+                )
+
+    def test_gdn_prefill_hooks_and_checkpoint_routing(self):
+        layer = SimpleNamespace(
+            layer_id=3,
+            q_dim=2,
+            k_dim=2,
+            v_dim=2,
+            num_q_heads=1,
+            num_k_heads=1,
+            num_v_heads=1,
+            head_q_dim=2,
+            head_k_dim=2,
+            head_v_dim=2,
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_prefix_lens=torch.tensor([0, 64]),
+        )
+        qkv = torch.arange(24, dtype=torch.float32).view(4, 6)
+        indices = torch.tensor([6, 2])
+        metadata = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 2, 4]),
+            mamba_cache_indices=indices,
+            has_mamba_track_mask=True,
+            conv_states_mask_indices=torch.tensor([4, 5]),
+            track_conv_indices=torch.tensor([[0, 1], [2, 3]]),
+            track_ssm_h_src=torch.tensor([0]),
+            track_ssm_h_dst=torch.tensor([4]),
+            track_ssm_h_batch_src=torch.tensor([1]),
+            track_chunk_idx=torch.tensor([-1, 0]),
+            track_ssm_final_src=torch.tensor([6]),
+            track_ssm_final_dst=torch.tensor([5]),
+        )
+        for snapshot in (False, True):
+            for contiguous in (True, False):
+                with self.subTest(snapshot=snapshot, contiguous=contiguous):
+                    backend = object.__new__(GDNAttnBackend)
+                    backend.forward_metadata = metadata
+                    backend.mis_metadata = None
+                    backend.requires_contiguous_prefill_state = contiguous
+                    conv_states = torch.zeros(16, 6, 2)[::2]
+                    ssm_states = torch.zeros(16, 1, 2, 2)[::2]
+                    cache = SimpleNamespace(conv=[conv_states], temporal=ssm_states)
+                    backend.state_layer_cache = lambda _: cache
+                    # Staged copies keep the padding sink at row 0, so the
+                    # requests sit at rows 1..n.
+                    expected_indices = torch.arange(1, 3) if contiguous else indices
+
+                    def convolve(_layer, _batch, x, states, slots):
+                        torch.testing.assert_close(slots, expected_indices)
+                        self.assertEqual(states.is_contiguous(), contiguous)
+                        states[slots] = 7
+                        return x + 10
+
+                    def extend(q, k, v, g, beta, **kwargs):
+                        self.assertEqual(kwargs["layer_id"], layer.layer_id)
+                        self.assertIs(
+                            kwargs["extend_prefix_lens"], batch.extend_prefix_lens
+                        )
+                        torch.testing.assert_close(
+                            kwargs["cache_indices"], expected_indices
+                        )
+                        self.assertEqual(
+                            kwargs["ssm_states"].is_contiguous(), contiguous
+                        )
+                        kwargs["ssm_states"][kwargs["cache_indices"]] = 5
+                        if snapshot:
+                            self.assertIs(
+                                kwargs["track_chunk_idx"], metadata.track_chunk_idx
+                            )
+                            track = kwargs["track_state"]
+                            self.assertEqual(track.dtype, torch.float32)
+                            self.assertEqual(track.shape, (2, 1, 2, 2))
+                            track[0] = 42
+                            track[1] = DOUBLE_ROUND_PROBE
+                            h = None
+                        else:
+                            self.assertIsNone(kwargs["track_state"])
+                            self.assertIsNone(kwargs["track_chunk_idx"])
+                            h = torch.full((1, 1, 1, 2, 2), 2.0)
+                        return v, None, h
+
+                    backend._convolve_prefill = Mock(side_effect=convolve)
+                    backend._prefill_gates = Mock(return_value=(None, None))
+                    backend.kernel_dispatcher = object.__new__(GDNKernelDispatcher)
+                    backend.kernel_dispatcher.extend_kernel = SimpleNamespace(
+                        supports_track_state_snapshot=snapshot, extend=extend
+                    )
+                    # Exercise the GPU gather policy with CPU tensors and fake kernels.
+                    with (
+                        patch.object(gdn_backend, "is_cpu", return_value=False),
+                        patch.object(gdn_backend, "is_cuda", return_value=False),
+                        patch.object(gdn_backend, "is_hip", return_value=False),
+                        patch.object(gdn_backend, "is_xpu", return_value=False),
+                        patch.object(gdn_backend, "is_npu", return_value=False),
+                    ):
+                        output = backend.forward_extend(layer, batch, qkv, None, None)
+                    backend._prefill_gates.assert_called_once_with(layer, None, None)
+                    torch.testing.assert_close(output.flatten(0, 2), qkv[:, 4:] + 10)
+                    torch.testing.assert_close(
+                        conv_states[[4, 5]], qkv.view(2, 2, 6).transpose(1, 2)
+                    )
+                    self.assertTrue(torch.all(conv_states[indices] == 7))
+                    self.assertTrue(torch.all(ssm_states[[6, 2, 5]] == 5))
+                    expected = DOUBLE_ROUND_PROBE if snapshot else 2.0
+                    self.assertTrue(torch.all(ssm_states[4] == expected))
+
+
+class TestKdaCutedslVerifyStateDtypeGate(CustomTestCase):
+    """Which SSM-state pools may take the fused CuTe DSpARK verify.
+
+    The kernel cp.async's the state in 16-byte vectors: 4 fp32 or 8 bf16
+    elements, so a bf16 slot must start on an 8-element boundary while 4 is
+    enough for fp32. fp16 is rejected, and the per-step snapshot buffer must
+    share the state dtype because the kernel stores snapshots in it.
+    """
+
+    H = 2
+    K = 128
+    DRAFT = 5
+
+    def _layer(self):
+        dim = self.H * self.K
+        return SimpleNamespace(
+            bias=None,
+            lower_bound=-5.0,
+            head_q_dim=self.K,
+            head_k_dim=self.K,
+            head_v_dim=self.K,
+            num_q_heads=self.H,
+            num_k_heads=self.H,
+            num_v_heads=self.H,
+            q_dim=dim,
+            k_dim=dim,
+            v_dim=dim,
+            conv_weights=torch.zeros(3 * dim, 4, dtype=torch.float32),
+        )
+
+    def _states(self, dtype, offset=0, slots=3):
+        shape = (slots, self.H, self.K, self.K)
+        numel = slots * self.H * self.K * self.K
+        return torch.zeros(numel + offset, dtype=dtype)[offset:].view(shape)
+
+    def _can_run(self, ssm_states, snapshot_dtype=None):
+        layer = self._layer()
+        tokens = 2 * self.DRAFT
+        dim = 3 * layer.q_dim
+        backend = SimpleNamespace(
+            kernel_dispatcher=SimpleNamespace(
+                verify_backend=SimpleNamespace(is_nv_cutedsl=lambda: True)
+            ),
+            state_pool=None,
+        )
+        snapshot_dtype = snapshot_dtype or ssm_states.dtype
+        with (
+            patch.object(kda_backend, "is_cuda", return_value=True),
+            patch.object(
+                kda_backend.importlib.util, "find_spec", return_value=object()
+            ),
+            patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
+        ):
+            return KDAAttnBackend._can_run_dspark_cutedsl_mtp(
+                backend,
+                layer=layer,
+                mixed_qkv=torch.zeros(tokens, dim, dtype=torch.bfloat16),
+                a=torch.zeros(tokens, self.H * self.K, dtype=torch.bfloat16),
+                b=torch.zeros(tokens, self.H, dtype=torch.bfloat16),
+                draft_token_num=self.DRAFT,
+                ragged_layout=None,
+                conv_states=torch.zeros(3, 3, dim, dtype=torch.bfloat16),
+                ssm_states=ssm_states,
+                intermediate_state_cache=torch.zeros(
+                    2, self.DRAFT, self.H, self.K, self.K, dtype=snapshot_dtype
+                ),
+                intermediate_conv_window_cache=torch.zeros(
+                    2, self.DRAFT, 3, dim, dtype=torch.bfloat16
+                ),
+                retrieve_parent_token=None,
+                replayssm_rawv=None,
+            )
+
+    def test_state_dtype_gate(self):
+        self.assertTrue(self._can_run(self._states(torch.float32)))
+        self.assertTrue(self._can_run(self._states(torch.bfloat16)))
+        self.assertFalse(self._can_run(self._states(torch.float16)))
+
+    def test_slot_alignment_follows_state_dtype(self):
+        # 4 elements = 16 bytes of fp32, but only 8 bytes of bf16.
+        self.assertTrue(self._can_run(self._states(torch.float32, offset=4)))
+        self.assertFalse(self._can_run(self._states(torch.bfloat16, offset=4)))
+        self.assertTrue(self._can_run(self._states(torch.bfloat16, offset=8)))
+
+    def test_snapshot_dtype_must_match_state(self):
+        self.assertFalse(
+            self._can_run(self._states(torch.bfloat16), snapshot_dtype=torch.float32)
+        )
+        self.assertFalse(
+            self._can_run(self._states(torch.float32), snapshot_dtype=torch.bfloat16)
+        )
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from sglang.kernels.ops.diffusion import BitExactFusionGate
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
@@ -15,17 +16,104 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rope
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    RotaryEmbedding,
+    get_rope,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import (
+    flashinfer_apply_rope_inplace,
+)
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
+    load_llm_encoder_weights,
 )
-from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    TextEncoder,
+    get_attention_head_partition,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
+
+logger = init_logger(__name__)
+
+# The cache-indexed native NeoX RoPE launches ~27 elementwise kernels per layer;
+# FlashInfer applies it to Q and K in one. With a bf16/fp16 cache and Q/K every
+# product is exact in fp32, so both paths round the same difference once.
+_NEOX_ROPE = BitExactFusionGate(
+    "Qwen3 encoder FlashInfer NeoX RoPE", per_signature=True
+)
+
+
+def _fp32_cos_sin_cache(rotary_emb: RotaryEmbedding) -> torch.Tensor:
+    cache = rotary_emb.cos_sin_cache
+    held = getattr(rotary_emb, "_fp32_cos_sin_cache", None)
+    if held is None or held[0] != (cache.device, cache.data_ptr()):
+        held = ((cache.device, cache.data_ptr()), cache.float())
+        rotary_emb._fp32_cos_sin_cache = held
+    return held[1]
+
+
+def _apply_neox_rope(
+    rotary_emb: RotaryEmbedding,
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``rotary_emb(positions, q, k)`` for [batch, seq, heads * head_dim] Q/K."""
+
+    def reference():
+        return rotary_emb(positions, q, k)
+
+    if (
+        flashinfer_apply_rope_inplace is None
+        or type(rotary_emb) is not RotaryEmbedding
+        or not rotary_emb.is_neox_style
+        or not rotary_emb.use_precomputed_cache
+        or rotary_emb.rotary_dim != head_dim
+        or not q.is_cuda
+        or q.dtype not in (torch.bfloat16, torch.float16)
+        or k.dtype != q.dtype
+        or rotary_emb.cos_sin_cache.dtype not in (torch.bfloat16, torch.float16)
+        or not q.is_contiguous()
+        or not k.is_contiguous()
+        or positions.numel() != q.shape[0] * q.shape[1]
+        or torch.compiler.is_compiling()
+    ):
+        return reference()
+
+    cache = _fp32_cos_sin_cache(rotary_emb)
+    flat_positions = positions.reshape(-1)
+    # one check per head layout; the token count does not change the arithmetic
+    sig = (q.shape[-1], k.shape[-1], q.dtype, rotary_emb.cos_sin_cache.dtype, q.device)
+
+    def fused(in_place: bool):
+        qf = q.view(flat_positions.numel(), -1)
+        kf = k.view(flat_positions.numel(), -1)
+        if not in_place:
+            qf, kf = qf.clone(), kf.clone()
+        flashinfer_apply_rope_inplace(
+            positions=flat_positions,
+            query=qf,
+            key=kf,
+            head_size=head_dim,
+            cos_sin_cache=cache,
+            is_neox=True,
+        )
+        return qf.view_as(q), kf.view_as(k)
+
+    if not _NEOX_ROPE.disabled and _NEOX_ROPE.is_verified(sig):
+        return fused(in_place=True)
+    return _NEOX_ROPE.run(
+        lambda: fused(in_place=False),
+        reference,
+        sig=sig,
+        equal=lambda a, b: all(torch.equal(x, y) for x, y in zip(a, b)),
+        logger=logger,
+    )
 
 
 class Qwen3MLP(nn.Module):
@@ -91,14 +179,10 @@ class Qwen3Attention(nn.Module):
         self.hidden_size = hidden_size
         tp_size = get_tp_world_size()
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.num_heads, self.num_kv_heads = get_attention_head_partition(
+            num_heads, num_kv_heads, tp_size
+        )
 
         self.head_dim = getattr(
             config, "head_dim", self.hidden_size // self.total_num_heads
@@ -180,8 +264,7 @@ class Qwen3Attention(nn.Module):
         q = q.reshape(batch_size, seq_len, -1)
         k = k.reshape(batch_size, seq_len, -1)
 
-        # Apply rotary embeddings
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = _apply_neox_rope(self.rotary_emb, positions, q, k, self.head_dim)
 
         # Reshape for attention
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
@@ -214,6 +297,10 @@ class Qwen3Attention(nn.Module):
             q_item = q[batch_index : batch_index + 1]
             k_item = k[batch_index : batch_index + 1]
             v_item = v[batch_index : batch_index + 1]
+
+            if valid_len == 0:
+                outputs.append(torch.zeros_like(q_item))
+                continue
 
             real_output = self.attn(
                 q_item[:, :valid_len],
@@ -323,6 +410,8 @@ class Qwen3ForCausalLM(TextEncoder):
     - FSDP sharding for CPU offload
     """
 
+    _aliases = ["Qwen3Model"]
+
     def __init__(self, config: Qwen3TextConfig) -> None:
         super().__init__(config)
 
@@ -426,64 +515,12 @@ class Qwen3ForCausalLM(TextEncoder):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights with support for tensor parallelism and weight remapping."""
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            # Strip 'model.' prefix from HuggingFace Qwen3 weights
-            if name.startswith("model."):
-                name = name[6:]  # len("model.") == 6
-
-            # Skip rotary embedding weights
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                continue
-
-            # Handle KV scale remapping
-            if "scale" in name:
-                kv_scale_name: str | None = maybe_remap_kv_scale_name(name, params_dict)
-                if kv_scale_name is None:
-                    continue
-                else:
-                    name = kv_scale_name
-
-            # Handle stacked params mapping (qkv_proj, gate_up_proj)
-            for (
-                param_name,
-                weight_name,
-                shard_id,
-            ) in self.config.arch_config.stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-
-                # Skip loading extra bias for GPTQ models
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-
-            loaded_params.add(name)
-
-        return loaded_params
+        return load_llm_encoder_weights(
+            weights,
+            dict(self.named_parameters()),
+            self.config.arch_config.stacked_params_mapping,
+            strip_prefix="model.",
+        )
 
 
 EntryClass = Qwen3ForCausalLM

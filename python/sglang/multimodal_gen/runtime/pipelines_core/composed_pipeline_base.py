@@ -9,6 +9,8 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, Callable, ClassVar, Iterator, Literal, cast
 
 import torch
@@ -17,6 +19,10 @@ from tqdm import tqdm
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
+)
+from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
+    is_comfyui_single_file,
+    load_comfyui_transformer,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -29,8 +35,16 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_or
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
-    ComponentResidencyStrategy,
     get_global_component_residency_manager,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentResidencyStrategy,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
+    COMFYUI_REQUIRED_MODULES,
+    create_comfyui_pipeline_stages,
+    initialize_comfyui_pipeline,
+    is_comfyui_mode,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -54,11 +68,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    external_component_path,
     maybe_download_model,
     prepare_diffusers_component_path_for_loading,
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.model_overlay import is_model_overlay
 
 logger = init_logger(__name__)
 
@@ -77,6 +93,9 @@ class ComposedPipelineBase(ABC):
     _required_config_modules: list[str] = []
     _unfiltered_required_config_modules: tuple[str, ...] = ()
     _extra_config_module_map: dict[str, str] = {}
+    # model_index.json component name -> the other repository's component path
+    # it loads from (external_component_path); load_modules sets it.
+    _external_component_paths: Mapping[str, str] = MappingProxyType({})
     # Exact module keys; unspecified components retain the default loader dispatch.
     component_loaders: ClassVar[dict[str, type[ComponentLoader]]] = {}
     server_args: ServerArgs | None = None
@@ -123,6 +142,9 @@ class ComposedPipelineBase(ABC):
         )
         if base_required_config_modules is None:
             raise NotImplementedError("Subclass must set _required_config_modules")
+        if is_comfyui_mode(server_args):
+            # ComfyUI owns text encoding, VAE decode, and the sampler loop.
+            base_required_config_modules = COMFYUI_REQUIRED_MODULES
         self._unfiltered_required_config_modules = tuple(base_required_config_modules)
         self._required_config_modules = list(self._unfiltered_required_config_modules)
         self._extra_config_module_map = dict(self._extra_config_module_map)
@@ -166,6 +188,12 @@ class ComposedPipelineBase(ABC):
 
     def __post_init__(self) -> None:
         assert self.server_args is not None, "server_args must be set"
+        if is_comfyui_mode(self.server_args):
+            initialize_comfyui_pipeline(self, self.server_args)
+            logger.info("Creating ComfyUI pipeline stages...")
+            create_comfyui_pipeline_stages(self, self.server_args)
+            return
+
         self.initialize_pipeline(self.server_args)
 
         logger.info("Creating pipeline stages...")
@@ -200,11 +228,19 @@ class ComposedPipelineBase(ABC):
                 raise ValueError(
                     f"model_subfolder must stay inside the model repository: {model_subfolder!r}"
                 )
-            model_root = maybe_download_model(
-                self.model_path,
-                allow_patterns=[f"{model_subfolder}/**"],
-                revision=self.server_args.revision,
-            )
+            if is_model_overlay(self.model_path):
+                # an overlay materializes every partition under one root
+                model_root = maybe_download_model(
+                    self.model_path,
+                    force_diffusers_model=True,
+                    revision=self.server_args.revision,
+                )
+            else:
+                model_root = maybe_download_model(
+                    self.model_path,
+                    allow_patterns=[f"{model_subfolder}/**"],
+                    revision=self.server_args.revision,
+                )
             model_path = os.path.join(model_root, model_subfolder)
 
         self.model_path = model_path
@@ -252,7 +288,10 @@ class ComposedPipelineBase(ABC):
 
     def validate_disagg_role(self, role: RoleType) -> None:
         """Validate whether the requested disaggregation role is supported."""
-        return
+        if role in (RoleType.PROMPT_ENCODER, RoleType.IMAGE_ENCODER):
+            raise ValueError(
+                f"{self.pipeline_name} does not support separate prompt/image encoder roles"
+            )
 
     def _get_extra_allowed_modules_for_role(
         self, role: RoleType, task_name: str
@@ -389,10 +428,33 @@ class ComposedPipelineBase(ABC):
         self, server_args: ServerArgs, module_name: str, load_module_name: str
     ) -> str:
         override_path = server_args.component_paths.get(module_name)
+        external_path = self._external_component_paths.get(load_module_name)
         if override_path is not None:
             component_model_path = prepare_diffusers_component_path_for_loading(
                 override_path
             )
+        elif external_path is not None:
+            local_path = os.path.join(self.model_path, load_module_name)
+            if os.path.exists(local_path):
+                # Releases may bundle a copy of the external component (the
+                # public MiniMax-H3-Image snapshot ships text_encoder/). Use it
+                # rather than downloading the other repository again.
+                logger.info(
+                    "Loading %s from the bundled %s (model_index.json names %s)",
+                    load_module_name,
+                    local_path,
+                    external_path,
+                )
+                component_model_path = local_path
+            else:
+                logger.info(
+                    "Loading %s from %s (model_index.json)",
+                    load_module_name,
+                    external_path,
+                )
+                component_model_path = prepare_diffusers_component_path_for_loading(
+                    external_path
+                )
         else:
             component_model_path = os.path.join(self.model_path, load_module_name)
 
@@ -425,9 +487,18 @@ class ComposedPipelineBase(ABC):
         loaded_modules: Optional[Dict[str, torch.nn.Module]] = None,
         If provided, loaded_modules will be used instead of loading from config/pretrained weights.
         """
+        if is_comfyui_mode(server_args) and is_comfyui_single_file(self.model_path):
+            return load_comfyui_transformer(self, server_args, loaded_modules)
 
         model_index = self._load_config()
         logger.info("Loading pipeline modules from config: %s", model_index)
+        external_paths = {}
+        for name, spec in model_index.items():
+            external_path = external_component_path(name, spec)
+            if external_path is not None:
+                external_paths[name] = external_path
+                model_index[name] = spec[:2]
+        self._external_component_paths = MappingProxyType(external_paths)
 
         # remove keys that are not pipeline modules
         model_index.pop("_class_name")
@@ -611,6 +682,9 @@ class ComposedPipelineBase(ABC):
                     module_name, load_module_name
                 )
             )
+            backend_by_role = server_args.resolve_component_backend_by_role(
+                module_name, load_module_name
+            )
             if attn_backend is not None:
                 logger.info(
                     "Using %s backend for component: %s",
@@ -627,6 +701,7 @@ class ComposedPipelineBase(ABC):
                 component_architecture=architecture,
                 component_attn_backend=attn_backend,
                 component_attn_name=matched_backend_key or module_name,
+                component_backend_by_role=backend_by_role,
             )
 
             self.memory_usages[module_name] = memory_usage
@@ -678,9 +753,7 @@ class ComposedPipelineBase(ABC):
         role_affinity: RoleType,
         stage_name: str,
     ) -> bool:
-        if self._disagg_role == RoleType.MONOLITHIC:
-            return True
-        if role_affinity == self._disagg_role:
+        if self._disagg_role.includes_stage(role_affinity):
             return True
 
         logger.info(
@@ -1093,10 +1166,7 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
-        self.component_residency_manager = get_global_component_residency_manager(
-            self, server_args
-        )
-        self.executor.component_residency_manager = self.component_residency_manager
+        self._install_component_residency_manager(server_args)
 
         return self.executor.execute_with_profiling(self.stages, batch, server_args)
 
@@ -1126,10 +1196,7 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
-        self.component_residency_manager = get_global_component_residency_manager(
-            self, server_args
-        )
-        self.executor.component_residency_manager = self.component_residency_manager
+        self._install_component_residency_manager(server_args)
         return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
         )
@@ -1148,12 +1215,23 @@ class ComposedPipelineBase(ABC):
             yield self.forward(batches[0], server_args)
             return
 
-        self.component_residency_manager = get_global_component_residency_manager(
-            self, server_args
-        )
-        self.executor.component_residency_manager = self.component_residency_manager
+        self._install_component_residency_manager(server_args)
         yield from self.executor.execute_group_sequentially_with_profiling(
             self.stages,
             batches,
             server_args,
         )
+
+    def _install_component_residency_manager(self, server_args: ServerArgs) -> None:
+        """Publish the residency manager the executor dereferences unguarded.
+
+        ``PipelineExecutor`` initializes ``component_residency_manager`` to
+        ``None``, and every ``_execute_stages`` run enters
+        ``_component_residency_request``. An entry point that reaches the
+        executor without calling this raises ``AttributeError`` on ``None``, so
+        all three forward paths must install it.
+        """
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager

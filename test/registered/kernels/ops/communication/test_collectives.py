@@ -12,24 +12,31 @@ from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.attention import attn_res
 from sglang.kernels.ops.communication import all_reduce_residual as all_reduce
 from sglang.kernels.ops.communication import (
+    attn_res_collective,
     gemm_ag,
-    gemm_ar,
     sp_collective,
 )
-from sglang.kernels.ops.communication.mp import register_comm_cleanup
+from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.layers.communication.k3_ar_fusion import _SHARDED_UP_MAX_TOKENS
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=34, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=21, stage="base-c", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=480, stage="nightly", runner_config="8-gpu-b200")
 
 _HIDDEN_SIZE = 7168
-_GEMM_AR_K_TOTAL = 12288
-_GEMM_AG_WORLD_SIZE = 8
+# The GEMV table's two ends, the first batch past it (slice GEMM + gather_add3 only),
+# and the model's gather cap, where the consumer reaches its widest block and strides.
+_GEMM_AG_NUM_TOKENS = (
+    1,
+    gemm_ag.GEMV_MAX_TOKENS,
+    gemm_ag.GEMV_MAX_TOKENS + 1,
+    _SHARDED_UP_MAX_TOKENS,
+)
 _MB = 1024 * 1024
 _SP_TUNING = sp_collective.Tuning(num_blocks=1, block_size=256)
 
@@ -75,21 +82,9 @@ def _init_comm():
         raise RuntimeError("Kimi K3 collectives require multicast symmetric memory")
     all_reduce.register_comm(comm.obj)
     sp_collective.register_comm(comm.obj)
-    attn_res.register_comm(comm.obj)
+    attn_res_collective.register_comm(comm.obj)
     register_comm_cleanup(comm)
     return comm
-
-
-@cache_once
-def _init_gemm_ar():
-    cpu_group, _ = _init_world()
-    world_size = dist.get_world_size()
-    gemm_ar.init(
-        world_size=world_size,
-        rank=dist.get_rank(),
-        group=cpu_group,
-        k=_GEMM_AR_K_TOTAL // world_size,
-    )
 
 
 def _symmetric_tensor(shape):
@@ -213,62 +208,63 @@ def test_sequence_parallel_collectives():
     torch.testing.assert_close(gather_output, expected_gather, rtol=0, atol=0)
 
 
-@torch.inference_mode()
-def test_gemm_all_gather():
-    _require_sm100()
-    if int(os.environ["WORLD_SIZE"]) != _GEMM_AG_WORLD_SIZE:
-        pytest.skip("Kimi K3 gemm_ag is compiled for TP8")
-    comm = _init_comm()
+@cache_once
+def _gemm_ag_operands():
     generator = torch.Generator().manual_seed(30)
-    x = (
-        (torch.randn(1, gemm_ag.K, generator=generator) * 0.05)
-        .to(torch.bfloat16)
-        .to(_device())
+    max_tokens = max(_GEMM_AG_NUM_TOKENS)
+    x = (torch.randn(max_tokens, gemm_ag.K, generator=generator) * 0.05).to(
+        torch.bfloat16
     )
-    weight = (
-        (torch.randn(gemm_ag.N, gemm_ag.K, generator=generator) * 0.05)
-        .to(torch.bfloat16)
-        .to(_device())
+    weight = (torch.randn(gemm_ag.N, gemm_ag.K, generator=generator) * 0.05).to(
+        torch.bfloat16
     )
-    bias = torch.randn(1, gemm_ag.N, generator=generator).to(
-        device=_device(), dtype=torch.bfloat16
-    )
-    output = torch.empty(1, gemm_ag.N, device=_device(), dtype=torch.bfloat16)
-    expected = (x.float() @ weight.float().t() + bias.float()).to(torch.bfloat16)
-
-    gemm_ag.gemm_ag_up_proj(
-        comm.world_size,
-        x,
-        weight,
-        bias,
-        None,
-        output,
-    )
-    torch.cuda.synchronize()
-    torch.testing.assert_close(output, expected, rtol=3e-2, atol=3e-2)
+    b = torch.randn(max_tokens, gemm_ag.N, generator=generator).to(torch.bfloat16)
+    c = torch.randn(max_tokens, gemm_ag.N, generator=generator).to(torch.bfloat16)
+    return tuple(t.to(_device()) for t in (x, weight, b, c))
 
 
+@pytest.mark.parametrize("with_c", [False, True])
+@pytest.mark.parametrize("num_tokens", _GEMM_AG_NUM_TOKENS)
 @torch.inference_mode()
-def test_gemm_all_reduce():
+def test_gemm_all_gather(num_tokens, with_c):
     _require_sm100()
-    _init_gemm_ar()
-    rank, world_size = dist.get_rank(), dist.get_world_size()
-    local_k = _GEMM_AR_K_TOTAL // world_size
-    generator = torch.Generator().manual_seed(40 + rank)
-    x = torch.randn(1, local_k, generator=generator).to(
-        device=_device(), dtype=torch.bfloat16
-    )
-    weight = torch.randn(gemm_ar.N, local_k, generator=generator).to(
-        device=_device(), dtype=torch.bfloat16
-    )
-    expected = (x.float() @ weight.float().t()).to(torch.bfloat16).float()
+    world_size = int(os.environ["WORLD_SIZE"])
+    if world_size not in gemm_ag.WORLD_SIZES:
+        pytest.skip(f"Kimi K3 gemm_ag is built for TP{gemm_ag.WORLD_SIZES}")
+    _init_comm()
     _, nccl_group = _init_world()
-    dist.all_reduce(expected, group=nccl_group)
+    x, weight, b, c = _gemm_ag_operands()
+    x, b = x[:num_tokens], b[:num_tokens]
+    c = c[:num_tokens] if with_c else None
+    output = torch.empty(num_tokens, gemm_ag.N, device=_device(), dtype=torch.bfloat16)
 
-    output = gemm_ar.o_proj_gemm_ar(x, weight)
-    torch.cuda.synchronize()
-    bad = ((output.float() - expected).abs() > 0.05 + 0.02 * expected.abs()).sum()
-    assert bad.item() <= output.numel() / 1000
+    if num_tokens <= gemm_ag.GEMV_MAX_TOKENS:
+        expected = x.float() @ weight.float().t() + b.float()
+        if c is not None:
+            expected += c.float()
+        gemm_ag.gemm_ag_up_proj(world_size, x, weight, b, c, output)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            output, expected.to(torch.bfloat16), rtol=3e-2, atol=3e-2
+        )
+
+    # Slice GEMM + gather: exact against the slices gathered by NCCL, with the
+    # replicated tail's bf16(bf16(up_proj + b) + c) rounding.
+    rows = gemm_ag.N // world_size
+    rank = dist.get_rank()
+    local = torch.nn.functional.linear(x, weight[rank * rows : (rank + 1) * rows])
+    slices = torch.empty(
+        world_size, num_tokens, rows, device=_device(), dtype=torch.bfloat16
+    )
+    dist.all_gather_into_tensor(slices, local, group=nccl_group)
+    expected = slices.permute(1, 0, 2).reshape(num_tokens, gemm_ag.N) + b
+    if c is not None:
+        expected = expected + c
+    for _ in range(3):  # each round flips the push-plane phase
+        output.fill_(float("nan"))
+        gemm_ag.gather_add3(world_size, local, b, c, output)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 @torch.inference_mode()
@@ -322,7 +318,7 @@ def test_attention_residual_direct_all_gather():
     )
 
     output, handle, multicast_ptr = _symmetric_tensor(tuple(full_reference.shape))
-    attn_res.attn_res_fused_direct_ag(
+    attn_res_collective.attn_res_fused_direct_ag(
         comm.world_size,
         prefix,
         bank,
@@ -343,9 +339,8 @@ def _precompile(num_gpus):
     for world_size in num_gpus:
         all_reduce._jit_module(world_size)
         sp_collective._jit_module(world_size)
-        gemm_ar._jit_module(_GEMM_AR_K_TOTAL // world_size, world_size)
-    if _GEMM_AG_WORLD_SIZE in num_gpus:
-        gemm_ag._jit_module()
+        if world_size in gemm_ag.WORLD_SIZES:
+            gemm_ag._jit_module(world_size)
     attn_res._jit_fused_tma_module(4, 1, 200)
 
 
