@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 indexer_weight_stream = None
 gva_is_inited = False
-ASCEND_950_SOC_VERSION = 260
 
 
 @functools.lru_cache(maxsize=1)
@@ -31,6 +30,24 @@ def is_npu_arch35() -> bool:
     import acl
 
     return acl.rt.get_device_info(0, 601) == (3510, 0)
+
+
+# SoC version reported by Ascend 950 (Atlas A5) devices; later aclnn-only
+# SoCs report higher values and share the same capability gates.
+ASCEND_950_SOC_VERSION = 260
+
+
+def is_ascend_950() -> bool:
+    """Whether the runtime SoC is Ascend 950 (Atlas A5) or a later aclnn-only SoC.
+
+    The SoC query initializes NPU state, so this must not be called before
+    device selection (see the deferred setup in ``init_npu_backend``).
+    """
+    if not _is_npu:
+        return False
+    from torch_npu.npu._backends import get_soc_version
+
+    return get_soc_version() >= ASCEND_950_SOC_VERSION
 
 
 def use_npu_arch35_mxfp8_wo_a(
@@ -232,16 +249,15 @@ def init_npu_backend():
     # and a significant reduction in performance.
     if "sglang.multimodal_gen" not in sys.modules:
         from torch_npu.contrib import transfer_to_npu  # noqa: F401
-        from torch_npu.npu._backends import get_soc_version
 
         # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
         torch.cuda.is_available = lambda: False
 
         def configure_internal_format():
-            if get_soc_version() < ASCEND_950_SOC_VERSION:
+            if not is_ascend_950():
                 torch_npu.npu.config.allow_internal_format = True
 
-        # The public query initializes NPU state; defer it until device selection.
+        # The SoC query initializes NPU state; defer it until device selection.
         torch_npu.npu._lazy_call(configure_internal_format)
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
