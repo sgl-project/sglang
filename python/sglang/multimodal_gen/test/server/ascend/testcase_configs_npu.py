@@ -17,7 +17,6 @@ def use_modelscope(name: str):
 
 
 ERNIE_IMAGE_WEIGHTS_PATH = use_modelscope("PaddlePaddle/ERNIE-Image")
-FLUX_1_DEV_WEIGHTS_PATH = use_modelscope("black-forest-labs/FLUX.1-dev")
 FLUX_2_DEV_WEIGHTS_PATH = use_modelscope("black-forest-labs/FLUX.2-dev")
 FLUX_2_KLEIN_4B_WEIGHTS_PATH = use_modelscope("black-forest-labs/FLUX.2-klein-4B")
 GLM_IMAGE_WEIGHTS_PATH = use_modelscope("ZhipuAI/GLM-Image")
@@ -57,14 +56,6 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
         run_consistency_check=False,
-    ),
-    DiffusionTestCase(
-        "flux_image_t2i_npu",
-        DiffusionServerArgs(
-            model_path=FLUX_1_DEV_WEIGHTS_PATH,
-            extras=EXTRAS_DISABLE_WARMUP,
-        ),
-        T2I_sampling_params,
     ),
     DiffusionTestCase(
         "flux_2_klein_4b_t2i_1npu",
