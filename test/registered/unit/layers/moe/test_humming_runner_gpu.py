@@ -41,16 +41,24 @@ class TestHummingRunnerGPU(CustomTestCase):
 
     def test_standard_ep_with_default_tuning(self):
         if get_device_sm() != 90:
-            self.skipTest("MXFP4 per-token AFP8 regression targets SM90")
-        for gemm_type in ("indexed", "grouped_contiguous"):
-            for shared in (0, 1):
-                with self.subTest(gemm_type=gemm_type, shared=shared):
-                    self._check_indexed_two_gemms(
-                        static_scales=False,
-                        gemm_type=gemm_type,
-                        ep_size=8,
-                        shared_experts=shared,
-                    )
+            self.skipTest("MXFP4 EP regression targets SM90")
+        cases = [
+            ("indexed", 0, True),
+            ("indexed", 1, True),
+            ("grouped_contiguous", 0, True),
+            ("grouped_contiguous", 1, True),
+            ("indexed", 0, False),
+            ("grouped_contiguous", 1, False),
+        ]
+        for gemm_type, shared, fp8 in cases:
+            with self.subTest(gemm_type=gemm_type, shared=shared, fp8=fp8):
+                self._check_indexed_two_gemms(
+                    static_scales=False,
+                    gemm_type=gemm_type,
+                    ep_size=8,
+                    shared_experts=shared,
+                    fp8_activations=fp8,
+                )
 
     def _check_indexed_two_gemms(
         self,
@@ -59,6 +67,7 @@ class TestHummingRunnerGPU(CustomTestCase):
         gemm_type="indexed",
         ep_size=1,
         shared_experts=0,
+        fp8_activations=True,
     ):
         from humming.schema import HummingInputSchema, HummingWeightSchema
         from humming.utils.weight import dequantize_weight
@@ -84,6 +93,8 @@ class TestHummingRunnerGPU(CustomTestCase):
             input_scale_group_size=0 if ep_size > 1 else 128,
             input_scale_dtype="float32",
         )
+        if not fp8_activations:
+            input_schema = HummingInputSchema(a_dtype="bfloat16")
         reference_weights = {}
         for sublayer, shape_n, shape_k in (
             ("w13", intermediate_size * 2, hidden_size),
@@ -224,6 +235,8 @@ class TestHummingRunnerGPU(CustomTestCase):
         )
 
         def quantize_reference(values, sublayer):
+            if not fp8_activations:
+                return values.float()
             if static_scales:
                 scale = getattr(layer, f"{sublayer}_input_scale")
                 return (values.float() / scale).clamp(-448, 448).to(
