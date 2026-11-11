@@ -60,7 +60,7 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
     prepare_kv_shard_forward,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.dcp.layout import get_dcp_lens, is_mla_dcp_lse_base_on_e
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -310,7 +310,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if model_runner.sliding_window_size is not None and (
             model_runner.sliding_window_size >= 0
         ):
-            max_rows = model_runner.max_running_requests * max(
+            # The parent's q_indptr_decode covers the padded batch, which can
+            # exceed max_running_requests under MLP sync.
+            max_rows = (self.q_indptr_decode.numel() - 1) * max(
                 self.num_draft_tokens or 1, 1
             )
             self._window_counter_buffer = make_persistent_multi_ctas_kv_counter_buffer(
@@ -1487,13 +1489,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Row p attends [p - sliding_window_size, p] via trtllm-gen sparse MLA;
         under DCP returns the rank-local (out, lse) for the caller's merge."""
-        # Import cycle: forward_mla -> dsa_backend -> trtllm_mla_backend.
-        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
-            is_mla_dcp_lse_base_on_e,
-        )
-
         bs, q_len, heads, head_dim = q.shape
         rows = bs * q_len
+        assert rows < self._window_row_indptr.numel(), (
+            f"{rows} window rows exceed the {self._window_row_indptr.numel() - 1} "
+            "sized at init"
+        )
         if get_in_autotune_dummy_run():
             # Autotune discards attention; its metadata overflows the workspace.
             out, lse = self._dummy_dcp_decode_for_autotune(

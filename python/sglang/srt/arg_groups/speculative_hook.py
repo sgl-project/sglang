@@ -1097,12 +1097,14 @@ def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
     draft_hf_config = _load_draft_hf_config(cfg)
     if not is_dflash_mla_draft_config(draft_hf_config):
         return
+    # Sliding layers index req_to_token by absolute position, which the compact
+    # draft table of --speculative-draft-window-size does not keep.
     layer_types = get_dflash_layer_types(draft_hf_config)
-    if layer_types and all(t == "sliding_attention" for t in layer_types):
+    if layer_types and "sliding_attention" in layer_types:
         raise ValueError(
-            "--speculative-draft-window-size is not supported for a sliding-window "
-            f"MLA draft on {draft_backend}: the backend applies the draft's own "
-            "window."
+            "--speculative-draft-window-size is not supported for an MLA draft "
+            f"with sliding-window layers on {draft_backend}: the backend applies "
+            "the draft's own window."
         )
 
 

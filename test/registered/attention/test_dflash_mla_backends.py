@@ -48,7 +48,9 @@ def _rope(x, positions):
     return x * cos[:, None] + torch.stack((-b, a), -1).flatten(-2) * sin[:, None]
 
 
-def _expanded_reference(module, prefix, hidden, positions, *, causal, window_left=None):
+def _expanded_reference(
+    module, prefix, hidden, positions, *, causal, window_left=None, heads=HEADS
+):
     """Independent FP32 SpecForge equations with per-head K and V."""
     w = {name: p.float() for name, p in module.named_parameters()}
 
@@ -58,7 +60,7 @@ def _expanded_reference(module, prefix, hidden, positions, *, causal, window_lef
     hidden = hidden.float()
     q_nope, q_pe = (
         F.linear(hidden, w["q_proj.weight"])
-        .view(-1, HEADS, NOPE + ROPE)
+        .view(-1, heads, NOPE + ROPE)
         .split((NOPE, ROPE), -1)
     )
     q = torch.cat((q_nope, _rope(q_pe, positions)), -1)
@@ -68,11 +70,11 @@ def _expanded_reference(module, prefix, hidden, positions, *, causal, window_lef
         c, k_pe = F.linear(x, w["kv_a_proj_with_mqa.weight"]).split((RANK, ROPE), -1)
         k_nope, v = (
             F.linear(norm(c, "kv_a_layernorm.weight"), w["kv_b_proj.weight"])
-            .view(-1, HEADS, NOPE + VALUE)
+            .view(-1, heads, NOPE + VALUE)
             .split((NOPE, VALUE), -1)
         )
         k_pe = _rope(k_pe[:, None], torch.arange(len(x), device=x.device))
-        k = torch.cat((k_nope, k_pe.expand(-1, HEADS, -1)), -1)
+        k = torch.cat((k_nope, k_pe.expand(-1, heads, -1)), -1)
         scores = torch.einsum("qhd,khd->hqk", q[i * BLOCK : (i + 1) * BLOCK], k)
         if causal:
             keys = torch.arange(len(x), device=x.device)[None]
@@ -94,9 +96,9 @@ class TestDFlashMLABackends(unittest.TestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy", device="cuda", tp_size=1), role="test")
 
-    def _make_runner(self, backend_name, config):
+    def _make_runner(self, backend_name, config, heads):
         model_config = TinyMLAModelConfig(
-            num_heads=HEADS,
+            num_heads=heads,
             kv_lora_rank=RANK,
             qk_rope_head_dim=ROPE,
             hidden_size=HIDDEN,
@@ -111,7 +113,7 @@ class TestDFlashMLABackends(unittest.TestCase):
             name="dflash",
             backend=backend_name,
             forward_mode=ForwardMode.TARGET_VERIFY,
-            num_heads=HEADS,
+            num_heads=heads,
             page_size=32,
             prefix_lens=(0, 31),
             extend_lens=(BLOCK, BLOCK),
@@ -148,13 +150,13 @@ class TestDFlashMLABackends(unittest.TestCase):
         backend.decode_attention_backend_str = backend_name
         return backend
 
-    def _check(self, backend_name, *, causal, sliding_window=None):
+    def _check(self, backend_name, *, causal, sliding_window=None, heads=HEADS):
         torch.manual_seed(20261016)
         window_left = None if sliding_window is None else sliding_window - 1
         config = Qwen3Config(
             hidden_size=HIDDEN,
             num_hidden_layers=1,
-            num_attention_heads=HEADS,
+            num_attention_heads=heads,
             num_key_value_heads=1,
             kv_lora_rank=RANK,
             qk_nope_head_dim=NOPE,
@@ -171,7 +173,7 @@ class TestDFlashMLABackends(unittest.TestCase):
             sliding_window=sliding_window,
             dflash_config={"attention_mode": "mla", "block_size": BLOCK},
         )
-        runner = self._make_runner(backend_name, config)
+        runner = self._make_runner(backend_name, config, heads)
         # As ModelRunner sets it from the draft's layers.
         runner.sliding_window_size = window_left
         module = DFlashMLAAttention(config, layer_id=0)
@@ -198,7 +200,7 @@ class TestDFlashMLABackends(unittest.TestCase):
                 name="dflash",
                 backend=backend_name,
                 forward_mode=ForwardMode.TARGET_VERIFY,
-                num_heads=HEADS,
+                num_heads=heads,
                 page_size=32,
                 prefix_lens=prefix_lens,
                 extend_lens=(BLOCK,) * len(prefix_lens),
@@ -244,6 +246,7 @@ class TestDFlashMLABackends(unittest.TestCase):
                 batch.positions,
                 causal=causal,
                 window_left=window_left,
+                heads=heads,
             )
             return batch, hidden, expected
 
@@ -302,6 +305,12 @@ class TestDFlashMLABackends(unittest.TestCase):
         for backend_name in WINDOW_BACKENDS:
             with self.subTest(backend=backend_name):
                 self._check(backend_name, causal=True, sliding_window=SLIDING_WINDOW)
+        # trtllm-gen has no 64 < heads < 128 kernel: the query is padded to 128.
+        for backend_name in ("trtllm_mla", "cutedsl_mla"):
+            with self.subTest(backend=backend_name, heads=96):
+                self._check(
+                    backend_name, causal=True, sliding_window=SLIDING_WINDOW, heads=96
+                )
 
 
 if __name__ == "__main__":
