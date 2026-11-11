@@ -36,7 +36,11 @@ from sglang.srt.layers.amx_utils import (
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+    route_dropped_experts_to_local,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -403,6 +407,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
+        # Weight layout, post-load processing and apply() must agree with the
+        # runner create_moe_runner() builds: an explicit --moe-runner-backend
+        # wins over SGLANG_USE_AITER, which only applies in auto mode.
+        if get_moe_runner_backend().is_auto():
+            self.use_aiter_moe = _use_aiter and get_moe_a2a_backend().supports_aiter()
+        else:
+            self.use_aiter_moe = get_moe_runner_backend().is_aiter()
         # True W4A8: DeepGEMM fp8_fp4 grouped GEMM (SM100 MXF8F6F4 UMMA).
         # Weights stay MXFP4 (e2m1 + ue8m0 g32, zero requantization);
         # activations are quantized to fp8 per-token-group-128.
@@ -520,7 +531,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # create_weights below uses the *unpadded* sizes so the loader's
             # naive-copy fast path is correct.
             intermediate_size_per_partition_after_pad = intermediate_size_per_partition
-        elif _use_aiter:
+        elif self.use_aiter_moe:
             # Expert intermediate is padded to 128 or 256. On K3 (TP8) the 256
             # default costs +33% mem (3072/8=384 -> 512). K3 FlyDSL MoE works with
             # 128 padding, so relaxing to 128 saves that memory and lets the TP8
@@ -951,8 +962,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 torch.stack(gemm2_bias_shuffled).reshape(E, -1),
                 requires_grad=False,
             )
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                cuda_mxfp4_decode_moe_supported,
+            )
+
+            layer.use_cuda_mxfp4_decode_moe = cuda_mxfp4_decode_moe_supported(
+                layer,
+                "situ",
+                layer.w13_weight.shape[1] // 2,  # after the 128 padding
+                self.hidden_size,
+                self.with_bias,
+                self.flashinfer_mxfp4_moe_precision,
+            )
             return
-        if _use_aiter:
+        if self.use_aiter_moe:
             if getattr(layer, "w13_weight_bias", None) is not None:
                 layer.w13_weight_bias.data = layer.w13_weight_bias.data.to(
                     torch.float32
@@ -1447,8 +1470,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if moe_runner_backend.is_auto():
-            # Must match apply() priority: _use_aiter before use_triton_kernels.
-            if _use_aiter and get_moe_a2a_backend().supports_aiter():
+            # Must match apply() priority: aiter before use_triton_kernels.
+            if self.use_aiter_moe:
                 moe_runner_backend = MoeRunnerBackend.AITER
             elif self.use_triton_kernels:
                 moe_runner_backend = MoeRunnerBackend.TRITON_KERNELS
@@ -1590,6 +1613,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             hidden_size=self.hidden_size,
             flashinfer_mxfp4_moe_precision=self.flashinfer_mxfp4_moe_precision,
             routing_bias=routing_bias,
+            use_cuda_mxfp4_decode_moe=layer.use_cuda_mxfp4_decode_moe,
         )
         return self.runner.run(dispatch_output, quant_info)
 
@@ -1626,7 +1650,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Same constraint as the deep_gemm branch above: the AITER runner also
         # serves the DeepEP formats (deepep_normal / deepep_ll), which carry
         # topk_ids/topk_weights directly and have no `.topk_output` to unpack.
-        if _use_aiter and DispatchOutputChecker.format_is_deepep(dispatch_output):
+        if self.use_aiter_moe and DispatchOutputChecker.format_is_deepep(
+            dispatch_output
+        ):
             return self._apply_aiter(layer, dispatch_output)
 
         x = dispatch_output.hidden_states
@@ -1677,6 +1703,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             assert TopKOutputChecker.format_is_standard(topk_output)
             topk_weights, topk_ids, _ = topk_output
+            topk_weights, topk_ids = route_dropped_experts_to_local(
+                topk_weights=topk_weights, topk_ids=topk_ids
+            )
             moe_runner_config = self.moe_runner_config
             output = sgl_fused_experts(
                 x,
@@ -1709,7 +1738,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return self._apply_sm120_cutlass(layer, dispatch_output)
         if self.use_flashinfer:
             return self._apply_sm100_trtllm_gen(layer, dispatch_output)
-        if _use_aiter:
+        if self.use_aiter_moe:
             return self._apply_aiter(layer, dispatch_output)
 
         backend = self.runner.runner_backend

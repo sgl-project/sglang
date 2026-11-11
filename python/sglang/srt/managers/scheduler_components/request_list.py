@@ -42,7 +42,8 @@ class ListKind(enum.Enum):
 
 
 class ReqList(ABC):
-    """A list of live requests. Every live request is in exactly one list."""
+    """A list of live requests. Every live request is in at most one list,
+    which its `owner_list` names: joining a second list raises."""
 
     kind: ListKind
 
@@ -50,10 +51,14 @@ class ReqList(ABC):
     def __iter__(self) -> Iterator[Req]: ...
 
     @abstractmethod
-    def join(self, items) -> None: ...
+    def join(self, items, *, at: Optional[int] = None) -> None: ...
 
     @abstractmethod
     def leave(self, reqs: Iterable[Req]) -> None: ...
+
+    def req_of(self, item) -> Req:
+        """The request an item of this list stands for."""
+        return item
 
     def abort(self, recv_req: AbortReq) -> None:
         """Abort the requests `recv_req` names."""
@@ -72,6 +77,16 @@ class ReqList(ABC):
     def __len__(self) -> int:
         return sum(1 for _ in self)
 
+    def _adopt(self, reqs: List[Req]) -> None:
+        for req in reqs:
+            if req.owner_list is not None:
+                raise RuntimeError(
+                    f"Request {req.rid} is in {req.owner_list.kind.name}, "
+                    f"cannot join {self.kind.name}"
+                )
+        for req in reqs:
+            req.owner_list = self
+
 
 class KeyedReqList(ReqList):
     """Requests in join order, held in a dict by identity: for a list asked `in`
@@ -81,20 +96,28 @@ class KeyedReqList(ReqList):
         self.kind = kind
         self._reqs: Dict[Req, None] = {}
 
-    def join(self, reqs: Iterable[Req]) -> None:
+    def join(self, reqs: Iterable[Req], *, at: Optional[int] = None) -> None:
         """Add the given requests; ones already in keep their place."""
+        if at is not None:
+            raise TypeError(f"{self.kind.name} has no positions to insert at")
+        reqs = [req for req in reqs if req.owner_list is not self]
+        self._adopt(reqs)
         for req in reqs:
-            self._reqs.setdefault(req, None)
+            self._reqs[req] = None
 
     def leave(self, reqs: Iterable[Req]) -> None:
         """Drop the given requests; ones not in are ignored."""
         for req in reqs:
-            self._reqs.pop(req, None)
+            if req in self._reqs:
+                del self._reqs[req]
+                req.owner_list = None
 
     def leave_finished(self) -> None:
         self.leave([req for req in self._reqs if req.finished()])
 
     def clear(self) -> None:
+        for req in self._reqs:
+            req.owner_list = None
         self._reqs.clear()
 
     def __iter__(self) -> Iterator[Req]:
@@ -124,31 +147,53 @@ class IndexedReqList(ReqList):
         self._req_of = req_of
         self._items: List[Any] = []
 
-    def join(self, items: Iterable) -> None:
-        """Add the given items at the back, in order."""
-        self._items.extend(items)
-
-    def prepend(self, items: Iterable) -> None:
-        """Add the given items at the front, in order."""
-        self._items[:0] = items
+    def join(self, items: Iterable, *, at: Optional[int] = None) -> None:
+        """Add the given items in order: at the back, or before position `at`."""
+        items = list(items)
+        self._adopt([self._req_of(item) for item in items])
+        if at is None:
+            self._items.extend(items)
+        else:
+            self._items[at:at] = items
 
     def replace(self, items: Iterable) -> None:
-        self._items = list(items)
+        """Hold `items` instead, in their order: a reorder or a filter of the
+        list, or new requests."""
+        items = list(items)
+        reqs = [self._req_of(item) for item in items]
+        # Checked before anything changes: one owned elsewhere raises.
+        self._adopt([req for req in reqs if req.owner_list is not self])
+        for item in self._items:
+            self._req_of(item).owner_list = None
+        for req in reqs:
+            req.owner_list = self
+        self._items = items
 
     def leave(self, reqs: Iterable[Req]) -> None:
         """Drop the items of the given requests; ones not in are ignored."""
         leaving = set(reqs)
-        if leaving:
-            self._items = [
-                item for item in self._items if self._req_of(item) not in leaving
-            ]
+        if not leaving:
+            return
+        kept = []
+        for item in self._items:
+            req = self._req_of(item)
+            if req in leaving:
+                req.owner_list = None
+            else:
+                kept.append(item)
+        self._items = kept
 
     def clear(self) -> None:
+        for item in self._items:
+            self._req_of(item).owner_list = None
         self._items = []
 
     def abort(self, recv_req: AbortReq) -> None:
         if self._abort is not None:
             self._abort(recv_req)
+
+    def req_of(self, item) -> Req:
+        return self._req_of(item)
 
     def items(self) -> Iterator:
         return iter(self._items)
@@ -160,17 +205,29 @@ class IndexedReqList(ReqList):
         return len(self._items)
 
     def __contains__(self, req: Req) -> bool:
-        return any(self._req_of(item) is req for item in self._items)
+        return req.owner_list is self
 
     def __getitem__(self, index):
         return self._items[index]
 
 
-def move(reqs: Iterable[Req], src: ReqList, dst: ReqList) -> None:
-    """Move requests from `src` to `dst`; each must be in `src`."""
-    reqs = list(reqs)
-    missing = [req.rid for req in reqs if req not in src]
-    if missing:
-        raise RuntimeError(f"Requests {missing} are not in {src.kind.name}")
-    src.leave(reqs)
-    dst.join(reqs)
+def move(items: Iterable, dst: ReqList, *, at: Optional[int] = None) -> None:
+    """Move requests into `dst` in one step, out of the list each is in, if
+    any. `items` are what `dst` holds: its wrappers for a list that wraps
+    requests, else the requests. `at` inserts them before that position of an
+    `IndexedReqList` instead of at the back."""
+    items = list(items)
+    if not items:
+        return
+    if at is not None and not isinstance(dst, IndexedReqList):
+        raise TypeError(f"{dst.kind.name} has no positions to insert at")
+    by_owner: Dict[ReqList, List[Req]] = {}
+    for item in items:
+        req = dst.req_of(item)
+        if req.owner_list is dst:
+            raise RuntimeError(f"Request {req.rid} is already in {dst.kind.name}")
+        if req.owner_list is not None:
+            by_owner.setdefault(req.owner_list, []).append(req)
+    for owner, reqs in by_owner.items():
+        owner.leave(reqs)
+    dst.join(items, at=at)
