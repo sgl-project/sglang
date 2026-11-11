@@ -47,7 +47,6 @@ class DecodePreemptionPlan(msgspec.Struct, frozen=True, kw_only=True):
     deficit_tokens: int
     # Indices into the running batch's reqs, in release order.
     victim_indices: tuple[int, ...]
-    victim_output_lens: tuple[int, ...]
     freed_tokens: int
 
 
@@ -102,15 +101,9 @@ def _starving_target(
             and now_s - req.uniboost_arrival_s >= wait_s
         )
 
-    queue = list(waiting_queue)
-    if preferred_rid is not None:
-        for req in queue:
-            if req.rid == preferred_rid and starving(req):
-                return req
-    for req in queue:
-        if starving(req):
-            return req
-    return None
+    starving_reqs = [r for r in waiting_queue if starving(r)]
+    preferred = [r for r in starving_reqs if r.rid == preferred_rid]
+    return (preferred or starving_reqs or [None])[0]
 
 
 def _token_prefix(req: Req, n: int):
@@ -187,7 +180,7 @@ def plan_decode_preemption(
             -len(running_reqs[i].origin_input_ids),
         ),
     )
-    other_lockers = [chunked_req] if chunked_req is not None else []
+    other_lockers = [] if chunked_req is None else [chunked_req]
     chosen: List[int] = []
     freed = 0.0
     for i in candidates:
@@ -205,9 +198,6 @@ def plan_decode_preemption(
                 need_tokens=need,
                 deficit_tokens=int(math.ceil(deficit)),
                 victim_indices=tuple(chosen),
-                victim_output_lens=tuple(
-                    len(running_reqs[j].output_ids) for j in chosen
-                ),
                 freed_tokens=int(freed),
             )
     return None
@@ -228,8 +218,6 @@ class DecodePreemptor:
         self._last_plan_s = -math.inf
         self._target_rid: Optional[str] = None
         self._target_passes_left = 0
-        self.num_events = 0
-        self.num_victims = 0
 
     @classmethod
     def maybe_create(
@@ -293,22 +281,17 @@ class DecodePreemptor:
         self._target_passes_left = RESERVE_MAX_PASSES
         for req in preempted:
             req.num_preemptions += 1
-        self.num_events += 1
-        self.num_victims += len(preempted)
         logger.info(
             "decode preemption [dp %d]: waiter %s queued %.1f s needs %d tok "
-            "(deficit %d); released %d decode(s) with output %s tok, ~%d tok "
-            "freed; totals events=%d victims=%d",
+            "(deficit %d); released %d decode(s) with output %s tok, ~%d tok freed",
             self.dp_rank,
             plan.target_rid,
             plan.target_wait_s,
             plan.need_tokens,
             plan.deficit_tokens,
             len(preempted),
-            list(plan.victim_output_lens),
+            [len(r.output_ids) for r in preempted],
             plan.freed_tokens,
-            self.num_events,
-            self.num_victims,
         )
 
     def promote_target(self, waiting_queue: Iterable[Req]) -> List[Req]:
