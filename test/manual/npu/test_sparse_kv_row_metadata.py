@@ -259,18 +259,27 @@ def main():
     parser.add_argument("--mf", action="store_true")
     parser.add_argument("--reference-source", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--kernel-source", type=Path)
     args = parser.parse_args()
     if args.device == "npu":
         import torch_npu  # noqa: F401
 
         torch.npu.set_device(0)
+    if args.kernel_source:
+        load(
+            "sgl_kernel_npu.sparsity_driven_kv_offload.row_metadata", args.kernel_source
+        )
     load(PKG + ".mtp", SOURCE / "mtp.py")
     kernels = load(PKG + ".row_metadata", SOURCE / "row_metadata.py")
     results = {
         "device": args.device,
         "torch": torch.__version__,
         "torch_npu": torch_npu.__version__ if args.device == "npu" else None,
-        "triton": kernels.triton.__version__,
+        "triton": kernels._kernel_module().triton.__version__,
+        "kernel_rows_source": kernels._kernel_module().__file__,
+        "kernel_rows_sha256": hashlib.sha256(
+            Path(kernels._kernel_module().__file__).read_bytes()
+        ).hexdigest(),
         "row_metadata_source": str(SOURCE / "row_metadata.py"),
         "row_metadata_sha256": hashlib.sha256(
             (SOURCE / "row_metadata.py").read_bytes()
@@ -672,10 +681,12 @@ def prefill_mapping_device_case(kernels, plan, batch, current_valid, lens, width
         valid = torch.empty(n, device=device, dtype=torch.bool)
         host_mask = torch.empty(total, device=device, dtype=torch.bool)
         counts = torch.empty(capacity, device=device, dtype=torch.int32)
-        kernels._mapping_init_kernel[(kernels.triton.cdiv(max(capacity, total), 512),)](
-            counts, host_mask, capacity, total, 512
-        )
-        kernels._mapping_count_kernel[(kernels.triton.cdiv(n, 32),)](
+        kernels._kernel_module()._mapping_init_kernel[
+            (kernels._kernel_module().triton.cdiv(max(capacity, total), 512),)
+        ](counts, host_mask, capacity, total, 512)
+        kernels._kernel_module()._mapping_count_kernel[
+            (kernels._kernel_module().triton.cdiv(n, 32),)
+        ](
             metadata,
             batch.out_cache_loc,
             current_valid,
@@ -686,10 +697,12 @@ def prefill_mapping_device_case(kernels, plan, batch, current_valid, lens, width
             n,
             b,
             capacity,
-            kernels.triton.next_power_of_2(b),
+            kernels._kernel_module().triton.next_power_of_2(b),
             32,
         )
-        kernels._mapping_finish_kernel[(kernels.triton.cdiv(n, 32),)](
+        kernels._kernel_module()._mapping_finish_kernel[
+            (kernels._kernel_module().triton.cdiv(n, 32),)
+        ](
             plan.source,
             batch.out_cache_loc,
             counts,
