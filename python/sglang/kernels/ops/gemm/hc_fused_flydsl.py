@@ -434,7 +434,11 @@ def hc_fused_mix(h, weights: HcFusedWeights, sumsq=None):
         sumsq = torch.empty((m, _SPLIT_K), device=dev, dtype=f32)
         np_, ss_out = _SPLIT_K // _HC, True
     else:
-        assert sumsq.shape == (m, k // _INJECT_BLOCK) and sumsq.dtype == f32
+        if sumsq.shape != (m, k // _INJECT_BLOCK) or sumsq.dtype != f32:
+            raise ValueError(
+                f"sumsq must be FP32 [{m}, {k // _INJECT_BLOCK}], "
+                f"got {sumsq.dtype} {list(sumsq.shape)}"
+            )
         np_, ss_out = sumsq.shape[1] // _HC, False
     _launch(
         h, weights.down, weights.up, weights.w1, p, sumsq, t, g, sc, out,
