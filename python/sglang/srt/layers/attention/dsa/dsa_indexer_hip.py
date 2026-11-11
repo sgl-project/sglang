@@ -431,14 +431,23 @@ def fp4_dcp_gather_index_k(
 def fp4_logits_plans(metadata) -> Optional[dict]:
     """The FP4 prefill logits schedules of an eager batch: every layer scores the same
     row chunks over the same key table, so the first keeps them (and their host read
-    of ks) for the rest. None under graph capture."""
+    of ks) for the rest, on the batch's DSAMetadata outside its fields (a replace()
+    copy starts empty). None under graph capture."""
+    from sglang.srt.layers.attention.dsa_backend import DSAMetadata
     from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
         is_in_breakable_cuda_graph,
     )
 
     if torch.cuda.is_current_stream_capturing() or is_in_breakable_cuda_graph():
         return None
-    return getattr(metadata.attn_metadata, "fp4_logits_plans", None)
+    attn_metadata = metadata.attn_metadata
+    if not isinstance(attn_metadata, DSAMetadata):
+        return None
+    plans = attn_metadata.__dict__.get("_fp4_logits_plans")
+    if plans is None:
+        plans = {}
+        object.__setattr__(attn_metadata, "_fp4_logits_plans", plans)  # frozen
+    return plans
 
 
 def fp4_prefill_q(indexer, query: torch.Tensor, x):

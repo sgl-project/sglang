@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Dict,
@@ -444,11 +444,6 @@ class DSAMetadata:
     pooled_topk_v2_plan: Optional[torch.Tensor] = None
     kpool_extend_plan: Optional[KPoolExtendPlan] = None
     kpool_write_plan: Optional[KPoolWritePlan] = None
-    # the FP4 indexer's prefill logits schedules, built by the first layer for the rest;
-    # not an init field, so a replace() copy starts empty
-    fp4_logits_plans: dict = field(
-        default_factory=dict, init=False, repr=False, compare=False
-    )
 
 
 @torch.compile
