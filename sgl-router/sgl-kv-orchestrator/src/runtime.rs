@@ -994,8 +994,7 @@ impl Actor {
                 },
             },
             "prefix" => {
-                let prefix: PrefixTarget =
-                    serde_json::from_value(target.clone()).map_err(|e| e.to_string())?;
+                let prefix = PrefixTarget::deserialize(target).map_err(|e| e.to_string())?;
                 // Reuse P1 structural/dependency validation before creating state.
                 let action = Action {
                     action_id: "validate".into(),
@@ -1434,9 +1433,10 @@ impl Actor {
                 action_id: "transfer".into(),
                 action_type: action.into(),
                 action_version: "1.0".into(),
-                payload: payload.clone(),
+                payload,
             };
             parse_action(&parsed).map_err(|e| format!("{e:?}"))?;
+            let payload = parsed.payload;
             // Share the live job for this spec, never a released job's receipt.
             // A fresh job gets its own Engine message identity, even while a
             // previous task still holds an unacknowledged receipt.

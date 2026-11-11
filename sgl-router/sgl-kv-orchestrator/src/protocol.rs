@@ -181,8 +181,7 @@ fn validate_target(target: &Value) -> Result<(), Error> {
         return Err(Error::InvalidPayload);
     }
     if target["kind"] == "prefix" {
-        let p: PrefixTarget =
-            serde_json::from_value(target.clone()).map_err(|_| Error::InvalidPayload)?;
+        let p = PrefixTarget::deserialize(target).map_err(|_| Error::InvalidPayload)?;
         let c = &p.compatibility;
         if c.components.iter().collect::<HashSet<_>>().len() != c.components.len()
             || p.start_token % c.page_size != 0
