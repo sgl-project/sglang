@@ -533,20 +533,13 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
-        # Resume only tags that are currently offloaded. A repeated resume, or a
-        # resume of a tag that was never released, is a no-op rather than a
-        # KeyError that would take the scheduler down.
-        pending = list(dict.fromkeys(tag for tag in tags if tag in self.offload_tags))
-        for tag in pending:
+        for tag in tags:
             self.offload_tags.remove(tag)
 
-        if not pending:
-            return ResumeMemoryOccupationReqOutput()
-
-        if GPU_MEMORY_TYPE_CUDA_GRAPH in pending:
+        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
-        if GPU_MEMORY_TYPE_WEIGHTS in pending:
+        if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("resume_memory_occupation")
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             torch.distributed.barrier(self.tp_cpu_group)
@@ -556,7 +549,7 @@ class SchedulerWeightUpdaterManager:
             )
             del self.stashed_model_static_state
 
-        if GPU_MEMORY_TYPE_KV_CACHE in pending:
+        if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
             scheduler = self.scheduler
             if scheduler is not None:
@@ -568,10 +561,6 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.resume_memory_occupation()
-
-        # Mirror release(): a resumed engine must be idle before the caller
-        # starts the next round of work on the same device.
-        torch.get_device_module().synchronize()
 
         return ResumeMemoryOccupationReqOutput()
 

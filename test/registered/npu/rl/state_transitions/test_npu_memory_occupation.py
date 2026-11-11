@@ -8,8 +8,6 @@ and that a resumed engine still produces the same output.
 import os
 import unittest
 
-import requests
-
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ascend.test_npu_rl_utils import (
     checkpoint_weight_bytes,
@@ -67,11 +65,6 @@ class TestNpuMemoryOccupation(CustomTestCase):
     def tearDownClass(cls):
         cls._server.__exit__(None, None, None)
 
-    def setUp(self):
-        # Failure recovery for the shared server: a failed case may leave a
-        # tag offloaded, and resume is idempotent.
-        resume_memory(self.base_url, ["weights", "kv_cache"])
-
     def test_01_release_weights_frees_memory(self):
         generate(self.base_url, PROMPTS[0])
         before = npu_free_bytes()
@@ -109,22 +102,6 @@ class TestNpuMemoryOccupation(CustomTestCase):
         actual = generation_signature(self.base_url, PROMPTS)
         self.assertEqual(actual, golden, "staged resume changed the output")
 
-    def test_resume_twice_keeps_server_healthy(self):
-        golden = generation_signature(self.base_url, PROMPTS)
-
-        release_memory(self.base_url, ["weights", "kv_cache"])
-        resume_memory(self.base_url, ["weights", "kv_cache"])
-        second = requests.post(
-            self.base_url + "/resume_memory_occupation",
-            json={"tags": ["weights", "kv_cache"]},
-            timeout=120,
-        )
-
-        self.assertEqual(second.status_code, 200, second.text)
-        self.assertTrue(health(self.base_url))
-        actual = generation_signature(self.base_url, PROMPTS)
-        self.assertEqual(actual, golden, "double resume changed the output")
-
 
 @unittest.skipUnless(npu_available(), "requires an Ascend NPU")
 @unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
@@ -134,19 +111,6 @@ class TestNpuMemoryOccupationFreshServer(CustomTestCase):
         # cover repeated cycles, but not the first release on a clean allocator.
         with npu_server(MODEL, extra_args=MEMORY_ARGS, env=npu_rl_env()) as base_url:
             golden = generation_signature(base_url, PROMPTS)
-
-            # Nothing has been released yet: resume must be a 200 no-op.
-            fresh_resume = requests.post(
-                base_url + "/resume_memory_occupation",
-                json={"tags": ["weights"]},
-                timeout=120,
-            )
-            self.assertEqual(fresh_resume.status_code, 200, fresh_resume.text)
-            self.assertEqual(
-                generation_signature(base_url, PROMPTS),
-                golden,
-                "fresh-server resume changed the output",
-            )
 
             release_memory(base_url, ["weights", "kv_cache"])
             resume_memory(base_url, ["weights", "kv_cache"])
