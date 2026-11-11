@@ -32,7 +32,7 @@ def _jit_tp_module(apply_clamp: bool, block_n: int) -> Module:
         "silu_and_mul_post_quant_mxfp4",
         str(block_n),
         clamp_str,
-        cuda_files=["elementwise/silu_and_mul_post_quant_mxfp4.cuh"],
+        cuda_files=["sail/silu_and_mul_post_quant_mxfp4.cuh"],
         cuda_wrappers=[
             ("run", f"SiluMulMxfp4TP<{block_n},{clamp_str}>::run"),
         ],
@@ -93,7 +93,7 @@ def _jit_fp8_module(apply_clamp: bool, apply_gemm1_alpha: bool) -> Module:
         "silu_and_mul_post_per_token_quant_fp8",
         clamp_str,
         alpha_str,
-        cuda_files=["elementwise/silu_and_mul_post_per_token_quant_fp8.cuh"],
+        cuda_files=["sail/silu_and_mul_post_per_token_quant_fp8.cuh"],
         cuda_wrappers=[
             (
                 "run",
@@ -156,7 +156,7 @@ def _jit_ep_module(apply_clamp: bool) -> Module:
     return load_jit(
         "silu_and_mul_masked_post_quant_mxfp4",
         clamp_str,
-        cuda_files=["elementwise/silu_and_mul_masked_post_quant_mxfp4.cuh"],
+        cuda_files=["sail/silu_and_mul_masked_post_quant_mxfp4.cuh"],
         cuda_wrappers=[
             ("run", f"SiluMulMxfp4EP<{_EP_BLOCK_N},{clamp_str}>::run"),
         ],
@@ -218,7 +218,7 @@ def _jit_fp8_masked_module(
         clamp_str,
         alpha_str,
         ue8m0_str,
-        cuda_files=["elementwise/silu_and_mul_masked_post_per_token_quant_fp8.cuh"],
+        cuda_files=["sail/silu_and_mul_masked_post_per_token_quant_fp8.cuh"],
         cuda_wrappers=[
             (
                 "run",
