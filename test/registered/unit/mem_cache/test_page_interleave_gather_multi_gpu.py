@@ -60,6 +60,7 @@ from sglang.srt.distributed import (
     initialize_model_parallel,
 )
 from sglang.srt.distributed.device_communicators.multicast_all_gather import (
+    _multicast_address,
     has_multicast_support,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -825,42 +826,73 @@ def _run_unmapped_rank_mla(rank, world, port, unmapped_call):
     assert any("nccl" in name.lower() for name in activity), activity
 
 
+def _probe_multicast_mapping(rank, world, port, availability):
+    from torch.distributed import _symmetric_memory as symm_mem
+
+    _dist_init(rank, world, port, attn_cp_size=1)
+    group = get_parallel().attn_tp_group.cpu_group
+    errors, buffers, handles = [], [], []
+    # Probe both mappings independently of the pool's gather selection. The
+    # driver can advertise multicast while cuMulticastBindMem still fails.
+    for name, nbytes in (("output", 4096), ("control", 128)):
+        buf = symm_mem.empty(nbytes, dtype=torch.uint8, device=f"cuda:{rank}")
+        handle = symm_mem.rendezvous(buf, group.group_name)
+        buffers.append(buf)
+        handles.append(handle)
+        try:
+            _multicast_address(buf, handle, rank, world)
+        except ValueError as error:
+            errors.append(f"{name}: {error}")
+    # Keep both allocations and handles alive until every rank has checked.
+    torch.distributed.barrier(group=group)
+    availability.put((rank, errors))
+
+
 @unittest.skipIf(
     torch.cuda.device_count() < 2 or not has_multicast_support(torch.device("cuda", 0)),
     "the multicast gather needs 2 CUDA devices with multicast",
 )
 class TestPageInterleaveMulticastGather(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        availability = mp.get_context("spawn").SimpleQueue()
+        try:
+            cls._spawn(_probe_multicast_mapping, 29821, availability)
+            results = [availability.get() for _ in range(_GATHER_WORLD)]
+        finally:
+            availability.close()
+        errors = [
+            f"rank {rank}: {', '.join(errors)}"
+            for rank, errors in sorted(results)
+            if errors
+        ]
+        if errors:
+            raise unittest.SkipTest(
+                "CUDA multicast mapping unavailable: " + "; ".join(errors)
+            )
+
+    @staticmethod
+    def _spawn(target, port, *args):
+        with envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True):
+            mp.spawn(
+                target,
+                args=(_GATHER_WORLD, port, *args),
+                nprocs=_GATHER_WORLD,
+                join=True,
+            )
+
     def test_gather_issues_no_nccl_kernels(self):
-        mp.spawn(
-            _run_multicast_mla,
-            args=(_GATHER_WORLD, 29817),
-            nprocs=_GATHER_WORLD,
-            join=True,
-        )
+        self._spawn(_run_multicast_mla, 29817)
 
     def test_cross_node_group_keeps_nccl_gather(self):
-        mp.spawn(
-            _run_cross_node_mla,
-            args=(_GATHER_WORLD, 29818),
-            nprocs=_GATHER_WORLD,
-            join=True,
-        )
+        self._spawn(_run_cross_node_mla, 29818)
 
     def test_rank_without_scratch_mapping_moves_every_rank_to_nccl(self):
-        mp.spawn(
-            _run_unmapped_rank_mla,
-            args=(_GATHER_WORLD, 29819, 0),
-            nprocs=_GATHER_WORLD,
-            join=True,
-        )
+        self._spawn(_run_unmapped_rank_mla, 29819, 0)
 
     def test_rank_without_control_mapping_moves_every_rank_to_nccl(self):
-        mp.spawn(
-            _run_unmapped_rank_mla,
-            args=(_GATHER_WORLD, 29820, 1),
-            nprocs=_GATHER_WORLD,
-            join=True,
-        )
+        self._spawn(_run_unmapped_rank_mla, 29820, 1)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA device")
