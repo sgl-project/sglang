@@ -32,6 +32,7 @@ class _SwaCache(RadixCache):
                 "page_size",
                 "storage",
                 "window_pool_names",
+                "target_window_pool",
                 "get_kvcache",
             ]
         )
@@ -40,6 +41,7 @@ class _SwaCache(RadixCache):
         allocator.storage = None
         # A static window pool keeping the 128-token window.
         allocator.window_pool_names = lambda: ("swa",)
+        allocator.target_window_pool = lambda: "swa"
         allocator.get_kvcache = lambda: SimpleNamespace(request_window=None)
         kv_storage_of(self.req_to_token_pool, allocator).bind_window_retention(
             128, None
@@ -125,7 +127,7 @@ class TestSWAEvictionInterval(unittest.TestCase):
         )
         free = cache.token_to_kv_pool_allocator.free_swa_segment
         with (
-            patch("sglang.srt.managers.schedule_batch._is_hip", True),
+            patch("sglang.srt.utils.is_hip", return_value=True),
             get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
             envs.SGLANG_SWA_EVICTION_INTERVAL.override(128),
             envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
@@ -138,6 +140,39 @@ class TestSWAEvictionInterval(unittest.TestCase):
         free.assert_called_once()
         self.assertTrue(torch.equal(free.call_args.args[0], torch.arange(64)))
         self.assertEqual(req.kv.get_evicted_seqlen("swa"), 64)
+
+
+class TestForwardCadenceRetirementIsPriced(unittest.TestCase):
+    def test_the_demand_keeps_every_commit_between_retirements(self):
+        """With window rows retired every interval forwards (Aiter MegaMoE on
+        ROCm), the demand keeps every row committed between retirements."""
+        from sglang.srt.mem_cache.kv.alloc.demand import window_retirement
+        from sglang.srt.runtime_context import get_context
+
+        cases = (
+            (None, None, True, 128),
+            ("EAGLE", 4, True, 512),
+            (None, None, False, 128),
+        )
+        for algorithm, draft_tokens, megamoe, rows in cases:
+            with self.subTest(algorithm=algorithm, megamoe=megamoe):
+                with (
+                    patch("sglang.srt.utils.is_hip", return_value=megamoe),
+                    get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+                    envs.SGLANG_SWA_EVICTION_INTERVAL.override(128),
+                    get_context().override_server_args(
+                        speculative_algorithm=algorithm,
+                        speculative_num_draft_tokens=draft_tokens,
+                    ),
+                    # The rows a decode step allocates ahead (its own term).
+                    patch(
+                        "sglang.srt.mem_cache.allocation_sizing."
+                        "get_alloc_reserve_per_decode",
+                        return_value=4,
+                    ),
+                ):
+                    retirement = window_retirement(shares_prefixes=False)
+                self.assertEqual(retirement.eviction_interval, rows)
 
 
 if __name__ == "__main__":

@@ -46,10 +46,13 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    check_stage_state_wires,
+    check_state_wire,
     filter_kv_indices_for_cp_rank,
     filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
     get_spec_kv_layout,
+    state_wire,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
@@ -133,6 +136,11 @@ class PrefillServerInfo:
     dsv41_spec_layout: Optional[dict] = None
     spec_kv_layout: Optional[dict] = None
     kv_layout: Optional[str] = None
+    # The (state type, sub-pool, window tail) entries every prefill rank registers;
+    # None when pipeline stages register different ones or ranks do not report them.
+    state_wire: Optional[List[List[Optional[str]]]] = None
+    # Each pipeline stage's entries, by stage, when the stages differ.
+    state_wires: Optional[List[Optional[List[List[Optional[str]]]]]] = None
     decode_allocation_policy: str = "early"
     # Each prefill shard-group rank owns a subset of logical KV pages.
     enable_kv_cache_sharding: bool = False
@@ -1385,6 +1393,26 @@ class CommonKVManager(BaseKVManager):
                 f"PD retract rebootstrap /generate request errored for rid={rid}.",
             )
 
+    def _check_prefill_state_entries(self, info: PrefillServerInfo) -> None:
+        """Refuse a prefill whose state entries cannot pair with this server's:
+        its own stage when the stage counts match, else every prefill stage."""
+        decode_wire = state_wire(self.kv_args)
+        if info.state_wire is not None or not info.state_wires:
+            check_state_wire(info.state_wire, decode_wire)
+            return
+        wires = info.state_wires
+        if info.pp_size == self.pp_size:
+            if self.pp_rank < len(wires):
+                check_state_wire(wires[self.pp_rank], decode_wire)
+            return
+        check_stage_state_wires(
+            [
+                wires[stage] if stage < len(wires) else None
+                for stage in range(info.pp_size)
+            ],
+            decode_wire,
+        )
+
     def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
         """Single non-blocking attempt to fetch and cache prefill parallel info.
         Returns True if info is available (cached or freshly fetched)."""
@@ -1454,6 +1482,8 @@ class CommonKVManager(BaseKVManager):
                 f"but decode server has kv_layout={self.kv_layout}. Both servers "
                 f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
             )
+
+        self._check_prefill_state_entries(info)
 
         local_layout = self.dsv41_spec_layout
         if local_layout is not None or info.dsv41_spec_layout is not None:
@@ -1725,6 +1755,11 @@ class CommonKVManager(BaseKVManager):
         payload["decode_allocation_policy"] = (
             get_disagg().disaggregation_decode_allocation_policy
         )
+        # Only a peer with state entries states them, so a payload without any
+        # is the one a peer that predates them sends.
+        wire = state_wire(self.kv_args)
+        if wire:
+            payload["state_wire"] = wire
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
             topology_rows = get_parallel().world_group.all_gather_object(payload)
@@ -3162,6 +3197,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_layout: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
         self.spec_kv_layout: Optional[dict] = None
+        self.state_wire_by_stage: Dict[int, Optional[list]] = {}
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
@@ -3220,6 +3256,23 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 text="Method not allowed", status=405, content_type="application/json"
             )
 
+    def _state_wire(self) -> Optional[list]:
+        """The state entries every pipeline stage registers alike, if so."""
+        wires = list(self.state_wire_by_stage.values())
+        if wires and all(w == wires[0] for w in wires):
+            return wires[0]
+        return None
+
+    def _state_wires(self) -> Optional[list]:
+        """Each stage's state entries, by stage, when the stages differ; None
+        when no stage registers any."""
+        if not any(self.state_wire_by_stage.values()) or self._state_wire() is not None:
+            return None
+        return [
+            self.state_wire_by_stage.get(stage)
+            for stage in range(max(self.state_wire_by_stage) + 1)
+        ]
+
     async def _handle_route_put(self, request: web.Request):
         data = await request.json()
         attn_tp_size = data["attn_tp_size"]
@@ -3263,6 +3316,16 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if self.spec_kv_layout is None:
             self.spec_kv_layout = spec_kv_layout
         self.decode_allocation_policy = policy
+        rank_state_wire = data.get("state_wire")
+        if (
+            pp_rank in self.state_wire_by_stage
+            and self.state_wire_by_stage[pp_rank] != rank_state_wire
+        ):
+            return web.Response(
+                text="PD state entries differ across the ranks of one pipeline stage",
+                status=400,
+            )
+        self.state_wire_by_stage[pp_rank] = rank_state_wire
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -3368,6 +3431,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 kv_layout=self.kv_layout,
                 dsv41_spec_layout=self.dsv41_spec_layout,
                 spec_kv_layout=self.spec_kv_layout,
+                state_wire=self._state_wire(),
+                state_wires=self._state_wires(),
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
@@ -3386,6 +3451,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 payload.pop("spec_kv_layout")
             if info.kv_layout is None:
                 payload.pop("kv_layout")
+            # No state entries are stated as none, as a server that predates
+            # them answers, so an older decode reads a dense prefill's answer.
+            if not info.state_wire:
+                payload.pop("state_wire")
+            if not info.state_wires:
+                payload.pop("state_wires")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():

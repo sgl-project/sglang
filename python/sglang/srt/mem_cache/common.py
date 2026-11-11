@@ -187,6 +187,7 @@ def match_kv_cache(
     token_ids: Optional[array] = None,
     *,
     cow_mamba: bool = False,
+    defer_cow_slot: bool = False,
     max_prefix_len: Optional[int] = None,
 ) -> MatchResult:
     """Match token_ids against tree_cache and adopt the hit as req's prefix."""
@@ -197,6 +198,7 @@ def match_kv_cache(
         MatchPrefixParams(
             key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
             cow_mamba=cow_mamba,
+            defer_cow_slot=defer_cow_slot,
             req=req,
         )
     )
@@ -246,8 +248,10 @@ def evict_from_tree_cache(
     tree_cache: BasePrefixCache | None, num_tokens: int
 ) -> bool | None:
     if tree_cache is not None and tree_cache.supports_prefix_sharing():
-        return tree_cache.token_to_kv_pool_allocator.evict_to_free_tokens(
-            tree_cache, num_tokens
+        from sglang.srt.mem_cache.capacity import evict_to_free_tokens
+
+        return evict_to_free_tokens(
+            tree_cache, tree_cache.token_to_kv_pool_allocator, num_tokens
         )
 
 

@@ -83,7 +83,9 @@ def _scheduler(cache, allocator, pool):
     scheduler.kv_checksum_computer = None
     scheduler.disagg_metadata_buffers = SimpleNamespace(set_buf=lambda req: None)
     scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
-        kv_manager=SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        kv_manager=SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=[], state_sub_pools=[])
+        )
     )
     scheduler.disagg_prefill_pending_chunk_rids = set()
     return scheduler

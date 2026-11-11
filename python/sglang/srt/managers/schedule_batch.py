@@ -13,7 +13,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.utils.common import ceil_align, flatten_arrays_to_pinned_cpu
-from sglang.srt.utils.device import async_h2d, is_hip, is_pin_memory_available
+from sglang.srt.utils.device import async_h2d, is_pin_memory_available
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpans,
@@ -123,12 +123,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     TreeLock,
 )
+from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     evict_from_tree_cache,
     match_kv_cache,
 )
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
+from sglang.srt.mem_cache.kv.alloc.demand import windows_retire_by_forward
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
@@ -158,6 +160,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
+    from sglang.srt.managers.scheduler_components.request_list import ReqList
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
     )
@@ -168,8 +171,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
-
-_is_hip = is_hip()
 
 
 def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
@@ -429,6 +430,9 @@ class ReqKvInfo:
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
+    # The scheduler list holding the request; `ReqList` keeps it.
+    owner_list: Optional[ReqList] = None
+
     def __init__(
         self,
         rid: str,
@@ -542,12 +546,14 @@ class Req(ReqDllmMixin):
         self._think_end_match_len = 0
         self._think_start_match_len = 0
 
+        # The request clips its limits in place; the incoming params stay as
+        # received, since pipeline stages relay them onward.
+        sampling_params = copy.copy(sampling_params)
         # Only custom logit processors read "__req__", and the reference is weak
         # so the request still dies by refcount.
         if custom_logit_processor is not None and isinstance(
             sampling_params.custom_params, dict
         ):
-            sampling_params = copy.copy(sampling_params)
             sampling_params.custom_params = sampling_params.custom_params | {
                 "__req__": weakref.proxy(self)
             }
@@ -1139,6 +1145,8 @@ class Req(ReqDllmMixin):
         self,
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
+        *,
+        defer_cow_slot: bool = False,
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
@@ -1182,6 +1190,7 @@ class Req(ReqDllmMixin):
                 tree_cache,
                 token_ids_to_match,
                 cow_mamba=cow_mamba,
+                defer_cow_slot=defer_cow_slot,
                 max_prefix_len=key_limit,
             )
             self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
@@ -1507,7 +1516,6 @@ class Req(ReqDllmMixin):
         self.lock = None
         self.swa_branching_seqlen = None
         self.extend_end = None
-        self.dllm_initialized = False
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
@@ -1532,6 +1540,8 @@ class Req(ReqDllmMixin):
             self.weight_version_events = truncate_weight_version_events(
                 self.weight_version_events, num_kept_tokens=self.send_token_offset
             )
+        # Reads output_ids, which input_embeds discards above.
+        self.reset_dllm_progress()
 
     def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
         if allocator.cpu_copy_carries_mamba:
@@ -2923,6 +2933,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
         return total
 
+    @capacity_decision
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         """Whether the next decode step fits in the KV pool. The ALLOCATOR owns
         the capacity gate (eviction + any per-step reservations of its own) —
@@ -2935,13 +2946,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if selected_indices is None
             else [self.reqs[i] for i in selected_indices]
         )
-        return self.token_to_kv_pool_allocator.check_decode_capacity(
+        from sglang.srt.mem_cache.capacity import check_decode_capacity
+
+        return check_decode_capacity(
+            self.tree_cache,
+            self.token_to_kv_pool_allocator,
             num_tokens=num_tokens,
-            tree_cache=self.tree_cache,
             requests=requests,
             spec_algorithm=self.spec_algorithm,
         )
 
+    @capacity_decision
     def retract_decode(
         self, request_retirer: RequestRetirer
     ) -> Tuple[List[Req], float, List[Req]]:
@@ -3554,12 +3569,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         per-request token gating synchronizes SWA pressure across DP ranks and
         triggers a retraction / re-prefill storm at high concurrency.
         """
-        if _is_hip:
-            from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
-            if get_moe_a2a_backend().is_megamoe():
-                due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
-                return (lambda req: due_this_forward), 1
+        if windows_retire_by_forward():
+            due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
+            return (lambda req: due_this_forward), 1
         windows = self.tree_cache.window_lengths()
         return (
             lambda req: any(

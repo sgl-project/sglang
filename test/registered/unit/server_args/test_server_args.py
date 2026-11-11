@@ -1127,6 +1127,40 @@ class TestTokenspeedMlaAlias(CustomTestCase):
         )
 
 
+class TestFlashinferMoeA2AAlias(CustomTestCase):
+    def test_maps_to_flashinfer_nvlink_one_sided(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="flashinfer",
+            speculative_moe_a2a_backend="flashinfer",
+        )
+
+        with self.assertLogs(serving_hook.logger, level="WARNING") as cm:
+            handle_deprecated_args(server_args)
+
+        for field in ("moe_a2a_backend", "speculative_moe_a2a_backend"):
+            self.assertEqual(
+                resolution_result(server_args, field), "flashinfer_nvlink_one_sided"
+            )
+            flag = "--" + field.replace("_", "-")
+            self.assertTrue(
+                any(f"{flag}=flashinfer is deprecated" in line for line in cm.output)
+            )
+
+    def test_canonical_name_is_unchanged(self):
+        server_args = ServerArgs(
+            model_path="dummy", moe_a2a_backend="flashinfer_nvlink_one_sided"
+        )
+
+        handle_deprecated_args(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "moe_a2a_backend"),
+            "flashinfer_nvlink_one_sided",
+        )
+        self.assertIsNone(resolution_result(server_args, "speculative_moe_a2a_backend"))
+
+
 class TestMultimodalFeatureTransport(CustomTestCase):
     @staticmethod
     def _set_model_type(server_args, *, is_multimodal):
@@ -2258,7 +2292,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             quantization=quantization,
-            moe_a2a_backend="flashinfer",
+            moe_a2a_backend="flashinfer_nvlink_one_sided",
             moe_runner_backend=runner_backend,
             flashinfer_a2a_dispatch_type=dispatch_type,
             attn_dp_size=4,
@@ -3434,6 +3468,7 @@ class TestPipelineParallelCompat(CustomTestCase):
             enable_multi_layer_eagle=False,
             disaggregation_mode="prefill",
             min_free_slots_delay=None,
+            scheduler_recv_interval=1,
         )
         cfg.update(overrides)
         return SimpleNamespace(**cfg)
@@ -3441,6 +3476,10 @@ class TestPipelineParallelCompat(CustomTestCase):
     def test_overlap_schedule_must_be_off(self):
         with self.assertRaisesRegex(AssertionError, "overlap schedule"):
             check_pipeline_parallel_compat(self._cfg(disable_overlap_schedule=False))
+
+    def test_scheduler_recv_interval_must_be_one(self):
+        with self.assertRaisesRegex(AssertionError, "--scheduler-recv-interval"):
+            check_pipeline_parallel_compat(self._cfg(scheduler_recv_interval=2))
 
     def test_no_speculative_decoding_is_fine(self):
         check_pipeline_parallel_compat(self._cfg())
