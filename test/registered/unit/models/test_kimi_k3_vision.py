@@ -650,8 +650,9 @@ def test_kimi_k3_rejects_frame_budget_before_vision_dp_collectives(tp_rank):
     from unittest.mock import Mock
 
     from sglang.srt.environ import envs
-    from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.managers.req_types import MultimodalDataItem
     from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+    from sglang.srt.multimodal.modality import Modality
 
     model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
     torch.nn.Module.__init__(model)

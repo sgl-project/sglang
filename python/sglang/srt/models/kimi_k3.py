@@ -8,7 +8,6 @@
 
 import logging
 import math
-import os
 import re
 from array import array
 from collections.abc import Iterable

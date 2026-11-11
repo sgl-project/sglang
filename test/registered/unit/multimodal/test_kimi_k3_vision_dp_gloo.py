@@ -63,8 +63,9 @@ def _run_vision_rank(rank, init_file):
     # Keep optional CUDA kernels out of a test that only runs CPU control flow.
     maybe_stub_sgl_kernel()
     from sglang.srt.environ import envs
-    from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.managers.req_types import MultimodalDataItem
     from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+    from sglang.srt.multimodal.modality import Modality
     from sglang.srt.runtime_context import get_parallel
 
     dist.init_process_group(
