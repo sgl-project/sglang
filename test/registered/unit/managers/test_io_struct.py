@@ -464,6 +464,25 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                         )
                         self.assertEqual(params, original)
 
+    def test_parent_session_id_reaches_every_batch_item(self):
+        """A sub-agent's parent session (a cache-residency hint) rides each item of a
+        batch like session_id, and the tokenized request defaults it to None."""
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            session_id="child",
+            parent_session_id="parent",
+        )
+        req.normalize_batch_and_arguments()
+        for i in range(2):
+            self.assertEqual(req[i].session_id, "child")
+            self.assertEqual(req[i].parent_session_id, "parent")
+        self.assertIsNone(GenerateReqInput(text="Hi").parent_session_id)
+        fields = TokenizedGenerateReqInput.__struct_fields__
+        defaults = TokenizedGenerateReqInput.__struct_defaults__
+        self.assertEqual(fields[-1], "parent_session_id")
+        self.assertIsNone(defaults[-1])
+
     def test_single_request_preserves_caller_sampling_params(self):
         """Reusing defaults after a per-request adjustment must keep the original budget."""
         params = {"max_new_tokens": 20}
