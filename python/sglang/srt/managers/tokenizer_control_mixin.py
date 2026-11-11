@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
 import msgspec
+from miles.backends.sglang_utils.gpu_delta import integration as gpu_delta
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.communicator import FanOutCommunicator
@@ -201,10 +202,7 @@ class TokenizerControlMixin:
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
 
-        from sglang.srt.weight_sync.gpu_delta import integration as gpu_delta
-
-        if gpu_delta is not None:
-            gpu_delta.init_tokenizer_control(self, get_parallel().num_dp_ranks)
+        gpu_delta.init_tokenizer_control(self, get_parallel().num_dp_ranks)
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (
@@ -222,10 +220,7 @@ class TokenizerControlMixin:
             getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
 
         self.get_internal_state_communicator.set_fan_out(control_fan_out)
-        from sglang.srt.weight_sync.gpu_delta import integration as gpu_delta
-
-        if gpu_delta is not None:
-            gpu_delta.update_tokenizer_fan_out(self, worker_count)
+        gpu_delta.update_tokenizer_fan_out(self, worker_count)
 
     async def add_external_corpus(
         self: TokenizerManager, obj: AddExternalCorpusReqInput
