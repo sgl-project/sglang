@@ -180,6 +180,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 if _is_hip:
+    from sglang.srt.models.kimi_k3_amd.attention import mono_output_gate_hip
     from sglang.srt.models.kimi_k3_amd.gemm import k3_bf16_gemm_hip, kda_f_b_gemm_hip
 
 # Kimi-K3.1 dense GEMMs routed to TGV for every caller of the shape: (n, k) ->
@@ -2512,7 +2513,6 @@ class KimiK3DeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        """The TP-local core output o_proj takes; a monokernel launch runs o_proj."""
         # Under interleave prefill CP the boundary hands the CP shards
         # gathered rank-major; the recurrence needs sequence order.
         gathered_rows = hidden_states.shape[0]
@@ -2818,12 +2818,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     def _compute_output_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
         alt = self._gate_pending_stream
         self._gate_pending_stream = None
-        pre = self.__dict__.get("_mono_pre")
+        pre = self.__dict__.get("_mono_pre") if _is_hip else None
         if pre is not None and "gate" in pre:
-            # g_proj(x) from a monokernel plugin's projection front
-            if alt is not None:
-                torch.cuda.current_stream().wait_stream(alt)
-            return pre["gate"]
+            return mono_output_gate_hip(pre, alt)
         if alt is None:
             return self.g_proj(hidden_states)[0]
         with torch.cuda.stream(alt):
