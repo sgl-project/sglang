@@ -7,6 +7,11 @@ from unittest.mock import MagicMock, patch
 import sglang
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.scheduler_components import request_retirer
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
@@ -115,6 +120,18 @@ class TestRelease(CustomTestCase):
         calls = []
         self._release(_req(FINISH_ABORT(), calls), calls, checkpoint=True, verb="abort")
         self.assertEqual(calls, ["output", "counts", "mm", "session", "beam", True])
+
+    def test_takes_the_request_out_of_its_list(self):
+        # A PD transfer or bootstrap failure ends a request still in its queue.
+        calls = []
+        req, other = _req(FINISH_ABORT(), calls), _req(None, calls)
+        queue = IndexedReqList(ListKind.PD_SENDING)
+        move([req, other], queue)
+
+        self._release(req, calls)
+
+        self.assertEqual(list(queue), [other])
+        self.assertIsNone(req.owner_list)
 
     def test_leaves_a_request_that_was_not_aborted_attached(self):
         calls = []
