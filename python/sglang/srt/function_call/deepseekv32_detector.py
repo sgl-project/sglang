@@ -3,6 +3,7 @@ import logging
 import re
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -259,22 +260,30 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
 
-        # Check if buffer contains any DSML markers or ends with potential tag prefix
-        # This handles partial/streaming DSML content
-        bar = self.dsml_token[0]
-        dsml_markers = [self.dsml_token, f"<{bar}", f"</{bar}"]
-        potentially_dsml = any(marker in current_text for marker in dsml_markers)
-
-        # Also check if text ends with start of a tag (to handle "<" arriving separately)
-        dsml_prefixes = ["<", f"<{bar}", "</", f"</{bar}"]
-        ends_with_prefix = any(
-            current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes
+        # A DSML tag can still be forming only while the buffer ends with a
+        # proper prefix of one of the structural tokens: a real tag's `<`
+        # always immediately precedes the marker, so a marker (or a `<`) that
+        # already sits inside prose cannot become a tag and must keep
+        # streaming instead of holding the rest of the reply hostage (#44941).
+        # Prose is only released before the first invoke: once a call has been
+        # seen (even a malformed or unknown one), the turn belongs to the
+        # calls block and everything after it fails closed, like one-shot.
+        structural_tokens = (
+            self.bot_token,
+            self.eot_token,
+            self.invoke_start_token,
+            self.invoke_end_token,
+        )
+        ends_with_partial_token = any(
+            current_text.endswith(token[:k])
+            for token in structural_tokens
+            for k in range(1, len(token))
         )
 
         if (
             not self.has_tool_call(current_text)
-            and not potentially_dsml
-            and not ends_with_prefix
+            and not ends_with_partial_token
+            and self.current_tool_id == -1
         ):
             # Trailing whitespace may be the blank line ahead of a DSML block;
             # hold it so it is trimmed with the preamble or dropped with the block.
@@ -283,12 +292,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 return StreamingParseResult()
             self._buffer = current_text[len(stripped) :]
             current_text = stripped
-            for e_token in [self.eot_token, self.invoke_end_token]:
-                if e_token in current_text:
-                    current_text = current_text.replace(e_token, "")
             return StreamingParseResult(normal_text=current_text)
 
         all_calls: list[ToolCallItem] = []
+        tool_indices = self._get_tool_indices(tools)
         # Only recovered for the first call: the DSML guard above never releases a
         # buffer that still holds a marker, so later prose stays buffered.
         preamble = ""
@@ -333,6 +340,20 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     current_text = self._buffer
                     continue
 
+                # Mirror parse_base_json: skip unknown tools unless configured
+                # to forward them, so the streaming and one-shot paths agree on
+                # the same completion (#44941).
+                if (
+                    func_name not in tool_indices
+                    and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+                ):
+                    logger.warning(
+                        f"Model attempted to call undefined function: {func_name}"
+                    )
+                    self._buffer = current_text[invoke_match.end() :]
+                    current_text = self._buffer
+                    continue
+
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
                     self.prev_tool_call_arr.append({})
@@ -369,6 +390,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
             self._buffer = ""
             if self.current_tool_id == -1:
                 preamble = self._text_before_dsml(current_text)
+            elif not all_calls:
+                # No call was emitted before the error, so there is no calls
+                # block to stay fail-closed inside: return to prose mode so
+                # later deltas stream instead of being held until finish().
+                self.current_tool_id = -1
             return StreamingParseResult(normal_text=preamble, calls=all_calls)
 
     def finish(self, tools: list[Tool]) -> StreamingParseResult:
