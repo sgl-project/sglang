@@ -403,7 +403,10 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         "flux_2_t2i_customized_vae_path",
         DiffusionServerArgs(
             model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
-            extras=["--vae-path=fal/FLUX.2-Tiny-AutoEncoder"],
+            extras=[
+                "--vae-path=fal/FLUX.2-Tiny-AutoEncoder",
+                "--trust-remote-code",
+            ],
         ),
         T2I_sampling_params,
         run_perf_check=False,
