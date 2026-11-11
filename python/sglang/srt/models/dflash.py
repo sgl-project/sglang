@@ -1472,7 +1472,7 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
 # autotuner (the default lowering is chosen by shape alone).
 _RANK_IDENTICAL_COMPILE_OPTIONS = (
     {"max_autotune": False, "max_autotune_gemm": False}
-    if get_compiler_backend() == "inductor"
+    if is_hip() and get_compiler_backend() == "inductor"
     else None
 )
 
