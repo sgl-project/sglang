@@ -56,6 +56,26 @@ python3 -m sglang_simulator.simulation.sglang.launch_server \
 
 `OFFLINE` advances the simulator's logical clock without sleeping. `BLOCKING` also sleeps for predicted forward and cache-load latency, which is useful when a client must observe simulated wall-clock pacing.
 
+### Use an external harness
+
+An external harness can keep its normal process entry point and opt into the existing simulator hooks. Set the activation marker before Python starts:
+
+```bash
+export SGLANG_SIMULATOR_AUTO_ACTIVATE=1
+export SGLANG_SIMULATOR_CONFIG_PATH=tools/sglang-simulator/examples/sim_configs/replay.json
+export SGLANG_USE_CPU_ENGINE=1
+
+python3 -m dynamo.sglang \
+  --model-path tools/sglang-simulator/test/assets/qwen3-8b \
+  --load-format dummy \
+  --device cpu \
+  --attention-backend torch_native \
+  --sampling-backend pytorch \
+  --disable-cuda-graph
+```
+
+The marker installs simulator hooks before the harness imports SGLang and propagates activation to spawned scheduler and detokenizer workers. It does not apply the standalone launcher's defaults, so the harness must still provide its normal SGLang arguments, including dummy loading and CPU options when those are required.
+
 ## Send a workload
 
 In another terminal, export the same output directory and run the simulator-aware serving benchmark from the repository root:
