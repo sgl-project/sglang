@@ -28,6 +28,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -299,7 +300,6 @@ class TestAllocationIntegration(CustomTestCase):
         queue.transfer_queue = SimpleNamespace(
             queue=decode_queue(ListKind.PD_RECEIVING)
         )
-        queue.pending_reqs = []
         queue._num_published_destinations = 0
         queue.pp_size, queue.tp_rank = 1, 0
         queue.gloo_group = object()
@@ -381,9 +381,9 @@ class TestAllocationIntegration(CustomTestCase):
             patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
             patch("sglang.srt.disaggregation.prefill.release_kv_cache"),
         ):
-            launched.join([req])
+            move([req], launched)
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req, launched
+                scheduler, req
             )
             self.assertEqual(list(scheduler.waiting_queue), [req])
             self.assertEqual(list(launched), [])
@@ -398,10 +398,9 @@ class TestAllocationIntegration(CustomTestCase):
             with get_context().override_server_args(
                 disaggregation_decode_allocation_policy="early"
             ):
-                scheduler.waiting_queue.clear()
-                launched.join([req])
+                move([req], launched)
                 SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                    scheduler, req, launched
+                    scheduler, req
                 )
             self.assertEqual(list(scheduler.waiting_queue), [])
             self.assertEqual(list(launched), [])
@@ -426,6 +425,7 @@ class TestAllocationIntegration(CustomTestCase):
         self.addCleanup(override.restore)
 
         class _Req:
+            owner_list = None
             release_mm_inputs_on_abort = Req.release_mm_inputs_on_abort
 
         req = _Req()
@@ -452,13 +452,13 @@ class TestAllocationIntegration(CustomTestCase):
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
         )
-        scheduler.prefill_launched_reqs.join([req])
+        move([req], scheduler.prefill_launched_reqs)
         with (
             patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
             patch("sglang.srt.disaggregation.prefill.release_kv_cache"),
         ):
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req, scheduler.prefill_launched_reqs
+                scheduler, req
             )
 
         self.assertEqual(list(scheduler.waiting_queue), [req])
@@ -478,6 +478,7 @@ class TestAllocationIntegration(CustomTestCase):
                     override.install()
                     try:
                         req = Mock(
+                            owner_list=None,
                             finished_reason=None,
                             to_finish=None,
                             inflight_steps=inflight_steps,
@@ -492,7 +493,7 @@ class TestAllocationIntegration(CustomTestCase):
                                 ListKind.PREFILL_LAUNCHED
                             ),
                         )
-                        scheduler.chunked_reqs.join([req])
+                        move([req], scheduler.chunked_reqs)
                         scheduler.checkpoint_disagg_prefill = MethodType(
                             SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill,
                             scheduler,
@@ -514,7 +515,7 @@ class TestAllocationIntegration(CustomTestCase):
                             launched = scheduler.prefill_launched_reqs
                             self.assertEqual(
                                 scheduler.optimistic_release_and_requeue.call_args_list,
-                                [] if inflight_steps else [call(req, launched)],
+                                [] if inflight_steps else [call(req)],
                             )
                             self.assertEqual(list(launched), [req])
                     finally:
@@ -557,16 +558,14 @@ class TestAllocationIntegration(CustomTestCase):
             scheduler, batch, result
         )
 
-        scheduler.optimistic_release_and_requeue.assert_called_once_with(
-            req, scheduler.prefill_launched_reqs
-        )
+        scheduler.optimistic_release_and_requeue.assert_called_once_with(req)
 
     def inflight_scheduler(self, reqs):
         scheduler = SchedulerDisaggregationPrefillMixin()
         scheduler.tree_cache = Mock()
         scheduler.scheduler_stage_metrics = None
         scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
-        scheduler.disagg_prefill_transfer_queue.join(reqs)
+        move(reqs, scheduler.disagg_prefill_transfer_queue)
         scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = object()
         scheduler.output_streamer = Mock()
         scheduler.send_kv_chunk = Mock()
@@ -625,10 +624,11 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler = self.inflight_scheduler(reqs)
         pool = scheduler.req_to_token_pool = ReqToTokenPool(2, 2, "cpu", False)
         pool.alloc(reqs)
-        scheduler.waiting_queue = []
+        waiting = scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        # The requeue frees the request's slot and moves it to the waiting queue.
         scheduler.optimistic_release_and_requeue = Mock(
-            side_effect=lambda req, src: pool.free(req)
+            side_effect=lambda req: (pool.free(req), move([req], waiting, at=0))
         )
         with get_context().override_server_args(
             disaggregation_decode_allocation_policy="early"
@@ -636,15 +636,13 @@ class TestAllocationIntegration(CustomTestCase):
             scheduler.process_disagg_prefill_transfer_queue()
             self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), reqs)
 
-            scheduler.waiting_queue.append(object())
+            move([FakeReq(rid="waiting")], waiting)
             scheduler.process_disagg_prefill_transfer_queue()
             self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), reqs[1:])
             self.assertEqual(pool.available_size(), 1)
 
             scheduler.process_disagg_prefill_transfer_queue()
-            scheduler.optimistic_release_and_requeue.assert_called_once_with(
-                reqs[0], scheduler.disagg_prefill_transfer_queue
-            )
+            scheduler.optimistic_release_and_requeue.assert_called_once_with(reqs[0])
 
     def test_success_is_sent_once_after_all_sender_state_is_cleared(self):
         sender, receiver = self.sender(), self.receiver()
@@ -854,9 +852,11 @@ class TestAllocationIntegration(CustomTestCase):
                     )
                     self.assertEqual(
                         [event[0] for event in events.mock_calls],
-                        ["metadata", "recompute"]
-                        if policy == "early"
-                        else ["recompute", "metadata"],
+                        (
+                            ["metadata", "recompute"]
+                            if policy == "early"
+                            else ["recompute", "metadata"]
+                        ),
                     )
                     self.assertEqual(queue._num_published_destinations, 1)
                 finally:
@@ -865,7 +865,6 @@ class TestAllocationIntegration(CustomTestCase):
     def test_normal_bootstrap_keeps_room_without_dispatching_recompute(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._check_if_req_exceed_kv_capacity = Mock(return_value=False)
-        queue.pending_reqs = []
         req = SimpleNamespace(
             bootstrap_room=7,
             bootstrap_host="prefill",
@@ -893,7 +892,6 @@ class TestAllocationIntegration(CustomTestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._check_if_req_exceed_kv_capacity = Mock(return_value=False)
         queue.queue = []
-        queue.pending_reqs = []
         queue._create_receiver_and_enqueue = Mock()
         queue._init_receiver = Mock()
         req = SimpleNamespace(

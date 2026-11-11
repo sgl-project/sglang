@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import suppress
 from typing import (
     TYPE_CHECKING,
@@ -117,6 +118,19 @@ class DeviceCapability(NamedTuple):
         return self.major * 10 + self.minor
 
 
+# The MLP prefix of a plain `ignore` entry that names its layer.
+_LAYER_MLP_PREFIX = re.compile(r"^(?!re:)(.*\.layers\.\d+\.mlp)\.")
+# Layers probed for `ignore` entries that name none (regexes, bare suffixes).
+_FUSION_PROBE_LAYERS = 256
+_EXPERT_PROJS = ("gate_proj", "up_proj", "down_proj")
+_SHARED_EXPERT_NAMES = ("shared_experts", "shared_expert")
+_EXPERT_PROBE_TAILS = tuple(
+    f"mlp.{expert}.{proj}"
+    for expert in ("experts.0", *_SHARED_EXPERT_NAMES)
+    for proj in _EXPERT_PROJS
+)
+
+
 class CompressedTensorsConfig(QuantizationConfig):
     def __init__(
         self,
@@ -168,6 +182,48 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+    def can_fuse_shared_expert(self) -> bool:
+        """Whether shared experts can fuse into the routed-expert FusedMoE.
+
+        Not where `ignore` gives any projection of a layer's shared expert a
+        different precision from the same projection of its routed experts,
+        in either direction: fusion would load BF16 weights into quantized
+        expert buffers, or quantized weights into BF16 ones. Each projection
+        is resolved per MoE layer with should_ignore_layer, so names and
+        regexes match alike.
+        """
+        prefixes = set()
+        for name in self.ignore:
+            match = _LAYER_MLP_PREFIX.match(name)
+            if match is not None:
+                prefixes.add(match.group(1))
+            elif name.startswith("re:") or any(
+                f".{tail}".endswith(f".{name}") for tail in _EXPERT_PROBE_TAILS
+            ):
+                # Names no layer but may match expert modules: probe them all.
+                prefixes.update(
+                    f"model.layers.{i}.mlp" for i in range(_FUSION_PROBE_LAYERS)
+                )
+
+        def ignored(layer_name: str) -> bool:
+            return should_ignore_layer(
+                layer_name,
+                ignore=self.ignore,
+                fused_mapping=self.packed_modules_mapping,
+            )
+
+        for prefix in prefixes:
+            for proj in _EXPERT_PROJS:
+                routed = ignored(f"{prefix}.experts.0.{proj}")
+                # A model names its shared expert one way, so an ignored
+                # projection under either name counts as ignored.
+                shared = any(
+                    ignored(f"{prefix}.{name}.{proj}") for name in _SHARED_EXPERT_NAMES
+                )
+                if shared != routed:
+                    return False
+        return True
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         self.target_scheme_map = hf_to_sglang_mapper.apply_dict(self.target_scheme_map)
@@ -252,13 +308,12 @@ class CompressedTensorsConfig(QuantizationConfig):
 
             layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
             if layer.scheme is None:  # ignored layer
-                use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
                 use_flashinfer_trtllm_moe = (
                     get_moe_runner_backend().is_flashinfer_trtllm()
                 )
                 use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
                 return UnquantizedFusedMoEMethod(
-                    use_triton_kernels, use_flashinfer_trtllm_moe, use_deep_gemm
+                    use_flashinfer_trtllm_moe, use_deep_gemm
                 )
             return CompressedTensorsFusedMoEMethod(self)
         return None

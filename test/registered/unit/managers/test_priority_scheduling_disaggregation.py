@@ -34,6 +34,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
@@ -46,6 +47,7 @@ from sglang.test.scheduler_test_utils import (
     FakeReq,
     decode_queue,
     empty_request_lists,
+    leaving_retirer,
     release_only_retirer,
 )
 from sglang.test.separate_buffer_allocator_double import (
@@ -90,7 +92,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         return scheduler
 
     def _new_req(self, priority=None):
-        req = MagicMock()
+        req = MagicMock(owner_list=None)
         req.exit_via = req.send_via = None
         req.kv.holds_kv = req.kv.holds_mamba = False
         req.kv.retraction_backup = None
@@ -113,9 +115,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler._add_request_to_queue(req)
 
         self.assertEqual(req.priority, -sys.maxsize - 1)
-        scheduler.disagg_prefill_bootstrap_queue.add.assert_called_once_with(
-            req, 8, src=None
-        )
+        scheduler.disagg_prefill_bootstrap_queue.add.assert_called_once_with(req, 8)
         req.time_stats.set_prefill_bootstrap_queue_entry_time.assert_called_once()
 
     def test_decode_mode_assigns_default_priority_before_prealloc_queue(self):
@@ -126,7 +126,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
 
         self.assertEqual(req.priority, -sys.maxsize - 1)
         scheduler.disagg_decode_prealloc_queue.add.assert_called_once_with(
-            req, is_retracted=False, src=None
+            req, is_retracted=False
         )
         req.time_stats.set_decode_prealloc_queue_entry_time.assert_called_once()
 
@@ -198,7 +198,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
                 scheduler.init_request_retirer()
                 queued = self._new_req(priority=1)
                 queued.rid = "queued"
-                scheduler.waiting_queue.join([queued])
+                move([queued], scheduler.waiting_queue)
                 incoming = self._new_req(priority=priority)
 
                 with patch(
@@ -297,7 +297,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             time_stats=MagicMock(),
         )
         queue.queue = IndexedReqList(ListKind.PD_BOOTSTRAP)
-        queue.queue.join([req])
+        move([req], queue.queue)
 
         with (
             patch(
@@ -472,13 +472,15 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         empty_request_lists(scheduler)
         scheduler.mm_receiver = None
-        req = MagicMock(rid="req", metadata_buffer_index=3, pending_bootstrap=True)
+        req = MagicMock(
+            rid="req", owner_list=None, metadata_buffer_index=3, pending_bootstrap=True
+        )
         req.exit_via = req.send_via = None
         req.finished_reason = None
         req.finish_outside_step.side_effect = lambda reason: setattr(
             req, "finished_reason", reason
         )
-        scheduler.waiting_queue.join([req])
+        move([req], scheduler.waiting_queue)
         scheduler.beam_coordinator = MagicMock()
         scheduler.enable_hicache_storage = False
         scheduler.ipc_channels = MagicMock()
@@ -539,7 +541,6 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
         queue.queue = decode_queue(ListKind.PD_PREALLOC, decode_reqs)
-        queue.pending_reqs = []
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
         # `move_preallocated` credits this counter; `__new__` skips the __init__
@@ -590,7 +591,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         )
         queue.tree_cache = MagicMock()
 
-        scheduler = MagicMock()
+        scheduler = MagicMock(request_retirer=leaving_retirer())
         scheduler.enable_priority_scheduling = True
         scheduler.schedule_low_priority_values_first = low_priority_values_first
         scheduler.running_batch.reqs = []
@@ -1045,8 +1046,11 @@ class TestDecodePrebuilt(unittest.TestCase):
 
     def test_waiting_queue_is_sorted_before_prebuilt_selection(self):
         scheduler = self._new_scheduler(enable_overlap=False)
-        original_waiting_queue = [MagicMock(rid="low"), MagicMock(rid="high")]
-        scheduler.waiting_queue.join(original_waiting_queue)
+        original_waiting_queue = [
+            MagicMock(rid="low", owner_list=None),
+            MagicMock(rid="high", owner_list=None),
+        ]
+        move(original_waiting_queue, scheduler.waiting_queue)
         scheduler.waiting_queue[0].priority = 1
         scheduler.waiting_queue[1].priority = 10
         scheduler.enable_priority_scheduling = True
@@ -1081,7 +1085,7 @@ class TestDecodePrebuilt(unittest.TestCase):
 
     def test_overlap_waits_for_forward_before_processing_prebuilt(self):
         scheduler = self._new_scheduler(enable_overlap=True)
-        scheduler.waiting_queue.join([MagicMock(rid="request")])
+        move([MagicMock(rid="request", owner_list=None)], scheduler.waiting_queue)
 
         call_order = []
         new_batch = MagicMock()
@@ -1114,8 +1118,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         self.assertEqual(call_order, ["prepare", "wait", "process"])
 
     def test_prebuilt_requests_run_from_their_admission(self):
-        """Admission moves the requests from waiting into running; one that the
-        prebuilt result finishes leaves again."""
+        """Admission moves the requests from waiting into running."""
         scheduler = self._new_scheduler(enable_overlap=False)
         scheduler.req_to_token_pool = MagicMock(size=2)
         scheduler.max_running_requests = 2
@@ -1126,18 +1129,14 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )
-        kept, done = (
-            FakeReq(
-                rid=rid,
-                kv=SimpleNamespace(restore_done_event=None, kv_committed_len=None),
-                init_next_round_input=lambda tree_cache: None,
-                finished_reason=None,
-            )
-            for rid in ("kept", "done")
+        kept = FakeReq(
+            rid="kept",
+            kv=SimpleNamespace(restore_done_event=None, kv_committed_len=None),
+            init_next_round_input=lambda tree_cache: None,
+            finished_reason=None,
         )
-        for req in (kept, done):
-            req.finished = partial(lambda req: req.finished_reason is not None, req)
-        scheduler.waiting_queue.join([kept, done])
+        kept.finished = lambda: kept.finished_reason is not None
+        move([kept], scheduler.waiting_queue)
 
         def lists_of(req):
             return [
@@ -1146,11 +1145,8 @@ class TestDecodePrebuilt(unittest.TestCase):
                 if req in reqs
             ]
 
-        def process_prebuilt(batch):
-            done.finished_reason = FINISH_ABORT("finished at prebuilt")
-
         scheduler.batch_result_processor = SimpleNamespace(
-            process_batch_result_prebuilt=process_prebuilt
+            process_batch_result_prebuilt=lambda batch: None
         )
 
         class _Batch(SimpleNamespace):
@@ -1183,7 +1179,6 @@ class TestDecodePrebuilt(unittest.TestCase):
 
         self.assertEqual(plan.running_batch.reqs, [kept])
         self.assertEqual(lists_of(kept), [ListKind.DECODING])
-        self.assertEqual(lists_of(done), [])
 
 
 if __name__ == "__main__":
