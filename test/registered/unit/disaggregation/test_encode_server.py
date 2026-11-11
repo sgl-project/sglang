@@ -118,8 +118,8 @@ class TestEncoderDPErrorHandling(CustomTestCase):
 
 
 class TestEncoderCacheIdentity(CustomTestCase):
-    def test_direct_embedding_reuses_combined_identity(self):
-        """A prefix-cache hit returns the embedding without re-encoding or rebuilding its key."""
+    def test_direct_embedding_reuses_per_grid_identity(self):
+        """Repeated grids hit one cache entry per grid without re-encoding."""
 
         async def run():
             encoder = MMEncoder.__new__(MMEncoder)
@@ -150,19 +150,22 @@ class TestEncoderCacheIdentity(CustomTestCase):
                 use_global_cache=False,
                 is_health_check=False,
             )
-            with patch.object(
-                MultiModalStaticCache,
-                "combine_hashes",
-                wraps=MultiModalStaticCache.combine_hashes,
-            ) as combine:
-                for _ in range(2):
-                    actual = await encoder._compute_direct_embedding(
-                        ctx, keep_on_gpu=False
-                    )
-                    torch.testing.assert_close(actual, expected)
-                self.assertEqual(combine.call_count, 2)
+            for _ in range(2):
+                actual = await encoder._compute_direct_embedding(ctx, keep_on_gpu=False)
+                torch.testing.assert_close(actual, expected)
             forward.assert_called_once()
-            self.assertEqual(len(encoder.mm_cache), 1)
+            self.assertEqual(len(encoder.mm_cache), 2)
+
+            mm_hashes = encoder._calculate_hashes_from_features(
+                features, ctx.preprocess_result, Modality.IMAGE
+            )
+            self.assertEqual(len(mm_hashes), 2)
+            for index, item_hash in enumerate(mm_hashes):
+                entry = encoder.mm_cache.get_single(item_hash)
+                self.assertIsNotNone(entry)
+                torch.testing.assert_close(
+                    entry.embedding, expected[index * 2 : (index + 1) * 2]
+                )
 
         from sglang.srt.runtime_context import get_context
 

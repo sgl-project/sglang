@@ -118,7 +118,7 @@ forward to preserve that assignment. An all-item hit still skips the forward.
 Recomputed entries are not counted as reused cache hits.
 
 ```bash Command
-python -m sglang.launch_server \
+SGLANG_VLM_CACHE_SIZE_MB=4096 python -m sglang.launch_server \
   --model-path Qwen/Qwen3-VL-8B-Instruct \
   --encoder-only \
   --enable-prefix-mm-cache \
@@ -126,8 +126,10 @@ python -m sglang.launch_server \
 ```
 
 The host cache size is controlled by `SGLANG_VLM_CACHE_SIZE_MB` (default
-4096 MB). This local cache is independent of `--enable-mm-global-cache`; the
-global cache uses Mooncake and can be enabled together with it.
+4096 MB). Large-Hopper Qwen3-VL serving overrides an unset value to `0`, so set
+it explicitly when enabling the encoder prefix cache. This local cache is
+independent of `--enable-mm-global-cache`; the global cache uses Mooncake and
+can be enabled together with it.
 
 #### Qwen VL
 
