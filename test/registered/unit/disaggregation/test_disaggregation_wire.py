@@ -986,7 +986,6 @@ class TestDisaggregationWire(unittest.TestCase):
                     ).get_buf_infos()
                     manager = object.__new__(CommonKVManager)
                     manager.customized_info_enabled = False
-                    # As CommonKVManager derives it on each side.
                     manager.exchange_aux_item_lens = prefill_width != legacy
                     manager.kv_args = SimpleNamespace(
                         aux_data_ptrs=src_ptrs, aux_item_lens=src_lens

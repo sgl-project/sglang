@@ -353,9 +353,6 @@ class CommonKVManager(BaseKVManager):
         self.customized_info_enabled = (
             envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.get() > 0
         )
-        # Older prefills reject a decode that reports its metadata row sizes unless
-        # both transfer customized_info, so exchange them only when a row size can
-        # differ from those builds' layout.
         self.exchange_aux_item_lens = self.customized_info_enabled or (
             get_disagg().disaggregation_max_top_logprobs_num
             != MetadataBuffers.LEGACY_TOP_LOGPROBS_NUM

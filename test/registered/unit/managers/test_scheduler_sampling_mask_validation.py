@@ -22,8 +22,6 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _handle_pd_request(mode, req):
-    """Handle `req` on a PD scheduler without sampling-mask buffers, returning
-    the mocked `prepare_abort` and `_add_request_to_queue`."""
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.enable_session_radix_cache = False
     scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
@@ -84,7 +82,6 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
     def test_pd_top_logprobs_beyond_capacity_return_bad_request_before_admission(
         self,
     ):
-        """Neither PD role may queue more top logprobs than its metadata rows hold."""
         capacity = 8
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             for top_logprobs_num in (capacity, capacity + 1):
@@ -94,18 +91,20 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                         disaggregation_max_top_logprobs_num=capacity
                     ),
                 ):
-                    # A request within capacity reaches the sampling-mask check,
-                    # which stops it before the model.
                     req = MagicMock(return_sampling_mask=True, return_logprob=True)
                     req.logprob.top_logprobs_num = top_logprobs_num
                     abort, add_to_queue = _handle_pd_request(mode, req)
                     abort.assert_called_once()
-                    self.assertEqual(
-                        abort.call_args.kwargs["status_code"], HTTPStatus.BAD_REQUEST
+                    self.assertIn(
+                        (
+                            "top_logprobs_num"
+                            if top_logprobs_num > capacity
+                            else "return_sampling_mask"
+                        ),
+                        abort.call_args.args[1],
                     )
                     self.assertEqual(
-                        "top_logprobs_num" in abort.call_args.args[1],
-                        top_logprobs_num > capacity,
+                        abort.call_args.kwargs["status_code"], HTTPStatus.BAD_REQUEST
                     )
                     add_to_queue.assert_not_called()
 

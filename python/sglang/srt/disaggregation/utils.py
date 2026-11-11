@@ -622,7 +622,6 @@ class CustomizedInfoError(ValueError):
 
 class MetadataBuffers:
     CUSTOMIZED_INFO_SLOTS = slice(6, 8)
-    # Builds without --disaggregation-max-top-logprobs-num always use this width.
     LEGACY_TOP_LOGPROBS_NUM = 128
 
     def __init__(
@@ -926,8 +925,7 @@ class MetadataBuffers:
                     raise RuntimeError(
                         f"top_logprobs_num {top_logprobs_len} exceeds "
                         f"disaggregation metadata capacity {max_top_logprobs_len}. "
-                        "Lower top_logprobs_num or raise "
-                        "--disaggregation-max-top-logprobs-num on prefill and decode."
+                        "Lower top_logprobs_num or increase the metadata buffer."
                     )
                 self.output_top_logprobs_val[req.metadata_buffer_index][
                     : len(req.logprob.output_top_logprobs_val[0])
