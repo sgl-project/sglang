@@ -3473,11 +3473,17 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import register_tgv_m_ranges
+        # TGV tactic tables target the CUDA cutedsl GEMM backend, which pulls
+        # in cuda.bindings at import time; skip registration off-CUDA (e.g.
+        # NPU, where the package is absent and the backend is never used).
+        if get_platform().is_cuda:
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                register_tgv_m_ranges,
+            )
 
-        register_tgv_m_ranges(_K3_TGV_M_RANGES)
-        if get_platform().device_sm == 103:
-            register_tgv_m_ranges(_K3_GB300_TGV_M_RANGES)
+            register_tgv_m_ranges(_K3_TGV_M_RANGES)
+            if get_platform().device_sm == 103:
+                register_tgv_m_ranges(_K3_GB300_TGV_M_RANGES)
         if quant_config is not None:
             if isinstance(quant_config, ModelSlimConfig):
                 model_mapping = {
