@@ -244,7 +244,7 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, keep_persistent_cache
     }
     retuned_knobs = {**initial_knobs, "native_tactic": 11}
     tuning_results = []
-    namespace = "sglang_flashinfer_megamoe_knobs_v1"
+    namespace = "sglang_flashinfer_megamoe_knobs"
     events = []
     workspace_knobs = []
 
@@ -295,7 +295,7 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, keep_persistent_cache
     records = {
         "sglang_flashinfer_megamoe": {
             f"{first._geometry_key}:1": {
-                "version": 1,
+                "version": 2,
                 "entries": [{"knobs": {"native_tactic": 99}}],
             }
         }

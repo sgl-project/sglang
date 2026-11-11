@@ -40,7 +40,7 @@ class _AutotuneContext:
 
 _active_context: _AutotuneContext | None = None
 # Keep direct knob records separate from the legacy native cache-file payloads.
-_CACHE_NAMESPACE = "sglang_flashinfer_megamoe_knobs_v1"
+_CACHE_NAMESPACE = "sglang_flashinfer_megamoe_knobs"
 
 
 @contextmanager
