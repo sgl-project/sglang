@@ -581,6 +581,45 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
         service.progress()
         return span
 
+    def test_prefetch_keeps_host_anchor_without_pinning_device_prefix(self):
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        with hicache(self, namespace_keys=True, write_policy="write_through") as owner:
+            _, cache, service, dma = owner
+            target = cache_fixtures.target((1, 2, 3, 4, 5, 6))
+            self._cold_scopes(owner, [target])
+            anchor = seed(cache)
+            backup_prefix(cache, dma, anchor)
+            self.assertIsNotNone(anchor.component_data[FULL].value)
+
+            controller = cache.cache_controller
+            get = controller.page_get_func
+            entered, release = threading.Event(), threading.Event()
+
+            def blocked_get(*args, **kwargs):
+                entered.set()
+                assert release.wait(5)
+                return get(*args, **kwargs)
+
+            try:
+                with patch.object(controller, "page_get_func", blocked_get):
+                    hint = self._restore(service, target, "host-anchor")
+                    wait_for(service, entered.is_set)
+                    self.assertEqual(
+                        cache.evict(EvictParams(num_tokens=4)).num_tokens_evicted, 4
+                    )
+                    self.assertEqual(cache.evict_host(4), 0)
+                    release.set()
+                    done = wait(service, hint)
+                    self.assertEqual(done.status, Status.COMPLETED)
+                    self.assertEqual(
+                        done.public_result.ready_scope[-1].coverage.end_token, 6
+                    )
+            finally:
+                release.set()
+            assert_retired(cache, service)
+            cache.sanity_check()
+
     def test_read_observations_count_physical_jobs_and_include_ordinary_reads(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 

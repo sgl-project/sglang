@@ -36,9 +36,7 @@ class _Read:
         default_factory=lambda: CacheRequestHandle("native-kv:" + uuid.uuid4().hex, 0)
     )
     interests: set[str] = field(default_factory=set)
-    anchor_lock: object = None
     host_locks: list = field(default_factory=list)
-    anchor: int | None = None
     operation: object = None
     failure: tuple[str, str] | None = None
     failure_status: Status = Status.FAILED
@@ -362,11 +360,7 @@ class StorageCacheReads:
         return [(node, start, matched) for node, start, _, matched in path]
 
     def _hold(self, job, rows):
-        if rows and rows[-1][0].id != job.anchor:
-            new = self.cache.lock(rows[-1][0].id)
-            self._release_anchor(job)
-            job.anchor_lock = new
-            job.anchor = rows[-1][0].id
+        # Host locks keep the restore path alive without blocking device eviction.
         self.executor._hold_host(job.host_locks, [n for n, _, _ in rows])
 
     def _published(self, job, inserted_host_node):
@@ -378,15 +372,8 @@ class StorageCacheReads:
         except Exception as error:
             job.failure = ("publication_error", str(error)[:512])
 
-    def _release_anchor(self, job):
-        if job.anchor_lock is not None:
-            self.cache.unlock(job.anchor_lock)
-            job.anchor_lock = None
-
     def _release(self, job):
         self.executor._release_host(job.host_locks)
-        self._release_anchor(job)
-        job.anchor = None
 
     def _host_length(self, job, rows=None):
         length = 0
