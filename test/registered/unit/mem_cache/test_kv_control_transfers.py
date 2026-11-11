@@ -1050,11 +1050,12 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             cache_limits=CacheLimits(max_concurrent_storage_reads=1),
         )
         with hicache(self, config, namespace_keys=True) as owner:
-            _, cache, service, _ = owner
-            first, second = [
-                cache_fixtures.target(cache_salt=salt) for salt in ("busy", "queued")
-            ]
+            _, cache, service, dma = owner
+            first = cache_fixtures.target(cache_salt="busy")
+            second = cache_fixtures.target((1, 2, 3, 4, 5, 6), cache_salt="queued")
             self._cold_scopes(owner, (first, second))
+            prefix = seed(cache, value=9, salt="queued")
+            backup_prefix(cache, dma, prefix, evict=True)
             cc = cache.cache_controller
             entered, release = threading.Event(), threading.Event()
             get = cc.page_get_func
@@ -1076,9 +1077,20 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 ):
                     active = self._restore(service, first, "active")
                     wait_for(service, entered.is_set)
-                    queued = self._restore(service, second, "queued")
+                    with patch.object(
+                        cache, "inc_host_lock_ref", wraps=cache.inc_host_lock_ref
+                    ) as hold:
+                        queued = self._restore(service, second, "queued")
+                        hold.assert_not_called()
                     self.assertEqual(queued.update.code, "storage_concurrency_limit")
-                    self._ordinary_prefetch(cache, service, second, demand)
+                    cache.prefetch_from_storage(
+                        demand,
+                        prefix.id,
+                        cache_fixtures.array("q", second.token_ids[4:]),
+                        last_hash=cache.get_last_hash_value(prefix.id),
+                        matched_prefix_tokens=list(second.token_ids[:4]),
+                        cache_salt=service.cache_salt(second.cache_salt),
+                    )
                     self.assertIn(demand, cache.ongoing_prefetch)
                     terminal = wait(service, queued)
                     self.assertEqual(terminal.status, Status.DEFERRED)
@@ -1086,7 +1098,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     release.set()
                     self.assertEqual(wait(service, active).status, Status.COMPLETED)
                     self.assertEqual(
-                        self._consume_ordinary_prefetch(cache, service, demand), (4, 0)
+                        self._consume_ordinary_prefetch(cache, service, demand), (2, 4)
                     )
                     self.assertEqual(reads[1:], [demand.rid])
             finally:

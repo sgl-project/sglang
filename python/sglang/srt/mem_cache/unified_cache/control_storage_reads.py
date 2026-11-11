@@ -510,16 +510,14 @@ class StorageCacheReads:
                     # but only a full node can anchor a storage suffix.
                     rows.pop()
                     host_length = min(host_length, start)
-            self._hold(job, rows)
             waiting = self._admission_wait(job)
             if waiting is not None:
                 job.waiting = waiting
-                self._release(job)
                 return
             if self.cache.cache_controller.prefetch_rate_limited():
                 job.waiting = "storage_rate_limit"
-                self._release(job)
                 return
+            self._hold(job, rows)
             needed = len(job.tokens) - host_length
             if not self._host_capacity(job, needed):
                 job.waiting = "whole_scope_capacity"
