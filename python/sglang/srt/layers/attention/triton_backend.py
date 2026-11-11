@@ -2536,7 +2536,6 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        assert self.runs_decode, "a DFLASH draft backend has no split-KV partials"
         # Select the correctly-sized attn_logits buffer for this layer.
         # The triton kernel's // Lv stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim.

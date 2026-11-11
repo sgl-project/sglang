@@ -54,7 +54,6 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
-from sglang.srt.models import dflash_hip
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.utils import apply_qk_norm, bind_or_assign
 from sglang.srt.runtime_context import get_parallel, get_spec
@@ -71,6 +70,8 @@ from sglang.srt.utils import BumpAllocator, is_gfx95_supported, is_hip, is_npu
 from sglang.srt.utils.device import get_compiler_backend
 
 _is_hip = is_hip()
+if _is_hip:
+    from sglang.srt.models import dflash_hip
 _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
