@@ -1504,6 +1504,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             simulated_acc_len_rng=self._simulated_acc_len_rng,
             speculative_runtime_hooks=self._speculative_runtime_hooks,
         )
+        if envs.SGLANG_OPT_POST_VERIFY_POOL_PRESIZE.get():
+            self._post_verify_graphs.enable_pool_presize()
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
