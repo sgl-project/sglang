@@ -131,15 +131,13 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
 from sglang.srt.models.kimi_k3_amd.moe import (
     KimiK3MoEHipMixin,
-    ffn_row_shards_hip,
     link_column_tails_hip,
     link_row_sharded_stream_hip,
+    row_shard_bank_hooks_hip,
 )
 from sglang.srt.models.kimi_k3_amd.row_shard_o_proj import (
     gather_full_o_proj,
-    pad_o_proj_rows,
     row_shard_o_proj,
-    take_o_proj_row_shard,
 )
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
@@ -487,21 +485,6 @@ def _add3(
 
 # One-shot log guard: proves the merged front is live (see _ep_front).
 _EP_FRONT_LOGGED = False
-
-
-def _row_sharded_switch_on() -> bool:
-    """Any of the opt-in gfx950 row-sharded front / o_proj / stream switches."""
-    return (
-        envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT.get()
-        or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT.get()
-        or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ.get()
-        or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get()
-    )
-
-
-def _is_row_shard_o_proj(o_proj: RowParallelLinear) -> bool:
-    """Whether row_shard_o_proj wrapped o_proj (its forward then keeps the input)."""
-    return "row_shard_input" in o_proj.__dict__
 
 
 def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
@@ -3029,6 +3012,10 @@ def _stage_facts(
 class KimiK3DecoderLayer(nn.Module):
     """Decoder layer carrying the K3 attention-residual stream."""
 
+    # gfx950 row-sharded FFN read (row_shard_bank_hooks_hip)
+    _row_shards = None
+    _o_proj_row_sharded = False
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -3129,26 +3116,6 @@ class KimiK3DecoderLayer(nn.Module):
 
         self._ffn_writes_stream = _latent_moe_writes_stream(config, layer_idx)
         self._declare_stages(config, layer_idx, attn_bank)
-        # o_proj keeps its input for the row-sharded FFN read (row_shard_o_proj),
-        # else writes into rows padded for its reduce-scatter
-        self._o_proj_row_sharded = False
-        o_proj = self.self_attn.o_proj
-        if self._row_shards is not None and _is_row_shard_o_proj(o_proj):
-            o_proj.row_shards = self._row_shards
-            self._o_proj_row_sharded = True
-        elif (
-            self._row_shards is not None
-            and _row_sharded_switch_on()
-            and _o_proj_takes_output(o_proj)
-        ):
-            pad_o_proj_rows(
-                o_proj, tp_size=get_parallel().attn_tp_size, row_shards=self._row_shards
-            )
-
-    def _o_proj_row_shard(self, num_tokens: int) -> Optional[torch.Tensor]:
-        if not self._o_proj_row_sharded:
-            return None
-        return take_o_proj_row_shard(self.self_attn.o_proj, num_tokens)
 
     def _declare_stages(self, config, layer_idx, attn_bank):
         """Declare this layer's attention and FFN stages as _stage_facts gives
@@ -3156,9 +3123,8 @@ class KimiK3DecoderLayer(nn.Module):
         K3 supplies for the bank path."""
         sp_collective = k3_sp_collective.enabled()
         bank = None
-        self._row_shards = None
         if self.use_attn_residuals:
-            self._row_shards = ffn_row_shards_hip(self) if _is_hip else None
+            row = row_shard_bank_hooks_hip(self) if _is_hip else {}
             bank = AttnBankState(
                 attn_bank,
                 self.self_attention_res_proj,
@@ -3171,15 +3137,7 @@ class KimiK3DecoderLayer(nn.Module):
                 and sp_collective
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
                 reads_slices=_carries_bank_slices(config),
-                ffn_row_shards=self._row_shards,
-                ffn_shard_front=(
-                    self.mlp.shard_front
-                    if self._row_shards is not None and isinstance(self.mlp, KimiK3MoE)
-                    else None
-                ),
-                ffn_attn_rows=self._o_proj_row_shard
-                if self._row_shards is not None
-                else None,
+                **row,
             ).residual_ops()
         attn, ffn = _stage_facts(
             config, layer_idx, sp_collective=sp_collective, bank=bank
