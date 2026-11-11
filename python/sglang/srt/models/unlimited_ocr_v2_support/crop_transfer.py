@@ -10,6 +10,7 @@ import msgspec
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.device import is_pin_memory_available
 from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 logger = logging.getLogger(__name__)
@@ -98,11 +99,18 @@ def _stage(
 ) -> torch.Tensor:
     with torch.inference_mode(inference_mode), torch.set_grad_enabled(grad_enabled):
         with operations_nvtx_range("ocr.crop_prefetch_allocate"):
-            try:
-                result = torch.empty(
-                    source.shape, dtype=dtype, device="cpu", pin_memory=True
-                )
-            except RuntimeError:
+            result = None
+            # Pinned memory only serves an async CUDA copy. On Apple silicon torch
+            # hands it back as an mps tensor that ops treat inconsistently, and the
+            # copy below then encodes MPS work beside the scheduler thread (abort).
+            if is_pin_memory_available():
+                try:
+                    result = torch.empty(
+                        source.shape, dtype=dtype, device="cpu", pin_memory=True
+                    )
+                except RuntimeError:
+                    pass
+            if result is None:
                 with operations_nvtx_range("ocr.crop_prefetch_pageable"):
                     result = torch.empty(source.shape, dtype=dtype, device="cpu")
         with operations_nvtx_range("ocr.crop_prefetch_cpu_copy"):
@@ -464,6 +472,9 @@ class UnlimitedOcrCropTransfer:
         target = torch.device(device)
         if first.device == target:
             return torch.stack(tensors, dim=0).type(dtype)
+        if not is_pin_memory_available(target):
+            # On MPS a pinned buffer is a broken mps tensor (see _stage).
+            return torch.stack(tensors, dim=0).type(dtype).to(device=target)
         count = len(tensors)
         shape = (count, *first.shape)
         key = (shape, dtype, str(target))
