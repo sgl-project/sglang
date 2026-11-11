@@ -49,6 +49,7 @@ from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.srt.multimodal.processors.kimi_common import (
     KimiGridMMDataMixin,
     kimi_image_identity,
@@ -58,6 +59,7 @@ from sglang.srt.multimodal.processors.kimi_k3 import (
     KimiK3ImageProcessor,
     _expand_k3_image_prompt_text,
     _expand_k3_image_prompt_token_ids,
+    _plan_k3_video,
 )
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
@@ -73,6 +75,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.runtime_context import get_context, get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -594,6 +597,7 @@ class _Tokenizer:
             "<|media_begin|>image 1536x1024<|media_content|>": [10, 11],
             "<|media_begin|>image 1024x1536<|media_content|>": [12, 13],
             "<|media_end|>": [14],
+            "<|media_content|>": [15],
         }
         return tokens.get(text, [])
 
@@ -622,6 +626,8 @@ class _AnySizeTokenizer:
             return [10, 11]
         if text == "<|media_end|>":
             return [14]
+        if text == "<|media_content|>":
+            return [15]
         return []
 
 
@@ -1103,7 +1109,7 @@ def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
 
     processor._run_preprocess_and_build_artifact_batch = prepare
     try:
-        with pytest.raises(ValueError, match="feature hash changed"):
+        with pytest.raises(RuntimeError, match="feature hash changed"):
             asyncio.run(processor.prepare_media_artifacts([image]))
     finally:
         processor.io_executor.shutdown()
@@ -1535,7 +1541,6 @@ def test_kimi_k3_rejects_tokenized_placeholder_mismatch():
 @pytest.mark.parametrize(
     ("request_obj", "extra_kwargs"),
     [
-        (SimpleNamespace(video_data=["video"]), {}),
         (SimpleNamespace(video_data=None), {"audio_data": ["audio"]}),
     ],
 )
@@ -1544,7 +1549,7 @@ def test_kimi_k3_rejects_unsupported_modalities(request_obj, extra_kwargs):
     processor.mm_tokens = Mock()
     processor.load_mm_data = AsyncMock()
 
-    with pytest.raises(ValueError, match="supports image input only"):
+    with pytest.raises(ValueError, match="supports image and video input only"):
         asyncio.run(
             processor.process_mm_data_async(
                 image_data=[],
@@ -1554,6 +1559,115 @@ def test_kimi_k3_rejects_unsupported_modalities(request_obj, extra_kwargs):
             )
         )
     processor.load_mm_data.assert_not_awaited()
+
+
+class _Video(VideoDecoderWrapper):
+    avg_fps = frame_shape = None  # shadow the decoder-backed properties
+
+    def __init__(self, *, num_frames, fps, height, width):
+        self.avg_fps = fps
+        self.frame_shape = (height, width)
+        self._num_frames = num_frames
+
+    def __len__(self):
+        return self._num_frames
+
+    def get_frames_at(self, indices):
+        return np.zeros((len(indices), *self.frame_shape, 3), dtype=np.uint8)
+
+
+# Video keys of the Kimi-K3 checkpoint's preprocessor_config.json media_proc_cfg.
+_K3_VIDEO_CFG = {
+    "in_patch_limit_each_frame": 16384,
+    "in_patch_limit_video": 655360,
+    "sample_fps": 8.0,
+    "max_num_frames_each_video": None,
+    "temporal_merge_kernel_size": 4,
+    "timestamp_mode": "hh:mm:ss.fff",
+}
+
+
+# Clips whose token counts were measured with Moonshot's hosted K3 estimator.
+@pytest.mark.parametrize(
+    ("width", "height", "num_frames", "fps", "frames", "chunk_tokens"),
+    [
+        (448, 448, 120, 30.0, 32, 256),  # sample_fps, not the source rate
+        # Over in_patch_limit_video: full-size frames, fewer of them.
+        (1920, 1088, 1800, 30.0, 60, 2691),
+    ],
+)
+def test_kimi_k3_video_plan_matches_hosted_api(
+    width, height, num_frames, fps, frames, chunk_tokens
+):
+    indices, resize_config = _plan_k3_video(
+        num_frames,
+        fps,
+        width,
+        height,
+        _K3_VIDEO_CFG,
+        _k3_preprocess_config(in_patch_limit=65536),
+    )
+
+    assert len(indices) == frames
+    assert (indices[0], indices[-1]) == (0, num_frames - 1)
+    assert resize_config["num_tokens"] == chunk_tokens
+
+
+def test_kimi_k3_video_request_serves_chunks_and_images_in_prompt_order():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_tokens = SimpleNamespace(image_token_id=99)
+    processor.video_slot_token_id = 77
+    processor.media_proc_cfg = _K3_VIDEO_CFG
+    processor.mm_feature_transport = "cpu"
+    processor.use_cuda_ipc = False
+    processor._tokenizer = SimpleNamespace(
+        encode=lambda text, allowed_special=None: [5]
+    )
+    processor._processor = SimpleNamespace(
+        preprocess_config=_k3_preprocess_config(),
+        prepare_image_features=lambda images: (
+            [torch.zeros(4, 3, 14, 14)],
+            [(28, 28)],
+            [{"num_tokens": 1}],
+            [(1, 2, 2)],
+        ),
+    )
+    processor.mm_processor_executor = None
+    processor.io_executor = ThreadPoolExecutor(1)
+    processor.hash_executor = MultimodalHashExecutor(max_workers=1)
+    processor.fast_load_mm_data = AsyncMock(
+        return_value=SimpleNamespace(
+            images=[Image.new("RGB", (28, 28))],
+            videos=[_Video(num_frames=10, fps=10.0, height=28, width=56)],
+        )
+    )
+
+    try:
+        output = asyncio.run(
+            processor.process_mm_data_async(
+                image_data=["image"],
+                input_text=[1, 77, 99],
+                request_obj=SimpleNamespace(
+                    video_data=["video"], mm_content_hashes=None
+                ),
+            )
+        )
+    finally:
+        processor.io_executor.shutdown()
+        processor.hash_executor.shutdown()
+
+    # 8 of 10 frames at 8 fps: two 4-frame chunks of 2 tokens, then the image.
+    assert output.input_ids == [1, 5, 5, 99, 99, 5, 99, 99, 5, 5, 99, 5]
+    assert [item.offsets for item in output.mm_items] == [
+        [(3, 4)],
+        [(6, 7)],
+        [(10, 10)],
+    ]
+    assert [
+        item.model_specific_data["image_grid_thw"].tolist() for item in output.mm_items
+    ] == [[[4, 2, 4]], [[4, 2, 4]], [[1, 2, 2]]]
+    assert [item.feature.shape[0] for item in output.mm_items] == [32, 32, 4]
+    assert all(item.pad_value is not None for item in output.mm_items)
 
 
 if __name__ == "__main__":

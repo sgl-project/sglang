@@ -313,6 +313,7 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
+                self.process_pending_chunked_abort()
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
                 )
@@ -691,12 +692,6 @@ class SchedulerPPMixin:
         if get_parallel().pp_size == 1 or not isinstance(allocator, ChainAllocator):
             return
         checks = resolve_level() >= InvariantCheckLevel.WARN
-        if checks and self.recv_skipper is not None:
-            raise ValueError(
-                "the pipeline stages compare their capacity decisions with "
-                "every iteration's requests under invariant checks; that needs "
-                "--scheduler-recv-interval 1"
-            )
         geometries = [None] * get_parallel().pp_size
         torch.distributed.all_gather_object(
             geometries, allocator.stage_geometry(), group=self.pp_group.cpu_group
