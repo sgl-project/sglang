@@ -937,6 +937,36 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertTrue(config.supports_input_partition("blocks.0.mlp.fc1", 256))
         self.assertFalse(config.supports_input_partition("blocks.0.mlp.fc1", 128))
 
+    def test_metadata_layer_names_relative_to_the_diffusion_model(self):
+        """Community INT8 converters name _quantization_metadata layers without the
+        tensors' model.diffusion_model. prefix; ComfyUI strips it before matching."""
+        from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+            inspect_comfy_quant_markers,
+        )
+
+        layer = "blocks.0.attn.qkv_proj"
+        metadata = {
+            "_quantization_metadata": json.dumps(
+                {"layers": {layer: {"format": "int8_tensorwise"}}}
+            )
+        }
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            save_file(
+                {
+                    f"model.diffusion_model.{layer}.weight": torch.ones(
+                        (2, 4), dtype=torch.int8
+                    ),
+                    f"model.diffusion_model.{layer}.weight_scale": torch.ones(2, 1),
+                },
+                checkpoint.name,
+                metadata=metadata,
+            )
+            markers = inspect_comfy_quant_markers([checkpoint.name])
+
+        self.assertEqual(
+            markers[f"model.diffusion_model.{layer}"]["format"], "int8_tensorwise"
+        )
+
     @patch(
         "sglang.multimodal_gen.runtime.layers.quantization.kitchen_w4a8."
         "w4a8_int8_linear",

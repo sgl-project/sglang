@@ -79,6 +79,9 @@ class TestAdapterRegistry(CustomTestCase):
                 tool_call_parsing_active=lambda request: False,
                 history_tool_calls_count=lambda request: 0,
                 tool_call_id=lambda item, index: "",
+                effective_tools=lambda request: [],
+                split_assistant_prefix=lambda messages, request: (messages, None),
+                append_assistant_prefix=lambda prompt_ids, prefix: prompt_ids,
             ),
             hf_config=SimpleNamespace(
                 model_type="deepseek_v41", architectures=["DeepseekV41ForCausalLM"]

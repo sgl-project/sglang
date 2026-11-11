@@ -8,7 +8,7 @@ from pathlib import Path
 
 from test_deepseek_ocr import TestDeepSeekOCR
 
-from sglang.srt.utils.hf_transformers import get_tokenizer
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
