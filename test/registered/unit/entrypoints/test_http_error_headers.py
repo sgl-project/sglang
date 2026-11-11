@@ -15,6 +15,9 @@ from fastapi.testclient import TestClient  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
 from sglang.srt.entrypoints.http_server import app as serving_app  # noqa: E402
+from sglang.srt.entrypoints.openai.chat_encoding_adapters import (  # noqa: E402
+    OPENAI_CHAT_WIRE,
+)
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
@@ -36,6 +39,9 @@ class TestHTTPErrorHeaders(CustomTestCase):
             ):
                 with self.subTest(prefix=prefix, path=path):
                     inner = FastAPI()
+                    inner.state.openai_serving_chat = SimpleNamespace(
+                        chat_wire=OPENAI_CHAT_WIRE
+                    )
                     inner.add_exception_handler(
                         HTTPException, serving_app.exception_handlers[HTTPException]
                     )

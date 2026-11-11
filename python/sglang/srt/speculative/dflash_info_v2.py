@@ -9,10 +9,13 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
+from sglang.srt.mem_cache.allocation_sizing import (
+    add_spec_decode_headroom_pages,
+    page_aligned_decode_alloc_lens,
+)
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 
 _OVERLAP_PLAN_STREAMS: dict[str, torch.cuda.Stream] = {}
 
@@ -152,28 +155,24 @@ class DFlashDraftInputV2(SpecInput):
             reserve=reserve,
             page_size=page_size,
         )
+        nxt_kv_lens, num_needed_tokens = add_spec_decode_headroom_pages(
+            batch,
+            nxt_kv_lens,
+            num_needed_tokens,
+            reserve=reserve,
+            page_size=page_size,
+        )
 
-        max_top_k = 1
-        uniform_top_k_value = None
-        uniform_top_k = True
-        nxt_kv_lens_sum = 0
-        committed_seq_lens_sum = 0
-        for i, (req, cur, nxt) in enumerate(zip(batch.reqs, cur_kv_lens, nxt_kv_lens)):
-            committed_len = int(req.kv.kv_committed_len)
-            committed_seq_lens_sum += committed_len
-            top_k = int(req.sampling_params.top_k)
-
-            batch_seq_lens_cpu_t[i] = committed_len
-            cur_kv_lens_cpu_t[i] = cur
-            nxt_kv_lens_cpu_t[i] = nxt
-
-            nxt_kv_lens_sum += nxt
-            if top_k > max_top_k:
-                max_top_k = top_k
-            if i == 0:
-                uniform_top_k_value = top_k
-            elif uniform_top_k and top_k != uniform_top_k_value:
-                uniform_top_k = False
+        committed_lens = [int(req.kv.kv_committed_len) for req in batch.reqs]
+        top_ks = [int(req.sampling_params.top_k) for req in batch.reqs]
+        batch_seq_lens_cpu_t.numpy()[:] = committed_lens
+        cur_kv_lens_cpu_t.numpy()[:] = cur_kv_lens
+        nxt_kv_lens_cpu_t.numpy()[:] = nxt_kv_lens
+        committed_seq_lens_sum = sum(committed_lens)
+        nxt_kv_lens_sum = sum(nxt_kv_lens)
+        max_top_k = max(top_ks)
+        uniform_top_k = top_ks.count(top_ks[0]) == bs
+        uniform_top_k_value = top_ks[0]
 
         self.max_top_k = max(max_top_k, 1)
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
