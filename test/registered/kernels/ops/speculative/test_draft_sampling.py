@@ -95,14 +95,19 @@ class TestGumbelArgmax(CustomTestCase):
     def test_fast_sample_matches_reference(self):
         gen = torch.Generator(device="cuda").manual_seed(1)
         # Below 2**23 elements and for 4097 (not a whole number of vectors) both
-        # sides take the torch path.
-        for rows, vocab in [(1, 32000), (64, 151936), (65, 248320), (70, 4097)]:
+        # sides take the torch path; 2049 x 4097 is above the size gate.
+        cases = [(1, 32000, 0), (64, 151936, 1), (65, 248320, 1), (2049, 4097, 0)]
+        for rows, vocab, fused_calls in cases:
             logits = torch.randn((rows, vocab), generator=gen, device="cuda") * 3
             probs = torch.softmax(logits, dim=-1)
             torch.cuda.manual_seed(1000 + rows)
             ref_p, ref_index = _reference_fast_sample(probs)
             torch.cuda.manual_seed(1000 + rows)
-            p, index = fast_sample(probs)
+            with mock.patch.object(
+                spec_utils, "div_argmax", wraps=spec_utils.div_argmax
+            ) as fused:
+                p, index = fast_sample(probs)
+            self.assertEqual(fused.call_count, fused_calls)
             self.assertTrue(torch.equal(index, ref_index))
             self.assertTrue(torch.equal(_bits(p), _bits(ref_p)))
 
