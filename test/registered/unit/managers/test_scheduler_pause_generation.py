@@ -388,7 +388,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         scheduler.grammar_manager = MagicMock(grammar_queue=[])
         scheduler.dllm_manager = MagicMock()
-        scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_lmcache = False
@@ -1137,7 +1136,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         done.finished_reason = FINISH_LENGTH(length=0)
         done.dllm_phase = DllmReqPhase.STAGING_PREFILL
         move([decoding, prefilling, done], scheduler.dllm_manager.waiting_queue)
-        scheduler.dllm_manager.add_staging_reqs([prefilling, done])
         scheduler.running_batch = self._make_batch(scheduler, [])
         scheduler.last_batch = self._make_batch(
             scheduler, [prefilling, done], forward_mode=ForwardMode.DLLM_EXTEND
@@ -1154,7 +1152,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             [entry["req"] for entry in requeue_log], [prefilling, decoding]
         )
         self.assertEqual(len(scheduler.dllm_manager.waiting_queue), 0)
-        self.assertFalse(scheduler.dllm_manager.any_staging_reqs())
         self.assertFalse(decoding.kv.holds_kv)
         self.assertEqual(decoding.dllm_phase, DllmReqPhase.INCOMING_PREFILL)
         self.assertFalse(decoding.dllm_initialized)

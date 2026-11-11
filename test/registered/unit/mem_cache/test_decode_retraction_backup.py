@@ -382,7 +382,6 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 queue=decode_queue(ListKind.PD_RECEIVING), enable_staging=False
             ),
             queue=decode_queue(ListKind.PD_PREALLOC),
-            pending_reqs=[],
             retracted_queue=IndexedReqList(ListKind.PD_RETRACTED),
             _prefill_dp_rank_queries={},
             _num_published_destinations=0,

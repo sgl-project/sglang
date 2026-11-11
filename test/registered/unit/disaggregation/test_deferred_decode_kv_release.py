@@ -870,6 +870,18 @@ def _make_pop_queue(mgr):
     return q
 
 
+def _releasing(record):
+    """A release stub that records the request and, like a release, takes it
+    out of its list."""
+
+    def release(req, *, checkpoint):
+        if req.owner_list is not None:
+            req.owner_list._leave([req])
+        record(req)
+
+    return release
+
+
 def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
     receiver = SimpleNamespace(
         kv_mgr=mgr,
@@ -923,9 +935,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
 
     def _pop(self, q):
         released = []
-        q.scheduler.request_retirer.release = lambda req, *, checkpoint: (
-            released.append(req)
-        )
+        q.scheduler.request_retirer.release = _releasing(released.append)
         with patch.object(decode_mod, "prepare_abort"):
             q.move_transferred(IndexedReqList(ListKind.WAITING))
         return released
@@ -1030,9 +1040,7 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         mgr = _make_manager()
         q = _make_pop_queue(mgr)
         released = []
-        q.scheduler.request_retirer.release = lambda req, *, checkpoint: (
-            released.append(req)
-        )
+        q.scheduler.request_retirer.release = _releasing(released.append)
         ready = SimpleNamespace(query=lambda: True)
         concluded = _make_failed_req(mgr, room=7, idx=3, abort_notified=False)
         concluded.awaiting_publish = True
@@ -1114,8 +1122,8 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
                 events.append(("unregister", room)),
             ),
         )
-        q.scheduler.request_retirer.release = lambda req, *, checkpoint: events.append(
-            ("release", req.bootstrap_room)
+        q.scheduler.request_retirer.release = _releasing(
+            lambda req: events.append(("release", req.bootstrap_room))
         )
 
         with patch.object(decode_mod, "prepare_abort"):

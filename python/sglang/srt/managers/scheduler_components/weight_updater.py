@@ -486,13 +486,9 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                    for queue_name in (
-                        "disagg_decode_transfer_queue",
-                        "disagg_decode_prealloc_queue",
-                    ):
-                        queue = getattr(scheduler, queue_name, None)
-                        if queue is not None:
-                            queue.release_memory_occupation()
+                    queue = getattr(scheduler, "disagg_decode_prealloc_queue", None)
+                    if queue is not None:
+                        queue.release_memory_occupation()
                 elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
@@ -543,13 +539,9 @@ class SchedulerWeightUpdaterManager:
             scheduler = self.scheduler
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                    for queue_name in (
-                        "disagg_decode_transfer_queue",
-                        "disagg_decode_prealloc_queue",
-                    ):
-                        queue = getattr(scheduler, queue_name, None)
-                        if queue is not None:
-                            queue.resume_memory_occupation()
+                    queue = getattr(scheduler, "disagg_decode_prealloc_queue", None)
+                    if queue is not None:
+                        queue.resume_memory_occupation()
                 elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:

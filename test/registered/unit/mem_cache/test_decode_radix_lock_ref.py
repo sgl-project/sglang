@@ -431,7 +431,6 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         decode_req.is_rebootstrap = False
 
         queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
-        queue.pending_reqs = []
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
         queue._num_published_destinations = 0

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Iterable
+from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler_components.deferred_responses import (
@@ -48,6 +49,20 @@ def release_only_retirer(
         send_abort_output=None,
         stream_output=None,
     )
+
+
+def leaving_retirer() -> MagicMock:
+    """A mock `RequestRetirer` whose exits take the request out of its list, as
+    the real ones do, and record their calls."""
+    retirer = MagicMock()
+
+    def leave(req, **_):
+        if req.owner_list is not None:
+            req.owner_list._leave([req])
+
+    for exit_ in ("abort", "retire_unadmitted", "release", "abort_retracted"):
+        getattr(retirer, exit_).side_effect = leave
+    return retirer
 
 
 def decode_queue(kind: ListKind, decode_reqs: Iterable = ()) -> IndexedReqList:

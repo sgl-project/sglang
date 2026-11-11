@@ -47,6 +47,7 @@ from sglang.test.scheduler_test_utils import (
     FakeReq,
     decode_queue,
     empty_request_lists,
+    leaving_retirer,
     release_only_retirer,
 )
 from sglang.test.separate_buffer_allocator_double import (
@@ -540,7 +541,6 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
         queue.queue = decode_queue(ListKind.PD_PREALLOC, decode_reqs)
-        queue.pending_reqs = []
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
         # `move_preallocated` credits this counter; `__new__` skips the __init__
@@ -591,7 +591,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         )
         queue.tree_cache = MagicMock()
 
-        scheduler = MagicMock()
+        scheduler = MagicMock(request_retirer=leaving_retirer())
         scheduler.enable_priority_scheduling = True
         scheduler.schedule_low_priority_values_first = low_priority_values_first
         scheduler.running_batch.reqs = []
@@ -1152,6 +1152,8 @@ class TestDecodePrebuilt(unittest.TestCase):
 
         def process_prebuilt(batch):
             done.finished_reason = FINISH_ABORT("finished at prebuilt")
+            # Its release takes it out of running.
+            done.owner_list._leave([done])
 
         scheduler.batch_result_processor = SimpleNamespace(
             process_batch_result_prebuilt=process_prebuilt

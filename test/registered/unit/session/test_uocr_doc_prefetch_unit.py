@@ -33,12 +33,19 @@ def _req(rid, *, after=None, budget=None, keep=False, max_new=1000):
 
 
 def _prefetch(aborted=None):
+    def abort_windows(reqs, finished_reason):
+        # Like the retirer's abort, takes each window out of its list.
+        for req in reqs:
+            req.owner_list._leave([req])
+        if aborted is not None:
+            aborted.extend(reqs)
+
     return p.DocPrefetch(
         early=None,
         device=torch.device("cpu"),
         forward_stream=None,
         tp_size=1,
-        abort_windows=lambda reqs, finished_reason: aborted.extend(reqs),
+        abort_windows=abort_windows,
     )
 
 
@@ -169,7 +176,10 @@ class TestNextWindowPrefetch(CustomTestCase):
         sched.add(released)
         _finish(w0, 1)
         prefetch.on_window_finished(w0)
-        self.assertCountEqual(prefetch.reset(), [parked, released])
+        held = prefetch.reset()
+        self.assertCountEqual(held, [parked, released])
+        # The flush aborts them, which takes them out.
+        prefetch._abort_windows(held, finished_reason=None)
         self.assertEqual(prefetch.held_count(), 0)
         self.assertEqual(list(prefetch.released), [])
 

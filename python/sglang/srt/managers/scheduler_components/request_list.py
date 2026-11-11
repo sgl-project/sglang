@@ -140,11 +140,23 @@ class IndexedReqList(ReqList):
         self.kind = kind
         self._abort = abort
         self._req_of = req_of
+        # May still hold items whose request left: a leave only clears the
+        # owner, and the next read or join drops those items in one pass.
         self._items: List[Any] = []
+        self._num_left = 0
+
+    def _compact(self) -> None:
+        if self._num_left:
+            self._items = [
+                item for item in self._items if self._req_of(item).owner_list is self
+            ]
+            self._num_left = 0
 
     def _join(self, items: Iterable, *, at: Optional[int] = None) -> None:
         """Add the given items in order: at the back, or before position `at`."""
         items = list(items)
+        # Before the adopt: a request rejoining would keep its old item.
+        self._compact()
         self._adopt([self._req_of(item) for item in items])
         if at is None:
             self._items.extend(items)
@@ -154,6 +166,7 @@ class IndexedReqList(ReqList):
     def reorder(self, items: Iterable) -> None:
         """Hold the same items in the order given."""
         items = list(items)
+        self._compact()
         if len(items) != len(self._items) or {
             id(self._req_of(item)) for item in items
         } != {id(self._req_of(item)) for item in self._items}:
@@ -162,22 +175,18 @@ class IndexedReqList(ReqList):
 
     def _leave(self, reqs: Iterable[Req]) -> None:
         """Drop the items of the given requests; ones not in are ignored."""
-        leaving = set(reqs)
-        if not leaving:
-            return
-        kept = []
-        for item in self._items:
-            req = self._req_of(item)
-            if req in leaving:
+        for req in reqs:
+            if req.owner_list is self:
                 req.owner_list = None
-            else:
-                kept.append(item)
-        self._items = kept
+                self._num_left += 1
 
     def _drop_all(self) -> None:
         for item in self._items:
-            self._req_of(item).owner_list = None
+            req = self._req_of(item)
+            if req.owner_list is self:
+                req.owner_list = None
         self._items = []
+        self._num_left = 0
 
     def abort(self, recv_req: AbortReq) -> None:
         if self._abort is not None:
@@ -187,18 +196,21 @@ class IndexedReqList(ReqList):
         return self._req_of(item)
 
     def items(self) -> Iterator:
+        self._compact()
         return iter(self._items)
 
     def __iter__(self) -> Iterator[Req]:
+        self._compact()
         return map(self._req_of, self._items)
 
     def __len__(self) -> int:
-        return len(self._items)
+        return len(self._items) - self._num_left
 
     def __contains__(self, req: Req) -> bool:
         return req.owner_list is self
 
     def __getitem__(self, index):
+        self._compact()
         return self._items[index]
 
 

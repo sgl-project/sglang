@@ -326,10 +326,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_components.request_retirer import (
-    RequestRetirer,
-    take_for_abort,
-)
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -2763,6 +2760,11 @@ class Scheduler(
                 *(self.running_mbs if get_parallel().pp_size > 1 else ()),
             ),
             get_pp_mbs=lambda: self.mbs if get_parallel().pp_size > 1 else (),
+            get_offloading_reqs=lambda: (
+                self.decode_offload_manager.offload_inflight
+                if self.decode_offload_manager is not None
+                else ()
+            ),
             # Hisparse pool counters diverge during host backup (see the
             # _get_swa_token_info clamp), and pending deferred KV releases hold
             # pages out of the allocator by design.
@@ -4143,7 +4145,6 @@ class Scheduler(
             req, finished_reason=req.discard_output_reason and reason.to_json()
         )
 
-        self.chunked_reqs._drop_all()
         self._pending_chunked_abort_req = None
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
@@ -4218,16 +4219,16 @@ class Scheduler(
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
+        staged = []
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
+            # Read before the merge below empties last_batch.
+            staged = self.dllm_manager.staged_reqs(last_batch)
 
         # Merge the prefill batch into the running batch
-        reqs_to_exclude = set()
-
-        if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
-            reqs_to_exclude.update(self.dllm_manager.staging_queue)
-            for req in self.dllm_manager.staging_queue:
-                self.finish_dllm_forward(req)
+        reqs_to_exclude = set(staged)
+        for req in staged:
+            self.finish_dllm_forward(req)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
@@ -4295,7 +4296,7 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
-            new_batch = self.get_new_batch_dllm(running_batch)
+            new_batch = self.get_new_batch_dllm(running_batch, staged)
         elif self._should_defer_prefill(running_batch):
             new_batch = None
         else:
@@ -4921,7 +4922,7 @@ class Scheduler(
             lists[ListKind.PD_BOOTSTRAP] = self.disagg_prefill_bootstrap_queue.queue
         lists[ListKind.PD_SENDING] = self.disagg_prefill_transfer_queue
         if self.dllm_config is not None:
-            # Its staging queue is the part of this queue the current round runs.
+            # It also holds the requests the current round runs.
             lists[ListKind.DLLM] = self.dllm_manager.waiting_queue
         components = (
             self.disagg_decode_prealloc_queue,
@@ -5963,7 +5964,6 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
-            and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
@@ -5979,7 +5979,7 @@ class Scheduler(
                 # Their steps are counted through the batches above.
                 ListKind.DECODING,
                 ListKind.PREFILL_LAUNCHED,
-                # Only its staging part is counted, above.
+                # Only the part the last round ran is counted, via last_batch.
                 ListKind.DLLM,
                 # Held across a weight update, whose cache flush needs idle.
                 ListKind.PD_HELD,
@@ -6311,7 +6311,7 @@ class Scheduler(
     def _abort_waiting(self, recv_req: AbortReq) -> None:
         is_decode = self.disaggregation_mode == DisaggregationMode.DECODE
         is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
-        for req in take_for_abort(self.waiting_queue, recv_req):
+        for req in [r for r in self.waiting_queue if recv_req.matches(r.rid)]:
             if is_prefill:
                 # A PD prefill request may hold KV its sender still reads; abort
                 # the sender before that KV is freed.
@@ -6435,10 +6435,9 @@ class Scheduler(
             retract_reqs += list(self.hisparse_coordinator.ack_staging_queue)
 
         if self.dllm_config is not None:
-            # A dLLM request keeps its row between rounds; a finished one leaves
-            # the lists only at the next schedule, which a paused loop never reaches.
+            # A dLLM request keeps its row between rounds; a finished one is not
+            # retracted.
             self.dllm_manager.filter_finished_reqs()
-            # The manager drops them from its waiting and staging queues.
             retract_reqs += self.dllm_manager.take(lambda r: r.kv.holds_kv)
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:

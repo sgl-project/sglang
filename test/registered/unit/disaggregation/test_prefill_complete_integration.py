@@ -300,7 +300,6 @@ class TestAllocationIntegration(CustomTestCase):
         queue.transfer_queue = SimpleNamespace(
             queue=decode_queue(ListKind.PD_RECEIVING)
         )
-        queue.pending_reqs = []
         queue._num_published_destinations = 0
         queue.pp_size, queue.tp_rank = 1, 0
         queue.gloo_group = object()
@@ -628,8 +627,9 @@ class TestAllocationIntegration(CustomTestCase):
         pool.alloc(reqs)
         scheduler.waiting_queue = []
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        # The requeue moves the request out of the transfer queue.
         scheduler.optimistic_release_and_requeue = Mock(
-            side_effect=lambda req: pool.free(req)
+            side_effect=lambda req: (pool.free(req), req.owner_list._leave([req]))
         )
         with get_context().override_server_args(
             disaggregation_decode_allocation_policy="early"
@@ -866,7 +866,6 @@ class TestAllocationIntegration(CustomTestCase):
     def test_normal_bootstrap_keeps_room_without_dispatching_recompute(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._check_if_req_exceed_kv_capacity = Mock(return_value=False)
-        queue.pending_reqs = []
         req = SimpleNamespace(
             bootstrap_room=7,
             bootstrap_host="prefill",
@@ -894,7 +893,6 @@ class TestAllocationIntegration(CustomTestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._check_if_req_exceed_kv_capacity = Mock(return_value=False)
         queue.queue = []
-        queue.pending_reqs = []
         queue._create_receiver_and_enqueue = Mock()
         queue._init_receiver = Mock()
         req = SimpleNamespace(

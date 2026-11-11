@@ -49,14 +49,6 @@ _OWNERS = (
     DeferredResponses,
 )
 
-# Fields annotated as holding requests that are not a `ReqList`: each holds
-# requests a list already holds.
-_NOT_LISTS = {
-    # Shares its entries with `queue`.
-    "DecodePreallocQueue.pending_reqs",
-    # A subset of `waiting_queue`.
-    "DllmManager.staging_queue",
-}
 
 _HOLDS_REQUESTS = re.compile(r"\b(Req|DecodeRequest)\b")
 
@@ -82,7 +74,7 @@ def _fields_holding_requests(owner) -> set:
 class TestRequestHoldersAreLists(CustomTestCase):
     def test_every_field_holding_requests_is_a_request_list(self):
         fields = set().union(*map(_fields_holding_requests, _OWNERS))
-        self.assertEqual(fields, _NOT_LISTS)
+        self.assertEqual(fields, set())
 
 
 _SRT = pathlib.Path(sglang.srt.__path__[0])
@@ -93,32 +85,19 @@ _EDITORS = {
     "managers/scheduler_components/request_retirer.py",
 }
 # The other code that edits a list directly, with its number of edits. Each
-# entry drops a request without ending it (a teardown), or ends one outside the
-# retirer; it leaves this table when its path moves to the retirer.
+# entry takes a request out before or without its release (a step's finished
+# requests, a deferred release, a staged request retracted), or edits a list
+# the retirer does not reach; it leaves this table when that path moves to
+# the retirer.
 _DIRECT_EDITS = {
-    "disaggregation/decode.py:DecodePreallocQueue.move_preallocated": 1,
-    "disaggregation/decode.py:DecodePreallocQueue.release_memory_occupation": 2,
-    "disaggregation/decode.py:DecodeTransferQueue.move_transferred_with_outcomes": 1,
-    "disaggregation/decode.py:DecodeTransferQueue.release_memory_occupation": 2,
     "disaggregation/decode.py:DecodeTransferQueue.resolve_deferred_releases": 1,
-    "disaggregation/decode.py:SchedulerDisaggregationDecodeMixin._verify_kv_checksums": 1,
-    "disaggregation/decode.py:SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run": 1,
-    "disaggregation/prefill.py:PrefillBootstrapQueue.move_bootstrapped": 1,
-    "disaggregation/prefill.py:PrefillBootstrapQueue.release_memory_occupation": 1,
-    "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin._retire_aborted_prefill_result": 1,
-    "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.process_disagg_prefill_transfer_queue": 1,
     "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.process_prefill_chunk": 1,
-    "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.resolve_waiting_queue_bootstrap": 1,
-    "disaggregation/role_switch.py:teardown_disaggregation": 1,
     "dllm/mixin/scheduler.py:DllmManager.take": 1,
     "managers/hisparse_coordinator.py:HiSparseCoordinator._release_staging": 1,
     "managers/scheduler.py:Scheduler._on_step_processed": 2,
     "managers/scheduler.py:Scheduler._retract_batches": 1,
-    "managers/scheduler.py:Scheduler.process_pending_chunked_abort": 1,
     "managers/scheduler_components/deferred_responses.py:DeferredResponses._abort": 1,
     "managers/scheduler_components/deferred_responses.py:DeferredResponses.stream_released": 1,
-    "models/unlimited_ocr_v2_support/document_prefetch.py:DocPrefetch._abort": 1,
-    "models/unlimited_ocr_v2_support/document_prefetch.py:DocPrefetch.reset": 2,
 }
 
 
@@ -216,6 +195,18 @@ class TestMove(CustomTestCase):
         queue._drop_all()
 
         self.assertEqual([r.owner_list for r in (a, b, c)], [None, None, None])
+
+    def test_a_request_back_in_the_list_it_left_is_in_it_once(self):
+        a, b = _reqs("ab")
+        queue = IndexedReqList(ListKind.WAITING)
+        move([a, b], queue)
+
+        queue._leave([a])
+        self.assertEqual(len(queue), 1)
+        move([a], queue)
+
+        self.assertEqual(list(queue), [b, a])
+        self.assertEqual(len(queue), 2)
 
     def test_a_reorder_keeps_the_same_requests(self):
         a, b, c = _reqs("abc")

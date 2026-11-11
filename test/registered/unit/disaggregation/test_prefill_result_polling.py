@@ -47,7 +47,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq
+from sglang.test.scheduler_test_utils import FakeReq, leaving_retirer
 from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
@@ -1070,10 +1070,12 @@ class TestPrefillResultPolling(CustomTestCase):
                         poll=lambda: KVPoll.Transferring
                     )
                 released = []
-                scheduler.request_retirer = Mock()
+                scheduler.request_retirer = leaving_retirer()
                 release = scheduler.request_retirer.release
-                release.side_effect = lambda *args, **kwargs: released.append(
-                    scheduler.iteration
+                leave = release.side_effect
+                release.side_effect = lambda req, **kwargs: (
+                    leave(req),
+                    released.append(scheduler.iteration),
                 )
                 with (
                     _single_rank_gloo_group(),
