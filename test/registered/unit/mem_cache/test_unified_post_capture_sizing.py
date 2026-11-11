@@ -43,6 +43,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
+    largest_take,
     setup_allocator_context,
 )
 
@@ -1192,10 +1193,10 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
         self.assertEqual(allocator.verify_byte_accounting(), [])
 
         # The resized capacity is fully allocatable and accounted.
-        n = allocator.available_size()
+        n = largest_take(allocator)
         self.assertGreater(n, 0)
         self.assertIsNotNone(allocator.alloc(n))
-        self.assertEqual(allocator.available_size(), 0)
+        self.assertEqual(largest_take(allocator), 0)
 
     def test_retraction_restores_complete_entries_at_new_dcp_coordinates(self):
         placement = FusedDraftPlacement.from_counts(
