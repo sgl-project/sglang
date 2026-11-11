@@ -32,6 +32,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Union,
@@ -4358,7 +4359,7 @@ class Scheduler(
         beam_width: Optional[int] = None,
         running_batch: Optional[ScheduleBatch] = None,
         num_held_rows: int = 0,
-        num_admitted_member_rows: int = 0,
+        admitted_reqs: Sequence[Req] = (),
     ) -> int:
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
         # Rows the counted requests may occupy: the free rows, plus the rows that
@@ -4370,7 +4371,7 @@ class Scheduler(
             self.req_to_token_pool.available_size()
             + num_held_rows
             - self.beam_coordinator.pending_member_rows(active_batch)
-            - num_admitted_member_rows,
+            - self.beam_coordinator.pending_member_rows_of(admitted_reqs),
             0,
         )
         res = min(pp_budget, row_budget)
@@ -4650,9 +4651,7 @@ class Scheduler(
                 candidate_beam_width,
                 running_batch=running_batch,
                 num_held_rows=num_held_rows,
-                num_admitted_member_rows=self.beam_coordinator.pending_member_rows_of(
-                    adder.can_run_list
-                ),
+                admitted_reqs=adder.can_run_list,
             ):
                 running_batch.batch_is_full = True
 
