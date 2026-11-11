@@ -32,7 +32,9 @@ def create_llvm_ptr(value, address_space: int = 0) -> ir.Value:
     """An LLVM pointer from an integer or index value."""
     value = _unwrap_value(value)
     if isinstance(value.type, ir.IndexType):
-        value = _unwrap_value(std_arith.IndexCastOp(ir.IntegerType.get_signless(64), value).result)
+        value = _unwrap_value(
+            std_arith.IndexCastOp(ir.IntegerType.get_signless(64), value).result
+        )
     ptr_type = ir.Type.parse(f"!llvm.ptr<{address_space}>")
     return llvm.IntToPtrOp(ptr_type, value).result
 

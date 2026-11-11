@@ -78,6 +78,10 @@ try:
     _unified_attention_has_muse_tiles = (
         "verify_block_m" in inspect.signature(unified_attention).parameters
     )
+    # Upstream aiter's equal-length query flag (every sequence has max_seqlen_q rows, e.g. a verify).
+    _unified_attention_has_equal_seqlen_q = (
+        "equal_seqlen_q" in inspect.signature(unified_attention).parameters
+    )
     from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
         asm_verify_attn_enabled,
         reset_verify_attn_plan_cache,
@@ -87,6 +91,7 @@ try:
     )
 except ImportError:
     _unified_attention_has_muse_tiles = False
+    _unified_attention_has_equal_seqlen_q = False
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
@@ -5109,6 +5114,15 @@ class AiterAttnBackend(AttentionBackend):
                         v_descale=v_descale,
                         sinks=sinks,
                         **self.muse_unified_attention_kwargs,
+                        **(
+                            {"equal_seqlen_q": True}
+                            if self.use_muse_attention_paths
+                            and _unified_attention_has_equal_seqlen_q
+                            and not _unified_attention_has_muse_tiles
+                            and q_unified.shape[0]
+                            == self.forward_metadata.max_q_len * seqused_k.shape[0]
+                            else {}
+                        ),
                     )
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

@@ -33,7 +33,9 @@ def _has_module(name: str) -> bool:
 
 # Both paths finalize through the FlyDSL Muse finalize (sglang.kernels.ops.moe.muse_moe_finalize), built on
 # FlyDSL and aiter's FlyDSL buffer helpers; without them the Triton expert path serves.
-_HAS_FLYDSL = _has_module("flydsl") and _has_module("aiter.ops.flydsl.kernels.buffer_ops")
+_HAS_FLYDSL = _has_module("flydsl") and _has_module(
+    "aiter.ops.flydsl.kernels.buffer_ops"
+)
 COMPACT_A4_ENABLED = envs.SGLANG_ROCM_MUSE_COMPACT_A4_VERIFY.get() and _HAS_FLYDSL
 A4W4_ENABLED = envs.SGLANG_ROCM_MUSE_A4W4_MOE.get() and _HAS_FLYDSL
 A4W4_MIN_ROWS = 256

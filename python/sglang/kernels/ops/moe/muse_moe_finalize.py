@@ -3,12 +3,11 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.tensor_shim import _to_raw
 from flydsl.expr import arith, range_constexpr
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
-
-from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.tensor_shim import _to_raw
 
 
 def build_splitk_silu(I, split_k):
@@ -49,9 +48,7 @@ def build_splitk_silu(I, split_k):
         for j in range_constexpr(vec):
             exp = fx.rocdl.exp2(
                 T.f32,
-                arith.mulf(
-                    gate[j], arith.constant(-1.4426950408889634, type=T.f32)
-                ),
+                arith.mulf(gate[j], arith.constant(-1.4426950408889634, type=T.f32)),
             )
             sigmoid = arith.divf(
                 arith.constant(1.0, type=T.f32),
@@ -61,9 +58,7 @@ def build_splitk_silu(I, split_k):
                 arith.truncf(T.bf16, arith.mulf(arith.mulf(gate[j], sigmoid), up[j]))
             )
         packed = _to_raw(fx.Vector.from_elements(values, fx.BFloat16))
-        buffer_ops.buffer_store(
-            packed, outr, row * I + col, mask=_to_raw(col < I)
-        )
+        buffer_ops.buffer_store(packed, outr, row * I + col, mask=_to_raw(col < I))
 
     @flyc.jit
     def launch(
@@ -200,9 +195,7 @@ def build_finalize(H, topk, has_norm, has_scale, weight_dtype="bf16", split_k=1)
                         )
                     for j in range_constexpr(vec):
                         value = (
-                            arith.extf(
-                                T.f32, arith.truncf(T.bf16, _to_raw(vector[j]))
-                            )
+                            arith.extf(T.f32, arith.truncf(T.bf16, _to_raw(vector[j])))
                             if split_k > 1
                             else arith.extf(T.f32, _to_raw(vector[j]))
                         )
@@ -217,9 +210,7 @@ def build_finalize(H, topk, has_norm, has_scale, weight_dtype="bf16", split_k=1)
                         ss = arith.addf(ss, arith.mulf(value, value))
                 if fx.const_expr(has_norm):
                     ss = wave_sum(ss)
-                    slot_base = fx.Int32(
-                        arith.index_cast(T.i32, _to_raw(slot_i))
-                    ) * 4
+                    slot_base = fx.Int32(arith.index_cast(T.i32, _to_raw(slot_i))) * 4
                     if lane == 0:
                         lds.sums[slot_base + wave] = fx.Float32(ss)
                     fx.gpu.barrier()
