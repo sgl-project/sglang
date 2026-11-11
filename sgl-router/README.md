@@ -105,8 +105,14 @@ every flag.
 | `POST /v1/tokenize`, `/v1/detokenize` | Tokenize with the router's tokenizer |
 | `GET /v1/models` | The served model |
 | `POST /flush_cache` | Fan out a cache flush to every worker |
-| `GET /healthz`, `/readyz` | Liveness and readiness |
+| `GET /server_info`, `/model_info`, `/health_generate` | Answered by one healthy worker (a prefill worker under P/D; `/health_generate` also runs on one of its decode peers and returns the decode's answer when both pass); `/get_server_info` and `/get_model_info` are aliases |
+| `GET /healthz`, `/readyz` | Liveness and readiness; `/health`, `/liveness`, and `/readiness` are aliases |
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
+
+sgl-model-gateway endpoints for features the router does not provide yet
+(the Responses and Conversations APIs, `/parse/*`, `/workers`,
+`/v1/tokenizers`, `/wasm`, `/ha/*`, `/v1/loads`, `/get_loads`,
+`/engine_metrics`) answer `501` with error code `unsupported_endpoint`.
 
 Both edges speak cleartext HTTP/2 where the peer does; see
 [operations](#operations). With `--grpc-port`, the router also serves the
@@ -279,8 +285,8 @@ tools) go to the engine's own route unchanged. See
 conditions, and [chat rendering](REFERENCE.md#chat-rendering) plus the
 per-model sections ([DeepSeek V4 and V4.1](REFERENCE.md#deepseek-v4-and-v41),
 [GLM-5.3](REFERENCE.md#glm-53), [Qwen3.8](REFERENCE.md#qwen38),
-[Kimi-K3](REFERENCE.md#kimi-k3), [MiniMax-M3](REFERENCE.md#minimax-m3)) for which
-chats forward `input_ids`.
+[Kimi-K3](REFERENCE.md#kimi-k3), [MiniMax-M3](REFERENCE.md#minimax-m3),
+[StepFun](REFERENCE.md#stepfun)) for which chats forward `input_ids`.
 
 ### Anthropic Messages
 
@@ -362,6 +368,28 @@ unset fields inherit the CLI flags. See
 - **Upgrading**: the `cache_aware_zmq` policy and the legacy cache and balance
   threshold flags were removed; see
   [upgrading](REFERENCE.md#upgrading-from-cache_aware_zmq).
+
+### FIPS builds
+
+For deployments that require FIPS 140-validated cryptography, build with the
+opt-in `fips` cargo feature. The router then uses the aws-lc-rs FIPS module as
+its TLS provider (outbound connections to workers and the Kubernetes API) and
+exits at startup unless FIPS mode is active. Default builds are unchanged.
+
+```bash
+cargo build --release --features fips
+# or the container image
+docker build -f docker/sgl-router.Dockerfile --build-arg CARGO_FEATURES=fips .
+```
+
+- The FIPS module builds from source and needs cmake, Go and clang, on a glibc
+  (not musl) target. The Dockerfile installs them when `fips` is requested;
+  `RUNTIME_BASE_IMAGE` selects the runtime base, e.g. a FIPS-mode OS image.
+- FIPS builds do not download tokenizers from Hugging Face Hub (its HTTP
+  client cannot use the FIPS module): pass a local `--tokenizer-path`, or
+  `--no-tokenizer` for load-only policies.
+- On macOS, the FIPS module links as a shared library; set
+  `DYLD_LIBRARY_PATH` to its build output directory to run a native build.
 
 ## License
 

@@ -29,6 +29,15 @@ pub fn env_i64(name: &str, default: i64) -> i64 {
     read(name, default, |raw| raw.parse().ok())
 }
 
+/// Python `EnvFloat.parse`: `float(raw)`, surrounding whitespace allowed.
+pub fn env_f64(name: &str, default: f64) -> f64 {
+    read(name, default, parse_f64)
+}
+
+pub(crate) fn parse_f64(raw: &str) -> Option<f64> {
+    raw.trim().parse().ok()
+}
+
 /// Shared read-or-default: unset → default; a set-but-unparsable value warns
 /// and falls back to the default (mirrors `EnvField.get`'s `warnings.warn`).
 fn read<T: Copy + std::fmt::Debug>(name: &str, default: T, parse: impl Fn(&str) -> Option<T>) -> T {

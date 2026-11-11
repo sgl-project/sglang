@@ -82,14 +82,14 @@ def _token_count(item) -> int:
 class EarlyEmbeddings(PrefetchedEmbeddingFunc):
     """The image encoder, plus parked windows' pages it encoded ahead of prefill.
 
-    Embeddings are keyed by item hash and kept until their window finishes:
+    Embeddings are keyed by the full item identity and kept until their window finishes:
     chunked prefill embeds an image once per chunk it overlaps.
     """
 
     def __init__(self, *, encode: Callable[[List[MultimodalDataItem]], torch.Tensor]):
         self._encode = encode
-        self._by_hash: Dict[int, torch.Tensor] = {}
-        self._owned: Dict[str, List[int]] = {}
+        self._by_key: Dict[bytes, torch.Tensor] = {}
+        self._owned: Dict[str, List[bytes]] = {}
         self._bytes = 0
         self._stream: Optional[torch.cuda.Stream] = None
 
@@ -97,12 +97,12 @@ class EarlyEmbeddings(PrefetchedEmbeddingFunc):
         return self._encode(items)
 
     def has_prefetched(self) -> bool:
-        return bool(self._by_hash)
+        return bool(self._by_key)
 
     def prefetched(
-        self, item_hash: Optional[int], token_count: int
+        self, item_key: Optional[bytes], token_count: int
     ) -> Optional[torch.Tensor]:
-        emb = self._by_hash.get(item_hash) if item_hash is not None else None
+        emb = self._by_key.get(item_key) if item_key is not None else None
         if emb is None or emb.shape[0] != token_count:
             return None
         return emb
@@ -122,7 +122,9 @@ class EarlyEmbeddings(PrefetchedEmbeddingFunc):
         them, and a miss here costs only time.
         """
         items = [
-            it for it in items if it.hash is not None and it.hash not in self._by_hash
+            it
+            for it in items
+            if it.hash is not None and it.cache_key not in self._by_key
         ]
         if not items or any(it.feature is None or not it.offsets for it in items):
             return
@@ -157,21 +159,21 @@ class EarlyEmbeddings(PrefetchedEmbeddingFunc):
             if emb.shape[0] != _token_count(it):
                 continue
             emb.record_stream(forward_stream)
-            self._by_hash[it.hash] = emb
+            self._by_key[it.cache_key] = emb
             self._bytes += emb.numel() * emb.element_size()
-            owned.append(it.hash)
+            owned.append(it.cache_key)
         self._owned[rid] = owned
 
     def release(self, rid: str) -> None:
         """Free a window's early embeddings once it no longer needs them."""
         for h in self._owned.pop(rid, ()):
-            emb = self._by_hash.pop(h, None)
+            emb = self._by_key.pop(h, None)
             if emb is not None:
                 self._bytes -= emb.numel() * emb.element_size()
 
     def clear(self) -> None:
         """Drop every early embedding."""
-        self._by_hash.clear()
+        self._by_key.clear()
         self._owned.clear()
         self._bytes = 0
 
@@ -220,7 +222,7 @@ class DocPrefetch:
             return False
         if not envs.SGLANG_ENABLE_UOCR_DOC_PREFETCH.get():
             return False
-        self._parked.join([req])
+        move([req], self._parked)
         mm = req.multimodal_inputs
         if self._encode_ahead and mm is not None and mm.mm_items:
             self._early.encode_ahead(
@@ -236,7 +238,7 @@ class DocPrefetch:
         """Mark every follow-up of a finished ``req`` released, budget capped.
 
         Called from the KV-release path after the window's KV was retained; the
-        scheduler queues released windows with ``take_released``. A retracted
+        scheduler moves ``released`` windows into its queue. A retracted
         window comes through the same hook unfinished and releases nothing.
         """
         if _after(req) is None and not _is_predecessor(req):
@@ -253,11 +255,12 @@ class DocPrefetch:
             return
         for follow in follows:
             _apply_budget(follow, used)
-        move(follows, self._parked, self._released)
+        move(follows, self._released)
 
-    def take_released(self) -> List[Req]:
-        """Follow-ups released since the last call, in release order."""
-        return self._released.take()
+    @property
+    def released(self) -> IndexedReqList:
+        """Follow-ups released and not yet queued, in release order."""
+        return self._released
 
     def request_lists(self) -> Dict[ListKind, ReqList]:
         return {
@@ -266,7 +269,7 @@ class DocPrefetch:
         }
 
     def _abort(self, windows: ReqList, recv_req: AbortReq) -> None:
-        aborted = windows.take(lambda r: recv_req.matches(r.rid))
+        aborted = [r for r in windows if recv_req.matches(r.rid)]
         for r in aborted:
             self.release_early(r.rid)
         self._abort_windows(aborted, finished_reason=recv_req.finished_reason)
@@ -286,10 +289,9 @@ class DocPrefetch:
             self._early.release(rid)
 
     def reset(self) -> List[Req]:
-        """Forget everything; returns the held follow-ups for the caller to abort."""
+        """Forget everything; returns the held follow-ups for the caller to
+        abort, which takes them out of their lists."""
         held = [*self._parked, *self._released]
-        self._parked.clear()
-        self._released.clear()
         self._finished.clear()
         if self._early is not None:
             self._early.clear()
