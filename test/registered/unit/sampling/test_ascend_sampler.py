@@ -92,6 +92,8 @@ class TestAscendSamplingMaskCapture(unittest.TestCase):
                 filtered = logits.masked_fill(logits < 2, -float("inf"))
                 probs = logits.softmax(-1)
                 with (
+                    # Match NPU eager execution; Dynamo cannot trace these CPU mocks.
+                    torch.compiler.set_stance("force_eager"),
                     patch.object(
                         sampler_module,
                         "torch_npu",
