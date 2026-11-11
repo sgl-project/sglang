@@ -965,6 +965,320 @@
       "canonical": "{\"model\":\"m\"}"
     },
     {
+      "type": "AnthropicMessagesRequest",
+      "name": "string and block content, tools, and stream default false",
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "a"
+              },
+              {
+                "type": "tool_use",
+                "id": "t1",
+                "name": "f",
+                "input": {
+                  "x": 1
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "t1",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "42"
+                  }
+                ],
+                "is_error": false
+              }
+            ]
+          }
+        ],
+        "max_tokens": 8,
+        "metadata": {
+          "user_id": "u"
+        },
+        "stop_sequences": [
+          "END"
+        ],
+        "system": "be brief",
+        "temperature": 0.5,
+        "thinking": {
+          "type": "enabled",
+          "budget_tokens": 1024
+        },
+        "tool_choice": {
+          "type": "tool",
+          "name": "f"
+        },
+        "tools": [
+          {
+            "name": "f",
+            "description": "d",
+            "input_schema": {
+              "type": "object",
+              "properties": {}
+            }
+          },
+          {
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 3
+          }
+        ],
+        "top_k": 5,
+        "top_p": 0.9,
+        "output_config": {
+          "effort": "high",
+          "task_budget": {
+            "type": "tokens",
+            "total": 100
+          }
+        },
+        "betas": [
+          "b"
+        ]
+      },
+      "canonical": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"a\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"f\",\"input\":{\"x\":1}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":[{\"type\":\"text\",\"text\":\"42\"}],\"is_error\":false}]}],\"max_tokens\":8,\"metadata\":{\"user_id\":\"u\"},\"stop_sequences\":[\"END\"],\"stream\":false,\"system\":\"be brief\",\"temperature\":0.5,\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024},\"tool_choice\":{\"type\":\"tool\",\"name\":\"f\"},\"tools\":[{\"name\":\"f\",\"description\":\"d\",\"input_schema\":{\"type\":\"object\",\"properties\":{}}},{\"type\":\"web_search_20250305\",\"name\":\"web_search\",\"max_uses\":3}],\"top_k\":5,\"top_p\":0.9,\"output_config\":{\"effort\":\"high\",\"task_budget\":{\"type\":\"tokens\",\"total\":100}},\"betas\":[\"b\"]}"
+    },
+    {
+      "type": "AnthropicMessagesRequest",
+      "name": "image, search_result, thinking, and redacted_thinking blocks; system as blocks",
+      "input": {
+        "model": "m",
+        "max_tokens": 1,
+        "system": [
+          {
+            "type": "text",
+            "text": "s"
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "AA=="
+                }
+              },
+              {
+                "type": "image",
+                "source": "ref"
+              },
+              {
+                "type": "search_result",
+                "source": {
+                  "url": "http://x"
+                },
+                "title": "T",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "c"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "hmm",
+                "signature": "sig"
+              },
+              {
+                "type": "redacted_thinking",
+                "data": "d"
+              },
+              {
+                "type": "tool_reference",
+                "tool_name": "f"
+              }
+            ]
+          }
+        ],
+        "stream": null
+      },
+      "canonical": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"AA==\"}},{\"type\":\"image\",\"source\":\"ref\"},{\"type\":\"search_result\",\"source\":{\"url\":\"http://x\"},\"title\":\"T\",\"content\":[{\"type\":\"text\",\"text\":\"c\"}]}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"hmm\",\"signature\":\"sig\"},{\"type\":\"redacted_thinking\",\"data\":\"d\"},{\"type\":\"tool_reference\",\"tool_name\":\"f\"}]}],\"max_tokens\":1,\"stream\":false,\"system\":[{\"type\":\"text\",\"text\":\"s\"}]}"
+    },
+    {
+      "type": "AnthropicMessagesResponse",
+      "name": "the unary reply: blocks, stop reason, usage; absent stop_sequence omitted",
+      "input": {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "t"
+          },
+          {
+            "type": "text",
+            "text": "ok"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "f",
+            "input": {}
+          }
+        ],
+        "model": "m",
+        "stop_reason": "tool_use",
+        "usage": {
+          "input_tokens": 5,
+          "output_tokens": 3,
+          "cache_read_input_tokens": 2
+        }
+      },
+      "canonical": "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"t\"},{\"type\":\"text\",\"text\":\"ok\"},{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"f\",\"input\":{}}],\"model\":\"m\",\"stop_reason\":\"tool_use\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"cache_read_input_tokens\":2}}"
+    },
+    {
+      "type": "AnthropicStreamEvent",
+      "name": "message_start keeps an empty content list",
+      "input": {
+        "type": "message_start",
+        "message": {
+          "id": "msg_1",
+          "type": "message",
+          "role": "assistant",
+          "content": [],
+          "model": "m",
+          "usage": {
+            "input_tokens": 5,
+            "output_tokens": 0
+          }
+        }
+      },
+      "canonical": "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}"
+    },
+    {
+      "type": "AnthropicStreamEvent",
+      "name": "content_block_delta with a text delta at index 0",
+      "input": {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+          "type": "text_delta",
+          "text": "hi"
+        }
+      },
+      "canonical": "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}"
+    },
+    {
+      "type": "AnthropicStreamEvent",
+      "name": "content_block_start with a tool_use block",
+      "input": {
+        "type": "content_block_start",
+        "index": 1,
+        "content_block": {
+          "type": "tool_use",
+          "id": "toolu_1",
+          "name": "f",
+          "input": {}
+        }
+      },
+      "canonical": "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"f\",\"input\":{}}}"
+    },
+    {
+      "type": "AnthropicStreamEvent",
+      "name": "message_delta carries the stop reason and usage; message_stop is bare",
+      "input": {
+        "type": "message_delta",
+        "delta": {
+          "stop_reason": "end_turn"
+        },
+        "usage": {
+          "output_tokens": 3
+        }
+      },
+      "canonical": "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}"
+    },
+    {
+      "type": "AnthropicStreamEvent",
+      "name": "message_stop",
+      "input": {
+        "type": "message_stop"
+      },
+      "canonical": "{\"type\":\"message_stop\"}"
+    },
+    {
+      "type": "AnthropicStreamEvent",
+      "name": "error event",
+      "input": {
+        "type": "error",
+        "error": {
+          "type": "api_error",
+          "message": "boom"
+        }
+      },
+      "canonical": "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"boom\"}}"
+    },
+    {
+      "type": "AnthropicErrorResponse",
+      "name": "the HTTP envelope",
+      "input": {
+        "type": "error",
+        "error": {
+          "type": "invalid_request_error",
+          "message": "max_tokens must be positive"
+        }
+      },
+      "canonical": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"max_tokens must be positive\"}}"
+    },
+    {
+      "type": "AnthropicCountTokensRequest",
+      "name": "count_tokens accepts the messages fields it shares",
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "name": "f",
+            "input_schema": {
+              "type": "object"
+            }
+          }
+        ],
+        "betas": []
+      },
+      "canonical": "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[{\"name\":\"f\",\"input_schema\":{\"type\":\"object\"}}]}"
+    },
+    {
+      "type": "AnthropicCountTokensResponse",
+      "name": "input_tokens",
+      "input": {
+        "input_tokens": 12
+      },
+      "canonical": "{\"input_tokens\":12}"
+    },
+    {
       "type": "UpdateWeightsFromDiskRequest",
       "name": "flush_cache defaults on and null resets it; unread fields keep Python's defaults",
       "input": {

@@ -127,6 +127,631 @@ class ErrorBody(msgspec.Struct, kw_only=True, frozen=True):
         return encode_ErrorBody(self)
 
 
+class AnthropicError(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicError: JSON object (unknown keys ignored)."""
+
+    type: str = ""
+    message: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicError":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicError(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicError(self)
+
+
+class AnthropicErrorResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicErrorResponse: JSON object (unknown keys ignored)."""
+
+    type: str = ""
+    error: Optional[AnthropicError] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicErrorResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicErrorResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicErrorResponse(self)
+
+
+class AnthropicUsage(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicUsage: JSON object (unknown keys ignored)."""
+
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    cache_creation_input_tokens: Optional[int] = None
+    cache_read_input_tokens: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicUsage":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicUsage(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicUsage(self)
+
+
+class AnthropicTextBlock(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicTextBlock: JSON object (unknown keys ignored)."""
+
+    text: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicTextBlock":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicTextBlock(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicTextBlock(self)
+
+
+class AnthropicImageBlock(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicImageBlock: JSON object (unknown keys ignored)."""
+
+    source: Optional[AnthropicImageSource] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicImageBlock":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicImageBlock(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicImageBlock(self)
+
+
+class AnthropicImageSourceObject(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicImageSourceObject: JSON object (unknown keys ignored)."""
+
+    type: Optional[str] = None
+    media_type: Optional[str] = None
+    data: Optional[str] = None
+    url: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicImageSourceObject":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicImageSourceObject(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicImageSourceObject(self)
+
+
+class AnthropicToolUseBlock(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicToolUseBlock: JSON object (unknown keys ignored)."""
+
+    id: str = ""
+    name: str = ""
+    input: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicToolUseBlock":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicToolUseBlock(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicToolUseBlock(self)
+
+
+class AnthropicToolResultBlock(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicToolResultBlock: JSON object (unknown keys ignored)."""
+
+    tool_use_id: Optional[str] = None
+    id: Optional[str] = None
+    content: Optional[AnthropicContent] = None
+    is_error: Optional[bool] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicToolResultBlock":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicToolResultBlock(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicToolResultBlock(self)
+
+
+class AnthropicToolReferenceBlock(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicToolReferenceBlock: JSON object (unknown keys ignored)."""
+
+    name: Optional[str] = None
+    tool_name: Optional[str] = None
+    id: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicToolReferenceBlock":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicToolReferenceBlock(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicToolReferenceBlock(self)
+
+
+class AnthropicSearchResultBlock(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicSearchResultBlock: JSON object (unknown keys ignored)."""
+
+    source: Optional[AnthropicSearchSource] = None
+    title: Optional[str] = None
+    content: List[AnthropicSearchResultItem] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicSearchResultBlock":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicSearchResultBlock(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicSearchResultBlock(self)
+
+
+class AnthropicSearchSourceObject(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicSearchSourceObject: JSON object (unknown keys ignored)."""
+
+    url: Optional[str] = None
+    text: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicSearchSourceObject":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicSearchSourceObject(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicSearchSourceObject(self)
+
+
+class AnthropicSearchResultItem(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicSearchResultItem: JSON object (unknown keys ignored)."""
+
+    type: Optional[str] = None
+    text: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicSearchResultItem":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicSearchResultItem(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicSearchResultItem(self)
+
+
+class AnthropicThinkingBlock(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicThinkingBlock: JSON object (unknown keys ignored)."""
+
+    thinking: str = ""
+    signature: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicThinkingBlock":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicThinkingBlock(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicThinkingBlock(self)
+
+
+class AnthropicRedactedThinkingBlock(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicRedactedThinkingBlock: JSON object (unknown keys ignored)."""
+
+    data: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicRedactedThinkingBlock":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicRedactedThinkingBlock(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicRedactedThinkingBlock(self)
+
+
+class AnthropicMessage(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicMessage: JSON object (unknown keys ignored)."""
+
+    role: str = ""
+    content: Optional[AnthropicContent] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicMessage":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicMessage(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicMessage(self)
+
+
+class AnthropicTool(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicTool: JSON object (unknown keys ignored)."""
+
+    type: Optional[str] = None
+    name: str = ""
+    description: Optional[str] = None
+    input_schema: Optional[Any] = None
+    defer_loading: Optional[bool] = None
+    max_uses: Optional[int] = None
+    allowed_domains: List[str] = []
+    blocked_domains: List[str] = []
+    display_width_px: Optional[int] = None
+    display_height_px: Optional[int] = None
+    display_number: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicTool":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicTool(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicTool(self)
+
+
+class AnthropicToolChoice(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicToolChoice: JSON object (unknown keys ignored)."""
+
+    type: str = ""
+    name: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicToolChoice":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicToolChoice(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicToolChoice(self)
+
+
+class AnthropicThinkingParam(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicThinkingParam: JSON object (unknown keys ignored)."""
+
+    type: str = ""
+    budget_tokens: Optional[int] = None
+    display: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicThinkingParam":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicThinkingParam(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicThinkingParam(self)
+
+
+class AnthropicTaskBudget(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicTaskBudget: JSON object (unknown keys ignored)."""
+
+    type: str = ""
+    total: int = 0
+    remaining: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicTaskBudget":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicTaskBudget(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicTaskBudget(self)
+
+
+class AnthropicOutputConfig(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicOutputConfig: JSON object (unknown keys ignored)."""
+
+    effort: Optional[str] = None
+    task_budget: Optional[AnthropicTaskBudget] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicOutputConfig":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicOutputConfig(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicOutputConfig(self)
+
+
+class AnthropicMessagesRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicMessagesRequest: JSON object (unknown keys ignored)."""
+
+    model: str = ""
+    messages: List[AnthropicMessage] = []
+    max_tokens: int = 0
+    metadata: Optional[Any] = None
+    stop_sequences: List[str] = []
+    stream: Optional[bool] = False
+    system: Optional[AnthropicContent] = None
+    temperature: Optional[float] = None
+    thinking: Optional[AnthropicThinkingParam] = None
+    tool_choice: Optional[AnthropicToolChoice] = None
+    tools: List[AnthropicTool] = []
+    top_k: Optional[int] = None
+    top_p: Optional[float] = None
+    output_config: Optional[AnthropicOutputConfig] = None
+    betas: List[str] = []
+    bootstrap_host: Optional[StringOrList] = None
+    bootstrap_port: Optional[OptionalInt64OrList] = None
+    bootstrap_room: Optional[Int64OrList] = None
+    routed_dp_rank: Optional[int] = None
+    disagg_prefill_dp_rank: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicMessagesRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicMessagesRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicMessagesRequest(self)
+
+
+class AnthropicMessagesResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicMessagesResponse: JSON object (unknown keys ignored)."""
+
+    id: str = ""
+    type: str = ""
+    role: str = ""
+    content: Optional[AnthropicContentBlockList] = None
+    model: str = ""
+    stop_reason: Optional[str] = None
+    stop_sequence: Optional[str] = None
+    usage: Optional[AnthropicUsage] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicMessagesResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicMessagesResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicMessagesResponse(self)
+
+
+class AnthropicCountTokensRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicCountTokensRequest: JSON object (unknown keys ignored)."""
+
+    model: str = ""
+    messages: List[AnthropicMessage] = []
+    system: Optional[AnthropicContent] = None
+    thinking: Optional[AnthropicThinkingParam] = None
+    tool_choice: Optional[AnthropicToolChoice] = None
+    tools: List[AnthropicTool] = []
+    output_config: Optional[AnthropicOutputConfig] = None
+    betas: List[str] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicCountTokensRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicCountTokensRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicCountTokensRequest(self)
+
+
+class AnthropicCountTokensResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicCountTokensResponse: JSON object (unknown keys ignored)."""
+
+    input_tokens: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicCountTokensResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicCountTokensResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicCountTokensResponse(self)
+
+
+class AnthropicMessageStartEvent(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicMessageStartEvent: JSON object (unknown keys ignored)."""
+
+    message: Optional[AnthropicMessagesResponse] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicMessageStartEvent":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicMessageStartEvent(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicMessageStartEvent(self)
+
+
+class AnthropicMessageDeltaEvent(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicMessageDeltaEvent: JSON object (unknown keys ignored)."""
+
+    delta: Optional[AnthropicMessageEndDelta] = None
+    usage: Optional[AnthropicUsage] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicMessageDeltaEvent":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicMessageDeltaEvent(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicMessageDeltaEvent(self)
+
+
+class AnthropicMessageEndDelta(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicMessageEndDelta: JSON object (unknown keys ignored)."""
+
+    stop_reason: Optional[str] = None
+    stop_sequence: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicMessageEndDelta":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicMessageEndDelta(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicMessageEndDelta(self)
+
+
+class AnthropicMessageStopEvent(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicMessageStopEvent: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicMessageStopEvent":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicMessageStopEvent(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicMessageStopEvent(self)
+
+
+class AnthropicContentBlockStartEvent(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicContentBlockStartEvent: JSON object (unknown keys ignored)."""
+
+    index: int = 0
+    content_block: Optional[AnthropicContentBlock] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicContentBlockStartEvent":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicContentBlockStartEvent(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicContentBlockStartEvent(self)
+
+
+class AnthropicContentBlockDeltaEvent(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicContentBlockDeltaEvent: JSON object (unknown keys ignored)."""
+
+    index: int = 0
+    delta: Optional[AnthropicContentDelta] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicContentBlockDeltaEvent":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicContentBlockDeltaEvent(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicContentBlockDeltaEvent(self)
+
+
+class AnthropicContentBlockStopEvent(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicContentBlockStopEvent: JSON object (unknown keys ignored)."""
+
+    index: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicContentBlockStopEvent":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicContentBlockStopEvent(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicContentBlockStopEvent(self)
+
+
+class AnthropicPingEvent(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicPingEvent: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicPingEvent":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicPingEvent(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicPingEvent(self)
+
+
+class AnthropicErrorEvent(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicErrorEvent: JSON object (unknown keys ignored)."""
+
+    error: Optional[AnthropicError] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicErrorEvent":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicErrorEvent(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicErrorEvent(self)
+
+
+class AnthropicTextDelta(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicTextDelta: JSON object (unknown keys ignored)."""
+
+    text: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicTextDelta":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicTextDelta(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicTextDelta(self)
+
+
+class AnthropicInputJsonDelta(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicInputJsonDelta: JSON object (unknown keys ignored)."""
+
+    partial_json: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicInputJsonDelta":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicInputJsonDelta(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicInputJsonDelta(self)
+
+
+class AnthropicThinkingDelta(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicThinkingDelta: JSON object (unknown keys ignored)."""
+
+    thinking: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicThinkingDelta":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicThinkingDelta(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicThinkingDelta(self)
+
+
+class AnthropicSignatureDelta(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AnthropicSignatureDelta: JSON object (unknown keys ignored)."""
+
+    signature: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AnthropicSignatureDelta":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AnthropicSignatureDelta(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AnthropicSignatureDelta(self)
+
+
 class SetInternalStateRequest(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.SetInternalStateRequest: JSON object (unknown keys ignored)."""
 
@@ -2298,6 +2923,27 @@ OptionalInt64 = Optional[int]
 # sglang.api.v1.OptionalInt64List: JSON bare array.
 OptionalInt64List = List[OptionalInt64]
 
+# sglang.api.v1.AnthropicContentBlock: JSON object tagged by its type key.
+AnthropicContentBlock = Union[AnthropicTextBlock, AnthropicImageBlock, AnthropicToolUseBlock, AnthropicToolResultBlock, AnthropicToolReferenceBlock, AnthropicSearchResultBlock, AnthropicThinkingBlock, AnthropicRedactedThinkingBlock]
+
+# sglang.api.v1.AnthropicContentBlockList: JSON bare array.
+AnthropicContentBlockList = List[AnthropicContentBlock]
+
+# sglang.api.v1.AnthropicContent: JSON: the value's shape picks the arm.
+AnthropicContent = Union[str, AnthropicContentBlockList]
+
+# sglang.api.v1.AnthropicImageSource: JSON: the value's shape picks the arm.
+AnthropicImageSource = Union[str, AnthropicImageSourceObject]
+
+# sglang.api.v1.AnthropicSearchSource: JSON: the value's shape picks the arm.
+AnthropicSearchSource = Union[str, AnthropicSearchSourceObject]
+
+# sglang.api.v1.AnthropicStreamEvent: JSON object tagged by its type key.
+AnthropicStreamEvent = Union[AnthropicMessageStartEvent, AnthropicMessageDeltaEvent, AnthropicMessageStopEvent, AnthropicContentBlockStartEvent, AnthropicContentBlockDeltaEvent, AnthropicContentBlockStopEvent, AnthropicPingEvent, AnthropicErrorEvent]
+
+# sglang.api.v1.AnthropicContentDelta: JSON object tagged by its type key.
+AnthropicContentDelta = Union[AnthropicTextDelta, AnthropicInputJsonDelta, AnthropicThinkingDelta, AnthropicSignatureDelta]
+
 # sglang.api.v1.SetInternalStateResponse: JSON bare array.
 SetInternalStateResponse = List[bool]
 
@@ -2584,6 +3230,1202 @@ def encode_ErrorBody(v: ErrorBody) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     d["message"] = v.message
     d["code"] = v.code
+    return d
+
+
+def decode_AnthropicError(value: Any) -> AnthropicError:
+    m = _expect_map(value, expected="struct AnthropicError")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "type":
+            kw["type"] = _expect_str(x, expected="a string")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+    return AnthropicError(**kw)
+
+
+def encode_AnthropicError(v: AnthropicError) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["type"] = v.type
+    d["message"] = v.message
+    return d
+
+
+def decode_AnthropicErrorResponse(value: Any) -> AnthropicErrorResponse:
+    m = _expect_map(value, expected="struct AnthropicErrorResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "type":
+            kw["type"] = _expect_str(x, expected="a string")
+        elif key == "error":
+            kw["error"] = None if x is None else decode_AnthropicError(x)
+    return AnthropicErrorResponse(**kw)
+
+
+def encode_AnthropicErrorResponse(v: AnthropicErrorResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["type"] = v.type
+    if v.error is not None:
+        d["error"] = encode_AnthropicError(v.error)
+    return d
+
+
+def decode_AnthropicUsage(value: Any) -> AnthropicUsage:
+    m = _expect_map(value, expected="struct AnthropicUsage")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "input_tokens":
+            kw["input_tokens"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "output_tokens":
+            kw["output_tokens"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "cache_creation_input_tokens":
+            kw["cache_creation_input_tokens"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "cache_read_input_tokens":
+            kw["cache_read_input_tokens"] = None if x is None else _expect_int(x, expected="i64")
+    return AnthropicUsage(**kw)
+
+
+def encode_AnthropicUsage(v: AnthropicUsage) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.input_tokens is not None:
+        d["input_tokens"] = v.input_tokens
+    if v.output_tokens is not None:
+        d["output_tokens"] = v.output_tokens
+    if v.cache_creation_input_tokens is not None:
+        d["cache_creation_input_tokens"] = v.cache_creation_input_tokens
+    if v.cache_read_input_tokens is not None:
+        d["cache_read_input_tokens"] = v.cache_read_input_tokens
+    return d
+
+
+def decode_AnthropicContentBlock(value: Any) -> AnthropicContentBlock:
+    raw = _expect_map(value, expected="map")
+    tag = raw.get("type")
+    if tag == "text":
+        try:
+            return AnthropicTextBlock(
+                text="" if "text" not in raw else _expect_str(raw["text"], expected="a string"),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "image":
+        try:
+            return AnthropicImageBlock(
+                source=None if raw.get("source") is None else decode_AnthropicImageSource(raw.get("source")),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "tool_use":
+        try:
+            return AnthropicToolUseBlock(
+                id="" if "id" not in raw else _expect_str(raw["id"], expected="a string"),
+                name="" if "name" not in raw else _expect_str(raw["name"], expected="a string"),
+                input=raw.get("input"),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "tool_result":
+        try:
+            return AnthropicToolResultBlock(
+                tool_use_id=None if raw.get("tool_use_id") is None else _expect_str(raw.get("tool_use_id"), expected="a string"),
+                id=None if raw.get("id") is None else _expect_str(raw.get("id"), expected="a string"),
+                content=None if raw.get("content") is None else decode_AnthropicContent(raw.get("content")),
+                is_error=None if raw.get("is_error") is None else _expect_bool(raw.get("is_error"), expected="a boolean"),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "tool_reference":
+        try:
+            return AnthropicToolReferenceBlock(
+                name=None if raw.get("name") is None else _expect_str(raw.get("name"), expected="a string"),
+                tool_name=None if raw.get("tool_name") is None else _expect_str(raw.get("tool_name"), expected="a string"),
+                id=None if raw.get("id") is None else _expect_str(raw.get("id"), expected="a string"),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "search_result":
+        try:
+            return AnthropicSearchResultBlock(
+                source=None if raw.get("source") is None else decode_AnthropicSearchSource(raw.get("source")),
+                title=None if raw.get("title") is None else _expect_str(raw.get("title"), expected="a string"),
+                content=[] if raw.get("content") is None else [decode_AnthropicSearchResultItem(e) for e in _expect_seq(raw.get("content"), expected="a sequence")],
+            )
+        except JsonContractError:
+            raise
+    elif tag == "thinking":
+        try:
+            return AnthropicThinkingBlock(
+                thinking="" if "thinking" not in raw else _expect_str(raw["thinking"], expected="a string"),
+                signature=None if raw.get("signature") is None else _expect_str(raw.get("signature"), expected="a string"),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "redacted_thinking":
+        try:
+            return AnthropicRedactedThinkingBlock(
+                data=None if raw.get("data") is None else _expect_str(raw.get("data"), expected="a string"),
+            )
+        except JsonContractError:
+            raise
+    raise JsonContractError("unknown type for AnthropicContentBlock")
+
+
+def encode_AnthropicContentBlock(v: AnthropicContentBlock) -> Any:
+    if isinstance(v, AnthropicTextBlock):
+        d: Dict[str, Any] = {"type": "text"}
+        d["text"] = v.text
+        return d
+    if isinstance(v, AnthropicImageBlock):
+        d: Dict[str, Any] = {"type": "image"}
+        if v.source is not None:
+            d["source"] = encode_AnthropicImageSource(v.source)
+        return d
+    if isinstance(v, AnthropicToolUseBlock):
+        d: Dict[str, Any] = {"type": "tool_use"}
+        d["id"] = v.id
+        d["name"] = v.name
+        if v.input is not None:
+            d["input"] = v.input
+        return d
+    if isinstance(v, AnthropicToolResultBlock):
+        d: Dict[str, Any] = {"type": "tool_result"}
+        if v.tool_use_id is not None:
+            d["tool_use_id"] = v.tool_use_id
+        if v.id is not None:
+            d["id"] = v.id
+        if v.content is not None:
+            d["content"] = encode_AnthropicContent(v.content)
+        if v.is_error is not None:
+            d["is_error"] = v.is_error
+        return d
+    if isinstance(v, AnthropicToolReferenceBlock):
+        d: Dict[str, Any] = {"type": "tool_reference"}
+        if v.name is not None:
+            d["name"] = v.name
+        if v.tool_name is not None:
+            d["tool_name"] = v.tool_name
+        if v.id is not None:
+            d["id"] = v.id
+        return d
+    if isinstance(v, AnthropicSearchResultBlock):
+        d: Dict[str, Any] = {"type": "search_result"}
+        if v.source is not None:
+            d["source"] = encode_AnthropicSearchSource(v.source)
+        if v.title is not None:
+            d["title"] = v.title
+        if v.content:
+            d["content"] = [encode_AnthropicSearchResultItem(e) for e in v.content]
+        return d
+    if isinstance(v, AnthropicThinkingBlock):
+        d: Dict[str, Any] = {"type": "thinking"}
+        d["thinking"] = v.thinking
+        if v.signature is not None:
+            d["signature"] = v.signature
+        return d
+    if isinstance(v, AnthropicRedactedThinkingBlock):
+        d: Dict[str, Any] = {"type": "redacted_thinking"}
+        if v.data is not None:
+            d["data"] = v.data
+        return d
+    raise TypeError(f"AnthropicContentBlock: unsupported value {type(v).__name__}")
+
+
+def decode_AnthropicContentBlockList(value: Any) -> AnthropicContentBlockList:
+    return [decode_AnthropicContentBlock(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_AnthropicContentBlockList(v: AnthropicContentBlockList) -> List[Any]:
+    return [encode_AnthropicContentBlock(e) for e in v]
+
+
+def decode_AnthropicContent(value: Any) -> AnthropicContent:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return decode_AnthropicContentBlockList(value)
+    raise _invalid_type(value, expected="one of the AnthropicContent shapes")
+
+
+def encode_AnthropicContent(v: AnthropicContent) -> Any:
+    if isinstance(v, (str,)):
+        return v
+    if isinstance(v, (list,)):
+        return encode_AnthropicContentBlockList(v)
+    return v
+
+
+def decode_AnthropicTextBlock(value: Any) -> AnthropicTextBlock:
+    m = _expect_map(value, expected="struct AnthropicTextBlock")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "text":
+            kw["text"] = _expect_str(x, expected="a string")
+    return AnthropicTextBlock(**kw)
+
+
+def encode_AnthropicTextBlock(v: AnthropicTextBlock) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["text"] = v.text
+    return d
+
+
+def decode_AnthropicImageBlock(value: Any) -> AnthropicImageBlock:
+    m = _expect_map(value, expected="struct AnthropicImageBlock")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "source":
+            kw["source"] = None if x is None else decode_AnthropicImageSource(x)
+    return AnthropicImageBlock(**kw)
+
+
+def encode_AnthropicImageBlock(v: AnthropicImageBlock) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.source is not None:
+        d["source"] = encode_AnthropicImageSource(v.source)
+    return d
+
+
+def decode_AnthropicImageSource(value: Any) -> AnthropicImageSource:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return decode_AnthropicImageSourceObject(value)
+    raise _invalid_type(value, expected="one of the AnthropicImageSource shapes")
+
+
+def encode_AnthropicImageSource(v: AnthropicImageSource) -> Any:
+    if isinstance(v, (str,)):
+        return v
+    if isinstance(v, (AnthropicImageSourceObject,)):
+        return encode_AnthropicImageSourceObject(v)
+    return v
+
+
+def decode_AnthropicImageSourceObject(value: Any) -> AnthropicImageSourceObject:
+    m = _expect_map(value, expected="struct AnthropicImageSourceObject")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "type":
+            kw["type"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "media_type":
+            kw["media_type"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "data":
+            kw["data"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "url":
+            kw["url"] = None if x is None else _expect_str(x, expected="a string")
+    return AnthropicImageSourceObject(**kw)
+
+
+def encode_AnthropicImageSourceObject(v: AnthropicImageSourceObject) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.type is not None:
+        d["type"] = v.type
+    if v.media_type is not None:
+        d["media_type"] = v.media_type
+    if v.data is not None:
+        d["data"] = v.data
+    if v.url is not None:
+        d["url"] = v.url
+    return d
+
+
+def decode_AnthropicToolUseBlock(value: Any) -> AnthropicToolUseBlock:
+    m = _expect_map(value, expected="struct AnthropicToolUseBlock")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "id":
+            kw["id"] = _expect_str(x, expected="a string")
+        elif key == "name":
+            kw["name"] = _expect_str(x, expected="a string")
+        elif key == "input":
+            kw["input"] = x
+    return AnthropicToolUseBlock(**kw)
+
+
+def encode_AnthropicToolUseBlock(v: AnthropicToolUseBlock) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["id"] = v.id
+    d["name"] = v.name
+    if v.input is not None:
+        d["input"] = v.input
+    return d
+
+
+def decode_AnthropicToolResultBlock(value: Any) -> AnthropicToolResultBlock:
+    m = _expect_map(value, expected="struct AnthropicToolResultBlock")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "tool_use_id":
+            kw["tool_use_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "id":
+            kw["id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "content":
+            kw["content"] = None if x is None else decode_AnthropicContent(x)
+        elif key == "is_error":
+            kw["is_error"] = None if x is None else _expect_bool(x, expected="a boolean")
+    return AnthropicToolResultBlock(**kw)
+
+
+def encode_AnthropicToolResultBlock(v: AnthropicToolResultBlock) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.tool_use_id is not None:
+        d["tool_use_id"] = v.tool_use_id
+    if v.id is not None:
+        d["id"] = v.id
+    if v.content is not None:
+        d["content"] = encode_AnthropicContent(v.content)
+    if v.is_error is not None:
+        d["is_error"] = v.is_error
+    return d
+
+
+def decode_AnthropicToolReferenceBlock(value: Any) -> AnthropicToolReferenceBlock:
+    m = _expect_map(value, expected="struct AnthropicToolReferenceBlock")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "name":
+            kw["name"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "tool_name":
+            kw["tool_name"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "id":
+            kw["id"] = None if x is None else _expect_str(x, expected="a string")
+    return AnthropicToolReferenceBlock(**kw)
+
+
+def encode_AnthropicToolReferenceBlock(v: AnthropicToolReferenceBlock) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.name is not None:
+        d["name"] = v.name
+    if v.tool_name is not None:
+        d["tool_name"] = v.tool_name
+    if v.id is not None:
+        d["id"] = v.id
+    return d
+
+
+def decode_AnthropicSearchResultBlock(value: Any) -> AnthropicSearchResultBlock:
+    m = _expect_map(value, expected="struct AnthropicSearchResultBlock")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "source":
+            kw["source"] = None if x is None else decode_AnthropicSearchSource(x)
+        elif key == "title":
+            kw["title"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "content":
+            kw["content"] = [] if x is None else [decode_AnthropicSearchResultItem(e) for e in _expect_seq(x, expected="a sequence")]
+    return AnthropicSearchResultBlock(**kw)
+
+
+def encode_AnthropicSearchResultBlock(v: AnthropicSearchResultBlock) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.source is not None:
+        d["source"] = encode_AnthropicSearchSource(v.source)
+    if v.title is not None:
+        d["title"] = v.title
+    if v.content:
+        d["content"] = [encode_AnthropicSearchResultItem(e) for e in v.content]
+    return d
+
+
+def decode_AnthropicSearchSource(value: Any) -> AnthropicSearchSource:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return decode_AnthropicSearchSourceObject(value)
+    raise _invalid_type(value, expected="one of the AnthropicSearchSource shapes")
+
+
+def encode_AnthropicSearchSource(v: AnthropicSearchSource) -> Any:
+    if isinstance(v, (str,)):
+        return v
+    if isinstance(v, (AnthropicSearchSourceObject,)):
+        return encode_AnthropicSearchSourceObject(v)
+    return v
+
+
+def decode_AnthropicSearchSourceObject(value: Any) -> AnthropicSearchSourceObject:
+    m = _expect_map(value, expected="struct AnthropicSearchSourceObject")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "url":
+            kw["url"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "text":
+            kw["text"] = None if x is None else _expect_str(x, expected="a string")
+    return AnthropicSearchSourceObject(**kw)
+
+
+def encode_AnthropicSearchSourceObject(v: AnthropicSearchSourceObject) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.url is not None:
+        d["url"] = v.url
+    if v.text is not None:
+        d["text"] = v.text
+    return d
+
+
+def decode_AnthropicSearchResultItem(value: Any) -> AnthropicSearchResultItem:
+    m = _expect_map(value, expected="struct AnthropicSearchResultItem")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "type":
+            kw["type"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "text":
+            kw["text"] = None if x is None else _expect_str(x, expected="a string")
+    return AnthropicSearchResultItem(**kw)
+
+
+def encode_AnthropicSearchResultItem(v: AnthropicSearchResultItem) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.type is not None:
+        d["type"] = v.type
+    if v.text is not None:
+        d["text"] = v.text
+    return d
+
+
+def decode_AnthropicThinkingBlock(value: Any) -> AnthropicThinkingBlock:
+    m = _expect_map(value, expected="struct AnthropicThinkingBlock")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "thinking":
+            kw["thinking"] = _expect_str(x, expected="a string")
+        elif key == "signature":
+            kw["signature"] = None if x is None else _expect_str(x, expected="a string")
+    return AnthropicThinkingBlock(**kw)
+
+
+def encode_AnthropicThinkingBlock(v: AnthropicThinkingBlock) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["thinking"] = v.thinking
+    if v.signature is not None:
+        d["signature"] = v.signature
+    return d
+
+
+def decode_AnthropicRedactedThinkingBlock(value: Any) -> AnthropicRedactedThinkingBlock:
+    m = _expect_map(value, expected="struct AnthropicRedactedThinkingBlock")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "data":
+            kw["data"] = None if x is None else _expect_str(x, expected="a string")
+    return AnthropicRedactedThinkingBlock(**kw)
+
+
+def encode_AnthropicRedactedThinkingBlock(v: AnthropicRedactedThinkingBlock) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.data is not None:
+        d["data"] = v.data
+    return d
+
+
+def decode_AnthropicMessage(value: Any) -> AnthropicMessage:
+    m = _expect_map(value, expected="struct AnthropicMessage")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "role":
+            kw["role"] = _expect_str(x, expected="a string")
+        elif key == "content":
+            kw["content"] = None if x is None else decode_AnthropicContent(x)
+    return AnthropicMessage(**kw)
+
+
+def encode_AnthropicMessage(v: AnthropicMessage) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["role"] = v.role
+    if v.content is not None:
+        d["content"] = encode_AnthropicContent(v.content)
+    return d
+
+
+def decode_AnthropicTool(value: Any) -> AnthropicTool:
+    m = _expect_map(value, expected="struct AnthropicTool")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "type":
+            kw["type"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "name":
+            kw["name"] = _expect_str(x, expected="a string")
+        elif key == "description":
+            kw["description"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "input_schema":
+            kw["input_schema"] = x
+        elif key == "defer_loading":
+            kw["defer_loading"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "max_uses":
+            kw["max_uses"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "allowed_domains":
+            kw["allowed_domains"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "blocked_domains":
+            kw["blocked_domains"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "display_width_px":
+            kw["display_width_px"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "display_height_px":
+            kw["display_height_px"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "display_number":
+            kw["display_number"] = None if x is None else _expect_int(x, expected="i64")
+    return AnthropicTool(**kw)
+
+
+def encode_AnthropicTool(v: AnthropicTool) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.type is not None:
+        d["type"] = v.type
+    d["name"] = v.name
+    if v.description is not None:
+        d["description"] = v.description
+    if v.input_schema is not None:
+        d["input_schema"] = v.input_schema
+    if v.defer_loading is not None:
+        d["defer_loading"] = v.defer_loading
+    if v.max_uses is not None:
+        d["max_uses"] = v.max_uses
+    if v.allowed_domains:
+        d["allowed_domains"] = list(v.allowed_domains)
+    if v.blocked_domains:
+        d["blocked_domains"] = list(v.blocked_domains)
+    if v.display_width_px is not None:
+        d["display_width_px"] = v.display_width_px
+    if v.display_height_px is not None:
+        d["display_height_px"] = v.display_height_px
+    if v.display_number is not None:
+        d["display_number"] = v.display_number
+    return d
+
+
+def decode_AnthropicToolChoice(value: Any) -> AnthropicToolChoice:
+    m = _expect_map(value, expected="struct AnthropicToolChoice")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "type":
+            kw["type"] = _expect_str(x, expected="a string")
+        elif key == "name":
+            kw["name"] = None if x is None else _expect_str(x, expected="a string")
+    return AnthropicToolChoice(**kw)
+
+
+def encode_AnthropicToolChoice(v: AnthropicToolChoice) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["type"] = v.type
+    if v.name is not None:
+        d["name"] = v.name
+    return d
+
+
+def decode_AnthropicThinkingParam(value: Any) -> AnthropicThinkingParam:
+    m = _expect_map(value, expected="struct AnthropicThinkingParam")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "type":
+            kw["type"] = _expect_str(x, expected="a string")
+        elif key == "budget_tokens":
+            kw["budget_tokens"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "display":
+            kw["display"] = None if x is None else _expect_str(x, expected="a string")
+    return AnthropicThinkingParam(**kw)
+
+
+def encode_AnthropicThinkingParam(v: AnthropicThinkingParam) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["type"] = v.type
+    if v.budget_tokens is not None:
+        d["budget_tokens"] = v.budget_tokens
+    if v.display is not None:
+        d["display"] = v.display
+    return d
+
+
+def decode_AnthropicTaskBudget(value: Any) -> AnthropicTaskBudget:
+    m = _expect_map(value, expected="struct AnthropicTaskBudget")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "type":
+            kw["type"] = _expect_str(x, expected="a string")
+        elif key == "total":
+            kw["total"] = _expect_int(x, expected="i64")
+        elif key == "remaining":
+            kw["remaining"] = None if x is None else _expect_int(x, expected="i64")
+    return AnthropicTaskBudget(**kw)
+
+
+def encode_AnthropicTaskBudget(v: AnthropicTaskBudget) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["type"] = v.type
+    d["total"] = v.total
+    if v.remaining is not None:
+        d["remaining"] = v.remaining
+    return d
+
+
+def decode_AnthropicOutputConfig(value: Any) -> AnthropicOutputConfig:
+    m = _expect_map(value, expected="struct AnthropicOutputConfig")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "effort":
+            kw["effort"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "task_budget":
+            kw["task_budget"] = None if x is None else decode_AnthropicTaskBudget(x)
+    return AnthropicOutputConfig(**kw)
+
+
+def encode_AnthropicOutputConfig(v: AnthropicOutputConfig) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.effort is not None:
+        d["effort"] = v.effort
+    if v.task_budget is not None:
+        d["task_budget"] = encode_AnthropicTaskBudget(v.task_budget)
+    return d
+
+
+def decode_AnthropicMessagesRequest(value: Any) -> AnthropicMessagesRequest:
+    m = _expect_map(value, expected="struct AnthropicMessagesRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "messages":
+            kw["messages"] = [] if x is None else [decode_AnthropicMessage(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "max_tokens":
+            kw["max_tokens"] = _expect_int(x, expected="i64")
+        elif key == "metadata":
+            kw["metadata"] = x
+        elif key == "stop_sequences":
+            kw["stop_sequences"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "stream":
+            kw["stream"] = False if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "system":
+            kw["system"] = None if x is None else decode_AnthropicContent(x)
+        elif key == "temperature":
+            kw["temperature"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "thinking":
+            kw["thinking"] = None if x is None else decode_AnthropicThinkingParam(x)
+        elif key == "tool_choice":
+            kw["tool_choice"] = None if x is None else decode_AnthropicToolChoice(x)
+        elif key == "tools":
+            kw["tools"] = [] if x is None else [decode_AnthropicTool(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "top_k":
+            kw["top_k"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "top_p":
+            kw["top_p"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "output_config":
+            kw["output_config"] = None if x is None else decode_AnthropicOutputConfig(x)
+        elif key == "betas":
+            kw["betas"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "bootstrap_host":
+            kw["bootstrap_host"] = None if x is None else decode_StringOrList(x)
+        elif key == "bootstrap_port":
+            kw["bootstrap_port"] = None if x is None else decode_OptionalInt64OrList(x)
+        elif key == "bootstrap_room":
+            kw["bootstrap_room"] = None if x is None else decode_Int64OrList(x)
+        elif key == "routed_dp_rank":
+            kw["routed_dp_rank"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "disagg_prefill_dp_rank":
+            kw["disagg_prefill_dp_rank"] = None if x is None else _expect_int(x, expected="i64")
+    return AnthropicMessagesRequest(**kw)
+
+
+def encode_AnthropicMessagesRequest(v: AnthropicMessagesRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model"] = v.model
+    if v.messages:
+        d["messages"] = [encode_AnthropicMessage(e) for e in v.messages]
+    d["max_tokens"] = v.max_tokens
+    if v.metadata is not None:
+        d["metadata"] = v.metadata
+    if v.stop_sequences:
+        d["stop_sequences"] = list(v.stop_sequences)
+    if v.stream is not None:
+        d["stream"] = v.stream
+    if v.system is not None:
+        d["system"] = encode_AnthropicContent(v.system)
+    if v.temperature is not None:
+        d["temperature"] = float(v.temperature)
+    if v.thinking is not None:
+        d["thinking"] = encode_AnthropicThinkingParam(v.thinking)
+    if v.tool_choice is not None:
+        d["tool_choice"] = encode_AnthropicToolChoice(v.tool_choice)
+    if v.tools:
+        d["tools"] = [encode_AnthropicTool(e) for e in v.tools]
+    if v.top_k is not None:
+        d["top_k"] = v.top_k
+    if v.top_p is not None:
+        d["top_p"] = float(v.top_p)
+    if v.output_config is not None:
+        d["output_config"] = encode_AnthropicOutputConfig(v.output_config)
+    if v.betas:
+        d["betas"] = list(v.betas)
+    if v.bootstrap_host is not None:
+        d["bootstrap_host"] = encode_StringOrList(v.bootstrap_host)
+    if v.bootstrap_port is not None:
+        d["bootstrap_port"] = encode_OptionalInt64OrList(v.bootstrap_port)
+    if v.bootstrap_room is not None:
+        d["bootstrap_room"] = encode_Int64OrList(v.bootstrap_room)
+    if v.routed_dp_rank is not None:
+        d["routed_dp_rank"] = v.routed_dp_rank
+    if v.disagg_prefill_dp_rank is not None:
+        d["disagg_prefill_dp_rank"] = v.disagg_prefill_dp_rank
+    return d
+
+
+def decode_AnthropicMessagesResponse(value: Any) -> AnthropicMessagesResponse:
+    m = _expect_map(value, expected="struct AnthropicMessagesResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "id":
+            kw["id"] = _expect_str(x, expected="a string")
+        elif key == "type":
+            kw["type"] = _expect_str(x, expected="a string")
+        elif key == "role":
+            kw["role"] = _expect_str(x, expected="a string")
+        elif key == "content":
+            kw["content"] = None if x is None else decode_AnthropicContentBlockList(x)
+        elif key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "stop_reason":
+            kw["stop_reason"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "stop_sequence":
+            kw["stop_sequence"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "usage":
+            kw["usage"] = None if x is None else decode_AnthropicUsage(x)
+    return AnthropicMessagesResponse(**kw)
+
+
+def encode_AnthropicMessagesResponse(v: AnthropicMessagesResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["id"] = v.id
+    d["type"] = v.type
+    d["role"] = v.role
+    if v.content is not None:
+        d["content"] = encode_AnthropicContentBlockList(v.content)
+    d["model"] = v.model
+    if v.stop_reason is not None:
+        d["stop_reason"] = v.stop_reason
+    if v.stop_sequence is not None:
+        d["stop_sequence"] = v.stop_sequence
+    if v.usage is not None:
+        d["usage"] = encode_AnthropicUsage(v.usage)
+    return d
+
+
+def decode_AnthropicCountTokensRequest(value: Any) -> AnthropicCountTokensRequest:
+    m = _expect_map(value, expected="struct AnthropicCountTokensRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "messages":
+            kw["messages"] = [] if x is None else [decode_AnthropicMessage(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "system":
+            kw["system"] = None if x is None else decode_AnthropicContent(x)
+        elif key == "thinking":
+            kw["thinking"] = None if x is None else decode_AnthropicThinkingParam(x)
+        elif key == "tool_choice":
+            kw["tool_choice"] = None if x is None else decode_AnthropicToolChoice(x)
+        elif key == "tools":
+            kw["tools"] = [] if x is None else [decode_AnthropicTool(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "output_config":
+            kw["output_config"] = None if x is None else decode_AnthropicOutputConfig(x)
+        elif key == "betas":
+            kw["betas"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+    return AnthropicCountTokensRequest(**kw)
+
+
+def encode_AnthropicCountTokensRequest(v: AnthropicCountTokensRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model"] = v.model
+    if v.messages:
+        d["messages"] = [encode_AnthropicMessage(e) for e in v.messages]
+    if v.system is not None:
+        d["system"] = encode_AnthropicContent(v.system)
+    if v.thinking is not None:
+        d["thinking"] = encode_AnthropicThinkingParam(v.thinking)
+    if v.tool_choice is not None:
+        d["tool_choice"] = encode_AnthropicToolChoice(v.tool_choice)
+    if v.tools:
+        d["tools"] = [encode_AnthropicTool(e) for e in v.tools]
+    if v.output_config is not None:
+        d["output_config"] = encode_AnthropicOutputConfig(v.output_config)
+    if v.betas:
+        d["betas"] = list(v.betas)
+    return d
+
+
+def decode_AnthropicCountTokensResponse(value: Any) -> AnthropicCountTokensResponse:
+    m = _expect_map(value, expected="struct AnthropicCountTokensResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "input_tokens":
+            kw["input_tokens"] = _expect_int(x, expected="i64")
+    return AnthropicCountTokensResponse(**kw)
+
+
+def encode_AnthropicCountTokensResponse(v: AnthropicCountTokensResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["input_tokens"] = v.input_tokens
+    return d
+
+
+def decode_AnthropicStreamEvent(value: Any) -> AnthropicStreamEvent:
+    raw = _expect_map(value, expected="map")
+    tag = raw.get("type")
+    if tag == "message_start":
+        try:
+            return AnthropicMessageStartEvent(
+                message=None if raw.get("message") is None else decode_AnthropicMessagesResponse(raw.get("message")),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "message_delta":
+        try:
+            return AnthropicMessageDeltaEvent(
+                delta=None if raw.get("delta") is None else decode_AnthropicMessageEndDelta(raw.get("delta")),
+                usage=None if raw.get("usage") is None else decode_AnthropicUsage(raw.get("usage")),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "message_stop":
+        try:
+            return AnthropicMessageStopEvent(
+            )
+        except JsonContractError:
+            raise
+    elif tag == "content_block_start":
+        try:
+            return AnthropicContentBlockStartEvent(
+                index=0 if "index" not in raw else _expect_int(raw["index"], expected="i64"),
+                content_block=None if raw.get("content_block") is None else decode_AnthropicContentBlock(raw.get("content_block")),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "content_block_delta":
+        try:
+            return AnthropicContentBlockDeltaEvent(
+                index=0 if "index" not in raw else _expect_int(raw["index"], expected="i64"),
+                delta=None if raw.get("delta") is None else decode_AnthropicContentDelta(raw.get("delta")),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "content_block_stop":
+        try:
+            return AnthropicContentBlockStopEvent(
+                index=0 if "index" not in raw else _expect_int(raw["index"], expected="i64"),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "ping":
+        try:
+            return AnthropicPingEvent(
+            )
+        except JsonContractError:
+            raise
+    elif tag == "error":
+        try:
+            return AnthropicErrorEvent(
+                error=None if raw.get("error") is None else decode_AnthropicError(raw.get("error")),
+            )
+        except JsonContractError:
+            raise
+    raise JsonContractError("unknown type for AnthropicStreamEvent")
+
+
+def encode_AnthropicStreamEvent(v: AnthropicStreamEvent) -> Any:
+    if isinstance(v, AnthropicMessageStartEvent):
+        d: Dict[str, Any] = {"type": "message_start"}
+        if v.message is not None:
+            d["message"] = encode_AnthropicMessagesResponse(v.message)
+        return d
+    if isinstance(v, AnthropicMessageDeltaEvent):
+        d: Dict[str, Any] = {"type": "message_delta"}
+        if v.delta is not None:
+            d["delta"] = encode_AnthropicMessageEndDelta(v.delta)
+        if v.usage is not None:
+            d["usage"] = encode_AnthropicUsage(v.usage)
+        return d
+    if isinstance(v, AnthropicMessageStopEvent):
+        d: Dict[str, Any] = {"type": "message_stop"}
+        return d
+    if isinstance(v, AnthropicContentBlockStartEvent):
+        d: Dict[str, Any] = {"type": "content_block_start"}
+        d["index"] = v.index
+        if v.content_block is not None:
+            d["content_block"] = encode_AnthropicContentBlock(v.content_block)
+        return d
+    if isinstance(v, AnthropicContentBlockDeltaEvent):
+        d: Dict[str, Any] = {"type": "content_block_delta"}
+        d["index"] = v.index
+        if v.delta is not None:
+            d["delta"] = encode_AnthropicContentDelta(v.delta)
+        return d
+    if isinstance(v, AnthropicContentBlockStopEvent):
+        d: Dict[str, Any] = {"type": "content_block_stop"}
+        d["index"] = v.index
+        return d
+    if isinstance(v, AnthropicPingEvent):
+        d: Dict[str, Any] = {"type": "ping"}
+        return d
+    if isinstance(v, AnthropicErrorEvent):
+        d: Dict[str, Any] = {"type": "error"}
+        if v.error is not None:
+            d["error"] = encode_AnthropicError(v.error)
+        return d
+    raise TypeError(f"AnthropicStreamEvent: unsupported value {type(v).__name__}")
+
+
+def decode_AnthropicMessageStartEvent(value: Any) -> AnthropicMessageStartEvent:
+    m = _expect_map(value, expected="struct AnthropicMessageStartEvent")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "message":
+            kw["message"] = None if x is None else decode_AnthropicMessagesResponse(x)
+    return AnthropicMessageStartEvent(**kw)
+
+
+def encode_AnthropicMessageStartEvent(v: AnthropicMessageStartEvent) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.message is not None:
+        d["message"] = encode_AnthropicMessagesResponse(v.message)
+    return d
+
+
+def decode_AnthropicMessageDeltaEvent(value: Any) -> AnthropicMessageDeltaEvent:
+    m = _expect_map(value, expected="struct AnthropicMessageDeltaEvent")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "delta":
+            kw["delta"] = None if x is None else decode_AnthropicMessageEndDelta(x)
+        elif key == "usage":
+            kw["usage"] = None if x is None else decode_AnthropicUsage(x)
+    return AnthropicMessageDeltaEvent(**kw)
+
+
+def encode_AnthropicMessageDeltaEvent(v: AnthropicMessageDeltaEvent) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.delta is not None:
+        d["delta"] = encode_AnthropicMessageEndDelta(v.delta)
+    if v.usage is not None:
+        d["usage"] = encode_AnthropicUsage(v.usage)
+    return d
+
+
+def decode_AnthropicMessageEndDelta(value: Any) -> AnthropicMessageEndDelta:
+    m = _expect_map(value, expected="struct AnthropicMessageEndDelta")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "stop_reason":
+            kw["stop_reason"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "stop_sequence":
+            kw["stop_sequence"] = None if x is None else _expect_str(x, expected="a string")
+    return AnthropicMessageEndDelta(**kw)
+
+
+def encode_AnthropicMessageEndDelta(v: AnthropicMessageEndDelta) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.stop_reason is not None:
+        d["stop_reason"] = v.stop_reason
+    if v.stop_sequence is not None:
+        d["stop_sequence"] = v.stop_sequence
+    return d
+
+
+def decode_AnthropicMessageStopEvent(value: Any) -> AnthropicMessageStopEvent:
+    m = _expect_map(value, expected="struct AnthropicMessageStopEvent")
+    return AnthropicMessageStopEvent()
+
+
+def encode_AnthropicMessageStopEvent(v: AnthropicMessageStopEvent) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_AnthropicContentBlockStartEvent(value: Any) -> AnthropicContentBlockStartEvent:
+    m = _expect_map(value, expected="struct AnthropicContentBlockStartEvent")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "index":
+            kw["index"] = _expect_int(x, expected="i64")
+        elif key == "content_block":
+            kw["content_block"] = None if x is None else decode_AnthropicContentBlock(x)
+    return AnthropicContentBlockStartEvent(**kw)
+
+
+def encode_AnthropicContentBlockStartEvent(v: AnthropicContentBlockStartEvent) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["index"] = v.index
+    if v.content_block is not None:
+        d["content_block"] = encode_AnthropicContentBlock(v.content_block)
+    return d
+
+
+def decode_AnthropicContentBlockDeltaEvent(value: Any) -> AnthropicContentBlockDeltaEvent:
+    m = _expect_map(value, expected="struct AnthropicContentBlockDeltaEvent")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "index":
+            kw["index"] = _expect_int(x, expected="i64")
+        elif key == "delta":
+            kw["delta"] = None if x is None else decode_AnthropicContentDelta(x)
+    return AnthropicContentBlockDeltaEvent(**kw)
+
+
+def encode_AnthropicContentBlockDeltaEvent(v: AnthropicContentBlockDeltaEvent) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["index"] = v.index
+    if v.delta is not None:
+        d["delta"] = encode_AnthropicContentDelta(v.delta)
+    return d
+
+
+def decode_AnthropicContentBlockStopEvent(value: Any) -> AnthropicContentBlockStopEvent:
+    m = _expect_map(value, expected="struct AnthropicContentBlockStopEvent")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "index":
+            kw["index"] = _expect_int(x, expected="i64")
+    return AnthropicContentBlockStopEvent(**kw)
+
+
+def encode_AnthropicContentBlockStopEvent(v: AnthropicContentBlockStopEvent) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["index"] = v.index
+    return d
+
+
+def decode_AnthropicPingEvent(value: Any) -> AnthropicPingEvent:
+    m = _expect_map(value, expected="struct AnthropicPingEvent")
+    return AnthropicPingEvent()
+
+
+def encode_AnthropicPingEvent(v: AnthropicPingEvent) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_AnthropicErrorEvent(value: Any) -> AnthropicErrorEvent:
+    m = _expect_map(value, expected="struct AnthropicErrorEvent")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "error":
+            kw["error"] = None if x is None else decode_AnthropicError(x)
+    return AnthropicErrorEvent(**kw)
+
+
+def encode_AnthropicErrorEvent(v: AnthropicErrorEvent) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.error is not None:
+        d["error"] = encode_AnthropicError(v.error)
+    return d
+
+
+def decode_AnthropicContentDelta(value: Any) -> AnthropicContentDelta:
+    raw = _expect_map(value, expected="map")
+    tag = raw.get("type")
+    if tag == "text_delta":
+        try:
+            return AnthropicTextDelta(
+                text="" if "text" not in raw else _expect_str(raw["text"], expected="a string"),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "input_json_delta":
+        try:
+            return AnthropicInputJsonDelta(
+                partial_json="" if "partial_json" not in raw else _expect_str(raw["partial_json"], expected="a string"),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "thinking_delta":
+        try:
+            return AnthropicThinkingDelta(
+                thinking="" if "thinking" not in raw else _expect_str(raw["thinking"], expected="a string"),
+            )
+        except JsonContractError:
+            raise
+    elif tag == "signature_delta":
+        try:
+            return AnthropicSignatureDelta(
+                signature="" if "signature" not in raw else _expect_str(raw["signature"], expected="a string"),
+            )
+        except JsonContractError:
+            raise
+    raise JsonContractError("unknown type for AnthropicContentDelta")
+
+
+def encode_AnthropicContentDelta(v: AnthropicContentDelta) -> Any:
+    if isinstance(v, AnthropicTextDelta):
+        d: Dict[str, Any] = {"type": "text_delta"}
+        d["text"] = v.text
+        return d
+    if isinstance(v, AnthropicInputJsonDelta):
+        d: Dict[str, Any] = {"type": "input_json_delta"}
+        d["partial_json"] = v.partial_json
+        return d
+    if isinstance(v, AnthropicThinkingDelta):
+        d: Dict[str, Any] = {"type": "thinking_delta"}
+        d["thinking"] = v.thinking
+        return d
+    if isinstance(v, AnthropicSignatureDelta):
+        d: Dict[str, Any] = {"type": "signature_delta"}
+        d["signature"] = v.signature
+        return d
+    raise TypeError(f"AnthropicContentDelta: unsupported value {type(v).__name__}")
+
+
+def decode_AnthropicTextDelta(value: Any) -> AnthropicTextDelta:
+    m = _expect_map(value, expected="struct AnthropicTextDelta")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "text":
+            kw["text"] = _expect_str(x, expected="a string")
+    return AnthropicTextDelta(**kw)
+
+
+def encode_AnthropicTextDelta(v: AnthropicTextDelta) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["text"] = v.text
+    return d
+
+
+def decode_AnthropicInputJsonDelta(value: Any) -> AnthropicInputJsonDelta:
+    m = _expect_map(value, expected="struct AnthropicInputJsonDelta")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "partial_json":
+            kw["partial_json"] = _expect_str(x, expected="a string")
+    return AnthropicInputJsonDelta(**kw)
+
+
+def encode_AnthropicInputJsonDelta(v: AnthropicInputJsonDelta) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["partial_json"] = v.partial_json
+    return d
+
+
+def decode_AnthropicThinkingDelta(value: Any) -> AnthropicThinkingDelta:
+    m = _expect_map(value, expected="struct AnthropicThinkingDelta")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "thinking":
+            kw["thinking"] = _expect_str(x, expected="a string")
+    return AnthropicThinkingDelta(**kw)
+
+
+def encode_AnthropicThinkingDelta(v: AnthropicThinkingDelta) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["thinking"] = v.thinking
+    return d
+
+
+def decode_AnthropicSignatureDelta(value: Any) -> AnthropicSignatureDelta:
+    m = _expect_map(value, expected="struct AnthropicSignatureDelta")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "signature":
+            kw["signature"] = _expect_str(x, expected="a string")
+    return AnthropicSignatureDelta(**kw)
+
+
+def encode_AnthropicSignatureDelta(v: AnthropicSignatureDelta) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["signature"] = v.signature
     return d
 
 

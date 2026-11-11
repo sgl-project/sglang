@@ -1,3 +1,4 @@
+mod anthropic;
 pub(crate) mod app;
 mod auth;
 mod corpus;

@@ -1187,6 +1187,68 @@ pub mod sglang_service_client {
                 .insert(GrpcMethod::new("sglang.api.v1.SglangService", "OllamaShow"));
             self.inner.unary(req, path, codec).await
         }
+        /// Anthropic Messages data plane. The unary and streamed replies have
+        /// different wire shapes, so they are two RPCs; `stream` in the request is
+        /// ignored here (the RPC decides).
+        pub async fn anthropic_messages(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AnthropicMessagesRequest>,
+        ) -> std::result::Result<tonic::Response<super::AnthropicMessagesResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/AnthropicMessages",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "AnthropicMessages",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn anthropic_stream_messages(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AnthropicMessagesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::AnthropicStreamEvent>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/AnthropicStreamMessages",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "AnthropicStreamMessages",
+            ));
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn anthropic_count_tokens(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AnthropicCountTokensRequest>,
+        ) -> std::result::Result<tonic::Response<super::AnthropicCountTokensResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/AnthropicCountTokens",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "AnthropicCountTokens",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1505,6 +1567,26 @@ pub mod sglang_service_server {
             &self,
             request: tonic::Request<super::OllamaShowRequest>,
         ) -> std::result::Result<tonic::Response<super::OllamaShowResponse>, tonic::Status>;
+        /// Anthropic Messages data plane. The unary and streamed replies have
+        /// different wire shapes, so they are two RPCs; `stream` in the request is
+        /// ignored here (the RPC decides).
+        async fn anthropic_messages(
+            &self,
+            request: tonic::Request<super::AnthropicMessagesRequest>,
+        ) -> std::result::Result<tonic::Response<super::AnthropicMessagesResponse>, tonic::Status>;
+        /// Server streaming response type for the AnthropicStreamMessages method.
+        type AnthropicStreamMessagesStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::AnthropicStreamEvent, tonic::Status>,
+            > + std::marker::Send
+            + 'static;
+        async fn anthropic_stream_messages(
+            &self,
+            request: tonic::Request<super::AnthropicMessagesRequest>,
+        ) -> std::result::Result<tonic::Response<Self::AnthropicStreamMessagesStream>, tonic::Status>;
+        async fn anthropic_count_tokens(
+            &self,
+            request: tonic::Request<super::AnthropicCountTokensRequest>,
+        ) -> std::result::Result<tonic::Response<super::AnthropicCountTokensResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct SglangServiceServer<T> {
@@ -3965,6 +4047,135 @@ pub mod sglang_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = OllamaShowSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/AnthropicMessages" => {
+                    #[allow(non_camel_case_types)]
+                    struct AnthropicMessagesSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::AnthropicMessagesRequest>
+                        for AnthropicMessagesSvc<T>
+                    {
+                        type Response = super::AnthropicMessagesResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AnthropicMessagesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::anthropic_messages(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AnthropicMessagesSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/AnthropicStreamMessages" => {
+                    #[allow(non_camel_case_types)]
+                    struct AnthropicStreamMessagesSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::ServerStreamingService<super::AnthropicMessagesRequest>
+                        for AnthropicStreamMessagesSvc<T>
+                    {
+                        type Response = super::AnthropicStreamEvent;
+                        type ResponseStream = T::AnthropicStreamMessagesStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AnthropicMessagesRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::anthropic_stream_messages(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AnthropicStreamMessagesSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/AnthropicCountTokens" => {
+                    #[allow(non_camel_case_types)]
+                    struct AnthropicCountTokensSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::AnthropicCountTokensRequest>
+                        for AnthropicCountTokensSvc<T>
+                    {
+                        type Response = super::AnthropicCountTokensResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AnthropicCountTokensRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::anthropic_count_tokens(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AnthropicCountTokensSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
