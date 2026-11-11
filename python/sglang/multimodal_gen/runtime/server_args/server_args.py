@@ -2639,8 +2639,8 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.output_store_backend,
             help=(
                 "Where a /rollout/generate request that sets rollout_return_outputs_via_store "
-                "puts its latents, debug and cond tensors: a radix_transfer_plugins backend "
-                "name, or none."
+                "puts its latents, debug and cond tensors and its generated output: a "
+                "radix_transfer_plugins backend name, or none."
             ),
         )
         parser.add_argument(

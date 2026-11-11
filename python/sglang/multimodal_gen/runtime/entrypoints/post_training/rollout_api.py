@@ -412,20 +412,20 @@ def _build_response(
             if video_dtype == "uint8":
                 out_i = _quantize_video_uint8(out_i)
             out_i = out_i.contiguous()
-        serialized_generated_output = _maybe_serialize(out_i)
         if not rollout:
             responses.append(
                 RolloutResponse(
                     request_id=request_id,
                     prompt=prompt,
                     seed=seed,
-                    generated_output=serialized_generated_output,
+                    generated_output=_maybe_serialize(out_i),
                     inference_time_s=inference_time_s,
                     peak_memory_mb=peak_memory_mb,
                 )
             )
             continue
         if stored is None:
+            serialized_generated_output = _maybe_serialize(out_i)
             per_sample_trajectory = _slice_rollout_trajectory_for_sample(
                 result.rollout_trajectory_data, sample_idx, batch_size
             )
@@ -435,6 +435,11 @@ def _build_response(
                 serialized_dit_sigmas=serialized_dit_sigmas,
             )
         else:
+            # some pipelines return a numpy array, which the inline path serializes as a tensor too
+            stored[f"generated_output.{sample_idx}"] = torch.as_tensor(out_i)
+            serialized_generated_output = {
+                "__store__": f"generated_output.{sample_idx}"
+            }
             serialized = _serialize_rollout_trajectory_via_store(
                 result.rollout_trajectory_data,
                 sample_idx,
