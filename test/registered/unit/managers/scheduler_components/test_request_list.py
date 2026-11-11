@@ -89,8 +89,7 @@ _EDITORS = {
 # The other code that edits a list directly, with its number of edits. Each
 # entry takes a request out before or without its release (a step's finished
 # requests, a deferred release, a staged request retracted), or edits a list
-# the retirer does not reach; it leaves this table when that path moves to
-# the retirer.
+# the retirer does not reach.
 _DIRECT_EDITS = {
     "disaggregation/decode.py:DecodeTransferQueue.resolve_deferred_releases": 1,
     "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.process_prefill_chunk": 1,

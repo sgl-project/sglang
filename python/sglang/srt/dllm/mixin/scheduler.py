@@ -64,7 +64,6 @@ class SchedulerDllmMixin:
         # Create prefill adder with resource constraints
         adder = self._create_dllm_prefill_adder(running_bs, running_batch=running_batch)
 
-        # Initialize DLLM manager and transfer requests
         # The last round's requests start their next block.
         for req in staged:
             req.init_next_round_input()

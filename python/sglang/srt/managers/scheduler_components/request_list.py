@@ -42,7 +42,6 @@ class ListKind(enum.Enum):
     DEFERRED = enum.auto()
 
 
-# The PD queues, which a role switch drops.
 PD_KINDS = frozenset(
     {
         ListKind.PD_BOOTSTRAP,
@@ -90,7 +89,7 @@ class ReqList(ABC):
 
     @abstractmethod
     def _drop_all(self) -> None:
-        """Drop every request without ending it: for a teardown."""
+        """Drop every request without ending it."""
 
     def __len__(self) -> int:
         return sum(1 for _ in self)

@@ -189,9 +189,10 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 @dataclass
 class _HostStagedAdmissionStats:
-    # One transfer pass: running/retracted/waiting queues do not change, and
-    # transfer entries are removed only at the end. Only admission changes
-    # the active count. Allocator and radix-cache counters stay live.
+    # One transfer pass: running/retracted/waiting queues do not change. The
+    # device transfer count is read once, at the first admission: an entry
+    # released before it is not counted. Only admission changes it after
+    # that. Allocator and radix-cache counters stay live.
     retractable_tokens: Optional[int] = None
     retractable_window_tokens: Optional[Dict[str, int]] = None
     max_req_tokens: Optional[int] = None
@@ -1490,8 +1491,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
     ) -> Dict[str, List[DecodeRequest]]:
-        """Non-blocking ensure parallel info for each addr; returns the ready
-        addrs."""
+        """Non-blocking ensure parallel info for each addr; return the ready ones."""
         ready: Dict[str, List[DecodeRequest]] = {}
 
         now = time.monotonic()

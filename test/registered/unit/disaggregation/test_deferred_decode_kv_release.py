@@ -871,9 +871,6 @@ def _make_pop_queue(mgr):
 
 
 def _releasing(record):
-    """A release stub that records the request and, like a release, takes it
-    out of its list."""
-
     def release(req, *, checkpoint):
         if req.owner_list is not None:
             req.owner_list._leave([req])

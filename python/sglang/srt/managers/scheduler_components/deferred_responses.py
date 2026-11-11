@@ -52,6 +52,12 @@ class DeferredResponses:
             raise ValueError("only finished, unstreamed responses can be deferred")
         if any(held.rid == req.rid for held in self.held):
             raise ValueError(f"response {req.rid!r} is already deferred")
+        if req.owner_list is not None:
+            # Its release would take it out of the deferred list.
+            raise ValueError(
+                f"response {req.rid!r} is still in {req.owner_list.kind.name}; "
+                "defer it after its release"
+            )
         move([(req, completion)], self.held)
         req.defer_output = True
         self.output_streamer.defer_outputs = True

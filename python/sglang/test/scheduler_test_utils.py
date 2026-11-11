@@ -52,8 +52,7 @@ def release_only_retirer(
 
 
 def leaving_retirer() -> MagicMock:
-    """A mock `RequestRetirer` whose exits take the request out of its list, as
-    the real ones do, and record their calls."""
+    """A mock `RequestRetirer` whose exits take the request out of its list."""
     retirer = MagicMock()
 
     def leave(req, **_):
