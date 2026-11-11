@@ -16,12 +16,16 @@ from sglang.srt.utils import is_sail
 
 logger = logging.getLogger(__name__)
 
+_is_sail = is_sail()
+
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
 
-    # Only the CUDA build consumes TMA-aligned scales: the SAIL build applies
-    # the layout inside its GEMMs, so this wrapper is unused there.
-    if DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+    # Only the SAIL build lacks this helper: it applies the layout inside its
+    # GEMMs. Everywhere else the wrapper must stay importable -- MUSA and
+    # Blackwell with UE8M0 scales also report
+    # DEEPGEMM_NEED_TMA_ALIGNED_SCALES as False while still calling it.
+    if not _is_sail:
         from deep_gemm.utils.layout import (
             get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
         )
@@ -47,9 +51,6 @@ if ENABLE_JIT_DEEPGEMM:
 
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
-
-
-_is_sail = is_sail()
 
 
 # TODO maybe rename these functions

@@ -15,7 +15,6 @@ from sglang.srt.layers.amx_utils import (
     _amx_process_weight_after_loading,
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
-from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -45,7 +44,6 @@ _is_sail = is_sail()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
-logger = logging.getLogger(__name__)
 
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
@@ -62,6 +60,9 @@ if _is_cuda:
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
+
+
+logger = logging.getLogger(__name__)
 
 
 class W8A8Int8Config(QuantizationConfig):
@@ -377,18 +378,15 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-        from sglang.srt.layers.moe.token_dispatcher.deepep import (
-            DeepEPLLDispatchOutput,
-            DeepEPNormalDispatchOutput,
+        from sglang.srt.layers.moe.token_dispatcher import (
+            DispatchOutputChecker,
+            StandardCombineInput,
         )
 
         x = dispatch_output.hidden_states
         # SAIL's DeepEP INT8 dispatch carries the routing tensors on the dispatch
         # output itself instead of a TopKOutput.
-        if _is_sail and isinstance(
-            dispatch_output, (DeepEPLLDispatchOutput, DeepEPNormalDispatchOutput)
-        ):
+        if _is_sail and DispatchOutputChecker.format_is_deepep(dispatch_output):
             topk_output = (dispatch_output.topk_weights, dispatch_output.topk_ids)
         else:
             topk_output = dispatch_output.topk_output
@@ -424,6 +422,8 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             return StandardCombineInput(hidden_states=output)
 
         if self.runner.runner_backend.is_deep_gemm():
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+
             quant_info = DeepGemmMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -434,14 +434,5 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
                 block_shape=None,
             )
         else:
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_int8_w8a8=True,
-                per_channel_quant=True,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a13_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-            )
+            quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)

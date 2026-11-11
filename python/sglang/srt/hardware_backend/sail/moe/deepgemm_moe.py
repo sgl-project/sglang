@@ -706,7 +706,9 @@ def fused_experts_none_to_deep_gemm(
     moe_runner_config = runner_config
     b1 = quant_info.b13
     b2 = quant_info.b2
-    use_fp8 = quant_info.use_fp8
+    # The unquantized method asks for FP8 dispatch unless BF16 dispatch is
+    # forced, even with BF16 experts; only FP8 weights take the FP8 GEMMs.
+    use_fp8 = quant_info.use_fp8 and w1.dtype == torch.float8_e4m3fn
     use_int8 = quant_info.use_int8
     use_mxfp4 = quant_info.use_mxfp4
     use_int4_w4a16 = quant_info.use_int4_w4a16

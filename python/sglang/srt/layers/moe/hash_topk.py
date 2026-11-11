@@ -317,10 +317,12 @@ class HashTopK(nn.Module):
             topk_ids = _mask_topk_ids_padded_region_to_int64(
                 topk_ids, num_token_non_padded
             )
+            if recorder_topk_ids is not None:
+                _mask_topk_ids_padded_region(recorder_topk_ids, num_token_non_padded)
         else:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-        if not (_is_hip or _is_npu) and recorder_topk_ids is not None:
-            _mask_topk_ids_padded_region(recorder_topk_ids, num_token_non_padded)
+            if recorder_topk_ids is not None:
+                _mask_topk_ids_padded_region(recorder_topk_ids, num_token_non_padded)
         if recorder_topk_ids is None:
             recorder_topk_ids = topk_ids
         if _is_npu and num_token_non_padded is not None:

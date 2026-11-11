@@ -65,16 +65,19 @@ class TestKimiK3PackedExpertLoader(CustomTestCase):
     dropped after the name remapping."""
 
     def test_packed_names_follow_quantization_and_npu_layout(self):
+        # (quant_name, quant_format, sail, npu, expected suffix)
         cases = (
-            ("mxfp4", None, False, "weight"),
-            ("compressed-tensors", "pack-quantized-mxfp4", False, "weight"),
-            ("compressed-tensors", "pack-quantized", False, "weight_packed"),
-            (None, None, False, "weight_packed"),
-            ("mxfp4", None, True, "weight_packed"),
+            ("mxfp4", None, False, False, "weight"),
+            ("mxfp4", None, False, True, "weight_packed"),
+            # Only SAIL keys the remap on MXFP4, since it also serves WNA16.
+            ("mxfp4", None, True, False, "weight"),
+            ("compressed-tensors", "pack-quantized-mxfp4", True, False, "weight"),
+            ("compressed-tensors", "pack-quantized", True, False, "weight_packed"),
+            (None, None, True, False, "weight_packed"),
         )
-        for quant_name, quant_format, npu, suffix in cases:
+        for quant_name, quant_format, sail, npu, suffix in cases:
             with self.subTest(
-                quant_name=quant_name, quant_format=quant_format, npu=npu
+                quant_name=quant_name, quant_format=quant_format, sail=sail, npu=npu
             ):
                 param = torch.nn.Parameter(torch.zeros(2, 4), requires_grad=False)
                 expected = torch.arange(1, 9, dtype=torch.float32).reshape(2, 4)
@@ -86,7 +89,12 @@ class TestKimiK3PackedExpertLoader(CustomTestCase):
                 target_name = f"model.layers.0.mlp.experts.w2_{suffix}"
                 quant_config = (
                     SimpleNamespace(
-                        get_name=lambda: quant_name, quant_format=quant_format
+                        get_name=lambda: quant_name,
+                        quant_format=quant_format,
+                        # Stands in for CompressedTensorsConfig._is_mxfp4_moe.
+                        _is_mxfp4_moe=lambda layer_name: (
+                            "mxfp4" in (quant_format or "")
+                        ),
                     )
                     if quant_name is not None
                     else None
@@ -105,7 +113,10 @@ class TestKimiK3PackedExpertLoader(CustomTestCase):
                     named_parameters=lambda: [(target_name, param)],
                     post_load_weights=lambda: None,
                 )
-                with patch.object(kimi_k3, "_is_npu", npu):
+                with (
+                    patch.object(kimi_k3, "_is_npu", npu),
+                    patch.object(kimi_k3, "_is_sail", sail),
+                ):
                     loaded = KimiK3LinearForCausalLM.load_weights(
                         model,
                         [("model.layers.0.mlp.experts.0.w2.weight_packed", expected)],

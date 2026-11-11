@@ -300,16 +300,7 @@ class DeepGemmRunnerOutput(RunnerOutput):
 class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
-    b13: Optional[torch.Tensor] = None
-    b2: Optional[torch.Tensor] = None
     use_fp8: bool = False
-    use_int8: bool = False
-    use_mxfp4: bool = False
-    use_int4_w4a16: bool = False
-    # BF16 activations; VALU uses Marlin weights with E8M0 bytes, MMA uses FP4
-    # directly with tiled scales.
-    use_mxfp4_w4a16: bool = False
-    per_channel_quant: bool = False
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
@@ -319,6 +310,17 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
     use_mxfp8: bool = False
+    # Platform runner fields go after the upstream ones so that positional
+    # construction keeps binding the upstream fields.
+    b13: Optional[torch.Tensor] = None
+    b2: Optional[torch.Tensor] = None
+    use_int8: bool = False
+    use_mxfp4: bool = False
+    use_int4_w4a16: bool = False
+    # BF16 activations; VALU uses Marlin weights with E8M0 bytes, MMA uses FP4
+    # directly with tiled scales.
+    use_mxfp4_w4a16: bool = False
+    per_channel_quant: bool = False
 
     def __post_init__(self):
         if self.use_mxfp8:
