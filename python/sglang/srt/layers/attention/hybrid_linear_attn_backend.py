@@ -25,6 +25,7 @@ from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
+    ForwardStateSlots,
     Mamba2Metadata,
 )
 from sglang.srt.layers.attention.mamba.prefill_track_metadata import (
@@ -34,7 +35,8 @@ from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
     validate_replay_state_indices_cpu,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayer
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -51,6 +53,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
@@ -128,6 +131,32 @@ class MambaAttnBackendBase(AttentionBackend):
         # Constant (== 1) for mamba-like backends; hoisted so the replay path
         # skips the per-cycle method dispatch.
         self._graph_seq_len_fill_value = self.get_cuda_graph_seq_len_fill_value()
+
+    @property
+    def state_tracking_indices(self) -> Optional[torch.Tensor]:
+        """Physical checkpoint destinations from the current execution metadata."""
+        return (
+            None
+            if self.forward_metadata is None
+            else self.forward_metadata.mamba_track_indices
+        )
+
+    def forward_state_slots(
+        self, num_requests: int, track_ids: Optional[torch.Tensor]
+    ) -> ForwardStateSlots:
+        """The forward's first ``num_requests`` state slots as its metadata resolved
+        them, with checkpoint slots when ``track_ids`` is not None."""
+        md = self.forward_metadata
+        assert md is not None, "no forward has prepared its state slots"
+        track = None
+        if track_ids is not None:
+            track = md.mamba_track_indices
+            assert track is not None, (
+                "the forward was prepared without the checkpoint slots its "
+                "commit writes"
+            )
+            track = track[:num_requests]
+        return ForwardStateSlots(md.mamba_cache_indices[:num_requests], track)
 
     def state_layer(self, layer_id: int) -> KVLayer:
         """The layer's recurrent-state route, once a layer-wise host load-back
@@ -755,6 +784,11 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        track_buf = (
+            None
+            if self.mamba_track_indices_buf is None
+            else self.mamba_track_indices_buf[:bs]
+        )
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
@@ -790,6 +824,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_track_indices=track_buf,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -801,6 +836,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_track_indices=track_buf,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
                 replayssm_ring_indices=replayssm_ring_indices,
@@ -1251,6 +1287,10 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
+    def window_capacity_children(self) -> list:
+        # Window layers attend through the full-attention child only.
+        return [self.full_attn_backend]
+
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
@@ -1334,6 +1374,14 @@ class HybridLinearAttnBackend(AttentionBackend):
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return SharedReadEnds.max_of(
             b.shared_read_ends(fm) for b in self.attn_backend_list
+        )
+
+    def get_decode_graph_variants(
+        self, capture_forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[AttentionGraphVariants]:
+        # Linear layers capture identically under every label.
+        return self.full_attn_backend.get_decode_graph_variants(
+            capture_forward_mode, captured_req_width
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
@@ -1578,6 +1626,11 @@ class HybridLinearAttnBackend(AttentionBackend):
                 **kwargs,
             )
 
+    def forward_state_slots(
+        self, num_requests: int, track_ids: Optional[torch.Tensor]
+    ) -> ForwardStateSlots:
+        return self.linear_attn_backend.forward_state_slots(num_requests, track_ids)
+
     def update_mamba_state_after_mtp_verify(
         self,
         last_correct_step_indices: torch.Tensor,
@@ -1585,31 +1638,21 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
         req_pool_indices: Optional[torch.Tensor] = None,
+        state_slots: Optional[ForwardStateSlots] = None,
     ):
-        """Commit accepted Mamba states; PP rows identify the delayed batch."""
+        """Commit accepted Mamba states; PP rows identify the delayed batch.
+        Writes ``state_slots``; ``mamba_track_indices`` only says whether to track."""
         request_number = last_correct_step_indices.shape[0]
         src_indices_raw = None
         if pp_spec_stable_rows_enabled() and req_pool_indices is not None:
             src_indices_raw = req_pool_indices[:request_number]
 
-        # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
+        if state_slots is None:
+            state_slots = self.forward_state_slots(request_number, mamba_track_indices)
+        state_indices_tensor = state_slots.working[:request_number]
         if mamba_track_indices is not None:
-            mamba_track_indices = self.linear_attn_backend._translate_mamba_indices(
-                mamba_track_indices
-            )
-
-        if src_indices_raw is not None:
-            state_indices_tensor = self.linear_attn_backend._translate_mamba_indices(
-                self.linear_attn_backend.req_to_token_pool.get_mamba_indices(
-                    req_pool_indices[:request_number]
-                )
-            )
-        else:
-            state_indices_tensor = (
-                self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                    :request_number
-                ]
-            )
+            assert state_slots.track is not None
+            mamba_track_indices = state_slots.track[:request_number]
 
         mamba_pool = self.linear_attn_backend.state_pool
         mamba_caches = mamba_pool.get_speculative_mamba2_params_all_layers()

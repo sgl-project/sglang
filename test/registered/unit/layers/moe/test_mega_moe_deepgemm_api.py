@@ -362,6 +362,25 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 activation_clamp=7.0,
                 routed_scaling_factor=1.0,
             )
+            mega_call = deep_gemm.fp8_fp4_mega_moe.call_args
+            eplb_load_row = torch.zeros(4, dtype=torch.int32)
+            mega_moe.run_mega_routed_experts(
+                experts,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                hidden_size=4,
+                intermediate_size=8,
+                top_k=2,
+                num_tokens=3,
+                eplb_load_row=eplb_load_row,
+            )
+            self.assertIs(
+                deep_gemm.fp8_fp4_mega_moe.call_args.kwargs[
+                    "cumulative_local_expert_recv_stats"
+                ],
+                eplb_load_row,
+            )
 
         self.assertEqual(out.shape, (3, 4))
         self.assertEqual(out.dtype, torch.bfloat16)
@@ -373,10 +392,42 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         ids_arg, weights_arg = pre_dispatch.call_args.args[1:3]
         self.assertEqual(ids_arg.dtype, torch.int32)
         self.assertEqual(weights_arg.dtype, torch.float32)
-        mega_call = deep_gemm.fp8_fp4_mega_moe.call_args
         self.assertIs(mega_call.args[1], experts.mega_l1_weights)
         self.assertIs(mega_call.args[2], experts.mega_l2_weights)
         self.assertEqual(mega_call.kwargs.get("activation_clamp"), 7.0)
+        self.assertNotIn("cumulative_local_expert_recv_stats", mega_call.kwargs)
+
+    def test_eplb_load_row_asks_the_recorder_for_this_ranks_slice(self):
+        row = torch.zeros(2, dtype=torch.int32)
+        recorder = MagicMock()
+        recorder.get_current_pass_local_count_buffer.return_value = row
+        group = SimpleNamespace(size=lambda: 4, rank=lambda: 2)
+        parallel = SimpleNamespace(moe_ep_group=SimpleNamespace(device_group=group))
+        moe = SimpleNamespace(
+            experts=SimpleNamespace(num_experts=8), num_fused_shared_experts=0
+        )
+        with (
+            patch.object(
+                mega_moe,
+                "get_global_expert_distribution_recorder",
+                return_value=recorder,
+            ),
+            patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
+            patch.object(mega_moe, "_device_sm", 100),
+            patch.object(mega_moe, "_mega_moe_mma_type", return_value="fp8xfp4"),
+        ):
+            self.assertIs(mega_moe._local_eplb_load_row(moe), row)
+            recorder.get_current_pass_local_count_buffer.assert_called_once_with(
+                num_experts=8, ep_rank=2, ep_size=4
+            )
+            for name, value in (
+                ("_device_sm", 90),
+                ("_mega_moe_mma_type", lambda experts: "mxf4xmxf4"),
+            ):
+                with patch.object(mega_moe, name, value):
+                    self.assertIsNone(mega_moe._local_eplb_load_row(moe))
+            shared = SimpleNamespace(experts=moe.experts, num_fused_shared_experts=1)
+            self.assertIsNone(mega_moe._local_eplb_load_row(shared))
 
     def test_v41_megamoe_selects_image_bias_on_local_rows(self):
         """Image rows must retain their router bias after attention-TP sharding.
@@ -767,6 +818,16 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "intermediate_size.*multiple of 256"):
             mega_moe.check_mega_moe_shapes(2048, 384, "nvfp4xnvfp4")
 
+    def test_shape_check_mxf4_takes_intermediate_multiples_of_128(self):
+        # The MXFP4 intermediate SFs are MN-major like fp8xfp4's, so DeepSeek-V4.1-Flash's
+        # 2304 (not a multiple of 512) is accepted; the input SF rows still need hidden % 512.
+        mega_moe.check_mega_moe_shapes(5120, 2304, "mxf4xmxf4")
+        mega_moe.check_mega_moe_shapes(512, 128, "mxf4xmxf4")
+        with self.assertRaisesRegex(ValueError, "intermediate_size.*multiple of 128"):
+            mega_moe.check_mega_moe_shapes(5120, 2240, "mxf4xmxf4")
+        with self.assertRaisesRegex(ValueError, "hidden_size.*multiple of 512"):
+            mega_moe.check_mega_moe_shapes(4864, 2304, "mxf4xmxf4")
+
     def test_mxf4_l1_uses_packed_gate_up_interleave(self):
         source = torch.arange(32).reshape(1, 32)
         expected = torch.tensor(
@@ -882,13 +943,18 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 tp_rank=0,
             ),
         ):
-            return fused_moe_layer_module.FusedMoE(
+            experts = fused_moe_layer_module.FusedMoE(
                 num_experts=2,
                 hidden_size=4,
                 intermediate_size=8,
                 layer_id=0,
                 quant_method=method,
             )
+
+        experts.w13_weight = torch.nn.Parameter(
+            torch.zeros(0, dtype=torch.uint8), requires_grad=False
+        )
+        return experts
 
     def _get_test_buffer(self, group):
         with patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}):
