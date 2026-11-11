@@ -1558,6 +1558,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"{value_bytes}-byte keys and {scale_bytes}-byte scales"
             )
         params = []
+        # NOTE(kpham-sgl): a page holds its tokens' keys, then their scales;
+        # each part is addressed in units of its own width.
         for width, offset in ((value_bytes, 0), (scale_bytes, page_size * value_bytes)):
             units_per_page = page_bytes // width
             src_units = (
