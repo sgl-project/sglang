@@ -119,7 +119,7 @@ class TestMegakernelDraftCapture(CustomTestCase):
         publish(server_args(enable_nvidia_megakernel=True), role="test")
         self.addCleanup(reset_context)
         view_patch = patch.object(
-            MegakernelBinding, "forward_view", return_value="view"
+            MegakernelBinding, "forward_view", return_value=SimpleNamespace(hybrid=None)
         )
         view_patch.start()
         self.addCleanup(view_patch.stop)
@@ -174,7 +174,7 @@ class TestEagleDraftRunnersFireTheHooks(CustomTestCase):
         self.assertEqual(seen, [(runner, "out", "forward batch", 16)])
 
     def test_the_captured_functions_call_the_hooks(self):
-        """capture_one_shape's captured function ends with the hook call, with its
+        """capture_one_shape's stock draft forward ends with the hook call, with its
         output, batch and token count."""
         for cls in (EAGLEDraftCudaGraphRunner, EAGLEDraftExtendCudaGraphRunner):
             with self.subTest(runner=cls.__name__):
@@ -189,14 +189,14 @@ class TestEagleDraftRunnersFireTheHooks(CustomTestCase):
                     for n in owner.body
                     if isinstance(n, ast.FunctionDef) and n.name == "capture_one_shape"
                 )
-                run_once = next(
+                run_stock = next(
                     n
                     for n in ast.walk(capture)
-                    if isinstance(n, ast.FunctionDef) and n.name == "run_once"
+                    if isinstance(n, ast.FunctionDef) and n.name == "run_stock"
                 )
                 calls = [
                     [ast.unparse(a) for a in n.args]
-                    for n in ast.walk(run_once)
+                    for n in ast.walk(run_stock)
                     if isinstance(n, ast.Call)
                     and ast.unparse(n.func) == "self._run_capture_tail_hooks"
                 ]

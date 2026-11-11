@@ -15,7 +15,6 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 """
 
 import logging
-import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -28,6 +27,8 @@ from sglang.kernels.ops.attention.kv_indices import spec_kv_index_token_blocks
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
 )
+from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
@@ -35,6 +36,12 @@ from sglang.srt.layers.attention.base_attn_backend import (
     resolve_window_id_space,
     resolve_window_kv_pool,
 )
+from sglang.srt.layers.cp.base import (
+    CPAttentionBackendKind,
+    get_cp_strategy,
+)
+from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.dp_attention import get_cuda_graph_max_batch_size
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -45,13 +52,15 @@ from sglang.srt.mem_cache.kv.alloc.id_space import (
     WindowRead,
     window_read,
 )
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.kv.memory.views import MHAKVView
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -61,15 +70,9 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
     fill_draft_window_rail,
-    generate_draft_decode_kv_indices,
     resolve_draft_decode_window,
 )
-from sglang.srt.utils import (
-    get_cuda_graph_max_batch_size,
-    get_int_env_var,
-    is_flashinfer_available,
-    next_power_of_2,
-)
+from sglang.srt.utils import get_int_env_var, is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -172,6 +175,7 @@ class PrefillMetadata:
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    cp_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -303,6 +307,10 @@ def fast_prefill_plan(
     )
     self._cached_o_data_type = o_data_type
     self._block_tables = None
+    # FlashInfer's plan() clears this on every call and may set it again for its
+    # SM90 fp8-KV verify kernel. This plan never takes that route, so clear it
+    # here too rather than let run() launch it with a previous plan's state.
+    self._eagle_verify_fp8kv_sm90_state = None
 
     args = [
         self._float_workspace_buffer,
@@ -325,6 +333,7 @@ def fast_prefill_plan(
         False,  # disable_split_kv
         0,  # num_colocated_ctas
         0,  # uniform_q_len
+        False,  # fixed_uniform_q_len
     ]
     self._plan_info = self._cached_module.plan(*args)
 
@@ -467,6 +476,8 @@ class FlashInferAttnBackend(AttentionBackend):
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
 
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
+        # Read by prefill_cp_unsupported_reason; the CP strategy owns the check.
+        self._model_config = model_runner.model_config
 
         # Allocate buffers
         # different from flashinfer zero_init_global_workspace_buffer
@@ -543,17 +554,29 @@ class FlashInferAttnBackend(AttentionBackend):
                 and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             ):
                 fmha_backend = "cutlass"
-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
-        )
 
-        # Two wrappers: one for sliding window attention and one for full attention.
-        # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
+        # Sliding/full or decoder/cross-attention layers use separate plans.
+        self.prefill_wrappers_ragged = []
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
         self.decode_wrappers = []
-        for _ in range(self.num_wrappers):
+        for wrapper_id in range(self.num_wrappers):
             if not skip_prefill:
+                self.prefill_wrappers_ragged.append(
+                    BatchPrefillWithRaggedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        # FlashInfer fmha_varlen hardcodes use_sliding_window=False;
+                        # use CUTLASS ragged here once it honors window_left.
+                        backend=(
+                            "fa2"
+                            if fmha_backend == "cutlass"
+                            and self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+                            and wrapper_id == 0
+                            else fmha_backend
+                        ),
+                    )
+                )
                 self.prefill_wrappers_paged.append(
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
@@ -596,6 +619,101 @@ class FlashInferAttnBackend(AttentionBackend):
         self.full_cg_prefill_wrappers: Optional[
             List[BatchPrefillWithPagedKVCacheWrapper]
         ] = None
+
+    def prefill_cp_unsupported_reason(self) -> Optional[str]:
+        """Why zigzag prefill CP cannot run on this backend, or None if it can.
+
+        Asked by ``ZigzagCPStrategy.can_apply`` only when FlashInfer is the
+        prefill backend, so subclasses such as TRTLLM-MHA never reach it.
+        """
+        model_config = self._model_config
+        if self.skip_prefill:
+            return "the backend was built without prefill wrappers"
+        if model_config.attention_arch != AttentionArch.MHA:
+            return "only dense MHA/GQA attention is supported"
+        # Set for sliding-window and encoder-decoder models.
+        if self.dispatch_reason is not None:
+            return "sliding-window and cross attention are not supported"
+        if model_config.head_dim != model_config.v_head_dim:
+            return "K and V head dims must match"
+        if not check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
+            return "prefill CUDA graphs must be disabled"
+        if self.prefill_uses_dequant_workspace:
+            return "KV caches read through a dequant workspace are not supported"
+        # Unified MHA views label token-major NHD rows as page_major.
+        if not all(
+            isinstance(view, MHAKVView)
+            and view.kv_cache_layout in ("nhd", "page_major")
+            for view in (
+                self.kv_layers.view(sub_pool.name)
+                for sub_pool in self.kv_layers.sub_pools()
+            )
+        ):
+            return "the KV cache must use a direct NHD layout"
+        return None
+
+    def _init_forward_metadata_cp(self, forward_batch: ForwardBatch) -> None:
+        cp_metadata = forward_batch.attn_cp_metadata
+        req_pool_indices = forward_batch.req_pool_indices
+
+        q_lens_cpu = (
+            cp_metadata.actual_seq_q_prev_list + cp_metadata.actual_seq_q_next_list
+        )
+        kv_lens_cpu = cp_metadata.kv_len_prev_list + cp_metadata.kv_len_next_list
+        virtual_bs = len(q_lens_cpu)
+        device = req_pool_indices.device
+        q_lens = torch.tensor(q_lens_cpu, dtype=torch.int32, device=device)
+        kv_lens = torch.tensor(kv_lens_cpu, dtype=torch.int32, device=device)
+
+        qo_indptr = torch.empty(virtual_bs + 1, dtype=torch.int32, device=device)
+        qo_indptr[0] = 0
+        qo_indptr[1:] = torch.cumsum(q_lens, dim=0)
+        paged_kv_indptr = torch.empty(virtual_bs + 1, dtype=torch.int32, device=device)
+        paged_kv_indptr[0] = 0
+        paged_kv_indptr[1:] = torch.cumsum(kv_lens, dim=0)
+        paged_kv_indices = torch.empty(
+            sum(kv_lens_cpu), dtype=torch.int32, device=device
+        )
+        kv_start_idx = torch.zeros_like(kv_lens)
+        bs = len(req_pool_indices)
+        # Keep both halves indexed by the iteration's original request rows.
+        for start in (0, bs):
+            end = start + bs
+            self.runner_ids.pack_read_stream(
+                forward_batch.iteration_ids,
+                req_pool_indices=req_pool_indices,
+                seq_lens=kv_lens[start:end],
+                indptr=paged_kv_indptr[start : end + 1],
+                out=paged_kv_indices,
+                kv_start_idx=kv_start_idx[start:end],
+            )
+        paged_kv_last_page_len = torch.ones(
+            virtual_bs, dtype=torch.int32, device=device
+        )
+
+        wrapper = self.prefill_wrappers_paged[0]
+        updater = self.indices_updater_prefill
+        wrapper.begin_forward(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            updater.num_qo_heads,
+            updater.num_kv_heads,
+            updater.head_dim,
+            1,
+            causal=True,
+            q_data_type=updater.q_data_type,
+            kv_data_type=updater.data_type,
+            non_blocking=True,
+            fixed_split_size=self.prefill_split_tile_size,
+        )
+        self.forward_metadata = PrefillMetadata(
+            prefill_wrappers=[wrapper],
+            use_ragged=False,
+            extend_no_prefix=False,
+            cp_wrapper=wrapper,
+        )
 
     def _check_kv_attention_access(self, phase: str, access) -> None:
         if access is not None:
@@ -666,6 +784,12 @@ class FlashInferAttnBackend(AttentionBackend):
         if extend_seq_lens is None or len(extend_seq_lens) <= 1:
             extend_seq_lens = [forward_batch.input_ids.size(0)]
 
+        # The metadata tensors below are tiny (a few thousand elements at most)
+        # but get rebuilt every forward. MIS disables CUDA graphs, so doing this
+        # arithmetic on the GPU dispatches ~8 eager kernel launches per sequence
+        # on the single-threaded scheduler, which is its dominant cost under load.
+        # The delimiter indices already live on the host, so we keep the whole
+        # computation on the CPU and pay a single host->device copy per result.
         seq_start = 0
         for i, seq_len in enumerate(extend_seq_lens):
             seq_end = seq_start + seq_len
@@ -674,22 +798,21 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_start = seq_end
                 continue
 
-            first_delim = delimiter_indices_cpu[0].item()  # CPU .item(), no GPU sync
-            delimiter_indices = delimiter_indices_cpu.to(device, non_blocking=True)
+            first_delim = delimiter_indices_cpu[0].item()
             prefix_len = first_delim + (
-                prefix_cache_lens[i] if prefix_cache_lens is not None else 0
+                int(prefix_cache_lens[i]) if prefix_cache_lens is not None else 0
             )
             prefix_len_ptr.append(prefix_len)
 
-            # Compute relative positions within items using searchsorted (no GPU sync).
-            #   suffix_range      = [0, 1, 2, 3, 4, ...]
-            #   searchsorted      = bucket index for each position
-            #   last_delim        = delimiter offset at start of current bucket
-            #   pos_within_item   = suffix_range - last_delim
+            # Position within each item, restarting at every delimiter:
+            #   suffix_range    = [0, 1, 2, ...] over the post-prefix tokens
+            #   bucket_idx      = which item each token falls in (searchsorted)
+            #   last_delim      = delimiter offset at the start of that item
+            #   pos_within_item = suffix_range - last_delim
             suffix_len = seq_len - first_delim
-            relative_positions = delimiter_indices - first_delim
+            relative_positions = delimiter_indices_cpu - first_delim
 
-            suffix_range = torch.arange(suffix_len, dtype=torch.int64, device=device)
+            suffix_range = torch.arange(suffix_len, dtype=torch.int64)
             bucket_idx = torch.searchsorted(
                 relative_positions, suffix_range, right=True
             )
@@ -700,11 +823,11 @@ class FlashInferAttnBackend(AttentionBackend):
 
             forward_batch.positions[seq_start + first_delim : seq_end] = (
                 prefix_len + pos_within_item - 1
-            )
+            ).to(device, non_blocking=True)
 
             seq_start = seq_end
 
-        # Pad token_pos_in_items_ptr for batch processing
+        # Pad token_pos_in_items_ptr to a common length for batch processing.
         if token_pos_in_items_ptr:
             token_pos_in_items_len = max(t.numel() for t in token_pos_in_items_ptr)
             token_pos_in_items_ptr = [
@@ -712,9 +835,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     [
                         t,
                         torch.zeros(
-                            token_pos_in_items_len - t.numel(),
-                            dtype=torch.uint16,
-                            device=device,
+                            token_pos_in_items_len - t.numel(), dtype=torch.uint16
                         ),
                     ]
                 )
@@ -724,19 +845,20 @@ class FlashInferAttnBackend(AttentionBackend):
         if not prefix_len_ptr or not token_pos_in_items_ptr:
             return MultiItemScoringParams()
 
+        # Build the result on the host, then move each tensor to the device once.
+        max_item_len_ptr = torch.stack(
+            [t.to(torch.int32).max().to(torch.uint16) for t in token_pos_in_items_ptr],
+            dim=0,
+        )
         return MultiItemScoringParams(
-            prefix_len_ptr=torch.tensor(
-                prefix_len_ptr, dtype=torch.uint32, device=device
+            prefix_len_ptr=torch.tensor(prefix_len_ptr, dtype=torch.uint32).to(
+                device, non_blocking=True
             ),
-            token_pos_in_items_ptr=torch.cat(token_pos_in_items_ptr, dim=0),
+            token_pos_in_items_ptr=torch.cat(token_pos_in_items_ptr, dim=0).to(
+                device, non_blocking=True
+            ),
             token_pos_in_items_len=token_pos_in_items_len & 0xFFFFFFFF,
-            max_item_len_ptr=torch.stack(
-                [
-                    t.to(torch.int32).max().to(torch.uint16)
-                    for t in token_pos_in_items_ptr
-                ],
-                dim=0,
-            ),
+            max_item_len_ptr=max_item_len_ptr.to(device, non_blocking=True),
         )
 
     def init_forward_metadata_out_graph(
@@ -999,6 +1121,10 @@ class FlashInferAttnBackend(AttentionBackend):
         return layer.k_scale, layer.v_scale
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if is_cp_active(forward_batch):
+            self._init_forward_metadata_cp(forward_batch)
+            return
+
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             swa_out_cache_loc = self.runner_ids.write_ids(
@@ -1103,6 +1229,11 @@ class FlashInferAttnBackend(AttentionBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
         window_kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        # Recapture replaces buffers; wrappers must bind to the new ones.
+        self.decode_cuda_graph_metadata = {}
+        self.prefill_cuda_graph_metadata = {}
+        self.draft_extend_cuda_graph_metadata = {}
+
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
                 (max_num_tokens * self.max_context_len,),
@@ -1326,9 +1457,13 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ) -> None:
+        # Variants share the wrappers replay replans; replacing them leaves
+        # earlier graphs with stale or freed workspaces.
         if forward_mode.is_decode_or_idle():
-            decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
-            self.decode_cuda_graph_metadata[bs] = decode_wrappers
+            decode_wrappers = self.decode_cuda_graph_metadata.get(bs)
+            if decode_wrappers is None:
+                decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
+                self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
         elif forward_mode.is_target_verify() or forward_mode.is_dllm_extend():
             use_custom_mask = (
@@ -1336,15 +1471,21 @@ class FlashInferAttnBackend(AttentionBackend):
                 and spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
             )
-            prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            prefill_wrappers = self.prefill_cuda_graph_metadata.get(bs)
+            if prefill_wrappers is None:
+                prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
+                self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
             )
         elif forward_mode.is_draft_extend_v2():
             # Draft-extend: causal paged prefill over the full sequence (no mask).
-            prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask=False)
-            self.draft_extend_cuda_graph_metadata[bs] = prefill_wrappers
+            prefill_wrappers = self.draft_extend_cuda_graph_metadata.get(bs)
+            if prefill_wrappers is None:
+                prefill_wrappers = self._create_prefill_wrappers(
+                    bs, use_custom_mask=False
+                )
+                self.draft_extend_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_extend():
             if self.full_cg_prefill_wrappers is None:
@@ -1370,9 +1511,39 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
-            self._get_wrapper_idx(layer)
-        ]
+        cp_wrapper = self.forward_metadata.cp_wrapper
+        if cp_wrapper is not None:
+            cp_strategy = get_cp_strategy()
+            cp_strategy.materialize_full_kv(
+                forward_batch=forward_batch, layer=layer, k=k, v=v
+            )
+            kv_cache = self.kv_layers.read(layer.layer_id).kv()
+
+            def _flashinfer_cp_attn(logical_q: torch.Tensor) -> torch.Tensor:
+                return cp_wrapper.forward(
+                    logical_q.contiguous().view(
+                        -1, layer.tp_q_head_num, layer.head_dim
+                    ),
+                    kv_cache,
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    window_left=-1,
+                    logits_soft_cap=layer.logit_cap,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
+
+            output = cp_strategy.run_attention(
+                q=q,
+                forward_batch=forward_batch,
+                device=q.device,
+                attn_fn=_flashinfer_cp_attn,
+                attention_backend=CPAttentionBackendKind.FLASHINFER,
+            )
+            return output.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+        wrapper_idx = self._get_wrapper_idx(layer)
+        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[wrapper_idx]
         # Window-read planning may put the window in a custom mask. Other
         # wrappers leave per-layer windows to forward, even when planned with -1.
         paged_window_left = layer.sliding_window_size
@@ -1420,7 +1591,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     KVWriteLoc.for_layer(
                         forward_batch,
                         layer,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     ),
                     k,
                     v,
@@ -1462,16 +1635,18 @@ class FlashInferAttnBackend(AttentionBackend):
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
+            prefill_wrapper_ragged = self.prefill_wrappers_ragged[wrapper_idx]
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
-                o = self.prefill_wrapper_ragged.forward(
+                o = prefill_wrapper_ragged.forward(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
                     sm_scale=layer.scaling,
+                    window_left=layer.sliding_window_size,
                     logits_soft_cap=logits_soft_cap,
                 )
 
@@ -1484,7 +1659,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                     else -1
                 )
-                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                o1, s1 = prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
@@ -1513,7 +1688,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     KVWriteLoc.for_layer(
                         forward_batch,
                         layer,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     ),
                     k,
                     v,
@@ -1544,7 +1721,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     KVWriteLoc.for_layer(
                         forward_batch,
                         layer,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
+                        window_locs=window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        ),
                     ),
                     k,
                     v,
@@ -1923,7 +2102,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.qo_indptr = attn_backend.qo_indptr
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self._swa_space = attn_backend._swa_space
-        self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+        self.prefill_wrappers_ragged = attn_backend.prefill_wrappers_ragged
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -1988,7 +2167,7 @@ class FlashInferIndicesUpdaterPrefill:
             paged_kernel_lens_sum = seq_lens_sum
 
         self.call_begin_forward(
-            self.prefill_wrapper_ragged,
+            self.prefill_wrappers_ragged[0],
             prefill_wrappers[0],
             req_pool_indices,
             paged_kernel_lens,
@@ -2094,7 +2273,7 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
             self.call_begin_forward(
-                self.prefill_wrapper_ragged,
+                self.prefill_wrappers_ragged[wrapper_id],
                 prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
@@ -2191,7 +2370,7 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
 
             self.call_begin_forward(
-                self.prefill_wrapper_ragged,
+                self.prefill_wrappers_ragged[wrapper_id],
                 prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
@@ -2305,6 +2484,9 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
+                # window.window_left is the paged pass's: -1 on this prefix read,
+                # which its custom mask keeps to the window.
+                window_left=window.window if window is not None else -1,
             )
 
         if use_sliding_window_kv_pool and not use_swa_source:
@@ -2815,10 +2997,9 @@ def should_use_tensor_core(
     Returns:
         bool: Whether to use tensor cores
     """
-    # Try to use environment variable first
-    env_override = os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE")
-    if env_override is not None:
-        return env_override.lower() == "true"
+    forced = envs.SGLANG_FLASHINFER_USE_TENSOR_CORE.get()
+    if forced is not None:
+        return forced
 
     # Try to use _grouped_size_compiled_for_decode_kernels if available
     # This is for flashinfer <=0.1.6. Otherwise, there is an accuracy bug

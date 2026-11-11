@@ -1,5 +1,5 @@
 """The full top-k of the ratio-1/2 index layers outside the candidate scheme:
-DeepGEMM on SM100, torch elsewhere."""
+DeepGEMM on SM100+, torch elsewhere."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from .scoring import (
     get_deep_gemm_prefill_data,
     prefill_requests,
     select_decode,
+    sharded_dense_prefill_topk,
     write_prefill,
 )
 from .types import (
@@ -71,7 +72,11 @@ class FullTopKIndexer:
         kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
             inputs.layer_id, data.k_slots
         )
-        dense_prefill_topk(data, kv, out=inputs.out_raw_indices[: data.num_rows])
+        out = inputs.out_raw_indices[: data.num_rows]
+        if inputs.row_shard is None:
+            dense_prefill_topk(data, kv, out=out)
+        else:
+            sharded_dense_prefill_topk(data, kv, out=out, shard=inputs.row_shard)
         data.write_page_indices(inputs)
 
     def _torch_prefill(self, inputs: PrefillInputs) -> None:
@@ -91,7 +96,7 @@ class FullTopKIndexer:
             topk_plans = metadata.topk_metadata_chunks
             assert not metadata.use_topk_v2 or topk_plans is not None
             for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):
-                q, lens, table = data.paged_logits_args(metadata, rows)
+                q, lens, table, indices = data.paged_logits_args(metadata, rows)
                 logits = deep_gemm_fp4_paged_mqa_logits(
                     q,
                     data.k_cache,
@@ -100,6 +105,7 @@ class FullTopKIndexer:
                     table,
                     plan,
                     metadata.max_compressed_seq_len,
+                    indices=indices,
                 )
                 # TODO(dark): add bf16 topk
                 topk_transform_paged_from_metadata(
@@ -112,7 +118,7 @@ class FullTopKIndexer:
                     ),
                 )
             return
-        q, lens, table = data.paged_logits_args(metadata)
+        q, lens, table, indices = data.paged_logits_args(metadata)
         logits = deep_gemm_fp4_paged_mqa_logits(
             q,
             data.k_cache,
@@ -121,6 +127,7 @@ class FullTopKIndexer:
             table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
+            indices=indices,
         )
         # TODO(dark): add bf16 topk
         topk_transform_paged_from_metadata(
