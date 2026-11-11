@@ -983,7 +983,8 @@ class AiterAttnBackend(AttentionBackend):
         self._muse_extend_fp8_logged = False
         # sliding-layer extend on the Gluon kernel's window variant (FP8 Q like the full layers)
         self.muse_extend_swa_gluon = (
-            bool(self.muse_extend_gluon) and envs.SGLANG_ROCM_MUSE_EXTEND_SWA_GLUON.get()
+            bool(self.muse_extend_gluon)
+            and envs.SGLANG_ROCM_MUSE_EXTEND_SWA_GLUON.get()
         )
         # full layers on the FlyDSL extend kernel
         self.muse_extend_fly = (

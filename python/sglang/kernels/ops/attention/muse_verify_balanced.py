@@ -10,17 +10,13 @@ Partials: ``[segments + 1, 8, heads, 64]`` FP32 with max / denom ``[segments + 1
 slot takes the idle programs' writes.
 """
 
+import flydsl.expr as fx
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from sglang.kernels.ops.attention.muse_verify_flydsl import (
-    CHUNK,
-    QL,
-    _launcher,
-    _run_compiled,
-    fx,
-)
+from sglang.kernels.ops.attention.muse_verify_flydsl import CHUNK, QL, _launcher
 
 # slot groups per chunk group of the kernel's main loop (``slots`` of verify_fly_partials)
 NS = 2
