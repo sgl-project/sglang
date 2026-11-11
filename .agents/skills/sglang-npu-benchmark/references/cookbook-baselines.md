@@ -47,3 +47,23 @@ is specific to the draft path. Kept as a documented incompatible config, not a s
 4. Dry-run: cell count, flag existence, grid validation.
 5. Smoke cell first (small num_prompts) to validate health + accuracy gate, then the grid.
 6. Record provenance; run >= 3 repeats; report with variance gate on.
+
+## Cross-machine check (16-NPU A3, CANN 9.1.0)
+
+Re-validated on a second Atlas A3 node (8 cards x 2 dies = 16 NPU, openEuler 22.03 SP4,
+CANN 9.1.0, driver 25.5.0, SGLang 0.0.0.dev18415, torch_npu 2.10.0.post6), Qwen3-8B BF16,
+`random-ids`, gsm8k gate on (20 questions):
+
+| config | output tok/s | per card | p99 TTFT | p99 TPOT | gsm8k | SLA |
+|---|---|---|---|---|---|---|
+| TP=2, conc 1 | 53.8 | 26.9 | 120.8 ms | 19.3 ms | 0.900 | pass |
+| TP=2, conc 32 | 1099.1 | 549.6 | 6848 ms | 30.6 ms | - | FAIL (saturated-queue TTFT, expected) |
+| TP=8, conc 32 | 1491.7 | 186.5 | 767.7 ms | 22.4 ms | 0.900 | pass |
+
+TP=8 vs TP=2 at conc 32: +36% aggregate throughput and p99 TTFT 6.8 s -> 0.77 s.
+
+Same-machine pitfall confirmations (see the pitfalls reference): with `dataset_name: random`
+the bench client failed on the offline node with `LocalEntryNotFoundError` (the HF hub is still
+contacted for the tokenizer); `random-ids` + `HF_HUB_OFFLINE=1` + local model path fixed it.
+When the gsm8k script was not present at the expected `benchmark/gsm8k/` path, the accuracy gate
+degraded to `accuracy=None` and the performance data was kept, as designed.
