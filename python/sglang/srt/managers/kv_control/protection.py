@@ -54,8 +54,7 @@ class HostPrefix(msgspec.Struct, frozen=True, kw_only=True):
 
     ``cache_salt`` is the already resolved physical salt: callers apply the
     executor's compatibility/namespace transform exactly once before creating
-    this value. It is not a raw application salt. No token material is inferred
-    and resolving a prefix never inserts or splits a radix node.
+    this value. It is not a raw application salt. No token material is inferred.
     """
 
     token_ids: tuple[int, ...]
@@ -87,9 +86,9 @@ class _Record(msgspec.Struct, kw_only=True):
 class ProtectionRegistry:
     """One registry per Engine/namespace/cache generation on its cache owner.
 
-    Only existing, complete FULL host prefixes at materialized radix boundaries
-    are supported. Native UUID-bounded host-lock receipts survive radix splits;
-    an operation completing has no effect on these independently owned locks.
+    Only complete, page-aligned FULL prefixes resident in host memory are
+    supported. Native UUID-bounded host-lock receipts survive radix splits; an
+    operation completing has no effect on these independently owned locks.
 
     Active claims and terminal revision records have separate finite bounds.
     Terminal records are never evicted: exhaustion rejects new claim keys.
@@ -270,7 +269,7 @@ class ProtectionRegistry:
 
     def _resolve(
         self, prefixes: tuple[HostPrefix, ...]
-    ) -> tuple[tuple[UnifiedTreeNode, ...], frozenset[int]]:
+    ) -> tuple[tuple[tuple[UnifiedTreeNode, int], ...], frozenset[int]]:
         from sglang.srt.mem_cache.radix_cache import RadixKey
 
         if (
@@ -291,7 +290,7 @@ class ProtectionRegistry:
             raise ControlError(
                 "capacity", "Protection scope exceeds its traversal budget"
             )
-        nodes, pages = {}, set()
+        spans: dict[int, tuple[UnifiedTreeNode, int]] = {}
         for prefix in prefixes:
             tokens = prefix.token_ids
             if not tokens or len(tokens) % self._core.page_size:
@@ -316,13 +315,10 @@ class ProtectionRegistry:
                         "unsupported", "Bigram host prefixes are unsupported"
                     )
                 matched = node.key.match_at(key, offset, self._core.page_size)
-                if matched != len(node.key):
-                    code = (
-                        "unsupported" if offset + matched == len(tokens) else "missing"
-                    )
-                    raise ControlError(
-                        code, "Protection requires an existing complete radix boundary"
-                    )
+                if not matched or (
+                    matched != len(node.key) and offset + matched != len(tokens)
+                ):
+                    raise ControlError("missing", "Protection prefix is not resident")
                 value = node.component_data[_FULL].host_value
                 if value is None:
                     raise ControlError(
@@ -338,10 +334,28 @@ class ProtectionRegistry:
                         "unsupported",
                         "Host prefix has an unsupported physical span layout",
                     )
-                nodes[node.id] = node
-                pages.update(value[:: self._core.page_size].tolist())
+                previous = spans.get(node.id)
+                if previous is None or matched > previous[1]:
+                    spans[node.id] = (node, matched)
                 offset += matched
-        return tuple(nodes.values()), frozenset(pages)
+        pages = set()
+        for node, matched in spans.values():
+            value = node.component_data[_FULL].host_value
+            pages.update(value[: matched : self._core.page_size].tolist())
+        return tuple(spans.values()), frozenset(pages)
+
+    def _materialize(
+        self, spans: tuple[tuple[UnifiedTreeNode, int], ...]
+    ) -> tuple[UnifiedTreeNode, ...]:
+        # Split only admitted prefixes so their unrelated suffix stays evictable.
+        nodes = []
+        for node, matched in spans:
+            if matched < len(node.key):
+                node, action = self._core._split_node(node.key, node, matched)
+                if action is not None:
+                    self._cache._apply_cache_action(action)
+            nodes.append(node)
+        return tuple(nodes)
 
     def _hold(
         self, nodes: tuple[UnifiedTreeNode, ...]
@@ -360,7 +374,7 @@ class ProtectionRegistry:
         for node_id, receipt in reversed(holds):
             self._cache.dec_host_lock_ref(node_id, receipt)
 
-    def _hold_ttl(self, nodes, pages, ttl, *, replacing=None):
+    def _hold_ttl(self, spans, pages, ttl, *, replacing=None):
         old_pages = replacing.pages if replacing is not None and replacing.holds else ()
         added = len(pages.difference(self._physical_refs))
         removed = sum(self._physical_refs[p] == 1 for p in set(old_pages) - pages)
@@ -368,7 +382,7 @@ class ProtectionRegistry:
             self.max_protected_tokens
         ):
             raise ControlError("capacity", "L2 protection token capacity exhausted")
-        holds = self._hold(nodes)
+        holds = self._hold(self._materialize(spans))
         try:
             now = self._now()
             self._ttl(ttl, now)
@@ -413,10 +427,12 @@ class ProtectionRegistry:
         if replay is not None:
             return replay
         self._admit_key(record)
-        nodes, pages = self._resolve(prefixes)
+        spans, pages = self._resolve(prefixes)
         holds = ()
         if ttl is not None:
-            holds, now = self._hold_ttl(nodes, pages, ttl, replacing=record)
+            holds, now = self._hold_ttl(spans, pages, ttl, replacing=record)
+        else:
+            self._materialize(spans)
         # Acquire the replacement first: an update never opens an eviction gap.
         if record is not None:
             self._drop_holds(record)
@@ -485,9 +501,9 @@ class ProtectionRegistry:
             )
         self._admit_key(record)
         if ttl is not None and not record.holds:
-            nodes, pages = self._resolve(record.snapshot.prefixes)
+            spans, pages = self._resolve(record.snapshot.prefixes)
             assert pages == record.pages
-            record.holds, now = self._hold_ttl(nodes, pages, ttl)
+            record.holds, now = self._hold_ttl(spans, pages, ttl)
         if priority is not None:
             self._set_priority(record, priority)
         record.snapshot = msgspec.structs.replace(

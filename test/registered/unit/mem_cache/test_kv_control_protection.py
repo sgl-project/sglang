@@ -324,15 +324,13 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
                 self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
             owner[1].sanity_check()
 
-    def test_rejects_unmaterialized_missing_and_incomplete_prefixes_without_inserting(
-        self,
-    ):
+    def test_rejects_missing_and_incomplete_prefixes_without_splitting(self):
         with transfer_fixtures.hicache(self) as owner:
             _, cache, _, _ = owner
             node = host_copy(owner)
             pins = registry(owner, max_scope_tokens=8)
             for scope, code in (
-                (prefixes((1, 2)), "unsupported"),
+                (prefixes((1, 2), (99,)), "missing"),
                 (prefixes((1, 2, 3, 5)), "missing"),
                 (prefixes((1, 2, 3, 4, 5)), "missing"),
                 (prefixes(tuple(range(9))), "capacity"),
@@ -366,6 +364,58 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
             self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
             self.assertEqual(pins.protected_tokens, 0)
             cache.sanity_check()
+
+    def test_compressed_prefix_protects_only_its_pages(self):
+        config = ServiceConfig(
+            namespace="ns",
+            engine_id="engine",
+            protection_limits=ProtectionLimits(max_protected_tokens=2),
+        )
+        for ttl in (5, None):
+            with (
+                self.subTest(ttl=ttl),
+                transfer_fixtures.hicache(self, config=config) as owner,
+            ):
+                _, cache, service, _ = owner
+                self.clock.now = 100
+                tail = host_copy(owner)
+                slots = tail.component_data[FULL].host_value.clone()
+                pins = service.control.executor.protection.registry
+                self.error(
+                    "capacity",
+                    pins.acquire,
+                    key=claim(),
+                    revision=1,
+                    prefixes=prefixes((1, 2, 3)),
+                    ttl_seconds=5,
+                )
+                self.assertIs(tail.parent, cache.tree_core.root_node)
+                # Overlapping endpoints in the same compressed node use the
+                # longest match and count the shared page only once.
+                active = pins.acquire(
+                    key=claim(),
+                    revision=1,
+                    prefixes=prefixes((1, 2), (1,)),
+                    ttl_seconds=ttl,
+                    priority=7,
+                )
+                self.assertEqual(active.physical_tokens, 2)
+                head = tail.parent.component_data[FULL]
+                self.assertTrue(torch.equal(head.host_value, slots[:2]))
+                self.assertEqual(head.host_lock_ref, int(ttl is not None))
+                self.assertEqual(tail.component_data[FULL].host_lock_ref, 0)
+                self.assertEqual(pins.priorities, dict.fromkeys(slots[:2].tolist(), 7))
+                self.assertEqual(cache.evict_host(2), 2)
+                self.assertIsNone(tail.component_data[FULL].host_value)
+                host = cache.host_pool_group.anchor_entry.host_pool
+                self.assertTrue(torch.all(host.k_buffer[0][head.host_value] == 7))
+                self.clock.now = 105
+                pins.expire()
+                self.assertEqual(head.host_lock_ref, 0)
+                self.assertEqual(pins.priorities, dict.fromkeys(slots[:2].tolist(), 7))
+                pins.release(key=claim(), revision=2)
+                self.assertEqual(cache.evict_host(2), 2)
+                cache.sanity_check()
 
     def test_clear_invalidation_and_reset_never_replay_receipts_against_new_tree(self):
         with transfer_fixtures.hicache(self) as owner:
@@ -422,9 +472,10 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
                 pins.acquire,
                 key=claim(),
                 revision=1,
-                prefixes=prefixes((1, 2, 3, 4)),
+                prefixes=prefixes((1, 2)),
                 ttl_seconds=10,
             )
+            self.assertIs(node.parent, cache.tree_core.root_node)
             self.assertEqual(pins.protected_tokens, 0)
             self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
             self.assertGreater(node.component_data[FULL].lock_ref, 0)
