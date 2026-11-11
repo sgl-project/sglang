@@ -3,6 +3,7 @@ it only through the Req finish methods."""
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from sglang.srt.managers import schedule_batch
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
@@ -74,6 +75,24 @@ class TestReqFinishMethods(CustomTestCase):
         req.update_finish_state(0)
         self.assertIs(req.finished_reason, reason)
         self.assertIsNone(req.to_finish)
+
+    def test_abort_resets_start_lens_for_the_one_token_prompt(self):
+        req = Req(
+            rid="r",
+            origin_input_text="",
+            origin_input_ids=[1, 2, 3],
+            sampling_params=SamplingParams(),
+            return_logprob=True,
+            return_routed_experts=True,
+            routed_experts_start_len=-1,
+        )
+        req.logprob_start_len = 2
+        with patch("sglang.srt.managers.schedule_batch.get_parallel") as parallel:
+            parallel().tp_rank = 0
+            req.set_finish_with_abort("rejected at intake")
+        self.assertEqual(list(req.origin_input_ids), [0])
+        self.assertEqual(req.logprob_start_len, -1)
+        self.assertEqual(req.routed_experts_start_len, 0)
 
 
 if __name__ == "__main__":

@@ -598,7 +598,7 @@ def _fused_moe_lora_fake(
 
 # Register as SGLang custom ops following the same pattern as other ops
 try:
-    from sglang.srt.utils.common import direct_register_custom_op
+    from sglang.srt.utils.custom_op import direct_register_custom_op
 
     direct_register_custom_op(
         op_name="fused_moe_lora",

@@ -183,6 +183,87 @@ Keep the prefix cache enabled for every strategy.
 
 Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not override `linear_lower_bound` through `--json-model-override-args`.
 
+### Tune B300 TP4 for long-context agent traffic
+
+For long-context agent workloads with prefix reuse, tune the prefill interval together with the KV/KDA memory split. On **four NVIDIA B300 GPUs with TP4 and FP8 weights**, the configuration below increased AgentX S19 total throughput by **26.3%** and output throughput by **35.6%** at client concurrency 64.
+
+| Parameter | Baseline | Tuned |
+| --- | --- | --- |
+| `--prefill-decode-interval` | `0` | `1` |
+| `--chunked-prefill-size` | `16384` | `16384` |
+| `--cuda-graph-max-bs-prefill` | `8192` | `8192` |
+| `--mamba-max-states-per-path` | `-1` (unlimited) | `2` |
+| `--mamba-full-memory-ratio` | `0.9` | `0.5` |
+
+Reducing the memory ratio shifts capacity from KDA states to KV tokens. KV capacity increased from 13.92M to 17.62M tokens, while KDA checkpoint capacity decreased from 1,626 to 1,144 states. At C64, the input cache-hit rate rose from 87.00% to 92.12%.
+
+<Accordion title="Benchmark server command">
+
+Measured on Linux with SGLang revision `3fa242f27c5e6caca28ccd2538f2043eec654740`, FlashInfer 0.7.2, and PyTorch 2.14.1+cu130. Set `MODEL_PATH` to the public model identifier or your local FP8 checkpoint.
+
+The benchmark pins speculative acceptance to 3.5 with the three `SGLANG_SIMULATE_ACC_*` variables below. Omit these variables for normal serving and accuracy evaluation.
+
+```bash
+MODEL_PATH="zai-org/GLM-5.3-Flash"
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+SGLANG_SIMULATE_ACC_LEN=3.5 \
+SGLANG_SIMULATE_ACC_METHOD=match-expected \
+SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token \
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --served-model-name zai-org/GLM-5.3-Flash \
+  --tp-size 4 \
+  --dsa-prefill-backend trtllm \
+  --dsa-decode-backend trtllm \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-runner-backend flashinfer_trtllm \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 \
+  --enable-linear-replayssm-spec \
+  --max-running-requests 32 \
+  --cuda-graph-max-bs-decode 32 \
+  --cuda-graph-backend-prefill breakable \
+  --cuda-graph-max-bs-prefill 8192 \
+  --mem-fraction-static 0.9 \
+  --prefill-decode-interval 1 \
+  --chunked-prefill-size 16384 \
+  --mamba-max-states-per-path 2 \
+  --mamba-full-memory-ratio 0.5 \
+  --random-seed 316023864 \
+  --weight-loader-prefetch-checkpoints \
+  --weight-loader-prefetch-num-threads 16 \
+  --watchdog-timeout 3600 \
+  --enable-metrics --enable-cache-report \
+  --host 127.0.0.1 --port 30000
+```
+
+For the baseline, change the interval to `0`, the path-state cap to `-1`, and the memory ratio to `0.9`. Both configurations use 16,384-token prefill chunks and explicitly pin the prefill graph capacity to 8,192 tokens to match the measured configuration rather than rely on version-dependent defaults.
+
+</Accordion>
+
+The same configuration was also measured at C4. Total throughput increased by 2.9% and output throughput by 1.1%; median TTFT increased from 125.6 to 136.2 ms. C4 and C64 are client concurrency levels; the server's `max_running_requests` remains 32.
+
+| Client concurrency | Configuration | Total tokens/s | Output tokens/s | TTFT p50 (ms) | TPOT p99 (ms) |
+| --- | --- | --- | --- | --- | --- |
+| 4 | Baseline | 29,078.6 | 190.8 | 125.6 | 4.68 |
+| 4 | Tuned | 29,929.3 | 192.8 | 136.2 | 4.37 |
+| 64 | Baseline | 179,693.8 | 1,210.9 | 1,744.2 | 163.25 |
+| 64 | Tuned | 227,018.8 | 1,642.5 | 642.4 | 65.77 |
+
+Total throughput includes cached input tokens. TPOT p99 is the 99th percentile of per-request average time per output token.
+
+Tune the cap and memory ratio together: with interval `1` and ratio `0.9`, adding `cap=2` reduced C64 total throughput from 184,053.1 to 166,257.3 tokens/s. A follow-up at ratio `0.5` with an unlimited path-state cap measured 190,658.5 total tokens/s and 1,292.1 output tokens/s, compared with 227,018.8 and 1,642.5 with `cap=2`.
+
+<Accordion title="Measurement details">
+
+Each C4/C64 point is one 900-second AgentX send window after graph/kernel warmup, snapshot primers, and one additional warmup request per client lane. Each point used a fresh server, client seed 42, and corpus revision `23f152f6f0f9399a85901b89a6458def0ef16729`. Native full-run metrics include a final drain of up to 30 seconds.
+
+The C64 baseline completed 1,344 requests and cancelled 5 at the measurement boundary; the tuned configuration completed 1,644 with no cancellations. Both passed the native submission checks with no request errors. The sweep covers C4 and C64 with simulated acceptance; repeated runs and natural-acceptance performance are separate follow-ups.
+
+</Accordion>
+
 ### Keep the KV and DSA backends paired
 
 On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. MI355X instead uses FP8 KV with TileLang DSA in the recorded ROCm recipe. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination, and TRT-LLM DSA is not the MI355X backend.
