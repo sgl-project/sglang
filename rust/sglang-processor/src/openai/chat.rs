@@ -733,8 +733,12 @@ fn request_tools(
     for tool in tools {
         let function = &tool["function"];
         let well_formed = tool.get("type").is_none_or(Value::is_string)
-            && tool.get("defer_loading").is_none_or(Value::is_null)
-            && function.get("defer_loading").is_none_or(Value::is_null)
+            // A deferred tool lowers: every renderer dumps the flag as
+            // `Tool._propagate_defer_loading` leaves it, and the templates that
+            // read it (GLM-5.3's) hide the tool as Python's do. A value pydantic
+            // would refuse goes to the engine for its 400.
+            && is_pydantic_flag(tool.get("defer_loading"))
+            && is_pydantic_flag(function.get("defer_loading"))
             && function.get("strict").is_none_or(|s| s == false)
             && function
                 .get("description")
@@ -760,6 +764,20 @@ fn request_tools(
 const SCHEMA_TYPES: &[&str] = &[
     "string", "number", "integer", "boolean", "object", "array", "null",
 ];
+
+/// Whether `value` is an unset `Optional[bool]` or one pydantic's lax `bool`
+/// accepts: a boolean, 0 or 1, or a yes/no word in any case.
+fn is_pydantic_flag(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null | Value::Bool(_)) => true,
+        Some(Value::Number(n)) => matches!(n.as_f64(), Some(0.0 | 1.0)),
+        Some(Value::String(s)) => matches!(
+            s.to_lowercase().as_str(),
+            "0" | "off" | "f" | "false" | "n" | "no" | "1" | "on" | "t" | "true" | "y" | "yes"
+        ),
+        Some(_) => false,
+    }
+}
 
 /// A schema `normalize_json_schema_types` leaves as is and `check_schema`
 /// accepts, judged on the keywords tool schemas use.
@@ -1767,6 +1785,47 @@ impl ChatResponder {
 mod tests {
     use super::*;
 
+    /// Claude Code's deferred tools (`defer_loading: true`, on the tool as the
+    /// Anthropic conversion puts it or on the function) lower with the rest,
+    /// so a request that declares one still takes the token path; a flag
+    /// pydantic refuses goes to the engine.
+    #[test]
+    fn deferred_tools_lower() {
+        let with = |tool: Value| {
+            let raw = json!({"tools": [
+                {"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}},
+                tool,
+            ]});
+            request_tools(raw.as_object().unwrap(), true)
+        };
+        let placeholder = |defer: Value| {
+            json!({"type": "function", "defer_loading": defer, "function": {
+                "name": "DeferredToolPlaceholder",
+                "description": "Reserved placeholder that keeps deferred tool loading active; never call this tool.",
+                "parameters": {"type": "object", "properties": {}}}})
+        };
+        let auto = Ok(Some(ToolChoice::Auto));
+        for defer in [
+            json!(true),
+            json!(false),
+            json!(null),
+            json!(1),
+            json!("no"),
+        ] {
+            assert_eq!(with(placeholder(defer.clone())), auto, "{defer}");
+        }
+        let on_function = json!({"type": "function", "function": {
+            "name": "DeferredToolPlaceholder", "defer_loading": true, "parameters": {"type": "object"}}});
+        assert_eq!(with(on_function), auto);
+        for defer in [json!(2), json!("maybe"), json!([true]), json!({})] {
+            assert_eq!(
+                with(placeholder(defer.clone())),
+                Err(Unsupported("tool_definition")),
+                "{defer}"
+            );
+        }
+    }
+
     /// Kimi K3 starts in reasoning unless the merged kwargs turn `thinking` off;
     /// a parser the port does not cover keeps its own default.
     #[test]
@@ -1942,9 +2001,9 @@ mod tests {
         }
     }
 
-    /// A K3 request whose `tool_choice` forces a call is lowered with the
-    /// forced-call tag and the tools close as a stop, and its output's calls
-    /// are parsed as under `auto`. Another tool parser has no such tag here.
+    /// A K3 request with ordinary and deferred tools whose `tool_choice` forces
+    /// a call gets the forced-call tag and tools-close stop, and its output's
+    /// calls are parsed as under `auto`. Another tool parser has no such tag.
     #[test]
     fn forced_tool_choice_lowers_and_parses_kimi_k3_calls() {
         let k3 = ChatModel {
@@ -1960,13 +2019,18 @@ mod tests {
             {"type": "function", "function": {"name": "get_weather", "parameters": {
                 "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}},
             {"type": "function", "function": {"name": "get_time"}},
+            {"type": "function", "defer_loading": true, "function": {
+                "name": "DeferredToolPlaceholder", "parameters": {"type": "object", "properties": {}}}},
         ]);
         let output = "I need the weather.<|close|>think<|sep|><|open|>tools<|sep|>\
             <|open|>call tool=\"get_weather\" index=\"1\"<|sep|>\
             <|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|>\
             <|close|>call<|sep|>";
         for (choice, callable) in [
-            (json!("required"), vec!["get_weather", "get_time"]),
+            (
+                json!("required"),
+                vec!["get_weather", "get_time", "DeferredToolPlaceholder"],
+            ),
             (
                 json!({"type": "function", "function": {"name": "get_weather"}}),
                 vec!["get_weather"],
@@ -2033,9 +2097,9 @@ mod tests {
         }
     }
 
-    /// A K3 request with tools and `tool_choice: "none"` is lowered with the
-    /// nonempty-response tag, no tools-close stop, and its output as content.
-    /// Another constraint or another tool parser leaves the request untagged.
+    /// A K3 request with ordinary and deferred tools and `tool_choice: "none"`
+    /// gets the nonempty-response tag, no tools-close stop, and its output as
+    /// content. Another constraint or tool parser leaves it untagged.
     #[test]
     fn none_tool_choice_constrains_kimi_k3_to_a_response() {
         let k3 = ChatModel {
@@ -2050,7 +2114,11 @@ mod tests {
         let body = json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hello"}],
-            "tools": [{"type": "function", "function": {"name": "get_time"}}],
+            "tools": [
+                {"type": "function", "function": {"name": "get_time"}},
+                {"type": "function", "defer_loading": true, "function": {
+                    "name": "DeferredToolPlaceholder", "parameters": {"type": "object", "properties": {}}}},
+            ],
             "tool_choice": "none",
         });
         let lower = |body: &Value, settings: &OpenAiSettings| {
