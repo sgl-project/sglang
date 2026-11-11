@@ -423,7 +423,7 @@ impl<'a> ModelRouting<'a> {
     }
 }
 
-fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
+pub(crate) fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
     let model = model.0.clone();
     match error {
         PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers { model },
