@@ -685,6 +685,7 @@ class Sampler(nn.Module):
                 sampling_info.sampling_seed,
                 positions,
                 npu_top_k_top_p_eligible=sampling_info.npu_top_k_top_p_eligible,
+                trunc_fused_eligible=sampling_info.trunc_fused_eligible,
             )
             return batch_next_token_ids.to(torch.int32)
 
@@ -824,11 +825,12 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     else:
         probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
+    probs_sort.masked_fill_(
         torch.arange(0, probs_sort.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+        >= top_ks.view(-1, 1),
+        0.0,
+    )
+    probs_sort.masked_fill_((probs_sum - probs_sort) > top_ps.view(-1, 1), 0.0)
 
     if need_min_p_sampling:
         # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
@@ -836,7 +838,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
             "With sampling seed, multinomial_with_seed will provide wrong results"
         )
         min_p_thresholds = probs_sort[:, 0] * min_ps
-        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+        probs_sort.masked_fill_(probs_sort < min_p_thresholds.view(-1, 1), 0.0)
 
     if sampling_seed is None:
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
@@ -862,6 +864,46 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     return batch_next_token_ids
 
 
+def _npu_fused_trunc_sampling_from_logits(
+    logits: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+) -> torch.Tensor:
+    """Apply top-k / top-p truncation and sample over the top-K candidates.
+
+    ``torch.topk`` yields the candidates in descending order, so top-k becomes a
+    rank mask and top-p becomes a prefix-mass mask, both over K columns instead
+    of the full vocabulary. The probabilities are the exact full-vocabulary
+    softmax values (the denominator is a full-vocabulary logsumexp), so the kept
+    set equals the sorted slow path's whenever the nucleus fits in the K
+    candidates; the caller guarantees that through ``trunc_fused_eligible``.
+
+    Sampling uses the Gumbel-max trick, so no host synchronization is needed on
+    the decode step. ``sampling_seed`` and ``min_p`` requests do not take this
+    path.
+    """
+    vocab_size = logits.shape[-1]
+    k = min(envs.SGLANG_NPU_FUSED_TRUNC_K.get(), vocab_size)
+
+    topk_vals, topk_idx = torch.topk(logits, k, dim=-1)
+    lse = torch.logsumexp(logits, dim=-1, keepdim=True)
+    probs = (topk_vals - lse).exp()
+
+    # Same top-p semantics as the slow path: a token is dropped once the mass
+    # before it exceeds top_p, and the first token always survives.
+    cumulative = torch.cumsum(probs, dim=-1)
+    top_p_mask = cumulative - probs > top_ps.view(-1, 1)
+    top_k_mask = torch.arange(0, k, device=logits.device).view(1, -1) >= top_ks.view(
+        -1, 1
+    )
+    probs = probs.masked_fill(top_k_mask | top_p_mask, 0.0)
+
+    q = torch.empty_like(probs).exponential_()
+    q.clamp_min_(torch.finfo(probs.dtype).tiny)
+    sampled_k = (probs / q).argmax(dim=-1, keepdim=True)
+    return torch.gather(topk_idx, 1, sampled_k).view(-1).to(torch.int32)
+
+
 def top_k_top_p_min_p_sampling_from_logits_ascend(
     logits: torch.Tensor,
     top_ks: torch.Tensor,
@@ -871,6 +913,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     sampling_seed: Optional[torch.Tensor],
     positions: torch.Tensor,
     npu_top_k_top_p_eligible: bool = False,
+    trunc_fused_eligible: bool = False,
 ):
     """A top-k, top-p and min-p sampling implementation for ascend npu with torch_npu interface.
 
@@ -899,6 +942,17 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
                 logprobs_top_k_top_p, sampling_seed, positions
             )
     else:
+        # Truncate and sample over the top-K candidates instead of sorting the
+        # full vocabulary. Opt-in, exact for top_k <= K, and never used with
+        # min-p or per-request seeds.
+        if (
+            envs.SGLANG_NPU_USE_FUSED_TRUNC.get()
+            and trunc_fused_eligible
+            and not need_min_p_sampling
+            and sampling_seed is None
+        ):
+            return _npu_fused_trunc_sampling_from_logits(logits, top_ks, top_ps)
+
         probs = torch.softmax(logits, dim=-1)
         probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
 
@@ -1015,7 +1069,7 @@ def top_p_normalize_probs_torch(
     # See also top_k_top_p_min_p_sampling_from_probs_torch
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    probs_sort.masked_fill_((probs_sum - probs_sort) > top_ps.view(-1, 1), 0.0)
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
     return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
 
