@@ -3,7 +3,7 @@
 export const config = {
   modelName: "Unlimited-OCR-2",
 
-  supportedHardware: ["l20"],
+  supportedHardware: ["l20", "h100", "h200", "b200", "b300", "gb200", "gb300"],
 
   // L20 is not in the shared HARDWARE_CATALOG.
   hardware: [
@@ -50,6 +50,12 @@ export const config = {
 
   dockerImages: {
     l20: "lmsysorg/sglang:dev",
+    h100: "lmsysorg/sglang:dev",
+    h200: "lmsysorg/sglang:dev",
+    b200: "lmsysorg/sglang:dev",
+    b300: "lmsysorg/sglang:dev",
+    gb200: "lmsysorg/sglang:dev",
+    gb300: "lmsysorg/sglang:dev",
   },
 
   github: {
@@ -79,6 +85,140 @@ export const config = {
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--chat-template unlimited-ocr",
+        "--uocr-doc-split",
+        "--enable-streaming-session",
+        "--uocr-max-page-tokens 8000",
+        "--cuda-graph-backend-decode full",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // Starting recipes: the exact 8,000-token/page configurations below
+    // have not been validated on these platforms.
+    {
+      match: {
+        hw: "h100",
+        variant: "default",
+        quant: "bf16",
+        strategy: "balanced",
+        nodes: "single",
+      },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--chat-template unlimited-ocr",
+        "--uocr-doc-split",
+        "--enable-streaming-session",
+        "--uocr-max-page-tokens 8000",
+        "--cuda-graph-backend-decode full",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: {
+        hw: "h200",
+        variant: "default",
+        quant: "bf16",
+        strategy: "balanced",
+        nodes: "single",
+      },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--chat-template unlimited-ocr",
+        "--uocr-doc-split",
+        "--enable-streaming-session",
+        "--uocr-max-page-tokens 8000",
+        "--cuda-graph-backend-decode full",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: {
+        hw: "b200",
+        variant: "default",
+        quant: "bf16",
+        strategy: "balanced",
+        nodes: "single",
+      },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--chat-template unlimited-ocr",
+        "--uocr-doc-split",
+        "--enable-streaming-session",
+        "--uocr-max-page-tokens 8000",
+        "--cuda-graph-backend-decode full",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: {
+        hw: "b300",
+        variant: "default",
+        quant: "bf16",
+        strategy: "balanced",
+        nodes: "single",
+      },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--chat-template unlimited-ocr",
+        "--uocr-doc-split",
+        "--enable-streaming-session",
+        "--uocr-max-page-tokens 8000",
+        "--cuda-graph-backend-decode full",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: {
+        hw: "gb200",
+        variant: "default",
+        quant: "bf16",
+        strategy: "balanced",
+        nodes: "single",
+      },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--chat-template unlimited-ocr",
+        "--uocr-doc-split",
+        "--enable-streaming-session",
+        "--uocr-max-page-tokens 8000",
+        "--cuda-graph-backend-decode full",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: {
+        hw: "gb300",
+        variant: "default",
+        quant: "bf16",
+        strategy: "balanced",
+        nodes: "single",
+      },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
         "--chat-template unlimited-ocr",
         "--uocr-doc-split",
         "--enable-streaming-session",

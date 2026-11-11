@@ -20,7 +20,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx1250_supported
 
 _is_hip = is_hip()
 if _is_hip:
@@ -488,6 +488,7 @@ def mhc_pre_big_fuse_tilelang(
     n_splits: int = 16,
     hc_mult: int = 4,
     gemm_last_dim: int = -1,
+    eps_outside_sqrt: bool = False,
 ):
     num_tokens = T.dynamic("num_tokens")
     hc_mult3 = hc_mult * (2 + hc_mult)
@@ -516,7 +517,10 @@ def mhc_pre_big_fuse_tilelang(
 
         for i_split in T.serial(n_splits):
             rms[0] += gemm_out_sqrsum[i_split, i]
-        rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
+        if eps_outside_sqrt:
+            rms[0] = 1.0 / (T.sqrt(rms[0] / (hc_mult * hidden_size)) + rms_eps)
+        else:
+            rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
         for j in T.Parallel(hc_mult3):
             mixes[j] = 0
             for i_split in T.serial(n_splits):
@@ -667,9 +671,7 @@ def _mhc_pre_gemm_sqrsum_dispatch():
     """SM120's TileLang pipeline cannot warp-specialize this kernel (the role
     marker fails on tirx.Bind), so re-wrap it there with warp specialization
     disabled. Other archs keep the original compiled form."""
-    from sglang.srt.utils import is_sm120_supported
-
-    if not is_sm120_supported():
+    if not current_arch().is_sm(12):
         return mhc_pre_gemm_sqrsum_tilelang
     _tl = _load_tilelang()
     cfg = {_tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
@@ -696,14 +698,12 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
 
     ENABLE_PDL = is_arch_support_pdl()
 
-    from sglang.srt.utils import is_sm120_supported
-
     _tl = _load_tilelang()
     # See _mhc_pre_gemm_sqrsum_dispatch: SM120 cannot compile the
     # warp-specialized form of these kernels.
     _cfg = (
         {_tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
-        if is_sm120_supported()
+        if current_arch().is_sm(12)
         else None
     )
 
@@ -915,6 +915,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
     n_splits: int = 16,
     hc_mult: int = 4,
     gemm_last_dim: int = -1,
+    eps_outside_sqrt: bool = False,
 ):
     """Fused mhc_pre big_fuse + RMSNorm of layer_input.
 
@@ -951,7 +952,10 @@ def mhc_pre_big_fuse_with_norm_tilelang(
 
         for i_split in T.serial(n_splits):
             rms[0] += gemm_out_sqrsum[i_split, i]
-        rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
+        if eps_outside_sqrt:
+            rms[0] = 1.0 / (T.sqrt(rms[0] / (hc_mult * hidden_size)) + rms_eps)
+        else:
+            rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
         for j in T.Parallel(hc_mult3):
             mixes[j] = 0
             for i_split in T.serial(n_splits):
@@ -1075,7 +1079,10 @@ def mhc_pre(
     *,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
+    eps_outside_sqrt: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``eps_outside_sqrt`` normalizes by ``1 / (sqrt(mean_sq) + eps)`` instead of
+    ``rsqrt(mean_sq + eps)``; set it to the formula the checkpoint was trained with."""
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
     assert hc_scale.dtype == torch.float32
@@ -1144,9 +1151,14 @@ def mhc_pre(
                 hidden_block = 256
             elif hc_hidden_size == 28672:
                 hidden_block = 128
+            elif hc_hidden_size == 14336:
+                # 14336 = 4 * 3584 (xing4_0). hidden_block=256 -> 14336/256=56.
+                # Caller must pass n_splits_pre dividing 56 so that
+                # (14336//n_splits_pre) % 256 == 0 (e.g. n_splits_pre=8 -> 1792).
+                hidden_block = 256
             else:
                 raise NotImplementedError(
-                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
+                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672, 14336}}, "
                     f"got {hc_hidden_size}"
                 )
             kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
@@ -1234,6 +1246,7 @@ def mhc_pre(
             big_fuse_n_splits,
             hc_mult,
             gemm_last_dim,
+            eps_outside_sqrt,
         )
     else:
         mhc_pre_big_fuse_tilelang(
@@ -1254,6 +1267,7 @@ def mhc_pre(
             big_fuse_n_splits,
             hc_mult,
             gemm_last_dim,
+            eps_outside_sqrt,
         )
 
     post_mix = post_mix.view(*outer_shape, hc_mult, 1)
@@ -1964,6 +1978,7 @@ def _mhc_pre_dispatch(
     sinkhorn_repeat: int,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
+    n_splits_pre: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
     if _use_aiter_mhc():
@@ -2008,6 +2023,7 @@ def _mhc_pre_dispatch(
         hc_sinkhorn_eps=hc_sinkhorn_eps,
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
+        n_splits_pre=n_splits_pre,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
     )
@@ -2051,7 +2067,12 @@ def hc_pre(
     hc_norm_weight: torch.Tensor | None = None,
     out_norm_weight: torch.Tensor | None = None,
     out_norm_eps: float | None = None,
+    n_splits_pre: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """Split-K parallelism of the TileLang mhc_pre GEMM: the split size must
+    keep (hc_mult * hidden_size) // n_splits_pre divisible by the kernel's
+    hidden_block, e.g. n_splits_pre=8 for hc_hidden_size=14336 (14336/8=1792,
+    a multiple of 256; the default 32 would give 448, which is not)."""
     s, total = x.shape
     hidden_size = total // hc_mult
     if x.numel() == 0:
@@ -2076,6 +2097,7 @@ def hc_pre(
         sinkhorn_repeat=sinkhorn_iters,
         norm_weight=out_norm_weight,
         norm_eps=out_norm_eps,
+        n_splits_pre=n_splits_pre,
     )
     return (
         layer_input,
@@ -2330,10 +2352,23 @@ def _block_m_for(m: int) -> int:
     return _HC_MIX_BLOCK_M
 
 
-def _num_slices_for(k: int) -> int:
-    """Slice count depends only on K, never on batch size M."""
-    blocks = k // _HC_MIX_BLOCK_K
-    assert k % _HC_MIX_BLOCK_K == 0, k
+@functools.lru_cache(maxsize=None)
+def _hc_mix_stats_sinkhorn_block_k(device: torch.device) -> int:
+    # Query the input device lazily to avoid initializing CUDA before fork.
+    # SM121 has not been measured.
+    if (
+        device.type == "cuda"
+        and not _is_hip
+        and torch.cuda.get_device_capability(device) == (12, 0)
+    ):
+        return 32
+    return _HC_MIX_BLOCK_K
+
+
+def _num_slices_for(k: int, block_k: int = _HC_MIX_BLOCK_K) -> int:
+    """Slice count depends only on K and tile width, never on batch size M."""
+    blocks = k // block_k
+    assert k % block_k == 0, k
     for n in _HC_MIX_SLICE_CHOICES:
         if blocks % n == 0:
             return n
@@ -2491,11 +2526,15 @@ def hc_mix_stats_sinkhorn(
     if m == 0:
         return pre, post, comb
 
-    num_slices = _num_slices_for(k)
+    block_k = _hc_mix_stats_sinkhorn_block_k(dev)
+    num_slices = _num_slices_for(k, block_k)
     mix_pad = max(16, triton.next_power_of_2(mix))
     part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
     part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
     block_m = _block_m_for(m)
+    if block_k == 32:
+        # SM120's 8-row tile changes rounding relative to 16/32-row batches.
+        block_m = max(16, block_m)
     _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
         x_flat,
         hc_fn,
@@ -2509,7 +2548,7 @@ def hc_mix_stats_sinkhorn(
         MIX_PAD=mix_pad,
         NUM_SLICES=num_slices,
         BLOCK_M=block_m,
-        BLOCK_K=_HC_MIX_BLOCK_K,
+        BLOCK_K=block_k,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         num_warps=_HC_MIX_NUM_WARPS,
         num_stages=_HC_MIX_NUM_STAGES,
@@ -2558,6 +2597,17 @@ def hc_mix_stats_sinkhorn(
 # residual), accumulated over a fixed slice count to bound the fp32 error.
 _HC_MIX_COMPENSATED_SLICES = 16
 _HC_MIX_BF16X3_BLOCK_M = 128
+_HC_MIX_BF16X3_BLOCK_K = 64
+_HC_PRENORM_BLOCK_M = 64
+
+
+def _hc_mix_deepgemm_slices(m: int) -> int:
+    # Halve the slices when the prenorm grid overflows one wave. The fp32 error
+    # grows about linearly with K per slice, so do not go below half.
+    grid_m = triton.cdiv(m, _HC_PRENORM_BLOCK_M)
+    if grid_m * _HC_MIX_COMPENSATED_SLICES <= current_arch().num_sms:
+        return _HC_MIX_COMPENSATED_SLICES
+    return _HC_MIX_COMPENSATED_SLICES // 2
 
 
 def split_bf16_hc_weight(weight: torch.Tensor):
@@ -2640,7 +2690,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
     block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
     assert x.is_contiguous() and x.dtype == torch.bfloat16
     assert hopper_medium or 4096 <= m <= 65536
-    assert k % (slices * _HC_MIX_BLOCK_K) == 0
+    assert k % (slices * _HC_MIX_BF16X3_BLOCK_K) == 0
     assert len(weight_parts) == 3
     assert all(
         w.shape == (mix, k) and w.dtype == torch.bfloat16 and w.is_contiguous()
@@ -2661,7 +2711,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
         K_PER_SLICE=k // slices,
         MIX_COLS=mix,
         MIX_PAD=triton.next_power_of_2(mix),
-        BLOCK_K=_HC_MIX_BLOCK_K,
+        BLOCK_K=_HC_MIX_BF16X3_BLOCK_K,
         BLOCK_M=block_m,
         num_warps=4,
         num_stages=3,
@@ -2697,12 +2747,15 @@ def hc_mix_stats_sinkhorn_deepgemm(
     hc_eps: float,
     hc_mult: int = 4,
 ):
-    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
+        tf32_hc_prenorm_gemm,
+        tf32_hc_prenorm_gemm_dual,
+    )
 
     assert x_flat.dtype == torch.bfloat16 and x_flat.is_contiguous()
     m, k = x_flat.shape
     mix = (2 + hc_mult) * hc_mult
-    slices = _HC_MIX_COMPENSATED_SLICES
+    slices = _hc_mix_deepgemm_slices(m)
     high, low = weight_parts
     assert high.shape == low.shape == (mix, k)
     dev = x_flat.device
@@ -2715,10 +2768,13 @@ def hc_mix_stats_sinkhorn_deepgemm(
     mix_hi = torch.empty((slices, m, mix), dtype=torch.float32, device=dev)
     mix_lo = torch.empty_like(mix_hi)
     sq = torch.empty((slices, m), dtype=torch.float32, device=dev)
-    tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
-    # sq depends only on x_flat, so the second projection recomputes the same
-    # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
-    tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
+    if current_arch().is_sm(10):
+        tf32_hc_prenorm_gemm_dual(x_flat, high, low, mix_hi, mix_lo, sq, slices)
+    else:
+        tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
+        # sq depends only on x_flat, so the second projection recomputes the same
+        # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
+        tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         mix_hi,
         sq,
