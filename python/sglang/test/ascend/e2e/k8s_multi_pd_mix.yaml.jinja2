@@ -51,6 +51,8 @@ spec:
             value: "{{ install_sglang_from_source }}"
           - name: METRICS_DATA_FILE
             value: "{{ metrics_data_file }}"
+          - name: NPU_ACCURACY_DATASET
+            value: "{{ accuracy_dataset }}"
           - name: KUBECONFIG
             value: "{{ kube_config }}"
           - name: NAMESPACE
@@ -103,7 +105,13 @@ spec:
           - name: share
             mountPath: /root/sglang
             subPath: {{ sglang_source_relative_path }}
+          - name: shm-volume
+            mountPath: /dev/shm
         volumes:
+        - name: shm-volume
+          emptyDir:
+            medium: Memory
+            sizeLimit: "16Gi"
         {% if env in ["ci", "debug"] %}
         - name: share
           persistentVolumeClaim:

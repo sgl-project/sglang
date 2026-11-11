@@ -5,7 +5,9 @@ The scheduler polls it while busy, idle or paused, then calls ``result`` before
 streaming; errors abort the response. Cancellation retires responses even if
 work continues; completions must not cancel work needed by sibling requests.
 
-Completions own payloads after KV release. Held responses do not affect
+A deferred request moves out of its scheduler request list into the deferred
+one, so a caller does not defer while it iterates those lists. Completions own payloads
+after KV release. Held responses do not affect
 ``Scheduler.is_fully_idle``: only the output rank holds them, so TP ranks must
 agree on idle-gated operations. PD disaggregation is unsupported.
 """

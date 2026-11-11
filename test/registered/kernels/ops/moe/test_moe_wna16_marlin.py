@@ -17,10 +17,11 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend, initialize_moe_config
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_moe_nvfp4_layer_for_marlin,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
-from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
+from sglang.srt.utils.device import is_sm80_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
     awq_marlin_quantize,
@@ -29,15 +30,6 @@ from sglang.test.test_marlin_utils import (
 )
 
 register_cuda_ci(est_time=720, stage="extra-a", runner_config="1-gpu-large")
-
-
-def _has_aot_moe_wna16_marlin_gemm() -> bool:
-    return hasattr(torch.ops.sgl_kernel, "moe_wna16_marlin_gemm") and hasattr(
-        torch.ops.sgl_kernel.moe_wna16_marlin_gemm, "default"
-    )
-
-
-AOT_AVAILABLE = _has_aot_moe_wna16_marlin_gemm()
 
 
 def stack_and_dev(tensors: list[torch.Tensor]):
@@ -150,59 +142,6 @@ def _run_single_gemm(
     )
 
 
-def _run_single_gemm_aot(
-    a,
-    c,
-    qweight,
-    scales,
-    zeros,
-    g_idx,
-    sort_indices,
-    workspace,
-    sorted_token_ids,
-    expert_ids,
-    num_tokens_post_padded,
-    topk_weights,
-    quant_type,
-    block_size_m,
-    topk,
-    size_m,
-    size_n,
-    size_k,
-    mul_topk_weights,
-    is_k_full,
-    use_atomic_add,
-):
-    return torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
-        a,
-        c,
-        qweight,
-        None,  # b_bias
-        scales,
-        None,  # global_scale
-        zeros,
-        g_idx,
-        sort_indices,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        moe_block_size=block_size_m,
-        top_k=topk,
-        mul_topk_weights=mul_topk_weights,
-        is_ep=False,
-        b_q_type_id=quant_type.id,
-        size_m=size_m,
-        size_n=size_n,
-        size_k=size_k,
-        is_k_full=is_k_full,
-        use_atomic_add=use_atomic_add,
-        use_fp32_reduce=True,
-        is_zp_float=False,
-    )
-
-
 def generate_test_cases():
     m_list = [1, 123]
     n_list = [128, 1024]
@@ -254,9 +193,6 @@ TEST_CASES = generate_test_cases()
 def test_moe_wna16_marlin_gemm(
     m, n, k, e, topk, dtype, group_size, act_order, quant_type
 ):
-    if not AOT_AVAILABLE:
-        pytest.skip("sgl_kernel moe_wna16_marlin_gemm AOT op not available")
-
     torch.manual_seed(0)
 
     has_zp = quant_type in [scalar_types.uint4, scalar_types.uint8]
@@ -327,33 +263,11 @@ def test_moe_wna16_marlin_gemm(
 
     torch.cuda.synchronize()
 
-    # --- Check bitwise equality with AOT kernel ---
-    c_aot = torch.empty((m * topk, 2 * n), dtype=dtype, device="cuda")
-    c_aot = _run_single_gemm_aot(
-        a,
-        c_aot,
-        qweight1,
-        scales1,
-        zeros1,
-        g_idx1,
-        sort_indices1,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        scalar_type,
-        block_size_m,
-        topk,
-        m,
-        2 * n,
-        k,
-        False,
-        True,
-        use_atomic_add,
-    )
-    torch.cuda.synchronize()
-    torch.testing.assert_close(c_jit, c_aot, rtol=0, atol=0)
+    # Row i * topk + j of the output is token i through its j-th routed expert.
+    per_expert = torch.matmul(a.float(), w_ref1.float().transpose(1, 2))
+    tokens = torch.arange(m, device="cuda").repeat_interleave(topk)
+    expected = per_expert[topk_ids.flatten(), tokens].to(dtype)
+    torch.testing.assert_close(c_jit, expected, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(
@@ -689,7 +603,10 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     output_ref *= routed_scaling_factor
 
     torch.cuda.synchronize()
-    torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.25)
+    # Outputs reach |32-64|, where one bf16 ulp is 0.25, and on SM90 the kernel
+    # sums partials with bf16 atomic adds, so the order (and the result) varies
+    # run to run. atol=0.25 left no room for that; allow two ulps.
+    torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.5)
 
 
 def _dequant_mxfp4_reference(packed, scales):

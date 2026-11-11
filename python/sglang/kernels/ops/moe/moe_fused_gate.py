@@ -7,9 +7,10 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_arch_support_pdl
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.kernels.ops.moe import moe_route_radix
+from sglang.kernels.ops.moe import moe_route_radix, moe_route_warp
 
 _SCORING_FUNC_MAP = {
     "sigmoid": 0,
@@ -242,7 +243,9 @@ def _router_triton_kernel(
             in_g = (group_of_n[None, :] == g) & mask_n[None, :]
             vals = tl.where(in_g, biased, -float("inf"))
             top1 = tl.max(vals, axis=1)[:, None]  # [BLOCK_M, 1]
-            vals2 = tl.where(vals >= top1, -float("inf"), vals)
+            # Drop only the first copy of the max: a tied max also counts as top2.
+            top1_n = tl.min(tl.where(vals == top1, offs_n[None, :], BLOCK_N), axis=1)
+            vals2 = tl.where(offs_n[None, :] == top1_n[:, None], -float("inf"), vals)
             top2 = tl.max(vals2, axis=1)[:, None]  # [BLOCK_M, 1]
             group_score = tl.where(offs_g[None, :] == g, top1 + top2, group_score)
 
@@ -369,7 +372,8 @@ def moe_fused_gate(
     ``packed_out`` ([M, topk] int32, optional) receives the FlashInfer routed-MoE form
     ``(id << 16) | bf16_bits(weight)``, bitwise identical to ``fused_pack_topk``.
     """
-    scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
+    scoring_func = scoring_func.lower()
+    scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func)
     assert scoring_func_int is not None, (
         f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
     )
@@ -380,9 +384,7 @@ def moe_fused_gate(
     ), "scores must be float32/float16/bfloat16"
     assert scores.ndim == 2, "scores must be 2D"
     if bias is None:
-        assert scoring_func.lower() == "softmax", (
-            "bias is required for non-softmax routing"
-        )
+        assert scoring_func == "softmax", "bias is required for non-softmax routing"
     else:
         # The kernel loads the bias and upcasts it to fp32 in-register (see
         # _router_triton_kernel), so a non-fp32 bias (DeepSeek-V4 stores the
@@ -412,10 +414,11 @@ def moe_fused_gate(
 
     from sglang.srt.environ import envs
 
+    cuda = current_arch().cuda
     if (
         envs.SGLANG_OPT_SM120_MTP_ROUTER_TOP22.get()
         and scores.is_cuda
-        and torch.cuda.get_device_capability(scores.device) == (12, 0)
+        and current_arch().is_sm(12, 0)
         and 2 <= scores.shape[0] <= 16
         and scores.shape[1] == 512
         and scores.dtype == torch.float32
@@ -424,7 +427,7 @@ def moe_fused_gate(
         and bias.dtype == torch.float32
         and bias.is_contiguous()
         and topk == 22
-        and scoring_func.lower() == "sigmoid"
+        and scoring_func == "sigmoid"
         and num_fused_shared_experts == 0
         and num_expert_group <= 1
         and moe_softcapping == 0.0
@@ -451,7 +454,7 @@ def moe_fused_gate(
     # kernels are order-insensitive). It is 3.1-3.5x faster than the Triton
     # kernel at [1..8192, 896] top-16 on B200.
     if (
-        scoring_func.lower() == "sigmoid"
+        scoring_func == "sigmoid"
         and num_fused_shared_experts == 0
         and num_expert_group <= 1
         and moe_softcapping == 0.0
@@ -471,6 +474,40 @@ def moe_fused_gate(
         )
         if moe_route_radix.covered(scores, bias, topk):
             return moe_route_radix.route_radix(*radix_args, sorted=False)
+
+    # One-warp-per-token CUDA router: same selection, order and padding contract
+    # as the Triton kernel below.
+    if (
+        moe_softcapping == 0.0
+        and moe_route_warp.covered(
+            scores.dtype,
+            scores.shape[1],
+            topk,
+            scoring_func,
+            num_fused_shared_experts,
+            num_expert_group,
+            topk_group,
+        )
+        and moe_route_warp.bias_layout_ok(bias, bias_alt)
+    ):
+        return moe_route_warp.moe_route_warp(
+            scores,
+            bias,
+            topk,
+            scoring_func=scoring_func,
+            num_fused_shared_experts=num_fused_shared_experts,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            num_token_non_padded=num_token_non_padded,
+            renormalize_epsilon=renormalize_epsilon,
+            packed_out=packed_out,
+            input_ids=input_ids,
+            bias_alt=bias_alt,
+            bias_alt_token_id=bias_alt_token_id,
+        )
 
     M, N = scores.shape
     K = topk
@@ -503,8 +540,7 @@ def moe_fused_gate(
         # On SM103, early-launching the small DSV4.1 target router increases
         # latency when it overlaps with mHC/shared-expert work. Use ordinary
         # stream dependencies; keep PDL for the draft router and larger batches.
-        arch = get_jit_cuda_arch()
-        use_pdl = (arch.major, arch.minor) != (10, 3)
+        use_pdl = cuda is not None and cuda.capability != (10, 3)
     extra = {"launch_pdl": True} if use_pdl else {}
     # Dynamo cannot analyze the kernel (PDL inline asm), so it writes back every
     # pointer arg; aliasing an output as an unused arg's fallback clobbers it.

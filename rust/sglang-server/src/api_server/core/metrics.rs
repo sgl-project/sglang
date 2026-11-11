@@ -152,6 +152,124 @@ impl CounterFamily {
     }
 }
 
+/// Every [`ExtensionCounter`] registered in this process.
+static EXTENSION_COUNTERS: Mutex<Vec<&'static ExtensionCounter>> = Mutex::new(Vec::new());
+
+/// Every [`ExtensionHistogram`] registered in this process.
+static EXTENSION_HISTOGRAMS: Mutex<Vec<&'static ExtensionHistogram>> = Mutex::new(Vec::new());
+
+/// A counter family recorded by code built on this frontend, such as an
+/// external multimodal processor. With metrics enabled, it is written with
+/// the frontend's own counters, so `/metrics` exports it summed over processes.
+pub struct ExtensionCounter(CounterFamily);
+
+impl ExtensionCounter {
+    /// Register a family; prometheus_client names counters `*_total`. A name
+    /// registered again returns the first registration (and its help). The
+    /// family lives for the rest of the process.
+    pub fn register(name: &'static str, help: &'static str) -> &'static Self {
+        let mut counters = EXTENSION_COUNTERS.lock().unwrap();
+        if let Some(counter) = counters.iter().find(|counter| counter.0.name == name) {
+            return counter;
+        }
+        let counter: &'static Self = Box::leak(Box::new(Self(CounterFamily::new(name, help))));
+        counters.push(counter);
+        counter
+    }
+
+    /// Add one to the series with these labels.
+    pub fn inc(&self, labels: &[(&str, &str)]) {
+        self.0.series(&owned_labels(labels)).inc(1);
+    }
+
+    /// Create the series with these labels at zero, as prometheus_client's
+    /// `labels()` does: a rate over it then starts from a zero series, not a
+    /// missing one.
+    pub fn init_series(&self, labels: &[(&str, &str)]) {
+        self.0.series(&owned_labels(labels));
+    }
+
+    /// The count of the series with these labels; `None` when there is no
+    /// such series. Reading creates none.
+    pub fn value(&self, labels: &[(&str, &str)]) -> Option<u64> {
+        existing_series(&self.0.series, labels).map(|counter| counter.0.load(Ordering::Relaxed))
+    }
+}
+
+/// A histogram family recorded by code built on this frontend, written with
+/// the frontend's own histograms (see [`ExtensionCounter`]).
+pub struct ExtensionHistogram(HistogramFamily);
+
+impl ExtensionHistogram {
+    /// Register a family with `buckets` as prometheus_client's `Histogram`
+    /// takes them (see [`HistogramFamily::new`]). A name registered again
+    /// returns the first registration (and its help and buckets). The family
+    /// lives for the rest of the process.
+    pub fn register(
+        name: &'static str,
+        help: &'static str,
+        buckets: &[f64],
+    ) -> Result<&'static Self, String> {
+        let mut histograms = EXTENSION_HISTOGRAMS.lock().unwrap();
+        if let Some(histogram) = histograms.iter().find(|histogram| histogram.0.name == name) {
+            return Ok(histogram);
+        }
+        let histogram: &'static Self =
+            Box::leak(Box::new(Self(HistogramFamily::new(name, help, buckets)?)));
+        histograms.push(histogram);
+        Ok(histogram)
+    }
+
+    /// Observe `value` in the series with these labels.
+    pub fn observe(&self, labels: &[(&str, &str)], value: f64) {
+        self.0.series(&owned_labels(labels)).observe(value);
+    }
+
+    /// The number of observations in the series with these labels; `None`
+    /// when there is no such series. Reading creates none.
+    pub fn count(&self, labels: &[(&str, &str)]) -> Option<u64> {
+        existing_series(&self.0.series, labels).map(|histogram| {
+            histogram
+                .buckets
+                .iter()
+                .map(|bucket| bucket.load(Ordering::Relaxed))
+                .sum()
+        })
+    }
+
+    /// The sum of the observations in the series with these labels; `None`
+    /// when there is no such series. Reading creates none.
+    pub fn sum(&self, labels: &[(&str, &str)]) -> Option<f64> {
+        existing_series(&self.0.series, labels)
+            .map(|histogram| f64::from_bits(histogram.sum.load(Ordering::Relaxed)))
+    }
+}
+
+/// An extension's labels as a series key: sorted by name, as the written key
+/// sorts them, so one label set in any order is one series.
+fn owned_labels(labels: &[(&str, &str)]) -> Labels {
+    let mut labels: Labels = labels
+        .iter()
+        .map(|&(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+    labels.sort();
+    labels
+}
+
+/// The series with these labels, if there is one.
+fn existing_series<T>(
+    series: &Mutex<Vec<(Labels, Arc<T>)>>,
+    labels: &[(&str, &str)],
+) -> Option<Arc<T>> {
+    let labels = owned_labels(labels);
+    series
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(l, _)| *l == labels)
+        .map(|(_, series)| series.clone())
+}
+
 impl HistogramFamily {
     /// `buckets` as prometheus_client's `Histogram` takes them: sorted, and
     /// `+Inf` appended unless already last.
@@ -483,9 +601,15 @@ impl FrontendMetrics {
         for family in self.counters() {
             family.entries(&mut counters);
         }
+        for counter in EXTENSION_COUNTERS.lock().unwrap().iter() {
+            counter.0.entries(&mut counters);
+        }
         let mut histograms = Vec::new();
         for family in self.histograms() {
             family.entries(&mut histograms);
+        }
+        for histogram in EXTENSION_HISTOGRAMS.lock().unwrap().iter() {
+            histogram.0.entries(&mut histograms);
         }
         for (file, entries) in [
             (&self.counter_file, counters),
@@ -1172,5 +1296,93 @@ mod tests {
         config.bucket_time_to_first_token = Some(vec![2.0, 1.0]);
         assert!(FrontendMetrics::new(&config, DisaggregationMode::Null).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Registered extension families are written with the frontend's own: a
+    /// counter series created before its first increment reads zero, and a
+    /// histogram keeps its own buckets.
+    #[test]
+    fn extension_families_are_exported() {
+        let dir = temp_dir("extension");
+        let metrics =
+            FrontendMetrics::new(&config(&dir, BTreeMap::new()), DisaggregationMode::Null).unwrap();
+        let counter = ExtensionCounter::register(
+            "sglang:test_extension_events_total",
+            "Events counted by a test extension.",
+        );
+        counter.inc(&[("reason", "a"), ("kind", "x")]);
+        // The same label set in another order is the same series.
+        counter.inc(&[("kind", "x"), ("reason", "a")]);
+        counter.init_series(&[("reason", "b"), ("kind", "x")]);
+        assert_eq!(counter.value(&[("reason", "a"), ("kind", "x")]), Some(2));
+        assert_eq!(counter.value(&[("kind", "x"), ("reason", "b")]), Some(0));
+        // A read creates no series.
+        assert_eq!(counter.value(&[("kind", "x"), ("reason", "c")]), None);
+        let again = ExtensionCounter::register("sglang:test_extension_events_total", "Other help.");
+        assert!(std::ptr::eq(again, counter));
+
+        let histogram = ExtensionHistogram::register(
+            "sglang:test_extension_seconds",
+            "Durations observed by a test extension.",
+            &[0.1, 1.0],
+        )
+        .unwrap();
+        histogram.observe(&[("phase", "load")], 0.0625);
+        histogram.observe(&[("phase", "load")], 0.5);
+        histogram.observe(&[("phase", "load")], 4.0);
+        assert_eq!(histogram.count(&[("phase", "load")]), Some(3));
+        assert_eq!(histogram.sum(&[("phase", "load")]), Some(4.5625));
+        assert_eq!(histogram.count(&[("phase", "never")]), None);
+        assert_eq!(histogram.sum(&[("phase", "never")]), None);
+        let again =
+            ExtensionHistogram::register("sglang:test_extension_seconds", "Other help.", &[2.0])
+                .unwrap();
+        assert!(std::ptr::eq(again, histogram));
+        assert!(
+            ExtensionHistogram::register("sglang:test_unsorted_seconds", "Unsorted.", &[2.0, 1.0])
+                .is_err()
+        );
+
+        let text = rendered(&metrics, &dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            text.contains("# TYPE sglang:test_extension_events_total counter"),
+            "{text}"
+        );
+        assert_eq!(
+            sample(
+                &text,
+                r#"sglang:test_extension_events_total{kind="x",reason="a"}"#
+            ),
+            Some(2.0)
+        );
+        assert_eq!(
+            sample(
+                &text,
+                r#"sglang:test_extension_events_total{kind="x",reason="b"}"#
+            ),
+            Some(0.0)
+        );
+        let events = text
+            .lines()
+            .filter(|line| line.starts_with("sglang:test_extension_events_total{"))
+            .count();
+        assert_eq!(events, 2, "{text}");
+        assert!(
+            text.contains("# TYPE sglang:test_extension_seconds histogram"),
+            "{text}"
+        );
+        for (le, count) in [("0.1", 1.0), ("1.0", 2.0), ("+Inf", 3.0)] {
+            let bucket =
+                format!(r#"sglang:test_extension_seconds_bucket{{le="{le}",phase="load"}}"#);
+            assert_eq!(sample(&text, &bucket), Some(count), "{bucket}: {text}");
+        }
+        assert_eq!(
+            sample(
+                &text,
+                r#"sglang:test_extension_seconds_count{phase="load"}"#
+            ),
+            Some(3.0)
+        );
     }
 }

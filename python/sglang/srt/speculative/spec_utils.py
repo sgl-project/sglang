@@ -10,21 +10,16 @@ from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 import torch
 from huggingface_hub import snapshot_download
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.cache_locs import (
-    fill_front_out_cache_loc_func as fill_front_out_cache_loc_func,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    generate_draft_decode_window_kv_indices as generate_draft_decode_window_kv_indices,
+    fill_front_out_cache_loc_func,
+    generate_draft_decode_window_kv_indices,
 )
 from sglang.kernels.ops.speculative.eagle import (
-    fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
+    fill_accept_out_cache_loc_func,
 )
-from sglang.kernels.ops.speculative.row_argmax import row_argmax
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
@@ -37,12 +32,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
-from sglang.srt.managers.utils import _async_d2h
-from sglang.srt.mem_cache.allocation import (
-    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
-)
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -60,6 +51,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import fast_topk
+from sglang.srt.utils.device import async_d2h as _async_d2h
 from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cuda = is_cuda()
@@ -70,6 +62,7 @@ _is_xpu = is_xpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -195,11 +188,8 @@ def fast_sample(
         scores = probs.float() / q
 
     if num_samples == 1:
-        # row_argmax is FP32-only; the seeded path keeps float64 scores.
-        if scores.dtype == torch.float32:
-            sample_index = row_argmax(scores).unsqueeze(-1)
-        else:
-            sample_index = scores.argmax(dim=-1, keepdim=True)
+        # The seeded path's float64 scores fall back to torch.argmax.
+        sample_index = sampling_argmax(scores).unsqueeze(-1)
     else:
         sample_index = scores.topk(num_samples, dim=-1).indices
     sample_p = probs.gather(1, sample_index)
@@ -279,6 +269,17 @@ def sample_draft_proposal(
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
+
+# XORed into the server seed so these draws differ from other samplers'.
+_SIM_ACC_LEN_DOMAIN = 0x0F3D6B8C2A915E47
+
+
+def simulated_acc_len_generator(seed: int) -> torch.Generator:
+    """The generator of the SGLANG_SIMULATE_ACC_LEN draws (forced lengths, and
+    DSpark's bonus seed), seeded alike on every rank from the server seed."""
+    return torch.Generator().manual_seed(
+        (int(seed) ^ _SIM_ACC_LEN_DOMAIN) & 0x7FFFFFFFFFFFFFFF
+    )
 
 
 def check_simulate_acc_token_mode() -> None:
@@ -372,7 +373,7 @@ def fill_draft_window_rail(
     """Emit every draft step's window-clipped read ids into the per-step rows
     of ``window_kv_indices`` and their indptr into ``window_kv_indptr``: step
     i of a branch reads the last ``min(seq_len + i + 1, window)`` of its
-    tokens, from the storage window layers use (``runner_ids.window_kv_kind``).
+    tokens, from the storage window layers use (``runner_ids.window_storage``).
     ``window`` is the number of tokens the backend's window layers attend."""
     num_seqs = forward_batch.batch_size
     width = num_seqs * topk * window
@@ -384,7 +385,7 @@ def fill_draft_window_rail(
         forward_batch.iteration_ids,
         req_pool_indices=forward_batch.req_pool_indices,
         bs=num_seqs,
-        kind=runner_ids.window_kv_kind,
+        kind=runner_ids.window_storage,
     )
     generate_draft_decode_window_kv_indices[(num_steps, num_seqs, topk)](
         src.row_ids,
@@ -405,15 +406,12 @@ def fill_draft_window_rail(
         v2p=src.v2p,
         TRANSLATE=src.v2p is not None,
     )
-    if (
-        not src.is_translated
-        and runner_ids.window_kv_kind == IdSpaceKind.SLIDING_WINDOW
-    ):
+    if not src.is_translated and runner_ids.window_storage != IdSpaceKind.FULL:
         # Static pool: the legacy full->swa translate, as the target's window
         # reads apply it.
         for i in range(num_steps):
             row = window_kv_indices[i][:width]
-            row.copy_(runner_ids.ids_in(IdSpaceKind.SLIDING_WINDOW, row))
+            row.copy_(runner_ids.ids_in(runner_ids.window_storage, row))
 
 
 def record_stream_each(tensors, stream):
@@ -725,22 +723,35 @@ def traverse_tree(
         if is_accepted:
             if curr != 0:
                 # Accept the current token
-                grammar.accept_token(int(draft_tokens[curr]))
-            if not grammar.is_terminated():
-                # Generate the bitmask for the current token
-                grammar.fill_vocab_mask(allocate_token_bitmask, curr)
-                if retrieve_next_token[curr] != -1:
-                    # Visit the child node
-                    dfs(
-                        int(retrieve_next_token[curr]),
-                        retrieve_next_token,
-                        retrieve_next_sibling,
-                        curr,
+                try:
+                    grammar.accept_token(int(draft_tokens[curr]))
+                except ValueError:
+                    # The matcher can reject a draft token that passed the parent
+                    # mask row (mask/matcher desync, e.g. a disagg retracted-request
+                    # double-accept). Clear it in the parent row so verify won't
+                    # accept it, and prune this branch rather than raising to -- and
+                    # killing -- the scheduler. The accept failed, so the grammar is
+                    # still at the parent state; no rollback is owed for this node.
+                    parent_bitmask[int(current_token) // 32] &= ~(
+                        1 << (int(current_token) % 32)
                     )
+                    is_accepted = False
+            if is_accepted:
+                if not grammar.is_terminated():
+                    # Generate the bitmask for the current token
+                    grammar.fill_vocab_mask(allocate_token_bitmask, curr)
+                    if retrieve_next_token[curr] != -1:
+                        # Visit the child node
+                        dfs(
+                            int(retrieve_next_token[curr]),
+                            retrieve_next_token,
+                            retrieve_next_sibling,
+                            curr,
+                        )
 
-            if curr != 0:
-                # Rollback the current token
-                grammar.rollback(1)
+                if curr != 0:
+                    # Rollback the current token
+                    grammar.rollback(1)
 
         if retrieve_next_sibling[curr] != -1:
             # Visit the sibling node
@@ -1060,9 +1071,11 @@ def _versions(*tensors: torch.Tensor) -> Optional[tuple[int, ...]]:
     return tuple(t._version for t in tensors)
 
 
-# SGLANG_Q35MF_MKH_N3B: the verify rounds of this process reuse the last indices.
+# SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS: the verify rounds of this process reuse the last indices.
 _VERIFY_TRACK_INDICES: Optional[VerifyTrackIndices] = (
-    VerifyTrackIndices() if envs.SGLANG_Q35MF_MKH_N3B.get() else None
+    VerifyTrackIndices()
+    if envs.SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS.get()
+    else None
 )
 
 
@@ -1168,6 +1181,7 @@ def commit_mamba_states_after_verify(
     accept_index: torch.Tensor,
     draft_token_num: int,
     prepared_step_indices: Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]] = None,
+    state_slots: Optional[ForwardStateSlots] = None,
 ) -> None:
     """Commit accepted per-step mamba states into the persistent caches.
 
@@ -1176,6 +1190,9 @@ def commit_mamba_states_after_verify(
     conv/ssm caches. After acceptance, the state of each request's last
     accepted step is committed back, plus the interval-crossing state used
     for prefix-cache tracking (mamba extra_buffer mode).
+
+    Writes ``state_slots``, the verify forward's resolved slots by default, and
+    looks up no table: it may run after the scheduler reused a finished row.
 
     No-op for models without mamba-style state or backends without the
     commit hook.
@@ -1192,12 +1209,27 @@ def commit_mamba_states_after_verify(
     # still needs its usual accept-rollback, so we keep the conv-window scatter and
     # skip only the SSM scatter. GDN-only + linear-chain (topk<=1) -- the runtime
     # ring is allocated only then; KDA never allocates the cursors.
-    req_pool = model_runner.req_to_token_pool
     mamba_pool = model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
     bs = accept_lens.shape[0]
     src_indices_raw = (
         batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
     )
+
+    replay_state_indices = replay_track_indices = None
+    if mamba_pool is not None and (
+        mamba_pool.replayssm_spec_fold or mamba_pool.replayssm_cache_base is not None
+    ):
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        # Persistent destinations are state slots; replay/scratch rows still
+        # index requests.
+        if state_slots is None:
+            state_slots = model_runner.attn_backend.forward_state_slots(
+                bs, batch.mamba_track_indices
+            )
+        replay_state_indices = state_slots.working[:bs]
+        if batch.mamba_track_indices is not None:
+            replay_track_indices = state_slots.track[:bs]
 
     # Fold-every-commit: replay the accepted prefix from the ring into
     # `temporal`; the same fold stores the interval-crossing state to the
@@ -1214,7 +1246,7 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        state_batch_indices = replay_state_indices
         if prepared_step_indices is None:
             last_correct_step_indices, mamba_steps_to_track = (
                 _verify_commit_step_indices(
@@ -1231,7 +1263,7 @@ def commit_mamba_states_after_verify(
             state_batch_indices=state_batch_indices,
             accept_lens=accept_lens,
             last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
             null_block_id=-1,
@@ -1254,7 +1286,7 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        state_batch_indices = replay_state_indices
         replay_indices = batch.req_pool_indices
         if prepared_step_indices is None:
             last_correct_step_indices, mamba_steps_to_track = (
@@ -1295,7 +1327,7 @@ def commit_mamba_states_after_verify(
             cache_base=mamba_pool.replayssm_cache_base,
             is_flush=mamba_pool.replayssm_is_flush,
             accept_lens=accept_lens,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,
         )
@@ -1311,7 +1343,7 @@ def commit_mamba_states_after_verify(
             fused_conv_window_scatter_with_mask(
                 spec_state.conv[0],
                 spec_state.intermediate_conv_window[0],
-                batch.mamba_track_indices,
+                replay_track_indices,
                 mamba_steps_to_track,
                 src_indices_raw,
             )
@@ -1335,7 +1367,7 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        state_batch_indices = replay_state_indices
         accept_indices_offset = torch.arange(
             0,
             bs * draft_token_num,
@@ -1352,7 +1384,7 @@ def commit_mamba_states_after_verify(
         # the track ping-pong slot (mirrors the regular commit's
         # mamba_steps_to_track); commit_kda_replayssm_spec folds it in one pass, so
         # `temporal` stays current and no device-side force-flush is needed.
-        mamba_track_indices = batch.mamba_track_indices
+        mamba_track_indices = replay_track_indices
         mamba_steps_to_track = None
         if mamba_track_indices is not None:
             ti = mamba_track_grid(batch.tree_cache.page_size)
@@ -1406,7 +1438,29 @@ def commit_mamba_states_after_verify(
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=model_runner.model,
                 req_pool_indices=batch.req_pool_indices[:bs],
+                state_slots=state_slots,
             )
+
+
+def relayed_commit_state_slots(
+    target_worker: TpModelWorker, batch: ScheduleBatch
+) -> Optional[ForwardStateSlots]:
+    """The slots a PP stage's relayed verify commit writes, resolved when it runs:
+    the rows still belong to the batch, but a compaction may have moved the slots."""
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+        ForwardStateSlots,
+    )
+
+    model_runner = target_worker.model_runner
+    if mambaish_config(model_runner.model_config) is None:
+        return None
+    req_pool = model_runner.req_to_token_pool
+    state_ids = model_runner.runner_ids.state_ids(req_pool.state_sub_pool)
+    track = batch.mamba_track_indices
+    return ForwardStateSlots(
+        state_ids.ids(req_pool.get_mamba_indices(batch.req_pool_indices)),
+        None if track is None else state_ids.ids(track),
+    )
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
