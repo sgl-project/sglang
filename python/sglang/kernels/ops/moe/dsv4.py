@@ -28,7 +28,7 @@ def _jit_mask_topk_module():
 def _jit_mask_topk_cast_to_i64_module():
     return load_jit(
         make_name("mask_topk_cast_to_i64"),
-        cuda_files=["deepseek_v4/hash_topk.cuh"],
+        cuda_files=["sail/mask_topk_ids_to_int64.cuh"],
         cuda_wrappers=[("run", "MaskCastInt64Kernel::run")],
     )
 
