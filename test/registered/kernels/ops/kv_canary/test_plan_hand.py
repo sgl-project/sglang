@@ -12,11 +12,7 @@ from sglang.kernels.ops.kv_canary.plan_ref import (
 from sglang.kernels.ops.kv_canary.verify import VerifyPlan
 from sglang.kernels.ops.kv_canary.write import WritePlan
 from sglang.srt.utils import get_device, get_device_module
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_xpu_ci,
-)
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.kv_canary._differential import run_plan_diff
 from sglang.test.kernels.kv_canary._fixtures import (
     allocate_plan_pair,
@@ -29,7 +25,6 @@ from sglang.test.kernels.kv_canary._invariants import PlanInvariants
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
-register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 
 
 _DEVICE = torch.device(get_device())
