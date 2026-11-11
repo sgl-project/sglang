@@ -488,7 +488,8 @@ impl serde::Serialize for NativeFrame {
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/generate", post(generate))
+        // Python takes PUT as well as POST, with the same handler.
+        .route("/generate", post(generate).put(generate))
         .merge(health_routes())
 }
 
@@ -3024,6 +3025,54 @@ mod tests {
                     axums.is_ok()
                 ),
             }
+        }
+    }
+
+    /// Python takes `PUT /generate` as well as POST, with the same handler:
+    /// a malformed body is the same 400 on both verbs.
+    #[tokio::test]
+    async fn generate_takes_put_like_post() {
+        use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
+        let (intake_tx, _intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let core = CoreHandle::new(
+            intake_tx,
+            abort_tx,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Vec::new(),
+                multimodal: false,
+                metrics: None,
+                peer_endpoints: Vec::new(),
+                metadata: CoreMetadata::default(),
+                request_log: None,
+                generate_validator: None,
+            },
+        );
+        let state = Arc::new(AppState {
+            core,
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
+            chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
+        });
+        for method in ["POST", "PUT"] {
+            let request = Request::builder()
+                .method(method)
+                .uri("/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"text": 5}"#))
+                .unwrap();
+            let response = routes()
+                .with_state(state.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method}");
         }
     }
 }

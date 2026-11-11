@@ -133,6 +133,7 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "OpenAiTokenizeResponse" => {
                 check::<api::OpenAiTokenizeResponse>(&name, input, canonical)
             }
+            "OpenAiModelList" => check::<api::OpenAiModelList>(&name, input, canonical),
             "OpenAiErrorResponse" => check::<api::OpenAiErrorResponse>(&name, input, canonical),
             "OllamaChatRequest" => check::<api::OllamaChatRequest>(&name, input, canonical),
             "OllamaChatResponse" => check::<api::OllamaChatResponse>(&name, input, canonical),

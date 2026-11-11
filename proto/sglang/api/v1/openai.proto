@@ -957,3 +957,27 @@ message OpenAiDetokenizeRequest {
 message OpenAiDetokenizeResponse {
   StringOrList text = 1;
 }
+
+// ---- Models --------------------------------------------------------------------------
+
+// `GET /v1/models` and `GET /v1/models/{model}`.
+message OpenAiModelCard {
+  string id = 1;
+  string object = 2;
+  int64 created = 3;
+  string owned_by = 4;
+  optional string root = 5 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional string parent = 6 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional int64 max_model_len = 7 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+}
+
+message OpenAiModelList {
+  string object = 1;
+  repeated OpenAiModelCard data = 2;
+}
+
+message OpenAiListModelsRequest {}
+
+message OpenAiRetrieveModelRequest {
+  string model = 1;
+}

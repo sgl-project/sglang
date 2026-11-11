@@ -368,6 +368,20 @@ impl SglangService for Mock {
         unimplemented!()
     }
 
+    async fn open_ai_list_models(
+        &self,
+        _: Request<api::OpenAiListModelsRequest>,
+    ) -> Result<Response<api::OpenAiModelList>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_retrieve_model(
+        &self,
+        _: Request<api::OpenAiRetrieveModelRequest>,
+    ) -> Result<Response<api::OpenAiModelCard>, Status> {
+        unimplemented!()
+    }
+
     type OpenAiStreamCompletionsStream = ItemStreamOf<api::OpenAiCompletionStreamResponse>;
 
     async fn open_ai_stream_completions(

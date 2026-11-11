@@ -27,6 +27,7 @@ async-stream = { workspace = true }
 base64 = "0.22"
 bytes = { workspace = true }
 flate2 = "1"
+tower = { workspace = true }
 futures = { workspace = true }
 pyo3 = { workspace = true }
 serde = { workspace = true }
@@ -81,6 +82,5 @@ sglang_api_types = { package = "sglang-api-types", path = "../sglang-api-types" 
 
 [dev-dependencies]
 # `Router::oneshot` for handler-level router tests.
-tower = { version = "0.5", features = ["util"] }
 # Paused virtual time for deadline tests.
 tokio = { workspace = true, features = ["test-util"] }

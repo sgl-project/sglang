@@ -3283,6 +3283,71 @@ class OpenAiDetokenizeResponse(msgspec.Struct, kw_only=True, frozen=True):
         return encode_OpenAiDetokenizeResponse(self)
 
 
+class OpenAiModelCard(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiModelCard: JSON object (unknown keys ignored)."""
+
+    id: str = ""
+    object: str = ""
+    created: int = 0
+    owned_by: str = ""
+    root: Optional[str] = None
+    parent: Optional[str] = None
+    max_model_len: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiModelCard":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiModelCard(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiModelCard(self)
+
+
+class OpenAiModelList(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiModelList: JSON object (unknown keys ignored)."""
+
+    object: str = ""
+    data: List[OpenAiModelCard] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiModelList":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiModelList(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiModelList(self)
+
+
+class OpenAiListModelsRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiListModelsRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiListModelsRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiListModelsRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiListModelsRequest(self)
+
+
+class OpenAiRetrieveModelRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenAiRetrieveModelRequest: JSON object (unknown keys ignored)."""
+
+    model: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenAiRetrieveModelRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenAiRetrieveModelRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenAiRetrieveModelRequest(self)
+
+
 class ParseFunctionCallRequest(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.ParseFunctionCallRequest: JSON object (unknown keys ignored)."""
 
@@ -10417,6 +10482,83 @@ def encode_OpenAiDetokenizeResponse(v: OpenAiDetokenizeResponse) -> Dict[str, An
     d: Dict[str, Any] = {}
     if v.text is not None:
         d["text"] = encode_StringOrList(v.text)
+    return d
+
+
+def decode_OpenAiModelCard(value: Any) -> OpenAiModelCard:
+    m = _expect_map(value, expected="struct OpenAiModelCard")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "id":
+            kw["id"] = _expect_str(x, expected="a string")
+        elif key == "object":
+            kw["object"] = _expect_str(x, expected="a string")
+        elif key == "created":
+            kw["created"] = _expect_int(x, expected="i64")
+        elif key == "owned_by":
+            kw["owned_by"] = _expect_str(x, expected="a string")
+        elif key == "root":
+            kw["root"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "parent":
+            kw["parent"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "max_model_len":
+            kw["max_model_len"] = None if x is None else _expect_int(x, expected="i64")
+    return OpenAiModelCard(**kw)
+
+
+def encode_OpenAiModelCard(v: OpenAiModelCard) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["id"] = v.id
+    d["object"] = v.object
+    d["created"] = v.created
+    d["owned_by"] = v.owned_by
+    d["root"] = v.root
+    d["parent"] = v.parent
+    d["max_model_len"] = v.max_model_len
+    return d
+
+
+def decode_OpenAiModelList(value: Any) -> OpenAiModelList:
+    m = _expect_map(value, expected="struct OpenAiModelList")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "object":
+            kw["object"] = _expect_str(x, expected="a string")
+        elif key == "data":
+            kw["data"] = [] if x is None else [decode_OpenAiModelCard(e) for e in _expect_seq(x, expected="a sequence")]
+    return OpenAiModelList(**kw)
+
+
+def encode_OpenAiModelList(v: OpenAiModelList) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["object"] = v.object
+    if v.data:
+        d["data"] = [encode_OpenAiModelCard(e) for e in v.data]
+    return d
+
+
+def decode_OpenAiListModelsRequest(value: Any) -> OpenAiListModelsRequest:
+    m = _expect_map(value, expected="struct OpenAiListModelsRequest")
+    return OpenAiListModelsRequest()
+
+
+def encode_OpenAiListModelsRequest(v: OpenAiListModelsRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_OpenAiRetrieveModelRequest(value: Any) -> OpenAiRetrieveModelRequest:
+    m = _expect_map(value, expected="struct OpenAiRetrieveModelRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+    return OpenAiRetrieveModelRequest(**kw)
+
+
+def encode_OpenAiRetrieveModelRequest(v: OpenAiRetrieveModelRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model"] = v.model
     return d
 
 
