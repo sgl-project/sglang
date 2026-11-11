@@ -46,7 +46,17 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Set, Union
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Union,
+)
 
 import torch
 
@@ -584,6 +594,13 @@ class AddReqResult(Enum):
     # No memory comes back for a request no chunk of which fits now
     # (`PrefillBudget.unschedulable`): it is aborted, not queued.
     UNSCHEDULABLE = auto()
+    # Waits for `--prefill-cache-reserve`; the requests behind it still try.
+    HELD = auto()
+
+
+# Arbitrary: in a replay of coding-agent traffic 16 kept the hit rate where 4
+# let the cache thrash again; a held request is admitted once passed this often.
+CACHE_RESERVE_MAX_OVERTAKES = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -643,6 +660,11 @@ def windows_retire_behind_checkpoints(tree_cache: Optional[BasePrefixCache]) -> 
 
 
 class PrefillAdder:
+    # Off unless `_init_cache_reserve` sets them; adders built without
+    # __init__ (test doubles, `object.__new__`) keep the reserve off.
+    cache_reserve_tokens: Optional[int] = None
+    cache_reserve_held: Sequence[tuple[Req, int]] = ()
+
     def __init__(
         self,
         page_size: int,
@@ -879,6 +901,8 @@ class PrefillAdder:
         """Fix the room `--prefill-cache-reserve` keeps for cached prefixes."""
         ratio = get_schedule().prefill_cache_reserve
         self.cache_reserve_tokens = None
+        # Requests held this pass, with how many had been admitted before each.
+        self.cache_reserve_held = []
         if ratio is None:
             return
         self.kv_capacity = self._kv_capacity()
@@ -899,6 +923,11 @@ class PrefillAdder:
                 if table.enable_mamba_extra_buffer
                 else 0
             )
+
+    def count_cache_reserve_overtakes(self) -> None:
+        """Charge each request held this pass with the requests admitted after it."""
+        for req, admitted_before in self.cache_reserve_held:
+            req.cache_reserve_overtaken += len(self.can_run_list) - admitted_before
 
     def _kv_capacity(self) -> int:
         """The pool size in the units of `memory_budget.remaining_total`."""
@@ -926,6 +955,8 @@ class PrefillAdder:
             return False
         cached = req.prefix_len + req.host_hit_length
         if 2 * cached >= len(req.full_untruncated_fill_ids):
+            return False
+        if req.cache_reserve_overtaken >= CACHE_RESERVE_MAX_OVERTAKES:
             return False
         if (
             self.memory_budget.remaining_total - total_tokens
@@ -1742,7 +1773,8 @@ class PrefillAdder:
 
             # OTHER, not NO_TOKEN: the batch is not full, the next pass asks again.
             if self._holds_for_cache_reserve(req, total_tokens=total_tokens):
-                return AddReqResult.OTHER
+                self.cache_reserve_held.append((req, len(self.can_run_list)))
+                return AddReqResult.HELD
 
             # A rejected candidate must not report prefillable or queue H2D.
             if (self.prefill_delayer_single_pass is not None) and (

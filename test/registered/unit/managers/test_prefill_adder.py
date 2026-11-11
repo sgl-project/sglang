@@ -2899,12 +2899,13 @@ class TestPrefillAdder(CustomTestCase):
         req = self.create_mock_req("new", priority=0, max_new_tokens=10)
         req.full_untruncated_fill_ids = list(range(prompt_len))
         req.prefix_len = prefix_len
+        req.cache_reserve_overtaken = 0
         return req
 
     def test_cache_reserve_holds_uncached_request_while_others_run(self):
         """A request that would leave less than the reserve free or evictable
-        waits (OTHER, so the next pass asks again) before the delayer is asked
-        or anything is taken."""
+        is HELD (the requests behind it still try, the next pass asks again)
+        before the delayer is asked or anything is taken."""
         delayer = _RecordingDelayer(allow=True)
         adder = self._cache_reserve_adder(
             running=True, prefill_delayer_single_pass=delayer
@@ -2912,10 +2913,29 @@ class TestPrefillAdder(CustomTestCase):
         req = self._reserve_req(prefix_len=0)
         self.assertEqual(
             adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
-            AddReqResult.OTHER,
+            AddReqResult.HELD,
         )
         self.assertEqual(adder.can_run_list, [])
         self.assertEqual(delayer.calls, [])
+
+    def test_cache_reserve_admits_a_request_passed_over_often_enough(self):
+        """Each request admitted after a held one in the pass counts as passing
+        it; once passed CACHE_RESERVE_MAX_OVERTAKES times it is no longer held,
+        so warm traffic behind it cannot hold it forever."""
+        adder = self._cache_reserve_adder(running=True)
+        req = self._reserve_req(prefix_len=0)
+        req.cache_reserve_overtaken = schedule_policy.CACHE_RESERVE_MAX_OVERTAKES - 2
+        adder.can_run_list = [MagicMock()]
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.HELD,
+        )
+        adder.can_run_list = adder.can_run_list + [MagicMock(), MagicMock()]
+        adder.count_cache_reserve_overtakes()
+        self.assertEqual(
+            req.cache_reserve_overtaken, schedule_policy.CACHE_RESERVE_MAX_OVERTAKES
+        )
+        self.assertFalse(adder._holds_for_cache_reserve(req, total_tokens=211))
 
     def test_cache_reserve_admits_cached_or_idle(self):
         """A request whose cached prefix covers half its prompt reuses resident

@@ -4703,7 +4703,10 @@ class Scheduler(
                     # keep the request queued forever.
                     unschedulable.append(req)
                     continue
+                if res == AddReqResult.HELD:
+                    continue
                 break
+        adder.count_cache_reserve_overtakes()
 
         if unschedulable:
             self.waiting_queue.leave(unschedulable)
