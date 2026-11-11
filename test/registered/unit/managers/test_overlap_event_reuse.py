@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.managers import overlap_utils
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import overlap_events
+from sglang.srt.utils import overlap_events, scheduler_affinity
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -89,6 +89,60 @@ class TestFutureMapIndexOps(unittest.TestCase):
         self.assertTrue(torch.equal(results[0][1], results[1][1]))
         self.assertEqual(results[1][1].tolist(), [9, 3, 17])
         self.assertEqual(results[1][1].dtype, torch.int64)
+
+
+class TestSchedulerMainThreadAffinity(unittest.TestCase):
+    """Affinity syscalls are mocked: the test process keeps its own CPU set."""
+
+    def setUp(self):
+        for name, value in (
+            ("_main_cores", frozenset()),
+            ("_other_cores", frozenset()),
+            ("_last_scan", 0.0),
+        ):
+            patcher = patch.object(scheduler_affinity, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_main_thread_takes_its_gpu_pair_and_others_leave_the_reserve(self):
+        affinity = scheduler_affinity
+        for cpus, gpu, main, reserved in (
+            (64, 0, {62, 63}, 4),
+            (64, 1, {60, 61}, 4),
+            (128, 3, {120, 121}, 8),
+        ):
+            with (
+                self.subTest(cpus=cpus, gpu=gpu),
+                patch.object(
+                    affinity.os, "sched_getaffinity", return_value=set(range(cpus))
+                ),
+                patch.object(affinity.os, "sched_setaffinity") as apply,
+                patch.object(affinity.os, "listdir", return_value=["10", "20"]),
+                patch.object(affinity.threading, "get_native_id", return_value=10),
+            ):
+                affinity.pin_main_thread(gpu)
+                others = frozenset(range(cpus - reserved))
+                self.assertEqual(apply.call_args_list[0].args, (0, frozenset(main)))
+                self.assertEqual(apply.call_args_list[1].args, (20, others))
+
+    def test_small_cpu_set_and_idle_rescan(self):
+        affinity = scheduler_affinity
+        with (
+            patch.object(affinity.os, "sched_getaffinity", return_value=set(range(8))),
+            patch.object(affinity.os, "sched_setaffinity") as apply,
+        ):
+            affinity.pin_main_thread(0)
+            apply.assert_not_called()
+        with patch.object(affinity, "_move_other_threads") as scan:
+            affinity.maybe_repin()
+            scan.assert_not_called()
+            affinity._main_cores = frozenset({2, 3})
+            with patch.object(
+                affinity.time, "monotonic", side_effect=[6.0, 10.0, 11.5]
+            ):
+                for _ in range(3):
+                    affinity.maybe_repin()
+            self.assertEqual(scan.call_count, 2)
 
 
 if __name__ == "__main__":

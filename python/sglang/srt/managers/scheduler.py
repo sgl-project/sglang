@@ -59,7 +59,7 @@ from sglang.srt.runtime_context import (
     publish,
     spawn_world_rank,
 )
-from sglang.srt.utils import overlap_events
+from sglang.srt.utils import overlap_events, scheduler_affinity
 
 from sglang.srt.utils.log_utils import suppress_noisy_warnings  # isort: skip
 
@@ -2210,17 +2210,22 @@ class Scheduler(
             self.last_batch = batch
             self.invariant_checker.run(CheckPhase.BUSY, batch)
 
-    def _start_overlap_host_loop(self) -> None:
-        """Host-path switches applied when an overlap event loop starts."""
+    def _start_overlap_host_loop(self) -> bool:
+        """Host-path switches applied when an overlap event loop starts; True when
+        the main thread was pinned (the idle branch then calls maybe_repin)."""
+        pin = envs.SGLANG_OPT_SCHEDULER_MAIN_THREAD_AFFINITY.get()
+        if pin:
+            scheduler_affinity.pin_main_thread(get_device().gpu_id)
         if envs.SGLANG_OPT_FREEZE_ENV_READS.get():
             freeze_env_reads()
             logger.info("Environment reads frozen for the overlap event loop.")
+        return pin
 
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.enable_skip_finishing_decode = True
-        self._start_overlap_host_loop()
+        pinned = self._start_overlap_host_loop()
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -2279,6 +2284,8 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+                if pinned:
+                    scheduler_affinity.maybe_repin()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.

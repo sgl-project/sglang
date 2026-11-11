@@ -380,6 +380,11 @@ class Envs:
     SGLANG_OPT_FREEZE_ENV_READS = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # The scheduler's main thread on two reserved cores of its NUMA node, the process's other
+    # threads off them (utils/scheduler_affinity.py), from an overlap event loop's start.
+    SGLANG_OPT_SCHEDULER_MAIN_THREAD_AFFINITY = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
