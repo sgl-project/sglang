@@ -421,6 +421,8 @@ class GatedResidual(HyperConnectionBase):
         Pass ``next_norm`` only when no PLE or other update touches the residual first.
         """
         hyper_input, _, partials = residuals
+        # Fused mix: partials are [M, HC] inject logits; SM100: [M, 8, 4] gate partials.
+        # This check tells them apart only because ROCm never sets _gate_stream.
         if self._fused_hc_ok and partials is not None:
             from sglang.kernels.ops.gemm.hc_fused_flydsl import hc_apply_inject
 
