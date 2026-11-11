@@ -16,6 +16,11 @@ from unittest.mock import Mock
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -193,7 +198,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.req_device_buffer_tokens.fill_(-1)
         self.coordinator.req_device_buffer_token_locs.fill_(-1)
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
-        self.coordinator.ack_staging_queue.clear()
+        self.coordinator.ack_staging_queue._drop_all()
         self.coordinator._has_pending_backup = False
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False
@@ -628,7 +633,7 @@ class TestHiSparseUnit(unittest.TestCase):
     # Test: Staging (PD Colocate) path
     # ==================================================================
     def test_request_lifecycle_staging_path(self):
-        """prefill -> staging DMA -> collect_ready -> swap-in -> finish."""
+        """prefill -> staging DMA -> move_ready -> swap-in -> finish."""
         initial = self._get_initial_sizes()
         fill_len = self.page_size
         req = _make_req("staging-req", list(range(fill_len)))
@@ -637,11 +642,13 @@ class TestHiSparseUnit(unittest.TestCase):
         kv_loc = self._alloc_kv(req, fill_len)
         self._write_device_patterns(kv_loc, fill_len)
 
+        launched = KeyedReqList(ListKind.PREFILL_LAUNCHED)
+        move([req], launched)
         self.coordinator.admit_request_into_staging(req)
         self.assertTrue(req.hisparse_staging)
 
         get_device_module().synchronize()
-        ready = self.coordinator.collect_ready_reqs()
+        ready = self.coordinator.move_ready_reqs(KeyedReqList(ListKind.DECODING))
         self.assertEqual(len(ready), 1)
         self.assertFalse(req.hisparse_staging)
         self.assertTrue(self.coordinator._skip_first_backup[req.kv.req_pool_idx])
@@ -675,9 +682,11 @@ class TestHiSparseUnit(unittest.TestCase):
         kv_loc = self._alloc_kv(req, fill_len)
         self._write_device_patterns(kv_loc, fill_len)
 
+        launched = KeyedReqList(ListKind.PREFILL_LAUNCHED)
+        move([req], launched)
         self.coordinator.admit_request_into_staging(req)
         get_device_module().synchronize()
-        ready = self.coordinator.collect_ready_reqs()
+        ready = self.coordinator.move_ready_reqs(KeyedReqList(ListKind.DECODING))
         self.assertEqual(ready, [req])
 
         host_row = self.coordinator.req_to_host_pool[req.kv.req_pool_idx, :rounded_len]

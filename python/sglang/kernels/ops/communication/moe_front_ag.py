@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 
 # Threads per block for a gathered output up to this many bytes; wider blocks
-# beyond. The grid is capped at one block per push counter, so wider blocks are
+# beyond. The grid is capped at the push plane's launch width, so wider blocks are
 # what keeps enough 16B spin loads in flight at large batches.
 _NARROW_BLOCK_MAX_BYTES = 256 * 1024
 _NARROW_BLOCK, _WIDE_BLOCK = 128, 512
