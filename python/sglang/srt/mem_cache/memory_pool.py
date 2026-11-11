@@ -5603,6 +5603,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self._finalize_allocation_log(size)
 
     def _create_index_key_cache(self) -> IndexKeyCache:
+        if self.index_k_fp4:
+            from sglang.srt.mem_cache.index_key_cache_hip import Fp4IndexKeyCache
+
+            return Fp4IndexKeyCache(self, self.index_buf_size)
         return IndexKeyCache(self, self.index_buf_size)
 
     def _should_allocate_index_layer(self, local_layer_idx: int) -> bool:
@@ -5933,9 +5937,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()
-        cache = self.index_key_cache
-        for index_k_cache in (*cache.buffer, *cache.scale_buffer):
+        for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        if self.index_k_fp4:  # the FP4 keys' exponents
+            for scales in self.index_key_cache.scale_buffer:
+                kv_size_bytes += get_tensor_size_bytes(scales)
         return kv_size_bytes
 
 
