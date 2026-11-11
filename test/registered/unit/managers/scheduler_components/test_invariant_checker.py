@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, StaticPoolSh
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.session.streaming_session import SessionSlot
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.tree_slots import tree_slots_of
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -139,6 +140,44 @@ class TestCheckTreeCacheGate(CustomTestCase):
             checker.run(CheckPhase.IDLE)
 
             checker.tree_cache.sanity_check.assert_not_called()
+
+
+class TestEndedRequests(CustomTestCase):
+    def _checker(self, listed=(), offloading=()):
+        return SchedulerInvariantChecker(
+            disaggregation_mode=DisaggregationMode.NULL,
+            page_size=1,
+            tree_cache=None,
+            token_to_kv_pool_allocator=None,
+            req_to_token_pool=None,
+            pool_stats_observer=None,
+            scheduler_stage_metrics=None,
+            get_request_lists=lambda: {ListKind.WAITING: list(listed)},
+            get_offloading_reqs=lambda: offloading,
+        )
+
+    def _req(self, rid, *, sent, exited):
+        return FakeReq(
+            rid=rid,
+            send_via="stream" if sent else None,
+            exit_via="release" if exited else None,
+        )
+
+    def test_a_request_in_no_list_must_have_exited_through_the_retirer(self):
+        ended = self._req("ended", sent=True, exited=True)
+        queued = self._req("queued", sent=False, exited=False)
+        offloading = self._req("offloading", sent=True, exited=False)
+        dropped = self._req("dropped", sent=True, exited=False)
+        checker = self._checker(listed=[queued], offloading=[offloading])
+        with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
+            for req in (ended, queued, offloading, dropped):
+                checker.expect_output(req)
+
+        with self.assertRaisesRegex(StateCheckError, r"never exited.*\['dropped'\]"):
+            checker._check_ended_requests()
+
+        dropped.exit_via = "release"
+        checker._check_ended_requests()
 
 
 class TestEveryWindowIsConserved(CustomTestCase):
