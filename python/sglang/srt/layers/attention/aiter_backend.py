@@ -999,7 +999,7 @@ class AiterAttnBackend(AttentionBackend):
 
         nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
 
-        if not (self.use_mla or self.use_triton_unified_attention):
+        if self._uses_paged_ragged_decode():
             self.workspace_buffer = torch.empty(
                 (max_bs * self.num_head * self.max_num_partitions * self.head_dim)
                 * nbyes_per_qo_elem
@@ -1760,10 +1760,19 @@ class AiterAttnBackend(AttentionBackend):
 
         k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
         q_u = _unified_extend_q(q, layer.tp_q_head_num, layer.qk_head_dim)
-        o = q_u.new_empty(
-            (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim),
-            dtype=self.input_dtype,
-        )
+        o_shape = (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+        # Under a breakable prefill graph the graph-owned output buffer is handed in here;
+        # writing it directly saves RadixAttention._eager_attention's copy of the result.
+        o = forward_batch._attn_output
+        if (
+            o is None
+            or o.dtype != self.input_dtype
+            or o.numel() != q_u.shape[0] * layer.tp_q_head_num * layer.v_head_dim
+            or not o.is_contiguous()
+        ):
+            o = q_u.new_empty(o_shape, dtype=self.input_dtype)
+        else:
+            o = o.view(o_shape)
         q_descale = None
         if (
             self.muse_extend_fp8_q
@@ -2601,6 +2610,15 @@ class AiterAttnBackend(AttentionBackend):
             context_len=self.max_context_len,
         )
 
+    def _uses_paged_ragged_decode(self) -> bool:
+        """Whether forward_decode runs paged_attention_ragged, the only reader of
+        workspace_buffer and of the partition buckets."""
+        return not (
+            self.use_mla
+            or self.use_triton_unified_attention
+            or self.kv_cache_is_vectorized_5d
+        )
+
     def _build_decode_partition_buckets(self) -> tuple[tuple[str, int, int], ...]:
         """(label, max_seq_len, num_partitions), ascending; the last serves any length."""
         fallback = (
@@ -2608,15 +2626,10 @@ class AiterAttnBackend(AttentionBackend):
             self.max_context_len,
             self.max_num_partitions,
         )
-        paged_ragged_decode = not (
-            self.use_mla
-            or self.use_triton_unified_attention
-            or self.kv_cache_is_vectorized_5d
-        )
         # Below 128 partitions buckets save little: at batch 256 and 1.5K tokens,
         # 32 and 128 partitions cost 1% and 9% more than 16.
         if not (
-            paged_ragged_decode
+            self._uses_paged_ragged_decode()
             and self.max_num_partitions >= 128
             and envs.SGLANG_AITER_DECODE_PARTITION_BUCKETS.get()
         ):
