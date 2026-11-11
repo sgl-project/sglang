@@ -395,6 +395,9 @@ class Envs:
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
     SGLANG_TEST_TI2I_INPUT_IMAGE = EnvStr(None)
+    # Optional manual cuTile NVFP4 checks; no downloads or server launch.
+    SGLANG_TEST_CUTILE_LARGE_BATCH = EnvBool(False)
+    SGLANG_TEST_MINIMAX_LAYER30_DIR = EnvStr(None)
     # Expand jit_kernel test grids to their full parameter ranges (nightly).
     SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

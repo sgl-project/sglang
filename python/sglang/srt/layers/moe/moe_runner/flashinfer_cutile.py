@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import math
 import threading
-import weakref
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -14,6 +13,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
+from sglang.srt.runtime_context import get_buffer
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -56,18 +56,19 @@ class _CuTileExecution:
         return output
 
 
-# Runners keep strong references for their lifetime. The pool does not keep an
-# unloaded model's workspaces alive, and never shares execution across streams.
-_EXECUTION_POOL: weakref.WeakValueDictionary[tuple, _CuTileExecution] = (
-    weakref.WeakValueDictionary()
-)
-
-
 class FlashInferCuTileRunnerCore(DispatchMoeRunnerCore):
+    """Share execution workspaces for the lifetime of the current resources.
+
+    FlashInfer caches workspaces for visited token buckets in each execution.
+    Different streams need independent executions, so their allocations add up.
+    The token capacity bounds inputs, not the sum of resident workspace memory.
+    Keep these allocations until the runtime resources are reset: individual
+    eviction could invalidate a captured CUDA graph.
+    """
+
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
         validate_flashinfer_cutile_config(config)
-        self._executions: dict[tuple, _CuTileExecution] = {}
         self._geometry = (
             config.num_experts,
             config.hidden_size,
@@ -94,23 +95,25 @@ class FlashInferCuTileRunnerCore(DispatchMoeRunnerCore):
             self._geometry,
             max_num_tokens,
         )
-        execution = self._executions.get(key)
+        # Do not cache this pool or its executions on the runner. reset_context()
+        # replaces Resources while existing runners may still be alive.
+        pool: dict[tuple, _CuTileExecution] = get_buffer(
+            "flashinfer_cutile_execution_pool", dict
+        )
+        execution = pool.get(key)
         if execution is None:
-            execution = _EXECUTION_POOL.get(key)
-            if execution is None:
-                if _is_capturing(device):
-                    raise RuntimeError(
-                        "flashinfer_cutile must initialize and warm up its "
-                        "execution stream before CUDA graph capture."
-                    )
-                _check_device_support(device)
-                execution = _CuTileExecution(
-                    config=self.config,
-                    device=device,
-                    max_num_tokens=max_num_tokens,
+            if _is_capturing(device):
+                raise RuntimeError(
+                    "flashinfer_cutile must initialize and warm up its "
+                    "execution stream before CUDA graph capture."
                 )
-                _EXECUTION_POOL[key] = execution
-            self._executions[key] = execution
+            _check_device_support(device)
+            execution = _CuTileExecution(
+                config=self.config,
+                device=device,
+                max_num_tokens=max_num_tokens,
+            )
+            pool[key] = execution
         return execution
 
     def run_from_dispatch(

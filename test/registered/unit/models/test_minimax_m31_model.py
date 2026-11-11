@@ -133,6 +133,11 @@ def cutile_server_args(**kwargs):
         enable_lora=False,
         enable_paged_experts=False,
         paged_experts_enable_disk=False,
+        cpu_offload_gb=0,
+        offload_group_size=-1,
+        enable_memory_saver=False,
+        enable_weights_cpu_backup=False,
+        load_format="auto",
     )
     return server_args(**(defaults | kwargs))
 
@@ -239,6 +244,44 @@ class TestMiniMaxM31ConfigResolution(CustomTestCase):
         # The new validation does not inspect unrelated backend configurations.
         _validate_flashinfer_cutile_config(SimpleNamespace(moe_runner_backend="auto"))
 
+    def test_cutile_memory_saver_requires_recoverable_weights(self):
+        """Releasing unbacked weights is unsafe when cuTile cannot reload them."""
+        cases = (
+            (False, False, None),
+            (False, True, None),
+            (True, False, "enable-weights-cpu-backup"),
+            (True, True, None),
+        )
+        for enable_memory_saver, enable_weights_cpu_backup, error in cases:
+            with (
+                self.subTest(
+                    memory_saver=enable_memory_saver,
+                    cpu_backup=enable_weights_cpu_backup,
+                ),
+                override_platform(device_sm=120),
+            ):
+                args = cutile_server_args(
+                    enable_memory_saver=enable_memory_saver,
+                    enable_weights_cpu_backup=enable_weights_cpu_backup,
+                )
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        _validate_flashinfer_cutile_config(args)
+                else:
+                    _validate_flashinfer_cutile_config(args)
+
+    def test_cutile_lifecycle_constraints_do_not_restrict_other_backends(self):
+        for backend in ("auto", "marlin"):
+            with self.subTest(backend=backend):
+                _validate_flashinfer_cutile_config(
+                    cutile_server_args(
+                        moe_runner_backend=backend,
+                        enable_memory_saver=True,
+                        enable_weights_cpu_backup=False,
+                        load_format="presharded",
+                    )
+                )
+
     def test_cutile_config_rejects_unsupported_combinations(self):
         cases = (
             (dict(quantization="mxfp8"), "minimax_m3_nvfp4"),
@@ -248,6 +291,9 @@ class TestMiniMaxM31ConfigResolution(CustomTestCase):
             (dict(dtype="float16"), "BF16"),
             (dict(speculative_algorithm="DSPARK"), "speculative decoding"),
             (dict(enable_paged_experts=True), "paged experts"),
+            (dict(cpu_offload_gb=1), "cpu-offload-gb"),
+            (dict(offload_group_size=2), "offload-group-size"),
+            (dict(load_format="presharded"), "load-format presharded"),
         )
         for settings, error in cases:
             with (
@@ -264,18 +310,25 @@ class TestMiniMaxM31ConfigResolution(CustomTestCase):
             ):
                 _validate_flashinfer_cutile_config(cutile_server_args())
 
-    def test_cutile_rejects_quantization_before_backend_rewrite(self):
-        args = cutile_server_args(quantization="mxfp8")
-        with (
-            override_platform(device_sm=120),
-            patch(
-                "sglang.srt.arg_groups.moe_hook.run_post_process_pass",
-                side_effect=AssertionError("backend rewrite must not run"),
-            ),
-            self.assertRaisesRegex(ValueError, "minimax_m3_nvfp4"),
-        ):
-            handle_moe_kernel_config(args)
-        self.assertEqual(args.moe_runner_backend, "flashinfer_cutile")
+    def test_cutile_rejects_incompatible_modes_before_backend_rewrite(self):
+        cases = (
+            (dict(quantization="mxfp8"), "minimax_m3_nvfp4"),
+            (dict(enable_memory_saver=True), "enable-weights-cpu-backup"),
+            (dict(load_format="presharded"), "load-format presharded"),
+        )
+        for settings, error in cases:
+            args = cutile_server_args(**settings)
+            with (
+                self.subTest(settings=settings),
+                override_platform(device_sm=120),
+                patch(
+                    "sglang.srt.arg_groups.moe_hook.run_post_process_pass",
+                    side_effect=AssertionError("backend rewrite must not run"),
+                ),
+                self.assertRaisesRegex(ValueError, error),
+            ):
+                handle_moe_kernel_config(args)
+            self.assertEqual(args.moe_runner_backend, "flashinfer_cutile")
 
     def test_nvfp4_defaults_on_blackwell_and_portable_fallback(self):
         base = dict(quantization="minimax_m3_nvfp4", page_size=128)

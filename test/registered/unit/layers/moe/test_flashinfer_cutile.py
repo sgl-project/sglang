@@ -1,9 +1,9 @@
 """CPU contracts for the FlashInfer cuTile NVFP4 adapter."""
 
-import importlib.util
+import gc
 import sys
-from enum import Enum
-from pathlib import Path
+import weakref
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,64 +11,70 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.layers.moe.moe_runner import flashinfer_cutile
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import (
+    PackedTopKOutput,
+    StandardTopKOutput,
+    StandardTopKOutputPacked,
+)
+from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.layers.quantization.minimax_m3_nvfp4 import MiniMaxM3Nvfp4MoE
+from sglang.srt.model_executor.model_runner_components import weight_exporter
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    WeightUpdater,
+)
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_flags,
+    get_parallel,
+    get_schedule,
+    override_platform,
+    reset_context,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class _StandardTopK(SimpleNamespace):
-    pass
-
-
-class _StandardTopKWithPacked(SimpleNamespace):
-    pass
-
-
-class _Backend(Enum):
-    FLASHINFER_CUTILE = "flashinfer_cutile"
+@contextmanager
+def _runtime_scope(max_num_tokens=512):
+    """Publish real config; exercise the same accessors as model execution."""
+    with (
+        get_context().override_server_args(
+            max_prefill_tokens=max_num_tokens, disable_cuda_graph=True
+        ),
+        get_exec().graph.override(cuda_graph_config=None),
+        get_parallel().override(moe_ep_size=1),
+        get_flags().moe.override(
+            a2a_backend=MoeA2ABackend.NONE,
+            runner_backend=MoeRunnerBackend.FLASHINFER_CUTILE,
+        ),
+        override_platform(is_blackwell=True, is_hip=False, device_sm=120),
+    ):
+        yield
 
 
 @pytest.fixture
-def adapter(monkeypatch):
-    """Stub GPU dependency boundaries; execute the real adapter on CPU tensors."""
-    names = (
-        "sglang.srt.layers.moe.moe_runner.base",
-        "sglang.srt.layers.moe.utils",
-        "sglang.srt.layers.moe.topk",
-        "sglang.srt.layers.moe.token_dispatcher.standard",
-        "sglang.srt.runtime_context",
-        "flashinfer",
-        "flashinfer.fused_moe",
-        "flashinfer.fused_moe.core",
-    )
+def runtime():
+    reset_context()
+    try:
+        with _runtime_scope():
+            yield
+    finally:
+        reset_context()
+
+
+@pytest.fixture
+def adapter(monkeypatch, runtime):
+    """Keep SGLang interfaces real; replace only FlashInfer and CUDA boundaries."""
+    names = ("flashinfer", "flashinfer.fused_moe", "flashinfer.fused_moe.core")
     modules = {name: ModuleType(name) for name in names}
-
-    class DispatchCore:
-        def __init__(self, config):
-            self.config = config
-
-    base = modules["sglang.srt.layers.moe.moe_runner.base"]
-    base.DispatchMoeRunnerCore = DispatchCore
-    base.MoeQuantInfo = type("MoeQuantInfo", (), {})
-    base.MoeRunnerConfig = SimpleNamespace
-    utils = modules["sglang.srt.layers.moe.utils"]
-    utils.MoeRunnerBackend = _Backend
-    utils.get_moe_a2a_backend = lambda: SimpleNamespace(
-        is_none=lambda: True, value="none"
-    )
-    topk = modules["sglang.srt.layers.moe.topk"]
-    topk.TopKOutputChecker = SimpleNamespace(
-        format_is_standard=lambda value: isinstance(
-            value, (_StandardTopK, _StandardTopKWithPacked)
-        )
-    )
-    standard = modules["sglang.srt.layers.moe.token_dispatcher.standard"]
-    standard.StandardDispatchOutput = SimpleNamespace
-    standard.StandardCombineInput = SimpleNamespace
-    context = modules["sglang.srt.runtime_context"]
-    context.cutedsl_moe_max_num_tokens = lambda: 512
-    context.get_parallel = lambda: SimpleNamespace(moe_ep_size=1)
-    context.get_platform = lambda: SimpleNamespace(device_sm=120)
-    context.get_server_args = lambda: SimpleNamespace(max_prefill_tokens=512)
 
     class WeightPack:
         def __init__(self):
@@ -82,9 +88,25 @@ def adapter(monkeypatch):
         def prepare_weights(**kwargs):
             return SimpleNamespace(**kwargs)
 
+    class MoELayer:
+        def __init__(self, *, config, device):
+            self.config = config
+            self.device = device
+            self.activations = []
+
+        def __call__(self, activations, weights):
+            self.activations.append(activations)
+            # A deterministic external-kernel substitute makes routing and
+            # output-scale changes observable, without pretending to run FP4.
+            totals = (activations.topk_weights * (activations.topk_ids + 1)).sum(
+                dim=-1, keepdim=True
+            )
+            return (activations.hidden_states_q.float() * totals).bfloat16()
+
     provider = modules["flashinfer.fused_moe"]
     provider.CuTileNvfp4Config = CuTileConfig
     provider.MoEWeightPack = WeightPack
+    provider.MoELayer = MoELayer
     for name in (
         "SwiGLU",
         "MoEActivationPack",
@@ -103,21 +125,20 @@ def adapter(monkeypatch):
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
-    path = (
-        Path(__file__).resolve().parents[5]
-        / "python/sglang/srt/layers/moe/moe_runner/flashinfer_cutile.py"
+    # The adapter uses CPU tensors here; actual hardware eligibility and driver
+    # behavior remain covered by the separate manual SM120/SM121 tests.
+    monkeypatch.setattr(flashinfer_cutile, "_check_device_support", lambda device: None)
+    monkeypatch.setattr(flashinfer_cutile, "_is_capturing", lambda device: False)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=10)
     )
-    name = "sglang_cutile_adapter_cpu_test"
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, module)
-    spec.loader.exec_module(module)
-    monkeypatch.setattr(module, "_check_device_support", lambda device: None)
-    return module
+    return flashinfer_cutile
 
 
 def _config(**overrides):
-    layer = SimpleNamespace(moe_ep_size=1, moe_tp_size=1)
+    layer = torch.nn.Module()
+    layer.moe_ep_size = layer.moe_tp_size = 1
+    layer.moe_ep_rank = layer.moe_tp_rank = 0
     values = dict(
         num_experts=2,
         num_local_experts=2,
@@ -125,26 +146,15 @@ def _config(**overrides):
         intermediate_size_per_partition=64,
         top_k=2,
         params_dtype=torch.bfloat16,
-        activation="silu",
-        is_gated=True,
         num_fused_shared_experts=0,
-        apply_router_weight_on_input=False,
-        no_combine=False,
-        no_combine_keep_router_weight=False,
-        silu_mul_keep_fp32=False,
-        use_tp_all_gather_activation=False,
         gemm1_alpha=1.702,
         gemm1_beta=1.0,
         gemm1_clamp_limit=7.0,
-        swiglu_limit=None,
         gate_up_interleaved=False,
-        routed_scaling_factor=None,
         layer=layer,
-        moe_ep_size=1,
-        moe_tp_size=1,
     )
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return MoeRunnerConfig(**values)
 
 
 def _layer():
@@ -173,16 +183,19 @@ def _layer():
     return layer
 
 
-def _dispatch(topk_type=_StandardTopK, *, empty=False):
+def _dispatch(topk_type=StandardTopKOutput, *, empty=False):
     count = 0 if empty else 2
-    return SimpleNamespace(
+    values = dict(
+        topk_ids=torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)[:count],
+        topk_weights=torch.tensor([[2.0, 3.0], [1.0, 4.0]])[:count],
+        router_logits=torch.zeros(count, 2),
+    )
+    if topk_type is StandardTopKOutputPacked:
+        values["packed_topk_ids"] = torch.zeros(count, 2, dtype=torch.int32)
+    return StandardDispatchOutput(
         hidden_states=torch.ones(count, 64, dtype=torch.bfloat16),
         hidden_states_scale=None,
-        topk_output=topk_type(
-            topk_ids=torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)[:count],
-            topk_weights=torch.tensor([[2.0, 3.0], [1.0, 4.0]])[:count],
-            router_logits=None,
-        ),
+        topk_output=topk_type(**values),
     )
 
 
@@ -264,7 +277,7 @@ def test_unsupported_runner_config_is_rejected(adapter, overrides):
 
 
 @pytest.mark.parametrize("factor", [None, 2.5])
-@pytest.mark.parametrize("topk_type", [_StandardTopK, _StandardTopKWithPacked])
+@pytest.mark.parametrize("topk_type", [StandardTopKOutput, StandardTopKOutputPacked])
 def test_routing_values_and_output_scaling(adapter, monkeypatch, factor, topk_type):
     config = _config(routed_scaling_factor=factor)
     runner = adapter.FlashInferCuTileRunnerCore(config)
@@ -272,19 +285,14 @@ def test_routing_values_and_output_scaling(adapter, monkeypatch, factor, topk_ty
     original_weights = dispatch.topk_output.topk_weights.clone()
     original_input = dispatch.hidden_states.clone()
 
-    def execute(activations, weight_pack):
-        torch.testing.assert_close(activations.topk_weights, original_weights)
-        assert activations.topk_ids.dtype == torch.int32
-        totals = (activations.topk_weights * (activations.topk_ids + 1)).sum(
-            dim=-1, keepdim=True
-        )
-        return (activations.hidden_states_q.float() * totals).bfloat16()
-
-    monkeypatch.setattr(runner, "_get_execution", lambda device, num_tokens: execute)
     payload = adapter.FlashInferCuTileMoeQuantInfo(
         weight_pack=object(), device=torch.device("cpu")
     )
     result = runner.run_from_dispatch(dispatch, payload, config).hidden_states
+    execution = runner._get_execution(torch.device("cpu"), 2)
+    activations = execution.layer.activations[-1]
+    torch.testing.assert_close(activations.topk_weights, original_weights)
+    assert activations.topk_ids.dtype == torch.int32
     expected = torch.tensor([8.0, 6.0])[:, None].expand(2, 64)
     if factor is not None:
         expected = expected * factor
@@ -297,7 +305,7 @@ def test_empty_batch_does_not_create_execution(adapter, monkeypatch):
     config = _config()
     runner = adapter.FlashInferCuTileRunnerCore(config)
     create = Mock(side_effect=AssertionError("empty batch must not create workspace"))
-    monkeypatch.setattr(runner, "_get_execution", create)
+    monkeypatch.setattr(sys.modules["flashinfer.fused_moe"], "MoELayer", create)
     dispatch = _dispatch(empty=True)
     payload = adapter.FlashInferCuTileMoeQuantInfo(
         weight_pack=object(), device=torch.device("cpu")
@@ -311,8 +319,11 @@ def test_packed_only_routing_is_rejected(adapter):
     config = _config()
     runner = adapter.FlashInferCuTileRunnerCore(config)
     dispatch = _dispatch()
-    dispatch.topk_output = SimpleNamespace(
-        packed_topk_ids=torch.zeros(2, 2, dtype=torch.int32)
+    dispatch = dispatch._replace(
+        topk_output=PackedTopKOutput(
+            packed_topk_ids=torch.zeros(2, 2, dtype=torch.int32),
+            router_logits=torch.zeros(2, 2),
+        )
     )
     payload = adapter.FlashInferCuTileMoeQuantInfo(
         weight_pack=object(), device=torch.device("cpu")
@@ -346,19 +357,13 @@ def test_negative_padding_does_not_route_to_an_expert(adapter, monkeypatch):
     original_ids = dispatch.topk_output.topk_ids.clone()
     original_weights = dispatch.topk_output.topk_weights.clone()
 
-    def execute(activations, weight_pack):
-        assert activations.topk_ids[0, 1].item() == 0
-        assert activations.topk_weights[0, 1].item() == 0
-        totals = (activations.topk_weights * (activations.topk_ids + 1)).sum(
-            dim=-1, keepdim=True
-        )
-        return (activations.hidden_states_q.float() * totals).bfloat16()
-
-    monkeypatch.setattr(runner, "_get_execution", lambda device, num_tokens: execute)
     payload = adapter.FlashInferCuTileMoeQuantInfo(
         weight_pack=object(), device=torch.device("cpu")
     )
     result = runner.run_from_dispatch(dispatch, payload, config).hidden_states
+    activations = runner._get_execution(torch.device("cpu"), 2).layer.activations[-1]
+    assert activations.topk_ids[0, 1].item() == 0
+    assert activations.topk_weights[0, 1].item() == 0
     torch.testing.assert_close(
         result.float(), torch.tensor([2.0, 6.0])[:, None].expand(2, 64)
     )
@@ -367,50 +372,73 @@ def test_negative_padding_does_not_route_to_an_expert(adapter, monkeypatch):
 
 
 def test_execution_pool_shares_only_matching_stream_and_geometry(adapter, monkeypatch):
-    import gc
-    import weakref
-
     stream = [10]
-    monkeypatch.setattr(adapter, "_get_max_num_tokens", lambda: 8)
-    monkeypatch.setattr(adapter, "_is_capturing", lambda device: False)
     monkeypatch.setattr(
         torch.cuda,
         "current_stream",
         lambda device: SimpleNamespace(cuda_stream=stream[0]),
     )
-    monkeypatch.setattr(
-        adapter,
-        "_create_moe_layer",
-        lambda **kwargs: lambda act, weights: act.hidden_states_q.clone(),
-    )
-    first = adapter.FlashInferCuTileRunnerCore(_config())
-    second = adapter.FlashInferCuTileRunnerCore(_config())
-    device = torch.device("cpu")
-    shared = first._get_execution(device, 2)
-    assert second._get_execution(device, 2) is shared
+    with get_schedule().override(max_prefill_tokens=8):
+        first = adapter.FlashInferCuTileRunnerCore(_config())
+        second = adapter.FlashInferCuTileRunnerCore(_config())
+        device = torch.device("cpu")
+        shared = first._get_execution(device, 2)
+        assert second._get_execution(device, 2) is shared
 
-    stream[0] = 11
-    assert first._get_execution(device, 2) is not shared
-    stream[0] = 10
-    other = adapter.FlashInferCuTileRunnerCore(_config(gemm1_beta=2.0))
-    assert other._get_execution(device, 2) is not shared
-    with pytest.raises(ValueError, match="capacity"):
-        first._get_execution(device, 9)
+        stream[0] = 11
+        assert first._get_execution(device, 2) is not shared
+        stream[0] = 10
+        other = adapter.FlashInferCuTileRunnerCore(_config(gemm1_beta=2.0))
+        assert other._get_execution(device, 2) is not shared
+        with pytest.raises(ValueError, match="capacity"):
+            first._get_execution(device, 9)
 
-    reference = weakref.ref(shared)
-    del shared, first, second
+
+def test_context_reset_releases_execution_while_runner_is_alive(adapter, monkeypatch):
+    """Old runner references must not keep a reset runtime's workspaces alive."""
+    runner = adapter.FlashInferCuTileRunnerCore(_config())
+    execution = runner._get_execution(torch.device("cpu"), 2)
+    reference = weakref.ref(execution)
+    del execution
+    gc.collect()
+    # Resources own the workspace, even when no forward holds it.
+    assert reference() is not None
+    reset_context()
     gc.collect()
     assert reference() is None
 
+    with _runtime_scope():
+        monkeypatch.setattr(adapter, "_is_capturing", lambda device: True)
+        with pytest.raises(RuntimeError, match="warm"):
+            runner._get_execution(torch.device("cpu"), 2)
+        monkeypatch.setattr(adapter, "_is_capturing", lambda device: False)
+        assert runner._get_execution(torch.device("cpu"), 2) is not None
+
+
+def test_context_reset_does_not_reuse_old_execution_or_warmup(adapter, monkeypatch):
+    """A still-referenced old execution cannot leak warmup into a new context."""
+    config = _config()
+    runner = adapter.FlashInferCuTileRunnerCore(config)
+    dispatch = _dispatch()
+    payload = adapter.FlashInferCuTileMoeQuantInfo(
+        weight_pack=object(), device=torch.device("cpu")
+    )
+    runner.run_from_dispatch(dispatch, payload, config)
+    old = runner._get_execution(torch.device("cpu"), 2)
+    assert 2 in old.warmed_token_counts
+    reset_context()
+    with _runtime_scope():
+        new = runner._get_execution(torch.device("cpu"), 2)
+        assert new is not old
+        monkeypatch.setattr(adapter, "_is_capturing", lambda device: True)
+        with pytest.raises(RuntimeError, match="warm"):
+            runner.run_from_dispatch(dispatch, payload, config)
+
 
 def test_cold_execution_cannot_be_created_during_capture(adapter, monkeypatch):
-    monkeypatch.setattr(adapter, "_get_max_num_tokens", lambda: 8)
     monkeypatch.setattr(adapter, "_is_capturing", lambda device: True)
-    monkeypatch.setattr(
-        torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=20)
-    )
     create = Mock(side_effect=AssertionError("must not allocate during capture"))
-    monkeypatch.setattr(adapter, "_create_moe_layer", create)
+    monkeypatch.setattr(sys.modules["flashinfer.fused_moe"], "MoELayer", create)
     runner = adapter.FlashInferCuTileRunnerCore(_config())
     with pytest.raises(RuntimeError, match="warm"):
         runner._get_execution(torch.device("cpu"), 2)
@@ -419,114 +447,35 @@ def test_cold_execution_cannot_be_created_during_capture(adapter, monkeypatch):
 def test_capture_requires_a_warmed_token_count(adapter, monkeypatch):
     capture = [True]
     monkeypatch.setattr(adapter, "_is_capturing", lambda device: capture[0])
-    monkeypatch.setattr(
-        adapter,
-        "_create_moe_layer",
-        lambda **kwargs: lambda act, weights: act.hidden_states_q.clone(),
-    )
+    config = _config()
     execution = adapter._CuTileExecution(
-        config=_config(), device=torch.device("cpu"), max_num_tokens=8
+        config=config, device=torch.device("cpu"), max_num_tokens=8
     )
-    act = SimpleNamespace(hidden_states_q=torch.ones(2, 64))
+    act = SimpleNamespace(
+        hidden_states_q=torch.ones(2, 64),
+        topk_ids=torch.zeros(2, 2, dtype=torch.int32),
+        topk_weights=torch.ones(2, 2),
+    )
     with pytest.raises(RuntimeError, match="warm"):
         execution(act, object())
     capture[0] = False
-    torch.testing.assert_close(execution(act, object()), act.hidden_states_q)
+    expected = execution(act, object())
     capture[0] = True
-    torch.testing.assert_close(execution(act, object()), act.hidden_states_q)
+    torch.testing.assert_close(execution(act, object()), expected)
     act.hidden_states_q = torch.ones(3, 64)
     with pytest.raises(RuntimeError, match="warm"):
         execution(act, object())
 
 
-def _load_real_minimax_scheme(monkeypatch, adapter, *, use_cutile):
-    """Load the real scheme and parent allocator with only GPU imports stubbed."""
-    names = (
-        "sglang.srt.layers.moe",
-        "sglang.srt.layers.moe.fused_moe_triton",
-        "sglang.srt.layers.quantization",
-        "sglang.srt.layers.quantization.compressed_tensors",
-        "sglang.srt.layers.quantization.compressed_tensors.compressed_tensors",
-        "sglang.srt.layers.quantization.compressed_tensors.schemes",
-        "sglang.srt.layers.quantization.fp8",
-        "sglang.srt.layers.quantization.utils",
-        "sglang.srt.layers.utils.common",
-        "sglang.srt.utils",
+def _minimax_scheme(*, use_cutile):
+    backend = (
+        MoeRunnerBackend.FLASHINFER_CUTILE if use_cutile else MoeRunnerBackend.MARLIN
     )
-    modules = {name: ModuleType(name) for name in names}
-    for module in modules.values():
-        module.__path__ = []
-    moe = modules["sglang.srt.layers.moe"]
-    moe.MoeRunner = SimpleNamespace
-    moe.MoeRunnerBackend = _Backend
-    moe.MoeRunnerConfig = SimpleNamespace
-    modules[
-        "sglang.srt.layers.moe.fused_moe_triton"
-    ].FusedMoeWeightScaleSupported = SimpleNamespace(
-        GROUP=SimpleNamespace(value="group"),
-        TENSOR=SimpleNamespace(value="tensor"),
-    )
-    compressed = modules[
-        "sglang.srt.layers.quantization.compressed_tensors.compressed_tensors"
-    ]
-    compressed.CompressedTensorsFusedMoEMethod = SimpleNamespace
-    schemes = modules["sglang.srt.layers.quantization.compressed_tensors.schemes"]
-    schemes.CompressedTensorsMoEScheme = type("CompressedTensorsMoEScheme", (), {})
-    modules["sglang.srt.layers.quantization.fp8"].Fp8Config = type("Fp8Config", (), {})
-    quant_utils = modules["sglang.srt.layers.quantization.utils"]
-    for name in (
-        "is_layer_skipped",
-        "prepare_static_weights_for_trtllm_fp4_moe",
-        "reorder_w1w3_to_w3w1",
-        "replace_parameter",
-        "swizzle_blockscale",
+    with (
+        get_flags().moe.override(runner_backend=backend),
+        override_platform(is_blackwell=use_cutile, is_hip=False),
     ):
-        setattr(quant_utils, name, lambda *args, **kwargs: None)
-    modules["sglang.srt.layers.utils.common"].set_weight_attrs = (
-        lambda *args, **kwargs: None
-    )
-    modules["sglang.srt.utils"].is_hip = lambda: False
-    for name, module in modules.items():
-        monkeypatch.setitem(sys.modules, name, module)
-    backend = SimpleNamespace(
-        is_flashinfer_cutile=lambda: use_cutile,
-        is_flashinfer_trtllm=lambda: False,
-        is_flashinfer_trtllm_routed=lambda: False,
-    )
-    monkeypatch.setattr(
-        sys.modules["sglang.srt.layers.moe.utils"],
-        "get_moe_runner_backend",
-        lambda: backend,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        sys.modules["sglang.srt.runtime_context"],
-        "get_platform",
-        lambda: SimpleNamespace(
-            is_blackwell=use_cutile, is_hip=False, is_gfx95=False, device_sm=120
-        ),
-    )
-    monkeypatch.setitem(
-        sys.modules, "sglang.srt.layers.moe.moe_runner.flashinfer_cutile", adapter
-    )
-    directory = (
-        Path(__file__).resolve().parents[5] / "python/sglang/srt/layers/quantization"
-    )
-
-    def load(name, path):
-        spec = importlib.util.spec_from_file_location(name, path)
-        module = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, name, module)
-        spec.loader.exec_module(module)
-        return module
-
-    parent = load(
-        "cutile_test_compressed_parent",
-        directory / "compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4_moe.py",
-    )
-    schemes.CompressedTensorsW4A4Nvfp4MoE = parent.CompressedTensorsW4A4Nvfp4MoE
-    module = load("cutile_test_minimax_scheme", directory / "minimax_m3_nvfp4.py")
-    return module.MiniMaxM3Nvfp4MoE()
+        return MiniMaxM3Nvfp4MoE()
 
 
 def _allocate_scheme_layer(monkeypatch, scheme):
@@ -538,9 +487,13 @@ def _allocate_scheme_layer(monkeypatch, scheme):
         value = empty(*args, **kwargs)
         if value.dtype == torch.float32:
             value.fill_(13.0)
+        elif value.dtype in (torch.uint8, torch.float8_e4m3fn):
+            value.fill_(1)
         return value
 
     layer = torch.nn.Module()
+    layer.moe_ep_size = layer.moe_tp_size = 1
+    layer.moe_ep_rank = layer.moe_tp_rank = 0
     with monkeypatch.context() as allocations:
         allocations.setattr(torch, "empty", marked_empty)
         scheme.create_weights(
@@ -554,12 +507,12 @@ def _allocate_scheme_layer(monkeypatch, scheme):
 
 
 def test_dynamic_checkpoint_omitted_input_scales_default_to_one(adapter, monkeypatch):
-    scheme = _load_real_minimax_scheme(monkeypatch, adapter, use_cutile=True)
+    scheme = _minimax_scheme(use_cutile=True)
     layer = _allocate_scheme_layer(monkeypatch, scheme)
     torch.testing.assert_close(layer.w13_input_global_scale, torch.ones(2, 2))
     torch.testing.assert_close(layer.w2_input_global_scale, torch.ones(2))
     torch.testing.assert_close(layer.w13_weight_global_scale, torch.full((2, 2), 13.0))
-    scheme.moe_runner_config = _config()
+    scheme.moe_runner_config = _config(layer=layer)
     # The actual load-completion path must accept a checkpoint with no input scales.
     scheme.process_weights_after_loading(layer)
 
@@ -568,11 +521,11 @@ def test_dynamic_checkpoint_omitted_input_scales_default_to_one(adapter, monkeyp
 def test_checkpoint_input_scale_override_is_preserved_and_rejected(
     adapter, monkeypatch, name
 ):
-    scheme = _load_real_minimax_scheme(monkeypatch, adapter, use_cutile=True)
+    scheme = _minimax_scheme(use_cutile=True)
     layer = _allocate_scheme_layer(monkeypatch, scheme)
     # Simulate the loader overwriting the newly allocated default with a real value.
     getattr(layer, name).fill_(2.0)
-    scheme.moe_runner_config = _config()
+    scheme.moe_runner_config = _config(layer=layer)
     with pytest.raises(ValueError, match="scale"):
         scheme.process_weights_after_loading(layer)
     torch.testing.assert_close(
@@ -581,10 +534,188 @@ def test_checkpoint_input_scale_override_is_preserved_and_rejected(
 
 
 def test_non_cutile_weight_allocation_keeps_existing_behavior(adapter, monkeypatch):
-    scheme = _load_real_minimax_scheme(monkeypatch, adapter, use_cutile=False)
+    scheme = _minimax_scheme(use_cutile=False)
     layer = _allocate_scheme_layer(monkeypatch, scheme)
+    assert not hasattr(layer, "_weight_export_error")
     torch.testing.assert_close(layer.w13_input_global_scale, torch.full((2, 2), 13.0))
     torch.testing.assert_close(layer.w2_input_global_scale, torch.full((2,), 13.0))
+
+
+def test_prepared_weights_reject_reload_without_discarding_current_pack(
+    adapter, monkeypatch
+):
+    """A reload must fail explicitly before replacing the live prepared weights."""
+    scheme = _minimax_scheme(use_cutile=True)
+    layer = _allocate_scheme_layer(monkeypatch, scheme)
+    # A cold loader may invoke restore before the first preparation.
+    scheme.restore_weights_before_loading(layer)
+    scheme.moe_runner_config = _config(layer=layer)
+    scheme.process_weights_after_loading(layer)
+    prepared = scheme.cutile_quant_info
+    view = prepared.weight_pack.views["cutile_nvfp4"]
+    execution_weights = {
+        name: value.detach().clone()
+        for name, value in vars(view).items()
+        if isinstance(value, torch.Tensor)
+    }
+    remaining = {
+        name: value.detach().clone() for name, value in layer.named_parameters()
+    }
+    for operation in (
+        scheme.restore_weights_before_loading,
+        scheme.process_weights_after_loading,
+    ):
+        with pytest.raises(
+            RuntimeError, match="Online weight updates.*flashinfer_cutile"
+        ):
+            operation(layer)
+        assert scheme.cutile_quant_info is prepared
+        for name, value in execution_weights.items():
+            torch.testing.assert_close(getattr(view, name).float(), value.float())
+        assert set(dict(layer.named_parameters())) == set(remaining)
+        for name, value in layer.named_parameters():
+            torch.testing.assert_close(value.float(), remaining[name].float())
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_online_updates_reject_before_mutating_any_model_weight(
+    adapter, monkeypatch, prepared
+):
+    """The real updater must see the nested expert marker before any loader runs."""
+    scheme = _minimax_scheme(use_cutile=True)
+    layer = _allocate_scheme_layer(monkeypatch, scheme)
+    assert "flashinfer_cutile" in layer._derived_weight_cache_error
+    scheme.moe_runner_config = _config(layer=layer)
+    if prepared:
+        scheme.process_weights_after_loading(layer)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dense = torch.nn.Linear(2, 2, bias=False)
+            self.experts = layer
+
+        def load_weights(self, named_tensors):
+            # If a guard regresses, a real loader write makes the failure observable.
+            parameters = dict(self.named_parameters())
+            with torch.no_grad():
+                for name, value in named_tensors:
+                    parameters[name].copy_(value)
+
+    model = Model()
+    before = {name: value.detach().clone() for name, value in model.named_parameters()}
+    updater = WeightUpdater(
+        tp_rank=0,
+        device="cpu",
+        gpu_id=0,
+        model_config=None,
+        custom_weight_loaders={},
+        get_model=lambda: model,
+        update_model_fields=lambda **kwargs: None,
+        recapture_cuda_graph=lambda: None,
+        get_model_runner=lambda: None,
+    )
+    tensors = [("dense.weight", torch.zeros_like(model.dense.weight))]
+    reason = layer._derived_weight_cache_error
+    assert updater.load_rejection("plugin_weight_update") == reason
+    for result in (
+        updater.update_weights_from_disk("/unused/checkpoint", "auto"),
+        updater.update_weights_from_tensor(tensors),
+        updater.update_weights_from_tensor(tensors, load_format="direct"),
+        updater.load_weights_from_distributed(tensors),
+        updater.update_weights_from_ipc(None),
+    ):
+        assert result == (False, reason)
+    assert set(dict(model.named_parameters())) == set(before)
+    for name, value in model.named_parameters():
+        torch.testing.assert_close(value.float(), before[name].float())
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_exports_reject_before_writing_or_sending_incomplete_weights(
+    adapter, monkeypatch, tmp_path, prepared
+):
+    """Unregistered expert weights must not produce a successful partial export."""
+    from sglang.srt.model_loader.loader import RemoteModelLoader, ShardedStateLoader
+
+    scheme = _minimax_scheme(use_cutile=True)
+    layer = _allocate_scheme_layer(monkeypatch, scheme)
+    scheme.moe_runner_config = _config(layer=layer)
+    if prepared:
+        scheme.process_weights_after_loading(layer)
+    reason = layer._weight_export_error
+    assert "Weight export" in reason and "flashinfer_cutile" in reason
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dense = torch.nn.Linear(2, 2, bias=False)
+            self.experts = layer
+
+        def get_weights_by_name(self, name, truncate_size, tp_size):
+            return self.get_parameter(name)[:truncate_size]
+
+    model = Model()
+    parameters_before = {
+        name: value.detach().clone() for name, value in model.named_parameters()
+    }
+    if prepared:
+        quant_info = scheme.cutile_quant_info
+        view = quant_info.weight_pack.views["cutile_nvfp4"]
+        execution_weights = {
+            name: value.detach().clone()
+            for name, value in vars(view).items()
+            if isinstance(value, torch.Tensor)
+        }
+
+    def unexpected_side_effect(*args, **kwargs):
+        pytest.fail("A rejected cuTile export must not start storage or communication")
+
+    # Keep WeightExporter real. Only replace storage/communication boundaries
+    # with tripwires, so even a misplaced guard cannot write or send test data.
+    monkeypatch.setattr(ShardedStateLoader, "save_model", unexpected_side_effect)
+    monkeypatch.setattr(RemoteModelLoader, "save_model", unexpected_side_effect)
+    monkeypatch.setattr(
+        weight_exporter, "init_custom_process_group", unexpected_side_effect
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", unexpected_side_effect)
+    monkeypatch.setattr(torch.distributed, "broadcast", unexpected_side_effect)
+    monkeypatch.setattr(torch.distributed, "barrier", unexpected_side_effect)
+    exporter = weight_exporter.WeightExporter(
+        tp_rank=0,
+        tp_size=1,
+        gpu_id=0,
+        get_model_path=unexpected_side_effect,
+        get_model=lambda: model,
+    )
+    save_path = tmp_path / "sharded"
+    with pytest.raises(RuntimeError, match="Weight export.*flashinfer_cutile"):
+        exporter.save_sharded_model(str(save_path))
+    with pytest.raises(RuntimeError, match="Weight export.*flashinfer_cutile"):
+        exporter.save_remote_model("redis://unused/checkpoint")
+    assert exporter.init_weights_send_group_for_remote_instance(
+        master_address="127.0.0.1",
+        ports="29500",
+        group_rank=0,
+        world_size=1,
+        group_name="cutile_export_test",
+    ) == (False, reason)
+    assert exporter.send_weights_to_remote_instance(
+        master_address="127.0.0.1",
+        ports="29500",
+        group_name="cutile_export_test",
+    ) == (False, reason)
+    assert exporter.get_weights_by_name("dense.weight") is None
+    assert not save_path.exists()
+    assert list(tmp_path.iterdir()) == []
+    assert exporter._weights_send_group == {}
+    assert set(dict(model.named_parameters())) == set(parameters_before)
+    for name, value in model.named_parameters():
+        torch.testing.assert_close(value.float(), parameters_before[name].float())
+    if prepared:
+        assert scheme.cutile_quant_info is quant_info
+        for name, value in execution_weights.items():
+            torch.testing.assert_close(getattr(view, name).float(), value.float())
 
 
 if __name__ == "__main__":

@@ -202,6 +202,17 @@ def _validate_flashinfer_cutile_config(cfg: Any) -> None:
             "does not yet support speculative decoding",
         ),
         (not cfg.enable_paged_experts, "does not support paged experts"),
+        (cfg.cpu_offload_gb <= 0, "does not support --cpu-offload-gb"),
+        (cfg.offload_group_size <= 0, "does not support --offload-group-size"),
+        (
+            not cfg.enable_memory_saver or cfg.enable_weights_cpu_backup,
+            "requires --enable-weights-cpu-backup with --enable-memory-saver",
+        ),
+        (
+            cfg.load_format != "presharded",
+            "does not support --load-format presharded because prepared weights "
+            "cannot be exported",
+        ),
     )
     for satisfied, message in requirements:
         if not satisfied:
