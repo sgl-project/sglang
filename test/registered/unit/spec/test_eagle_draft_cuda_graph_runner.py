@@ -432,6 +432,56 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
 
         self.assertIs(output[-1], pooled_probs)
 
+    def test_planned_inputs_stage_what_the_default_copies_stage(self):
+        from sglang.kernels.ops.memory import small_field_copy
+
+        class _CopyPlan:
+            def __call__(self, dsts, srcs):
+                assert len(dsts) == len(srcs)
+                for dst, src in zip(dsts, srcs):
+                    dst.copy_(src)
+                return True
+
+        staged = {}
+        for planned in (False, True):
+            backend = _RecordingDraftBackend()
+            runner = self._build_runner(backend)
+            runner._planned_inputs = {}
+            for buf in vars(runner.buffers).values():
+                if buf is not None:
+                    buf.fill_(-1)
+            forward_batch = self._build_forward_batch([3, 4, 5, 6], 18)
+            forward_batch.spec_info.hidden_states = torch.arange(8.0).view(4, 2)
+            with (
+                patch.object(draft_graph, "_GRAPH_INPUT_PLAN", planned),
+                patch.object(small_field_copy, "SmallFieldCopyPlan", _CopyPlan),
+            ):
+                runner.execute(forward_batch)
+            self.assertEqual(len(runner._planned_inputs), int(planned))
+            staged[planned] = {
+                name: buf.clone()
+                for name, buf in vars(runner.buffers).items()
+                if buf is not None
+            }
+        for name, buf in staged[False].items():
+            self.assertTrue(torch.equal(staged[True][name], buf), name)
+
+    def test_a_refused_input_plan_falls_back_and_stays_refused(self):
+        from sglang.kernels.ops.memory import small_field_copy
+
+        runner = self._build_runner(_RecordingDraftBackend())
+        runner._planned_inputs = {}
+        forward_batch = self._build_forward_batch([3, 4, 5, 6], 18)
+        with (
+            patch.object(draft_graph, "_GRAPH_INPUT_PLAN", True),
+            patch.object(
+                small_field_copy, "SmallFieldCopyPlan", lambda: lambda d, s: False
+            ),
+        ):
+            runner.execute(forward_batch)
+        self.assertEqual(list(runner._planned_inputs.values()), [None])
+        self.assertTrue(torch.equal(runner.buffers.seq_lens, forward_batch.seq_lens))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -406,6 +406,12 @@ class Envs:
     # streams (named streams incl. the graph capture stream, HC gate, PLE prefetch); None
     # keeps torch's default. Lower is higher.
     SGLANG_FORWARD_HELPER_STREAM_PRIORITY = EnvInt(None)
+    # The EAGLE draft graph runner stages an unpadded round's inputs, hidden states and draft
+    # probs included, with one small-field copy into destination views cached per input
+    # layout, instead of slicing every buffer, a grouped copy and separate copy_ calls.
+    SGLANG_OPT_SPEC_DRAFT_GRAPH_INPUT_PLAN = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
