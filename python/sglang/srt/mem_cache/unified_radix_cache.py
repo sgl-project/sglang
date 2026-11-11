@@ -3578,11 +3578,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
-        _drain_and_alloc_storage_hit()
+        if not defer_read_staging:
+            _drain_and_alloc_storage_hit()
         _drain_ack_prefetch()
         _drain_backup()
+        if defer_read_staging and n_release is not None:
+            # Terminal ACKs can enqueue unused staging after the earlier
+            # queue snapshot. Reclaim it before evicting for the next read.
+            n_release = cc.host_mem_release_queue.qsize()
         _drain_release()
         _drain_extra_release()
+        if defer_read_staging:
+            _drain_and_alloc_storage_hit()
 
     def drain_storage_control_queues(self) -> None:
         cc = self.cache_controller

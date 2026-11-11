@@ -581,6 +581,70 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
         service.progress()
         return span
 
+    def test_completed_read_releases_staging_before_new_host_eviction(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            first, second = [cache_fixtures.target(range(i, i + 4)) for i in (1, 9)]
+            self._cold_scopes(owner, (first, second))
+            hot = self._host_pressure(owner, leave_free=4)
+            cc = cache.cache_controller
+            entered, release, finished, queried = [threading.Event() for _ in range(4)]
+            cancelled = CacheRequestHandle("cancelled-reader", 0)
+            next_read = CacheRequestHandle("next-reader", 0)
+            get, put_ack = cc.page_get_func, cc.ack_prefetch_queue.put
+            put_hit = cc.prefetch_hit_queue.put
+
+            def blocked_get(operation, *args, **kwargs):
+                if operation.handle == cancelled:
+                    entered.set()
+                    assert release.wait(5)
+                return get(operation, *args, **kwargs)
+
+            def observe_ack(ack):
+                put_ack(ack)
+                if ack.operation.handle == cancelled and ack.completed_req:
+                    finished.set()
+
+            def observe_hit(operation):
+                put_hit(operation)
+                if operation.handle == next_read:
+                    queried.set()
+
+            with (
+                patch.object(cache, "prefetch_threshold", 1),
+                patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                patch.object(cc, "page_get_func", blocked_get),
+                patch.object(cc.ack_prefetch_queue, "put", observe_ack),
+                patch.object(cc.prefetch_hit_queue, "put", observe_hit),
+            ):
+                try:
+                    self._ordinary_prefetch(cache, service, first, cancelled)
+
+                    def started():
+                        cache.drain_storage_control_queues()
+                        return entered.is_set()
+
+                    wait_for(service, started)
+                    cache.release_aborted_request(cancelled)
+                    self.assertEqual(cc.mem_pool_host.available_size(), 0)
+                    self._ordinary_prefetch(cache, service, second, next_read)
+                    self.assertTrue(queried.wait(5))
+                finally:
+                    release.set()
+                self.assertTrue(finished.wait(5))
+                cache.drain_storage_control_queues()
+                self.assertEqual(
+                    self._consume_ordinary_prefetch(cache, service, next_read), (4, 0)
+                )
+                self.assertTrue(
+                    all(n.component_data[FULL].host_value is not None for n, _ in hot)
+                )
+                cache.release_aborted_request(next_read)
+            assert_retired(cache, service)
+            cache.sanity_check()
+
     def test_queued_reads_do_not_evict_host_cache_before_io_is_ready(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
