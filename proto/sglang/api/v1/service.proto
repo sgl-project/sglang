@@ -8,6 +8,7 @@ syntax = "proto3";
 
 package sglang.api.v1;
 
+import "sglang/api/v1/control.proto";
 import "sglang/api/v1/generate.proto";
 import "sglang/api/v1/hicache.proto";
 import "sglang/json/v1/options.proto";
@@ -48,6 +49,12 @@ service SglangService {
   // Duplicate native IDs cancel all matching generations. A later reuse of the
   // ID is unaffected. Internal control/detokenization requests are not targeted.
   rpc Abort(AbortRequest) returns (AbortResponse);
+
+  // `/freeze_gc`, `/pause_generation`, `/continue_generation`,
+  // `/pd_role_switch`, `/update_weight_version`.
+  rpc FreezeGc(FreezeGcRequest) returns (FreezeGcResponse);
+  rpc PauseGeneration(PauseGenerationRequest) returns (GenerationPauseResponse);
+  rpc ContinueGeneration(ContinueGenerationRequest) returns (GenerationPauseResponse);
 }
 
 message ListModelsRequest {}
