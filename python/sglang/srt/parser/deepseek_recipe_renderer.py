@@ -7,6 +7,7 @@ import copy
 import functools
 import json
 import logging
+import re
 import uuid
 from types import ModuleType
 from typing import Any, Optional, Union
@@ -108,11 +109,14 @@ def _error_message(body: Any) -> str:
 
 def _take_message_tools(
     messages: list[dict[str, Any]], tool_choice: Any
-) -> tuple[list[dict[str, Any]], list[tuple[str, str, list[dict[str, Any]]]]]:
+) -> tuple[
+    list[dict[str, Any]], list[tuple[str, str, list[dict[str, Any]]]], list[int]
+]:
     """Brackets each declaring message with marker system messages, which conversion
-    keeps even when it drops an empty declaring message."""
+    keeps even when it drops an empty declaring message. The last list holds the
+    request index of each rewritten message."""
     token = uuid.uuid4().hex
-    rewritten, declarations = [], []
+    rewritten, declarations, origins = [], [], []
     for index, message in enumerate(messages):
         tools = message.get("tools") or []
         message = {key: value for key, value in message.items() if key != "tools"}
@@ -123,6 +127,7 @@ def _take_message_tools(
             tools = [tool for tool in tools if tool["function"]["name"] == name]
         if not tools:
             rewritten.append(message)
+            origins.append(index)
             continue
         opening = f"<sglang message tools {token} {index}>"
         closing = f"</sglang message tools {token} {index}>"
@@ -131,12 +136,15 @@ def _take_message_tools(
             message,
             {"role": "system", "content": closing},
         ]
+        origins += [index] * 3
         declarations.append((opening, closing, tools))
-    return rewritten, declarations
+    return rewritten, declarations, origins
 
 
 def _declare_message_tools(
-    conversation: Any, declarations: list[tuple[str, str, list[dict[str, Any]]]]
+    conversation: Any,
+    declarations: list[tuple[str, str, list[dict[str, Any]]]],
+    encoding: Any,
 ) -> Any:
     """Deferred tools render only where a system message declares them; the opening
     tools block keeps the call format even when every tool is deferred."""
@@ -159,6 +167,11 @@ def _declare_message_tools(
         for tool in conversation.tools
     ]
     by_name = {tool.name: tool for tool in tools}
+
+    def special_ranges(message):
+        alone = recipe.Conversation([message], thinking_mode=False)
+        return encoding.render_conversation(alone).special_ranges
+
     messages = list(conversation.messages)
     for opening, closing, declaration in declarations:
         bracket = [
@@ -171,12 +184,18 @@ def _declare_message_tools(
         start, end = bracket
         # Conversion drops a declaring message whose content is empty.
         message = messages[start + 1] if end > start + 1 else recipe.SystemMessage("")
-        # The constructor re-derives image placeholders from the token's spellings.
-        if message.image_sources and message.content.count(IMAGE_TOKEN) != len(
-            message.image_sources
+        # The constructor takes the token's first spellings as the image
+        # placeholders, so one spelled as text ahead of an image would take its place.
+        if message.image_sources and special_ranges(message) != special_ranges(
+            recipe.SystemMessage(
+                message.content,
+                image_sources=message.image_sources,
+                image_token=IMAGE_TOKEN,
+            )
         ):
             raise ValueError(
-                f"a message that declares tools cannot spell {IMAGE_TOKEN} as text"
+                f"a message that declares tools cannot spell {IMAGE_TOKEN} as text "
+                "before one of its images"
             )
         messages[start : end + 1] = [
             recipe.SystemMessage(
@@ -278,7 +297,7 @@ class DeepSeekRecipe:
         normalized["model"] = self.model
         if effort_budget is not None:
             normalized["reasoning_effort"] = BUDGET_TIER
-        normalized["messages"], declarations = _take_message_tools(
+        normalized["messages"], declarations, origins = _take_message_tools(
             normalized["messages"], tool_choice=body.get("tool_choice")
         )
         if declarations:
@@ -297,10 +316,18 @@ class DeepSeekRecipe:
         try:
             converted = recipe.ChatCompletionRequest(normalized).convert(self._options)
         except recipe.ConversionError as error:
-            raise ValueError(_error_message(error.body)) from error
+            # Recipe locates an error by the index of the rewritten message.
+            message = _error_message(error.body)
+            located = re.match(r"\.messages\[(\d+)\]", message)
+            if located and int(located[1]) < len(origins):
+                index = origins[int(located[1])]
+                message = f".messages[{index}]{message[located.end() :]}"
+            raise ValueError(message) from error
         if not declarations:
             return converted.conversation
-        return _declare_message_tools(converted.conversation, declarations)
+        return _declare_message_tools(
+            converted.conversation, declarations, self._encoding
+        )
 
     def encode_conversation(
         self, conversation: Any, *, effort_budget: Optional[int] = None
