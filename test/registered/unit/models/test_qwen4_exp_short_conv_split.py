@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import qwen4_exp
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -59,15 +59,25 @@ class TestQwen4ExpShortConvSplit(CustomTestCase):
             global_num_token_non_padded_cpu=None,
             extend_seq_lens=torch.tensor(lengths),
             extend_seq_lens_cpu=lengths,
-            req_pool_indices=torch.arange(1, len(lengths) + 1),
             mamba_track_indices=None,
             mamba_track_mask=None,
         )
-        pool = Mock(get_mamba_indices=lambda indices: indices)
+        # Request i uses state slot i + 1; slot 0 is the pools' dummy slot.
+        attn_backend = SimpleNamespace(
+            forward_state_slots=lambda count, _: SimpleNamespace(
+                working=torch.arange(1, count + 1)
+            )
+        )
 
         def run(limit):
             state = initial_state.clone()
-            pool.short_conv_layer_cache = lambda layer_id: state
+            short_conv = SimpleNamespace(
+                view=SimpleNamespace(layer_cache=lambda view_layer_id: state),
+                view_layer_id=0,
+            )
+            kv_pool = SimpleNamespace(
+                layer_router=SimpleNamespace(read=lambda layer_id, part: short_conv)
+            )
             inputs = []
             real_conv1d = F.conv1d
 
@@ -76,7 +86,9 @@ class TestQwen4ExpShortConvSplit(CustomTestCase):
                 return real_conv1d(conv_input, *args, **kwargs)
 
             with (
-                patch.object(qwen4_exp, "get_req_to_token_pool", return_value=pool),
+                patch.object(qwen4_exp, "get_req_to_token_pool", return_value=Mock()),
+                patch.object(qwen4_exp, "get_token_to_kv_pool", return_value=kv_pool),
+                patch.object(qwen4_exp, "get_attn_backend", return_value=attn_backend),
                 patch.object(qwen4_exp, "_SHORT_CONV_MAX_NUMEL", limit, create=True),
                 patch.object(qwen4_exp.F, "conv1d", conv1d),
             ):
