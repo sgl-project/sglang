@@ -1364,6 +1364,21 @@ class GemmaRMSNorm(BaseFusedOp):
             return rocm_triton_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
 
         if not _has_vllm_rms_norm:
+            if _has_rocm_triton_gemma_rms_norm and x.dim() == 2:
+                # one kernel instead of forward_native's op chain, same rounding points
+                if residual is not None:
+                    if post_residual_addition is not None:
+                        residual = residual + post_residual_addition
+                    return rocm_triton_gemma_fused_add_rmsnorm(
+                        x,
+                        residual,
+                        self.weight.data,
+                        self.variance_epsilon,
+                        round_sum=True,
+                    )
+                return rocm_triton_gemma_rmsnorm(
+                    x, self.weight.data, self.variance_epsilon
+                )
             return self.forward_native(x, residual, post_residual_addition)
 
         if _use_aiter:
@@ -1519,7 +1534,12 @@ class Gemma3RMSNorm(BaseFusedOp):
             return x, residual
         if x.dim() == 2:
             return gemma_rmsnorm(x, self.weight.data, self.eps)
-        return self.forward_native(x)
+        if x.numel() == 0:
+            return x
+        # q_norm and k_norm get [tokens, heads, head_dim]. The norm reduces over
+        # the last dim only, so flatten the leading dims for the fused kernel.
+        flat = x.contiguous().view(-1, x.shape[-1])
+        return gemma_rmsnorm(flat, self.weight.data, self.eps).view(x.shape)
 
     def forward_xpu(self, x, residual: Optional[torch.Tensor] = None):
         if residual is not None and x.dim() == 2:

@@ -20,8 +20,10 @@ This file implements HTTP APIs for the inference engine via fastapi.
 import asyncio
 import dataclasses
 import errno
+import inspect
 import logging
 import os
+import signal
 import socket
 import ssl
 import tempfile
@@ -69,6 +71,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+from pydantic import ValidationError
 from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
@@ -583,6 +586,27 @@ def _anthropic_error_response(*, status_code: int, error_type: str, message: str
     )
 
 
+def _chat_route_error_response(
+    request: Request, message: str, err_type: str, status_code: int
+) -> Optional[ORJSONResponse]:
+    """A chat error raised before the handler runs, in its wire's envelope;
+    None when the wire keeps the stock body."""
+    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
+    if route_path != "/v1/chat/completions":
+        return None
+    error = ErrorResponse(
+        object="error",
+        message=message,
+        type=err_type,
+        param=None,
+        code=status_code,
+    )
+    body = request.app.state.openai_serving_chat.chat_wire.error_body(error)
+    if body is None:
+        return None
+    return ORJSONResponse(content=body, status_code=status_code)
+
+
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):
     """Enrich HTTP exception with status code and other details.
@@ -629,6 +653,12 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
         return ORJSONResponse(
             content={"error": nested_error}, status_code=exc.status_code
         )
+
+    chat_error = _chat_route_error_response(
+        request, str(exc.detail), str(exc.status_code), exc.status_code
+    )
+    if chat_error is not None:
+        return chat_error
 
     error = ErrorResponse(
         object="error",
@@ -687,6 +717,12 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "code": HTTPStatus.BAD_REQUEST.value,
         }
         return ORJSONResponse(status_code=400, content={"error": nested_error})
+
+    chat_error = _chat_route_error_response(
+        request, message, "BadRequest", HTTPStatus.BAD_REQUEST.value
+    )
+    if chat_error is not None:
+        return chat_error
 
     err = ErrorResponse(
         message=message,
@@ -2218,16 +2254,52 @@ async def sagemaker_health() -> Response:
     return Response(status_code=status_code)
 
 
+# Checked in order, so a body with `messages` always reaches chat. Dispatch is by key
+# rather than by trying each model, because `input` is shared by
+# embeddings/classify/responses and ScoringRequest accepts any body.
+_SAGEMAKER_INVOCATION_ROUTES = (
+    ("messages", ChatCompletionRequest, openai_v1_chat_completions),
+    ("prompt", CompletionRequest, openai_v1_completions),
+    ("input", EmbeddingRequest, openai_v1_embeddings),
+)
+_SAGEMAKER_NO_MATCH_MSG = (
+    "Cannot determine the request type: expected one of 'messages' "
+    "(chat completions), 'prompt' (completions) or 'input' (embeddings)"
+)
+
+
 @app.post("/invocations")
-async def sagemaker_chat_completions(
-    request: ChatCompletionRequest, raw_request: Request
+async def sagemaker_invocations(
+    body: Annotated[Dict[str, Any], Body()], raw_request: Request
 ):
-    """OpenAI-compatible chat completion endpoint."""
-    return model_json_response(
-        await raw_request.app.state.openai_serving_chat.handle_request(
-            request, raw_request
+    """SageMaker's only inference route: dispatch by body key to the matching OpenAI route."""
+    for key, request_cls, route in _SAGEMAKER_INVOCATION_ROUTES:
+        if key in body:
+            break
+    else:
+        # The body is not echoed back: SageMaker request bodies can be up to 6 MB.
+        raise RequestValidationError(
+            errors=[
+                {
+                    "type": "value_error",
+                    "loc": ("body",),
+                    "msg": _SAGEMAKER_NO_MATCH_MSG,
+                }
+            ]
         )
-    )
+    try:
+        request = request_cls.model_validate(body)
+    except ValidationError as e:
+        raise RequestValidationError(
+            errors=[
+                {**err, "loc": ("body", *err["loc"])}
+                for err in e.errors(include_url=False)
+            ]
+        ) from e
+    # Route functions are called directly, so their route-level Depends (e.g.
+    # validate_json_request) and response_class do not apply; the wrapper replaces
+    # the ORJSONResponse that /v1/embeddings would otherwise get.
+    return model_json_response(await route(request, raw_request))
 
 
 ## Vertex AI API
@@ -2650,7 +2722,43 @@ def _wait_weights_ready():
     )
 
 
-class _ReusePortMultiprocess(Multiprocess):
+class _SigquitForwardingMultiprocess(Multiprocess):
+    """uvicorn supervisor that keeps SIGQUIT meaning "a child failed".
+
+    ``Multiprocess.__init__`` replaces the SIGQUIT handler with a queue that has
+    no ``handle_quit``, so a scheduler's SIGQUIT to this process is dropped and
+    the server outlives its schedulers. The handler installed before uvicorn
+    took over is called from the supervisor loop instead.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._sigquit_handler = signal.getsignal(signal.SIGQUIT)
+        super().__init__(*args, **kwargs)
+
+    def handle_quit(self) -> None:
+        if callable(self._sigquit_handler):
+            self._sigquit_handler(signal.SIGQUIT, None)
+        else:
+            logger.error("Received SIGQUIT from a child process; exiting.")
+            kill_process_tree(os.getpid())
+
+
+def _run_uvicorn_workers(app_path: str, **uvicorn_options) -> None:
+    """What ``uvicorn.run()`` does for workers > 1, minus its SIGQUIT trap."""
+    config = uvicorn.Config(app_path, **uvicorn_options)
+    sockets = [config.bind_socket()]
+    if "target" in inspect.signature(Multiprocess.__init__).parameters:
+        # uvicorn < 0.51 (not pinned on every platform): the supervisor is
+        # given the server's run().
+        supervisor = _SigquitForwardingMultiprocess(
+            config, target=uvicorn.Server(config=config).run, sockets=sockets
+        )
+    else:
+        supervisor = _SigquitForwardingMultiprocess(config, sockets=sockets)
+    supervisor.run()
+
+
+class _ReusePortMultiprocess(_SigquitForwardingMultiprocess):
     """Give each uvicorn worker a private SO_REUSEPORT listener.
 
     uvicorn's supervisor reads ``self.sockets`` once per worker it spawns, so a
@@ -2798,8 +2906,6 @@ def _run_granian_server(
     The event loop is uvloop. The default backlog and backpressure values are set
     exactly like uvicorn's defaults.
     """
-    import signal
-
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
     from granian.http import HTTP2Settings
@@ -3094,7 +3200,7 @@ def _setup_and_run_http_server(
                     )
                     supervisor.run()
                 else:
-                    uvicorn.run(app_path, **uvicorn_options)
+                    _run_uvicorn_workers(app_path, **uvicorn_options)
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
@@ -3188,7 +3294,8 @@ def launch_server(
         # The Rust server serves api-server, tokenizer, and detokenizer, so the
         # main process has no Python HTTP server / tokenizer manager to run.
         # Each Rust listener runs its own startup warmup and keeps /health at
-        # 503 until it succeeds, so the main process does not warm up here.
+        # 503 until it succeeds, so the main process does not warm up here. A
+        # failed warmup signals this process as a crashed scheduler does.
         from sglang.srt.rust_server.server import drain_notify_name
         from sglang.srt.rust_server.shutdown import RustServerSigtermDrain
 
