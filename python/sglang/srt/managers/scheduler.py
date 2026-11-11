@@ -32,6 +32,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Union,
@@ -788,11 +789,11 @@ class Scheduler(
 
         self.init_output_streamer()
 
-        self.init_deferred_responses()
-
         self.init_beam_coordinator()
 
         self.init_request_retirer()
+
+        self.init_deferred_responses()
 
         self.init_request_receiver()
 
@@ -2760,11 +2761,6 @@ class Scheduler(
                 *(self.running_mbs if get_parallel().pp_size > 1 else ()),
             ),
             get_pp_mbs=lambda: self.mbs if get_parallel().pp_size > 1 else (),
-            get_offloading_reqs=lambda: (
-                self.decode_offload_manager.offload_inflight
-                if self.decode_offload_manager is not None
-                else ()
-            ),
             # Hisparse pool counters diverge during host backup (see the
             # _get_swa_token_info clamp), and pending deferred KV releases hold
             # pages out of the allocator by design.
@@ -2892,6 +2888,7 @@ class Scheduler(
         self.deferred_responses = DeferredResponses(
             disaggregation_mode=self.disaggregation_mode,
             output_streamer=self.output_streamer,
+            request_retirer=self.request_retirer,
             send_abort=lambda req, finished_reason: self.send_abort_output(
                 make_abort_req(req, finished_reason=finished_reason), req
             ),
@@ -4221,7 +4218,6 @@ class Scheduler(
 
         staged = []
         if self.dllm_config is not None:
-            self.dllm_manager.filter_finished_reqs()
             # Read before the merge below empties last_batch.
             staged = self.dllm_manager.staged_reqs(last_batch)
 
@@ -4358,16 +4354,19 @@ class Scheduler(
         beam_width: Optional[int] = None,
         running_batch: Optional[ScheduleBatch] = None,
         num_held_rows: int = 0,
+        admitted_reqs: Sequence[Req] = (),
     ) -> int:
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
         # Rows the counted requests may occupy: the free rows, plus the rows that
         # counted requests already hold (a continuing chunk, a session borrow),
-        # minus the rows promised to beam members.
+        # minus the rows promised to beam members, both of running groups and of
+        # leaders already admitted to the prefill being built.
         active_batch = running_batch or self.running_batch
         row_budget = max(
             self.req_to_token_pool.available_size()
             + num_held_rows
-            - self.beam_coordinator.pending_member_rows(active_batch),
+            - self.beam_coordinator.pending_member_rows(active_batch)
+            - self.beam_coordinator.pending_member_rows_of(admitted_reqs),
             0,
         )
         res = min(pp_budget, row_budget)
@@ -4647,6 +4646,7 @@ class Scheduler(
                 candidate_beam_width,
                 running_batch=running_batch,
                 num_held_rows=num_held_rows,
+                admitted_reqs=adder.can_run_list,
             ):
                 running_batch.batch_is_full = True
 
@@ -4930,6 +4930,7 @@ class Scheduler(
             self.hisparse_coordinator,
             self.uocr_runtime,
             self.deferred_responses,
+            self.decode_offload_manager,
         )
         for component in components:
             if component is None:
@@ -5011,9 +5012,6 @@ class Scheduler(
         )
         if forward_steps is not None:
             forward_steps.forward_processed(getattr(result, "forward_launch", None))
-        # Requests finish only in a step's processing.
-        self.running_reqs._leave_finished()
-        self.prefill_launched_reqs._leave_finished()
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose step in flight commits their last output by length."""
@@ -6422,6 +6420,12 @@ class Scheduler(
             ):
                 retract_reqs += [r for r in last_batch.reqs if not r.finished()]
 
+        # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
+        # freeing its KV under a live disagg KV-sender crashes move_bootstrapped or
+        # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.
+        # TODO(disagg-prefill-retract): tear the sender down (abort + release metadata
+        # buffer + reset pending_bootstrap) before freeing KV, then retract for real.
+        # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
         if (
             self.chunked_req is not None
             and not self.chunked_req.finished()
@@ -6430,15 +6434,15 @@ class Scheduler(
             retract_reqs.append(self.chunked_req)
 
         if self.hisparse_coordinator is not None:
-            # Only a running loop moves a staged request on; the whole queue, so
-            # TP ranks agree. Its release in retract_all drops it from staging.
+            # Only a running loop moves a staged request on;
+            # the whole queue, so TP ranks agree.
             retract_reqs += list(self.hisparse_coordinator.ack_staging_queue)
 
         if self.dllm_config is not None:
-            # A dLLM request keeps its row between rounds; a finished one is not
-            # retracted.
-            self.dllm_manager.filter_finished_reqs()
-            retract_reqs += self.dllm_manager.take(lambda r: r.kv.holds_kv)
+            # A dLLM request keeps its row between rounds.
+            retract_reqs += [
+                r for r in self.dllm_manager.waiting_queue if r.kv.holds_kv
+            ]
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Transferred requests wait for a slot holding their row and KV;
@@ -6476,15 +6480,6 @@ class Scheduler(
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:
                 self._add_request_to_queue(req)
-        # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
-        # freeing its KV under a live disagg KV-sender crashes move_bootstrapped or
-        # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.
-        # TODO(disagg-prefill-retract): tear the sender down (abort + release metadata
-        # buffer + reset pending_bootstrap) before freeing KV, then retract for real.
-        # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
-        if self.disaggregation_mode != DisaggregationMode.PREFILL:
-            # A finished chunked request was not retracted.
-            self.chunked_reqs._drop_all()
 
     def _publish_paused_state(self):
         # Surface the paused state to dashboards immediately. The scheduler

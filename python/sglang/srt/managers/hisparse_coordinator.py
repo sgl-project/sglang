@@ -1375,9 +1375,7 @@ class HiSparseCoordinator:
         return top_k_indices
 
     def _release_staging(self, req: Req) -> None:
-        """Remove a request from the staging queue and free its host + device resources."""
-        # Remove from staging queue
-        self.ack_staging_queue._leave([req])
+        """Free a staged request's host + device resources."""
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
