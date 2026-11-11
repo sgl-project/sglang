@@ -114,6 +114,7 @@ class TestAllPPLoras(CustomTestCase):
             req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
             req.output_ids = []
             req.is_retracted = False
+            req.owner_list = None
             req.time_stats = SimpleNamespace(wait_queue_entry_time=0.0)
             return req
 
