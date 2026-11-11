@@ -555,6 +555,8 @@ class MMEncoder:
         configure_media_url_security(
             get_mm().allowed_media_domains,
             get_mm().media_url_max_file_size_mb,
+            get_mm().media_url_timeout,
+            get_mm().allow_local_media_files,
         )
         self.transfer_backend = get_disagg().encoder_transfer_backend
         self.use_mooncake = self.transfer_backend == "mooncake"
@@ -1766,7 +1768,7 @@ class MMEncoder:
                 mm_hashes = [mm_item.cache_key for mm_item in mm_items]
                 mm_hash = MultiModalStaticCache.combine_hashes(mm_hashes)
                 async with self.mm_cache_lock:
-                    mm_cache = self.mm_cache.get(mm_hashes)
+                    mm_cache = self.mm_cache.get(mm_hashes, combined_hash=mm_hash)
                     if mm_cache is not None:
                         mm_embedding = mm_cache.embedding
                         cache_hit = True
