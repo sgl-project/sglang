@@ -1,7 +1,6 @@
 # docker build -t sglang:xpu -f xpu.Dockerfile --build-arg http_proxy=${http_proxy} --build-arg https_proxy=${https_proxy} --build-arg no_proxy=${no_proxy} --no-cache .
 
-# Use Intel deep learning essentials base image with Ubuntu 24.04
-FROM intel/deep-learning-essentials:2026.1.3-devel-ubuntu24.04
+FROM ubuntu:24.04
 
 # Avoid interactive prompts during package install
 ENV DEBIAN_FRONTEND=noninteractive
@@ -20,11 +19,14 @@ ARG SG_LANG_KERNEL_SOURCE=wheel
 
 USER root
 
-# Versioned Intel GPU stack instead of the base image's rolling PPA (see sgl-kernel-xpu#296).
+# GPU driver stack and oneAPI toolchain from one versioned Intel OMIX release.
 ARG INTEL_OMIX_VERSION=0.5.0
+# oneAPI toolkit version shipped by INTEL_OMIX_VERSION; bump together.
+ARG ONEAPI_VERSION=2026.2
 
-RUN rm -f /etc/apt/sources.list.d/kobuk-team-ubuntu-intel-graphics-*.sources && \
-    apt-get update && apt-get install -y curl gpg && \
+RUN apt-get update && apt-get install -y \
+        ca-certificates curl gpg wget git file cmake build-essential pkg-config \
+        software-properties-common && \
     curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key | \
         gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg && \
     echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu noble/intel-omix/${INTEL_OMIX_VERSION} unified" \
@@ -32,10 +34,34 @@ RUN rm -f /etc/apt/sources.list.d/kobuk-team-ubuntu-intel-graphics-*.sources && 
     # Fail here if the omix channel can't be fetched.
     apt-get update -o APT::Update::Error-Mode=any && \
     apt-get install -y \
-        intel-gpu-compute intel-metrics-discovery clinfo \
+        intel-omix-dev intel-metrics-discovery clinfo \
         intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo \
         ffmpeg && \
+    test -x /opt/intel/oneapi/${ONEAPI_VERSION}/bin/icpx && \
     rm -rf /var/lib/apt/lists/*
+
+# Static equivalent of setvars.sh for the unified oneAPI layout, so build steps,
+# docker exec and runtime all see icpx and the oneAPI libs.
+ENV ONEAPI_ROOT=/opt/intel/oneapi/${ONEAPI_VERSION}
+ENV CMPLR_ROOT=${ONEAPI_ROOT} \
+    MKLROOT=${ONEAPI_ROOT} \
+    TBBROOT=${ONEAPI_ROOT} \
+    CCL_ROOT=${ONEAPI_ROOT} \
+    CCL_CONFIGURATION=cpu_gpu_dpcpp \
+    Pti_DIR=${ONEAPI_ROOT}/lib/cmake/pti \
+    PATH=${ONEAPI_ROOT}/bin:${PATH} \
+    LD_LIBRARY_PATH=${ONEAPI_ROOT}/lib \
+    LIBRARY_PATH=${ONEAPI_ROOT}/lib \
+    C_INCLUDE_PATH=${ONEAPI_ROOT}/include \
+    CPLUS_INCLUDE_PATH=${ONEAPI_ROOT}/include \
+    CMAKE_PREFIX_PATH=${ONEAPI_ROOT} \
+    PKG_CONFIG_PATH=${ONEAPI_ROOT}/lib/pkgconfig \
+    SETVARS_COMPLETED=1
+# Log vars oneapi-vars.sh sets that differ from the ENV above (informational only).
+RUN icpx --version && \
+    { env -i bash -c ". ${ONEAPI_ROOT}/oneapi-vars.sh >/dev/null; env" || true; } | sort > /tmp/oneapi.env && \
+    env | sort | comm -13 - /tmp/oneapi.env | sed 's/^/oneapi-vars only: /' && \
+    rm -f /tmp/oneapi.env
 
 
 RUN apt-get update && apt-get install -y \
@@ -88,8 +114,7 @@ RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
 # major to it -- under build isolation torch is absent and the match is skipped.
 # Pinned (v0.0.10b2) so image builds are reproducible; bump via --build-arg.
 ARG TORCH_MEMORY_SAVER_REF=a5c99f11b18ebb8e9fda71a68812e476ae49e417
-# Base image already applies setvars.sh in its own layers (SETVARS_COMPLETED=1,
-# icpx on PATH, LIBRARY_PATH/CPATH populated), so re-sourcing here is redundant.
+# The oneAPI ENV block above already puts icpx and the oneAPI libs on the paths.
 RUN TMS_PLATFORM=xpu pip install --no-cache-dir --no-build-isolation \
     git+https://github.com/fzyzcjy/torch_memory_saver.git@${TORCH_MEMORY_SAVER_REF}
 
