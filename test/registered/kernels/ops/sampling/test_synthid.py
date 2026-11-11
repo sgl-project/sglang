@@ -384,11 +384,7 @@ class TestSynthIDKernels(CustomTestCase):
                                 filter_synthid_probs, sampling_info=info
                             ),
                         )
-                    expected = (
-                        [1.0, 0.0, 0.0]
-                        if backend == "flashinfer" and min_p > 0 and top_p == 0.55
-                        else [5 / 8, 3 / 8, 0.0]
-                    )
+                    expected = [5 / 8, 3 / 8, 0.0]
                     torch.testing.assert_close(
                         logits.softmax(-1),
                         torch.tensor([expected], device="cuda"),

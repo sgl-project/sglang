@@ -273,8 +273,8 @@ def filter_synthid_probs(
             top_ks,
             top_ps,
             min_ps,
-            need_top_k_sampling=sampling_info.need_top_k_sampling,
-            need_top_p_sampling=sampling_info.need_top_p_sampling,
+            need_top_k_sampling=True,
+            need_top_p_sampling=True,
             need_min_p_sampling=sampling_info.need_min_p_sampling,
         )
     elif backend == "pytorch":
