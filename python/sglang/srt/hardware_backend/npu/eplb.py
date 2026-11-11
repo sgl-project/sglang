@@ -38,7 +38,7 @@ _FORMAT_FRACTAL_NZ = 29
 _BASE_FORMATS = (_FORMAT_NCHW, _FORMAT_ND)
 
 
-def update_expert_weights_with_staging(
+def migrate_expert_weights(
     weights_by_layer: dict[int, list[torch.Tensor]],
     old_metadata: ExpertLocationMetadata,
     new_metadata: ExpertLocationMetadata,
@@ -59,13 +59,14 @@ def update_expert_weights_with_staging(
     world_size = dist.get_world_size(group)
     _validate_migration_topology(world_size)
     adapter = _ExpertWeightAdapter(weights_by_layer, changed_layer_ids, rank)
-    temp_buffers = []
+    # Even an idle rank validates the changed chunk, but needs no scratch buffers.
+    if not local_update_plan:
+        return {}
+    temp_buffers = adapter.create_temp_buffers()
     missing_experts_by_layer = {}
 
     for layer, old_placement, new_placement in local_update_plan:
         weights = weights_by_layer[layer]
-        if not temp_buffers:
-            temp_buffers = adapter.create_temp_buffers()
         migration_weights = adapter.make_weight_views(weights)
         missing_experts = []
         update_layer_fn(
@@ -92,16 +93,27 @@ def _validate_migration_topology(group_size: int) -> None:
     from sglang.srt.runtime_context import get_parallel
 
     parallel = get_parallel()
+    world_size = dist.get_world_size()
     # TP and WORLD must have the same members and rank numbering.
     if parallel.pp_size != 1 or not (
-        parallel.tp_size == parallel.moe_ep_size == group_size == dist.get_world_size()
+        parallel.tp_size == parallel.moe_ep_size == group_size == world_size
     ):
-        raise ValueError("NPU EPLB requires PP=1 and TP size = EP size = WORLD size.")
+        raise ValueError(
+            "NPU EPLB requires PP=1 and TP size = EP size = EPLB group size = "
+            f"WORLD size; got PP={parallel.pp_size}, TP={parallel.tp_size}, "
+            f"EP={parallel.moe_ep_size}, EPLB group={group_size}, WORLD={world_size}."
+        )
 
 
-def _select_expert_weight_updates(old_metadata, new_metadata, layer_ids, rank):
+def _select_expert_weight_updates(
+    old_metadata: ExpertLocationMetadata,
+    new_metadata: ExpertLocationMetadata,
+    layer_ids: list[int],
+    rank: int,
+) -> tuple[list[int], list[tuple[int, list[int], list[int]]]]:
     """Return changed layers for validation and this rank's migration plan.
 
+    Each plan entry contains the layer ID and its old/new expert placements.
     A sender-only layer participates in migration but needs no local writeback.
     Validate every changed layer, even when this rank has no work in that layer.
     """
@@ -136,7 +148,9 @@ def _select_expert_weight_updates(old_metadata, new_metadata, layer_ids, rank):
     return changed_layer_ids, local_update_plan
 
 
-def _rank_may_send_experts(old_placement, new_placement, local_slots):
+def _rank_may_send_experts(
+    old_placement: list[int], new_placement: list[int], local_slots: slice
+) -> bool:
     """A possible sender holds an expert needed by a changed destination slot."""
     local_experts = set(old_placement[local_slots])
     return any(
@@ -183,7 +197,13 @@ def _validate_migration_weights(
 
 
 class _ExpertStorageLayout(NamedTuple):
-    """Logical and physical metadata required to reuse a chunk's byte buffers."""
+    """Metadata for byte views and scratch buffers shared by a layer chunk.
+
+    ``shape`` describes the exported routed weights. ``total_experts`` counts
+    all expert rows in the allocation, including any shared-expert suffix.
+    ``storage_bytes`` includes NZ padding, so dividing it by ``total_experts``
+    gives the physical size of one expert, not just its logical element count.
+    """
 
     shape: tuple[int, ...]
     dtype: torch.dtype

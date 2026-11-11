@@ -34,7 +34,7 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.eplb import (
         _copy_expert_weight_runs,
         _expert_ranks_by_logical_id,
-        update_expert_weights_with_staging,
+        migrate_expert_weights,
     )
 
 
@@ -155,7 +155,7 @@ def _update_expert_weights_raw(
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
     if _is_npu:
-        return update_expert_weights_with_staging(
+        return migrate_expert_weights(
             weights_by_layer=routed_experts_weights_of_layer,
             old_metadata=old_expert_location_metadata,
             new_metadata=new_expert_location_metadata,
