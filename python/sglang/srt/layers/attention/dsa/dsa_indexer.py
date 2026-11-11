@@ -195,6 +195,32 @@ _MERGED_K_GATE_MAX_M = 16
 # Kimi-K3.1 prefill extends with at least this many rows split the indexer
 # (logits and top-k) across the attention-TP ranks and all-gather the top-k
 _INDEXER_TP_SPLIT_MIN_ROWS = 1024
+# MI355X, 140k keys: unsplit 512 rows cost ~0.6 ms/layer in logits + top-k vs
+# ~0.16 ms for a 64-row slice; re-measure if the top-k all-gather gets slower.
+_INDEXER_TP_SPLIT_MIN_ROWS_HIP = 64
+
+
+def _indexer_tp_split_min_rows() -> int:
+    rows = envs.SGLANG_OPT_DSA_INDEXER_TP_SPLIT_MIN_ROWS.get()
+    if rows is not None:
+        return rows
+    return _INDEXER_TP_SPLIT_MIN_ROWS_HIP if _is_hip else _INDEXER_TP_SPLIT_MIN_ROWS
+
+
+def _resolve_hip_prefill_mqa_logits():
+    if envs.SGLANG_USE_FLYDSL_DSA_PREFILL_LOGITS.get():
+        try:
+            from aiter.ops.flydsl import flydsl_fp8_mqa_logits
+
+            return flydsl_fp8_mqa_logits
+        except ImportError:
+            logger.warning(
+                "FlyDSL fp8_mqa_logits unavailable; DSA prefill indexer uses Triton",
+                exc_info=True,
+            )
+    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+    return fp8_mqa_logits
 
 
 if _is_cuda or _is_hip:
@@ -474,7 +500,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.num_init_tokens = self.num_local_tokens = 0
         self.tp_split_min_rows: Optional[int] = None
         if config is not None and is_kimi_k31(config):
-            self.tp_split_min_rows = _INDEXER_TP_SPLIT_MIN_ROWS
+            self.tp_split_min_rows = _indexer_tp_split_min_rows()
+        self._hip_prefill_mqa_logits = (
+            _resolve_hip_prefill_mqa_logits() if _is_hip else None
+        )
         if config is not None:
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
@@ -1831,14 +1860,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
                 if _is_hip:
-                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
                     kv, scale = kv_fp8
                     # Match the CUDA deep_gemm path (clean_logits=False): the topk
                     # transform masks invalid positions via ks/ke/lengths, so the
                     # -inf pre-fill of the [tokens x seq_len_kv] logits buffer is
                     # redundant and grows quadratically with context length.
-                    logits = fp8_mqa_logits(
+                    logits = self._hip_prefill_mqa_logits(
                         q_fp8[:q_offset],
                         kv,
                         scale,
@@ -1911,11 +1938,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
             with self._with_real_sm_count():
                 if _is_hip:
-                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
                     kv, scale = kv_fp8
                     # clean_logits=False: topk transform handles masking (see above)
-                    logits_chunk = fp8_mqa_logits(
+                    logits_chunk = self._hip_prefill_mqa_logits(
                         q_fp8[start:end],
                         kv,
                         scale,

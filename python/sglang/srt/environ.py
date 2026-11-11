@@ -2328,6 +2328,13 @@ class Envs:
     SGLANG_DSA_FULL_BATCH_MQA = EnvBool(True)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # Kimi-K3.1 prefill indexer: extends of at least this many rows split the logits
+    # and top-k across the attention-TP ranks and all-gather the top-k.
+    # Unset picks the platform default (1024 on CUDA, 64 on ROCm).
+    SGLANG_OPT_DSA_INDEXER_TP_SPLIT_MIN_ROWS = EnvInt(None)
+    # ROCm prefill indexer logits: aiter FlyDSL fp8_mqa_logits instead of Triton;
+    # same fp8 inputs and fp32 accumulation, only the summation order differs.
+    SGLANG_USE_FLYDSL_DSA_PREFILL_LOGITS = EnvBool(True)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
     # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.
