@@ -3,7 +3,7 @@
 The kernels and their public operators live in sgl-kernel-npu
 (``sgl_kernel_npu.operators.diffusion``); this module resolves them from the
 installed wheel, once per process. A wheel that predates them raises
-``ModuleNotFoundError`` here, which retires only the calling site.
+``ModuleNotFoundError`` at the first call, as every other NPU kernel path does.
 """
 
 from __future__ import annotations

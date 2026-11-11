@@ -357,8 +357,8 @@ inspecting model modules is its whole job.
 
 Qwen-Image 2.1's three NPU sites resolve their kernels from the installed
 `sgl-kernel-npu` wheel at first use; this package only adapts the calls. A wheel
-that predates them retires the calling site, which then runs its eager chain;
-the other sites are unaffected.
+that predates them raises `ModuleNotFoundError` at the first call, as every other
+NPU kernel path in this repository does.
 
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|

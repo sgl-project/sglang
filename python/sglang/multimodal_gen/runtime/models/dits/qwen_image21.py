@@ -173,8 +173,8 @@ def apply_qk_norm(x, norm):
 
 
 def _can_use_rmsnorm_npu(x, weight):
-    # Shapes the kernel cannot serve raise ValueError there, which retires this
-    # site rather than duplicating its tile rules here.
+    # Shape, layout and tile limits are the kernel's contract; it rejects what
+    # it cannot serve instead of returning a wrong result.
     return _is_npu and x.is_npu and x.dtype in (torch.float16, torch.bfloat16)
 
 
@@ -186,31 +186,14 @@ def _can_use_silu_mul_npu(gate, value):
     return _is_npu and gate.is_npu and gate.dtype is torch.bfloat16
 
 
-def _try_npu_fusion(site, fused_fn, *args):
-    """Run a kernel that may reject its inputs; retire this site if it does.
-
-    ValueError means the shape is outside the kernel's contract,
-    ModuleNotFoundError that the installed sgl-kernel-npu predates the
-    operator. Both retire only this site; the others are unaffected.
-    """
-    try:
-        return fused_fn(*args)
-    except (ValueError, ModuleNotFoundError) as error:
-        site.disable()
-        logger.warning("%s retired: %s", site.name, error)
-        return None
-
-
 def apply_residual_gate(residual, update, gate):
     fused = None
     if (
         _can_use_residual_gate_npu(residual, update, gate)
         and _RESIDUAL_GATE_NPU_FUSION.can_attempt_once()
     ):
-        fused = _try_npu_fusion(
-            _RESIDUAL_GATE_NPU_FUSION, residual_gate_add_npu, residual, update, gate
-        )
-        if fused is not None and _RESIDUAL_GATE_NPU_FUSION.verified:
+        fused = residual_gate_add_npu(residual, update, gate)
+        if _RESIDUAL_GATE_NPU_FUSION.verified:
             return fused
     out = residual_gate_add(residual, update, gate)
     if fused is not None:
@@ -245,20 +228,14 @@ def apply_qk_norm_rope(x, norm, rope):
             logger=logger,
         )
     if _can_use_rmsnorm_npu(x, norm.weight) and _QK_NORM_NPU_FUSION.can_attempt_once():
-        normalized = _try_npu_fusion(
-            _QK_NORM_NPU_FUSION,
-            rmsnorm_npu_onepass,
-            x,
-            norm.weight,
-            norm.variance_epsilon,
+        npu_fused = apply_rope(
+            rmsnorm_npu_onepass(x, norm.weight, norm.variance_epsilon), rope
         )
-        if normalized is not None:
-            npu_fused = apply_rope(normalized, rope)
-            if _QK_NORM_NPU_FUSION.verified:
-                return npu_fused
-            return _QK_NORM_NPU_FUSION.accept_or_fallback(
-                npu_fused, apply_rope(norm(x), rope), logger=logger
-            )
+        if _QK_NORM_NPU_FUSION.verified:
+            return npu_fused
+        return _QK_NORM_NPU_FUSION.accept_or_fallback(
+            npu_fused, apply_rope(norm(x), rope), logger=logger
+        )
     return apply_rope(norm(x), rope)
 
 
@@ -532,14 +509,11 @@ class QwenImage21FeedForward(nn.Module):
                 logger=logger,
             )
         elif _can_use_silu_mul_npu(gate, value) and _SILU_MUL_FUSION.can_attempt_once():
-            fused = _try_npu_fusion(_SILU_MUL_FUSION, silu_mul_npu, gate, value)
-            if fused is not None and _SILU_MUL_FUSION.verified:
+            fused = silu_mul_npu(gate, value)
+            if _SILU_MUL_FUSION.verified:
                 return self.out(fused)[0]
-            eager = nn.functional.silu(gate) * value
-            hidden = (
-                eager
-                if fused is None
-                else _SILU_MUL_FUSION.accept_or_fallback(fused, eager, logger=logger)
+            hidden = _SILU_MUL_FUSION.accept_or_fallback(
+                fused, nn.functional.silu(gate) * value, logger=logger
             )
         else:
             hidden = nn.functional.silu(gate) * value
