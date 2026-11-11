@@ -118,8 +118,8 @@
             "runtime_peak_vram_mb": 14216.0,
             "load_peak_allocated_mb": 903.0,
             "runtime_peak_allocated_mb": 6925.0,
-            "load_peak_host_anon_mb": 6759.33,
-            "runtime_peak_host_anon_mb": 6759.33,
+            "load_peak_host_anon_mb": 7071.05,
+            "runtime_peak_host_anon_mb": 7071.05,
             "estimated_full_test_time_s": 200.3
         },
         "zimage_image_t2i": {
@@ -172,8 +172,8 @@
             "runtime_peak_vram_mb": 19146.0,
             "load_peak_allocated_mb": 4880.0,
             "runtime_peak_allocated_mb": 14216.0,
-            "load_peak_host_anon_mb": 10559.66,
-            "runtime_peak_host_anon_mb": 10559.66,
+            "load_peak_host_anon_mb": 10905.63,
+            "runtime_peak_host_anon_mb": 10905.63,
             "estimated_full_test_time_s": 172.8
         },
         "lingbot_video_moe_t2v": {
