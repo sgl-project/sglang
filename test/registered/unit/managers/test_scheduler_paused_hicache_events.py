@@ -2,6 +2,7 @@
 
 import unittest
 from array import array
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, call, patch
 
@@ -14,7 +15,7 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     UpdateWeightFromDiskReqInput,
@@ -25,11 +26,16 @@ from sglang.srt.managers.scheduler_components import weight_updater
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
-from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -62,6 +68,9 @@ class _TreeCache:
 
     def get_last_hash_value(self, node):
         return None
+
+    def window_reprefill_tail_tokens(self, req):
+        return 0
 
     def prefetch_from_storage(self, handle, last_host_node, new_input_tokens, *a, **k):
         # Page-aligned length against the threshold, as the unified tree does.
@@ -158,10 +167,25 @@ class TestPausedFlushAfterRetract(unittest.TestCase):
                 reqs=[req],
                 batch_is_full=False,
                 is_empty=lambda: not s.running_batch.reqs,
+                filter_batch=lambda keep_indices: setattr(
+                    s.running_batch,
+                    "reqs",
+                    [s.running_batch.reqs[i] for i in keep_indices],
+                ),
             ),
+            result_queue=deque(),
+            cur_batch_for_debug=None,
+            dllm_config=None,
+            uocr_runtime=None,
+            disagg_prefill_bootstrap_queue=None,
+            disagg_prefill_transfer_queue=IndexedReqList(ListKind.PD_SENDING),
+            disagg_decode_prealloc_queue=None,
+            disagg_decode_transfer_queue=None,
             last_batch=None,
             chunked_req=None,
-            waiting_queue=[],
+            waiting_queue=IndexedReqList(ListKind.WAITING),
+            chunked_reqs=IndexedReqList(ListKind.CHUNKED),
+            pause_state=PauseState(),
             disaggregation_mode=DisaggregationMode.NULL,
             decode_offload_manager=None,
             hisparse_coordinator=None,
@@ -183,8 +207,12 @@ class TestPausedFlushAfterRetract(unittest.TestCase):
                 current_scheduler_metrics_enabled=False, is_stats_logging_rank=False
             ),
             kv_events_publisher=MagicMock(),
-            running_reqs=RunningReqs(),
-            prefill_launched_reqs=RequestList(),
+            beam_coordinator=MagicMock(),
+            output_streamer=MagicMock(),
+            send_abort_output=MagicMock(),
+            invariant_checker=MagicMock(),
+            running_reqs=KeyedReqList(ListKind.DECODING),
+            prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
             request_receiver=object.__new__(SchedulerRequestReceiver),
             deferred_responses=DeferredResponses(
                 disaggregation_mode=DisaggregationMode.NULL,
@@ -193,6 +221,8 @@ class TestPausedFlushAfterRetract(unittest.TestCase):
             ),
         )
         s._process_storage_prefetch_retries = lambda: None
+        s.init_request_retirer()
+        move([req], s.running_reqs)
 
         def get_next_batch_to_run(running_batch, last_batch):
             s._process_hicache_events()  # the real getter's first step
