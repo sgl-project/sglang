@@ -546,6 +546,60 @@ fn recorder_keeps_five_minutes_and_the_unfinished() {
     assert_eq!(recorded(&recorder).0, ["second", "third"]);
 }
 
+/// Past its byte budget the finished window drops its oldest records first,
+/// counting a body shared by a batch's items once; the unfinished stay.
+#[test]
+fn recorder_drops_the_oldest_finished_past_its_byte_budget() {
+    let output = || Arc::new(Mutex::new(CoreOutput::default()));
+    let out = |len: usize| {
+        let mut map = Map::new();
+        map.insert("text".into(), "x".repeat(len).into());
+        map
+    };
+    // `{"text":"<n x>"}` is n + 11 bytes; each `{}` body is 2.
+    let recorder = CrashRecorder::omitting(Vec::new(), 2 * (100 + 11 + 2));
+    let finish = |rid: &str, len: usize| {
+        let id = recorder.register(dump_request(&recorder, rid), 1.0, output());
+        recorder.finish(id, true, &out(len), 2.0);
+    };
+    let _running = recorder.register(dump_request(&recorder, "running"), 1.0, output());
+    finish("a", 100);
+    finish("b", 100);
+    assert_eq!(recorded(&recorder).0, ["a", "b"]);
+    finish("c", 100);
+    assert_eq!(recorded(&recorder).0, ["b", "c"]);
+    // A record larger than the whole budget is not kept, and evicts the rest.
+    finish("huge", 1000);
+    assert!(recorded(&recorder).0.is_empty());
+    assert_eq!(recorded(&recorder).1.len(), 1);
+
+    // Two items of one batch share a body: the budget counts it once.
+    let shared = recorder.body(RawBody {
+        // A 100-byte JSON body.
+        bytes: Bytes::from(format!(r#"{{"text":"{}"}}"#, "y".repeat(89))),
+        overrides: None,
+    });
+    let recorder_items = CrashRecorder::omitting(Vec::new(), 100 + 2 * (10 + 11));
+    for (index, rid) in ["first", "second"].into_iter().enumerate() {
+        let request = DumpRequest {
+            body: shared.clone(),
+            batch_index: Some(index),
+            rid: rid.into(),
+        };
+        let id = recorder_items.register(request, 1.0, output());
+        recorder_items.finish(id, true, &out(10), 2.0);
+    }
+    assert_eq!(recorded(&recorder_items).0, ["first", "second"]);
+
+    // A budget of 0 keeps the whole window.
+    let unbounded = CrashRecorder::default();
+    for rid in ["a", "b", "c"] {
+        let id = unbounded.register(dump_request(&unbounded, rid), 1.0, output());
+        unbounded.finish(id, true, &out(1000), 2.0);
+    }
+    assert_eq!(recorded(&unbounded).0, ["a", "b", "c"]);
+}
+
 /// A call dropped unfinished after admission (the client went away) is kept
 /// with what it generated, as Python records an aborted request; one dropped
 /// before the scheduler saw it (preprocessing failed) is not.

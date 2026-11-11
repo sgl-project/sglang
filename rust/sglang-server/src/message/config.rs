@@ -265,6 +265,9 @@ pub struct ServerArgs {
     /// `--crash-dump-folder` is set: keep the requests a crash dump writes
     /// (Python owns the folder and the file; see `Server::crash_dump_snapshot`).
     pub crash_dump: bool,
+    /// Bytes the crash dump's finished-request window may hold
+    /// (`SGLANG_CRASH_DUMP_MAX_BYTES`); 0 keeps the whole window.
+    pub crash_dump_max_bytes: usize,
     /// `sampling_params.custom_params` keys the server itself adds to a
     /// request (none from a client); request logs and crash dumps leave them out.
     pub server_added_custom_params: Vec<String>,
@@ -333,6 +336,7 @@ impl ServerArgs {
         metrics,
         request_log,
         crash_dump,
+        crash_dump_max_bytes,
         server_added_custom_params,
     ))]
     // The parameter list IS the schema; one keyword per field, all required.
@@ -397,6 +401,7 @@ impl ServerArgs {
         metrics: Option<MetricsConfig>,
         request_log: Option<RequestLogConfig>,
         crash_dump: bool,
+        crash_dump_max_bytes: usize,
         server_added_custom_params: Vec<String>,
     ) -> Self {
         Self {
@@ -459,6 +464,7 @@ impl ServerArgs {
             metrics,
             request_log,
             crash_dump,
+            crash_dump_max_bytes,
             server_added_custom_params,
         }
     }
@@ -528,6 +534,7 @@ impl Default for ServerArgs {
             metrics: None,
             request_log: None,
             crash_dump: false,
+            crash_dump_max_bytes: 0,
             server_added_custom_params: Vec::new(),
         }
     }

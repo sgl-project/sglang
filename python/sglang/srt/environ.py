@@ -365,6 +365,9 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    # Bytes the Rust server's crash dump keeps of requests finished in its five-minute
+    # window, oldest dropped first; 0 keeps the whole window.
+    SGLANG_CRASH_DUMP_MAX_BYTES = EnvInt(256 * 1024 * 1024)
     # Read by JIT kernel headers (sgl_kernel/logging.h): DEBUG | INFO | WARNING | ERROR.
     SGLANG_JIT_LOG_LEVEL = EnvStr("WARNING")
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
