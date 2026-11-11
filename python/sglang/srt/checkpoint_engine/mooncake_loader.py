@@ -775,6 +775,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebalance-buckets", default="round_robin", choices=["none", "round_robin"])
     parser.add_argument("--pipeline-depth", type=int, default=4, help="Number of buffer slots (default: 4)")
     parser.add_argument("--flush-cache", action="store_true", help="Flush cache after weight update")
+    parser.add_argument("--use-gloo", action=argparse.BooleanOptionalAction, default=True, help="Use gloo backend")
     parser.add_argument(
         "--update-timeout",
         type=float,
@@ -1045,7 +1046,7 @@ def do_load(
 
     try:
         # ========== Phase 1: Initialize process group ==========
-        _init_process_group(device_id=gpu_index)
+        _init_process_group(device_id=gpu_index, use_gloo=args.use_gloo)
         if rank == 0:
             logger.info(f"Loading checkpoint -> {ep}")
 
