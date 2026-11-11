@@ -297,6 +297,7 @@ class TestA3Budget(unittest.TestCase):
                 "MemoryPoolConfigurator": object,
                 "_is_npu": True,
                 "ceil_div": lambda a, b: (a + b - 1) // b,
+                "_get_dsv4_compress_state_dtype_sizes": lambda: (4, 4),
             },
         )
         pool = object.__new__(ns["DSV4PoolConfigurator"])
@@ -304,6 +305,7 @@ class TestA3Budget(unittest.TestCase):
         pool._unified = False
         pool.kv_bytes = 584
         pool.attn_head_dim = 512
+        pool.indexer_head_dim = 128
         pool.low_ratio_index_bytes = 256 if a3 else 68
         pool.page_size = 128
         pool.num_layers_total = 40
@@ -347,6 +349,79 @@ class TestA3Budget(unittest.TestCase):
         budget = self._budget(a3=False)
         self.assertEqual(budget._get_paged_kv_bytes_per_token(1), 584)
         self.assertEqual(budget._get_low_ratio_kv_padding_bytes(128), 0)
+
+    def _resolve_draft_budget(self, budget, *, dspark=True, stages=3, cap=512):
+        # Execute the production constructor's sizing block with an already
+        # resolved layout, without importing NPU/distributed runtime modules.
+        cls = next(
+            node
+            for node in ast.parse(BUDGET_FILE.read_text()).body
+            if isinstance(node, ast.ClassDef) and node.name == "DSV4PoolConfigurator"
+        )
+        init = next(
+            node for node in cls.body if getattr(node, "name", None) == "__init__"
+        )
+        start = next(
+            i
+            for i, node in enumerate(init.body)
+            if isinstance(node, ast.If)
+            and "self._npu_low_ratio_bf16" in ast.unparse(node.test)
+            and "kvc.spec_algorithm.is_dspark()" in ast.unparse(node.test)
+        )
+        end = next(
+            i + 1
+            for i, node in enumerate(init.body[start:], start)
+            if isinstance(node, ast.If)
+            and "not self._draft_kv_priced_exactly" in ast.unparse(node.test)
+        )
+        budget.encoder_replay = False
+        budget.is_speculative = True
+        budget.swa_cap_tokens = cap
+        budget.swa_ratio = 0.1
+        budget._spec_infl = 1.0
+        kvc = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_dspark=lambda: dspark),
+            spec_aux_config=SimpleNamespace(
+                dspark_num_stages=stages, dflash_draft_num_layers=0
+            ),
+        )
+        module = ast.Module(body=init.body[start:end], type_ignores=[])
+        exec(compile(module, str(BUDGET_FILE), "exec"), {"self": budget, "kvc": kvc})  # noqa: S102
+
+    def test_a3_dspark_reserves_all_draft_swa_layers_only(self):
+        for stages in (1, 3, 5):
+            for cap in (None, 512):
+                budget = self._budget()
+                self._resolve_draft_budget(budget, stages=stages, cap=cap)
+                self.assertEqual(budget._npu_dspark_draft_layers, stages)
+                self.assertEqual(budget.bytes_per_swa_token, (40 + stages) * 1024)
+                self.assertEqual(
+                    budget.bytes_per_full_token,
+                    3200 + (0.1 * (40 + stages) * 1024 if cap is None else 0),
+                )
+                self.assertEqual(budget._spec_infl, 1.0)
+
+    def test_a3_dspark_padding_includes_draft_reserved_pages(self):
+        budget = self._budget()
+        fake_module = ModuleType("sglang.srt.mem_cache.deepseek_v4_memory_pool")
+        fake_module.DSV41_INDEX_PAGE_SIZE = 64
+        with patch.dict("sys.modules", {fake_module.__name__: fake_module}):
+            before = budget._get_low_ratio_kv_padding_bytes(256)
+            self._resolve_draft_budget(budget)
+            self.assertEqual(
+                budget._get_low_ratio_kv_padding_bytes(256) - before, 3 * 128 * 1024
+            )
+
+    def test_a3_dspark_requires_draft_layer_count(self):
+        with self.assertRaisesRegex(AssertionError, "draft layer count"):
+            self._resolve_draft_budget(self._budget(), stages=0)
+
+    def test_other_speculative_budgets_keep_existing_inflation(self):
+        for a3, dspark in ((False, True), (False, False), (True, False)):
+            budget = self._budget(a3=a3)
+            self._resolve_draft_budget(budget, dspark=dspark)
+            self.assertEqual(budget._npu_dspark_draft_layers, 0)
+            self.assertEqual(budget._spec_infl, 41 / 40)
 
 
 if __name__ == "__main__":

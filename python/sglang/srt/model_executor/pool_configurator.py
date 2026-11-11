@@ -1132,8 +1132,10 @@ class _DSV4PoolSizes:
 
 
 class DSV4PoolConfigurator(MemoryPoolConfigurator):
-    """DSV4 compressed attention: coeff is bytes_per_full_token, inflated by (T+D)/T
-    for a draft worker; bias is the request-scoped pools that do not scale with it."""
+    """DSV4 compressed attention budgets, including speculative draft storage.
+
+    The bias covers request-scoped pools that do not scale with full tokens.
+    """
 
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
@@ -1141,6 +1143,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     # A subclass that adds the draft's KV to the per-token bytes itself sets this,
     # replacing the (T+D)/T inflation.
     _draft_kv_priced_exactly = False
+    _npu_dspark_draft_layers = 0
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
@@ -1360,6 +1363,21 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             if self.encoder_replay and not self.paged_draft_layers
             else self._resolve_swa_cap_tokens()
         )
+        if (
+            self._npu_low_ratio_bf16
+            and kvc.spec_algorithm.is_dspark()
+            and not self.encoder_replay
+        ):
+            # A3 DSpark allocates a BF16 paged SWA pool for every draft stage,
+            # but no compressed KV/indexer pools. Reserve that exact footprint.
+            aux = kvc.spec_aux_config
+            self._npu_dspark_draft_layers = int(
+                aux.dspark_num_stages or aux.dflash_draft_num_layers or 0
+            )
+            assert self._npu_dspark_draft_layers > 0, (
+                "DSpark draft layer count is required"
+            )
+            self._draft_kv_priced_exactly = True
         self.bytes_per_swa_token = self._get_bytes_per_swa_token()
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if (
@@ -1506,7 +1524,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.ring_sizes.get(4, 0) / self.page_size
-        return self._get_paged_kv_bytes_per_token() * self.num_swa_layers + (
+        return self._get_paged_kv_bytes_per_token() * (
+            self.num_swa_layers + self._npu_dspark_draft_layers
+        ) + (
             c4_state_ratio
             * (c4_state_bytes + c4_indexer_state_bytes)
             * self.num_layers(4)
@@ -1543,7 +1563,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 padding = (
                     self.page_size
                     * self._get_paged_kv_bytes_per_token()
-                    * self.num_layers_total
+                    * (self.num_layers_total + self._npu_dspark_draft_layers)
                 )
                 for ratio in (1, 2):
                     page = self.page_size // ratio
