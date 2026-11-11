@@ -2773,10 +2773,9 @@ class DeepseekSparseAttnBackend(
                     layer=layer,
                     topk_indices=shared_topk_indices,
                 )
-            # On ROCm, DCP target verify, like decode, returns this rank's partial.
+            # the dcp_partial of _forward_flashmla_kv on ROCm's sharded index-K
             if (
-                _is_hip
-                and self.attn_dcp_size > 1
+                self.dsa_shards_index_k
                 and forward_batch.forward_mode.is_target_verify()
             ):
                 from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
@@ -3163,7 +3162,7 @@ class DeepseekSparseAttnBackend(
                     layer=layer,
                     topk_indices=shared_topk_indices,
                 )
-            if _is_hip and self.attn_dcp_size > 1:
+            if self.dsa_shards_index_k:
                 from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
                     forward_triton_dcp_partial,
                 )
