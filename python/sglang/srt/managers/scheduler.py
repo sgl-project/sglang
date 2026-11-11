@@ -3245,6 +3245,24 @@ class Scheduler(
         """Extension point for request-local state, including session requests."""
         return Req(*args, **kwargs)
 
+    def _live_request_with_rid(self, rid: str) -> Optional[Req]:
+        """The live request already using `rid`, if any.
+
+        Every live request sits in exactly one of `request_lists()` (waiting,
+        running, chunked, prefill-launched, or a disaggregation queue), so a
+        scan of those lists sees every rid this scheduler has admitted. The
+        tokenizer workers each check only their own `rid_to_state`, so without
+        this check the second of two concurrent same-rid requests landing on
+        different tokenizer workers would both run, and the detokenizer would
+        merge their states under the one rid and stream one client's tokens
+        into the other's response (see #49903).
+        """
+        for req_list in self.request_lists().values():
+            for req in req_list:
+                if req.rid == rid:
+                    return req
+        return None
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -3412,6 +3430,19 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
+            return
+
+        if self._live_request_with_rid(req.rid) is not None:
+            # A second request with a live rid. The tokenizer workers each
+            # check only their own rid_to_state, so this scheduler is the
+            # first place that sees both. Reject it before it is queued and
+            # run, or the detokenizer would merge the two requests' states
+            # under the one rid (see #49903). Same message as the
+            # tokenizer-side check, so the client sees the same 400.
+            error_msg = f"Duplicate request ID detected: {req.rid}"
+            logger.error(error_msg)
+            prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+            self.request_retirer.retire_unadmitted(req)
             return
 
         if recv_req.pp_prefetch_ticketed is True:
@@ -4015,6 +4046,19 @@ class Scheduler(
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
         self._record_kv_event_lora_name(req, recv_req.lora_name)
+
+        if self._live_request_with_rid(req.rid) is not None:
+            # Same duplicate-rid rejection as generate requests (see
+            # #49903): the tokenizer workers each check only their own
+            # rid_to_state, so this scheduler is the first place that sees
+            # both. Queued as an abort, as the other intake rejections in
+            # this handler do.
+            req.set_finish_with_abort(
+                f"Duplicate request ID detected: {req.rid}",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+            self._add_request_to_queue(req)
+            return
 
         if mm_input_error is not None:
             req.set_finish_with_abort(
