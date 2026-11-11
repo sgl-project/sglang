@@ -8,11 +8,12 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(
-    est_time=3600,
-    suite="nightly-perf-4-npu-a5",
-    nightly=True,
-)
+# TEMP: disabled during overlap-schedule validation.
+# register_npu_ci(
+#     est_time=3600,
+#     suite="nightly-perf-4-npu-a5",
+#     nightly=True,
+# )
 
 CASE_ID = "test_npu_deepseek_v4_flash_fp8_1p1d_16p_in16k_out1k_a5_overlap"
 
