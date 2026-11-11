@@ -77,7 +77,6 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_parallel,
-    get_platform,
 )
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
@@ -1503,7 +1502,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         use_dg_native = (
             not use_cute_dsl
             and _is_cuda
-            and (dcp_size == 1 or get_platform().is_sm100)
             and forward_batch.forward_mode.is_target_verify()
             and next_n >= 2
             and ctx_2d is not None

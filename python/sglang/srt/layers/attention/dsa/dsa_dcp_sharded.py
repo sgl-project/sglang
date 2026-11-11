@@ -75,14 +75,6 @@ def _side_stream(device: torch.device) -> torch.cuda.Stream:
 
 
 class DcpCandidateAllGather:
-    """All-gather of the top-k candidates over the DCP group through torch
-    symmetric memory (NVLS multimem, as TorchSymmMemCommunicator does for
-    all-reduce): every rank writes its candidates into one symmetric output
-    buffer, rendezvoused once at init. Falls back to the group all-gather when
-    multicast is unavailable or the payload does not fit. Only the first
-    min(local_lens[row], topk) pairs in each row are valid.
-    """
-
     def __init__(self, group, max_rows: int, topk: int):
         import torch.distributed._symmetric_memory as symm_mem
 
