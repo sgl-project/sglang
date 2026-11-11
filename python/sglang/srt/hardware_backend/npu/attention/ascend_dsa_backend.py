@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     update_kpool_write_plan,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -339,3 +340,226 @@ class AscendDSAAttnMultiStepDraftBackend(AscendAttnMultiStepDraftBackend):
     """Create an Ascend backend that generates DSA metadata for each draft decode step."""
 
     backend_cls = AscendDSAAttnBackend
+
+
+def _get_topk_npu(
+    layer_id: int,
+    query: torch.Tensor,
+    weights: torch.Tensor,
+    positions: torch.Tensor,
+    metadata: AscendDSAIndexerMetadata,
+    index_topk: int,
+    index_kpool: int,
+) -> torch.Tensor:
+    from sgl_kernel_npu.operators.indexer import (
+        pack_pool_key_indexer_indices,
+        pool_key_indexer,
+        prepare_pool_key_indexer_inputs,
+    )
+
+    metadata = metadata.attn_metadata
+    (
+        query_safe,
+        weights_safe,
+        query_ends_safe,
+        pool_lens_safe,
+        tail_lens_safe,
+        page_table_safe,
+    ) = prepare_pool_key_indexer_inputs(
+        query,
+        weights,
+        metadata.pool_query_ends,
+        metadata.pool_key_lens,
+        metadata.pool_tail_lens,
+        metadata.pool_page_table,
+    )
+
+    pool = get_token_to_kv_pool()
+    kv = pool.layer_router.read(layer_id)
+    pool, layer_id = kv.view, kv.view_layer_id
+    indices = pool_key_indexer(
+        query=query_safe,
+        pool_key=pool.get_index_k_buffer(layer_id),
+        weights=weights_safe,
+        pool_tail_k=tail_lens_safe,
+        actual_seq_q=query_ends_safe,
+        actual_seq_k=pool_lens_safe,
+        block_table=page_table_safe,
+        layout_q="TND",
+        layout_k="PA_BBND",
+        topk=index_topk,
+        pool_size=index_kpool,
+        mask_mode=3,
+        quant_mode=-1,
+        return_value=False,
+    )
+    return pack_pool_key_indexer_indices(
+        indices=indices[: query.shape[0]],
+        positions=positions,
+        query_ends=metadata.pool_query_ends,
+        topk=index_topk,
+        pool_size=index_kpool,
+    )
+
+
+def _compress_write_npu(
+    key: torch.Tensor,
+    gate_score: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    layer_id: int,
+    metadata: AscendDSAIndexerMetadata,
+    compress_ape: torch.Tensor,
+    index_kpool: int,
+) -> None:
+    mode = forward_batch.forward_mode
+    if mode.is_target_verify() or mode.is_draft_extend_v2():
+        _compress_write_mtp_npu(
+            key=key,
+            gate_score=gate_score,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            metadata=metadata,
+            compress_ape=compress_ape,
+        )
+    elif mode.is_decode_or_idle():
+        _compress_write_decode_npu(
+            key=key,
+            gate_score=gate_score,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            metadata=metadata,
+            compress_ape=compress_ape,
+            index_kpool=index_kpool,
+        )
+    elif mode.is_extend_without_speculative():
+        _compress_write_extend_npu(
+            key=key,
+            gate_score=gate_score,
+            layer_id=layer_id,
+            metadata=metadata,
+            compress_ape=compress_ape,
+        )
+    else:
+        raise NotImplementedError(f"NPU KPool does not support {mode}")
+
+
+def _compress_write_mtp_npu(
+    key: torch.Tensor,
+    gate_score: torch.Tensor,
+    forward_batch: ForwardBatch,
+    layer_id: int,
+    metadata: AscendDSAIndexerMetadata,
+    compress_ape: torch.Tensor,
+) -> None:
+    from sgl_kernel_npu.operators.mem_cache import (
+        kpool_write_tail_and_maybe_compress,
+    )
+
+    plan = metadata.attn_metadata.kpool_write_plan
+    assert plan is not None, "NPU DSA kpool MTP requires kpool_write_plan"
+
+    pool = get_token_to_kv_pool()
+    kv = pool.layer_router.read(layer_id)
+    pool, layer_id = kv.view, kv.view_layer_id
+    tail_k, tail_score = pool.get_compress_tail_buffers(layer_id)
+    kpool_write_tail_and_maybe_compress(
+        index_k_cache=pool.get_index_k_buffer(layer_id),
+        key=key,
+        score=gate_score,
+        tail_k=tail_k,
+        tail_score=tail_score,
+        ape=compress_ape,
+        req_pool_indices=plan.req,
+        write_start=plan.write_start,
+        tail_logical_start=plan.tail_logical_start,
+        write_loc=plan.write_loc,
+        out_cache_loc=forward_batch.out_cache_loc,
+        num_draft_tokens=plan.num_draft_tokens,
+        effective_n_per_batch=plan.effective_n_per_batch,
+    )
+
+
+def _compress_write_decode_npu(
+    key: torch.Tensor,
+    gate_score: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    layer_id: int,
+    metadata: AscendDSAIndexerMetadata,
+    compress_ape: torch.Tensor,
+    index_kpool: int,
+) -> None:
+    from sgl_kernel_npu.operators.mem_cache import (
+        kpool_decode_update_and_maybe_write_cache,
+    )
+
+    pool = get_token_to_kv_pool()
+    kv = pool.layer_router.read(layer_id)
+    pool, layer_id = kv.view, kv.view_layer_id
+    tail_k, tail_score = pool.get_compress_tail_buffers(layer_id)
+    kpool_decode_update_and_maybe_write_cache(
+        buf=pool.get_index_k_buffer(layer_id),
+        tail_k=tail_k,
+        tail_score=tail_score,
+        key=key,
+        slot_score=gate_score,
+        ape=compress_ape,
+        block_tables=metadata.get_page_table_64(),
+        req_pool_indices=forward_batch.req_pool_indices,
+        positions=positions,
+        seq_lens=metadata.get_seqlens_int32(),
+        out_cache_loc=forward_batch.out_cache_loc,
+        pool_size=index_kpool,
+        slots_per_page=pool.index_page_size,
+    )
+
+
+def _compress_write_extend_npu(
+    key: torch.Tensor,
+    gate_score: torch.Tensor,
+    layer_id: int,
+    metadata: AscendDSAIndexerMetadata,
+    compress_ape: torch.Tensor,
+) -> None:
+    from sgl_kernel_npu.operators.mem_cache import (
+        kpool_assemble_softmax_rotate_write_cache,
+        scatter_kpool_tail_updates,
+    )
+
+    pool = get_token_to_kv_pool()
+    kv = pool.layer_router.read(layer_id)
+    pool, layer_id = kv.view, kv.view_layer_id
+    tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
+    plan = metadata.attn_metadata.kpool_extend_plan
+    assert plan is not None, "NPU DSA extend requires kpool_extend_plan"
+
+    # NPU index cache uses BF16, so tail updates cannot reuse the GPU FP8 path.
+    writes, tails = plan.writes, plan.tails
+    if not writes.is_empty:
+        kpool_assemble_softmax_rotate_write_cache(
+            index_k_cache=pool.get_index_k_buffer(layer_id),
+            chunk_k=key,
+            chunk_score=gate_score,
+            tail_k=tail_k_buf,
+            tail_score=tail_score_buf,
+            req_pool_idx=writes.req,
+            n_from_tail=writes.n_from_tail,
+            chunk_src_start=writes.chunk_src,
+            tail_logical_base=writes.tail_logical_base,
+            ape=compress_ape,
+            loc=writes.write_loc,
+        )
+    if not tails.is_empty:
+        scatter_kpool_tail_updates(
+            pool=pool,
+            chunk_k=key,
+            chunk_score=gate_score,
+            tail_k=tail_k_buf,
+            tail_score=tail_score_buf,
+            req_pool_idx=tails.req,
+            dst_logical_start=tails.dst_logical_start,
+            chunk_src_start=tails.chunk_src,
+            n_write=tails.n_write,
+        )

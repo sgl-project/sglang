@@ -282,7 +282,7 @@ def _kpool_cpu_plan(
     return plan
 
 
-def _kpool_plan_to_device(
+def _kpool_plan_to_npu(
     cpu: _KPoolCpuPlan,
     full_real_page_table: torch.Tensor,
     kpool: int,
@@ -644,7 +644,7 @@ def init_kpool_extend_metadata(
             topk_transform_method,
         )
     else:
-        plan = _kpool_plan_to_device(cpu, full_real_page_table, kpool, index_page_size)
+        plan = _kpool_plan_to_npu(cpu, full_real_page_table, kpool, index_page_size)
     return dataclasses.replace(metadata, kpool_extend_plan=plan)
 
 
@@ -883,10 +883,6 @@ def update_kpool_write_plan(
 
     plan = metadata.kpool_write_plan
     assert plan is not None, "kpool_write_plan must be allocated before update"
-    if is_npu():
-        real_page_table = torch.repeat_interleave(
-            real_page_table, num_draft_tokens, dim=0
-        ).contiguous()  # [B,P] -> [B*draft_token, P], expand as required
 
     update_kpool_write_plan_cuda_graph(
         write_start=write_start,

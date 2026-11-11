@@ -1925,205 +1925,36 @@ class IndexerKPool(MultiPlatformOp):
             query[..., : self.rope_head_dim] = q_rope
             key[..., : self.rope_head_dim] = k_rope
 
+        from sglang.srt.hardware_backend.npu.attention.ascend_dsa_backend import (
+            _compress_write_npu,
+            _get_topk_npu,
+        )
+
         # --- Write Phase ---
-        if mode.is_target_verify() or mode.is_draft_extend_v2():
-            self._compress_write_mtp_npu(
-                key, gate_score, forward_batch, layer_id, metadata
-            )
-        elif mode.is_decode_or_idle():
-            self._compress_write_decode_npu(
-                key, gate_score, positions, forward_batch, layer_id, metadata
-            )
-        elif mode.is_extend_without_speculative():
-            self._compress_write_extend_npu(key, gate_score, layer_id, metadata)
-        else:
-            raise NotImplementedError(f"NPU KPool does not support {mode}")
+        _compress_write_npu(
+            key=key,
+            gate_score=gate_score,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            metadata=metadata,
+            compress_ape=self.index_kpool_compress_ape,
+            index_kpool=self.index_kpool,
+        )
 
         if not return_indices:
             return None
 
         # --- Read Phase ---
-        return self._get_topk_npu(
-            layer_id,
-            query,
-            x,
-            positions,
-            metadata,
-        )  # [T, index_topk + index_kpool - 1]
-
-    def _get_topk_npu(
-        self,
-        layer_id,
-        query,
-        x,
-        positions,
-        metadata: BaseIndexerMetadata,
-    ):
-        from sgl_kernel_npu.operators.indexer import (
-            pack_pool_key_indexer_indices,
-            pool_key_indexer,
-            prepare_pool_key_indexer_inputs,
-        )
-
-        # 1. get model weights
+        # Get model weights. Here only apply 1/sqrt(H). PoolKeyIndexer will apply 1/sqrt(D)
         weights, _ = self.weights_proj(x.float())  # [T,H]
-        # Here only apply 1/sqrt(H). PoolKeyIndexer will apply 1/sqrt(D)
         weights = (weights * self.n_heads**-0.5).to(torch.bfloat16).contiguous()
-
-        # 2. get dsa metadata for pooled-key indexer (batch-level)
-        metadata = metadata.attn_metadata
-        if metadata.pool_query_ends is None:
-            raise RuntimeError(
-                "NPU KPool requires request-level pooled-indexer metadata"
-            )
-        # Append one sentinel for pool_key_indexer
-        (
-            query_safe,
-            weights_safe,
-            query_ends_safe,
-            pool_lens_safe,
-            tail_lens_safe,
-            page_table_safe,
-        ) = prepare_pool_key_indexer_inputs(
-            query,
-            weights,
-            metadata.pool_query_ends,
-            metadata.pool_key_lens,
-            metadata.pool_tail_lens,
-            metadata.pool_page_table,
-        )
-
-        pool = get_token_to_kv_pool()
-        kv = pool.layer_router.read(layer_id)
-        pool, layer_id = kv.view, kv.view_layer_id
-        indices = pool_key_indexer(
-            query=query_safe,
-            pool_key=pool.get_index_k_buffer(layer_id),
-            weights=weights_safe,
-            pool_tail_k=tail_lens_safe,
-            actual_seq_q=query_ends_safe,
-            actual_seq_k=pool_lens_safe,
-            block_table=page_table_safe,
-            layout_q="TND",
-            layout_k="PA_BBND",
-            topk=self.index_topk,
-            pool_size=self.index_kpool,
-            mask_mode=3,
-            quant_mode=-1,
-            return_value=False,
-        )  # selected kv token [T+1, index_topk + index_kpool - 1]
-        return pack_pool_key_indexer_indices(
-            indices=indices[: query.shape[0]],
+        return _get_topk_npu(
+            layer_id=layer_id,
+            query=query,
+            weights=weights,
             positions=positions,
-            query_ends=metadata.pool_query_ends,
-            topk=self.index_topk,
-            pool_size=self.index_kpool,
-        )
-
-    def _compress_write_mtp_npu(
-        self,
-        key: torch.Tensor,
-        gate_score: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-        metadata: BaseIndexerMetadata,
-    ) -> None:
-        """Execute compress_write (target_verify / draft_extend_v2)"""
-        from sgl_kernel_npu.operators.mem_cache import (
-            kpool_write_tail_and_maybe_compress,
-        )
-
-        plan = metadata.attn_metadata.kpool_write_plan
-        assert plan is not None, "NPU DSA kpool MTP requires kpool_write_plan"
-
-        pool = get_token_to_kv_pool()
-        kv = pool.layer_router.read(layer_id)
-        pool, layer_id = kv.view, kv.view_layer_id
-        tail_k, tail_score = pool.get_compress_tail_buffers(layer_id)
-        kpool_write_tail_and_maybe_compress(
-            index_k_cache=pool.get_index_k_buffer(layer_id),
-            key=key,
-            score=gate_score,
-            tail_k=tail_k,
-            tail_score=tail_score,
-            ape=self.index_kpool_compress_ape,
-            req_pool_indices=plan.req,
-            write_start=plan.write_start,
-            tail_logical_start=plan.tail_logical_start,
-            write_loc=plan.write_loc,
-            out_cache_loc=forward_batch.out_cache_loc,
-            num_draft_tokens=plan.num_draft_tokens,
-            effective_n_per_batch=plan.effective_n_per_batch,
-        )
-
-    def _compress_write_decode_npu(
-        self, key, gate_score, positions, forward_batch, layer_id, metadata
-    ):
-        """Execute compress_write (decode)"""
-        from sgl_kernel_npu.operators.mem_cache import (
-            kpool_decode_update_and_maybe_write_cache,
-        )
-
-        pool = get_token_to_kv_pool()
-        kv = pool.layer_router.read(layer_id)
-        pool, layer_id = kv.view, kv.view_layer_id
-        tail_k, tail_score = pool.get_compress_tail_buffers(layer_id)
-        kpool_decode_update_and_maybe_write_cache(
-            buf=pool.get_index_k_buffer(layer_id),
-            tail_k=tail_k,
-            tail_score=tail_score,
-            key=key,
-            slot_score=gate_score,
-            ape=self.index_kpool_compress_ape,
-            block_tables=metadata.get_page_table_64(),
-            req_pool_indices=forward_batch.req_pool_indices,
-            positions=positions,
-            seq_lens=metadata.get_seqlens_int32(),
-            out_cache_loc=forward_batch.out_cache_loc,
-            pool_size=self.index_kpool,
-            slots_per_page=pool.index_page_size,
-        )
-
-    def _compress_write_extend_npu(self, key, gate_score, layer_id, metadata):
-        """Execute compress_write (extend)"""
-        pool = get_token_to_kv_pool()
-        kv = pool.layer_router.read(layer_id)
-        pool, layer_id = kv.view, kv.view_layer_id
-        tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
-        plan = metadata.attn_metadata.kpool_extend_plan
-        assert plan is not None, "NPU DSA extend requires kpool_extend_plan"
-
-        # The NPU index cache is BF16, so tail updates cannot reuse the GPU
-        # FP8 scatter implementation.
-        from sgl_kernel_npu.operators.mem_cache import (
-            kpool_assemble_softmax_rotate_write_cache,
-            scatter_kpool_tail_updates,
-        )
-
-        writes, tails = plan.writes, plan.tails
-        if not writes.is_empty:
-            kpool_assemble_softmax_rotate_write_cache(
-                index_k_cache=pool.get_index_k_buffer(layer_id),
-                chunk_k=key,
-                chunk_score=gate_score,
-                tail_k=tail_k_buf,
-                tail_score=tail_score_buf,
-                req_pool_idx=writes.req,
-                n_from_tail=writes.n_from_tail,
-                chunk_src_start=writes.chunk_src,
-                tail_logical_base=writes.tail_logical_base,
-                ape=self.index_kpool_compress_ape,
-                loc=writes.write_loc,
-            )
-        if not tails.is_empty:
-            scatter_kpool_tail_updates(
-                pool=pool,
-                chunk_k=key,
-                chunk_score=gate_score,
-                tail_k=tail_k_buf,
-                tail_score=tail_score_buf,
-                req_pool_idx=tails.req,
-                dst_logical_start=tails.dst_logical_start,
-                chunk_src_start=tails.chunk_src,
-                n_write=tails.n_write,
-            )
+            metadata=metadata,
+            index_topk=self.index_topk,
+            index_kpool=self.index_kpool,
+        )  # [T, index_topk + index_kpool - 1]
