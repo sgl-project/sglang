@@ -445,8 +445,8 @@ def dcp_global_topk(
     every rank in one process). Every rank must call this with the same number
     of rows, also when it has no local keys.
 
-    With ``DcpTopKMerge``, and on ROCm, the result
-    holds only this rank's slots, which is all ``dcp_localize_compact`` keeps.
+    With ``DcpTopKMerge`` the result holds only this rank's slots, which is all
+    ``dcp_localize_compact`` keeps.
     """
     parallel = get_parallel()
     rows = local_lens.shape[0]
@@ -455,12 +455,6 @@ def dcp_global_topk(
     out = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
     if rows == 0:
         return out
-    if get_platform().is_hip:
-        from sglang.srt.layers.attention.dsa import dsa_dcp_sharded_hip
-
-        return dsa_dcp_sharded_hip.dcp_global_topk(
-            logits, local_lens, global_lens, page_table, out, span, all_gather
-        )
     if all_gather is None and _TOPK_MERGE is not None and _TOPK_MERGE.usable(rows):
         candidates = _local_candidates(logits, local_lens, topk)
         _TOPK_MERGE(candidates, global_lens, page_table, out, span)
@@ -687,6 +681,11 @@ def init_dcp_fused_topk(
     """Collective over the DCP group; call on every rank before CUDA graph
     capture. Returns whether decode rows select and merge in one kernel."""
     global _FUSED_TOPK, _FUSED_TOPK_CREATED
+    if get_platform().is_hip:  # ROCm's only DCP top-k, for any context length
+        from sglang.srt.layers.attention.dsa.dsa_dcp_sharded_hip import DcpTopKHip
+
+        _FUSED_TOPK = DcpTopKHip(page_size)
+        return True
     if max_context_len > DCP_FUSED_TOPK_MAX_CONTEXT:
         print_info_once("DSA DCP fused top-k off: it needs context length <= 1M")
         return False

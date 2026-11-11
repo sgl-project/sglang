@@ -968,7 +968,8 @@ class DeepseekSparseAttnBackend(
             assert not get_exec().features.enable_return_indexer_topk
             if not init_dcp_topk_merge(max_rows, self.dsa_index_topk):
                 init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
-            if envs.SGLANG_ENABLE_DSA_DCP_FUSED_TOPK.get():
+            # ROCm's DCP top-k takes the fused top-k's place
+            if envs.SGLANG_ENABLE_DSA_DCP_FUSED_TOPK.get() or _is_hip:
                 init_dcp_fused_topk(
                     max_rows,
                     self.dsa_index_topk,

@@ -2,8 +2,7 @@
 ``dsa_dcp_sharded`` over the group all-gather, without multicast or the v2 plan,
 and the prefill gather of every request's cache rows."""
 
-from functools import partial
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 import triton
@@ -47,6 +46,36 @@ def _local_candidates(
     return out
 
 
+class DcpTopKHip:
+    """ROCm's DCP top-k in ``dsa_dcp_sharded``'s fused top-k slot: local select,
+    exchange and exact merge, then this rank's slots compacted with their counts,
+    as ``DcpFusedTopK`` returns them. Any row count and context length."""
+
+    def __init__(self, page_size: int):
+        self.page_size = page_size
+
+    def usable(self, rows: int) -> bool:
+        return True
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        local_lens: torch.Tensor,
+        global_lens: torch.Tensor,
+        page_table: torch.Tensor,
+        slots: torch.Tensor,
+        out_len: torch.Tensor,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
+            dcp_localize_compact,
+        )
+
+        span = self.page_size * get_parallel().attn_dcp_size
+        global_lens = global_lens.to(torch.int32)
+        dcp_global_topk(logits, local_lens, global_lens, page_table, slots, span)
+        return dcp_localize_compact(slots, out_len)[0]
+
+
 def dcp_global_topk(
     logits: torch.Tensor,
     local_lens: torch.Tensor,
@@ -54,9 +83,9 @@ def dcp_global_topk(
     page_table: torch.Tensor,
     out: torch.Tensor,
     span: int,
-    all_gather: Optional[Callable[[torch.Tensor], torch.Tensor]],
 ) -> torch.Tensor:
-    """``dsa_dcp_sharded.dcp_global_topk`` into ``out`` for its non-empty rows.
+    """``dsa_dcp_sharded.dcp_global_topk`` into ``out`` for non-empty rows; only this
+    rank's slots are set, which is all ``dcp_localize_compact`` keeps.
 
     The global top-k is the top-k of the ranks' local top-k candidates, so it selects
     over those (WORLD * topk per row) instead of a context-wide dense buffer."""
@@ -65,8 +94,6 @@ def dcp_global_topk(
     parallel = get_parallel()
     world = parallel.attn_dcp_size
     rows, topk = out.shape
-    if all_gather is None:
-        all_gather = partial(parallel.dcp_group.all_gather, dim=0)
     if supports_dcp_topk_hip(topk, world):
         # only the scores travel: every rank selects the same winners from them and
         # emits its own, which is all dcp_localize_compact keeps
@@ -74,7 +101,7 @@ def dcp_global_topk(
             logits, local_lens, world=world, rank=parallel.attn_dcp_rank
         )
         return dcp_global_slots_hip(
-            all_gather(scores),
+            parallel.dcp_group.all_gather(scores, dim=0),
             positions,
             global_lens,
             page_table,
@@ -86,7 +113,8 @@ def dcp_global_topk(
     candidates = _local_candidates(logits, local_lens, topk)
     # AITER's custom all-gather takes float dtypes only; the int32 (score bits,
     # position) pairs travel bit-exact as float32, else they would go to RCCL.
-    gathered = all_gather(candidates.view(torch.float32)).view(torch.int32)
+    gathered = parallel.dcp_group.all_gather(candidates.view(torch.float32), dim=0)
+    gathered = gathered.view(torch.int32)
     num_candidates = world * topk
     scores = torch.empty(
         (rows, num_candidates), dtype=torch.float32, device=logits.device
