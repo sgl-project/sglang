@@ -4075,6 +4075,7 @@ dependencies = [
  "flume",
  "futures",
  "http",
+ "http-body",
  "itertools",
  "mime",
  "numpy",
