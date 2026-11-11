@@ -1863,7 +1863,7 @@ def setup_state_kv_args(
         and StateType.DSA in kv_args.state_types
         and isinstance(owner_view, DSATokenToKVPool)
         and owner_view.index_kpool == 1
-        and not getattr(owner_view, "index_k_fp4", False)
+        and not owner_view.index_k_fp4
     ):
         value_bytes = owner_view.index_head_dim
         scale_bytes = owner_view.index_head_dim // owner_view.quant_block_size * 4

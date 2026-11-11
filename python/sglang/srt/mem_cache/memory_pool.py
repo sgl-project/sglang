@@ -5460,6 +5460,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
     # The fp8 index-K layout; __init__ sets the instance value.
     use_fp4_indexer = False
+    index_k_fp4 = False
 
     @staticmethod
     def index_bytes_per_token_for(
