@@ -1578,11 +1578,10 @@ class SchedulerDisaggregationPrefillMixin:
             self.checkpoint_disagg_prefill(req)
 
             if not self.check_bootstrap(req):
-                if is_aborted(req):
-                    # bootstrap failed
-                    self.chunked_reqs._drop_all()
-                elif (
-                    get_disagg().disaggregation_decode_allocation_policy
+                # A failed bootstrap released the request, emptying the slot.
+                if (
+                    not is_aborted(req)
+                    and get_disagg().disaggregation_decode_allocation_policy
                     != "prefill_complete"
                     and self.has_bootstrapped_waiting_req()
                 ):
