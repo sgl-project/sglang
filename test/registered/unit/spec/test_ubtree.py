@@ -383,8 +383,6 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
         self.assertFalse(algo.supports_grammar_overlap())
         self.assertFalse(algo.supports_ragged_verify())
         self.assertFalse(algo.supports_prefill_shared_read_done())
-        self.assertFalse(algo.can_run_cuda_graph(None, is_draft_worker=True))
-        self.assertTrue(algo.can_run_cuda_graph(None, is_draft_worker=False))
         _assert_custom_spec_algo_conforms(CustomSpecAlgo)
 
     def test_invalid_runtime_shapes_are_rejected(self):

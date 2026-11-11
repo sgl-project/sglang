@@ -178,11 +178,6 @@ class SpeculativeAlgorithm(Enum):
             or (self.is_dflash_family() and not self.is_ubtree())
         )
 
-    def can_run_cuda_graph(self, forward_batch, *, is_draft_worker: bool) -> bool:
-        # UBTree owns its segmented draft graph; the ordinary draft decode
-        # runner does not refresh its changing attention metadata.
-        return not (self.is_ubtree() and is_draft_worker)
-
     def create_cuda_graph_verify_input(
         self, *, custom_mask, num_tokens_per_req: int, is_draft_worker: bool
     ):
