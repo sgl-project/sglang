@@ -5,6 +5,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     context as bcg_context,
@@ -31,10 +34,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+class _Batch(SimpleNamespace):
+    """A ForwardBatch stand-in that the eager plan can reference weakly."""
+
+
 @pytest.fixture
 def prefill_graph_flags():
     """The state a prefill breakable-graph break runs under."""
-    static_batch = SimpleNamespace(name="static")
+    static_batch = _Batch(name="static", live_forward_batch=None)
     saved = (
         bcg_context._in_breakable_cuda_graph,
         tc_context._in_tc_piecewise_cuda_graph,
@@ -99,20 +106,29 @@ def _fake_layer(seen, skips_capture_warmup=False):
     return SimpleNamespace(
         _run_self_attn_inner=inner,
         _mla_skips_capture_warmup=skips_capture_warmup,
+        _eager_mla_plan=kimi_k3._EagerMlaPlan(),
     )
+
+
+def test_prefill_cp_keeps_mla_attention_in_the_graph():
+    # Under prefill CP the layer sees CP-local rows and positions, which a
+    # break that attends the unsharded live batch cannot use.
+    breaks = kimi_k3._mla_breaks_under_prefill_graph
+    assert breaks(is_kda_layer=False, attn_cp_size=1)
+    assert not breaks(is_kda_layer=False, attn_cp_size=8)
+    assert not breaks(is_kda_layer=True, attn_cp_size=1)
 
 
 def test_mla_break_runs_live_rows_and_plans_once(prefill_graph_flags, monkeypatch):
     planned = []
-    backend = SimpleNamespace(
-        full_attn_backend=SimpleNamespace(
-            init_forward_metadata=lambda fb: planned.append(
-                (fb, is_in_breakable_cuda_graph())
-            )
+    backend = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+    backend.full_attn_backend = SimpleNamespace(
+        init_forward_metadata=lambda fb: planned.append(
+            (fb, is_in_breakable_cuda_graph())
         )
     )
     monkeypatch.setattr(kimi_k3, "get_attn_backend", lambda: backend)
-    live = SimpleNamespace(positions=torch.arange(3))
+    live = _Batch(positions=torch.arange(3))
     prefill_graph_flags.live_forward_batch = live
     seen = []
     layer = _fake_layer(seen)
@@ -127,6 +143,11 @@ def test_mla_break_runs_live_rows_and_plans_once(prefill_graph_flags, monkeypatc
     assert [s["rows"] for s in seen] == [3, 3]
     assert all(s["batch"] is live and not s["graph"] for s in seen)
     _assert_graph_state(prefill_graph_flags)
+    # The next replay's batch is planned again.
+    next_live = _Batch(positions=torch.arange(2))
+    prefill_graph_flags.live_forward_batch = next_live
+    kimi_k3.KimiK3DecoderLayer._mla_self_attn_eager(layer, hidden, out)
+    assert planned == [(live, False), (next_live, False)]
 
 
 def test_mla_break_without_live_batch_uses_static_batch(
@@ -162,7 +183,7 @@ def test_dsa_dcp_break_skips_capture_warmup(prefill_graph_flags, monkeypatch):
     out = torch.full((4, 2), 3.0)
     kimi_k3.KimiK3DecoderLayer._mla_self_attn_eager(layer, hidden, out)
     assert seen == [] and torch.count_nonzero(out) == 0
-    prefill_graph_flags.live_forward_batch = SimpleNamespace(positions=torch.arange(2))
+    prefill_graph_flags.live_forward_batch = _Batch(positions=torch.arange(2))
     kimi_k3.KimiK3DecoderLayer._mla_self_attn_eager(layer, hidden, out)
     assert [s["rows"] for s in seen] == [2]
     torch.testing.assert_close(out[:2], hidden[:2] * 2)

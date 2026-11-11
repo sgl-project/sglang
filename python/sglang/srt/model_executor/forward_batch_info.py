@@ -719,6 +719,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     engram_history: Optional[torch.Tensor] = None
     engram_staged_rows: Optional[StagedRows] = None
 
+    # Prefill CUDA graph replay only: the unpadded batch behind this static batch.
+    live_forward_batch: Optional[ForwardBatch] = None
+
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None

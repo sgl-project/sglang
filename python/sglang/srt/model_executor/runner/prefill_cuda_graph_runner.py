@@ -339,6 +339,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _dcp_attention_on_live_batch = False
     # Log why a pass that fits a bucket runs eagerly (one rank per group).
     _log_declines = False
+    # Reasons already logged at INFO; repeats go to DEBUG.
+    _logged_decline_reasons: frozenset[str] = frozenset()
     dllm_attention = None
 
     @property
@@ -742,11 +744,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             model_runner.model, "prepare_context_parallel_metadata_for_dcp"
         )
         self._dcp_kv_buffers: Dict[ShapeKey, torch.Tensor] = {}
-        # A model whose attention runs as one eager break on the live batch
-        # (Kimi-K3) gathers the cached prefix as the eager runner does. Replay
-        # gives it the live batch's own gather buffer, so prefix hits replay too.
-        self._dcp_attention_on_live_batch = self._dcp_extend_active and getattr(
-            model_runner.model, "prefill_graph_attention_on_live_batch", False
+        # Attention that runs eagerly on the live batch gathers its cached prefix
+        # into the live batch's own buffer, so prefix hits replay too.
+        self._dcp_attention_on_live_batch = (
+            self._dcp_extend_active
+            and model_runner.model_config.prefill_graph_attention_on_live_batch
         )
         self._log_declines = get_parallel().attn_tp_rank == 0
 
@@ -770,15 +772,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.raw_bs = 0
 
     def _pin_dsa_logits_budget(self, *, before_capture: bool) -> None:
-        """The DSA indexer sizes its logits scratch from free memory at its first
-        measurement, which would otherwise come after the graph pool takes its
-        share. Measure it before capture, take the TP minimum, and after capture
-        keep it within half of the memory left free."""
+        """Measure the DSA logits budget before the graph pool takes its share;
+        after capture, keep it within half of the memory left free."""
+        # dsa_indexer imports this package, so a module-level import would cycle.
+        from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+
         indexer_cls = next(
             (
                 type(indexer)
                 for indexer in self.dsa_indexers or ()
-                if hasattr(indexer, "pin_mqa_logits_budget")
+                if isinstance(indexer, Indexer)
             ),
             None,
         )
@@ -1596,7 +1599,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         num_tokens = len(forward_batch.input_ids)
         # A pass that fits a bucket but runs eagerly: say why.
         if self._log_declines and num_tokens <= self.max_num_tokens:
-            logger.info(
+            first = reason not in self._logged_decline_reasons
+            if first:
+                self._logged_decline_reasons = self._logged_decline_reasons | {reason}
+            logger.log(
+                logging.INFO if first else logging.DEBUG,
                 "Prefill CUDA graph declined: %s (%d tokens, %d requests).",
                 reason,
                 num_tokens,

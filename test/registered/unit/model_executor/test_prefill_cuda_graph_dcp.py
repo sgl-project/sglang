@@ -90,13 +90,16 @@ class TestDcpAdmission(unittest.TestCase):
         self.assertTrue(runner.can_run_graph(fresh))
         self.assertFalse(runner.can_run_graph(prefix_hit))
 
-    def test_declines_that_fit_a_bucket_are_logged_with_a_reason(self):
+    def test_each_decline_reason_is_logged_once_at_info(self):
+        # A reason that repeats every pass must not flood the INFO log.
         runner = _runner(dcp_active=True)
         runner._log_declines = True
         with self.assertLogs(
-            "sglang.srt.model_executor.runner.prefill_cuda_graph_runner", "INFO"
+            "sglang.srt.model_executor.runner.prefill_cuda_graph_runner", "DEBUG"
         ) as logs:
-            self.assertFalse(runner.can_run_graph(_batch(8, [4])))
+            for _ in range(2):
+                self.assertFalse(runner.can_run_graph(_batch(8, [4])))
+        self.assertEqual([r.levelname for r in logs.records], ["INFO", "DEBUG"])
         self.assertIn("declined: DCP prefix hit (8 tokens, 1 requests)", logs.output[0])
 
     def test_prefix_hits_replay_when_attention_reads_the_live_batch(self):

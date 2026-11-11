@@ -1651,14 +1651,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def pin_mqa_logits_budget(
         cls, device_index: int, cpu_group, max_bytes: Optional[int] = None
     ) -> int:
-        """Fix the logits budget for the rest of the process at the smallest
-        one in cpu_group.
-
-        Without max_bytes the budget is measured now (it follows free memory);
-        with max_bytes the pinned budget is only lowered to it. Prefill CUDA
-        graphs pin it before capture, so the graph pool does not shrink it and
-        every rank of the group chunks its rows the same way.
-        """
+        """Pin the logits budget to the cpu_group minimum for the process lifetime.
+        Without max_bytes it is measured now; max_bytes only lowers the pinned one."""
         budget_bytes = cls._mqa_logits_budget_bytes.get(device_index)
         if budget_bytes is None or max_bytes is None:
             budget_bytes = mqa_logits_budget_bytes(
