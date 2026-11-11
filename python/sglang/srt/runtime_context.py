@@ -1021,7 +1021,8 @@ class RuntimeContext:
                 if self._server_args
                 else "cuda"
             )
-            stream = torch.get_device_module(device).Stream()
+            kwargs = forward_helper_stream_kwargs() if device == "cuda" else {}
+            stream = torch.get_device_module(device).Stream(**kwargs)
             self.resources.streams[name] = stream
         return stream
 
@@ -1666,6 +1667,18 @@ def assert_published(server_args, *, role: str) -> RuntimeContext:
 def publish_role() -> str | None:
     """The role recorded by the last ``publish`` (None for a legacy set)."""
     return _CONTEXT._publish_role
+
+
+def forward_helper_stream_kwargs() -> Dict[str, int]:
+    """Stream() kwargs of the forward path's helper streams (named streams, the graph
+    capture stream, HC gate, PLE prefetch): SGLANG_FORWARD_HELPER_STREAM_PRIORITY under
+    the runtime master, else none (torch's default priority)."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return {}
+    priority = envs.SGLANG_FORWARD_HELPER_STREAM_PRIORITY.get()
+    return {} if priority is None else {"priority": priority}
 
 
 def get_stream(name: str) -> Any:

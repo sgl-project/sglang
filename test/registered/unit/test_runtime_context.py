@@ -15,7 +15,7 @@ import types
 import unittest
 import warnings
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import msgspec
 import msgspec.structs
@@ -38,12 +38,15 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.overrides import (
     resolution_result,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     ParallelContext,
+    RuntimeContext,
     SpawnRanks,
     _FlagGroupBase,
     assert_published,
     derive_parallel_widths,
+    forward_helper_stream_kwargs,
     get_context,
     get_device,
     get_exec,
@@ -3141,6 +3144,44 @@ class TestNothingReadsThePlacementBeforeItIsFrozen(CustomTestCase):
             "ask get_parallel() there, or move the call after the freeze:\n  "
             + "\n  ".join(offenders),
         )
+
+
+class TestForwardHelperStreamPriority(CustomTestCase):
+    def test_priority_applies_only_under_the_runtime_master(self):
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        priority = envs.SGLANG_FORWARD_HELPER_STREAM_PRIORITY
+        for master_on, value, expected in (
+            (False, "-1", {}),
+            (True, None, {}),
+            (True, "-1", {"priority": -1}),
+        ):
+            with (
+                self.subTest(master=master_on, value=value),
+                master.override(master_on),
+                priority.override(value),
+            ):
+                self.assertEqual(forward_helper_stream_kwargs(), expected)
+
+    def test_named_streams_take_the_helper_priority_on_cuda_only(self):
+        for device, kwargs in (("cuda", {"priority": -1}), ("npu", {})):
+            module = SimpleNamespace(Stream=Mock())
+            context = RuntimeContext(parallel=ParallelContext())
+            with (
+                self.subTest(device=device),
+                patch(
+                    "sglang.srt.arg_groups.overrides.resolution_result",
+                    return_value=device,
+                ),
+                patch("torch.get_device_module", return_value=module),
+                patch(
+                    "sglang.srt.runtime_context.forward_helper_stream_kwargs",
+                    return_value={"priority": -1},
+                ),
+            ):
+                context._server_args = object()
+                stream = context.get_stream("graph_capture")
+                self.assertIs(context.get_stream("graph_capture"), stream)
+            module.Stream.assert_called_once_with(**kwargs)
 
 
 if __name__ == "__main__":

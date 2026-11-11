@@ -402,6 +402,10 @@ class Envs:
     SGLANG_OPT_CUDA_GRAPH_FILL_PLAN = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # With SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION: priority of the forward path's helper
+    # streams (named streams incl. the graph capture stream, HC gate, PLE prefetch); None
+    # keeps torch's default. Lower is higher.
+    SGLANG_FORWARD_HELPER_STREAM_PRIORITY = EnvInt(None)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
