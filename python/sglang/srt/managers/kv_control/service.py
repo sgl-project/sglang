@@ -80,7 +80,6 @@ def runtime_config():
         get_disagg,
         get_memory,
         get_parallel,
-        get_schedule,
         get_spec,
     )
 
@@ -106,10 +105,6 @@ def runtime_config():
             "KV control does not support speculative decoding or PD disaggregation"
         )
     memory = get_memory()
-    if memory.enable_hierarchical_cache and not get_schedule().disable_overlap_schedule:
-        raise ValueError(
-            "Native host transfers currently require --disable-overlap-schedule"
-        )
     if (
         memory.disable_radix_cache
         or memory.radix_cache_backend

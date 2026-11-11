@@ -18,7 +18,7 @@ and protection state before treating a receipt as proof of readiness.
 
 ```bash
 python -m sglang.launch_server --model-path MODEL_PATH \
-  --enable-hierarchical-cache --disable-overlap-schedule \
+  --enable-hierarchical-cache \
   --hicache-storage-backend mooncake \
   --kv-control-config '{"namespace":"model-weights-v1","engine_id":"worker-a"}'
 ```

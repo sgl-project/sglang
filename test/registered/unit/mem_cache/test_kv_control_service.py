@@ -67,11 +67,29 @@ insert, match_len, target = (
 
 
 class TestKVControlService(cache_fixtures.KVCacheTestCase):
+    def test_hicache_runtime_profile_accepts_both_scheduler_modes(self):
+        for disabled in (False, True):
+            with self.subTest(disable_overlap_schedule=disabled):
+                with get_context().override_server_args(
+                    kv_control_config={"namespace": "ns"},
+                    enable_hierarchical_cache=True,
+                    disable_overlap_schedule=disabled,
+                ):
+                    self.assertEqual(runtime_config().namespace, "ns")
+
     def test_runtime_profile_rejects_unsupported_config(self):
-        for fields in [{"tp_size": 2}, {"disable_radix_cache": True}]:
+        for fields in [
+            {"tp_size": 2},
+            {"pp_size": 2},
+            {"disable_radix_cache": True},
+            {"enable_lmcache": True},
+        ]:
             with self.subTest(fields=fields):
                 with get_context().override_server_args(
-                    kv_control_config={"namespace": "ns"}, **fields
+                    kv_control_config={"namespace": "ns"},
+                    enable_hierarchical_cache=True,
+                    disable_overlap_schedule=False,
+                    **fields,
                 ):
                     with pytest.raises(ValueError):
                         runtime_config()
