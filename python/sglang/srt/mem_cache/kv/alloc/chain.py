@@ -3,15 +3,16 @@
 Every sub-pool is a band allocator, an end or a float of the chain. The owner
 band mints the virtual token ids; a window band binds the owner's virtual
 pages; a state band hands out per-request slots. Every lifecycle call (frees,
-groups, events, pins, flushes, verification) is one loop over the bands.
-What still differs between chain shapes is the interim capacity policy in
-`interim.py`, chosen from the band geometry.
+groups, events, pins, flushes, verification) is one loop over the bands, and
+every capacity question is one layout search over them, whatever the chain's
+shape.
 """
 
 from __future__ import annotations
 
 import functools
 import logging
+import math
 from contextlib import contextmanager
 from typing import (
     Any,
@@ -35,38 +36,68 @@ from sglang.kernels.ops.memory.allocator import (
 )
 from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.capacity import observe_only_read
 from sglang.srt.mem_cache.kv.alloc.band import (
     Band,
     FloatBand,
     allocator_operation,
     chain_byte_accounting_violations,
     flush_deferred_free_group,
-    full_tokens_before_mamba_recheck,
-    relieve_for_alloc,
     settle_pending_for_recovery,
+)
+from sglang.srt.mem_cache.kv.alloc.demand import (
+    DemandPurpose,
+    KVDemand,
+    demand_inputs,
+    smallest_admissible_chunk,
 )
 from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardSteps
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
-from sglang.srt.mem_cache.kv.alloc.interim import (
-    ChainAdmissionRules,
-    interim_policy_for,
-)
 from sglang.srt.mem_cache.kv.alloc.invariants import (
     WINDOW_SEGMENT_BOUND,
     WINDOW_SEGMENT_RELEASED,
 )
 from sglang.srt.mem_cache.kv.alloc.page_usage import Consumer
 from sglang.srt.mem_cache.kv.alloc.pricing import (
+    NO_MOVE,
     ChainSnapshot,
-    no_relief_plan,
+    TakePlan,
+    feasible,
+    first_plan,
+    move_order,
+)
+from sglang.srt.mem_cache.kv.alloc.pricing import plan as plan_layout
+from sglang.srt.mem_cache.kv.alloc.pricing import (
+    reclaimed_snapshot,
     snapshot_chain,
+)
+from sglang.srt.mem_cache.kv.alloc.signals import NetworkWaiter
+from sglang.srt.mem_cache.kv.alloc.stage_capacity import (
+    StageCapacity,
+    StageGeometry,
+    check_stage_pools,
+    simulated_snapshot,
+    stage_geometry,
 )
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.invariants import expect, resolve_level
 
+# Rows an unreleased network transfer touches, fixed for one relief.
+_NETWORK_ROWS = "network-rows"
+
+# A band's growth average keeps 1 - 1/_GROWTH_DECAY of itself per take, in
+# units of 1/_GROWTH_SCALE page.
+_GROWTH_DECAY = 16
+_GROWTH_SCALE = 64
+
 logger = logging.getLogger(__name__)
+
+
+def _units_key(demands: Mapping[str, int]) -> Tuple[Tuple[str, int], ...]:
+    """A demand of units per band as a question pipeline stages compare."""
+    return tuple(sorted(demands.items()))
 
 
 def _one_operation(method):
@@ -94,13 +125,19 @@ class _ScopedPhysicalTakes:
 
     def __init__(self, allocator, demands):
         self.allocator = allocator
-        self.demands = dict(demands)
-        snapshot = allocator.pricing_snapshot()
-        self.initial_live = {band.name: band.live for band in snapshot.bands}
-        if no_relief_plan(snapshot, tuple(self.demands.items())) is None:
+        self.demands = {name: n for name, n in demands.items() if n > 0}
+        # Make the rearrangement this reservation needs before any take is
+        # issued, so the takes then fit in place, in whatever order they come.
+        # Under pipeline stages, which decide on snapshots that fix no page, none is
+        # fixed here: a host load's reservation ends inside the scope that took it.
+        if not allocator.lay_out_for(self.demands):
             raise RuntimeError(
                 "physical reservation needs reclamation before its scope"
             )
+        snapshot = allocator.pricing_snapshot()
+        if allocator.plan_in_place(self.demands) is None:
+            raise RuntimeError("a realized layout does not hold its reservation")
+        self.initial_live = {band.name: band.live for band in snapshot.bands}
         self.applying = False
 
     @_one_operation
@@ -111,17 +148,22 @@ class _ScopedPhysicalTakes:
             - (current.live - self.initial_live[current.name])
             for current in snapshot.bands
         }
-        if pages > remaining[band.sub_pool_name]:
+        if pages > remaining[band.sub_pool_name] or any(
+            n < 0 for n in remaining.values()
+        ):
             return None
-        plan = no_relief_plan(snapshot, tuple(remaining.items()))
-        if plan is None:
-            return None
-        take = plan.takes[band.sub_pool_name].prefix(
-            pages, page_bytes=band.entry_bytes_per_page
+        # Planned again from the current layout: the takes so far consumed
+        # prefixes of earlier plans, so the rest still fits in place.
+        layout = self.allocator.plan_in_place(
+            {name: n for name, n in remaining.items() if n > 0}
         )
+        if layout is None:
+            return None
         self.applying = True
         try:
-            return band.take_planned_physical_pages(take, consumer)
+            return band.take_planned_pages(
+                layout.takes[band.sub_pool_name].prefix(pages), consumer
+            )
         finally:
             self.applying = False
 
@@ -160,18 +202,19 @@ def take_new_pages(
     *,
     copy_new_pages: bool,
     physical_pages: Optional[torch.Tensor] = None,
+    consumer: Consumer = Consumer.FORWARD,
 ) -> Optional[torch.Tensor]:
     """Fill tail pages before taking new virtual pages for each request.
 
     Bind every new page in the owner band before translating its token ids;
-    otherwise its v2p entry remains -1.
-    """
+    otherwise its v2p entry remains -1. ``consumer``: who writes the new
+    pages first (`Band.acquire`)."""
     if num_new_pages > len(owner.free_virtual_ids):
         return None
-    # Physical-capacity pre-check; on shortfall run the relief ladder.
+    # Physical-capacity pre-check; on shortfall the chain lays itself out.
     need_tokens = num_new_pages * owner.page_size
     if physical_pages is None and need_tokens > owner.available_size():
-        if not relieve_for_alloc(owner, need_tokens):
+        if not owner.relieve(need_tokens):
             return None
     # The free list is only rebound, not mutated in place, so its consumed
     # prefix still names the pages the kernel takes.
@@ -183,7 +226,7 @@ def take_new_pages(
     out_indices = page_tokens(owner.free_virtual_ids)
     if new_virtual_pages is not None:
         if physical_pages is None:
-            if owner.place_pages(new_virtual_pages, num_new_pages) is None:
+            if owner.place_pages(new_virtual_pages, num_new_pages, consumer) is None:
                 return None
         else:
             owner.ids.bind(new_virtual_pages, physical_pages)
@@ -197,12 +240,32 @@ def take_new_pages(
 class ChainAllocator(BaseTokenToKVPoolAllocator):
     """Token, window and state allocation over one shared byte buffer."""
 
-    hands_out_virtual_ids = True
+    # Every sub-pool takes its rows from one shared arena.
+    pools_share_memory = True
 
-    # Base init writes `self.size`; capacity is computed by the chain's policy.
+    hands_out_virtual_ids = True
+    # State slots acquire allocates for a fresh request (its working slot and
+    # initial tracking slots); the storage binds it from the state policy.
+    fresh_request_state_slots = 1
+    # Bound at construction: the sizing plan, the request rows' memory, and
+    # (once the storage binds them) each window's retained tail by sub-pool.
+    plan = None
+    request_memory = None
+    retained_windows: Optional[Dict[str, int]] = None
+    # Under pipeline parallelism, every stage's geometry, which every capacity
+    # question is asked of (`install_stage_capacity`); None on a single stage.
+    stage_capacity: Optional[StageCapacity] = None
+    # Every stage's simulated snapshot, kept until the capacity epoch moves.
+    _stage_memo: Tuple[Optional[int], Tuple[ChainSnapshot, ...]] = (None, ())
+
+    # Base init writes `self.size`; the chain computes its capacity.
     @property
     def size(self) -> int:
-        return self._policy.size(self)
+        """Token capacity for observers: held plus `available_size` with no window
+        (the leak census's available term cancels), else the smaller side share."""
+        if not self._windows:
+            return self.available_size() + self.full_attn_allocator.allocated_count()
+        return min(self._size_full, self._size_swa)
 
     @size.setter
     def size(self, value) -> None:
@@ -305,18 +368,19 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self.forward_steps: Optional[ForwardSteps] = (
             ForwardSteps(self.members) if lazy_compaction else None
         )
+        for band in self.members:
+            band.chain_allocator = self
         by_name = {band.sub_pool_name: band for band in self.members}
         self.bands = tuple(by_name[band.name] for band in arena.bands)
         _wire_chain(self.bands)
         self._band_positions = {b.sub_pool_name: i for i, b in enumerate(self.bands)}
+        # Moving average of each band's growth past its holes, `_GROWTH_SCALE`
+        # per page; read from the plans alone, so every rank keeps the same one.
+        self._growth: Dict[str, int] = {b.sub_pool_name: 0 for b in self.bands}
         self._snapshot_key: Optional[int] = None
         self._snapshot_memo: Optional[ChainSnapshot] = None
         self._window_capacity_from_sizing = full_max_total_num_tokens is not None
-        self._policy = interim_policy_for(
-            self,
-            full_max_total_num_tokens=full_max_total_num_tokens,
-            swa_max_total_num_tokens=swa_max_total_num_tokens,
-        )
+        self._set_token_shares(full_max_total_num_tokens, swa_max_total_num_tokens)
 
         if self.swa_attn_allocator is not None:
             self._size_window_host_pools()
@@ -324,20 +388,61 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self.free_page_reps_group: Optional[List[torch.Tensor]] = None
         self.full_page_reps_group: List[torch.Tensor] = []
         self.full_free_group: List[torch.Tensor] = []
-        if self._policy.keeps_leak_census:
+        if self._keeps_leak_census():
             # Empty (not None) for the leak checker.
             self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
             self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
 
         logger.info(
-            "[unified-memory-pool] ChainAllocator ready (%s): %s, joint available=%d",
-            self._policy.unit_name,
+            "[unified-memory-pool] ChainAllocator ready: %s, joint available=%d",
             ", ".join(
                 f"{b.sub_pool_name}({b.grow_direction}) max_slots={b.max_slots} "
                 f"entry_bytes={b.entry_bytes}"
                 for b in self.bands
             ),
             self.available_size(),
+        )
+
+    def _set_token_shares(
+        self,
+        full_max_total_num_tokens: Optional[int],
+        swa_max_total_num_tokens: Optional[int],
+    ) -> None:
+        """Each side's nominal token share: the sizing's rows per rank in logical
+        tokens, else the empty pool's; without a window, the owner's id space."""
+        owner, window = self.full_attn_allocator, self.swa_attn_allocator
+        if window is None:
+            # A logical token capacity, widened like `size`, not a row count.
+            self._size_full = (owner.max_slots - 1) * get_parallel().attn_dcp_size
+            self._size_swa = 0
+            return
+        if (full_max_total_num_tokens is None) != (swa_max_total_num_tokens is None):
+            raise ValueError(
+                "full_max_total_num_tokens and swa_max_total_num_tokens must "
+                "either both be set or both be omitted"
+            )
+        if full_max_total_num_tokens is not None:
+            self._size_full = (
+                int(full_max_total_num_tokens) * owner.page_size // owner.pool_page_size
+            )
+            self._size_swa = (
+                int(swa_max_total_num_tokens)
+                * window.page_size
+                // window.pool_page_size
+            )
+        else:
+            self._size_full = owner.available_size()
+            self._size_swa = min(
+                window.available_size(), len(owner.free_virtual_ids) * self.page_size
+            )
+
+    def _keeps_leak_census(self) -> bool:
+        """Whether the leak checker's census applies: not where it would mix
+        physical and virtual ids (a float, a state end, several windows)."""
+        return (
+            self.mamba_allocator is None
+            and len(self._windows) <= 1
+            and not any(band.grow_direction == "float" for band in self.bands)
         )
 
     def _size_window_host_pools(self) -> None:
@@ -359,23 +464,20 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def _windows(self) -> Tuple[Band, ...]:
         return tuple(self.window_allocators.values())
 
-    # -- capacity views (the interim policy of the chain's shape) --
+    # -- the pricing snapshot --
 
     def _snapshot_key_now(self) -> int:
-        """The chain's capacity epoch and, per band, its compaction mode and
-        whether a pin source is busy: neither is a capacity field. A band's
-        blocked bit is its load pin, a capacity field, or a busy pin source;
-        sources are callables, so the epoch alone misses a flip."""
+        """The chain's capacity epoch and, per band, its compaction mode, which
+        is not a capacity field."""
         epoch = bits = 0
         for band in self.bands:
             epoch += band._capacity_epoch
-            pinned = band.pinned_by_source()
-            bits = (bits << 2) | (2 if band.lazy_compaction else 0) | pinned
-        return (epoch << (2 * len(self.bands))) | bits
+            bits = (bits << 1) | bool(band.lazy_compaction)
+        return (epoch << len(self.bands)) | bits
 
     def pricing_snapshot(self) -> ChainSnapshot:
         """The bands' snapshot every capacity decision prices on, kept until
-        the epoch moves or a pin source's answer changes."""
+        the epoch moves."""
         key = self._snapshot_key_now()
         if key != self._snapshot_key:
             self._snapshot_memo = snapshot_chain(
@@ -386,6 +488,42 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             )
             self._snapshot_key = key
         return self._snapshot_memo
+
+    def network_held_bytes(self) -> Tuple[Tuple[int, int], ...]:
+        """Merged byte ranges outside the bands that unreleased network sends
+        still read (a last-resort move's fences); no device read, alike on every
+        rank."""
+        ranges = sorted(
+            (use.lo, use.hi)
+            for band in self.bands
+            if band.usage.has_fences()
+            for use in band.usage.network_fences()
+        )
+        merged: List[Tuple[int, int]] = []
+        for lo, hi in ranges:
+            if merged and lo <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+            else:
+                merged.append((lo, hi))
+        return tuple(merged)
+
+    def held_snapshot(self) -> ChainSnapshot:
+        """The pricing snapshot with `network_held_bytes` held, so a realization
+        first tries the layouts in which no take waits for a send."""
+        snapshot = self.pricing_snapshot()
+        held = self.network_held_bytes()
+        if not held:
+            return snapshot
+        return msgspec.structs.replace(snapshot, held=held)
+
+    def plan_in_place(self, demands: Dict[str, int]) -> Optional[TakePlan]:
+        """Takes that fit where the bands stand: around send-held bytes when that
+        serves, else through them (such a take waits on the host for the send)."""
+        held = self.held_snapshot()
+        found = plan_layout(held, demands, NO_MOVE)
+        if found is None and held.held:
+            found = plan_layout(self.pricing_snapshot(), demands, NO_MOVE)
+        return found
 
     def _snapshot_memo_violations(self) -> List[str]:
         """Idle-time check: a kept snapshot that differs from a fresh one means a
@@ -404,55 +542,277 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def _cap_full_available(self, tokens):
         return self.full_attn_allocator.cap_available(tokens)
 
+    # -- pipeline stages --
+    #
+    # Every stage holds the same units in its own arena and asks each capacity
+    # question of every stage's simulated snapshot, so every stage decides alike.
+
+    def stage_geometry(self) -> StageGeometry:
+        """This stage's arena bytes and bands, as every stage prices them."""
+        id_owners = tuple(
+            band.sub_pool_name
+            for band in (self.full_attn_allocator, self.mamba_allocator)
+            if band is not None
+        )
+        return stage_geometry(
+            self.pricing_snapshot(),
+            id_owners=id_owners,
+            window_tokens=self._size_swa,
+        )
+
+    def _stage_pools(self) -> Tuple[Tuple[str, ...], int]:
+        return tuple(sorted(band.sub_pool_name for band in self.bands)), self.page_size
+
+    def agree_on_stage_shares(self, group) -> None:
+        """Every stage in ``group`` joins, whatever its bands: all must plan the same
+        sub-pools, then with a window each keeps the smallest FULL and window shares,
+        so request limits and the HiCache host pools sized from them agree."""
+        every = [None] * torch.distributed.get_world_size(group)
+        torch.distributed.all_gather_object(
+            every,
+            (self._stage_pools(), self._size_full, self._size_swa),
+            group=group,
+        )
+        check_stage_pools([pools for pools, _, _ in every])
+        if self._windows:
+            self._size_full = min(full for _, full, _ in every)
+            self._size_swa = min(window for _, _, window in every)
+            self._size_window_host_pools()
+
+    def install_stage_capacity(
+        self,
+        stage: int,
+        geometries: Sequence[StageGeometry],
+        *,
+        checks: bool = False,
+    ) -> None:
+        """Answer capacity questions as stage ``stage`` of ``geometries`` (stage order),
+        asking every stage; each keeps the smallest nominal window share."""
+        if geometries[stage] != self.stage_geometry():
+            raise ValueError(f"stage {stage}'s geometry is not this chain's")
+        check_stage_pools([(g.sub_pools(), g.page_size) for g in geometries])
+        if self._windows:
+            self._size_swa = min(geometry.window_tokens for geometry in geometries)
+        self.stage_capacity = StageCapacity(stage, geometries, checks=checks)
+        self._stage_memo = (None, ())
+
+    def _logical_counts(self) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """Live pages per band, and virtual pages in use per id owner: what
+        every stage holds alike."""
+        live = {
+            band.sub_pool_name: band.allocated_count() // band.page_size
+            for band in self.bands
+        }
+        used = {
+            band.sub_pool_name: band.ids.num_virtual_ids
+            - band.min_page_index
+            - len(band.free_virtual_ids)
+            for band in (self.full_attn_allocator, self.mamba_allocator)
+            if band is not None
+        }
+        return live, used
+
+    def _stage_snapshots(self) -> Tuple[ChainSnapshot, ...]:
+        """The snapshots each capacity question is asked of: the pricing snapshot on a
+        single stage, else every stage's simulated snapshot, in stage order."""
+        capacity = self.stage_capacity
+        if capacity is None:
+            return (self.pricing_snapshot(),)
+        key = self._snapshot_key_now()
+        if self._stage_memo[0] != key:
+            live, used = self._logical_counts()
+            self._stage_memo = (
+                key,
+                tuple(
+                    simulated_snapshot(geometry, live, used)
+                    for geometry in capacity.geometries
+                ),
+            )
+        return self._stage_memo[1]
+
+    def _ask(
+        self,
+        op: str,
+        key: Callable[[], Any],
+        on_stage: Callable[[ChainSnapshot], Any],
+        combine: Callable = all,
+    ):
+        """Question ``(op, key())`` answered by ``on_stage`` on the pricing snapshot,
+        or under pipeline stages ``combine`` of its answers on every stage's
+        snapshot; ``key`` is built only for the stages' digest."""
+        capacity = self.stage_capacity
+        if capacity is None:
+            return on_stage(self.pricing_snapshot())
+        answer = combine(on_stage(s) for s in self._stage_snapshots())
+        if capacity.checks:
+            capacity.note(op, key(), answer)
+        return answer
+
+    def _decided_take(self, demands: Dict[str, int]) -> Optional[bool]:
+        """Whether a take of ``demands`` (units per band) succeeds on every pipeline
+        stage; None on a single stage, where the take itself decides."""
+        if self.stage_capacity is None:
+            return None
+        demands = {n: d for n, d in demands.items() if d > 0}
+        return self._ask(
+            "take",
+            lambda: _units_key(demands),
+            lambda s: self._units_fit_on(s, demands),
+        )
+
+    def _refused_decided_take(self, decided: Optional[bool], demands) -> None:
+        # The only fixed pages under pipeline stages are a host load's reservation,
+        # held only inside its own scope, which laid out every take of that load.
+        if decided:
+            raise RuntimeError(
+                f"this pipeline stage cannot take {demands}, which every "
+                "stage decided it takes"
+            )
+
+    def stage_counts(self) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """The units every stage holds alike (`_logical_counts`)."""
+        return self._logical_counts()
+
+    # -- capacity questions --
+    #
+    # Sub-pools share bytes and demands mix per-token and per-request units, so
+    # decisions ask the demand itself; the scalar reads below are observer estimates.
+
+    def units_fit(self, demands: Dict[str, int]) -> bool:
+        """Whether a take of these units (pages of a token sub-pool, slots of the
+        state sub-pool) succeeds now by the take's own checks, on every PP stage."""
+        return self._ask(
+            "units_fit",
+            lambda: _units_key(demands),
+            lambda snapshot: self._units_fit_on(snapshot, demands),
+        )
+
+    def _units_fit_on(self, snapshot: ChainSnapshot, demands: Dict[str, int]) -> bool:
+        owner = snapshot.band(self.full_attn_allocator.sub_pool_name)
+        owner_pages = demands.get(owner.name, 0)
+        if owner_pages > owner.free_virtual_pages:
+            return False
+        if self._full_cap_reclaim(owner_pages * self.page_size):
+            return False
+        # A window binds the owner's virtual pages: it can never hold more.
+        bound = owner.num_virtual_pages - owner.min_page
+        if any(demands.get(w.sub_pool_name, 0) > bound for w in self._windows):
+            return False
+        state = self.mamba_allocator
+        if (
+            state is not None
+            and demands.get(state.sub_pool_name, 0)
+            > snapshot.band(state.sub_pool_name).free_virtual_pages
+        ):
+            return False
+        return feasible(snapshot, {n: d for n, d in demands.items() if d > 0})
+
+    def _estimated_pages(self, names: Tuple[str, ...]) -> int:
+        """Pages each of ``names`` could take together by free bytes, index space, id
+        room and FULL cap; it ignores alignment, fixed and pending pages, so may err."""
+        # The least over every stage's simulated snapshot, so every stage agrees.
+        return min(
+            self._estimated_pages_on(snapshot, names)
+            for snapshot in self._stage_snapshots()
+        )
+
+    def _estimated_pages_on(
+        self, snapshot: ChainSnapshot, names: Tuple[str, ...]
+    ) -> int:
+        owner_name = self.full_attn_allocator.sub_pool_name
+        owner_snap = snapshot.band(owner_name)
+        # Every band's first page lies past the padding sink.
+        sink = min(b.min_page * b.page_bytes for b in snapshot.bands)
+        free_bytes = (
+            snapshot.total_bytes
+            - sink
+            - sum(b.live * b.page_bytes for b in snapshot.bands)
+        )
+        named = [snapshot.bands[snapshot.index(name)] for name in names]
+        pages = max(0, free_bytes) // sum(b.page_bytes for b in named)
+        for b in named:
+            # Its id owner's room: an owner's own free ids; a window binds
+            # the token owner's.
+            if b.name in self.window_pool_names():
+                id_room = owner_snap.num_virtual_pages - owner_snap.min_page
+            else:
+                id_room = b.free_virtual_pages
+            pages = min(pages, b.num_pages - b.min_page - b.live, id_room)
+        owner = self.full_attn_allocator
+        if owner.sub_pool_name in names and owner.max_live_tokens is not None:
+            room = max(0, owner.max_live_tokens - owner.allocated_count())
+            pages = min(pages, room // self.page_size)
+        return max(0, pages)
+
+    def estimated_units_available(self, sub_pool: str) -> int:
+        """An estimate of what ``sub_pool`` alone could still take, in tokens (slots for
+        state), for observers; reading it inside a capacity decision is a violation."""
+        observe_only_read("ChainAllocator.estimated_units_available")
+        band = self.bands[self._band_positions[sub_pool]]
+        pages = self._estimated_pages((sub_pool,))
+        return pages if band is self.mamba_allocator else pages * self.page_size
+
+    def state_slots_fit(self, count: int) -> bool:
+        """Whether ``count`` state slots can be taken now."""
+        return count <= 0 or self.units_fit({self.mamba_allocator.sub_pool_name: count})
+
+    def estimated_state_slots_available(self) -> int:
+        """`estimated_units_available` of the state sub-pool: observers only."""
+        return self.estimated_units_available(self.mamba_allocator.sub_pool_name)
+
+    def held_units(self, sub_pool: str) -> int:
+        """Units sub-pool ``sub_pool`` holds now: tokens (slots for state)."""
+        return self.bands[self._band_positions[sub_pool]].allocated_count()
+
+    # The scalar reads the shared allocator interface requires: estimates
+    # (`estimated_units_available`), never for decisions.
+
     def available_size(self) -> int:
-        return self._cap_full_available(self._policy.available_size(self))
+        """An estimate of the tokens one more token allocation could take, the owner
+        and every window taking each token together. Observers only."""
+        observe_only_read("ChainAllocator.available_size")
+        names = tuple(
+            b.sub_pool_name for b in (self.full_attn_allocator, *self._windows)
+        )
+        return self._estimated_pages(names) * self.page_size
+
+    def owner_available_size(self):
+        """An estimate of the token sub-pool's availability. Observers only."""
+        return self.full_available_size()
 
     def full_available_size(self) -> int:
-        return self._cap_full_available(self._policy.full_available_size(self))
+        return self.estimated_units_available(self.full_attn_allocator.sub_pool_name)
 
     def swa_available_size(self) -> int:
-        return self._policy.swa_available_size(self)
-
-    def window_pool_names(self) -> Tuple[str, ...]:
-        return tuple(window.sub_pool_name for window in self._windows)
+        if self.swa_attn_allocator is None:
+            raise AttributeError("a chain without a window has no window tokens")
+        return self.estimated_units_available(self.swa_attn_allocator.sub_pool_name)
 
     def window_available_size(self, sub_pool: str) -> int:
-        """What a take from window sub-pool ``sub_pool`` can serve now: the
-        target window's as the chain's policy answers it, another window's
-        from its own band."""
+        """An estimate of window sub-pool ``sub_pool``'s availability."""
         if sub_pool not in self.window_pool_names():
             raise KeyError(f"no window sub-pool {sub_pool!r}")
-        if sub_pool == self.roles.window:
-            return self.swa_available_size()
-        return self.window_allocators[sub_pool].schedulable_available_size()
+        return self.estimated_units_available(sub_pool)
 
     def conserve_full_available_size(self) -> int:
-        return self._policy.conserve_full_available_size(self)
+        """The sizing's nominal owner share minus the owner tokens held: the
+        static split, not what a take can serve."""
+        return self._size_full - self.full_attn_allocator.allocated_count()
 
     def conserve_swa_available_size(self) -> int:
-        return self._policy.conserve_swa_available_size(self)
-
-    def schedulable_full_available_size(self) -> int:
-        return self.full_attn_allocator.schedulable_available_size()
-
-    def schedulable_swa_available_size(self) -> int:
-        return self.swa_attn_allocator.schedulable_available_size()
-
-    @property
-    def current_full_capacity(self) -> int:
-        return self._policy.current_full_capacity(self)
-
-    @property
-    def current_swa_capacity(self) -> int:
-        return self._policy.current_swa_capacity(self)
+        """The sizing's nominal window share minus the window tokens held."""
+        return self._size_swa - self.swa_attn_allocator.allocated_count()
 
     @property
     def size_full(self) -> int:
-        return self._policy.size_full(self)
+        cap = self.full_attn_allocator.max_live_tokens
+        if cap is None or not self._windows:
+            return self._size_full
+        return min(self._size_full, cap)
 
     @property
     def size_swa(self) -> int:
-        return self._policy.size_swa(self)
+        return self._size_swa
 
     @property
     def draft_virtual_id_space(self) -> int:
@@ -471,91 +831,353 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             * self.page_size
         )
 
-    def ensure_capacity(self, full_tokens: int, swa_tokens: int, **kwargs) -> bool:
-        if self._full_cap_reclaim(full_tokens):
-            return False
-        return self._policy.ensure_capacity(self, full_tokens, swa_tokens, **kwargs)
+    def owner_tokens_only_owner_frees_serve(self, owner_pages: int) -> int:
+        """Of a take of ``owner_pages`` owner pages, the tokens only freeing owner
+        tokens makes room for (past the FULL live-token cap or the owner's free ids,
+        the most over PP stages), so an eviction can count them before it walks."""
+        owner = self.full_attn_allocator.sub_pool_name
 
-    def prefill_state_fits(self, full_tokens, swa_tokens, state_slots, **kwargs):
-        """Check native state demand without charging it to the FULL-token cap."""
-        if self._full_cap_reclaim(full_tokens, empty_pool=True):
-            return False
-        if self._full_cap_reclaim(full_tokens) > kwargs.get("full_evictable_tokens", 0):
-            return False
-        return self._policy.prefill_state_fits(
-            self, full_tokens, swa_tokens, state_slots, **kwargs
+        def on_stage(snapshot: ChainSnapshot) -> int:
+            short_ids = max(0, owner_pages - snapshot.band(owner).free_virtual_pages)
+            return max(
+                self._full_cap_reclaim(owner_pages * self.page_size),
+                short_ids * self.page_size,
+            )
+
+        return self._ask(
+            "owner_frees_serve", lambda: owner_pages, on_stage, combine=max
         )
 
-    def can_reserve(self, full_tokens, swa_tokens, **kwargs) -> bool:
-        if self._full_cap_reclaim(full_tokens, empty_pool=True):
-            return False
-        if self._full_cap_reclaim(
-            full_tokens, empty_pool=kwargs.get("empty_pool", False)
-        ) > kwargs.get("full_evictable_tokens", 0):
-            return False
-        return self._policy.can_reserve(self, full_tokens, swa_tokens, **kwargs)
+    def window_pool_names(self) -> Tuple[str, ...]:
+        return tuple(window.sub_pool_name for window in self._windows)
 
-    def reclaim_plan(self, full_tokens, swa_tokens, **kwargs):
-        cap_reclaim = self._full_cap_reclaim(full_tokens)
-        if cap_reclaim > kwargs.get("full_evictable_tokens", 0):
+    def target_window_pool(self) -> Optional[str]:
+        """The target's window (the longest window its layers declare)."""
+        return self.roles.window
+
+    def sub_pool_roles(self) -> Tuple[str, Tuple[str, ...], Optional[str]]:
+        """The token sub-pool's name, every window sub-pool's, and the state
+        sub-pool's (None without one)."""
+        state = self.mamba_allocator
+        return (
+            self.full_attn_allocator.sub_pool_name,
+            self.window_pool_names(),
+            None if state is None else state.sub_pool_name,
+        )
+
+    def page_demands(self, demand: KVDemand) -> Dict[str, int]:
+        """Pages per band for a token demand: the owner's tokens, each
+        window's, and state slots."""
+        demand = demand.checked(self.window_pool_names())
+        page = self.page_size
+        demands = {
+            self.full_attn_allocator.sub_pool_name: -(-int(demand.full_tokens) // page)
+        }
+        for name, tokens in demand.window_tokens.items():
+            demands[name] = -(-int(tokens) // page)
+        if self.mamba_allocator is not None:
+            demands[self.mamba_allocator.sub_pool_name] = int(demand.state_slots)
+        return demands
+
+    def ensure_capacity(self, demand: KVDemand) -> bool:
+        """Whether an allocation of this demand succeeds now: the question the
+        take itself answers, so a yes here is a successful take."""
+        return self.units_fit(self.page_demands(demand))
+
+    def admits(
+        self,
+        demand: KVDemand,
+        *,
+        evictable: Optional[Dict[str, int]] = None,
+        empty_pool: bool = False,
+    ) -> bool:
+        """Whether ``demand`` fits once ``evictable`` cached entries (tokens per
+        sub-pool, slots for state) are evicted, or in an empty pool. Every
+        admission question asks this, so an admitted demand is one the take
+        serves. Token counts may be fractional expected values."""
+        window_tokens = dict(demand.window_tokens)
+        if set(window_tokens) != set(self.window_pool_names()):
+            raise ValueError(
+                f"admission must name every window: got {sorted(window_tokens)}, "
+                f"the pool keeps {sorted(self.window_pool_names())}"
+            )
+        evictable = {} if empty_pool or evictable is None else evictable
+        units = self._admission_units(demand, evictable, empty_pool)
+
+        def key():
+            return (
+                demand.full_tokens,
+                tuple(sorted(window_tokens.items())),
+                demand.state_slots,
+                tuple(sorted(evictable.items())),
+                empty_pool,
+            )
+
+        if units is None:
+            return self._ask("admits", key, lambda snapshot: False)
+        demands, reclaim = units
+        return self._ask(
+            "admits",
+            key,
+            lambda snapshot: self._admits_on(
+                snapshot, demand.state_slots, demands, reclaim, empty_pool
+            ),
+        )
+
+    def _admission_units(
+        self, demand: KVDemand, evictable: Dict[str, int], empty_pool: bool
+    ) -> Optional[Tuple[Dict[str, int], Dict[str, int]]]:
+        """The units ``demand`` takes and those ``evictable`` frees, per band;
+        None when it fits no stage (negative counts, the FULL cap)."""
+        full_tokens = demand.full_tokens
+        if full_tokens < 0 or any(t < 0 for t in demand.window_tokens.values()):
             return None
-        plan = self._policy.reclaim_plan(self, full_tokens, swa_tokens, **kwargs)
-        if plan is None:
+        owner = self.full_attn_allocator.sub_pool_name
+        # Expected decode lengths may be fractional; a page holds whole tokens.
+        full_tokens = math.ceil(full_tokens)
+        if self._full_cap_reclaim(full_tokens, empty_pool=True):
             return None
-        return max(plan[0], cap_reclaim), plan[1]
+        if self._full_cap_reclaim(full_tokens, empty_pool=empty_pool) > evictable.get(
+            owner, 0
+        ):
+            return None
+        page = self.page_size
+        demands = {owner: -(-full_tokens // page)}
+        reclaim = {owner: evictable.get(owner, 0) // page}
+        for name in self.window_pool_names():
+            demands[name] = -(-math.ceil(demand.window_tokens[name]) // page)
+            reclaim[name] = evictable.get(name, 0) // page
+        state = self.mamba_allocator
+        if state is not None:
+            demands[state.sub_pool_name] = int(demand.state_slots)
+            reclaim[state.sub_pool_name] = int(evictable.get(state.sub_pool_name, 0))
+        return demands, reclaim
 
-    def prealloc_fits_assumes_reclaim(self) -> bool:
-        return self._policy.prealloc_fits_assumes_reclaim(self)
+    def _admits_on(
+        self,
+        snapshot: ChainSnapshot,
+        state_slots,
+        demands: Dict[str, int],
+        reclaim: Dict[str, int],
+        empty_pool: bool,
+    ) -> bool:
+        """`admits` on one stage's ``snapshot``: its ids, then its layout."""
+        owner = snapshot.band(self.full_attn_allocator.sub_pool_name)
+        owner_pages = owner.num_virtual_pages - owner.min_page
+        # A window binds the owner's virtual pages: it can never hold more.
+        if any(demands[name] > owner_pages for name in self.window_pool_names()):
+            return False
+        free_ids = (
+            owner_pages
+            if empty_pool
+            else owner.free_virtual_pages + reclaim[owner.name]
+        )
+        if demands[owner.name] > free_ids:
+            return False
+        if self.mamba_allocator is not None:
+            state = snapshot.band(self.mamba_allocator.sub_pool_name)
+            free_slots = (
+                state.num_virtual_pages - state.min_page
+                if empty_pool
+                else state.free_virtual_pages + reclaim[state.name]
+            )
+            if state_slots > free_slots:
+                return False
+        snapshot = reclaimed_snapshot(snapshot, reclaim, empty_pool=empty_pool)
+        return feasible(snapshot, {n: d for n, d in demands.items() if d > 0})
 
-    def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool | None:
-        return self._policy.prealloc_ceiling_fits(self, full_tokens, swa_tokens)
+    def prealloc_ceiling_fits(self, demand: KVDemand) -> bool | None:
+        demand = demand.checked(self.window_pool_names())
+        return self.admits(demand, empty_pool=True)
 
-    def prealloc_fits(self, tree_cache, full_tokens, swa_tokens, **kwargs) -> bool:
-        return self._policy.prealloc_fits(
-            self, tree_cache, full_tokens, swa_tokens, **kwargs
+    def window_capacity_and_available(self, sub_pool: str) -> Tuple[int, int]:
+        """Window ``sub_pool``'s tokens held plus its estimated availability, and that
+        estimate. Observers only."""
+        band = self._window_band(sub_pool)
+        available = self.estimated_units_available(sub_pool)
+        return available + band.allocated_count(), available
+
+    def _window_band(self, sub_pool: str):
+        for window in self._windows:
+            if window.sub_pool_name == sub_pool:
+                return window
+        raise KeyError(f"no window sub-pool {sub_pool!r}")
+
+    def prealloc_fits(
+        self,
+        demand: KVDemand,
+        *,
+        evictable: Dict[str, int],
+        full_budget_tokens: int,
+        window_budget_tokens: Optional[Dict[str, int]] = None,
+    ) -> bool:
+        """A decode-node preallocation on the admission rule: its tokens, window
+        tails and state slots priced together. The scheduler's budgets count from
+        zero (`capacity.shares_memory`): each is minus what it holds back for pending
+        work, charged as pending demand, never as a per-side cap, since the sides
+        share bytes."""
+        demand = demand.checked(self.window_pool_names())
+        windows = dict(demand.window_tokens)
+        for name, budget in (window_budget_tokens or {}).items():
+            windows[name] += max(0, -budget)
+        return self.admits(
+            KVDemand(
+                demand.full_tokens + max(0, -full_budget_tokens),
+                windows,
+                demand.state_slots,
+            ),
+            evictable=evictable,
         )
 
-    def reclaim_for_prealloc(
-        self, tree_cache, full_tokens: int, swa_tokens: int, **kwargs
-    ) -> str | None:
-        return self._policy.reclaim_for_prealloc(
-            self, tree_cache, full_tokens, swa_tokens, **kwargs
+    def prealloc_shortfall(self, demand: KVDemand) -> str | None:
+        """None when a preallocation of ``demand`` fits now, else the shortfall;
+        eviction, if any, came first (`mem_cache.capacity`)."""
+        if self.units_fit(self.page_demands(demand)):
+            return None
+        return (
+            "Unified memory reclamation insufficient: "
+            f"needed=(full={demand.full_tokens}, "
+            f"windows={dict(demand.window_tokens)}, "
+            f"state_slots={demand.state_slots})"
         )
 
-    def admission_rules(self) -> ChainAdmissionRules:
-        return self._policy.admission_rules(self)
+    def fits_after_frees(self, demands: Dict[str, int]) -> bool:
+        """Whether ``demands`` fit once the caller's queued frees apply, so an
+        eviction walk sees the room it made and stops."""
+        self.flush_deferred_full_frees()
+        return self.units_fit(demands)
 
-    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
-        from sglang.srt.mem_cache.prefill_budget import ChainPrefillBudget
-
-        return ChainPrefillBudget(
-            self,
-            tree_cache,
-            rules=self.admission_rules(),
-            num_mixed_decode_tokens=num_mixed_decode_tokens,
-        )
+    def set_network_waiter(self, waiter: Optional[NetworkWaiter]) -> None:
+        """Wait on the host for network transfers a move cannot avoid: every
+        band of the chain asks ``waiter``."""
+        for band in self.bands:
+            band.network_waiter = waiter
 
     def usage(self) -> Dict[str, Tuple[int, int]]:
-        """Each sub-pool's (capacity, available units), by sub-pool name."""
-        return self._policy.usage(self)
+        """Each sub-pool's (capacity, available units), by sub-pool name: the
+        units it holds plus its estimated availability, and that estimate
+        (`estimated_units_available`). The held units are exact, so a leak
+        census comparing what is held against the capacity stays exact.
+        Observers only."""
+        usage = {}
+        for band in self.bands:
+            name = band.sub_pool_name
+            free = self.estimated_units_available(name)
+            usage[name] = (band.allocated_count() + free, free)
+        return usage
 
-    def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
-        return self._policy.swa_capacity_and_available(
-            self, full_capacity=full_capacity, swa_capacity=swa_capacity
+    def _ceiling_windows(self, sliding_window_size: int | None) -> Dict[str, int]:
+        """The tail a lone request keeps of each window: the storage's retained
+        lengths once bound, else the window's stated length or the scheduler's."""
+        if self.retained_windows is not None:
+            return dict(self.retained_windows)
+        windows = {}
+        for window in self._windows:
+            stated = None
+            if self.plan is not None:
+                lifetime = self.plan.sub_pool(window.sub_pool_name).lifetime
+                stated = getattr(lifetime, "window", None)
+            windows[window.sub_pool_name] = (
+                stated if stated is not None else sliding_window_size
+            )
+        return windows
+
+    def max_new_tokens_for_memory(
+        self,
+        input_tokens: int,
+        max_new_tokens: int,
+        *,
+        token_capacity: int,
+        sliding_window_size: int | None,
+        chunk_size: int | None,
+        prefill_retire_lag: int,
+        eviction_interval: int,
+        checkpoint_interval: int = 0,
+        decode_retire_lag: int = 0,
+        chunk_align: int | None = None,
+    ) -> int | None:
+        """The most new tokens, at most ``max_new_tokens``, a lone request of
+        ``input_tokens`` can be admitted with in an empty pool, within
+        ``token_capacity``; None when even the prompt cannot. Priced as
+        `DemandPurpose.CEILING`: all of its decode, a fresh request's state
+        slots, window retirement (`demand.window_retirement`), and the smallest
+        chunk admission may cut its prompt to (`smallest_admissible_chunk`)."""
+        page = self.page_size
+        paged_input = -(-input_tokens // page) * page
+        max_new_tokens = min(
+            max_new_tokens, max(0, token_capacity - paged_input - page - 1)
+        )
+        windows = self._ceiling_windows(sliding_window_size)
+        state_slots = (
+            0 if self.mamba_allocator is None else self.fresh_request_state_slots
+        )
+        # Below the grid no shorter chunk is admissible: admission runs the
+        # request at the configured chunk or not at all.
+        chunk = smallest_admissible_chunk(chunk_size, page, chunk_align) or chunk_size
+
+        def fits(new_tokens):
+            return self.admits(
+                demand_inputs(
+                    DemandPurpose.CEILING,
+                    input_tokens,
+                    new_tokens,
+                    windows=windows,
+                    page_size=page,
+                    chunk_limit=chunk,
+                    prefill_retire_lag=prefill_retire_lag,
+                    eviction_interval=eviction_interval,
+                    checkpoint_interval=checkpoint_interval,
+                    decode_retire_lag=decode_retire_lag,
+                    state_slots=state_slots,
+                ).demand(),
+                empty_pool=True,
+            )
+
+        if not fits(0):
+            return None
+        if fits(max_new_tokens):
+            return max_new_tokens
+        low, high = 0, max_new_tokens
+        while low < high:
+            mid = (low + high + 1) // 2
+            if fits(mid):
+                low = mid
+            else:
+                high = mid - 1
+        return low
+
+    def get_extend_allocation_demand(
+        self,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        *,
+        conservative_num_tokens: int,
+        shard_size: int,
+    ) -> int:
+        """The new pages' tokens an extend takes; the conservative count when
+        the extend is sharded, or the owner alone takes them."""
+        if shard_size != 1 or not self._windows:
+            return conservative_num_tokens
+        return self.page_size * get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            prefix_lens=prefix_lens_cpu,
         )
 
-    def max_new_tokens_for_memory(self, input_tokens, max_new_tokens, **kwargs):
-        return self._policy.max_new_tokens_for_memory(
-            self, input_tokens, max_new_tokens, **kwargs
+    # A shared-memory pool never calls the prefix cache (`mem_cache.capacity`
+    # drives eviction), so the inherited separate-pool hooks raise.
+    def _asks_the_cache(self, *args, **kwargs):
+        raise TypeError(
+            "a shared-memory pool does not call the prefix cache; ask "
+            "sglang.srt.mem_cache.capacity instead"
         )
 
-    def get_extend_allocation_demand(self, prefix_lens_cpu, seq_lens_cpu, **kwargs):
-        return self._policy.get_extend_allocation_demand(
-            self, prefix_lens_cpu, seq_lens_cpu, **kwargs
-        )
-
-    def evict_to_free_tokens(self, tree_cache, num_tokens: int, **kwargs):
-        return self._policy.evict_to_free_tokens(self, tree_cache, num_tokens, **kwargs)
+    admit_preallocation = _asks_the_cache
+    create_prefill_budget = _asks_the_cache
+    evict_to_free_tokens = _asks_the_cache
+    check_decode_capacity = _asks_the_cache
+    reclaim_for_prealloc = _asks_the_cache
+    reclaim_for_load_back = _asks_the_cache
 
     def resize(self, config) -> None:
         if (
@@ -586,14 +1208,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 if band.is_id_owner
                 else owner.ids.num_virtual_ids,
             )
-        self._policy = interim_policy_for(
-            self,
-            full_max_total_num_tokens=(
+        self._set_token_shares(
+            (
                 config.full_max_total_num_tokens
                 if self._window_capacity_from_sizing
                 else None
             ),
-            swa_max_total_num_tokens=(
+            (
                 config.swa_max_total_num_tokens
                 if self._window_capacity_from_sizing
                 else None
@@ -621,16 +1242,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 config.full_max_total_num_tokens * owner.entry_bytes
             )
 
-    def _flush_targets(self):
-        return self._policy.flush_targets(self)
-
-    def _ask_float_for_room(self, need_tokens: int) -> None:
-        self._policy.ask_float_for_room(self, need_tokens)
-
     # -- state slots --
-
-    def mamba_full_cache_donor(self):
-        return self._policy.mamba_full_cache_donor(self)
 
     def flush_deferred_full_frees(self) -> None:
         """Expose grouped owner frees without ending the caller's free group."""
@@ -643,14 +1255,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 self.full_free_group,
             ),
         )
-
-    def full_tokens_before_mamba_recheck(self, target_size: int) -> int:
-        return full_tokens_before_mamba_recheck(
-            self.full_attn_allocator, self.mamba_allocator, target_size
-        )
-
-    def prepare_mamba_allocation(self, target_size: int) -> None:
-        self._policy.prepare_mamba_allocation(self, target_size)
 
     # -- translation --
 
@@ -784,16 +1388,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     # -- ordering with transfers and forwards --
 
-    def add_pin_source(
-        self, sub_pools: Sequence[str], busy: Callable[[], bool]
-    ) -> None:
-        """Keep the named sub-pools' pages in place whenever ``busy()`` holds:
-        a DMA initiator whose queues outlive an iteration, registered once. A
-        transfer that reaches every sub-pool names every one: a band it leaves
-        out would relocate its own pages under the same in-flight copy."""
-        for name in sub_pools:
-            self.bands[self._band_positions[name]].add_pin_source(busy)
-
     def fix_pages(self, sub_pool: str, key: Hashable, pages: Sequence[int]) -> None:
         """Keep these physical pages of ``sub_pool`` where they are, under
         ``key``, until `unfix_pages`: a transfer that holds their physical ids,
@@ -894,7 +1488,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def verify_byte_accounting(self) -> List[str]:
         return (
             chain_byte_accounting_violations(list(self.bands))
-            + self._policy.memo_violations(self)
             + self._snapshot_memo_violations()
         )
 
@@ -905,147 +1498,251 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self,
         *,
         full_tokens: int,
-        swa_tokens: int,
         num_owner_pages: int,
         owner_take: Callable[[Optional[torch.Tensor]], Optional[torch.Tensor]],
-        window_pages: Callable[
-            [torch.Tensor, torch.Tensor], torch.Tensor
-        ] = lambda out, new_pages: new_pages,
         window_tail_pages: Optional[Mapping[str, int]] = None,
+        consumer: Consumer = Consumer.FORWARD,
     ) -> Optional[torch.Tensor]:
-        """Price before taking owner ids, then bind their new window pages.
-
-        With ``window_tail_pages`` (by window sub-pool), each named window
-        binds only the last that many of the new pages, its live tail; an
-        unnamed window binds all of them."""
+        """Take the owner's and every window's new pages in one planned layout,
+        then bind the windows to the owner's new virtual pages; None exactly when
+        no reachable layout serves the demand. With ``window_tail_pages`` (naming
+        every window), each window binds only the last that many new pages."""
         owner = self.full_attn_allocator
-        if not self._policy.prices_before_take:
-            # The owner prices and relieves its own shortfall.
-            return owner_take(None)
-        if len(self._windows) > 1:
-            pages = self._window_page_counts(
-                num_owner_pages, swa_tokens, window_tail_pages
+        demands = {owner.sub_pool_name: num_owner_pages}
+        for window in self._windows:
+            demands[window.sub_pool_name] = (
+                num_owner_pages
+                if window_tail_pages is None
+                else window_tail_pages[window.sub_pool_name]
             )
-            auxiliary = [
-                n
-                for name, n in pages.items()
-                if name != self.swa_attn_allocator.sub_pool_name
-            ]
-            if not self.ensure_capacity(
-                full_tokens,
-                swa_tokens,
-                auxiliary_swa_tokens=max(auxiliary, default=0) * self.page_size,
-            ):
-                return None
-        elif not self.ensure_capacity(full_tokens, swa_tokens):
+        decided = self._decided_take(demands)
+        if decided is False:
+            return None
+        if self._full_cap_reclaim(full_tokens) or num_owner_pages > len(
+            owner.free_virtual_ids
+        ):
+            self._refused_decided_take(decided, demands)
+            return None
+        physical = self._plan_and_take(
+            demands, bind_at_frontier=True, consumer=consumer
+        )
+        if physical is None:
+            self._refused_decided_take(decided, demands)
             return None
         # free_virtual_ids is rebound (slice/cat), never mutated in place, so
         # this prefix view still names the pages the owner is about to consume.
         new_virtual_pages = owner.free_virtual_ids[:num_owner_pages]
-        if len(self._windows) > 1:
-            if num_owner_pages > len(owner.free_virtual_ids):
-                return None
-            reserved = self._reserve_token_pages(num_owner_pages, pages)
-            if reserved is None:
-                return None
-            out = owner_take(reserved[owner.sub_pool_name])
-            assert out is not None
-            for window in self._windows:
-                # The extend kernel hands the new pages out in token order, so
-                # a tail's new pages are the last ones.
-                count = pages[window.sub_pool_name]
-                bind = new_virtual_pages[new_virtual_pages.numel() - count :]
-                physical = reserved[window.sub_pool_name]
-                assert bind.numel() == physical.numel()
-                window.ids.bind(bind, physical)
-                window._maybe_zero_pages(physical)
-            return out
-        out = owner_take(None)
-        assert out is not None, (
-            "ChainAllocator: the owner refused after the joint pre-check "
-            "passed -- internal-state inconsistency"
-        )
-        bind = window_pages(out, new_virtual_pages)
+        # None: the owner takes at its frontier and binds in one kernel.
+        out = owner_take(physical.get(owner.sub_pool_name))
+        if out is None:
+            raise RuntimeError(
+                "ChainAllocator: the owner refused pages its planned layout "
+                "reserved -- internal-state inconsistency"
+            )
         for window in self._windows:
-            window.alloc_with_virtual(bind)
+            if window.sub_pool_name not in physical:
+                continue
+            pages = physical[window.sub_pool_name]
+            num_pages = demands[window.sub_pool_name]
+            # The extend kernel hands new pages out in token order, so the tail is
+            # a slice, not a data-dependent filter that would block the host.
+            bind = new_virtual_pages[new_virtual_pages.numel() - num_pages :]
+            if pages is None:
+                if window.place_pages(bind, num_pages, consumer) is None:
+                    raise RuntimeError(
+                        f"{window.sub_pool_name}: the planned frontier take of "
+                        f"{num_pages} pages was refused"
+                    )
+                continue
+            assert bind.numel() == pages.numel()
+            window.ids.bind(bind, pages)
+            window._maybe_zero_pages(pages)
         return out
 
-    def _window_page_counts(
+    @_one_operation
+    def _plan_and_take(
         self,
-        owner_pages: int,
-        swa_tokens: int,
-        window_tail_pages: Optional[Mapping[str, int]],
-    ) -> Dict[str, int]:
-        """New pages each window binds: a named window its own tail, the
-        primary window ``swa_tokens`` worth, any other window every new page."""
-        counts = {}
-        for window in self._windows:
-            name = window.sub_pool_name
-            if window_tail_pages is not None and name in window_tail_pages:
-                counts[name] = window_tail_pages[name]
-            elif window is self.swa_attn_allocator:
-                counts[name] = -(-swa_tokens // self.page_size)
-            else:
-                counts[name] = owner_pages
-        return counts
-
-    def _reserve_token_pages(self, owner_pages, window_pages: Mapping[str, int]):
-        bands = (self.full_attn_allocator, *self._windows)
-        plan = no_relief_plan(
-            self.pricing_snapshot(),
-            tuple(
-                (
-                    band.sub_pool_name,
-                    owner_pages
-                    if band is self.full_attn_allocator
-                    else window_pages[band.sub_pool_name],
-                )
-                for band in bands
-            ),
-        )
-        if plan is None:
-            return None
-        saved = []
-        reserved = {}
-        for band in bands:
-            fields = [
-                "watermark_physical",
-                "live_page_count",
-                "_free_phys_pages",
-                "_free_phys_sorted",
-                "_pending_until_retire",
-                "_pending_host",
-            ]
-            if isinstance(band, FloatBand):
-                fields += ["low_wm_page", "high_wm_page", "_next_hole_end"]
-            saved.append((band, {name: getattr(band, name) for name in fields}))
-            physical = band.take_planned_physical_pages(plan.takes[band.sub_pool_name])
-            if physical is None:
-                # No ids or bytes have been published. Restore the host allocation
-                # state; each assignment advances, never rewinds, its epoch.
-                for allocated, fields in saved:
-                    for name, value in fields.items():
-                        setattr(allocated, name, value)
+        demands: Dict[str, int],
+        *,
+        bind_at_frontier: bool = False,
+        consumer: Consumer = Consumer.FORWARD,
+    ) -> Optional[Dict[str, Optional[torch.Tensor]]]:
+        """Physical pages for ``demands`` (pages per band) in a planned layout;
+        None exactly when `feasible` says no, and a plan that does not realize
+        raises. With ``bind_at_frontier``, see `realize`."""
+        demands = {name: n for name, n in demands.items() if n > 0}
+        if not demands:
+            return {}
+        with self._relief(demands) as plan:
+            if plan is None:
                 return None
-            reserved[band.sub_pool_name] = physical
-        return reserved
+            return self.realize(
+                plan, bind_at_frontier=bind_at_frontier, consumer=consumer
+            )
+
+    @_one_operation
+    def realize(
+        self,
+        plan: TakePlan,
+        *,
+        bind_at_frontier: bool = False,
+        consumer: Consumer = Consumer.FORWARD,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        """Lay the chain out as ``plan`` (made from its current snapshot) says and
+        take each demanded band's physical pages; a refusal is an internal error.
+        With ``bind_at_frontier``, a band whose take only extends its frontier
+        maps to None: the caller takes and binds them in one kernel."""
+        self._lay_out(plan)
+        self._note_growth(plan)
+        taken = {}
+        for band in self.bands:
+            take = plan.takes.get(band.sub_pool_name)
+            if take is None or not take.count():
+                continue
+            if bind_at_frontier and band.takes_at_frontier(take):
+                taken[band.sub_pool_name] = None
+                continue
+            physical = band.take_planned_pages(take, consumer)
+            if physical is None:
+                raise RuntimeError(
+                    f"{band.sub_pool_name}: the planned take of {take.count()} "
+                    "pages was refused"
+                )
+            taken[band.sub_pool_name] = physical
+        return taken
+
+    def _note_growth(self, plan: TakePlan) -> None:
+        """Fold one plan's extensions (pages a take adds past the band's holes)
+        into every band's growth average."""
+        for name, average in self._growth.items():
+            take = plan.takes.get(name)
+            extended = 0
+            if take is not None and take.pages is not None:
+                extended = take.pages[1] - take.pages[0]
+            self._growth[name] = (
+                average - average // _GROWTH_DECAY + extended * _GROWTH_SCALE
+            )
+
+    @_one_operation
+    def lay_out_for(self, demands: Dict[str, int]) -> bool:
+        """Make the least rearrangement after which ``demands`` (pages per band)
+        fit without moving a page, for takes issued later in any order; False
+        exactly when `feasible` says no."""
+        demands = {name: n for name, n in demands.items() if n > 0}
+        with self._relief(demands) as plan:
+            if plan is None:
+                return False
+            self._lay_out(plan)
+            return True
 
     @contextmanager
-    def scoped_physical_takes(
-        self, full_tokens, swa_tokens, *, auxiliary_swa_tokens=None, state_slots=0
-    ):
-        """Consume a pre-realized reservation across independently issued H2D takes."""
-        if len(self._windows) <= 1:
-            yield
+    def _relief(self, demands: Dict[str, int]):
+        """The plan serving ``demands``, and the scope it is laid out in.
+
+        Plans but the last resort keep out of the bytes unreleased network sends
+        still read (`held_snapshot`). A rearrangement reads every band's host
+        state before the layout's first stream wait, and keeps rows a network
+        transfer touches in place when some layout serves that way; only
+        otherwise does it move them, and a copy or reuse of their bytes then
+        waits on the host for the engine (`set_network_waiter`). The choice
+        reads logical releases only, alike on every rank."""
+        in_place = plan_layout(
+            self.held_snapshot(), demands, NO_MOVE, growth=self._growth
+        )
+        if in_place is not None:
+            yield in_place
             return
+        if not feasible(self.pricing_snapshot(), demands):
+            # No layout serves it: refused before any pending page settles.
+            yield None
+            return
+        # Settle pending pages first, so the plan and its realization see holes
+        # and live pages only (a float left with no live page parks).
+        with self.settle_pending_for_recovery(self.bands):
+            yield from self._relief_plan(demands)
+
+    def _relief_plan(self, demands: Dict[str, int]):
+        held = False
+        try:
+            for band in self.bands:
+                if band.has_network_rows():
+                    rows = band.network_rows()
+                    if rows:
+                        band.fix_pages(_NETWORK_ROWS, sorted(rows))
+                        band.holds_fixed = True
+                        held = True
+            held_world = self.held_snapshot()
+            found = (
+                first_plan(held_world, demands, growth=self._growth)
+                if held or held_world.held
+                else None
+            )
+            if found is None and held:
+                for band in self.bands:
+                    band.unfix_pages(_NETWORK_ROWS)
+                    band.holds_fixed = False
+                held = False
+            if found is None:
+                found = first_plan(
+                    self.pricing_snapshot(), demands, growth=self._growth
+                )
+            yield found
+        finally:
+            for band in self.bands:
+                if held:
+                    band.unfix_pages(_NETWORK_ROWS)
+                band.holds_fixed = False
+
+    def _lay_out(self, plan: TakePlan) -> None:
+        """The plan's rearrangement: compact the listed ends, then move the
+        floats into their target blocks."""
+        bands = {band.sub_pool_name: band for band in self.bands}
+        for name in plan.flush:
+            band = bands[name]
+            band.flush_for_allocation()
+            low_byte = band._byte_low_frontier()
+            high_byte = band._byte_high_frontier()
+            live = band.occupied_pages() if band.lazy_compaction else None
+            if live is not None:
+                e = band.entry_bytes_per_page
+                fixed = band.fixed_extent()
+                if band.grow_direction == "up":
+                    top = band.min_page_index + live
+                    if fixed is not None:
+                        top = max(top, fixed[1])
+                    packed = (band.min_page_index * e, top * e)
+                else:
+                    bottom = band.num_pages - live
+                    if fixed is not None:
+                        bottom = min(bottom, fixed[0])
+                    packed = (bottom * e, band.num_pages * e)
+                if (low_byte, high_byte) != packed:
+                    raise RuntimeError(
+                        f"{name}: an urgent flush left {(low_byte, high_byte)}, "
+                        f"the plan needs {packed}"
+                    )
+        blocks = {
+            name: (
+                first * bands[name].entry_bytes_per_page,
+                end * bands[name].entry_bytes_per_page,
+            )
+            for name, (first, end) in plan.targets.items()
+        }
+        spans = {
+            name: (bands[name]._byte_low_frontier(), bands[name]._byte_high_frontier())
+            for name in plan.targets
+        }
+        for name in move_order(spans, blocks):
+            bands[name].relocate_into(*plan.targets[name])
+
+    @contextmanager
+    def scoped_physical_takes(self, demand: KVDemand):
+        """Consume a pre-realized reservation across independently issued H2D
+        takes, on every chain shape: without the scope a floating window's take
+        can land where the later state slot no longer fits."""
         if any(band._physical_take_scope is not None for band in self.members):
             raise RuntimeError("physical reservation scopes cannot be nested")
-        scope = _ScopedPhysicalTakes(
-            self,
-            self._policy._demands(
-                self, full_tokens, swa_tokens, auxiliary_swa_tokens, state_slots
-            ),
-        )
+        scope = _ScopedPhysicalTakes(self, self.page_demands(demand))
         for band in self.members:
             band._physical_take_scope = scope
         try:
@@ -1054,10 +1751,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             for band in self.members:
                 band._physical_take_scope = None
 
-    def _take_owner_tokens(self, need_size, physical):
+    def _take_owner_tokens(self, need_size, physical, consumer=Consumer.FORWARD):
         owner = self.full_attn_allocator
         if physical is None:
-            return owner.alloc(need_size)
+            return owner.alloc(need_size, consumer)
         return take_new_pages(
             owner,
             need_size // self.page_size,
@@ -1066,17 +1763,22 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             ),
             copy_new_pages=False,
             physical_pages=physical,
+            consumer=consumer,
         )
 
-    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+    def alloc(
+        self, need_size: int, consumer: Consumer = Consumer.FORWARD
+    ) -> Optional[torch.Tensor]:
+        """``need_size`` owner token ids; ``consumer`` writes their pages
+        first (`Band.acquire`)."""
         with record_function("ChainAllocator.alloc"):
             return self._allocate(
                 full_tokens=need_size,
-                swa_tokens=need_size,
                 num_owner_pages=need_size // self.page_size,
                 owner_take=lambda physical: self._take_owner_tokens(
-                    need_size, physical
+                    need_size, physical, consumer
                 ),
+                consumer=consumer,
             )
 
     def _paged_take(
@@ -1088,6 +1790,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
         num_new_pages: int,
+        consumer: Consumer = Consumer.FORWARD,
     ) -> Callable[[Optional[torch.Tensor]], Optional[torch.Tensor]]:
         def extend_tokens(free_pages: torch.Tensor) -> torch.Tensor:
             bs = len(prefix_lens)
@@ -1113,6 +1816,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             extend_tokens,
             copy_new_pages=False,
             physical_pages=physical,
+            consumer=consumer,
         )
 
     @_one_operation
@@ -1124,24 +1828,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
+        consumer: Consumer = Consumer.FORWARD,
     ) -> Optional[torch.Tensor]:
         """Paged extend; returns virtual TOKEN ids. A window binds exactly the
-        virtual pages the owner consumed."""
+        virtual pages the owner consumed. ``consumer`` writes the new pages
+        first (`Band.acquire`)."""
         with record_function("ChainAllocator.alloc_extend"):
-            if not self._policy.prices_before_take:
-                return self._paged_take(
-                    prefix_lens,
-                    prefix_lens_cpu,
-                    seq_lens,
-                    seq_lens_cpu,
-                    last_loc,
-                    extend_num_tokens,
-                    get_num_new_pages(
-                        seq_lens=seq_lens_cpu,
-                        page_size=self.full_attn_allocator.page_size,
-                        prefix_lens=prefix_lens_cpu,
-                    ),
-                )()
             num_new_pages = get_num_new_pages(
                 seq_lens=seq_lens_cpu,
                 page_size=self.page_size,
@@ -1150,7 +1842,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             need_tokens = num_new_pages * self.page_size
             return self._allocate(
                 full_tokens=need_tokens,
-                swa_tokens=need_tokens,
                 num_owner_pages=num_new_pages,
                 owner_take=self._paged_take(
                     prefix_lens,
@@ -1160,7 +1851,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     last_loc,
                     extend_num_tokens,
                     num_new_pages,
+                    consumer,
                 ),
+                consumer=consumer,
             )
 
     @_one_operation
@@ -1172,13 +1865,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
-        swa_tail_len: int,
-        window_tail_lens: Optional[Mapping[str, int]] = None,
+        window_tail_lens: Mapping[str, int],
+        consumer: Consumer = Consumer.FORWARD,
     ) -> Optional[torch.Tensor]:
         """Decode-node prealloc: owner KV for the whole sequence, window KV for
-        the live window tail only. ``swa_tail_len`` is the primary window's
-        tail; ``window_tail_lens`` names the tail of every other window that
-        keeps its own retention (a fused draft's band).
+        the live window tail only. ``window_tail_lens`` names every window's
+        own tail by sub-pool.
 
         The owner and the window SHARE one virtual id space (a virtual page names
         an owner-physical page and, if bound, a window-physical one), so the tail
@@ -1187,16 +1879,25 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         sink and is skipped by `free`'s `> 0` mask -- exactly the out-of-window
         state window retirement produces. Admission prices the owner's new pages
         and only the new pages in the window tail; a partial prefix page is
-        already bound and costs no new window page.
+        already bound and costs no new window page. ``consumer`` writes the
+        new pages first (`Band.acquire`).
         """
         assert len(prefix_lens_cpu) == 1
-        tails = dict(window_tail_lens or {})
-        tails[self.swa_attn_allocator.sub_pool_name] = swa_tail_len
+        tails = dict(
+            KVDemand(extend_num_tokens, window_tail_lens)
+            .checked(self.window_pool_names())
+            .window_tokens
+        )
         assert all(0 <= tail <= extend_num_tokens for tail in tails.values())
         with record_function("ChainAllocator.alloc_extend_swa_tail"):
             prefix_len = int(prefix_lens_cpu[0])
             seq_len = int(seq_lens_cpu[0])
             first_new_page = (prefix_len + self.page_size - 1) // self.page_size
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu,
+            )
 
             def new_tail_pages(tail_len: int) -> int:
                 # Only NEW pages need binding; a tail page carried in from the
@@ -1208,30 +1909,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     first_new_page, first_tail_page
                 )
 
-            num_swa_pages = new_tail_pages(swa_tail_len)
-            window_tail_pages = {
-                name: new_tail_pages(tail) for name, tail in tails.items()
+            tail_pages = {
+                window.sub_pool_name: new_tail_pages(tails[window.sub_pool_name])
+                for window in self._windows
             }
-            num_new_pages = get_num_new_pages(
-                seq_lens=seq_lens_cpu,
-                page_size=self.page_size,
-                prefix_lens=prefix_lens_cpu,
-            )
-
-            # Only NEW pages need binding; a tail page carried in from the prefix
-            # is already bound on the swa side. The extend kernel gives the j-th
-            # new page to sequence page first_new_page + j, so the tail's new
-            # pages are the last num_swa_pages of them. Slicing them on the host
-            # keeps admission free of host syncs: a device-side match
-            # (torch.unique) blocks the scheduler behind the in-flight forward.
-            def tail_pages(out: torch.Tensor, new_pages: torch.Tensor) -> torch.Tensor:
-                if num_swa_pages > 0:
-                    return new_pages[-num_swa_pages:]
-                return new_pages[:0]
-
             return self._allocate(
                 full_tokens=num_new_pages * self.page_size,
-                swa_tokens=num_swa_pages * self.page_size,
                 num_owner_pages=num_new_pages,
                 owner_take=self._paged_take(
                     prefix_lens,
@@ -1241,9 +1924,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     last_loc,
                     extend_num_tokens,
                     num_new_pages,
+                    consumer,
                 ),
-                window_pages=tail_pages,
-                window_tail_pages=window_tail_pages,
+                window_tail_pages=tail_pages,
+                consumer=consumer,
             )
 
     @_one_operation
@@ -1276,7 +1960,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             need_tokens = num_new_pages * self.page_size
             return self._allocate(
                 full_tokens=need_tokens,
-                swa_tokens=need_tokens,
                 num_owner_pages=num_new_pages,
                 owner_take=lambda physical: take_new_pages(
                     self.full_attn_allocator,
@@ -1289,11 +1972,38 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     @_one_operation
     def alloc_state_slots(self, need_size: int) -> Optional[torch.Tensor]:
-        """Per-request state slots: the state band prices and relieves its own
-        shortfall (VIRTUAL slot ids). A new slot may be written on the schedule
-        stream (a state copy into it) before any forward runs, so it is
-        acquired as a schedule-stream copy's."""
-        return self.mamba_allocator.alloc(need_size, Consumer.SCHEDULE_COPY)
+        """Per-request state slots (VIRTUAL slot ids), laid out with the token
+        pages. Acquired as a schedule-stream copy's, since a state copy may write
+        a new slot before any forward runs."""
+        state = self.mamba_allocator
+        if need_size <= 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        demands = {state.sub_pool_name: need_size}
+        decided = self._decided_take(demands)
+        if decided is False:
+            return None
+        if need_size > len(state.free_virtual_ids):
+            self._refused_decided_take(decided, demands)
+            return None
+        physical = self._plan_and_take(
+            demands, bind_at_frontier=True, consumer=Consumer.SCHEDULE_COPY
+        )
+        if physical is None:
+            self._refused_decided_take(decided, demands)
+            return None
+        slots = state.free_virtual_ids[:need_size]
+        pages = physical[state.sub_pool_name]
+        if pages is None:
+            if state.place_pages(slots, need_size, Consumer.SCHEDULE_COPY) is None:
+                raise RuntimeError(
+                    f"{state.sub_pool_name}: the planned frontier take of "
+                    f"{need_size} slots was refused"
+                )
+        else:
+            state.ids.bind(slots, pages)
+            state._maybe_zero_pages(pages)
+        state.free_virtual_ids = state.free_virtual_ids[need_size:]
+        return state._expand_pages_to_tokens(slots)
 
     def is_slot_allocated(self, slot: int) -> bool:
         """Token-slot surface = the owner (which owns the virtual ids)."""
