@@ -14,6 +14,7 @@ from sglang.srt.layers.moe.topk import (
     _post_process_topk_ids,
     apply_routing_simulation,
     routing_simulation_enabled,
+    simulated_routing_groups,
 )
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
@@ -239,6 +240,7 @@ def run_mega_gate(
             num_routed_topk=top_k,
             top_k=top_k,
             layer_id=moe.layer_id,
+            groups=simulated_routing_groups(moe.topk.topk_config),
             num_token_non_padded=bound,
             weight_scale=(
                 routed_scaling_factor if in_buffer and not fused_in_topk else 1.0
