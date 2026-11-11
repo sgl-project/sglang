@@ -29,6 +29,15 @@ on:
         required: false
         type: string
         default: 'true'
+      accuracy_dataset:
+        description: 'Force the dataset of multi-node accuracy cases. "auto" keeps the weekday rule (gsm8k Mon-Fri, gpqa_diamond on weekends).'
+        required: false
+        type: choice
+        options:
+          - auto
+          - gsm8k
+          - gpqa_diamond
+        default: 'auto'
   workflow_call:
     inputs:
       ref:
@@ -56,6 +65,11 @@ on:
         required: false
         type: string
         default: ''
+      accuracy_dataset:
+        description: 'Force the dataset of multi-node accuracy cases (gsm8k/gpqa_diamond). Empty or "auto" keeps the weekday rule.'
+        required: false
+        type: string
+        default: ''
 concurrency:
   group: nightly-test-npu-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
@@ -69,6 +83,7 @@ jobs:
       image_a5: ${{ steps.set-vars.outputs.image_a5 }}
       skip_install_flag: ${{ steps.set-vars.outputs.skip_install_flag }}
       run_start_metadata: ${{ steps.set-vars.outputs.run_start_metadata }}
+      accuracy_dataset: ${{ steps.set-vars.outputs.accuracy_dataset }}
     steps:
       # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
       - name: Set image config
@@ -116,6 +131,29 @@ jobs:
           RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_time':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d-%H%M)")"
           # Write to GITHUB_OUTPUT and print to the log in one command.
           echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
+          # Multi-node accuracy dataset: an explicit input wins; otherwise gsm8k
+          # (200-sample cap) on weekdays and gpqa_diamond on weekends. The cron
+          # fires at 16:00 UTC, i.e. 00:00 the next day in Beijing, so resolve
+          # the weekday in Asia/Shanghai.
+          ACCURACY_DATASET_INPUT="${{ inputs.accuracy_dataset }}"
+          case "${ACCURACY_DATASET_INPUT}" in
+            gsm8k|gpqa_diamond)
+              ACCURACY_DATASET="${ACCURACY_DATASET_INPUT}"
+              ;;
+            ""|auto)
+              ACCURACY_DOW="$(TZ=Asia/Shanghai date +%u)"
+              if [ "${ACCURACY_DOW}" -le 5 ]; then
+                ACCURACY_DATASET="gsm8k"
+              else
+                ACCURACY_DATASET="gpqa_diamond"
+              fi
+              ;;
+            *)
+              echo "Unsupported accuracy_dataset: ${ACCURACY_DATASET_INPUT}"
+              exit 1
+              ;;
+          esac
+          echo "accuracy_dataset=${ACCURACY_DATASET}" | tee -a $GITHUB_OUTPUT
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
@@ -158,7 +196,7 @@ jobs:
       runner_config: linux-aarch64-a3-4-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '120'
-      timeout_per_file: '3600'
+      timeout_per_file: '5400'
       partitions: '{"size":2,"arr":[0,1]}'
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
@@ -292,6 +330,7 @@ jobs:
        install_sglang_deps: false
        device_type_for_deps: 'a5'
        run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+
   nightly-poc-multi-node-tests:
     name: multi-node-poc
     if: ${{ !cancelled() }}
@@ -301,28 +340,12 @@ jobs:
       max-parallel: 1
       matrix:
         test_config:
-          # glm5_1 performance tests
-          # Disable test case temporarily due to feature refactor in PR #38293.
-          # - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms
-          #   prefill_size: 2
-          #   decode_size: 2
-          #   router_size: 1
-          #   test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms.py
-          #   test_type: 'perf'
-          #   prefill_decode_deployment: 'separation'
-          # - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26
-          #   prefill_size: 2
-          #   decode_size: 2
-          #   router_size: 1
-          #   test_case: test/registered/npu/accuracy/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26.py
-          #   test_type: 'accuracy'
-          #   prefill_decode_deployment: 'separation'
           # deepseek_v4_flash performance tests
-          - name: deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms
+          - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms
             prefill_size: 1
             decode_size: 1
             router_size: 1
-            test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms.py
+            test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
           # deepseek_v4_flash accuracy tests
@@ -341,20 +364,28 @@ jobs:
             test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa.py
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
-          # glm_5_2 accuracy tests (2 prefill + 2 decode nodes)
-          - name: glm_5_2_w8a8_2p2d_32p_dcp_gpqa
+          # glm_5_3 accuracy tests (2 prefill + 2 decode nodes)
+          - name: glm_5_3_w8a8_1p1d_32p_pcp_gpqa
             prefill_size: 2
             decode_size: 2
             router_size: 1
-            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_2p2d_32p_dcp_gpqa.py
+            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_pcp_gpqa.py
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
-          - name: glm_5_2_w8a8_2p2d_32p_pcp_gpqa
+          - name: glm_5_3_w8a8_1p1d_32p_dcp_gpqa
             prefill_size: 2
             decode_size: 2
             router_size: 1
-            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_2p2d_32p_pcp_gpqa.py
+            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_dcp_gpqa.py
             test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          # glm_5_3 performance tests (2 prefill + 2 decode nodes)
+          - name: glm_5_3_w8a8_1p1d_32p_in128k_out1k_prefix90_20ms
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/npu/performance/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_in128k_out1k_prefix90_20ms.py
+            test_type: 'perf'
             prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
@@ -370,6 +401,7 @@ jobs:
       prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
@@ -380,11 +412,11 @@ jobs:
       max-parallel: 1
       matrix:
         test_config:
-          # glm_5_2 accuracy tests
-          - name: glm_5_2_w8a8_16p_gpqa
-            node_size: 2
-            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py
-            test_type: 'accuracy'
+          # glm_5_3 accuracy tests
+          # - name: glm_5_3_w8a8_16p_gpqa
+          #   node_size: 2
+          #   test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_16p_gpqa.py
+          #   test_type: 'accuracy'
           # kimi_k3 accuracy tests
           - name: kimi_k3_w4a8_32p_gpqa
             node_size: 4
@@ -415,6 +447,7 @@ jobs:
       prefill_decode_deployment: 'mix'
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
 
   check-all-jobs:
     if: ${{ !cancelled() }}

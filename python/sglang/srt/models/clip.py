@@ -3,7 +3,7 @@
 
 from array import array
 from functools import partial
-from typing import Iterable, List, Optional, Tuple, Type, Union
+from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -20,11 +20,41 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import MultimodalInputs
-from sglang.srt.model_executor.model_runner import ForwardBatch
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.managers.req_types import MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, flatten_nested_list
+from sglang.srt.utils import flatten_nested_list
+
+
+def load_clip_weights(
+    params_dict: Dict[str, torch.nn.Parameter],
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> None:
+    stacked_params_mapping = [
+        # (param_name, shard_name, shard_id)
+        ("qkv_proj", "q_proj", "q"),
+        ("qkv_proj", "k_proj", "k"),
+        ("qkv_proj", "v_proj", "v"),
+    ]
+    for name, loaded_weight in weights:
+        if "position_ids" in name:
+            continue
+        if "out_proj" in name:
+            name = name.replace("out_proj", "proj")
+        for param_name, shard_name, shard_id in stacked_params_mapping:
+            if shard_name not in name:
+                continue
+            name = name.replace(shard_name, param_name)
+            param = params_dict[name]
+            weight_loader = param.weight_loader
+            weight_loader(param, loaded_weight, shard_id)
+            break
+        else:
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
 
 
 def prepare_clip_attention_mask(
@@ -464,6 +494,8 @@ class CLIPVisionTransformer(nn.Module):
                 f"layers, but you requested {len(self.encoder.layers)} layers."
             )
 
+        # As in HF, applied only to the pooled CLS token (CLIPModel.forward);
+        # forward() returns the un-normed encoder states.
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
     @property
@@ -473,23 +505,29 @@ class CLIPVisionTransformer(nn.Module):
     def forward(
         self,
         pixel_values: torch.Tensor,
-    ) -> torch.Tensor:
+        output_hidden_states: bool = False,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         hidden_states = self.embeddings(pixel_values.to(self.device))
         hidden_states = self.pre_layrnorm(hidden_states)
 
-        return_all_hidden_states = False
-
-        last_hidden_state = self.encoder(
+        # Matches HF's `last_hidden_state`, or with output_hidden_states its
+        # `hidden_states`: entry 0 is the pre_layrnorm'd embedding, entry i layer i.
+        return self.encoder(
             inputs_embeds=hidden_states,
-            return_all_hidden_states=return_all_hidden_states,
+            return_all_hidden_states=output_hidden_states,
         )
 
-        last_hidden_state = self.post_layernorm(last_hidden_state)
 
-        return last_hidden_state
+class CLIPVisionOutput(NamedTuple):
+    """HF-shaped vision tower output, for callers selecting an interior layer."""
+
+    last_hidden_state: torch.Tensor
+    hidden_states: List[torch.Tensor]
 
 
 class CLIPVisionModel(nn.Module):
+    """CLIP vision tower, standalone or as a `LlavaForConditionalGeneration` tower."""
+
     def __init__(
         self,
         config: CLIPVisionConfig,
@@ -497,6 +535,7 @@ class CLIPVisionModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.config = config
         self.vision_model = CLIPVisionTransformer(
             config, quant_config, prefix=add_prefix("vision_model", prefix)
         )
@@ -505,8 +544,23 @@ class CLIPVisionModel(nn.Module):
     def device(self) -> torch.device:
         return self.vision_model.device
 
-    def forward(self, pixel_values: torch.Tensor):
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        image_sizes: Optional[List[Tuple[int, int]]] = None,
+        output_hidden_states: bool = False,
+    ) -> Union[torch.Tensor, CLIPVisionOutput]:
+        # `image_sizes` is accepted for signature parity with the variable-resolution
+        # towers (Pixtral); CLIP always sees square `config.image_size` crops.
+        if output_hidden_states:
+            hidden_states = self.vision_model(pixel_values, output_hidden_states=True)
+            return CLIPVisionOutput(
+                last_hidden_state=hidden_states[-1], hidden_states=hidden_states
+            )
         return self.vision_model(pixel_values)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        load_clip_weights(dict(self.named_parameters()), weights)
 
 
 class CLIPModel(nn.Module):
@@ -577,7 +631,7 @@ class CLIPModel(nn.Module):
         if len(pixel_values_list) != 0:
             pixel_values = torch.concat(pixel_values_list)
             vision_outputs = self.vision_model(pixel_values)
-            pooled_output = vision_outputs[:, 0, :]
+            pooled_output = self.vision_model.post_layernorm(vision_outputs[:, 0, :])
             image_embeds = self.visual_projection(pooled_output)
             image_embeds = nn.functional.normalize(image_embeds, p=2, dim=1)
             return EmbeddingPoolerOutput(embeddings=image_embeds)
@@ -594,30 +648,7 @@ class CLIPModel(nn.Module):
         return input_ids
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if "position_ids" in name:
-                continue
-            if "out_proj" in name:
-                name = name.replace("out_proj", "proj")
-            for param_name, shard_name, shard_id in stacked_params_mapping:
-                if shard_name not in name:
-                    continue
-                name = name.replace(shard_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+        load_clip_weights(dict(self.named_parameters()), weights)
 
 
 # monkey patch weight loader to remove open_clip file
@@ -632,7 +663,13 @@ def monkey_patch_weight_loader():
     )
 
     def prepare_weights(
-        self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
+        self,
+        model_name_or_path: str,
+        revision: Optional[str],
+        fall_back_to_pt: bool,
+        # Must mirror DefaultModelLoader._prepare_weights; the override pins
+        # allow_patterns to *.bin, so the caller's patterns are ignored.
+        allow_patterns_overrides: Optional[List[str]] = None,
     ) -> Tuple[str, List[str], bool]:
         model_name_or_path = (
             self._maybe_download_from_modelscope(model_name_or_path, revision)
@@ -675,4 +712,4 @@ def monkey_patch_weight_loader():
     setattr(DefaultModelLoader, "_prepare_weights", prepare_weights)
 
 
-EntryClass = CLIPModel
+EntryClass = [CLIPModel, CLIPVisionModel]

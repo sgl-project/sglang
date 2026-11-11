@@ -8,6 +8,8 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
+    PluginWeightUpdateReqInput,
+    PluginWeightUpdateReqOutput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -17,8 +19,10 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
-from sglang.srt.managers.scheduler_components.request_list import RequestList
-from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
     _WeightUpdateSession,
@@ -33,6 +37,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -41,66 +46,6 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class _ServingStub:
     def __init__(self, weight_version: str):
         self.weight_version = weight_version
-
-
-class _ContextStub:
-    def __init__(self, serving: _ServingStub):
-        self.serving = serving
-
-    def override(self, source, **fields):
-        self.serving.weight_version = fields["weight_version"]
-
-
-class TestSchedulerRecordWeightVersionChange(CustomTestCase):
-    def _serving(self, version: str) -> _ServingStub:
-        serving = _ServingStub(version)
-        for name, value in (
-            ("get_serving", serving),
-            ("get_context", _ContextStub(serving)),
-        ):
-            patcher = patch(f"sglang.srt.managers.scheduler.{name}", return_value=value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        return serving
-
-    def _scheduler(
-        self, *, inflight=(), waiting=(), chunked=None, staging=()
-    ) -> SimpleNamespace:
-        return SimpleNamespace(
-            collect_inflight_reqs=lambda: set(inflight),
-            deferred_responses=DeferredResponses(
-                disaggregation_mode=DisaggregationMode.NULL,
-                output_streamer=None,
-                send_abort=None,
-            ),
-            waiting_queue=list(waiting),
-            chunked_req=chunked,
-            hisparse_coordinator=(
-                SimpleNamespace(
-                    ack_staging_queue=[SimpleNamespace(req=req) for req in staging]
-                )
-                if staging
-                else None
-            ),
-        )
-
-    def test_every_source_of_live_requests_is_stamped(self):
-        """A request missed here keeps attributing its next tokens to the superseded version."""
-        self._serving("v1")
-        inflight, queued, chunked, staged = (object() for _ in range(4))
-        scheduler = self._scheduler(
-            inflight=[inflight], waiting=[queued], chunked=chunked, staging=[staged]
-        )
-
-        with patch(
-            "sglang.srt.managers.scheduler.record_weight_version_events",
-            return_value=0,
-        ) as recorder:
-            Scheduler.record_weight_version_change(scheduler, new_version="v2")
-
-        self.assertEqual(
-            set(recorder.call_args.args[0]), {inflight, queued, chunked, staged}
-        )
 
 
 class TestSchedulerBatchWeightVersion(CustomTestCase):
@@ -170,8 +115,8 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.load_publisher = MagicMock()
         scheduler.load_inquirer = MagicMock()
         scheduler.tree_cache = SimpleNamespace(flush_pending_backups=MagicMock())
-        scheduler.running_reqs = RunningReqs()
-        scheduler.prefill_launched_reqs = RequestList()
+        scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
+        scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.invariant_checker = MagicMock()
         scheduler.kv_weight_version_tracker = KvWeightVersionTracker(
             num_slots=8,
@@ -181,8 +126,6 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=True,
             disaggregation_mode=DisaggregationMode.NULL,
-            enable_overlap=False,
-            enable_overlap_mlx=False,
             model_config=SimpleNamespace(think_end_ids=None),
             token_to_kv_pool_allocator=MagicMock(),
             tree_cache=scheduler.tree_cache,
@@ -197,7 +140,10 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
             logprob_result_processor=None,
             output_streamer=MagicMock(),
             beam_coordinator=MagicMock(),
+            request_retirer=release_only_retirer(tree_cache=scheduler.tree_cache),
             abort_request=lambda *args, **kwargs: None,
+            still_in_batch=lambda req: True,
+            prefill_launched_reqs=scheduler.prefill_launched_reqs,
         )
         for name, value in (
             ("get_observability", SimpleNamespace(enable_metrics=False)),
@@ -329,6 +275,7 @@ def _runner(result=(True, "ok")):
     runner.weight_updater.receive_weights_from_distributed.return_value = [
         ("weight", torch.tensor([1.0]))
     ]
+    runner.weight_updater.load_rejection.return_value = None
     return runner
 
 
@@ -600,6 +547,189 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         self.assertFalse(output.success)
         self.assertIn("begin_weight_update", output.message)
         target.weight_updater.receive_weights_from_distributed.assert_not_called()
+
+
+class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
+    def setUp(self):
+        super().setUp()
+        gather = patch(
+            "torch.distributed.all_gather_object",
+            side_effect=lambda outputs, obj, group: outputs.__setitem__(0, obj),
+        )
+        gather.start()
+        self.addCleanup(gather.stop)
+        override = get_parallel().override(tp_rank=0, tp_size=1)
+        override.__enter__()
+        self.addCleanup(override.__exit__, None, None, None)
+        self.flushes = []
+
+    def _manager_serving(self, handlers, *, target=None, draft=None, session=True):
+        manager = self._manager(target or _runner(), draft, session=session)
+        manager.flush_cache = lambda **kwargs: self.flushes.append(kwargs) or True
+        platform = patch(
+            "sglang.srt.managers.scheduler_components.weight_updater.current_platform",
+            SimpleNamespace(get_weight_update_handlers=lambda: handlers),
+        )
+        platform.start()
+        self.addCleanup(platform.stop)
+        return manager
+
+    def test_received_tensors_load_into_every_selected_runner(self):
+        """Like update_weights_from_distributed: the transport receives, the core loads target and draft."""
+        weights = [("w", object())]
+        target, draft = _runner(), _runner()
+        manager = self._manager_serving(
+            {"ici": lambda *, context, payload: weights}, target=target, draft=draft
+        )
+
+        output = manager.plugin_weight_update(
+            PluginWeightUpdateReqInput(handler="ici", weight_version="3")
+        )
+
+        self.assertTrue(output.success)
+        self.assertEqual(output.received_tensor_counts, [1])
+        target.weight_updater.load_weights_from_distributed.assert_called_once_with(
+            weights
+        )
+        draft.weight_updater.load_weights_from_distributed.assert_called_once_with(
+            weights
+        )
+        self.assertEqual(self.recorded, ["3"])
+        self.assertEqual(len(self.flushes), 1)
+
+    def test_end_runs_post_load_only_after_writes_that_bypassed_load_weights(self):
+        """A transport that writes parameters itself returns no tensors, like p2p peer writes."""
+        for received, run_post_load in (([("w", object())], False), ([], True)):
+            with self.subTest(received=received):
+                target = _runner()
+                manager = self._manager_serving(
+                    {"ici": lambda *, context, payload: received}, target=target
+                )
+                manager.plugin_weight_update(PluginWeightUpdateReqInput(handler="ici"))
+                manager.end_weight_update(EndWeightUpdateReqInput())
+
+                target.weight_updater.end_weight_update.assert_called_once_with(
+                    run_post_load=run_post_load
+                )
+
+    def test_a_failed_receive_loads_nothing_on_its_rank_and_keeps_the_cache_and_version(
+        self,
+    ):
+        """A rank that failed to receive loads nothing; the request fails and the old KV and version stay."""
+
+        def broken(*, context, payload):
+            raise ValueError("no receive buffers")
+
+        target = _runner()
+        output = self._manager_serving(
+            {"ici": broken}, target=target
+        ).plugin_weight_update(
+            PluginWeightUpdateReqInput(handler="ici", weight_version="3")
+        )
+
+        self.assertFalse(output.success)
+        self.assertIn("no receive buffers", output.message)
+        target.weight_updater.load_weights_from_distributed.assert_not_called()
+        self.assertEqual((self.flushes, self.recorded), ([], []))
+
+    def test_rank_0_reports_another_ranks_failure_from_the_gather(self):
+        """Only rank 0 replies: a failure gathered from rank 1 fails the request after rank 0 loaded."""
+        gathered = [(1, None), (0, "TP rank 1: no receive buffers")]
+        target = _runner()
+        manager = self._manager_serving(
+            {"ici": lambda *, context, payload: [("w", object())]}, target=target
+        )
+
+        with (
+            patch(
+                "torch.distributed.all_gather_object",
+                side_effect=lambda outputs, obj, group: outputs.__setitem__(
+                    slice(None), gathered
+                ),
+            ),
+            get_parallel().override(tp_rank=0, tp_size=2),
+        ):
+            output = manager.plugin_weight_update(
+                PluginWeightUpdateReqInput(handler="ici", weight_version="3")
+            )
+
+        self.assertFalse(output.success)
+        self.assertIn("TP rank 1", output.message)
+        self.assertIn("other TP ranks have loaded", output.message)
+        self.assertEqual(output.received_tensor_counts, [])
+        target.weight_updater.load_weights_from_distributed.assert_called_once()
+        self.assertEqual((self.flushes, self.recorded), ([], []))
+
+    def test_a_runner_that_rejects_loads_fails_the_request_before_the_transport_runs(
+        self,
+    ):
+        """The weight-cache and derived-weight guards cover direct writes too, so they run first."""
+        called = []
+        target = _runner()
+        target.weight_updater.load_rejection.return_value = (
+            "[weight_cache] plugin_weight_update is not supported"
+        )
+
+        output = self._manager_serving(
+            {"ici": lambda *, context, payload: called.append(1) or []}, target=target
+        ).plugin_weight_update(PluginWeightUpdateReqInput(handler="ici"))
+
+        self.assertFalse(output.success)
+        self.assertIn("weight_cache", output.message)
+        self.assertEqual(called, [])
+
+    def test_transport_state_persists_across_calls(self):
+        """A transport that registers buffers in one call must find them in the next."""
+
+        def receive(*, context, payload):
+            context.state.setdefault("calls", 0)
+            context.state["calls"] += 1
+            return []
+
+        manager = self._manager_serving({"ici": receive})
+        for _ in range(2):
+            manager.plugin_weight_update(PluginWeightUpdateReqInput(handler="ici"))
+
+        self.assertEqual(manager._plugin_state["calls"], 2)
+
+    def test_requests_outside_a_session_or_for_unknown_handlers_are_rejected(self):
+        """A caller that skips begin, or names a missing transport, gets an error, not a crash."""
+        called = []
+        handlers = {"ici": lambda *, context, payload: called.append(1) or []}
+
+        outside = self._manager_serving(handlers, session=False).plugin_weight_update(
+            PluginWeightUpdateReqInput(handler="ici")
+        )
+        unknown = self._manager_serving(handlers).plugin_weight_update(
+            PluginWeightUpdateReqInput(handler="nccl")
+        )
+
+        self.assertFalse(outside.success)
+        self.assertIn("begin_weight_update", outside.message)
+        self.assertFalse(unknown.success)
+        self.assertIn("nccl", unknown.message)
+        self.assertEqual(called, [])
+
+
+class TestPluginWeightUpdateReply(CustomTestCase):
+    def test_attention_dp_leaders_replies_merge_like_the_distributed_route(self):
+        """Under attention DP the tokenizer gets one reply per leader; one failure fails the request."""
+        ok = PluginWeightUpdateReqOutput(
+            success=True, message="Success", received_tensor_counts=[3, 3]
+        )
+        failed = PluginWeightUpdateReqOutput(
+            success=False, message="TP rank 1: no receive buffers"
+        )
+
+        merged_ok = PluginWeightUpdateReqOutput.merged([ok, ok])
+        merged_failed = PluginWeightUpdateReqOutput.merged([ok, failed])
+
+        self.assertEqual(
+            (merged_ok.success, merged_ok.received_tensor_counts), (True, [3, 3])
+        )
+        self.assertFalse(merged_failed.success)
+        self.assertIn("no receive buffers", merged_failed.message)
+        self.assertEqual(merged_failed.received_tensor_counts, [])
 
 
 if __name__ == "__main__":

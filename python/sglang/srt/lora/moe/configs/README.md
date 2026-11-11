@@ -3,7 +3,7 @@
 `<arch>.plans.json` selects the base row layout and LoRA execution stages for
 `lora_triton`, `lora_cutedsl` and `lora_marlin`. Supported capability majors
 9 and 10 select `sm90` and `sm100`, respectively. Other architectures,
-including SM120, are unsupported. A missing table uses `default.plans.json`.
+including SM120, are unsupported.
 
 ## Selection and overrides
 

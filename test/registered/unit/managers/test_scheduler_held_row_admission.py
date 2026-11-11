@@ -13,7 +13,12 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -22,13 +27,14 @@ NUM_ROWS = 4
 
 
 class _Req:
+    owner_list = None
+
     def __init__(self, holds_row):
         self.kv = SimpleNamespace(holds_kv=holds_row)
         self.beam_group = None
         self.token_indices_to_pool = None
-        self.inflight_middle_chunks = 0
 
-    def init_next_round_input(self, tree_cache=None):
+    def init_next_round_input(self, tree_cache=None, **_):
         pass
 
 
@@ -63,10 +69,13 @@ class TestHeldRowAdmission(CustomTestCase):
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
         s.is_hybrid_swa = False
-        s.waiting_queue = waiting
-        s.chunked_req = final_chunk
+        s.waiting_queue = IndexedReqList(ListKind.WAITING)
+        move(waiting, s.waiting_queue)
+        s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
+        move([final_chunk], s.chunked_reqs)
         s.min_free_slots_delayer = None
-        s.policy = Mock()
+        s.invariant_checker = Mock()
+        s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
         s.policy.shortest_prefill_chunk_limit.return_value = None
         s.processed_tokens_counter = 0
         s.chunked_prefill_size = 8192
@@ -75,11 +84,14 @@ class TestHeldRowAdmission(CustomTestCase):
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )
         s.get_prefill_adder_class = lambda: _Adder
+        s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(
             buffer_pipeline=None, storage_prefetch_retries=None
         )
-        s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
+        s.token_to_kv_pool_allocator = SimpleNamespace(
+            state_slots=None, pools_share_memory=False
+        )
         s.new_token_ratio_tracker = SimpleNamespace(current=0.0)
         s.max_prefill_tokens = 1 << 20
         s.is_mixed_chunk = False
@@ -90,8 +102,10 @@ class TestHeldRowAdmission(CustomTestCase):
         s.enable_lora = False
         s.disaggregation_mode = disaggregation_mode
         s.disagg_prefill_bootstrap_queue = None
+        s.disagg_prefill_transfer_queue = []
         s.enable_hicache_storage = False
         s.enable_lmcache = False
+        s.enable_unified_cache_external_linker = False
         s.truncation_align_size = None
         s.model_config = None
         s.enable_overlap = False
@@ -101,7 +115,8 @@ class TestHeldRowAdmission(CustomTestCase):
             available_size=lambda: NUM_ROWS - len(running) - 1
         )
         s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
-        s.running_reqs = RunningReqs()
+        s.running_reqs = KeyedReqList(ListKind.DECODING)
+        s.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         return s
 
     def _admitted(self, disaggregation_mode):

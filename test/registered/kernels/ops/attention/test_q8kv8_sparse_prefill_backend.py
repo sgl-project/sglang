@@ -40,6 +40,7 @@ from sglang.test.kernels.deepseek_v4.k_cache_reference import (
 )
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def test_q8kv8_sparse_prefill_backend_selector_uses_cli_value(monkeypatch):
@@ -723,10 +724,9 @@ def test_q8kv8_sparse_prefill_real_kernel_repeated_launch_stable():
 @pytest.mark.parametrize("ratio", [0, 1, 2, 4, 128])
 @pytest.mark.parametrize("scenario", ["first", "next", "replay", "tail", "large"])
 def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
-    from sglang.kernels.ops.attention.flash_mla_interface import (
-        FlashMLASchedMeta,
-        flash_mla_with_kvcache,
-    )
+    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+
+    from sglang.kernels.ops.attention.flash_mla_interface import flash_mla_with_kvcache
     from sglang.srt.mem_cache.dsv41_request_window import window_layout
     from sglang.srt.runtime_context import get_platform
 
@@ -814,9 +814,16 @@ def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
         attn_sink=sink,
     )
     cache = backend.forward_metadata.sparse_prefill_cache
-    if ratio:
+    if ratio == 128:
         _, combined, combined_lens = cache.layer_inputs(ratio, core, page_size)
+        c_base = torch.arange(2, device=device) * c_max
         n_compressed = 2 * c_max
+    elif ratio:
+        _, combined, combined_lens = cache.layer_inputs(ratio, core, page_size)
+        # Below c128 each request packs only its own compressed history.
+        c_lens = seq.long() // ratio
+        c_base = torch.cumsum(c_lens, 0) - c_lens
+        n_compressed = int(c_lens.sum())
     else:
         combined, combined_lens = cache.c0_combined_indices, cache.c0_combined_lens
         n_compressed = 0
@@ -826,7 +833,7 @@ def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
         w = int(layout.lengths[i])
         assert int(combined_lens[i]) == c + w
         if c:
-            torch.testing.assert_close(combined[i, :c], raw[i, :c] + group[i] * c_max)
+            torch.testing.assert_close(combined[i, :c], raw[i, :c] + c_base[group[i]])
         torch.testing.assert_close(
             combined[i, c : c + w], layout.indices[i, :w] + n_compressed
         )

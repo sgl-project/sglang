@@ -23,7 +23,8 @@
 #   GPU_ARCH=*-rocm1010 is ROCm 10.1 + torch 2.12 off the same channel, and
 #   keeps the SDK's Triton instead of building one.
 #   GPU_ARCH=gfx1250-rocm1010 also replaces the SDK's RCCL with a newer build
-#   from rocm-systems; see BUILD_RCCL.
+#   from rocm-systems (see BUILD_RCCL), and its ROCr and rocprofiler-sdk with
+#   patched builds (see BUILD_ROCPROFILER).
 
 # Usage (to build SGLang ROCm + Mori docker image):
 # remove --build-arg NIC_BACKEND=ainic since new MoRI JIT will do NIC auto detection on target
@@ -356,7 +357,7 @@ ENV BUILD_MOONCAKE="1"
 # gfx1250 is promoted to its own AITER pin here, ahead of the gfx942/gfx950
 # shared pin. Validated by the manual gfx1250 AITER Scout #173 A/B (no automated
 # gfx1250 Scout): gpt-oss, Flux.2, Wan2.2 and Kimi-K2 all NO_NEW_REGRESSION.
-ENV AITER_COMMIT_DEFAULT="26f4f1fb2de14d122c71f5fed7afb97a5c97cade"
+ENV AITER_COMMIT_DEFAULT="07ff5f318b8a34334125a2287acbfcc56bd2898a"
 # The upstream Triton the gfx1250 bring-up was validated against, carried over
 # from the ROCm 7.14 flavor this image replaced. Built from source below.
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
@@ -379,11 +380,17 @@ ENV TRITON_REVERT_COMMITS_DEFAULT="9debefe44117a44c274b05033cfe9e4858883b86"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="26f4f1fb2de14d122c71f5fed7afb97a5c97cade"
+ENV AITER_COMMIT_DEFAULT="07ff5f318b8a34334125a2287acbfcc56bd2898a"
 ENV BUILD_RCCL="1"
-# Head of ROCm/rocm-systems#14254: develop plus a fix for a hang in the first
-# all-reduce on gfx1250. Not merged yet; move to develop once it is.
-ENV RCCL_COMMIT_DEFAULT="1c0ab425abda9d1fd80fa977c253556b14eb140b"
+# rocm-systems develop. The fix for the hang in the first all-reduce on gfx1250
+# (ROCm/rocm-systems#14254) has landed on the mainline, so pin develop instead
+# of the PR branch.
+ENV RCCL_COMMIT_DEFAULT="d2e0de357464cd34cabaea859b71c10da88e7ae9"
+# torch.profiler hangs on TP workloads in the queue interposition of the 10.1
+# rocprofiler-sdk ("Async signal handler still waiting on signal"). The fix
+# (ROCm/rocm-systems#9984) needs ROCr's hsa_amd_signal_wait_any fix (#8564), and
+# 10.1 has neither.
+ENV BUILD_ROCPROFILER="1"
 # hipBLASLt 10.1 looks for TensileLibrary_lazy_gfx1250.dat directly under
 # library/, not library/<arch>/, and every GEMM fails without this.
 ENV HIPBLASLT_TENSILE_LIBPATH="/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/hipblaslt/library/gfx1250"
@@ -458,12 +465,17 @@ ARG RCCL_REPO="https://github.com/ROCm/rocm-systems.git"
 ARG RCCL_COMMIT=""
 ENV RCCL_COMMIT="${RCCL_COMMIT:-${RCCL_COMMIT_DEFAULT}}"
 
+ARG ROCPROFILER_REPO="https://github.com/ROCm/rocm-systems.git"
+# Cherry-picked in order onto the rocm-systems commit the SDK was built from:
+# ROCr #8564, then rocprofiler-sdk #9984 and #12957.
+ARG ROCPROFILER_CHERRY_PICKS="80696bf14d3ce2acf4fa5480488be4b6dba8d73c 6cdcc6a08813ca7940f0ba5b5fb48ae70116b712 93bd837e4d641b8243491331e25df2ff6f61c371"
+
 ARG LLVM_REPO="https://github.com/jrbyrnes/llvm-project.git"
 ARG LLVM_BRANCH="MainOpSelV2"
 ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="78566d459c140956fd15606e102132b1acc83eec"
+ARG MOONCAKE_COMMIT="748af1a53dba2d57c110de0e7feb5613ddb8835b"
 
 ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
 ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
@@ -800,23 +812,23 @@ RUN pip list --format=freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt
 RUN cd sglang \
     && cp python/pyproject_other.toml python/pyproject.toml \
     && case "${GPU_ARCH}" in \
-         *-rocm1000) srt_extras="srt_hip_rocm724,diffusion_hip"; \
+         *-rocm1000) srt_extras="srt_hip_rocm724,diffusion_hip,fastokens"; \
                      all_extras="all_hip_rocm724" ; \
                      CONS="-c /tmp/constraints.txt" ; \
                      ;; \
-         *-rocm1010) srt_extras="srt_hip_rocm101,diffusion_hip"; \
+         *-rocm1010) srt_extras="srt_hip_rocm101,diffusion_hip,fastokens"; \
                      all_extras="all_hip_rocm101" ; \
                      CONS="-c /tmp/constraints.txt" ; \
                      ;; \
-         *-rocm724) srt_extras="srt_hip_rocm724,diffusion_hip"; \
+         *-rocm724) srt_extras="srt_hip_rocm724,diffusion_hip,fastokens"; \
                     all_extras="all_hip_rocm724" ; \
                     CONS="-c /tmp/constraints.txt" ; \
                     ;; \
-         *-rocm720) srt_extras="srt_hip,diffusion_hip"; \
+         *-rocm720) srt_extras="srt_hip,diffusion_hip,fastokens"; \
                     all_extras="all_hip" ; \
                     CONS="-c /tmp/constraints.txt" ; \
                     ;; \
-         *) srt_extras="srt_hip,diffusion_hip"; \
+         *) srt_extras="srt_hip,diffusion_hip,fastokens"; \
             all_extras="all_hip" ; \
             CONS="-c /tmp/constraints.txt" ; \
             echo 'diffusers==0.37.0' >> /tmp/constraints.txt ; \
@@ -1160,6 +1172,59 @@ RUN if [ "${BUILD_RCCL:-0}" = "1" ]; then \
         done; \
         cd / && rm -rf /sgl-workspace/rocm-systems /opt/rccl /tmp/librccl.so.1; \
         python3 -c "import ctypes, torch; v = ctypes.c_int(); ctypes.CDLL('librccl.so.1').ncclGetVersion(ctypes.byref(v)); maps = sorted({l.split()[-1] for l in open('/proc/self/maps') if 'librccl' in l}); print('[RCCL] ncclGetVersion', v.value, maps); assert len(maps) == 1, maps"; \
+    fi
+
+# -----------------------
+# ROCr + rocprofiler-sdk (BUILD_ROCPROFILER=1 stages only): rebuild both from
+# the rocm-systems commit the SDK was built from (TheRock manifest) with
+# ROCPROFILER_CHERRY_PICKS applied, and overwrite the SDK's libhsa-runtime64.so.1
+# and librocprofiler-sdk.so.1. ROCr links against the SDK's own sysdeps (elf,
+# drm, numa), and both files keep the stock RPATH, as in the RCCL block.
+RUN if [ "${BUILD_ROCPROFILER:-0}" = "1" ]; then \
+        set -eux; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends xxd libdw-dev libelf-dev; \
+        rm -rf /var/lib/apt/lists/*; \
+        pip install --no-cache-dir patchelf; \
+        SP="$VIRTUAL_ENV/lib/python3.12/site-packages"; \
+        SYSDEPS="${ROCM_HOME}/lib/rocm_sysdeps"; \
+        PIN="$(python3 -c "import json; m = json.load(open('$SP/_rocm_sdk_core/share/therock/therock_manifest.json')); print(next(s['pin_sha'] for s in m['submodules'] if s['submodule_name'] == 'rocm-systems'))")"; \
+        echo "[ROCPROFILER] rocm-systems ${PIN} + ${ROCPROFILER_CHERRY_PICKS}"; \
+        mkdir -p /sgl-workspace/rocm-systems && cd /sgl-workspace/rocm-systems; \
+        git init -q; \
+        git remote add origin "${ROCPROFILER_REPO}"; \
+        git sparse-checkout init --cone; \
+        git sparse-checkout set projects/rocr-runtime projects/rocprofiler-sdk; \
+        git fetch --depth 1 --filter=blob:none origin "${PIN}"; \
+        git checkout -q FETCH_HEAD; \
+        # depth 2 also fetches the parent of each commit, which cherry-pick diffs against
+        for c in ${ROCPROFILER_CHERRY_PICKS}; do git fetch --depth 2 --filter=blob:none origin "$c"; done; \
+        git -c user.name=sglang -c user.email=sglang@localhost cherry-pick ${ROCPROFILER_CHERRY_PICKS}; \
+        git submodule update --init --depth 1 --jobs 8 -- $(git config --file .gitmodules --get-regexp path \
+            | awk '{print $2}' | grep '^projects/rocprofiler-sdk/external/' | grep -vE 'googletest|doxygen'); \
+        PKG_CONFIG_PATH="${SYSDEPS}/lib/pkgconfig" cmake -S projects/rocr-runtime -B /tmp/rocr-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="${ROCM_HOME};${SYSDEPS}" \
+            -DLIBELF_INCLUDE_DIRS="${SYSDEPS}/include" -DLIBELF_LIBRARIES="${SYSDEPS}/lib/libelf.so"; \
+        cmake --build /tmp/rocr-build --parallel "$(nproc)"; \
+        cmake -S projects/rocprofiler-sdk -B /tmp/rocprofiler-sdk-build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${ROCM_HOME}" -DROCPROFILER_BUILD_TESTS=OFF \
+            -DROCPROFILER_BUILD_SAMPLES=OFF -DROCPROFILER_BUILD_DOCS=OFF; \
+        cmake --build /tmp/rocprofiler-sdk-build --parallel "$(nproc)"; \
+        for spec in libhsa-runtime64:/tmp/rocr-build librocprofiler-sdk:/tmp/rocprofiler-sdk-build; do \
+            lib="${spec%%:*}"; build="${spec#*:}"; \
+            cp -L "$(find "$build" -name "$lib.so.1" -path '*/lib/*' | head -1)" "/tmp/$lib.so.1"; \
+            patchelf --force-rpath --set-rpath "$(patchelf --print-rpath "$SP/_rocm_sdk_core/lib/$lib.so.1")" "/tmp/$lib.so.1"; \
+            for d in "$SP/_rocm_sdk_core/lib" "$SP/_rocm_sdk_devel/lib"; do \
+                # _rocm_sdk_devel also ships $lib.so and $lib.so.1.<version> as hard links to the stock file
+                names="$(cd "$d" && ls "$lib".so*)"; \
+                rm -f "$d/$lib".so*; \
+                cp "/tmp/$lib.so.1" "$d/$lib.so.1"; \
+                for n in $names; do [ "$n" = "$lib.so.1" ] || ln -sf "$lib.so.1" "$d/$n"; done; \
+            done; \
+        done; \
+        cd / && rm -rf /sgl-workspace/rocm-systems /tmp/rocr-build /tmp/rocprofiler-sdk-build \
+            /tmp/libhsa-runtime64.so.1 /tmp/librocprofiler-sdk.so.1; \
+        python3 -c "import ctypes, torch; [ctypes.CDLL(n) for n in ('libhsa-runtime64.so.1', 'librocprofiler-sdk.so.1')]; maps = sorted({l.split()[-1] for l in open('/proc/self/maps') if 'libhsa-runtime64' in l or 'librocprofiler-sdk.so' in l}); print('[ROCPROFILER]', maps); assert len(maps) == 2, maps"; \
     fi
 
 # -----------------------

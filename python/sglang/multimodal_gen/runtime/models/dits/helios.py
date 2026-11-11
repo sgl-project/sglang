@@ -499,6 +499,35 @@ class HeliosTransformerBlock(nn.Module):
 
         HELIOS_GATED_RESIDUAL.mark(self)
 
+    def _modulated_norm(self, norm, hidden_states, shift, scale, lengths):
+        if len(lengths) == 1:
+            return norm(hidden_states, shift, scale)
+        return torch.cat(
+            [
+                norm(states, shift[:, i : i + 1], scale[:, i : i + 1])
+                for i, states in enumerate(hidden_states.split(lengths, dim=1))
+            ],
+            dim=1,
+        )
+
+    def _gated_residual(self, hidden_states, update, gate, lengths, fp32_update=False):
+        outputs = []
+        for i, (states, value) in enumerate(
+            zip(hidden_states.split(lengths, dim=1), update.split(lengths, dim=1))
+        ):
+            if len(lengths) > 1:
+                states, value = states.contiguous(), value.contiguous()
+            segment_gate = gate if len(lengths) == 1 else gate[:, i : i + 1]
+            fused = try_gated_residual(
+                HELIOS_GATED_RESIDUAL, self, states, value, segment_gate
+            )
+            if fused is None:
+                if fp32_update:
+                    value = value.float()
+                fused = (states.float() + value * segment_gate).type_as(states)
+            outputs.append(fused)
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=1)
+
     def forward(
         self,
         hidden_states,
@@ -507,34 +536,28 @@ class HeliosTransformerBlock(nn.Module):
         rotary_emb,
         original_context_length=None,
         cross_attn_key_value=None,
+        modulation_lengths=None,
     ):
-        if temb.ndim == 4:
-            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                self.scale_shift_table.unsqueeze(0) + temb.float()
-            ).chunk(6, dim=2)
-            shift_msa = shift_msa.squeeze(2)
-            scale_msa = scale_msa.squeeze(2)
-            gate_msa = gate_msa.squeeze(2)
-            c_shift_msa = c_shift_msa.squeeze(2)
-            c_scale_msa = c_scale_msa.squeeze(2)
-            c_gate_msa = c_gate_msa.squeeze(2)
-        else:
-            shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
-                self.scale_shift_table + temb.float()
-            ).chunk(6, dim=1)
+        # History and current tokens each share one conditioning row.
+        if temb.ndim == 3:
+            temb = temb.unsqueeze(1)
+        lengths = modulation_lengths or (hidden_states.shape[1],)
+        if len(lengths) == 2 and lengths[0] == 0:
+            temb = temb[:, 1:]
+            lengths = lengths[1:]
+        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+            self.scale_shift_table.unsqueeze(0).float() + temb.float()
+        ).unbind(dim=2)
 
         # 1. Self-attention
-        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
+        norm_hidden_states = self._modulated_norm(
+            self.norm1, hidden_states, shift_msa, scale_msa, lengths
+        )
         attn_output = self.attn1(
             norm_hidden_states, rotary_emb, original_context_length
         )
-        fused = try_gated_residual(
-            HELIOS_GATED_RESIDUAL, self, hidden_states, attn_output, gate_msa
-        )
-        hidden_states = (
-            fused
-            if fused is not None
-            else (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
+        hidden_states = self._gated_residual(
+            hidden_states, attn_output, gate_msa, lengths
         )
 
         # 2. Cross-attention
@@ -567,17 +590,12 @@ class HeliosTransformerBlock(nn.Module):
             hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
-        norm_hidden_states = self.norm3(hidden_states, c_shift_msa, c_scale_msa)
-        ff_output = self.ffn(norm_hidden_states)
-        fused = try_gated_residual(
-            HELIOS_GATED_RESIDUAL, self, hidden_states, ff_output, c_gate_msa
+        norm_hidden_states = self._modulated_norm(
+            self.norm3, hidden_states, c_shift_msa, c_scale_msa, lengths
         )
-        hidden_states = (
-            fused
-            if fused is not None
-            else (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(
-                hidden_states
-            )
+        ff_output = self.ffn(norm_hidden_states)
+        hidden_states = self._gated_residual(
+            hidden_states, ff_output, c_gate_msa, lengths, fp32_update=True
         )
 
         return hidden_states
@@ -927,10 +945,9 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 batch_size, history_context_length, -1
             )
             timestep_proj_t0 = (
-                timestep_proj_t0.unflatten(-1, (6, -1))
-                .float()
+                timestep_proj_t0.float()
                 .view(1, 6, 1, -1)
-                .expand(batch_size, -1, history_context_length, -1)
+                .expand(batch_size, -1, -1, -1)
             )
 
         # Take only the time embeddings (temb, timestep_proj); skip the text
@@ -942,24 +959,25 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         cross_attn_key_values = self._get_cross_attn_key_values(
             encoder_hidden_states, forward_batch
         )
-        # cast the compact rows to fp32 once; the blocks' .float() is then a no-op
-        timestep_proj = timestep_proj.unflatten(-1, (6, -1)).float()
+        # Keep one row per timestep; blocks broadcast it within each token span.
+        timestep_proj = timestep_proj.float().view(batch_size, 6, 1, -1)
 
         if indices_hidden_states is not None and not self.zero_history_timestep:
             main_repeat_size = hidden_states.shape[1]
         else:
             main_repeat_size = effective_context_length
         temb = temb.view(batch_size, 1, -1).expand(batch_size, main_repeat_size, -1)
-        timestep_proj = timestep_proj.view(batch_size, 6, 1, -1).expand(
-            batch_size, 6, main_repeat_size, -1
-        )
 
         if indices_hidden_states is not None and self.zero_history_timestep:
             temb = torch.cat([temb_t0, temb], dim=1)
             timestep_proj = torch.cat([timestep_proj_t0, timestep_proj], dim=2)
 
-        if timestep_proj.ndim == 4:
-            timestep_proj = timestep_proj.permute(0, 2, 1, 3)
+        timestep_proj = timestep_proj.permute(0, 2, 1, 3)
+        modulation_lengths = (
+            (history_context_length, effective_context_length)
+            if timestep_proj.shape[1] == 2
+            else (hidden_states.shape[1],)
+        )
 
         # 7. Transformer blocks
         hidden_states = hidden_states.contiguous()
@@ -974,6 +992,7 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 rotary_emb,
                 effective_context_length,
                 cross_attn_key_value=key_value,
+                modulation_lengths=modulation_lengths,
             )
 
         self.cnt += 1
