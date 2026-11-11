@@ -4093,6 +4093,7 @@ class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
+        self._start_overlap_host_loop()
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
         defer_prealloc = (

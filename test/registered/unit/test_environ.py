@@ -16,7 +16,7 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 # The first HARD_GATED children are EnvRuntimeBool: the master is a hard gate.
-HARD_GATED = 12
+HARD_GATED = 13
 NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_OPT_OVERLAP_EVENT_REUSE",
     "SGLANG_OPT_MULTI_CTA_VERIFY_TREE_SAMPLING",
@@ -30,6 +30,7 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_OPT_SCHEDULE_BATCH_FIELD_SNAPSHOT",
     "SGLANG_OPT_FUTURE_MAP_INDEX_OPS",
     "SGLANG_OPT_SPEC_DECODE_EMPTY_ALLOCATION",
+    "SGLANG_OPT_FREEZE_ENV_READS",
     "SGLANG_DSPARK_FUSED_ACCEPT_TAIL",
     "SGLANG_DSPARK_DEFER_CONTEXT_KV",
     "SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK",
@@ -165,6 +166,29 @@ class TestEnvField(unittest.TestCase):
             warnings.simplefilter("always")
             self.assertIs(envs.SGLANG_TEST_RETRACT.get(), False)
         self.assertIn("Invalid value", str(caught[0].message))
+
+    def test_frozen_reads_serve_the_first_value_until_set_or_clear(self):
+        from sglang.srt import environ
+
+        field = envs.SGLANG_TEST_RETRACT
+        with patch.object(environ, "_FROZEN", False):
+            environ.freeze_env_reads()
+            os.environ[field.name] = "1"
+            self.assertIs(field.get(), True)
+            os.environ[field.name] = "0"
+            self.assertIs(field.get(), True)
+            field.set(False)
+            self.assertIs(field.get(), False)
+            with field.override(True):
+                self.assertIs(field.get(), True)
+            self.assertIs(field.get(), False)
+            field.clear()
+            self.assertIs(field.get(), False)
+            os.environ[field.name] = "1"
+            self.assertIs(field.get(), False)
+            field.clear()
+        os.environ[field.name] = "1"
+        self.assertIs(field.get(), True)
 
     def test_mega_runtime_defaults_and_registry_scope(self):
         with ExitStack() as stack:

@@ -42,6 +42,17 @@ def _default_on_in_ci() -> bool:
     return envs.SGLANG_IS_IN_CI.get()
 
 
+_UNREAD = object()
+# freeze_env_reads(): get() serves each field's first value read after the freeze; set,
+# clear and override drop it. A direct os.environ write after the freeze is not seen.
+_FROZEN = False
+
+
+def freeze_env_reads() -> None:
+    global _FROZEN
+    _FROZEN = True
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -51,6 +62,7 @@ class EnvField:
         # whether the env var is explicitly set to None.
         self._set_to_none = False
         self.secret = secret
+        self._frozen_value = _UNREAD
 
     def __set_name__(self, owner, name):
         assert EnvField._allow_set_name, "Usage like `a = envs.A` is not allowed"
@@ -65,6 +77,14 @@ class EnvField:
         return self.default() if callable(self.default) else self.default
 
     def get(self) -> Any:
+        if _FROZEN:
+            value = self._frozen_value
+            if value is _UNREAD:
+                value = self._frozen_value = self._get()
+            return value
+        return self._get()
+
+    def _get(self) -> Any:
         value = os.getenv(self.name)
 
         # Explicitly set to None
@@ -91,6 +111,7 @@ class EnvField:
     def set(self, value: Any):
         self._set_to_none = value is None
         os.environ[self.name] = str(value)
+        self._frozen_value = _UNREAD
 
     @contextmanager
     def override(self, value: Any):
@@ -106,10 +127,12 @@ class EnvField:
             else:
                 os.environ.pop(self.name, None)
             self._set_to_none = backup_set_to_none
+            self._frozen_value = _UNREAD
 
     def clear(self):
         os.environ.pop(self.name, None)
         self._set_to_none = False
+        self._frozen_value = _UNREAD
 
     def __bool__(self):
         raise RuntimeError(
@@ -349,6 +372,12 @@ class Envs:
     # A spec decode step that needs no new KV pages (most steps at page size 64) skips the
     # length tensors and their two H2D copies, which only the allocation reads.
     SGLANG_OPT_SPEC_DECODE_EMPTY_ALLOCATION = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # From an overlap event loop's start, envs.X.get() serves each variable's first read
+    # (freeze_env_reads; set / clear / override still refresh it): dozens of os.environ
+    # lookups per round.
+    SGLANG_OPT_FREEZE_ENV_READS = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
 

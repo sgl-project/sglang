@@ -125,7 +125,7 @@ from sglang.srt.distributed.parallel_state import (
     close_custom_all_reduce,
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, freeze_env_reads
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.hf_transformers import (
@@ -2210,10 +2210,17 @@ class Scheduler(
             self.last_batch = batch
             self.invariant_checker.run(CheckPhase.BUSY, batch)
 
+    def _start_overlap_host_loop(self) -> None:
+        """Host-path switches applied when an overlap event loop starts."""
+        if envs.SGLANG_OPT_FREEZE_ENV_READS.get():
+            freeze_env_reads()
+            logger.info("Environment reads frozen for the overlap event loop.")
+
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.enable_skip_finishing_decode = True
+        self._start_overlap_host_loop()
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
