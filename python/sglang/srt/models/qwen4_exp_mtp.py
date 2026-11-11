@@ -17,7 +17,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
+from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import is_npu
@@ -45,7 +45,7 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         config.full_attention_interval = 1
         config.ple_layer_ids = []
 
-        quant_config = _mtp_quant_config(quant_config)
+        quant_config = self.own_quant_config(quant_config)
 
         self.config = config
         self.quant_config = quant_config
