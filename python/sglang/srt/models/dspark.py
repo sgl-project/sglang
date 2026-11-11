@@ -22,7 +22,7 @@ from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
@@ -32,7 +32,6 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils import is_gfx95_supported
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 if TYPE_CHECKING:
@@ -40,26 +39,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# fp8 target lm_head GEMM for the DSPARK verify logits, opt-in via
-# SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD. The bf16 head matmul
-# [num_verify_tokens, hidden] x [hidden, vocab_slice] is a per-decode-step cost
-# that grows with the verify batch; running it in fp8 (per-token activation
-# scale + per-output-channel weight scale) roughly halves that GEMM. The weight
-# is fp8-quantized once and cached on the module. Evaluated once at import to
-# keep the per-token decode path free of env lookups.
-#
-# Platform guard: the fp8 _scaled_mm path is validated on gfx95x (MI355X). On
-# gfx942 (MI300X) it produces an accuracy regression, so gate the flag on the
-# arch -- a user who sets the env on gfx942 keeps the safe bf16 head matmul
-# (the flag stays inert) rather than silently hitting the accuracy issue.
-_DSPARK_FP8_LM_HEAD = (
-    envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.get() and is_gfx95_supported()
-)
-if envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.get() and not _DSPARK_FP8_LM_HEAD:
-    logger.warning(
-        "SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD is set but the fp8 lm_head path is only "
-        "supported on gfx95x; keeping the bf16 head matmul on this device."
-    )
 _FP8_DTYPE = torch.float8_e4m3fn
 _FP8_MAX = 448.0
 
@@ -91,6 +70,26 @@ def _fp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tenso
         scale_b=w_scale.t(),
         out_dtype=hidden.dtype,
     )
+
+
+def _mxfp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
+    from flashinfer import block_scale_interleave, mm_mxfp8, mxfp8_quantize
+
+    weight = lm_head.weight
+    cache = getattr(lm_head, "_mxfp8_weight_cache", None)
+    if cache is None or cache[0].shape != weight.shape:
+        n, k = weight.shape
+        w_q, w_sf = mxfp8_quantize(
+            weight.to(torch.bfloat16), is_sf_swizzled_layout=False
+        )
+        w_sf = block_scale_interleave(
+            w_sf.view(torch.uint8).reshape(n, k // 32).contiguous()
+        ).contiguous()
+        cache = (w_q, w_sf)
+        lm_head._mxfp8_weight_cache = cache
+    h_q, h_sf = mxfp8_quantize(hidden.to(torch.bfloat16), is_sf_swizzled_layout=True)
+    logits = mm_mxfp8(h_q, cache[0].t(), h_sf, cache[1], backend="cute-dsl")
+    return logits if logits.dtype == hidden.dtype else logits.to(hidden.dtype)
 
 
 def _is_pow2(n: int) -> bool:
@@ -132,13 +131,17 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
     if should_apply_lm_head_quant_method(lm_head, quant_method):
         return quant_method.apply(lm_head, hidden, None)
     weight = lm_head.weight
-    if (
-        _DSPARK_FP8_LM_HEAD
-        and weight.is_floating_point()
-        and hidden.shape[0] > 0
-        and weight.shape[-1] % 16 == 0
-    ):
-        return _fp8_lm_head_matmul(hidden, lm_head)
+    dtype = get_spec().speculative_dspark_lm_head_dtype
+    if dtype is not None and weight.is_floating_point() and hidden.shape[0] > 0:
+        if dtype == "fp8" and weight.shape[-1] % 16 == 0:
+            return _fp8_lm_head_matmul(hidden, lm_head)
+        if (
+            dtype == "mxfp8"
+            and hidden.is_cuda
+            and weight.shape[-1] % 32 == 0
+            and weight.shape[0] % 128 == 0
+        ):
+            return _mxfp8_lm_head_matmul(hidden, lm_head)
     return torch.matmul(hidden.to(weight.dtype), weight.T)
 
 

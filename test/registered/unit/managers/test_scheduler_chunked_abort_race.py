@@ -67,7 +67,8 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     empty_request_lists(sched)
     sched.enable_continuous_input_polling = False
     sched.result_queue = deque()
-    sched.chunked_req = chunked_req
+    if chunked_req is not None:
+        sched.chunked_reqs.join([chunked_req])
     sched._pending_chunked_abort_req = pending_req
     sched.disaggregation_mode = None
     sched.enable_hicache_storage = False
