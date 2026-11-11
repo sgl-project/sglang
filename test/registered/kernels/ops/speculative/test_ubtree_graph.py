@@ -57,9 +57,8 @@ def _lookup_config():
     return config
 
 
-def _make_fa3_verify_backend(width, algorithm, enabled, *, max_bs=1):
+def _make_fa3_verify_backend(width, algorithm, *, max_bs=1):
     from sglang.srt.configs.model_config import AttentionArch
-    from sglang.srt.environ import envs
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
     from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
     from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
@@ -105,7 +104,6 @@ def _make_fa3_verify_backend(width, algorithm, enabled, *, max_bs=1):
             speculative_eagle_topk=2,
         ),
         get_parallel().override(attn_tp_size=1),
-        envs.SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH.override(enabled),
     ):
         backend = FlashAttentionBackend(runner)
         backend.init_cuda_graph_state(max_bs, max_bs * width)
@@ -128,7 +126,7 @@ def test_eagle_full_mask_metadata_reuses_tree_columns(width, mode, batch_size, l
     from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
     from sglang.srt.model_executor.forward_mode import ForwardMode
 
-    backend = _make_fa3_verify_backend(width, "EAGLE", True, max_bs=batch_size)
+    backend = _make_fa3_verify_backend(width, "EAGLE", max_bs=batch_size)
     lengths = [4, 7][:live_bs] + [0] * (batch_size - live_bs)
     visible = torch.ones(width, width, dtype=torch.bool, device="cuda").tril()
     masks = [
@@ -189,18 +187,12 @@ def test_eagle_full_mask_metadata_reuses_tree_columns(width, mode, batch_size, l
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FA3 requires CUDA")
 @pytest.mark.parametrize("width", [2, 17, 32, 33, 49, 65])
-@pytest.mark.parametrize(
-    "algorithm,enabled", [("UBTREE", True), ("UBTREE", False), ("EAGLE", True)]
-)
-def test_fa3_verify_metadata_graph_isolated_and_refreshes_live_inputs(
-    width, algorithm, enabled
-):
+@pytest.mark.parametrize("algorithm", ["UBTREE", "EAGLE"])
+def test_fa3_verify_metadata_graph_isolated_and_refreshes_live_inputs(width, algorithm):
     from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
     from sglang.srt.model_executor.forward_mode import ForwardMode
 
-    backend = _make_fa3_verify_backend(width, algorithm, enabled)
-    optimized = algorithm == "UBTREE" and enabled
-    assert backend._ubtree_verify_metadata_in_graph == optimized
+    backend = _make_fa3_verify_backend(width, algorithm)
     q = torch.randn(width, 4, 64, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(3 * 512, 1, 2, 64, dtype=torch.bfloat16, device="cuda")
     v = torch.randn_like(k)
@@ -235,7 +227,7 @@ def test_fa3_verify_metadata_graph_isolated_and_refreshes_live_inputs(
     backend.init_forward_metadata_out_graph(batch, in_capture=True)
     backend.init_forward_metadata_out_graph(batch)
 
-    def attend(use_precomputed):
+    def attend():
         results = []
         for metadata in (
             backend.forward_metadata,
@@ -254,9 +246,6 @@ def test_fa3_verify_metadata_graph_isolated_and_refreshes_live_inputs(
                 causal=False,
                 return_softmax_lse=True,
                 num_splits=backend.num_splits,
-                scheduler_metadata=metadata.scheduler_metadata
-                if use_precomputed
-                else None,
                 ver=backend.fa_impl_ver,
             )
             results.extend(result[:2])
@@ -264,7 +253,7 @@ def test_fa3_verify_metadata_graph_isolated_and_refreshes_live_inputs(
 
     def run():
         backend.init_forward_metadata_in_graph(batch)
-        return attend(optimized)
+        return attend()
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -277,9 +266,6 @@ def test_fa3_verify_metadata_graph_isolated_and_refreshes_live_inputs(
     prefix = backend.forward_metadata
     suffix = backend.forward_metadata_spec_decode_expand
     metadata_pointers = (prefix.page_table.data_ptr(), suffix.page_table.data_ptr())
-    scheduler_pointers = tuple(
-        m.scheduler_metadata.data_ptr() if optimized else None for m in (prefix, suffix)
-    )
     for iteration, (row, length) in enumerate(((2, 13), (1, 2), (2, 193))):
         batch.req_pool_indices.fill_(row)
         batch.seq_lens.fill_(length)
@@ -307,13 +293,7 @@ def test_fa3_verify_metadata_graph_isolated_and_refreshes_live_inputs(
         order = torch.where(visible, columns, columns + width).argsort(dim=1)
         slots = backend.req_to_token[row, length : length + width].expand(width, -1)
         torch.testing.assert_close(suffix.page_table.long(), slots.gather(1, order))
-        for i, metadata in enumerate((prefix, suffix)):
-            if optimized:
-                assert metadata.scheduler_metadata.data_ptr() == scheduler_pointers[i]
-            else:
-                assert metadata.scheduler_metadata is None
-        # Compare both FA3 cascade legs with the ordinary per-call scheduler.
-        expected = attend(False)
+        expected = attend()
         for actual, reference in zip(captured, expected):
             torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-2)
 

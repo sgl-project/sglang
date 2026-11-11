@@ -8,7 +8,6 @@ import torch
 import sglang.srt.model_executor.model_runner as model_runner_module
 import sglang.srt.speculative.spec_utils as spec_utils
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention import flashattention_backend as flashattention_module
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
@@ -16,7 +15,6 @@ from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -201,92 +199,6 @@ class TestFlashAttentionDraftWidth(CustomTestCase):
                             actual_query_token_count,
                             "cu_seqlens_q must cover every flattened draft query row",
                         )
-
-
-class TestUBTreeMetadataGraphCapability(CustomTestCase):
-    def _backend(self, **overrides):
-        backend = FlashAttentionBackend.__new__(FlashAttentionBackend)
-        for name, value in dict(
-            is_draft_runner=False,
-            skip_prefill=False,
-            fa_impl_ver=3,
-            topk=2,
-            speculative_num_draft_tokens=32,
-            page_size=1,
-            use_mla=False,
-            has_swa=False,
-            local_attn_builder=None,
-            is_encoder_decoder=False,
-            runner_ids=SimpleNamespace(is_translating=False),
-            _kv_shard_pool=None,
-            _disable_scheduler_metadata_precompute=False,
-        ).items():
-            setattr(backend, name, overrides.get(name, value))
-        return backend
-
-    def test_only_supported_ubtree_target_can_enable(self):
-        with envs.SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH.override(True):
-            for algorithm in (None, "EAGLE", "EAGLE3", "DFLASH", "UBTREE"):
-                with self.subTest(algorithm=algorithm):
-                    with get_context().override_server_args(
-                        speculative_algorithm=algorithm
-                    ):
-                        self.assertEqual(
-                            self._backend()._can_enable_ubtree_verify_metadata_graph(),
-                            algorithm == "UBTREE",
-                        )
-            with get_context().override_server_args(speculative_algorithm="UBTREE"):
-                for field, value in (
-                    ("is_draft_runner", True),
-                    ("skip_prefill", True),
-                    ("fa_impl_ver", 4),
-                    ("topk", 1),
-                    ("speculative_num_draft_tokens", None),
-                    ("speculative_num_draft_tokens", 1),
-                    ("page_size", 128),
-                    ("use_mla", True),
-                    ("has_swa", True),
-                    ("local_attn_builder", object()),
-                    ("is_encoder_decoder", True),
-                    ("runner_ids", SimpleNamespace(is_translating=True)),
-                    ("_kv_shard_pool", object()),
-                    ("_disable_scheduler_metadata_precompute", True),
-                ):
-                    with self.subTest(field=field):
-                        self.assertFalse(
-                            self._backend(
-                                **{field: value}
-                            )._can_enable_ubtree_verify_metadata_graph()
-                        )
-                for width in (2, 17, 32, 33, 49, 65):
-                    with self.subTest(width=width):
-                        self.assertTrue(
-                            self._backend(
-                                speculative_num_draft_tokens=width
-                            )._can_enable_ubtree_verify_metadata_graph()
-                        )
-
-    def test_flag_is_required_and_only_verify_uses_the_frozen_capability(self):
-        with get_context().override_server_args(speculative_algorithm="UBTREE"):
-            with envs.SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH.override(False):
-                self.assertFalse(
-                    self._backend()._can_enable_ubtree_verify_metadata_graph()
-                )
-            backend = self._backend()
-            with envs.SGLANG_OPT_FA3_VERIFY_METADATA_IN_GRAPH.override(True):
-                backend._ubtree_verify_metadata_in_graph = (
-                    backend._can_enable_ubtree_verify_metadata_graph()
-                )
-            # Capture/replay cannot switch policies after an env override ends.
-            for mode in (
-                ForwardMode.DECODE,
-                ForwardMode.EXTEND,
-                ForwardMode.DRAFT_EXTEND_V2,
-            ):
-                self.assertFalse(backend._capture_ubtree_verify_metadata(mode))
-            self.assertTrue(
-                backend._capture_ubtree_verify_metadata(ForwardMode.TARGET_VERIFY)
-            )
 
 
 class TestFlashAttentionGraphMetadata(CustomTestCase):

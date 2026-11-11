@@ -505,8 +505,6 @@ def _handle_ubtree(server_args: ServerArgs) -> None:
     validate_runtime_config(cfg, tuple(attention_backends_of(cfg)))
     if cfg.enable_unified_memory:
         raise ValueError("UBTREE does not yet support unified memory")
-    if not envs.SGLANG_OPT_UBTREE_FA3_TREE_ONLY_MASK.get():
-        raise ValueError("UBTREE requires SGLANG_OPT_UBTREE_FA3_TREE_ONLY_MASK=1")
 
 
 def _handle_uno(server_args: ServerArgs) -> None:
