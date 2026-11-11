@@ -46,6 +46,58 @@ def _batch(extend_lens, starts=None, capture=CaptureHiddenMode.NULL):
     )
 
 
+class TestTailTokenCounts(CustomTestCase):
+    def test_eager_and_graph_tail_bound_counts_and_restore_full_extend(self):
+        """Compacting an extend to its SWA tail must also bound the real-row
+        counts consumed by attention and MoE, without modifying the saved scalars."""
+        for graph in (False, True):
+            for real in (0, 129):
+                with self.subTest(graph=graph, real=real):
+                    global_count = torch.tensor(real, dtype=torch.int32)
+                    local_count = torch.tensor(min(real, 30), dtype=torch.int32)
+                    batch = SimpleNamespace(
+                        attn_cp_metadata=None,
+                        global_num_token_non_padded_cpu=real,
+                        global_num_token_non_padded=global_count,
+                        num_token_non_padded=local_count,
+                    )
+                    backend = object.__new__(DeepseekV4AttnBackend)
+                    full = object()
+                    backend.forward_metadata = full
+                    backend.tail_forward_metadata = SimpleNamespace(
+                        late_layer_tail=SimpleNamespace(
+                            real_rows_count=128 if graph else None,
+                            extend_seq_lens_cpu=[128],
+                            cp_metadata=None,
+                        ),
+                        core_attn_metadata=SimpleNamespace(),
+                    )
+                    backend._bcg_tail_num_token_non_padded = None
+                    backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+                    with (
+                        patch.object(
+                            deepseek_v4_backend,
+                            "get_local_dp_buffer_len",
+                            return_value=132,
+                        ),
+                        patch.object(deepseek_v4_backend, "set_local_dp_buffer_len"),
+                    ):
+                        saved = backend.enter_late_layer_tail(batch)
+                        self.assertEqual(batch.global_num_token_non_padded_cpu, 128)
+                        self.assertEqual(
+                            batch.global_num_token_non_padded.item(), min(real, 128)
+                        )
+                        self.assertEqual(
+                            batch.num_token_non_padded.item(), min(real, 128)
+                        )
+                        self.assertEqual(global_count.item(), real)
+                        backend.exit_late_layer_tail(saved, batch)
+                    self.assertIs(backend.forward_metadata, full)
+                    self.assertEqual(batch.global_num_token_non_padded_cpu, real)
+                    self.assertIs(batch.global_num_token_non_padded, global_count)
+                    self.assertIs(batch.num_token_non_padded, local_count)
+
+
 class TestWholeExtendRequests(CustomTestCase):
     def test_no_prompt_reader_keeps_the_window_tail(self):
         # No logprobs and output-only logprobs (start == extend) read no
