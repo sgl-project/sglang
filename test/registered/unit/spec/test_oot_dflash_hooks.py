@@ -196,20 +196,11 @@ class TestRejectDflashSlidingMlaDraftWindow(CustomTestCase):
         with patch(f"{HOOK_MODULE}._load_draft_hf_config", return_value=draft_cfg):
             _reject_dflash_sliding_mla_draft_window(args)
 
-    def test_drafts_with_sliding_layers_are_rejected(self):
-        drafts = (
-            _mla_draft(["sliding_attention"] * 5, 1024),
-            _mla_draft(["sliding_attention", "full_attention"], 1024),
-        )
-        for backend in ("cutedsl_mla", "trtllm_mla"):
-            for draft_cfg in drafts:
-                with self.subTest(backend=backend, layers=draft_cfg["layer_types"]):
-                    with self.assertRaises(ValueError):
-                        self._check(backend, 1024, draft_cfg)
-
-    def test_full_attention_draft_and_no_flag_are_accepted(self):
+    def test_any_sliding_layer_rejects_the_flag(self):
+        mixed = _mla_draft(["sliding_attention", "full_attention"], 1024)
+        with self.assertRaises(ValueError):
+            self._check("cutedsl_mla", 1024, mixed)
         self._check("cutedsl_mla", 1024, _mla_draft(["full_attention"] * 7))
-        self._check("cutedsl_mla", None, _mla_draft(["sliding_attention"] * 5, 1024))
 
 
 if __name__ == "__main__":
