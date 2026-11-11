@@ -1652,12 +1652,6 @@ fn peek_prefix_len_is_read_only_and_agrees_with_match_prefix() {
     for (key, got) in keys.iter().zip(peeked) {
         assert_eq!(tc.match_prefix(&match_params(key)).device_prefix_len, got);
     }
-}
-
-#[test]
-fn peek_prefix_len_respects_namespace_and_page_alignment() {
-    let mut tc = core();
-    matched_chain(&mut tc);
     let lora = KeyNamespaceRef::new(Some("lora-1"), None);
     assert_eq!(tc.peek_prefix_len(&vec![1, 2, 3], lora), 0);
 
@@ -1676,29 +1670,18 @@ fn peek_prefix_len_respects_namespace_and_page_alignment() {
         /* priority = */ 0,
         /* extra_key = */ None,
     );
-    // The trailing partial page is dropped before the walk.
-    assert_eq!(
-        tc.peek_prefix_len(&vec![1, 2, 3], KeyNamespaceRef::new(None, None)),
-        2
-    );
-}
-
-#[test]
-fn peek_prefix_len_stops_at_a_dead_node() {
-    let mut tc = core();
-    let root = tc.arena.root();
+    // A node without a value is dead.
     tc.arena
         .alloc_child(
             root,
-            /* key = */ vec![1, 2],
+            /* key = */ vec![5, 6],
             /* priority = */ 0,
             /* extra_key = */ None,
         )
         .unwrap();
-    assert_eq!(
-        tc.peek_prefix_len(&vec![1, 2], KeyNamespaceRef::new(None, None)),
-        0
-    );
+    // The trailing partial page is dropped before the walk.
+    assert_eq!(tc.peek_prefix_len(&vec![1, 2, 3], namespace), 2);
+    assert_eq!(tc.peek_prefix_len(&vec![5, 6], namespace), 0);
 }
 
 #[test]
