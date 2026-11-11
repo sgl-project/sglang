@@ -1,4 +1,4 @@
-"""gfx950 small-M MXFP4/FP8 fused-MoE kernel for the ROCm aiter MoE path (Qwen3.5-397B-A17B TP4 shape: hidden 4096, per-rank intermediate 256).
+"""gfx950 small-M MXFP4/FP8 fused-MoE kernel for the ROCm aiter MoE path (Qwen3.5-397B-A17B TP4 / TP8 shapes: hidden 4096, per-rank intermediate 256 / 128).
 
 Two HIP kernels (source `smallm_moe.hip` next to this file, compiled with hipcc at first use) replace
 aiter.fused_moe for small token counts:
@@ -35,10 +35,11 @@ _DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_DIR, "smallm_moe.hip")
 DIM = 4096
 MAX_TOK = 64  # kernel list capacity (tokens per expert) and workspace size
-# Dispatch cap: above this token count aiter's flydsl path is faster (crossover ~44
-# tokens at per-rank intermediate 256 / TP4). Only that shape is dispatched here; the
-# TP2 shape (intermediate 512) has a lower crossover and is left to a follow-up.
-MAX_TOK_DISPATCH = {256: 40}
+# Dispatch cap per per-rank intermediate: above it aiter's flydsl path is faster
+# (crossover ~44 tokens at 256 / TP4). At 128 (TP8) the kernel stays ahead of aiter up
+# to its MAX_TOK capacity (0.92x of aiter's time at 64 tokens). The TP2 shape
+# (intermediate 512) has a lower crossover and is left to a follow-up.
+MAX_TOK_DISPATCH = {256: 40, 128: 64}
 MAX_TOK_DISPATCH_FP8 = {256: 20, 128: 48}  # crossover vs aiter's per_128x128 asm/CK
 
 _kernels: dict = {}
@@ -88,7 +89,7 @@ def smallm_moe_enabled() -> bool:
     failure has disabled the kernel in this process. Numerics differ slightly from the aiter path (bf16 activations
     instead of MXFP4 a4w4); GSM8K matches within run-to-run noise.
 
-    Model coverage: the kernel is compiled for Qwen3.5-397B-A17B only, MXFP4 at TP4 and FP8 block-scale at TP4/TP8
+    Model coverage: the kernel is compiled for Qwen3.5-397B-A17B only, MXFP4 and FP8 block-scale at TP4/TP8
     (hidden 4096, top-10 plus the optional fused shared expert). There is no model-name check;
     smallm_moe_supported() enforces the shape, and every other model or parallel layout keeps aiter fused_moe."""
     global _available
