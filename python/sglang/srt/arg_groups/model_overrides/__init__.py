@@ -26,7 +26,6 @@ from sglang.srt.arg_groups.model_overrides import glm4_moe  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import gpt_oss  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import granitemoehybrid  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import inkling  # noqa: F401
-from sglang.srt.arg_groups.model_overrides import interns2_mobius  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import iquest_q1  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import kimi_k3  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import lfm2  # noqa: F401
