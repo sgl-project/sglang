@@ -31,7 +31,6 @@ import bisect
 import contextlib
 import enum
 import functools
-import inspect
 import logging
 import os
 from typing import (
@@ -63,6 +62,7 @@ from sglang.srt.mem_cache.kv.alloc.forward_steps import (
 from sglang.srt.mem_cache.kv.alloc.host_free_list import HostFreeList
 from sglang.srt.mem_cache.kv.alloc.id_space import UnitIds
 from sglang.srt.mem_cache.kv.alloc.invariants import (
+    FREE_OF_BOUND_PAGE,
     FREE_OUTSIDE_RESERVATION,
     GEOMETRY_READY,
     HOST_READ_BEFORE_WAIT,
@@ -1042,7 +1042,7 @@ class Band:
 
     def available_size(self) -> int:
         """Tokens this band alone can take in place now, nothing in the chain moved
-        (the chain-wide read is `units_available`); memoized on the chain epoch."""
+        (the chain-wide question is `units_fit`); memoized on the chain epoch."""
         epoch = self._chain_capacity_epoch()
         if self._avail_memo_epoch != epoch:
             self._avail_memo_tokens = self._available_tokens()
@@ -1674,9 +1674,7 @@ class Band:
         self, free_index: torch.Tensor, pages: Optional[torch.Tensor] = None
     ) -> None:
         """Lazy free path: disjoint-element scatters plus ONE `torch.cat` onto
-        `_free_phys_pages`; boundary absorption is deferred to `_flush`. Callers
-        must not double-free -- a tombstone (-1) here would join the free list.
-        """
+        `_free_phys_pages`; boundary absorption is deferred to `_flush`."""
         self._stats_n_free_lazy += 1
         with record_function("Band._free_lazy"):
             free_v_pages_raw = free_index.detach().to(torch.int64)
@@ -1700,9 +1698,22 @@ class Band:
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self.live_page_count -= int(freed_p_pages.shape[0])
-            self._check_free_outside_reservation(freed_p_pages)
+            self._check_freed_pages(freed_p_pages)
             if not self._pend_until_retire(freed_p_pages):
                 self.release(freed_p_pages, Release.FREE)
+
+    def _check_freed_pages(self, freed_p_pages: torch.Tensor) -> None:
+        """Signal-only device checks at invariant level WARN and up: every freed
+        page was bound (no double free), and none is reserved for a host load."""
+        if resolve_level() < InvariantCheckLevel.WARN:
+            return
+        expect(
+            FREE_OF_BOUND_PAGE,
+            freed_p_pages >= 0,
+            msg=f"{self.sub_pool_name}: a free names a page that is not bound "
+            "(double free, or never allocated)",
+        )
+        self._check_free_outside_reservation(freed_p_pages)
 
     def _check_free_outside_reservation(self, freed_p_pages: torch.Tensor) -> None:
         """An owner free never overlaps a host load's reservation (a cancelled
@@ -2820,19 +2831,6 @@ class Band:
             with allocator_operation(self._chain_bands(), moves=True):
                 return self._flush(urgent=False)
 
-    def _raise_stale_slot_assertion(self, *, free_v, freed_p) -> None:
-        bad = free_v[freed_p < 0].tolist()
-        frames = inspect.stack()[1:9]
-        callers = " <- ".join(f"{f.filename.split('/')[-1]}:{f.lineno}" for f in frames)
-        raise AssertionError(
-            f"Band({self.sub_pool_name!r}).free: virtual id(s) {bad} have "
-            f"virtual_to_physical == -1 (double-free or never-allocated). "
-            f"State: {self.allocator_state_str()}. free_index unique={free_v.tolist()}. "
-            f"recent _inverse_history (last 3): "
-            f"{[(s.tolist(), d.tolist()) for s, d, _ in self._inverse_history[-3:]]}. "
-            f"Caller: {callers}."
-        )
-
     # -- free-group --
 
     def free_group_begin(self) -> None:
@@ -3291,9 +3289,7 @@ class FloatBand(Band):
                 self.free_group.append(self._copy_for_free_group(free_index))
                 return
             # Page-derivation ladder, as `_free_lazy`: caller ids, the ps==1
-            # identity, then dedup. No stale-slot assert -- callers must not
-            # double-free (a tombstoned page would join the hole list); the
-            # chain allocator's filters uphold it and the byte verifier catches a miss.
+            # identity, then dedup.
             free_v_pages_raw = free_index.detach().to(torch.int64)
             if _pages is not None:
                 free_v_pages = _pages
@@ -3311,7 +3307,7 @@ class FloatBand(Band):
             )
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
-            self._check_free_outside_reservation(freed_p_pages)
+            self._check_freed_pages(freed_p_pages)
             if not self._pend_until_retire(freed_p_pages):
                 self.release(freed_p_pages, Release.FREE)
             # Park is sync-free (span/hole COUNTS only); boundary absorption is
