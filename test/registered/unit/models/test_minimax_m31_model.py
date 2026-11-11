@@ -1,6 +1,7 @@
 """M3.1 config resolution, DSpark draft wiring and the deferred MoE handoff."""
 
 import copy
+import os
 import unittest
 from functools import partial
 from types import SimpleNamespace
@@ -19,9 +20,10 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     is_dspark_draft,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-from sglang.srt.models import minimax_m3
+from sglang.srt.models import minimax_m3, minimax_m3_vl
 from sglang.srt.models.dspark_minimax import DSparkMiniMaxDraftModel
 from sglang.srt.models.minimax_m3 import (
     MiniMaxM3Model,
@@ -37,7 +39,35 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 ARCH = ["MiniMaxM3SparseForConditionalGeneration"]
 NVFP4 = SimpleNamespace(
-    architectures=ARCH, quantization_config={"quant_method": "minimax_m3_nvfp4"}
+    architectures=ARCH,
+    quantization_config={"quant_method": "minimax_m3_nvfp4"},
+    num_key_value_heads=4,
+)
+MXFP8 = SimpleNamespace(
+    quantization_config={"quant_method": "mxfp8"}, num_key_value_heads=4
+)
+
+
+QUARK_M31 = SimpleNamespace(
+    quantization_config={
+        "quant_method": "quark",
+        "layer_quant_config": {
+            "language_model.model.layers.0.self_attn.q_proj": {
+                "weight": {
+                    "dtype": "fp8_e4m3",
+                    "qscheme": "per_block",
+                    "block_size": [1, 32],
+                    "scale_type": "float8_e8m0fnu",
+                    "is_dynamic": False,
+                }
+            }
+        },
+    },
+    num_key_value_heads=4,
+)
+QUARK_M3 = SimpleNamespace(
+    quantization_config={"quant_method": "quark", "layer_quant_config": {}},
+    num_key_value_heads=4,
 )
 
 
@@ -85,6 +115,7 @@ def server_args(**kwargs):
         pp_size=1,
         speculative_draft_kv_cache_dtype=None,
         speculative_draft_attention_backend=None,
+        dtype="auto",
         speculative_draft_model_quantization=None,
     )
     return SimpleNamespace(**(args | kwargs))
@@ -140,7 +171,8 @@ class TestMiniMaxM31ConfigResolution(CustomTestCase):
         for is_blackwell, algorithm, expected in cases:
             with (
                 self.subTest(blackwell=is_blackwell, algorithm=algorithm),
-                override_platform(is_blackwell=is_blackwell),
+                # pin a CUDA host: gfx950 is a supported non-Blackwell platform
+                override_platform(is_blackwell=is_blackwell, is_hip=False),
                 patch.dict("os.environ", SGLANG_RAGGED_VERIFY_MODE="static"),
             ):
                 overrides = _minimax_m3_overrides(
@@ -152,7 +184,7 @@ class TestMiniMaxM31ConfigResolution(CustomTestCase):
         for blackwell in (True, False):
             with (
                 self.subTest(blackwell=blackwell),
-                override_platform(is_blackwell=blackwell),
+                override_platform(is_blackwell=blackwell, is_hip=False),
             ):
                 self.assertEqual(
                     _minimax_m3_overrides(server_args(), packed_moe_hf()),
@@ -163,13 +195,16 @@ class TestMiniMaxM31ConfigResolution(CustomTestCase):
             dict(moe_quant_algo=None, moe_quant_format=None),
             dict(moe_quant_format="nvfp4-quantized"),
         ):
-            with self.subTest(**quant_overrides), override_platform(is_blackwell=True):
+            with (
+                self.subTest(**quant_overrides),
+                override_platform(is_blackwell=True, is_hip=False),
+            ):
                 overrides = _minimax_m3_overrides(
                     server_args(), packed_moe_hf(**quant_overrides)
                 )
                 self.assertEqual(overrides["quantization"], "mxfp8")
                 self.assertNotIn("moe_a2a_backend", overrides)
-        with override_platform(is_blackwell=True):
+        with override_platform(is_blackwell=True, is_hip=False):
             overrides = _minimax_m3_overrides(
                 server_args(quantization="mxfp8"), packed_moe_hf()
             )
@@ -212,7 +247,7 @@ class TestMiniMaxM31ConfigResolution(CustomTestCase):
         for name, (verify_mode, call) in cases.items():
             with (
                 self.subTest(name),
-                override_platform(is_blackwell=True),
+                override_platform(is_blackwell=True, is_hip=False),
                 patch.dict("os.environ", SGLANG_RAGGED_VERIFY_MODE=verify_mode),
                 self.assertRaises(ValueError),
             ):
@@ -226,7 +261,82 @@ class TestMiniMaxM31ConfigResolution(CustomTestCase):
             resolve(speculative_algorithm="DFLASH")()
 
 
-class TestMiniMaxM31DSparkDraft(CustomTestCase):
+def rocm_server_args(**kwargs):
+    rocm = dict(
+        tp_size=4,
+        attn_dp_size=1,
+        attn_cp_size=1,
+        ep_size=1,
+        enable_aiter_allreduce_fusion=False,
+    )
+    return server_args(**(rocm | kwargs))
+
+
+def gfx950():
+    return override_platform(
+        is_blackwell=False, is_sm100=False, is_hip=True, is_gfx95=True
+    )
+
+
+class TestMiniMaxM31Rocm(CustomTestCase):
+    def test_rocm_caps_nvfp4_tp_and_quark_attention_tp(self):
+        """Past one KV head per rank the server serves NUL bytes instead of failing, and
+        NVFP4 at TP8 serves runaway whitespace even with the attention TP divided."""
+        with gfx950():
+            for attn_dp_size in (1, 2):
+                with (
+                    self.subTest(attn_dp_size=attn_dp_size),
+                    self.assertRaisesRegex(ValueError, "--tp-size 4 or less"),
+                ):
+                    _minimax_m3_overrides(
+                        rocm_server_args(tp_size=8, attn_dp_size=attn_dp_size), NVFP4
+                    )
+            quark = dict(quantization="quark_mxfp4", tp_size=8)
+            with self.assertRaisesRegex(ValueError, "4 KV heads"):
+                _minimax_m3_overrides(rocm_server_args(**quark), MXFP8)
+            _minimax_m3_overrides(rocm_server_args(attn_dp_size=2, **quark), MXFP8)
+
+    def test_gfx950_keeps_custom_all_reduce_only_for_the_m31_quark_export(self):
+        """Custom all-reduce is measured faster for the M3.1 Quark export; the M3 export,
+        whose linears are bf16, stays on NCCL."""
+        with gfx950():
+            m31 = _minimax_m3_overrides(
+                rocm_server_args(quantization="quark"), QUARK_M31
+            )
+            m3 = _minimax_m3_overrides(rocm_server_args(quantization="quark"), QUARK_M3)
+        self.assertNotIn("disable_custom_all_reduce", m31)
+        self.assertTrue(m3["disable_custom_all_reduce"])
+
+    def test_gfx950_quick_all_reduce_takes_int4_only_where_unset(self):
+        """M3.1 gets INT4 when no level is set; a level already set stays, INT8 included,
+        since the ROCm images' INT8 cannot be told from one the user chose."""
+        level = "ROCM_QUICK_REDUCE_QUANTIZATION"
+        int4 = envs.SGLANG_ENABLE_MINIMAX_M3_AMD_QUICK_REDUCE_INT4
+        cases = (
+            (None, True, "INT4"),
+            ("INT8", True, "INT8"),
+            ("FP", True, "FP"),
+            ("INT8", False, "INT8"),
+            (None, False, None),
+        )
+        for preset, enabled, resolved in cases:
+            with (
+                self.subTest(preset=preset, enabled=enabled),
+                gfx950(),
+                patch.dict("os.environ"),
+                int4.override(enabled),
+            ):
+                os.environ.pop(level, None)
+                if preset is not None:
+                    os.environ[level] = preset
+                _minimax_m3_overrides(rocm_server_args(), NVFP4)
+                self.assertEqual(os.environ.get(level), resolved)
+        # only TP4 was measured: at TP2 an unset level stays unset
+        with gfx950(), patch.dict("os.environ"), int4.override(True):
+            os.environ.pop(level, None)
+            _minimax_m3_overrides(rocm_server_args(tp_size=2), NVFP4)
+            self.assertNotIn(level, os.environ)
+
     def test_draft_target_ids_are_zero_based_and_the_input_is_kept(self):
         config = draft_config()
         before = copy.deepcopy(config.to_dict())
@@ -294,6 +404,47 @@ class TestMiniMaxM31DSparkDraft(CustomTestCase):
             ),
             60,
         )
+
+
+class TestMiniMaxM31QuarkScaleNames(CustomTestCase):
+    """Quark 0.14+eef70b3 names the MXFP8 [1, 32] linear scale weight_scale."""
+
+    def test_multimodal_loader_puts_quark_scales_into_weight_scale_inv(self):
+        model = object.__new__(MiniMaxM3SparseForConditionalGeneration)
+        nn.Module.__init__(model)
+        model.model = SimpleNamespace(start_layer=0, end_layer=1)
+        model.num_fused_shared_experts = 0
+        model.quant_config = None
+        model.config = SimpleNamespace(text_config=SimpleNamespace(num_hidden_layers=1))
+        loaded = {}
+
+        def scale_param(key):
+            param = nn.Parameter(torch.zeros(2, dtype=torch.uint8), requires_grad=False)
+            param.weight_loader = lambda p, w, shard=None: loaded.__setitem__(
+                key, (shard, w)
+            )
+            return param
+
+        params = {
+            "model.layers.0.self_attn.qkv_proj.weight_scale_inv": scale_param("qkv"),
+            "model.layers.0.self_attn.o_proj.weight_scale_inv": scale_param("o"),
+        }
+        mapping = [(".qkv_proj", ".k_proj", "k")]
+        k = torch.full((2,), 127, dtype=torch.uint8)
+        o = torch.full((2,), 126, dtype=torch.uint8)
+        prefix = "model.layers.0.self_attn."
+        # the alias is ROCm-only; this CPU test runs the HIP loader path
+        with patch.object(minimax_m3_vl, "_is_hip", True):
+            model._load_llm_weight(
+                prefix + "k_proj.weight_scale", k, params, mapping, []
+            )
+            model._load_llm_weight(
+                prefix + "o_proj.weight_scale", o, params, mapping, []
+            )
+        self.assertEqual(loaded["qkv"][0], "k")
+        self.assertTrue(torch.equal(loaded["qkv"][1], k))
+        self.assertIsNone(loaded["o"][0])
+        self.assertTrue(torch.equal(loaded["o"][1], o))
 
 
 class CaptureLayer(nn.Module):
@@ -382,6 +533,70 @@ class TestMiniMaxM31Forward(CustomTestCase):
         self.assertIsInstance(result, MoeDeferredFinalize)
         self.assertIs(result.gated_shared_output, shared)
         self.assertEqual(result.routed_output.data_ptr(), deferred.gemm2_out.data_ptr())
+
+    def test_attention_dp_norms_keep_bf16(self):
+        """Under attention DP the norms keep bf16, since the DP gather after them takes a
+        tensor."""
+        from sglang.srt.models.minimax_common.amd import minimax_m3_hip
+
+        with (
+            envs.SGLANG_USE_AITER.override(True),
+            patch.object(minimax_m3_hip, "is_dp_attention_enabled", lambda: True),
+        ):
+            self.assertIsNone(minimax_m3_hip.norm_quant(object()))
+
+    def test_fused_cache_store_leaves_a_scaled_index_k_to_the_pool(self):
+        """The fused qk-norm/rope store writes index K unscaled; a non-unit idx_k scale
+        must reach the pool's store, which divides by it before the fp8 cast."""
+        from sglang.kernels.ops.attention import minimax_m3_qk_norm_rope
+        from sglang.srt.models.minimax_common.amd import minimax_m3_hip
+
+        fp8 = torch.float8_e4m3fn
+        q = torch.empty(2, 128, dtype=torch.bfloat16)
+
+        def stored_by_fusion(idx_k_scale, index_dtype):
+            pool = SimpleNamespace(
+                dtype=fp8,
+                index_k_pool=SimpleNamespace(dtype=index_dtype),
+                get_kv_buffer=lambda layer_id: (None, None),
+                get_index_k_buffer=lambda layer_id: None,
+            )
+            attn = SimpleNamespace(
+                _get_sparse_kv_pool=lambda: pool,
+                _enable_hisparse=False,
+                _can_use_rocm_sparse_qk_index_norm_rope=lambda *args: True,
+                _sparse_qk_index_norm_rope=lambda *args: ("unfused",) * 4,
+                _mark_sparse_kv_cached_by_fusion=lambda *args: None,
+                attn=SimpleNamespace(
+                    layer_id=0,
+                    idx_k_scale_float=idx_k_scale,
+                    k_scale_float=None,
+                    v_scale_float=None,
+                ),
+                q_norm=SimpleNamespace(weight=q, variance_epsilon=1e-6),
+                k_norm=SimpleNamespace(weight=q),
+                index_q_norm=SimpleNamespace(weight=q),
+                index_k_norm=SimpleNamespace(weight=q),
+                rotary_emb=SimpleNamespace(cos_sin_cache=q, is_neox_style=True),
+                head_dim=128,
+                rotary_dim=64,
+            )
+            batch = SimpleNamespace(out_cache_loc=torch.zeros(2, dtype=torch.int64))
+            with patch.object(
+                minimax_m3_qk_norm_rope,
+                "sparse_qk_index_gemma_rmsnorm_rope_cache",
+                lambda *args, **kwargs: ("fused",) * 4,
+            ):
+                out = minimax_m3_hip.sparse_qk_index_norm_rope_cache(
+                    attn, None, q, q, q, q, q, None, batch
+                )
+            return out[0] == "fused"
+
+        self.assertTrue(stored_by_fusion(None, fp8))
+        self.assertTrue(stored_by_fusion(1.0, fp8))
+        self.assertFalse(stored_by_fusion(0.5, fp8))
+        # a bf16 index cache ignores the scale on both paths
+        self.assertTrue(stored_by_fusion(0.5, torch.bfloat16))
 
 
 class TestMiniMaxM31Nvfp4Backend(CustomTestCase):

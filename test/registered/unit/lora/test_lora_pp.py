@@ -114,6 +114,7 @@ class TestAllPPLoras(CustomTestCase):
             req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
             req.output_ids = []
             req.is_retracted = False
+            req.owner_list = None
             req.time_stats = SimpleNamespace(wait_queue_entry_time=0.0)
             return req
 
@@ -151,6 +152,7 @@ class TestAllPPLoras(CustomTestCase):
             ),
             processed_tokens_counter=0,
             disagg_prefill_bootstrap_queue=None,
+            disagg_prefill_transfer_queue=None,
             get_num_allocatable_reqs=lambda *args, **kwargs: 1,
             get_prefill_adder_class=lambda: lambda *args, **kwargs: adder,
             request_retirer=None,

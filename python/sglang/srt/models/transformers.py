@@ -65,7 +65,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import AutoWeightsLoader, WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_device
-from sglang.srt.utils.common import direct_register_custom_op
+from sglang.srt.utils.custom_op import direct_register_custom_op
 
 
 def can_enable_torch_compile(config: PretrainedConfig) -> bool:
