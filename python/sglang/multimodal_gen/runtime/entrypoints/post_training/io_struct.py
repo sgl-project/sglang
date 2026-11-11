@@ -88,6 +88,8 @@ class RolloutRequest(BaseModel):
 
     rollout_return_denoising_env: bool = False
     rollout_return_dit_trajectory: bool = False
+    # False skips the VAE decode: the response carries only the rollout trajectory.
+    rollout_return_generated_output: bool = True
 
     # 0-indexed denoising-loop step filters. None = all steps.
     rollout_sde_step_indices: Optional[list[int]] = None
