@@ -519,6 +519,26 @@ def _prefill_sp_shared_stream() -> torch.cuda.Stream:
     return torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])
 
 
+def _prefill_sp_o_proj_reduce_scatter(
+    o_proj: nn.Module, x: torch.Tensor, sp: "_PrefillSP"
+) -> torch.Tensor:
+    from sglang.kernels.ops.communication.sp_collective_gemm import (
+        matmul_reduce_scatter,
+    )
+    from sglang.srt.layers.communication.sp_collective_gemm_workspace import (
+        sp_collective_gemm_workspace,
+    )
+
+    if sp.padded != x.shape[0]:
+        x = torch.nn.functional.pad(x, (0, 0, 0, sp.padded - x.shape[0]))
+    return matmul_reduce_scatter(
+        x,
+        o_proj.weight,
+        get_parallel().tp_group.device_group,
+        workspace=sp_collective_gemm_workspace,
+    )
+
+
 class _PrefillSP:
     __slots__ = (
         "num_tokens",
@@ -3233,6 +3253,7 @@ class KimiK3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        pre_o_proj: bool = False,
     ) -> torch.Tensor:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
@@ -3252,7 +3273,8 @@ class KimiK3DecoderLayer(nn.Module):
             attn_inputs = AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
             get_attn_tp_context().set_attn_inputs(attn_inputs)
 
-        result = self.self_attn(
+        attn = self.self_attn.forward_pre_o_proj if pre_o_proj else self.self_attn
+        result = attn(
             hidden_states=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
@@ -3265,6 +3287,21 @@ class KimiK3DecoderLayer(nn.Module):
             get_attn_tp_context().clear_attn_inputs()
 
         return result
+
+    @cached_property
+    def _sp_fuses_o_proj(self) -> bool:
+        from sglang.kernels.arch import current_arch
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        o_proj = self.self_attn.o_proj
+        return (
+            current_arch().is_sm(10)
+            and getattr(self.self_attn, "use_output_gate", True)
+            and o_proj.bias is None
+            and isinstance(o_proj.quant_method, UnquantizedLinearMethod)
+            and o_proj.weight.dtype == torch.bfloat16
+            and get_parallel().tp_size in (2, 4, 8)
+        )
 
     @property
     def prefill_sp_capable(self) -> bool:
@@ -3298,14 +3335,28 @@ class KimiK3DecoderLayer(nn.Module):
             write=self.is_block_write_layer,
         )
         residual = None if self.is_block_write_layer else prefix
-        partial = self._run_self_attn(
-            sp.gather(normed), positions, forward_batch, zero_allocator
-        )
-        prefix = sp.reduce_scatter(
-            sp.padded_rows(partial, k3_ar_fusion.ATTN_O_PROJ),
-            stream.new_empty((sp.local, stream.shape[1])),
-            residual,
-        )
+        if self._sp_fuses_o_proj:
+            attn_out = self._run_self_attn(
+                sp.gather(normed),
+                positions,
+                forward_batch,
+                zero_allocator,
+                pre_o_proj=True,
+            )
+            prefix = _prefill_sp_o_proj_reduce_scatter(
+                self.self_attn.o_proj, attn_out, sp
+            )
+            if residual is not None:
+                prefix.add_(residual)
+        else:
+            partial = self._run_self_attn(
+                sp.gather(normed), positions, forward_batch, zero_allocator
+            )
+            prefix = sp.reduce_scatter(
+                sp.padded_rows(partial, k3_ar_fusion.ATTN_O_PROJ),
+                stream.new_empty((sp.local, stream.shape[1])),
+                residual,
+            )
         normed, prefix = bank.forward(
             prefix,
             None,
