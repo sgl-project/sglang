@@ -5,6 +5,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from einops import rearrange
 
 from sglang.kernels.fused_op import BaseFusedOp
@@ -1671,6 +1672,26 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             device_index=device_index, allow_sync=True
         )
         self._mqa_logits_budget_bytes[device_index] = budget_bytes
+        return budget_bytes
+
+    @classmethod
+    def pin_mqa_logits_budget(
+        cls, device_index: int, cpu_group, max_bytes: Optional[int] = None
+    ) -> int:
+        """Pin the logits budget to the cpu_group minimum for the process lifetime.
+        Without max_bytes it is measured now; max_bytes only lowers the pinned one."""
+        budget_bytes = cls._mqa_logits_budget_bytes.get(device_index)
+        if budget_bytes is None or max_bytes is None:
+            budget_bytes = mqa_logits_budget_bytes(
+                device_index=device_index, allow_sync=True
+            )
+        if max_bytes is not None:
+            budget_bytes = min(budget_bytes, max_bytes)
+        if cpu_group is not None and dist.get_world_size(cpu_group) > 1:
+            budget = torch.tensor([budget_bytes], dtype=torch.int64)
+            dist.all_reduce(budget, op=dist.ReduceOp.MIN, group=cpu_group)
+            budget_bytes = int(budget.item())
+        cls._mqa_logits_budget_bytes[device_index] = budget_bytes
         return budget_bytes
 
     def _get_topk_ragged(

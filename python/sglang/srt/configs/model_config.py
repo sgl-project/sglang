@@ -1139,6 +1139,8 @@ class ModelConfig:
         self.is_multimodal_breakable_cuda_graph_supported = enable_multimodal and (
             is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
         )
+        # K3 prefill graphs run MLA attention eagerly on the live batch.
+        self.prefill_graph_attention_on_live_batch = is_kimi_k3(self.hf_config)
 
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model

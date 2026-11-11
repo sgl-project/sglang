@@ -8,8 +8,10 @@
 
 import logging
 import re
+import weakref
 from array import array
 from collections.abc import Iterable
+from contextlib import contextmanager
 from functools import cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -114,10 +116,26 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    context as _bcg_context,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    context_manager as _tc_piecewise_context,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
+from sglang.srt.model_executor.runner_utils import capture_mode as _capture_mode
+from sglang.srt.model_executor.runner_utils import prefill_graph as _prefill_graph
+from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -196,6 +214,61 @@ def _k3_side_stream_max_tokens() -> int:
     if not get_platform().is_blackwell:
         return 64
     return 288 if get_platform().device_sm == 103 else 128
+
+
+@contextmanager
+def _as_eager_prefill(forward_batch: ForwardBatch):
+    """Suspend the graph flags, capture mode, tc_piecewise context and prefill-graph
+    scope, so a break that runs a whole attention module takes the eager paths."""
+    saved = (
+        _bcg_context._in_breakable_cuda_graph,
+        _tc_piecewise_context._in_tc_piecewise_cuda_graph,
+        _tc_piecewise_context._tc_piecewise_forward_context,
+        _capture_mode.is_capture_mode,
+    )
+    _bcg_context._in_breakable_cuda_graph = False
+    _tc_piecewise_context._in_tc_piecewise_cuda_graph = False
+    _tc_piecewise_context._tc_piecewise_forward_context = None
+    _capture_mode.is_capture_mode = False
+    scope_token = _prefill_graph._current.set(None)
+    try:
+        with set_forward_batch(forward_batch):
+            yield
+    finally:
+        _prefill_graph._current.reset(scope_token)
+        (
+            _bcg_context._in_breakable_cuda_graph,
+            _tc_piecewise_context._in_tc_piecewise_cuda_graph,
+            _tc_piecewise_context._tc_piecewise_forward_context,
+            _capture_mode.is_capture_mode,
+        ) = saved
+
+
+def _mla_breaks_under_prefill_graph(*, is_kda_layer: bool, attn_cp_size: int) -> bool:
+    # Prefill CP keeps attention in the graph: its rows and positions are CP-local.
+    return not is_kda_layer and attn_cp_size == 1
+
+
+class _EagerMlaPlan:
+    """Plans the eager MLA prefill metadata once per batch for a model's MLA breaks."""
+
+    def __init__(self) -> None:
+        # Weak, so a finished batch and its DCP gather buffer are not kept alive.
+        self._planned: Optional[weakref.ReferenceType] = None
+
+    def ensure(self, forward_batch: ForwardBatch) -> None:
+        if self._planned is not None and self._planned() is forward_batch:
+            return
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        # The runner plans under the graph flags; the eager attention needs this plan.
+        backend = get_attn_backend()
+        if isinstance(backend, HybridLinearAttnBackend):
+            backend = backend.full_attn_backend
+        backend.init_forward_metadata(forward_batch)
+        self._planned = weakref.ref(forward_batch)
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -2943,6 +3016,8 @@ class KimiK3DecoderLayer(nn.Module):
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         attn_bank: Optional[AttnBank] = None,
+        *,
+        eager_mla_plan: _EagerMlaPlan,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -2983,6 +3058,20 @@ class KimiK3DecoderLayer(nn.Module):
         # the attention drops the fusion when its o_proj cannot write into
         # caller-owned storage; the FFN read's fused all-reduce must agree
         self.all_reduce_fusion = self.self_attn.all_reduce_fusion
+
+        # Under prefill CUDA graphs, MLA attention runs as one eager break.
+        self._mla_eager_under_prefill_graph = _mla_breaks_under_prefill_graph(
+            is_kda_layer=config.is_kda_layer(layer_idx),
+            attn_cp_size=get_parallel().attn_cp_size,
+        )
+        self._breakable_mla_self_attn = eager_on_graph(self._mla_self_attn_eager)
+        self._eager_mla_plan = eager_mla_plan
+        # DSA under DCP gathers KV through req_to_token rows, which capture leaves unset.
+        self._mla_skips_capture_warmup = (
+            self._mla_eager_under_prefill_graph
+            and self.self_attn.use_dsa
+            and get_parallel().attn_dcp_size > 1
+        )
 
         # MLP / MoE
         if self._is_moe_layer:
@@ -3090,6 +3179,67 @@ class KimiK3DecoderLayer(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
+        # Only the prefill breakable runner installs the tc_piecewise context;
+        # decode graphs set the breakable flag alone and run attention inline.
+        if (
+            self._mla_eager_under_prefill_graph
+            and is_in_breakable_cuda_graph()
+            and get_tc_piecewise_forward_context() is not None
+        ):
+            # The fused all-reduce pulls its input from the persistent symmetric
+            # o_proj buffer, which the eager o_proj fills from its start.
+            if self.all_reduce_fusion:
+                out = _k3_symm_o_proj_out(self.self_attn.o_proj, hidden_states)
+            else:
+                out = hidden_states.new_empty(
+                    (hidden_states.shape[0], self.hidden_size)
+                )
+            self._breakable_mla_self_attn(hidden_states, out)
+            return out
+
+        return self._run_self_attn_inner(
+            hidden_states, positions, forward_batch, zero_allocator
+        )
+
+    def _mla_self_attn_eager(
+        self, hidden_states: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """Eager break: MLA attention on the live batch's rows, written into the
+        padded output. Replays reuse capture-time arguments, so the batch comes
+        from the forward context (the capture batch itself is unpadded)."""
+        static_batch = get_tc_piecewise_forward_context().forward_batch
+        live_batch = static_batch.live_forward_batch
+        if live_batch is None and self._mla_skips_capture_warmup:
+            # Capture warm-up of DSA under DCP. The break is opaque to the
+            # graph: its output feeds only the warm-up of the captured segments.
+            out.zero_()
+            return
+        forward_batch = static_batch if live_batch is None else live_batch
+        num_tokens = forward_batch.positions.shape[0]
+        with _as_eager_prefill(forward_batch):
+            self._eager_mla_plan.ensure(forward_batch)
+            attn_out = self._run_self_attn_inner(
+                hidden_states[:num_tokens],
+                forward_batch.positions,
+                forward_batch,
+                # The model's allocator is a capture-time object here; its
+                # bump pointer would run past the buffer over replays.
+                BumpAllocator(
+                    buffer_size=2, dtype=torch.float32, device=hidden_states.device
+                ),
+            )
+        if attn_out.data_ptr() != out.data_ptr():
+            out[:num_tokens].copy_(attn_out)
+        if out.shape[0] != num_tokens:
+            out[num_tokens:].zero_()
+
+    def _run_self_attn_inner(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ) -> torch.Tensor:
         # MLA layers with q_lora_rank read their latent inputs from the
         # attention-TP context.
         from sglang.srt.layers.layer_boundary import (
@@ -3246,6 +3396,7 @@ class KimiK3LinearModel(nn.Module):
             )
         else:
             self.norm = PPMissingLayer()
+        eager_mla_plan = _EagerMlaPlan()
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: KimiK3DecoderLayer(
@@ -3255,6 +3406,7 @@ class KimiK3LinearModel(nn.Module):
                 prefix=prefix,
                 alt_streams=self.alt_streams,
                 attn_bank=self.attn_bank,
+                eager_mla_plan=eager_mla_plan,
             ),
             prefix=f"{prefix}.layers",
             final_read=self._final_read if self.pp_group.is_last_rank else None,
