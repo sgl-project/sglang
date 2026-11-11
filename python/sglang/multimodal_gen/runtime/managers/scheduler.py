@@ -72,6 +72,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     BatchMetricsWindow,
     OutputBatch,
 )
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    slice_rollout_trajectory_range,
+)
 from sglang.multimodal_gen.runtime.post_training.scheduler_post_training_mixin import (
     SchedulerPostTrainingMixin,
 )
@@ -143,7 +146,6 @@ class Scheduler(
         local_rank: int | None = None,
     ):
         self.server_args = server_args
-        self.port_args = port_args
 
         # local_rank is the physical GPU index for torch.cuda.set_device.
         # In non-disagg mode, it equals gpu_id. In disagg mode, it may differ
@@ -1278,6 +1280,9 @@ class Scheduler(
                 metrics=metrics,
                 noise_pred=self._slice_batched_value(
                     output_batch.noise_pred, start, end, total_items
+                ),
+                rollout_trajectory_data=slice_rollout_trajectory_range(
+                    output_batch.rollout_trajectory_data, start, end
                 ),
                 peak_memory_mb=output_batch.peak_memory_mb,
             )

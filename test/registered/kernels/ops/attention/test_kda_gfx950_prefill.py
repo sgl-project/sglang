@@ -9,20 +9,13 @@ import torch
 from sglang.kernels.ops.attention.fla.kda import chunk_kda
 from sglang.kernels.ops.attention.linear import kda_gfx950_prefill
 from sglang.srt.layers.attention.linear.kernels import kda_triton
+from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 SLOTS = 40
-
-
-def _is_gfx950() -> bool:
-    return bool(
-        torch.version.hip
-        and torch.cuda.is_available()
-        and torch.cuda.get_device_properties().gcnArchName.split(":", 1)[0] == "gfx950"
-    )
 
 
 def _inputs(lengths, heads=4, seed=42) -> dict[str, torch.Tensor]:
@@ -93,7 +86,10 @@ def _hip(inputs, lower_bound=-5.0, **kwargs):
     )
 
 
-@unittest.skipUnless(_is_gfx950(), "gfx950 KDA prefill requires MI35x")
+@unittest.skipUnless(
+    torch.cuda.is_available() and is_gfx95_supported(),
+    "gfx950 KDA prefill requires MI35x",
+)
 class TestGfx950KDAPrefill(CustomTestCase):
     def _assert_close(self, actual, expected, inputs, actual_inputs, expected_inputs):
         torch.testing.assert_close(
