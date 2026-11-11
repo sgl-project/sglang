@@ -7,8 +7,9 @@ This mechanism allows upstream callers to leave the body opaque
 import re
 
 import http_sf
-from fastapi import HTTPException
-from starlette.datastructures import Headers
+from fastapi import HTTPException, Request
+
+from sglang.srt.runtime_context import get_schedule, get_serving
 
 # request header -> (target attribute, value type)
 _HEADER_OVERRIDES = {
@@ -39,19 +40,25 @@ def apply_header_overrides(obj, headers) -> None:
 
 def resolve_request_priority(
     priority: int | None,
-    headers: Headers | None,
+    raw_request: Request | None,
     *,
     body_priority_is_set: bool,
-    enabled: bool,
 ) -> int | None:
     """Resolve native priority headers without changing body or legacy overrides.
 
     The converted priority already includes any opt-in vendor override. RFC 9218
     requires ignoring malformed dictionaries and invalid urgency values.
     """
-    if not enabled or body_priority_is_set or priority is not None or headers is None:
+    if (
+        body_priority_is_set
+        or priority is not None
+        or raw_request is None
+        or not get_schedule().enable_priority_scheduling
+        or get_serving().allow_header_priority is False
+    ):
         return priority
 
+    headers = raw_request.headers
     values = headers.getlist("x-priority")
     if values:
         if len(values) != 1 or not re.fullmatch(r"[+-]?[0-9]+", values[0].strip(" \t")):

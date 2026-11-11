@@ -11,6 +11,7 @@ maybe_stub_sgl_kernel()
 import argparse
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -18,11 +19,13 @@ from starlette.background import BackgroundTask
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
+from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.environ import envs
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
 from sglang.srt.runtime_context import (
     get_context,
     get_schedule,
@@ -42,6 +45,8 @@ class _RecordingEngine:
         self.server_args = server_args
         self.requests = []
         self.received_priorities = []
+        self.max_req_input_len = 65536
+        self.rid_to_state = {}
         self.request_logger = SimpleNamespace(log_requests=False, log_requests_level=0)
         backend = Tokenizer(
             models.WordLevel({"[UNK]": 0, "hello": 1, "ok": 2}, "[UNK]")
@@ -55,7 +60,9 @@ class _RecordingEngine:
         self.model_config = SimpleNamespace(
             is_multimodal=False,
             hf_config=SimpleNamespace(
-                model_type="llama", architectures=["LlamaForCausalLM"]
+                model_type="llama",
+                architectures=["LlamaForCausalLM"],
+                sparse_attention_config={"page_token_id": 128827},
             ),
             get_default_sampling_params=lambda: {},
         )
@@ -149,6 +156,27 @@ class TestPriorityHeaders(CustomTestCase):
             choice = response.json()["choices"][0]
             text = choice.get("text", choice.get("message", {}).get("content"))
             self.assertEqual(text, "ok")
+
+    def test_split_document_stream_resolves_priority_before_generation(self):
+        serving = self.client.app.state.openai_serving_chat
+        splitter = ChatDocSplitter(
+            serving,
+            handle_window=serving.handle_request,
+            config=UocrDocumentConfig(),
+        )
+        with (
+            patch.object(serving, "_doc_splitter", splitter),
+            patch.object(splitter, "_plan_doc_split", return_value=[(0, 1, 0)]),
+        ):
+            self._assert_priority(_PATHS[0], -5, {"X-Priority": "-5"}, stream=True)
+            self._assert_priority(_PATHS[0], 20, {"Priority": "u=2"}, stream=True)
+            self._assert_priority(
+                _PATHS[0], 0, {"X-Priority": "bad"}, stream=True, priority=0
+            )
+            response = self._post(_PATHS[0], {"X-Priority": "bad"}, stream=True)
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertIn("X-Priority must be a single integer", response.text)
+            self.assertEqual(self.engine.received_priorities, [-5, 20, 0])
 
     def test_body_and_header_precedence(self):
         """Zero and explicit null cannot be mistaken for an omitted body field."""

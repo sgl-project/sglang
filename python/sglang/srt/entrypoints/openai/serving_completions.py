@@ -32,6 +32,7 @@ from sglang.srt.entrypoints.openai.utils import (
     spec_tokens_details_from_meta_info,
     to_openai_style_logprobs,
 )
+from sglang.srt.entrypoints.request_headers import resolve_request_priority
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
@@ -135,7 +136,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
             session_id=request.session_id,
             extra_key=request.extra_key,
             cache_salt=request.cache_salt,
-            priority=request.priority,
+            priority=resolve_request_priority(
+                request.priority,
+                raw_request,
+                body_priority_is_set="priority" in request.model_fields_set,
+            ),
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
