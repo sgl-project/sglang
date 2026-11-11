@@ -122,10 +122,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_parallel import legacy_draft_attn_tp_size
-from sglang.srt.speculative.ragged_verify import (
-    RaggedVerifyMode,
-    read_ragged_verify_mode,
-)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.device import (
@@ -3278,6 +3274,11 @@ class KVCacheConfigurator:
             return False
         if not (get_platform().is_cuda or get_platform().is_hip):
             return False
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
         mamba = get_exec().mamba
         return (
             get_spec().speculative_eagle_topk == 1
