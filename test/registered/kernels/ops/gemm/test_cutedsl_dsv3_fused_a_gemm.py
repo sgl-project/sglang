@@ -18,8 +18,8 @@ from sglang.kernels.ops.gemm.cutedsl_dsv3_fused_a_gemm import (  # noqa: E402
     dsv3_fused_a_gemm,
 )
 
-# hd_in must be a multiple of 256; 6144/7168 cover the real fused-A shapes.
-HD_INS = [6144, 7168]
+# hd_in must be a multiple of 256; 2560/3584 are not 1024-aligned.
+HD_INS = [2560, 3584, 6144, 7168]
 # hd_out must be a multiple of 16; 2112 and 2624 cover real fused-A variants.
 HD_OUTS = [2112, 2624]
 NUM_TOKENS = get_ci_test_range(list(range(1, 17)), [1, 8, 16])

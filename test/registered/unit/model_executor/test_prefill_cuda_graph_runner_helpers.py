@@ -235,6 +235,11 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         self.assertEqual(captured.tolist(), [[5, 5]] * 2 + [[0, 0]] * 4)
 
     def test_ple_replay_uses_live_request_layout(self):
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
             breakable_cuda_graph as bcg,
         )
@@ -251,17 +256,50 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         )
         context = SimpleNamespace(forward_batch=batch)
         capture = Mock(cuda_graph=SimpleNamespace(_break_fns=[]))
-        pool = Mock(get_mamba_indices=lambda indices: indices)
-        cases = [([8], [0] * 8), ([4, 4], [0] * 4 + [1] * 4)]
+        pool = SimpleNamespace(
+            state_sub_pool="mamba", get_mamba_indices=lambda indices: indices
+        )
+        # Each replay's resolved slots: the identity map of its request rows.
+        linear_backend = SimpleNamespace(
+            forward_state_slots=lambda n, track_ids: SimpleNamespace(
+                working=context.forward_batch.req_pool_indices[:n], track=None
+            )
+        )
+        backend = SimpleNamespace(
+            req_to_token_pool=pool,
+            runner_ids=RunnerIds(
+                req_to_token=torch.zeros((3, 8), dtype=torch.int32),
+                token_to_kv_pool_allocator=None,
+                token_to_kv_pool=SimpleNamespace(id_spaces=lambda: {}),
+                page_size=1,
+                device="cpu",
+            ),
+            linear_attn_backend=linear_backend,
+            forward_state_slots=linear_backend.forward_state_slots,
+        )
+        cases = [
+            (
+                [8],
+                [0] * 8,
+                list(range(8)),
+                [0, 8],
+            ),
+            (
+                [3, 0, 2, 3],
+                [0, 0, 0, 2, 2, 3, 3, 3],
+                [0, 1, 2, 0, 1, 0, 1, 2],
+                [0, 3, 3, 5, 8],
+            ),
+        ]
         with (
-            patch.object(qwen4_exp, "get_req_to_token_pool", return_value=pool),
+            forward_context(ForwardContext(attn_backend=backend)),
             patch.object(bcg, "_current_capture_var") as active,
             patch.object(
                 qwen4_exp, "get_tc_piecewise_forward_context", return_value=context
             ),
         ):
             active.get.return_value = capture
-            for lengths, expected in cases:
+            for lengths, expected_reqs, expected_offsets, expected_starts in cases:
                 context.forward_batch = batch = SimpleNamespace(**vars(batch))
                 batch.extend_seq_lens = torch.tensor(lengths)
                 batch.extend_seq_lens_cpu = lengths
@@ -277,7 +315,18 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                     self.assertIsNone(holder.batch)
                 for replay in capture.cuda_graph._break_fns:
                     replay()
-                self.assertEqual(holder.batch.req_indices.tolist(), expected)
+                self.assertEqual(holder.batch.lengths.tolist(), lengths)
+                self.assertEqual(holder.batch.processed_tokens, sum(lengths))
+                self.assertEqual(holder.batch.req_indices.tolist(), expected_reqs)
+                self.assertEqual(holder.batch.token_offsets.tolist(), expected_offsets)
+                self.assertEqual(holder.batch.query_start_loc.tolist(), expected_starts)
+                self.assertEqual(
+                    holder.batch.state_indices.tolist(),
+                    [
+                        index if length else 0
+                        for index, length in enumerate(lengths, start=1)
+                    ],
+                )
 
     def test_dspark_proxy_width_requires_receiving_stage_and_model_support(self):
         class Model:
@@ -297,6 +346,45 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                     ),
                     expected,
                 )
+
+    def test_cp_pp_replay_clears_previous_larger_shard(self):
+        # A graph reads its whole CP-local bucket, even when the next PP
+        # message carries fewer rows or omits an auxiliary field.
+        buffers = SimpleNamespace(
+            pp_proxy_tensors={
+                "hidden_states": torch.full((8, 2), 41.0),
+                "residual": torch.full((8, 3, 2), 42.0),
+                "dspark_hidden_states": torch.full((8, 4), 43.0),
+            }
+        )
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.buffers = buffers
+        runner.prefill_cp_bcg_input = SimpleNamespace(bucket_local_tokens={8: 4})
+        for rows in (4, 1):
+            with self.subTest(received_rows=rows):
+                received = PPProxyTensors(
+                    {"hidden_states": torch.full((rows, 2), float(rows))}
+                )
+                if rows == 4:
+                    for name in ("residual", "dspark_hidden_states"):
+                        received.tensors[name] = torch.full_like(
+                            buffers.pp_proxy_tensors[name][:rows], 7.0
+                        )
+                for name, value in received.tensors.items():
+                    buffers.pp_proxy_tensors[name][:rows].copy_(value)
+                runner._zero_stale_cp_pp_proxy_rows(received, 8)
+                replay_input = buffers.pp_proxy_tensors["hidden_states"][:4]
+                torch.testing.assert_close(
+                    replay_input[:rows], received["hidden_states"]
+                )
+                self.assertTrue(torch.all(replay_input[rows:] == 0))
+                for name in ("residual", "dspark_hidden_states"):
+                    expected = 7.0 if rows == 4 else 0.0
+                    self.assertTrue(
+                        torch.all(buffers.pp_proxy_tensors[name][:4] == expected)
+                    )
+        # Clearing a local graph bucket must not modify unrelated capacity.
+        self.assertTrue(torch.all(buffers.pp_proxy_tensors["hidden_states"][4:] == 41))
 
     def test_pp_proxy_stable_buffers_accept_full_and_hidden_only_contracts(self):
         buffers, registry = _make_pp_buffers_and_registry()

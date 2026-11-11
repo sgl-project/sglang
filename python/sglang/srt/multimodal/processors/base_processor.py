@@ -31,6 +31,15 @@ from sglang.srt.multimodal.cache import (
     PreprocessFingerprintProvider,
     build_processor_fingerprint,
 )
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    configure_media_url_security,
+    load_audio,
+    load_image,
+    load_video,
+    media_url_security_config,
+    smart_to_rgb,
+)
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
@@ -47,19 +56,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_serving,
 )
-from sglang.srt.utils import (
-    CLIENT_MEDIA_EXCEPTIONS,
-    configure_media_url_security,
-    envs,
-    is_cpu,
-    is_npu,
-    is_xpu,
-    load_audio,
-    load_image,
-    load_video,
-    logger,
-    smart_to_rgb,
-)
+from sglang.srt.utils import envs, is_cpu, is_npu, is_xpu, logger
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -234,6 +231,12 @@ def _forget_parent_executor_wakeups():
     concurrent.futures.process._threads_wakeups.clear()
 
 
+def _init_cpu_worker(media_url_policy: tuple) -> None:
+    _forget_parent_executor_wakeups()
+    # A spawned worker starts from the default media policy, not the server's.
+    configure_media_url_security(*media_url_policy)
+
+
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
@@ -278,6 +281,8 @@ class BaseMultimodalProcessor(ABC):
         configure_media_url_security(
             get_mm().allowed_media_domains,
             get_mm().media_url_max_file_size_mb,
+            get_mm().media_url_timeout,
+            get_mm().allow_local_media_files,
         )
         configured_mm_feature_transport = get_mm().mm_feature_transport
         self.mm_feature_transport = (
@@ -316,8 +321,7 @@ class BaseMultimodalProcessor(ABC):
             max_entries=8192,
         )
         self.trust_mm_content_hashes = bool(get_mm().trust_mm_content_hashes)
-        # The fingerprint is needed only to build artifact keys. Avoid inspecting
-        # processor state when this processor will never retain artifacts.
+        # Compute lazily once for both preprocess and encoder-cache identities.
         self.processor_fingerprint = (
             build_processor_fingerprint(self, hf_config)
             if self.mm_preprocess_cache.enabled
@@ -536,7 +540,8 @@ class BaseMultimodalProcessor(ABC):
         return concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context(start_method),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
-            initializer=_forget_parent_executor_wakeups,
+            initializer=_init_cpu_worker,
+            initargs=(media_url_security_config(),),
         )
 
     def _replace_broken_cpu_executor(
@@ -1662,6 +1667,9 @@ class BaseMultimodalProcessor(ABC):
                 "modality",
                 "hash",
                 "pad_value",
+                "pad_values",
+                "identity",
+                "processor_fingerprint",
                 "offsets",
             ):
                 # metadata fields need explicit handling, skip generic item.set
@@ -1967,7 +1975,7 @@ class BaseMultimodalProcessor(ABC):
                         feature=feature,
                         format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
                         offsets=dict_item.pop("offsets", None),
-                        # Trusted media identity for KV trie reuse and KV-event hashes.
+                        # Legacy hint; actual tensor contents determine cache identity.
                         hash=dict_item.pop("hash", None),
                         model_specific_data=dict_item,
                     )
@@ -2040,8 +2048,29 @@ class BaseMultimodalProcessor(ABC):
         *,
         images: Optional[List[Any]],
     ) -> List[MultimodalDataItem]:
-        """Apply model-specific item reshaping while features are still tensors."""
+        """Bind model configuration before optional model-specific reshaping."""
+        self._bind_cache_namespaces(mm_items)
         return mm_items
+
+    def _bind_cache_namespaces(self, mm_items: List[MultimodalDataItem]) -> bool:
+        if self.processor_fingerprint is None:
+            self.processor_fingerprint = build_processor_fingerprint(
+                self, self.hf_config
+            )
+        changed = False
+        for item in mm_items:
+            changed |= item.bind_processor_fingerprint(self.processor_fingerprint)
+        return changed
+
+    def finalize_cache_identities(self, output: MultimodalProcessorOutput) -> None:
+        """Common frontend boundary, including model-specific processor paths."""
+        if (
+            self._bind_cache_namespaces(output.mm_items)
+            and output.padded_input_ids is not None
+        ):
+            output.padded_input_ids = output.build_padded_input_ids(
+                output.input_ids, output.mm_items
+            )
 
     def _prepare_mm_items_for_transport(
         self, mm_items: List[MultimodalDataItem]
@@ -2049,6 +2078,12 @@ class BaseMultimodalProcessor(ABC):
         """Wrap final GPU features, rolling back every lease if one wrap fails."""
         if not self.use_cuda_ipc:
             return mm_items
+
+        for item in mm_items:
+            # Never reconstruct/consume an IPC lease merely to hash its contents.
+            # Leave namespace binding to finalization: fast paths may have
+            # already built padding, which must change together with identity.
+            item.set_pad_value()
 
         # Pool misses fall back to plain CPU tensors. The scheduler copies out
         # and releases each successful pool slice.

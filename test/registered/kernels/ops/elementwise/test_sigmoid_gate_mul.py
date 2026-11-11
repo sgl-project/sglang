@@ -5,7 +5,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=4, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=4, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=4, stage="jit-kernel-unit", runner_config="amd")
 
 DEVICE = "cuda"
@@ -75,6 +75,20 @@ def test_sigmoid_gate_mul_contiguous_output():
     gate = torch.randn(4, 4096, dtype=torch.bfloat16, device=DEVICE)
     out = fused_sigmoid_mul(x, gate)
     assert out.is_contiguous()
+
+
+def test_sigmoid_gate_mul_strided_gate_round_sigmoid_is_bit_exact():
+    num_tokens = 300
+    # The gate is the tail columns of a merged [q_up | gate] GEMM output.
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, 8192, dtype=torch.bfloat16, device=DEVICE)
+    merged = torch.randn(num_tokens, 4096 + 8192, dtype=torch.bfloat16, device=DEVICE)
+    gate = merged[:, 4096:]
+    ref = x * torch.sigmoid(gate)
+    assert torch.equal(fused_sigmoid_mul(x, gate, round_sigmoid=True), ref)
+    assert torch.equal(fused_sigmoid_mul(x, gate.contiguous(), round_sigmoid=True), ref)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from sglang.utils import LazyImport
+from sglang._lazy_import import LazyImport
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.configs.pipeline_configs import PipelineConfig
