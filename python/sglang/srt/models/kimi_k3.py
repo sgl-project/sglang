@@ -930,10 +930,9 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
 
         The situ activation and the flashinfer_mxfp4 quantizer read the fp32
         slices directly. Every other runner takes routed_input rounded back to
-        bf16 in _forward_fused, which is bit-identical to the bf16 front. On
-        ROCm a bf16 front would also round the fp32 correction bias to bf16
-        (select_experts matches the logits' dtype), so AITER takes it in fp32."""
+        bf16 in _forward_fused, which is bit-identical to the bf16 front."""
         return (
+            # AITER: a bf16 front would also round the fp32 correction bias
             (not _is_hip or get_bool_env_var("SGLANG_USE_AITER"))
             and self._eligible_for_fused_front
             and self._front_w.dtype == torch.bfloat16
