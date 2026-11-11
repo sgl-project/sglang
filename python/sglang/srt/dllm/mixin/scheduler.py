@@ -12,6 +12,7 @@ from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
@@ -34,11 +35,11 @@ class SchedulerDllmMixin:
         )
         self.dllm_manager = DllmManager(
             dllm_config=self.dllm_config,
-            release_aborted=self._release_aborted_dllm_req,
+            abort=self._abort_dllm_req,
         )
 
-    def _release_aborted_dllm_req(self: Scheduler, req: Req) -> None:
-        self.request_retirer.abort_queued(req)
+    def _abort_dllm_req(self: Scheduler, req: Req) -> None:
+        self.request_retirer.abort(req)
         logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
     def validate_dllm_request(self: Scheduler, req: Req) -> Optional[str]:
@@ -189,7 +190,7 @@ class SchedulerDllmMixin:
             req.finish_outside_step(FINISH_LENGTH(length=len(req.output_ids)))
 
         if req.finished():
-            self.request_retirer.release_finished(
+            self.request_retirer.release(
                 req,
                 checkpoint=not self.dllm_config.requires_separate_context_encoding,
             )
@@ -238,9 +239,7 @@ class SchedulerDllmMixin:
         num_requests_to_add = min(max_dllm_capacity, len(self.waiting_queue))
 
         if num_requests_to_add > 0:
-            requests_to_add = self.waiting_queue[:num_requests_to_add]
-            self.dllm_manager.add_waiting_reqs(requests_to_add)
-            self.waiting_queue.replace(self.waiting_queue[num_requests_to_add:])
+            self.dllm_manager.add_waiting_reqs(self.waiting_queue[:num_requests_to_add])
 
     def _should_skip_prefill(self: Scheduler, running_batch: ScheduleBatch) -> bool:
         """Check if DLLM prefill should be skipped."""
@@ -276,6 +275,7 @@ class SchedulerDllmMixin:
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=get_schedule().prefill_max_requests,
             dllm_config=self.dllm_config,
+            request_retirer=self.request_retirer,
         )
 
     def _process_dllm_batches(
@@ -438,7 +438,7 @@ class DllmManager:
     def __init__(
         self,
         dllm_config: Optional[DllmConfig],
-        release_aborted: Callable[[Req], None],
+        abort: Callable[[Req], None],
     ):
         self.dllm_config = dllm_config
         self.max_running_reqs = (
@@ -447,7 +447,7 @@ class DllmManager:
         self.waiting_queue = IndexedReqList(ListKind.DLLM, abort=self._abort)
         # A subset of the waiting queue.
         self.staging_queue: List[Req] = []
-        self._release_aborted = release_aborted
+        self._abort_one = abort
 
     def get_prefill_requests(self) -> List[Req]:
         """Get all prefill requests from waiting queue."""
@@ -457,17 +457,15 @@ class DllmManager:
         """Get all decode requests from waiting queue."""
         return [req for req in self.waiting_queue if not req.is_dllm_prefill()]
 
-    def add_waiting_reqs(self, reqs: Union[Req, List[Req]]) -> None:
-        """Add requests to waiting queue with redundancy check."""
+    def add_waiting_reqs(self, reqs: List[Req]) -> None:
+        """Move requests into the waiting queue, with a redundancy check."""
         assert self.dllm_config is not None, "Diffusion LLM config is not set."
 
-        reqs_to_add = reqs if isinstance(reqs, list) else [reqs]
-
         # Check for duplicate request IDs
-        if self._has_duplicate_reqs(reqs_to_add):
+        if self._has_duplicate_reqs(reqs):
             raise RuntimeError("Redundant requests detected in dLLM requests.")
 
-        self.waiting_queue.join(reqs_to_add)
+        move(reqs, self.waiting_queue)
 
     def add_staging_reqs(self, reqs: Union[Req, List[Req]]) -> None:
         """Add requests to staging queue (allocated by PrefillAdder)."""
@@ -491,15 +489,18 @@ class DllmManager:
 
     def filter_finished_reqs(self) -> None:
         """Remove finished requests from both queues."""
-        self.waiting_queue.take(lambda req: req.finished())
-        self.staging_queue = [req for req in self.staging_queue if not req.finished()]
+        self.take(lambda req: req.finished())
+
+    def take(self, pred: Callable[[Req], bool]) -> List[Req]:
+        """Drop and return requests matching `pred`; staging is a subset of waiting."""
+        taken = self.waiting_queue.take(pred)
+        leaving = set(taken)
+        self.staging_queue = [req for req in self.staging_queue if req not in leaving]
+        return taken
 
     def _abort(self, recv_req: AbortReq) -> None:
-        aborted_reqs = self.waiting_queue.take(lambda req: recv_req.matches(req.rid))
-        aborted = set(aborted_reqs)
-        self.staging_queue = [req for req in self.staging_queue if req not in aborted]
-        for req in aborted_reqs:
-            self._release_aborted(req)
+        for req in self.take(lambda req: recv_req.matches(req.rid)):
+            self._abort_one(req)
 
     def init_next_round(self) -> None:
         """Initialize staging requests for next round and clear staging queue."""

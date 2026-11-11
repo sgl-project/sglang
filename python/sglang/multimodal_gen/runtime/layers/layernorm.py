@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
+    WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT,
     can_use_fused_inplace_qknorm_rope,
     can_use_fused_scale_residual_norm_scale_shift_triton,
     fuse_scale_shift_kernel,
@@ -633,10 +634,13 @@ class _ScaleResidualNormScaleShift(CustomOp):
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
         prefix: str = "",
+        rocm_flydsl_high_only: bool = False,
     ):
         super().__init__()
         self.eps = eps
         self.dtype = dtype
+        if rocm_flydsl_high_only:
+            WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.mark(self, hidden_size)
         if self.norm_type == "rms":
             self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
         elif self.norm_type == "layer":
@@ -693,7 +697,10 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not _use_rocm_flydsl:
+        if not _use_rocm_flydsl or (
+            WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.metadata(self) is not None
+            and not WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.is_enabled(self)
+        ):
             return self.forward_native(residual, x, gate, shift, scale)
 
         try:
@@ -879,10 +886,6 @@ class ScaleResidualLayerNormScaleShift(_ScaleResidualNormScaleShift):
     norm_type = "layer"
 
 
-class ScaleResidualRMSNormScaleShift(_ScaleResidualNormScaleShift):
-    norm_type = "rms"
-
-
 class _NormScaleShift(CustomOp):
     """
     Fused kernel that combines:
@@ -900,9 +903,12 @@ class _NormScaleShift(CustomOp):
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
         prefix: str = "",
+        rocm_flydsl_high_only: bool = False,
     ):
         super().__init__()
         self.eps = eps
+        if rocm_flydsl_high_only:
+            WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.mark(self, hidden_size)
         if self.norm_type == "rms":
             self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
         elif self.norm_type == "layer":
@@ -942,7 +948,10 @@ class _NormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> torch.Tensor:
-        if not _use_rocm_flydsl:
+        if not _use_rocm_flydsl or (
+            WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.metadata(self) is not None
+            and not WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.is_enabled(self)
+        ):
             return self.forward_native(x, shift, scale)
 
         try:

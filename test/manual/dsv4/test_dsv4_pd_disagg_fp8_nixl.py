@@ -32,7 +32,6 @@ DSV4_FLASH_ENV = {
     # then copy_ from packed fp4 (2048) blows up in fused_moe_triton.
     "SGLANG_DSV4_FP4_EXPERTS": os.environ.get("SGLANG_DSV4_FP4_EXPERTS", "1"),
     "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
-    "SGLANG_OPT_USE_AITER_BATCHED_GEMM": "1",
     "SGLANG_USE_AITER": "1",
     # unset: aiter CK 2stage on small-M warmup has no kernel
     "AITER_BF16_FP8_MOE_BOUND": "0",

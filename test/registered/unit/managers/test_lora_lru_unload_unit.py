@@ -12,14 +12,19 @@
 # limitations under the License.
 # ==============================================================================
 
-"""LoRA unloads in the tokenizer manager. Evicting the wrong adapter, a pinned
-one, or none at all leaves the registry and the ranks disagreeing about which
-adapters are resident, with no error; an unload that reaches the ranks while a
-request still holds the adapter frees weights that request is reading."""
+"""LoRA unloads in the tokenizer manager and the scheduler. Evicting the wrong
+adapter, a pinned one, or none at all leaves the registry and the ranks
+disagreeing about which adapters are resident, with no error; an unload that
+reaches the ranks while a request still holds the adapter, or before a launched
+step that ran it is done, frees weights that request is reading."""
 
 import asyncio
 import unittest
 from unittest.mock import Mock
+
+from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
 
 from sglang.srt.lora.lora_registry import LoRARegistry
 from sglang.srt.managers.io_struct import (
@@ -28,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     LoRAUpdateOutput,
     UnloadLoRAAdapterReqInput,
 )
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -192,6 +198,30 @@ class TestLoRALRUUnload(CustomTestCase):
             self.assertEqual(manager.pending_lora_unloads, {})
 
         self._run(scenario)
+
+
+class TestSchedulerLoRAUnload(CustomTestCase):
+    def test_overlap_unload_waits_for_launched_forward(self):
+        events = []
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_overlap = True
+        scheduler.forward_stream = object()
+        scheduler.schedule_stream = Mock()
+        scheduler.schedule_stream.wait_stream.side_effect = lambda stream: (
+            events.append(("wait_stream", stream))
+        )
+        scheduler.tp_worker = Mock()
+        scheduler.tp_worker.unload_lora_adapter.side_effect = lambda req: events.append(
+            ("unload", req)
+        )
+        request = UnloadLoRAAdapterReqInput(lora_name="a", lora_id="a-id")
+
+        scheduler.unload_lora_adapter(request)
+
+        self.assertEqual(
+            events,
+            [("wait_stream", scheduler.forward_stream), ("unload", request)],
+        )
 
 
 if __name__ == "__main__":

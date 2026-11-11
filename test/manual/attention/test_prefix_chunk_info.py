@@ -7,7 +7,7 @@ from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import get_device
+from sglang.srt.utils.device import get_device
 from sglang.test.test_utils import CustomTestCase
 
 TEST_CASES = [

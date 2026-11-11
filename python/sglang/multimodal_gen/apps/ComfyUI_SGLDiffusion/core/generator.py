@@ -77,15 +77,41 @@ def _check_h3_single_file(path: str, sgld_options: dict) -> None:
             "file (e.g. *_int8_convrot), whose per-layer metadata selects the "
             "format, and leave quantization empty"
         )
-    from safetensors import safe_open
 
-    with safe_open(path, framework="pt") as f:
-        if any(".to_gate_compress." in key for key in f.keys()):
-            raise ValueError(
-                "This is a FastH3 checkpoint (VSA gate weights), which the base "
-                "MiniMax H3 model cannot load; load the native FastH3 directory "
-                "with SGLDNativeModelLoader"
-            )
+
+def _default_fasth3_attention(path: str, sgld_options: dict) -> None:
+    """A FastH3 single file runs the VSA-H3 attention it was distilled with.
+
+    FastH3 8-Step V2 trains at 0.8 sparsity, as the native loader defaults, and
+    the same GPU and execution-mode gates apply: elsewhere, and for Ref2VA files
+    (VSA-H3 does not tile the ComfyUI Ref2VA layout), attention stays dense. An
+    explicit attention_backend wins.
+    """
+    from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+        vsa_h3_device_supported,
+        vsa_h3_execution_supported,
+    )
+    from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.minimax_h3 import (
+        has_vsa_gate,
+        is_reference_checkpoint,
+    )
+
+    if "attention_backend" in sgld_options or not has_vsa_gate(path):
+        return
+    if is_reference_checkpoint(path):
+        return
+    if not vsa_h3_device_supported() or not vsa_h3_execution_supported(
+        enable_torch_compile=sgld_options.get("enable_torch_compile"),
+        enable_breakable_cuda_graph=sgld_options.get("enable_breakable_cuda_graph"),
+        ring_degree=sgld_options.get("ring_degree"),
+    ):
+        logger.info(
+            "FastH3 single file runs dense attention: VSA-H3 needs a supported "
+            "GPU and no torch.compile, CUDA graph or ring attention"
+        )
+        return
+    sgld_options["attention_backend"] = "video_sparse_attn_h3"
+    sgld_options.setdefault("attention_backend_config", '{"VSA_sparsity": 0.8}')
 
 
 # Renamed local files and directories miss the registry's path detectors and
@@ -681,6 +707,8 @@ class SGLDiffusionGenerator:
         else:
             sgld_options.pop("transformer_weights_path", None)
         detect_path = model_path
+        if not native_dir:
+            _default_fasth3_attention(detect_path, sgld_options)
         gather_options = {
             "model_path": detect_path,
             "model_options": model_options,
