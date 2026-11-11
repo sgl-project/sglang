@@ -446,18 +446,6 @@ def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
         return floor
 
 
-def _is_one_nvlink_clique(cpu_group: dist.ProcessGroup) -> bool:
-    """Collective over ``cpu_group``. A multi-node NVLink clique (GB200/GB300
-    NVL72) shares one fabric address space, so symmetric memory and its
-    multicast object span the group as on one node."""
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
-        is_one_nvlink_clique,
-    )
-
-    device = torch.device("cuda", torch.cuda.current_device())
-    return is_one_nvlink_clique(cpu_group, device)
-
-
 class MultimemAllGatherer:
     """Guarded multimem all-gather (last dim) with NCCL fallback; the single
     entry point for every caller. Owns one symmetric buffer built lazily on the
@@ -481,6 +469,9 @@ class MultimemAllGatherer:
         self._state = self._UNINIT if enabled else None
         if self._state is self._UNINIT:
             # Lazy import avoids a module-load dependency on the distributed facade.
+            from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+                is_one_nvlink_clique,
+            )
             from sglang.srt.distributed.parallel_state import (
                 get_tp_group,
                 in_the_same_node_as,
@@ -497,7 +488,10 @@ class MultimemAllGatherer:
                 tp_group.world_size > 1
                 and get_parallel().nnodes > 1
                 and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
-                and not _is_one_nvlink_clique(tp_group.cpu_group)
+                and not is_one_nvlink_clique(
+                    tp_group.cpu_group,
+                    torch.device("cuda", torch.cuda.current_device()),
+                )
             ):
                 logger.warning(
                     "multimem all-gather disabled because the TP group spans "
