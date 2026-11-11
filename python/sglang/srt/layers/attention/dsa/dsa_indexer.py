@@ -307,6 +307,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _HEAD_DIM_WITH_SF = 132
     # the gfx950 monokernel's fused histogram top-k workspace; None elsewhere
     _hist_topk = None
+    fp4_index_k = False
     # One measured budget per device for the process lifetime.
     _mqa_logits_budget_bytes: Dict[int, int] = {}
 

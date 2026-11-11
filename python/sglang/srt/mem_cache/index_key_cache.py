@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 
 
 class IndexKeyCache:
+    fp4 = False
+
     def __init__(self, pool: DSATokenToKVPool, index_buf_size: int):
         self.pool = pool
         # FP4 keys: ``buffer`` holds the e2m1 pages and ``scale_buffer`` their exponents,
