@@ -55,8 +55,8 @@ jobs:
           fi
           printf 'ref=%s\n' "$REQUESTED_REF" >> "$GITHUB_OUTPUT"
 
-  # Keep separate jobs rather than a matrix: cluster-task derives its staging
-  # directory and K8s Job name from GITHUB_JOB, which concurrent matrix legs share.
+  # Run independent workers concurrently. Separate jobs keep GITHUB_JOB unique,
+  # so cluster-task staging directories, K8s Job names, and evidence stay isolated.
   nightly-1a-ppu:
     needs: [prepare]
     runs-on: k8s-runner-group-cpu-flytiger
@@ -122,7 +122,7 @@ jobs:
           retention-days: 14
 
   nightly-1b-ppu:
-    needs: [prepare, nightly-1a-ppu]
+    needs: [prepare]
     if: ${{ always() && needs.prepare.result == 'success' }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -192,7 +192,7 @@ jobs:
           retention-days: 14
 
   nightly-2-ppu:
-    needs: [prepare, nightly-1b-ppu]
+    needs: [prepare]
     if: ${{ always() && needs.prepare.result == 'success' }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -248,7 +248,7 @@ jobs:
           retention-days: 14
 
   nightly-4-ppu:
-    needs: [prepare, nightly-2-ppu]
+    needs: [prepare]
     if: ${{ always() && needs.prepare.result == 'success' }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
