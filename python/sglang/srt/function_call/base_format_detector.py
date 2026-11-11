@@ -424,6 +424,9 @@ class BaseFormatDetector(ABC):
             return None
 
         converted_tools = [tool.model_dump() for tool in tools or []]
+        for tool in converted_tools:
+            function = tool["function"]
+            function["strict"] = function.get("strict") is True
         converted_tool_choice = (
             tool_choice.model_dump()
             if isinstance(tool_choice, ToolChoice)
