@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import move
 from sglang.srt.managers.utils import make_abort_req
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
@@ -17,13 +18,13 @@ from sglang.srt.utils.weight_versions import (
     weight_version_spans_to_json,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import empty_request_lists
+from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-class _ReqStub:
+class _ReqStub(FakeReq):
     def __init__(self, output_len: int):
         self.output_ids = [0] * output_len
         self.weight_version_events = []
@@ -298,9 +299,10 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
     def _scheduler(self, version, running=(), waiting=(), chunked=None):
         scheduler = Scheduler.__new__(Scheduler)
         empty_request_lists(scheduler)
-        scheduler.running_reqs.join(running)
+        move(running, scheduler.running_reqs)
         scheduler.waiting_queue = list(waiting)
-        scheduler.chunked_req = chunked
+        if chunked is not None:
+            move([chunked], scheduler.chunked_reqs)
         scheduler.serving = _ServingStub(version)
         for name, value in (
             ("get_serving", scheduler.serving),
@@ -322,8 +324,8 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         scheduler = self._scheduler(
             "v1", [running_req], [waiting_req], chunked=chunked_req
         )
-        scheduler.grammar_manager.grammar_queue.join([grammar_req])
-        scheduler.disagg_prefill_transfer_queue.join([sending_req])
+        move([grammar_req], scheduler.grammar_manager.grammar_queue)
+        move([sending_req], scheduler.disagg_prefill_transfer_queue)
 
         Scheduler.record_weight_version_change(scheduler, new_version="v2")
 
@@ -425,9 +427,9 @@ class TestSpanlessAbortPaths(CustomTestCase):
         scheduler.abort_on_priority_when_disabled = True
         scheduler.send_abort_output = lambda obj, req_arg: sent.append(obj)
         scheduler.tree_cache = scheduler.beam_coordinator = MagicMock()
+        scheduler.output_streamer = MagicMock()
         scheduler.hisparse_coordinator = None
         scheduler.init_request_retirer()
-        scheduler.request_retirer.release_aborted_request = MagicMock()
 
         with patch(
             "sglang.srt.managers.utils.get_serving",

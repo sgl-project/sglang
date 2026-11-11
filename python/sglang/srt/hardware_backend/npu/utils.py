@@ -384,7 +384,7 @@ def lazy_init_zbal_gva_mem(
         return 1
 
     global gva_is_inited
-    from sglang.srt.utils.common import get_available_gpu_memory
+    from sglang.srt.utils.device import get_available_gpu_memory
 
     # TODO need to use allgather if you want use total_memory stats from mem_get_info as unbalance os
     total_memory = 61.2  # 2.5GB for other (workspace & os) outside torch

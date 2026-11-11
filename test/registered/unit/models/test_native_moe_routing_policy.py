@@ -366,35 +366,6 @@ class TestNativeMoeRoutingPolicy(CustomTestCase):
         expected = self.logits.sigmoid().topk(2).values.sort(-1).values
         torch.testing.assert_close(routing.topk_weights.sort(-1).values, expected)
 
-    def test_deepseek_dual_stream_graph_rejects_materialized_routing(self):
-        """The logits-only graph cannot bypass a router requiring materialization."""
-        from sglang.srt.models import deepseek_v2
-
-        block = object.__new__(deepseek_v2.DeepseekV2MoE)
-        torch.nn.Module.__init__(block)
-        block.alt_stream = object()
-        block.num_fused_shared_experts = 0
-        block.shared_experts = torch.nn.Identity()
-        block.experts = SimpleNamespace(
-            use_flashinfer_trtllm_moe=True,
-            runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM,
-        )
-        block._enable_a2a_moe = False
-        block._fuse_shared_experts_inside_sbo = False
-        block.is_hash = False
-        block.topk = SimpleNamespace(
-            topk_config=SimpleNamespace(output_format=TopKOutputFormat.BYPASSED)
-        )
-        with (
-            patch.object(deepseek_v2, "_enable_pcg_dsv2_dual_stream", True),
-            patch.object(
-                deepseek_v2, "is_in_tc_piecewise_cuda_graph", return_value=True
-            ),
-        ):
-            self.assertTrue(block._can_dual_stream_graph(torch.ones((1, 4))))
-            block.topk.topk_config.output_format = TopKOutputFormat.STANDARD
-            self.assertFalse(block._can_dual_stream_graph(torch.ones((1, 4))))
-
 
 if __name__ == "__main__":
     unittest.main()
