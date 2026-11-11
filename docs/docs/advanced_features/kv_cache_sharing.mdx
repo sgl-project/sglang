@@ -148,7 +148,7 @@ python -m sglang.launch_server \
   --max-running-requests 512 \
   --disable-radix-cache \
   --bf16-gemm-backend cutedsl \
-  --moe-a2a-backend flashinfer \
+  --moe-a2a-backend flashinfer_nvlink_one_sided \
   --moe-runner-backend flashinfer_trtllm_routed \
   --speculative-algorithm EAGLE \
   --speculative-num-steps 3 \
