@@ -83,7 +83,7 @@ def mtp_rows(
     locations = (
         batch.out_cache_loc.reshape(-1) if batch.out_cache_loc is not None else None
     )
-    _mtp_rows_kernel[(triton.cdiv(slots.numel(), 256),)](
+    _mtp_rows_kernel[(triton.cdiv(slots.numel(), 32),)](
         batch.req_pool_indices,
         batch.seq_lens,
         input_positions,
@@ -107,7 +107,7 @@ def mtp_rows(
         counts.stride(0) if counts is not None else 0,
         publication_rows is not None,
         host_capacity,
-        256,
+        32,
     )
     if publication_rows is not None:
         return slots, destination, positions, valid
@@ -302,7 +302,7 @@ def prefill_current_mapping(
         plan.total_tokens,
         512,
     )
-    _mapping_count_kernel[(triton.cdiv(n, 128),)](
+    _mapping_count_kernel[(triton.cdiv(n, 32),)](
         metadata,
         locations,
         current_valid,
@@ -314,9 +314,9 @@ def prefill_current_mapping(
         b,
         capacity,
         triton.next_power_of_2(b),
-        128,
+        32,
     )
-    _mapping_finish_kernel[(triton.cdiv(n, 256),)](
+    _mapping_finish_kernel[(triton.cdiv(n, 32),)](
         plan.source,
         locations,
         counts,
@@ -325,7 +325,7 @@ def prefill_current_mapping(
         host_mask,
         n,
         capacity,
-        256,
+        32,
     )
     return src, dst, valid, host_mask
 
@@ -349,21 +349,38 @@ def _copy_rows_metadata_kernel(
     SRC_STRIDE: tl.constexpr,
     DST_STRIDE: tl.constexpr,
     VALID_STRIDE: tl.constexpr,
+    COMPONENT_GRID: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    live = tl.load(valid + i * VALID_STRIDE, i < N, other=0) != 0
-    s = tl.load(source_rows + i * SRC_STRIDE, i < N, other=0).to(tl.int64)
-    d = tl.load(destination_rows + i * DST_STRIDE, i < N, other=0).to(tl.int64)
+    if COMPONENT_GRID:
+        component = tl.program_id(1)
+        row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        i = component * N + row
+        mask = row < N
+        first = component == 0
+    else:
+        i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        row = i % N
+        mask = i < 2 * N
+        first = i < N
+    live = tl.load(valid + row * VALID_STRIDE, mask, other=0) != 0
+    s = tl.load(source_rows + row * SRC_STRIDE, mask, other=0).to(tl.int64)
+    d = tl.load(destination_rows + row * DST_STRIDE, mask, other=0).to(tl.int64)
     s, d = tl.where(live, s, 0), tl.where(live, d, 0)
-    tl.store(src + i, source_base_0 + s * WIDTH_0, i < N)
-    tl.store(src + N + i, source_base_1 + s * WIDTH_1, i < N)
-    tl.store(dst + i, destination_base_0 + d * WIDTH_0, i < N)
-    tl.store(dst + N + i, destination_base_1 + d * WIDTH_1, i < N)
-    tl.store(lengths + i, tl.where(live, WIDTH_0, 0), i < N)
-    tl.store(lengths + N + i, tl.where(live, WIDTH_1, 0), i < N)
+    width = tl.where(first, WIDTH_0, WIDTH_1)
+    tl.store(src + i, tl.where(first, source_base_0, source_base_1) + s * width, mask)
+    tl.store(
+        dst + i,
+        tl.where(first, destination_base_0, destination_base_1) + d * width,
+        mask,
+    )
+    tl.store(lengths + i, tl.where(live, width, 0), mask)
     if tl.program_id(0) == 0:
-        tl.store(count, N * 2)
+        if COMPONENT_GRID:
+            if tl.program_id(1) == 0:
+                tl.store(count, N * 2)
+        else:
+            tl.store(count, N * 2)
 
 
 def copy_rows_metadata(sources, destinations, source_rows, destination_rows, valid):
@@ -376,7 +393,10 @@ def copy_rows_metadata(sources, destinations, source_rows, destination_rows, val
     dst = torch.empty_like(src)
     lengths = torch.empty(src.shape, dtype=torch.int32, device=device)
     count = torch.empty(1, dtype=torch.int32, device=device)
-    _copy_rows_metadata_kernel[(triton.cdiv(n, 256),)](
+    # Keep component boundaries aligned to the 32-byte int32 output cache line.
+    component_grid = n % 8 == 0
+    grid = (triton.cdiv(n, 32), 2) if component_grid else (triton.cdiv(2 * n, 32),)
+    _copy_rows_metadata_kernel[grid](
         source_rows,
         destination_rows,
         valid,
@@ -394,6 +414,7 @@ def copy_rows_metadata(sources, destinations, source_rows, destination_rows, val
         source_rows.stride(0),
         destination_rows.stride(0),
         valid.stride(0),
-        256,
+        component_grid,
+        32,
     )
     return src, dst, lengths, count

@@ -379,7 +379,7 @@ def main():
         exact(kernels.mtp_rows(batch, q, 32, 128), mtp_reference(batch, q, 32, 128))
         results["cases"].append(f"mtp/strided/{kind}/no-locations")
         checkpoint(args, results)
-    for n in (1, 65, 1024, 8192):
+    for n in (1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 1024, 8192):
         sources = [
             torch.empty((32, 1, w), dtype=torch.bfloat16, device=d) for w in (512, 64)
         ]
@@ -393,17 +393,19 @@ def main():
             sources, destinations, src, dst, valid
         )
         exact(fused(), ref())
-        if d == "npu" and n == 65:
+        if d == "npu" and n in (31, 32, 33, 63, 64, 65, 127, 128, 129):
             graph, output = replay(fused, ref)
             src.clamp_(min=0)
             dst.clamp_(min=0)
-            valid.logical_not_()
-            # All addresses, including invalid negative rows, follow reference semantics.
-            graph.replay()
-            torch.npu.synchronize()
-            exact(output, ref())
+            for _ in range(3):
+                src.add_(1).remainder_(32)
+                dst.add_(3).remainder_(32)
+                valid.logical_not_()
+                graph.replay()
+                torch.npu.synchronize()
+                exact(output, ref())
         results["cases"].append(f"copy_rows/{n}")
-        if args.benchmark:
+        if args.benchmark and n in (1, 64, 65, 1024, 8192):
             results["benchmarks"][f"copy_rows/{n}"] = measure(ref, fused, d, 100)
         checkpoint(args, results)
     src = torch.arange(66, device=d, dtype=torch.int32)[::2]
@@ -490,7 +492,7 @@ def large_prefill_cases(args, kernels, results):
             "reference_block_tables",
             args.reference_source / Path(*PKG.split(".")) / "block_tables.py",
         )
-    for b, length, width in ((1, 64000, 1024), (16, 64000, 4)):
+    for b, length, width in ((1, 64000, 1024), (1, 63999, 1024), (16, 64000, 4)):
         lens = [length - r for r in range(b)]
         req = list(range(1, b + 1))
         table = torch.randperm((b + 1) * length, device=d).reshape(b + 1, length).int()
@@ -673,7 +675,7 @@ def prefill_mapping_device_case(kernels, plan, batch, current_valid, lens, width
         kernels._mapping_init_kernel[(kernels.triton.cdiv(max(capacity, total), 512),)](
             counts, host_mask, capacity, total, 512
         )
-        kernels._mapping_count_kernel[(kernels.triton.cdiv(n, 128),)](
+        kernels._mapping_count_kernel[(kernels.triton.cdiv(n, 32),)](
             metadata,
             batch.out_cache_loc,
             current_valid,
@@ -685,9 +687,9 @@ def prefill_mapping_device_case(kernels, plan, batch, current_valid, lens, width
             b,
             capacity,
             kernels.triton.next_power_of_2(b),
-            128,
+            32,
         )
-        kernels._mapping_finish_kernel[(kernels.triton.cdiv(n, 256),)](
+        kernels._mapping_finish_kernel[(kernels.triton.cdiv(n, 32),)](
             plan.source,
             batch.out_cache_loc,
             counts,
@@ -696,7 +698,7 @@ def prefill_mapping_device_case(kernels, plan, batch, current_valid, lens, width
             host_mask,
             n,
             capacity,
-            256,
+            32,
         )
         return source, destination, valid, host_mask
 
