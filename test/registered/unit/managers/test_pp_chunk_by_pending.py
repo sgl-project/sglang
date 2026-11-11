@@ -246,6 +246,7 @@ class _WaitingReq:
         self.kv = SimpleNamespace(holds_kv=False)
         self.beam_group = None
         self.token_indices_to_pool = None
+        self.owner_list = None
 
     def init_next_round_input(self, tree_cache=None, **_):
         self.events.append(("match", self))
