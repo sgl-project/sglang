@@ -1771,7 +1771,7 @@ class PrefillAdder:
                     self._defer_staged_for_capacity_if_idle(req, pool="prefill_budget")
                 return admission
 
-            # OTHER, not NO_TOKEN: the batch is not full, the next pass asks again.
+            # Not NO_TOKEN: the batch is not full, later requests still try.
             if self._holds_for_cache_reserve(req, total_tokens=total_tokens):
                 self.cache_reserve_held.append((req, len(self.can_run_list)))
                 return AddReqResult.HELD
