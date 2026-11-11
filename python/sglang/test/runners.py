@@ -32,9 +32,10 @@ from transformers import (
 )
 
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.model_loader.ci_weight_validation import ci_validate_and_clean_hf_cache
-from sglang.srt.utils import get_device, is_npu, load_image
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.multimodal.media_io import load_image
+from sglang.srt.utils import get_device, is_npu
 from sglang.test.test_utils import (
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     calculate_rouge_l,
@@ -110,7 +111,7 @@ def _get_sentence_transformer_embedding_model(
     from sentence_transformers import SentenceTransformer
     from sentence_transformers.util import is_sentence_transformer_model
 
-    from sglang.srt.utils.hf_transformers_utils import _fix_v5_add_bos_eos_token
+    from sglang.srt.hf_transformers import _fix_v5_add_bos_eos_token
 
     if is_sentence_transformer_model(model_path):
         model = SentenceTransformer(
@@ -598,6 +599,7 @@ class SRTRunner:
         max_lora_rank: Optional[int] = None,
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
+        lora_use_virtual_experts: Optional[bool] = None,
         enable_lora_overlap_loading: Optional[bool] = None,
         max_loaded_loras: Optional[int] = None,
         json_model_override_args: Optional[dict[str, Any]] = None,
@@ -657,6 +659,7 @@ class SRTRunner:
             max_lora_rank=max_lora_rank,
             lora_target_modules=lora_target_modules,
             enable_lora=enable_lora,
+            lora_use_virtual_experts=bool(lora_use_virtual_experts),
             enable_lora_overlap_loading=enable_lora_overlap_loading,
             max_loaded_loras=max_loaded_loras,
             json_model_override_args=(
@@ -695,6 +698,7 @@ class SRTRunner:
         top_k: Optional[int] = None,
         token_ids_logprob: Optional[List[int]] = None,
         dimensions: Optional[int] = None,
+        encoding_format: Optional[str] = None,
     ):
         if self.is_generation:
             return self.forward_generation_raw(
@@ -709,7 +713,10 @@ class SRTRunner:
         else:
             if self.model_type == "embedding":
                 response = self.engine.encode(
-                    prompt=prompts, image_data=image_data, dimensions=dimensions
+                    prompt=prompts,
+                    image_data=image_data,
+                    dimensions=dimensions,
+                    encoding_format=encoding_format,
                 )
                 if isinstance(response, list):
                     logits = [x["embedding"] for x in response]

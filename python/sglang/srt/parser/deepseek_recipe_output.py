@@ -17,6 +17,9 @@ from sglang.srt.parser.deepseek_recipe_renderer import (
     load_deepseek_recipe,
 )
 
+# The most tokens one UTF-8 character can span, a byte each.
+_MAX_UTF8_BYTES = 4
+
 
 class RecipeToolCallDelta(msgspec.Struct, frozen=True):
     """A piece of one call's JSON arguments; the first piece also names the call."""
@@ -174,12 +177,19 @@ class DeepSeekRecipeOutputParser:
     ) -> list[int]:
         # The scheduler matched `stop` in the decoded text and ended on the token
         # completing it; the earliest match ending there starts at most
-        # len(stop) - 1 characters before that token.
+        # len(stop) - 1 characters before that token. A stop not found there, as
+        # a `stop_regex` pattern is not, is not cut.
         decode = self._hf_tokenizer.decode
         start = len(token_ids) - 1
-        last = decode(token_ids[start:], skip_special_tokens=False)
-        text = last
-        while start > 0 and (stop not in text or len(text) - len(last) < len(stop) - 1):
+        text = decode(token_ids[start:], skip_special_tokens=False)
+        reach = len(text) + len(stop) - 1
+        tokens_past_reach = 0
+        while start > 0 and (stop not in text or len(text) < reach):
+            if len(text) >= reach:
+                # A character split across tokens decodes whole only with all of them.
+                if tokens_past_reach == _MAX_UTF8_BYTES:
+                    break
+                tokens_past_reach += 1
             start -= 1
             text = decode(token_ids[start:], skip_special_tokens=False)
         cut = text.find(stop)

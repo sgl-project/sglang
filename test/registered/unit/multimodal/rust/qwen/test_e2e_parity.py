@@ -10,6 +10,7 @@ is reproduced exactly.
 
 import asyncio
 import base64
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -31,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _fixtures import make_processor, snapshot  # noqa: E402
 from _mm_rust_utils import PROCESSOR_CONFIGS, image_bytes, load_core  # noqa: E402
 
-register_cpu_ci(est_time=16, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 CORE = load_core()
 DRIVER = getattr(getattr(CORE, "qwen_vl", None), "process_mm", None)
@@ -110,7 +111,26 @@ class TestQwenE2eParity(CustomTestCase):
             buffers[f"mm.feature.{index}"] = features[
                 row * spec.feature_dim : (row + n) * spec.feature_dim
             ].reshape(n, spec.feature_dim)
+            feature = buffers[f"mm.feature.{index}"]
+            # Match the native worker sidecar, which commits to its actual
+            # model-facing tensor and geometry, not the old source hash hint.
+            metadata = msgspec.msgpack.encode(
+                (
+                    "image",
+                    "f32",
+                    sys.byteorder == "little",
+                    list(feature.shape),
+                    {"image_grid_thw": list(grids[index])},
+                )
+            )
+            digest = hashlib.sha256(b"sglang-rust-mm-output-v1")
+            digest.update(len(metadata).to_bytes(8, "big"))
+            digest.update(metadata)
+            digest.update(feature.nbytes.to_bytes(8, "big"))
+            digest.update(memoryview(feature).cast("B"))
+            meta["items"][index]["identity"] = list(digest.digest())
             row += n
+        buffers["mm.meta"] = np.frombuffer(msgspec.msgpack.encode(meta), dtype=np.uint8)
         return snapshot(ids, RustMmProcessor.wrap_encoded(spec, buffers))
 
     def run_python(self, sources):
