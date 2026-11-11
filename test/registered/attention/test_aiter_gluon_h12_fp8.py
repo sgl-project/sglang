@@ -588,6 +588,12 @@ class TestMlaDcpGluonStartupCheck(CustomTestCase):
             mock.patch(f"{_BACKEND}._kv_cache_is_vectorized_5d", return_value=False),
             mock.patch(f"{_BACKEND}._require_untranslated_storage"),
             mock.patch(f"{_BACKEND}.is_dp_attention_enabled", return_value=False),
+            mock.patch(
+                f"{_BACKEND}.get_exec",
+                return_value=mock.Mock(
+                    deterministic=mock.Mock(enable_deterministic_inference=False)
+                ),
+            ),
             # __init__ rewrites these module globals; restore them afterwards.
             mock.patch(f"{_BACKEND}._use_mla_ps_kernel", True),
             mock.patch(f"{_BACKEND}.fast_mode", False),
