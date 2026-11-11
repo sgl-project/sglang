@@ -101,7 +101,7 @@ class TestFastImageProcessorDevice(CustomTestCase):
                     device = processor._fast_image_processor_device(Glm4vProcessor())
                     self.assertEqual(device, "cpu")
 
-    def test_npu_device_follows_each_instance_with_decoding_on_or_off(self):
+    def test_npu_preserves_current_device_with_decoding_on_or_off(self):
         hooks = {
             "qwen_vl_processor": ["npu_apply_qwen_image_preprocess_patch"],
             "glm46v_processor": ["npu_apply_glm46v_image_preprocess_patch"],
@@ -125,13 +125,17 @@ class TestFastImageProcessorDevice(CustomTestCase):
                 hf_processor = type(name, (), {})()
                 hf_processor.image_processor = object()
                 hf_processor.video_processor = object()
-                for processor, expected in ((first, "npu:1"), (second, "npu:3")):
+                for processor in (first, second):
                     for enabled in (False, True):
-                        with self.subTest(name=name, device=expected, decode=enabled):
+                        with self.subTest(
+                            name=name,
+                            base_gpu_id=processor.server_args.base_gpu_id,
+                            decode=enabled,
+                        ):
                             processor.gpu_image_decode = enabled
                             self.assertEqual(
                                 processor._fast_image_processor_device(hf_processor),
-                                expected,
+                                "npu",
                             )
         for name, names in hooks.items():
             for hook in names:

@@ -828,7 +828,7 @@ class BaseMultimodalProcessor(ABC):
                 and processor.video_processor is not None
             ):
                 npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
-            return f"npu:{server_args.base_gpu_id}"
+            return "npu"
         if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
             # For qwen-vl, the processor hits a reshape issue from the Ascend
             # dims restriction.
@@ -837,14 +837,14 @@ class BaseMultimodalProcessor(ABC):
             )
 
             npu_apply_qwen_image_preprocess_patch()
-            return f"npu:{server_args.base_gpu_id}"
+            return "npu"
         if processor.__class__.__name__ == "Glm46VProcessor":
             from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
                 npu_apply_glm46v_image_preprocess_patch,
             )
 
             npu_apply_glm46v_image_preprocess_patch()
-            return f"npu:{server_args.base_gpu_id}"
+            return "npu"
         if processor.__class__.__name__ == "Glm4vProcessor":
             # GLM-4V patch extraction exceeds the NPU tensor dimension limit.
             return "cpu"
