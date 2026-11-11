@@ -473,6 +473,10 @@ class CompletionRequest(PDRoutingFields):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    # Explicit KV-cache namespace: save this request's prefix under this id.
+    cache_id: Optional[str] = None
+    # Explicit KV-cache namespace: load a previously saved prefix under this id.
+    load_cache_id: Optional[str] = None
     # Priority for the request
     priority: Optional[int] = None
 
@@ -1179,6 +1183,10 @@ class ChatCompletionRequest(PDRoutingFields):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    # Explicit KV-cache namespace: save this request's prefix under this id.
+    cache_id: Optional[str] = None
+    # Explicit KV-cache namespace: load a previously saved prefix under this id.
+    load_cache_id: Optional[str] = None
     # Priority for the request
     priority: Optional[int] = None
 
@@ -2171,6 +2179,14 @@ class ResponsesRequest(PDRoutingFields):
     )
     cache_salt: Optional[str] = Field(
         default=None, description="Cache salt for request caching"
+    )
+    cache_id: Optional[str] = Field(
+        default=None,
+        description="Explicit KV-cache namespace to save this request's prefix under",
+    )
+    load_cache_id: Optional[str] = Field(
+        default=None,
+        description="Explicit KV-cache namespace to load a previously saved prefix from",
     )
 
     # Deprecated: use routed_dp_rank instead

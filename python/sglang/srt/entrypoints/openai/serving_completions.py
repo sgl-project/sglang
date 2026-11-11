@@ -135,6 +135,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             session_id=request.session_id,
             extra_key=request.extra_key,
             cache_salt=request.cache_salt,
+            cache_id=request.cache_id,
+            load_cache_id=request.load_cache_id,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
