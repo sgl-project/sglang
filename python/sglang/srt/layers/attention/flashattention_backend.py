@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, NamedTuple, Optional
 
 import torch
 
@@ -106,6 +106,17 @@ def _should_disable_scheduler_metadata_precompute() -> bool:
     return bool(get_parallel().enable_prefill_cp or get_parallel().attn_dp_enabled)
 
 
+class FlashAttentionKernels(NamedTuple):
+    """Kernels ``FlashAttentionBackend`` calls in place of an FA build. Each call
+    gets the arguments of ``flash_attn_varlen_func`` / ``flash_attn_with_kvcache``
+    of the FA version the layer is routed to: ``flash_attention_v3`` for
+    version 3, ``flash_attention_v4`` for version 4 (in
+    ``sglang.kernels.ops.attention``)."""
+
+    varlen_func: Callable
+    with_kvcache_func: Callable
+
+
 @dataclass
 class FlashAttentionMetadata:
     """Metadata to be init once in the model forward pass,
@@ -201,6 +212,7 @@ class FlashAttentionBackend(AttentionBackend):
         topk=0,
         speculative_num_steps=0,
         fa_impl_ver=3,
+        kernels: Optional[FlashAttentionKernels] = None,
     ):
         super().__init__()
 
@@ -314,19 +326,29 @@ class FlashAttentionBackend(AttentionBackend):
             self.fa_impl_ver == 3 and not self.use_mla and model_head_dim > 256
         )
         device_capability = get_device_capability()
-        if self.fa3_upgrades_to_fa4 and device_capability[0] < 9:
+        # These guard the FA4 build; custom kernels are their own.
+        checks_fa4_build = self.fa3_upgrades_to_fa4 and kernels is None
+        if checks_fa4_build and device_capability[0] < 9:
             raise ValueError(
                 f"The fa3 backend runs head_dim {model_head_dim} layers on FA4, "
                 "which requires SM90 or newer for paged KV cache. "
                 "Use --attention-backend triton on SM8x."
             )
-        if self.fa3_upgrades_to_fa4 and self.kv_cache_dtype != torch.bfloat16:
+        if checks_fa4_build and self.kv_cache_dtype != torch.bfloat16:
             raise ValueError(
                 f"FA4 has no {self.kv_cache_dtype_str} KV cache path on SM90, and "
                 f"the fa3 backend runs head_dim {model_head_dim} layers on FA4. "
                 "Use a BF16 KV cache."
             )
-        self._init_flash_attention_functions(device_capability)
+        if kernels is None:
+            self._init_flash_attention_functions(device_capability)
+        else:
+            if self.fa_impl_ver not in (3, 4):
+                raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
+            # The FA3 scheduler metadata and FA4 runtime policy are the FA builds'.
+            self._get_scheduler_metadata = None
+            self._get_fa_runtime_policy = None
+            self._fa_kernels = dict.fromkeys((3, 4), kernels)
 
         # Store head info for precomputing FA3 scheduler metadata
         self.head_dim = model_runner.model_config.head_dim
@@ -380,7 +402,7 @@ class FlashAttentionBackend(AttentionBackend):
             and not self.use_mla
         )
         # FA4 varlen at head_dim 512 is not validated on that path.
-        if self.fa3_upgrades_to_fa4 and self.fa_skip_kv_cache:
+        if checks_fa4_build and self.fa_skip_kv_cache:
             raise ValueError(
                 f"The fa3 backend runs head_dim {model_head_dim} layers on FA4, "
                 "which the embedding no-KV-cache path does not support. Enable "

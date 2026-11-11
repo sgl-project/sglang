@@ -23,6 +23,14 @@ def _get_loop_num(hf_config: Any) -> int:
 
 
 def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
+    """Find each layer's attention module, MoE block and DSA indexer.
+
+    Attention modules are found at known attribute paths (e.g.
+    ``layers[i].self_attn.attn``). If ``layer_model`` (the module that owns
+    ``layers``) defines ``get_attention_layers()``, its list is used instead:
+    one attention module (or None) per entry of ``layers``. MoE blocks and DSA
+    indexers are always found by attribute path.
+    """
     attention_layers: list[Any] = []
     moe_layers: list[Any] = []
     moe_fusions: list[Any] = []
@@ -37,10 +45,20 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
     layers = layer_model.layers
     if isinstance(layers, nn.ModuleDict):
         layers = layers.values()
-    for layer in layers:
+    model_attention_layers = None
+    if hasattr(layer_model, "get_attention_layers"):
+        model_attention_layers = list(layer_model.get_attention_layers())
+        if len(model_attention_layers) != len(layers):
+            raise ValueError(
+                f"get_attention_layers() returned {len(model_attention_layers)} "
+                f"entries for {len(layers)} layers"
+            )
+    for i, layer in enumerate(layers):
         attn_layer = None
         mha_companion_layer = None
-        if hasattr(layer, "self_attn"):
+        if model_attention_layers is not None:
+            attn_layer = model_attention_layers[i]
+        elif hasattr(layer, "self_attn"):
             if hasattr(layer.self_attn, "attn"):
                 attn_layer = layer.self_attn.attn
             elif hasattr(layer.self_attn, "attn_mqa"):
