@@ -1565,14 +1565,22 @@ class TestDflashDraftKvBudget(CustomTestCase):
         )
 
     def test_draft_kv_ring_charge_matches_the_ring_pool(self):
-        for dcp_size, page_size in ((8, 1), (1, 64)):
+        for dcp_size, page_size, publish in (
+            (8, 1, {}),
+            (1, 64, {}),
+            (
+                8,
+                64,
+                dict(disaggregation_mode="decode", disaggregation_decode_extra_slots=6),
+            ),
+        ):
             with (
-                self.subTest(dcp=dcp_size, page=page_size),
+                self.subTest(dcp=dcp_size, page=page_size, **publish),
                 mock_cpu_env(tp_size=8),
                 get_parallel().override(attn_dcp_size=dcp_size),
             ):
                 config = self._ring_target_configurator(
-                    page_size=page_size, max_running_requests=48
+                    page_size=page_size, max_running_requests=48, **publish
                 )
                 with get_spec().override(speculative_dflash_draft_kv_ring=True):
                     charged = config._dflash_draft_kv_ring_bytes()
@@ -1581,7 +1589,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 )
                 self.assertEqual(
                     req_pool.req_to_token.shape[0],
-                    48 + 1,
+                    48 + publish.get("disaggregation_decode_extra_slots", 0) + 1,
                 )
                 rows = config._dflash_draft_kv_ring_rows(
                     draft_hf_config=config.spec_aux_config.draft_model_config.hf_config,

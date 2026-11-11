@@ -102,10 +102,10 @@ export const KimiK31MambaRatioCalculator = () => {
       Number(flagArg("--speculative-dflash-block-size")) ||
       Number(flagArg("--speculative-num-draft-tokens")) || 8;
     const drafts = specOn && !replaySpec && pdRole !== "prefill" ? block : 0;
-    // The ring runs only colocated, on an MLA draft backend.
+    // The ring runs on an MLA draft backend, colocated or PD over Mooncake.
     const ringOn =
       specOn &&
-      !pdRole &&
+      (!pdRole || !flagArg("--disaggregation-transfer-backend") || flagArg("--disaggregation-transfer-backend").startsWith("mooncake")) &&
       ["cutedsl_mla", "trtllm_mla"].includes(flagArg("--speculative-draft-attention-backend")) &&
       !hasFlag("--enable-unified-memory") &&
       !hasFlag("--speculative-draft-window-size") &&
