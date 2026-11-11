@@ -303,6 +303,10 @@ class Envs:
     SGLANG_OPT_MAMBA_HOST_ONLY_CONCURRENT_FETCH = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Graph-input staging through a JIT copy plan cached per destination layout.
+    SGLANG_OPT_CUDA_GRAPH_FIELD_COPY_PLAN = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
