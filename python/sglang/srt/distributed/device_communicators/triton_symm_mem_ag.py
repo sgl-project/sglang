@@ -466,9 +466,8 @@ class MultimemAllGatherer:
     ):
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
-        # None => always NCCL; _UNINIT => build on first eager call. ROCm has no
-        # multicast, so the build would only fall back to NCCL after a symmetric
-        # memory rendezvous, which hung server start on MI355X.
+        # None => always NCCL; _UNINIT => build on first eager call.
+        # ROCm has no multicast; the build's symm-mem rendezvous hung MI355X start.
         self._state = self._UNINIT if enabled and not is_hip() else None
         if self._state is self._UNINIT:
             # Lazy import avoids a module-load dependency on the distributed facade.
