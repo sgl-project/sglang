@@ -429,6 +429,20 @@ def check_state_wire(
                 f"tail, decode tail): {shorter}. Both servers need the same "
                 "draft model and front rows, or a prefill keeping more."
             )
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    ring_entries = [StateType.DRAFT_RING.value, StateType.REQUEST_ROW.value]
+    for role, wire, other in (
+        ("prefill", prefill_wire, decode_wire),
+        ("decode", decode_wire, prefill_wire),
+    ):
+        if wire[:-2] == other and [entry[0] for entry in wire[-2:]] == ring_entries:
+            raise RuntimeError(
+                f"PD state entry mismatch: only the {role} server registers a "
+                f"DFLASH draft KV ring ({wire[-2:]}). Each server resolves the "
+                f"ring on its own: set SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0 on the "
+                f"{role} server, or align the flags that turn the ring on."
+            )
     raise RuntimeError(
         f"PD state entry mismatch: prefill server registers {prefill_wire}, but "
         f"decode server registers {decode_wire} (state type, sub-pool, window "
@@ -1215,6 +1229,16 @@ def should_send_replicated_state(
     return local_tp_rank_in_group % writers_per_decode == 0
 
 
+def draft_kv_ring_row_pairs(
+    src_rows: Sequence[int], dst_rows: Sequence[int]
+) -> Tuple[List[int], List[int]]:
+    """The (prefill, decode) ring rows a DRAFT_RING transfer copies, from two
+    position-matched ``transfer_rows``: a position goes only where both ranks
+    own it (row 0 marks one a rank does not own under DCP)."""
+    pairs = [(a, b) for a, b in zip(src_rows, dst_rows) if a and b]
+    return [a for a, _ in pairs], [b for _, b in pairs]
+
+
 def compute_mamba_state_slice_blocks(
     src_dim: int,
     dst_dim: int,
@@ -1814,13 +1838,11 @@ def setup_state_kv_args(
     total_kv_layers: Optional[int] = None,
     window_tails: Optional[Dict[str, int]] = None,
     draft_kv_ring: Optional[DFlashDraftKVRing] = None,
-    draft_kv_ring_on: bool = False,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
     peers read from its token KV layout. ``window_tails`` gives the tail each
     window sub-pool carries (`KVStorage.retained_window_lengths`); peers agree on it.
-    ``draft_kv_ring_on`` is the resolved DFLASH draft KV ring; ``draft_kv_ring``
-    is this stage's ring, None on a stage without the draft."""
+    A DFLASH draft KV ring's rows and floor go last, so peers pair them by position."""
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -1874,6 +1896,13 @@ def setup_state_kv_args(
             key_bytes,
             owner_view.index_bytes_per_token - key_bytes,
         )
+    if draft_kv_ring is not None:
+        append_state_component(
+            kv_args, StateType.DRAFT_RING, *draft_kv_ring.ring_buf_infos()
+        )
+        append_state_component(
+            kv_args, StateType.REQUEST_ROW, *draft_kv_ring.floor_buf_infos()
+        )
     kv_args.state_window_tails = [
         (window_tails or {}).get(sub_pool) if sub_pool is not None else None
         for sub_pool in kv_args.state_sub_pools
@@ -1890,8 +1919,6 @@ def setup_state_kv_args(
             if draft_token_to_kv_pool is not None
             else 0
         )
-    if draft_kv_ring_on:
-        _append_draft_kv_ring_state(kv_args, draft_kv_ring)
 
 
 def _token_kv_view(token_to_kv_pool):
@@ -1899,22 +1926,6 @@ def _token_kv_view(token_to_kv_pool):
     a pool wrapping one beside recurrent state (a hybrid draft) holds its
     layers in, else the pool itself."""
     return token_to_kv_pool.layer_router.wrapped_view() or token_to_kv_pool
-
-
-def _append_draft_kv_ring_state(
-    kv_args: KVArgs, ring: Optional[DFlashDraftKVRing]
-) -> None:
-    """A DFLASH draft KV ring ships its last window and its floor, last on both
-    sides so the component order matches. A PP stage without the draft keeps
-    empty slots and sends nothing for them."""
-    from sglang.srt.disaggregation.base.conn import StateType
-
-    if ring is not None:
-        append_state_component(kv_args, StateType.DRAFT_RING, *ring.ring_buf_infos())
-        append_state_component(kv_args, StateType.REQUEST_ROW, *ring.floor_buf_infos())
-    else:
-        append_state_component(kv_args, StateType.DRAFT_RING, [], [], [])
-        append_state_component(kv_args, StateType.REQUEST_ROW, [], [], [])
 
 
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:

@@ -7,12 +7,12 @@ import torch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import _resolve_dflash_draft_kv_ring
+from sglang.srt.disaggregation.utils import draft_kv_ring_row_pairs
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
     draft_kv_ring_rows_per_req,
-    draft_ring_row_pairs,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -72,13 +72,11 @@ class TestResolveDraftKVRing(CustomTestCase):
 
     def test_on_under_pd_over_mooncake(self):
         for mode in ("prefill", "decode"):
-            for backend in ("mooncake", "mooncake_tcp"):
-                with self.subTest(mode=mode, backend=backend), _switch():
-                    args = _args(
-                        disaggregation_mode=mode,
-                        disaggregation_transfer_backend=backend,
-                    )
-                    self.assertTrue(self._resolve(args))
+            with self.subTest(mode=mode), _switch():
+                args = _args(
+                    disaggregation_mode=mode, disaggregation_transfer_backend="mooncake"
+                )
+                self.assertTrue(self._resolve(args))
 
     def test_off_by_launch_flags_without_loading_the_draft(self):
         cases = {
@@ -87,6 +85,10 @@ class TestResolveDraftKVRing(CustomTestCase):
             ),
             "decode over mori": _args(
                 disaggregation_mode="decode", disaggregation_transfer_backend="mori"
+            ),
+            "decode host receive": _args(
+                disaggregation_mode="decode",
+                disaggregation_decode_host_receive_threshold=0.5,
             ),
             "unified": _args(enable_unified_memory=True),
             "flashinfer": _args(speculative_draft_attention_backend="flashinfer"),
@@ -138,9 +140,10 @@ class TestResolveDraftKVRing(CustomTestCase):
 
 WINDOW_LEFT = 1023
 BLOCK = 8
+_NO_MEM_POOL = SimpleNamespace(maybe_get_custom_mem_pool=lambda: None)
 
 
-def _ring(dcp, req_to_token_rows=4, dcp_rank=0, pool=None):
+def _ring(dcp, req_to_token_rows=4, dcp_rank=0, pool=_NO_MEM_POOL):
     return DFlashDraftKVRing(
         rows_per_req=draft_kv_ring_rows_per_req(
             window_left=WINDOW_LEFT, block_size=BLOCK, dcp_size=dcp
@@ -213,7 +216,7 @@ class TestDraftKVRingPDTransfer(CustomTestCase):
             src_rank = rank if prefill_dcp == decode_dcp else 0
             prefill = _ring(prefill_dcp, req_to_token_rows=8, dcp_rank=src_rank)
             decode = _ring(decode_dcp, req_to_token_rows=8, dcp_rank=rank)
-            src, dst = draft_ring_row_pairs(
+            src, dst = draft_kv_ring_row_pairs(
                 prefill.transfer_rows(3, seq_len).tolist(),
                 decode.transfer_rows(5, seq_len).tolist(),
             )
@@ -258,6 +261,7 @@ class TestDraftKVRingPDTransfer(CustomTestCase):
         page_size = 64
         pool = SimpleNamespace(
             page_size=page_size,
+            maybe_get_custom_mem_pool=lambda: None,
             get_contiguous_buf_infos=lambda: (
                 [1000, 2000],
                 [page_size * 576 * 10, page_size * 576 * 10],

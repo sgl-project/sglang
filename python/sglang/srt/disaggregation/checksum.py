@@ -153,20 +153,21 @@ class KvChecksumComputer:
     @classmethod
     def for_kv_args(cls, kv_args, device: torch.device) -> KvChecksumComputer:
         """Digest the KV and the state entries `state_indices_for_request`
-        addresses. A DFLASH draft KV ring's entries, registered last, are left
-        out: its rows are addressed per position, not by the request's state
-        slots."""
+        addresses. A DFLASH draft KV ring's two entries (its rows and floor) are
+        left out: its rows are addressed per position, not by the request's
+        state slots."""
         from sglang.srt.disaggregation.base.conn import StateType
 
-        num_entries = len(kv_args.state_types)
+        keep = list(range(len(kv_args.state_types)))
         if StateType.DRAFT_RING in kv_args.state_types:
-            num_entries = kv_args.state_types.index(StateType.DRAFT_RING)
+            ring = kv_args.state_types.index(StateType.DRAFT_RING)
+            keep = [i for i in keep if i not in (ring, ring + 1)]
         return cls(
             device=device,
             kv_data_ptrs=kv_args.kv_data_ptrs,
             kv_item_lens=kv_args.kv_item_lens,
-            state_data_ptrs=kv_args.state_data_ptrs[:num_entries],
-            state_item_lens=kv_args.state_item_lens[:num_entries],
+            state_data_ptrs=[kv_args.state_data_ptrs[i] for i in keep],
+            state_item_lens=[kv_args.state_item_lens[i] for i in keep],
         )
 
     def compute(

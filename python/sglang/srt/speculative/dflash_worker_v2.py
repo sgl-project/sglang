@@ -732,11 +732,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             req_to_token_rows=req_to_token_rows,
             device=self.device,
             window_left=window_left,
-            dcp_rank=parallel.dcp_rank if parallel.dcp_enabled else 0,
+            dcp_rank=parallel.attn_dcp_rank,
             pool=pool,
-            mem_pool=pool.maybe_get_custom_mem_pool(),
         )
-        if get_parallel().tp_rank == 0:
+        if parallel.tp_rank == 0:
             logger.info(
                 "DFLASH draft KV ring: %d rows per request per rank (%d positions), "
                 "%d req_to_token rows, draft pool %d rows.",

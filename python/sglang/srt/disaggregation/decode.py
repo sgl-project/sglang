@@ -168,7 +168,6 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
-    get_spec,
 )
 from sglang.srt.utils import ceil_align, is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_h2d
@@ -913,7 +912,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
             draft_kv_ring=self.draft_kv_ring,
-            draft_kv_ring_on=get_spec().speculative_dflash_draft_kv_ring,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -1382,6 +1380,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             resumed_reqs.append(req)
             req.is_retracted = False
             self._pre_alloc(req)
+            if self.draft_kv_ring is not None:
+                # Its ring rows were not backed up.
+                self.draft_kv_ring.reset_floor(
+                    int(req.kv.req_pool_idx), pre_alloc_fill_len(req)
+                )
             full_allocatable_tokens = self._allocatable_token_budgets(
                 count_retracted=False,
                 extra_reserved_reqs=len(resumed_reqs),
@@ -1938,6 +1941,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len,
                 total_prefix_len,
             )
+            if self.draft_kv_ring is not None and _is_fake_transfer(decode_req.req):
+                # No prefill sends this request's floor.
+                self.draft_kv_ring.reset_floor(
+                    int(decode_req.req.kv.req_pool_idx),
+                    pre_alloc_fill_len(decode_req.req),
+                )
             decode_req.prefix_match = prefix_match
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
@@ -2200,10 +2209,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         def _draft_ring_payload():
-            ring = self.draft_kv_ring
-            if ring is None:
-                return None
-            return ring.transfer_rows(int(decode_req.req.kv.req_pool_idx), seq_len)
+            return self.draft_kv_ring.transfer_rows(
+                int(decode_req.req.kv.req_pool_idx), seq_len
+            )
 
         def _request_row_payload():
             return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
@@ -2955,11 +2963,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         fill_len = pre_alloc_fill_len(req)
         req.kv.commit_prealloc(fill_len)
-        if self.draft_kv_ring is not None:
-            # The slot's ring rows hold an earlier request's draft KV: no draft
-            # context until a transfer's floor row lands. A resumed retraction
-            # gets none back, since its ring rows were not backed up.
-            self.draft_kv_ring.reset_floor(int(req.kv.req_pool_idx), fill_len)
 
         if prefix_len > 0:
             self.req_to_token_pool.write(

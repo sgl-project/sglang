@@ -1521,12 +1521,6 @@ class KVCacheConfigurator:
             return disagg.disaggregation_decode_extra_slots
         return 0
 
-    def _req_to_token_rows(self, max_running_requests: int) -> int:
-        """req_to_token rows of the pool built for max_running_requests: the
-        request rows, the PD pre-alloc rows and the padding row."""
-        pre_alloc_size = self._req_pool_pre_alloc_size() or 0
-        return self._req_pool_rows(max_running_requests) + pre_alloc_size + 1
-
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
         extra_max_context_len = get_req_to_token_extra_context_len()
 
@@ -2794,9 +2788,15 @@ class KVCacheConfigurator:
             return 0
         max_num_reqs = max(1, get_schedule().max_running_requests // self.attn_dp_size)
         page_size = get_schedule().page_size * self.dflash_draft_loc_space_scale
+        # request rows, PD pre-alloc rows, padding row
+        req_to_token_rows = (
+            self._req_pool_rows(max_num_reqs)
+            + (self._req_pool_pre_alloc_size() or 0)
+            + 1
+        )
         rows = self._dflash_draft_kv_ring_rows(
             draft_hf_config=draft_model_config.hf_config,
-            req_to_token_rows=self._req_to_token_rows(max_num_reqs),
+            req_to_token_rows=req_to_token_rows,
             page_size=page_size,
         )
         ring_bytes = (rows + page_size) * int(cell_size)

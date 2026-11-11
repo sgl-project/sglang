@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_with_staging,
     setup_state_kv_args,
     should_send_replicated_state,
+    state_wire,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
@@ -1279,10 +1280,9 @@ class TestDsaIndexKTokenBytes(unittest.TestCase):
 
 class TestDFlashDraftKVRingRegistration(unittest.TestCase):
     """A DFLASH draft KV ring registers its rows and its floor after the
-    storage's entries, so prefill and decode pair them by position; a stage
-    without the draft keeps two empty slots."""
+    storage's entries, so prefill and decode pair them by position."""
 
-    def _register(self, ring, *, ring_on):
+    def _register(self, ring):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
         pool = object.__new__(DSATokenToKVPool)
@@ -1297,9 +1297,7 @@ class TestDFlashDraftKVRingRegistration(unittest.TestCase):
         pool.get_state_buf_infos = lambda: ([0x1000], [4096], [64 * 132])
         pool.get_compress_tail_buf_infos = lambda: ([], [], [])
         kv_args = KVArgs()
-        setup_state_kv_args(
-            kv_args, _static_storage(pool), draft_kv_ring=ring, draft_kv_ring_on=ring_on
-        )
+        setup_state_kv_args(kv_args, _static_storage(pool), draft_kv_ring=ring)
         return kv_args
 
     def test_a_ring_registers_its_rows_and_floor_last(self):
@@ -1307,24 +1305,25 @@ class TestDFlashDraftKVRingRegistration(unittest.TestCase):
             ring_buf_infos=lambda: ([0x2000, 0x3000], [5760, 5760], [576, 576]),
             floor_buf_infos=lambda: ([0x4000], [136], [4]),
         )
-        kv_args = self._register(ring, ring_on=True)
+        kv_args = self._register(ring)
         self.assertEqual(
             kv_args.state_types,
             [StateType.DSA, StateType.DRAFT_RING, StateType.REQUEST_ROW],
         )
         self.assertEqual(kv_args.state_data_ptrs[1:], [[0x2000, 0x3000], [0x4000]])
         self.assertEqual(kv_args.state_item_lens[1:], [[576, 576], [4]])
-
-    def test_a_stage_without_the_ring_keeps_empty_slots(self):
-        kv_args = self._register(None, ring_on=True)
+        # Peers compare the wire, so a ring on one side only is refused.
         self.assertEqual(
-            kv_args.state_types,
-            [StateType.DSA, StateType.DRAFT_RING, StateType.REQUEST_ROW],
+            [entry[0] for entry in state_wire(kv_args)],
+            [
+                StateType.DSA.value,
+                StateType.DRAFT_RING.value,
+                StateType.REQUEST_ROW.value,
+            ],
         )
-        self.assertEqual(kv_args.state_data_ptrs[1:], [[], []])
 
-    def test_nothing_is_registered_with_the_ring_off(self):
-        kv_args = self._register(None, ring_on=False)
+    def test_nothing_is_registered_without_the_ring(self):
+        kv_args = self._register(None)
         self.assertEqual(kv_args.state_types, [StateType.DSA])
 
 
@@ -1650,6 +1649,43 @@ class TestQwen4StateWire(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(manager.sent), 1)
         self.assertEqual(manager.sent[0]["item_lens"], [16])
+
+    def test_draft_ring_sent_once_under_mixed_tp_on_non_mla(self):
+        """A DFLASH draft KV ring is identical across the prefill's attention
+        TP: one rank sends it flat to a narrower decode, the others nothing."""
+        req = SimpleNamespace(
+            room=42, mooncake_session_id="session", dst_state_indices=[[5, 6], [3]]
+        )
+        decode_info = SimpleNamespace(
+            dst_attn_tp_size=1,
+            dst_state_data_ptrs=[[2000], [3000]],
+            dst_state_item_lens=[[576], [4]],
+            dst_state_dim_per_tensor=[[], []],
+            dst_state_layer_ids=[[], []],
+        )
+        for engine_rank, expected in (
+            (0, [StateType.DRAFT_RING, StateType.REQUEST_ROW]),
+            (1, []),
+        ):
+            manager = self._qsa_compressed_manager(src_item_len=576)
+            manager.kv_args = SimpleNamespace(
+                engine_rank=engine_rank,
+                state_types=[StateType.DRAFT_RING, StateType.REQUEST_ROW],
+                state_data_ptrs=[[1000], [1100]],
+                state_item_lens=[[576], [4]],
+                state_dim_per_tensor=[[], []],
+                state_layer_ids=[[], []],
+            )
+            rc = MooncakeKVManager.maybe_send_extra(
+                manager,
+                req,
+                [[1, 2], [7]],
+                None,
+                target_rank_registration_info=decode_info,
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual([kw["state_type"] for kw in manager.sent], expected)
+            self.assertTrue(all(kw["force_flat"] for kw in manager.sent))
 
     def test_replicated_state_tp_policy(self):
         for src_tp, dst_tp, rank, expected in (

@@ -21,6 +21,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
@@ -431,6 +432,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
             return queue.req_to_token_pool.req_to_token[1, : len(req.origin_input_ids)]
 
         queue._pre_alloc = MagicMock(side_effect=pre_alloc)
+        queue.draft_kv_ring = None
         queue.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(4)
         queue.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=1,
@@ -519,6 +521,38 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertFalse(decode_req.awaiting_publish)
         self.assertEqual(queue._pending_publish, [])
         self.assertFalse(queue.has_published_destinations)
+
+    def test_draft_ring_floor_resets_only_for_a_fake_transfer(self):
+        """A prefill sends a real transfer's draft KV ring floor, so admitting
+        it leaves the floor alone; nothing sends a fake transfer's."""
+
+        def acquire(reqs):
+            reqs[0].kv.req_pool_idx = 1
+            return [1]
+
+        self.storage.acquire = acquire
+        for host, resets in (("10.0.0.1", False), (FAKE_BOOTSTRAP_HOST, True)):
+            with self.subTest(host=host):
+                decode_req = self._decode_req(_PollingReceiver())
+                decode_req.req.bootstrap_host = host
+                queue = self._deferring_queue([decode_req])
+                queue.draft_kv_ring = MagicMock()
+                # The real _pre_alloc, over a stubbed allocation.
+                queue._pre_alloc = DecodePreallocQueue._pre_alloc.__get__(queue)
+                queue._required_alloc_tokens = MagicMock(return_value=5)
+                queue._window_tails = MagicMock(return_value={})
+                queue._budgets_count_from_zero = MagicMock(return_value=False)
+                queue._alloc_for_decode_prealloc = MagicMock(
+                    return_value=torch.arange(8, 13)
+                )
+                self.assertEqual(
+                    queue.move_preallocated(queue.transfer_queue.queue),
+                    ([decode_req], []),
+                )
+                if resets:
+                    queue.draft_kv_ring.reset_floor.assert_called_once_with(1, 5)
+                else:
+                    queue.draft_kv_ring.reset_floor.assert_not_called()
 
     def test_deferred_publish_waits_for_a_page_move_since_its_allocation(self):
         """A page move between the allocation and the deferred publish rebinds
