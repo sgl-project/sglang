@@ -707,7 +707,6 @@ _EXPORTS: dict[str, str] = {
     "flux2_strided_qknorm_rope": "rope.flux2_qknorm_rope_triton",
     "rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
     # Ascend fusions resolved from sgl-kernel-npu at first use
-    "npu_fusions_available": "common.npu_fusions",
     "rmsnorm_npu_onepass": "common.npu_fusions",
     "residual_gate_add_npu": "common.npu_fusions",
     "silu_mul_npu": "common.npu_fusions",

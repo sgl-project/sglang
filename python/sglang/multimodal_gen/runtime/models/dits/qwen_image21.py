@@ -14,7 +14,6 @@ from sglang.kernels.ops.diffusion import (
     fused_layernorm_modulate,
     fused_packed_silu_mul_bitexact,
     fused_silu_mul_bitexact,
-    npu_fusions_available,
     qknorm_complex_rope_cuda,
     qknorm_complex_rope_pack_,
     residual_gate_add,
@@ -173,71 +172,30 @@ def apply_qk_norm(x, norm):
     return norm(x)
 
 
-_NPU_I32_LIMIT = 2**31
-
-
-def _is_pow2(value):
-    return value >= 2 and not (value & (value - 1))
-
-
 def _can_use_rmsnorm_npu(x, weight):
-    # The tile rule (power-of-two width inside the 8192-element budget, exact
-    # row split, at least 16 rows) belongs to the kernel; an unsupported shape
-    # raises ValueError there and retires the gate on first use.
-    return (
-        _is_npu
-        and x.is_npu
-        and npu_fusions_available()
-        and x.dtype in (torch.float16, torch.bfloat16)
-        and x.ndim >= 2
-        and x.is_contiguous()
-        and 0 < x.numel() < _NPU_I32_LIMIT
-        and weight.device == x.device
-        and weight.dtype == x.dtype
-        and weight.shape == (x.shape[-1],)
-        and weight.is_contiguous()
-    )
+    # Shapes the kernel cannot serve raise ValueError there, which retires this
+    # site rather than duplicating its tile rules here.
+    return _is_npu and x.is_npu and x.dtype in (torch.float16, torch.bfloat16)
 
 
 def _can_use_residual_gate_npu(residual, update, gate):
-    return (
-        _is_npu
-        and residual.is_npu
-        and npu_fusions_available()
-        and residual.dtype is torch.bfloat16
-        and update.dtype is residual.dtype
-        and update.shape == residual.shape
-        and residual.ndim >= 2
-        and residual.is_contiguous()
-        and update.is_contiguous()
-        and 0 < residual.numel() < _NPU_I32_LIMIT
-        and _is_pow2(residual.shape[-1])
-        and gate.dtype is residual.dtype
-        and gate.device == residual.device
-        and gate.stride(-1) == 1
-        and gate.numel() in (residual.numel(), residual.shape[-1])
-    )
+    return _is_npu and residual.is_npu and residual.dtype is torch.bfloat16
 
 
 def _can_use_silu_mul_npu(gate, value):
-    return (
-        _is_npu
-        and gate.is_npu
-        and npu_fusions_available()
-        and gate.dtype is torch.bfloat16
-        and value.dtype is gate.dtype
-        and value.shape == gate.shape
-        and gate.is_contiguous()
-        and value.is_contiguous()
-        and 0 < gate.numel() < _NPU_I32_LIMIT
-    )
+    return _is_npu and gate.is_npu and gate.dtype is torch.bfloat16
 
 
 def _try_npu_fusion(site, fused_fn, *args):
-    """Run a kernel that may reject its inputs; retire the gate if it does."""
+    """Run a kernel that may reject its inputs; retire this site if it does.
+
+    ValueError means the shape is outside the kernel's contract,
+    ModuleNotFoundError that the installed sgl-kernel-npu predates the
+    operator. Both retire only this site; the others are unaffected.
+    """
     try:
         return fused_fn(*args)
-    except ValueError as error:
+    except (ValueError, ModuleNotFoundError) as error:
         site.disable()
         logger.warning("%s retired: %s", site.name, error)
         return None
