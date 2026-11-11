@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import (
     get_memory,
+    get_parallel,
     get_serving,
     get_spec,
     max_speculative_num_draft_tokens,
@@ -543,16 +544,20 @@ def compute_num_reserved_tokens() -> int:
 def compute_spec_context_reserve(enable_overlap: bool) -> int:
     """Context slots kept free past a request's length cap for spec lookahead.
 
-    A step can accept up to one verify window past the cap, and under overlap the
-    already-launched next batch verifies the finished request once more; both
-    windows must stay within context_len (FA3 page table, RoPE cache). Every
-    algorithm that verifies a draft window needs this, not only EAGLE, whose
-    window additionally covers the draft tokens stored in output slots.
+    A step can accept up to one verify window past the cap, and one more window
+    of lookahead can still read the finished request: under overlap the
+    already-launched next batch verifies it once more, and under pipeline
+    parallelism (overlap off) the last stage tail-drafts its next chain from the
+    untrimmed seq_lens in the same step (EAGLEWorkerV2). Both windows must stay
+    within context_len (FA3 page table, RoPE cache). Every algorithm that
+    verifies a draft window needs this, not only EAGLE, whose window
+    additionally covers the draft tokens stored in output slots.
     """
     if SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm).is_none():
         return 0
     window = max(compute_num_reserved_tokens(), max_speculative_num_draft_tokens() or 0)
-    return window * (2 if enable_overlap else 1)
+    two_windows = enable_overlap or get_parallel().pp_size > 1
+    return window * (2 if two_windows else 1)
 
 
 def make_abort_req(

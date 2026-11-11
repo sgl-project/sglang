@@ -283,6 +283,61 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             tail_kv_len(self._init_and_check(scheduler, req), 4), context_len
         )
 
+    def test_spec_pp_tail_draft_stays_within_context(self):
+        """A request run to the length cap under PP spec: overlap is off, but the
+        last stage tail-drafts the next chain in the same step, so the draft's
+        KV length must not exceed context_len."""
+        context_len, input_len = 4096, 25
+        max_req_len = context_len - 1  # TpModelWorker.get_worker_info
+
+        def tail_draft_kv_len(max_new_tokens, num_steps, num_draft_tokens):
+            # The last unfinished step accepts up to num_draft_tokens onto
+            # seq_lens; the tail draft decodes num_steps - 1 positions past that.
+            return input_len + max_new_tokens - 2 + num_draft_tokens + num_steps - 1
+
+        def reserve_for(num_steps, num_draft_tokens, pp_size):
+            with (
+                get_context().override_server_args(
+                    speculative_algorithm="EAGLE",
+                    speculative_num_steps=num_steps,
+                    speculative_eagle_topk=1,
+                    speculative_num_draft_tokens=num_draft_tokens,
+                ),
+                get_parallel().override(pp_size=pp_size),
+            ):
+                return compute_spec_context_reserve(enable_overlap=False)
+
+        # EAGLE chains up to 8 draft tokens; reserving one window only covers
+        # chains of 6 draft tokens or fewer.
+        for num_steps, num_draft_tokens in ((3, 4), (5, 6), (6, 7), (7, 8)):
+            reserve = reserve_for(num_steps, num_draft_tokens, pp_size=2)
+            for requested in (None, 1 << 20, context_len - 4 - input_len):
+                with self.subTest(
+                    num_draft_tokens=num_draft_tokens, requested=requested
+                ):
+                    scheduler = self._new_scheduler(
+                        max_req_len=max_req_len,
+                        max_total_num_tokens=1 << 20,
+                        spec_context_reserve=reserve,
+                    )
+                    req = self._new_req(max_new_tokens=requested, input_len=input_len)
+                    max_new_tokens = self._init_and_check(scheduler, req)
+                    self.assertLessEqual(
+                        tail_draft_kv_len(max_new_tokens, num_steps, num_draft_tokens),
+                        context_len,
+                    )
+
+        # The single non-overlap window overruns the context at 7 draft tokens.
+        scheduler = self._new_scheduler(
+            max_req_len=max_req_len,
+            max_total_num_tokens=1 << 20,
+            spec_context_reserve=reserve_for(6, 7, pp_size=1),
+        )
+        req = self._new_req(max_new_tokens=None, input_len=input_len)
+        self.assertGreater(
+            tail_draft_kv_len(self._init_and_check(scheduler, req), 6, 7), context_len
+        )
+
     def test_unified_budget_rounds_prompt_and_decode_together(self):
         bundle = build_test_unified_pools(
             device="cpu",
