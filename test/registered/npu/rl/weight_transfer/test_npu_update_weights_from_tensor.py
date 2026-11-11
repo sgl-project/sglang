@@ -5,7 +5,6 @@ must reproduce the signature of a server that loaded the checkpoint at startup.
 Comparing two live updates with each other would only prove determinism.
 """
 
-import os
 import time
 import unittest
 
@@ -20,7 +19,6 @@ from sglang.test.ascend.test_npu_rl_utils import (
     generation_signature,
     health,
     load_checkpoint_tensor,
-    npu_available,
     npu_rl_env,
     npu_server,
     serialize_named_tensors,
@@ -57,8 +55,6 @@ LANE_ARGS = BASE_ARGS + ("--load-format", "dummy")
 TARGET_WEIGHT = "model.layers.0.mlp.down_proj.weight"
 
 
-@unittest.skipUnless(npu_available(), "requires an Ascend NPU")
-@unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
 class TestNpuUpdateWeightsFromTensor(CustomTestCase):
     @classmethod
     def setUpClass(cls):

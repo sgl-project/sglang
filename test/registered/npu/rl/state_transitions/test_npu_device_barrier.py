@@ -6,7 +6,6 @@ ordering directly; the e2e case repeats pause -> update -> continue to catch a
 race that only shows up over rounds.
 """
 
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -27,7 +26,6 @@ from sglang.test.ascend.test_npu_rl_utils import (
     end_weight_update,
     generate,
     load_checkpoint_tensor,
-    npu_available,
     npu_device_count,
     npu_rl_env,
     npu_server,
@@ -94,7 +92,6 @@ def _make_manager(events):
 
 
 class TestNpuDeviceBarrier(CustomTestCase):
-    @unittest.skipUnless(npu_available(), "requires an Ascend NPU")
     def test_release_synchronizes_before_return(self):
         torch.npu.set_device(0)
         torch.npu.synchronize()
@@ -173,11 +170,7 @@ class TestNpuDeviceBarrier(CustomTestCase):
         # resume_memory_occupation has no device-wide synchronize today; this
         # test locks the barrier/restore ordering that the current code provides.
 
-    @unittest.skipUnless(
-        npu_available() and npu_device_count() >= 2,
-        "requires at least 2 Ascend NPUs",
-    )
-    @unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
+    @unittest.skipUnless(npu_device_count() >= 2, "requires at least 2 Ascend NPUs")
     def test_02_dp_pause_returns_after_all_ranks_drain(self):
         with npu_server(MODEL, extra_args=DP_ARGS, env=npu_rl_env()) as base_url:
             requests_ = [
@@ -231,8 +224,6 @@ class TestNpuDeviceBarrier(CustomTestCase):
             continue_generation(base_url)
             self.assertTrue(generate(base_url, PROMPT, max_new_tokens=4))
 
-    @unittest.skipUnless(npu_available(), "requires an Ascend NPU")
-    @unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
     def test_pause_update_continue_is_stable_over_rounds(self):
         tensor_index = checkpoint_tensor_index(MODEL)
         original = load_checkpoint_tensor(tensor_index, NORM_WEIGHT)
