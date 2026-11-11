@@ -44,13 +44,14 @@ from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, flatten_nested_list
+from sglang.srt.utils import flatten_nested_list
 
 logger = logging.getLogger(__name__)
 

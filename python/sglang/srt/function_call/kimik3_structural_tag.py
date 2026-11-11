@@ -24,6 +24,9 @@ from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
     CALL_OPEN,
+    MESSAGE_CLOSE,
+    RESPONSE_CLOSE,
+    RESPONSE_OPEN,
     THINK_CLOSE,
     THINK_OPEN,
     TOOLS_CLOSE,
@@ -535,16 +538,47 @@ def _tool_calls_tag(call_tags: List[TagFormat], parallel_tool_calls: bool) -> Ta
     return TagFormat(begin=TOOLS_OPEN, content=content, end=TOOLS_CLOSE)
 
 
-def _auto_suffix(
-    tools_tag: TagFormat, parallel_tool_calls: bool
-) -> TriggeredTagsFormat:
+# Response text admits no control token: an exclude list of known markers would
+# miss the near-misses the model emits (<|close|>Message, a stray TOOLS_CLOSE).
+_RESPONSE_TEXT = AnyTextFormat(excludes=["<|open|>", _CLOSE_TOKEN])
+
+
+def _response(content: Format) -> OrFormat:
+    # Without thinking the prompt already opens the response channel, so the
+    # output starts inside it; after reasoning the model opens it itself.
+    return OrFormat(
+        elements=[
+            TagFormat(begin=RESPONSE_OPEN, content=content, end=RESPONSE_CLOSE),
+            TagFormat(begin="", content=content, end=RESPONSE_CLOSE),
+        ]
+    )
+
+
+_RESPONSE = _response(_RESPONSE_TEXT)
+# A model that wanted a tool otherwise closes an empty response block when no
+# tool may be called, and the client gets no content.
+_NONEMPTY_RESPONSE = _response(
+    SequenceFormat(
+        elements=[RegexFormat(pattern=r"[^ \t\r\n<]|<[^|<]"), _RESPONSE_TEXT]
+    )
+)
+
+# K3 emits MESSAGE_CLOSE before EOS, and EOS is masked until the grammar
+# completes, so a grammar ending at the tools close must still admit it.
+_OPTIONAL_MESSAGE_CLOSE = OptionalFormat(content=ConstStringFormat(value=MESSAGE_CLOSE))
+
+
+def _auto_suffix(tools_tag: TagFormat, parallel_tool_calls: bool) -> Format:
     # A retriggered second tools section would evade the single-call limit.
-    return TriggeredTagsFormat(
+    triggered = TriggeredTagsFormat(
         triggers=[TOOLS_OPEN],
         tags=[tools_tag],
         excludes=[THINK_OPEN, THINK_CLOSE, CALL_OPEN],
         stop_after_first=not parallel_tool_calls,
     )
+    if parallel_tool_calls:
+        return triggered
+    return SequenceFormat(elements=[triggered, _OPTIONAL_MESSAGE_CLOSE])
 
 
 def _with_reasoning(suffix: Format, thinking_mode: bool) -> Format:
@@ -658,10 +692,16 @@ def _select_tools(
 
 def get_kimik3_structural_tag(
     tools: List[Tool],
-    tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+    tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = "auto",
     thinking_mode: bool = False,
     parallel_tool_calls: bool = True,
 ) -> StructuralTag:
+    if tool_choice == "none":
+        # The K3 prompt still lists the tools, so forbid the tools section
+        # instead of letting raw call markup reach the content.
+        suffix = SequenceFormat(elements=[_NONEMPTY_RESPONSE, _OPTIONAL_MESSAGE_CLOSE])
+        return StructuralTag(format=_with_reasoning(suffix, thinking_mode))
+
     selected_tools, at_least_one = _select_tools(tools, tool_choice)
     if not selected_tools:
         raise ValueError("Kimi K3 structural tags require at least one tool")
@@ -671,10 +711,12 @@ def get_kimik3_structural_tag(
     if at_least_one:
         suffix: Format = SequenceFormat(
             elements=[
-                AnyTextFormat(
-                    excludes=[TOOLS_OPEN, THINK_OPEN, THINK_CLOSE, CALL_OPEN]
-                ),
+                # Only a response may precede the tools section, so a model that
+                # decides no tool is needed cannot close the message or end the
+                # turn without making the call.
+                OptionalFormat(content=_RESPONSE),
                 tools_tag,
+                _OPTIONAL_MESSAGE_CLOSE,
             ]
         )
     else:

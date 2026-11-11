@@ -194,7 +194,7 @@ def handle_context_parallelism(server_args: Any):
             "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
         )
 
-    from sglang.srt.layers.cp.base import init_cp_strategy
+    from sglang.srt.layers.cp.base import init_cp_strategy, is_cp_sharded_padded
 
     init_cp_strategy(
         enable_prefill_cp=bool(cfg.enable_prefill_cp),
@@ -202,6 +202,12 @@ def handle_context_parallelism(server_args: Any):
         cp_strategy=cfg.cp_strategy,
         cp_kv_layout=cfg.cp_kv_layout,
     )
+    if cfg.enable_unified_memory and is_cp_sharded_padded():
+        raise ValueError(
+            f"--cp-kv-layout {cfg.cp_kv_layout} keeps each rank's KV sharded "
+            "and padded, which --enable-unified-memory does not support; "
+            "drop one of them."
+        )
 
 
 def handle_shared_experts_tp(server_args: Any):
@@ -216,10 +222,14 @@ def handle_shared_experts_tp(server_args: Any):
         attn_cp_size=view.attn_cp_size,
         attn_dp_size=cfg.attn_dp_size,
     )
-    if size < 1 or attn_tp_size % size != 0:
+    # Shared experts can gather token rows across CP as well as attention TP,
+    # then reduce-scatter to the original shards. A subgroup must still fit
+    # inside one attention-DP replica / PP stage.
+    replica_size = attn_tp_size * view.attn_cp_size
+    if size < 1 or replica_size % size != 0:
         raise ValueError(
             f"--shared-experts-tp-size ({size}) must be a positive divisor "
-            f"of attention TP size ({attn_tp_size})."
+            f"of attention replica size ({replica_size}, attention TP x CP)."
         )
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         raise ValueError(
@@ -761,6 +771,16 @@ def handle_eplb_and_dispatch(server_args: Any):
         )
         logger.warning(
             "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
+        )
+
+    if cfg.enable_eplb and cfg.expert_distribution_recorder_mode in (
+        "per_pass",
+        "per_token",
+    ):
+        raise ValueError(
+            "--enable-eplb needs --expert-distribution-recorder-mode stat or "
+            "stat_approx; the detailed recorder modes (per_pass/per_token) only "
+            f"support file dumps (got {cfg.expert_distribution_recorder_mode})."
         )
 
     # Without an a2a backend all EP ranks run the MoE over the same tokens and

@@ -87,6 +87,10 @@ class FlashAttentionForwardBase:
             Callable signature: ``mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors) -> Boolean``
         """
         self.dtype = dtype
+        # Q/O tensor dtypes; they differ from the MMA dtype only on the SM90 FP8-KV
+        # dequant path (fp16 compute, bf16 Q/O).
+        self.q_dtype = dtype
+        self.o_dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -270,15 +274,18 @@ class FlashAttentionForwardBase:
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // self.dtype.width
         # atom_async_copy: async copy atom for QKV load
-        atom_async_copy = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            self.dtype,
-            num_bits_per_copy=universal_copy_bits,
-        )
+        atom_async_copy_Q, atom_async_copy = [
+            cute.make_copy_atom(
+                cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+                dtype,
+                num_bits_per_copy=universal_copy_bits,
+            )
+            for dtype in (self.q_dtype, self.dtype)
+        ]
         # atom_universal_copy: universal copy atom for O store
         atom_universal_copy = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
-            self.dtype,
+            self.o_dtype,
             num_bits_per_copy=universal_copy_bits,
         )
         # tQ_layout and tK_layout: thread layout for QK load
@@ -318,7 +325,7 @@ class FlashAttentionForwardBase:
         vO_layout = vQKV_layout
 
         self.gmem_tiled_copy_Q = cute.make_tiled_copy_tv(
-            atom_async_copy, tQ_layout, vQKV_layout
+            atom_async_copy_Q, tQ_layout, vQKV_layout
         )
         self.gmem_tiled_copy_K = cute.make_tiled_copy_tv(
             atom_async_copy, tK_layout, vQKV_layout
@@ -393,15 +400,15 @@ class FlashAttentionForwardBase:
             )
             return
         # store acc_O
-        rO = cute.make_fragment_like(acc_O, self.dtype)
-        rO.store(acc_O.load().to(self.dtype))
+        rO = cute.make_fragment_like(acc_O, self.o_dtype)
+        rO.store(acc_O.load().to(self.o_dtype))
         # Make sure all threads have finished reading V
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.Epilogue),
             number_of_threads=self.num_epilogue_threads,
         )
         smem_copy_atom_O = utils.get_smem_store_atom(
-            self.arch.major * 10 + self.arch.minor, self.dtype
+            self.arch.major * 10 + self.arch.minor, self.o_dtype
         )
         smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(
             tidx
@@ -485,7 +492,7 @@ class FlashAttentionForwardBase:
             )
             gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
             tOsO = gmem_thr_copy_O.partition_S(sO)
-            tOrO = cute.make_fragment_like(tOsO, self.dtype)
+            tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
             # load acc O from smem to rmem for wider vectorization
             cute.autovec_copy(tOsO, tOrO)
             if const_expr(not self.pack_gqa):

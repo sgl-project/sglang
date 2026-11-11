@@ -16,16 +16,14 @@ from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
     Derived,
+    json_list_type,
+    nullable_str,
 )
 from sglang.srt.arg_groups.choices import (
     LOAD_FORMAT_CHOICES,
     QUANTIZATION_CHOICES,
 )
-from sglang.srt.utils.common import (
-    human_readable_int,
-    json_list_type,
-    nullable_str,
-)
+from sglang.srt.utils.common import human_readable_int
 
 
 class Model(msgspec.Struct):
@@ -118,6 +116,13 @@ class Model(msgspec.Struct):
     is_embedding: A[
         bool,
         "Whether to use a CausalLM as an embedding model.",
+    ] = False
+    disable_normalize_embedding: A[
+        bool,
+        "Disable the L2 normalization the embedding Pooler applies after pooling, "
+        "returning the raw pooled vector. Only affects models whose Pooler is built "
+        "with normalize=True; custom poolers (cross-encoder, BERT pooler, vision "
+        "pooler) are unaffected.",
     ] = False
     revision: A[
         Optional[str],

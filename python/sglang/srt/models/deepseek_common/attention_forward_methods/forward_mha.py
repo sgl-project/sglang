@@ -16,6 +16,7 @@ from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
 )
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -688,6 +689,13 @@ class DeepseekMHAForwardMixin:
             return kv_a, k_pe
 
         kv_cache_fp8 = get_kv_layers().read(self.attn_mha.layer_id).key()
+        if dsa_shards_index_k():
+            kv_cache_fp8 = backend.dcp_gather_kv_cache(
+                kv_cache_fp8, forward_batch, backend.forward_metadata
+            )
+            kv_indices = torch.arange(
+                kv_indices.shape[0], dtype=kv_indices.dtype, device=kv_indices.device
+            )
 
         kv_latent_bf16 = dequantize_k_cache_paged_dsa(kv_cache_fp8, kv_indices)
 

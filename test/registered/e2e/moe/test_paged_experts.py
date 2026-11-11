@@ -2,8 +2,10 @@
 
 import io
 import json
+import os
 import re
 import statistics
+import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -24,7 +26,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=430, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=490, stage="extra-a", runner_config="1-gpu-large")
 
 PROMPTS = [
     "Natalia sold clips to 48 of her friends in April, and then she sold half as many "
@@ -74,9 +76,7 @@ class _PagedMatchesUnpaged:
     def setUpClass(cls):
         # Both servers boot and score at the same time.
         with ThreadPoolExecutor(2) as pool:
-            reference = pool.submit(
-                _serve_and_score, cls.model, DEFAULT_URL_FOR_TEST, [*cls.server_args]
-            )
+            reference = pool.submit(_reference, cls.model, cls.server_args)
             paged = pool.submit(
                 _serve_and_score, cls.model, PAGED_URL, [*cls.server_args, *PAGED_ARGS]
             )
@@ -140,7 +140,7 @@ class TestPagedExpertsAuto(_PagedMatchesUnpaged, CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.reference = _serve_and_score(cls.model, DEFAULT_URL_FOR_TEST, [])
+        cls.reference = _reference(cls.model)
         fraction = _mem_fraction_for_experts(cls.model, cls.resident_share)
         args = [
             "--mem-fraction-static",
@@ -164,6 +164,83 @@ class TestPagedExpertsAuto(_PagedMatchesUnpaged, CustomTestCase):
         self.assertLess(k, num_experts)
 
 
+class TestPagedExpertsDisk(_PagedMatchesUnpaged, CustomTestCase):
+    """``--paged-experts-enable-disk``: a first start writes every MoE layer's experts to the
+    expert cache (in an empty ``SGLANG_CACHE_DIR``), a second start reads them after checking
+    a few groups; both serve what the unpaged model does."""
+
+    model = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE
+
+    @classmethod
+    def setUpClass(cls):
+        cls.reference = _reference(cls.model)
+        with tempfile.TemporaryDirectory() as folder:
+            cls.starts = _serve_twice_with_cache(cls.model, folder, PAGED_ARGS)
+        cls.paged = cls.starts[1]["scores"]
+
+    def test_the_first_start_writes_every_layer_and_the_second_reads_them(self):
+        layers = AutoConfig.from_pretrained(self.model).num_hidden_layers
+        written, read = (_cache_outcomes(start["log"]) for start in self.starts)
+        self.assertEqual(written, {"read": 0, "rebuilt": 0, "written": layers})
+        self.assertEqual(read, {"read": layers, "rebuilt": 0, "written": 0})
+
+    def test_the_writing_start_matches_too(self):
+        self.assertEqual(self.starts[0]["scores"], self.reference)
+
+
+def _serve_twice_with_cache(model, folder, paged_args, server_args=()):
+    """Two starts with the expert cache under ``folder``: their scores and logs."""
+    starts = []
+    for _ in range(2):
+        log = io.StringIO()
+        scores = _serve_and_score(
+            model,
+            PAGED_URL,
+            [*server_args, *paged_args, "--paged-experts-enable-disk"],
+            log=log,
+            env=_cache_env(folder),
+        )
+        starts.append({"scores": scores, "log": log.getvalue()})
+    return starts
+
+
+def _cache_env(folder):
+    """``SGLANG_CACHE_DIR`` at ``folder``, for the expert cache; the compile caches that
+    default to it stay where they are, so the servers do not compile again."""
+    from sglang.srt.environ import envs, third_party_cache_defaults
+
+    env = {k: os.environ.get(k, v) for k, v in third_party_cache_defaults().items()}
+    env["SGLANG_DG_CACHE_DIR"] = envs.SGLANG_DG_CACHE_DIR.get()
+    env["SGLANG_CUTE_AOT_CACHE_DIR"] = envs.SGLANG_CUTE_AOT_CACHE_DIR.get()
+    env["SGLANG_CACHE_DIR"] = folder
+    return env
+
+
+def _cache_outcomes(log):
+    """What the expert cache's log line after loading counts."""
+    found = re.search(r"Paged experts: expert cache \S+: (.*)", log)
+    if found is None:
+        return None
+    counts = {"read": 0, "rebuilt": 0, "written": 0}
+    for verb, key in (("read", "read"), ("rebuilt", "rebuilt"), ("wrote", "written")):
+        n = re.search(rf"\b{verb} (\d+) layers?\b", found.group(1))
+        if n is not None:
+            counts[key] = int(n.group(1))
+    return counts
+
+
+_references = {}
+
+
+def _reference(model, server_args=()):
+    """The unpaged server's scores, once per model and arguments: the classes of one model
+    share them."""
+    key = (model, tuple(server_args))
+    if key not in _references:
+        _references[key] = _serve_and_score(model, DEFAULT_URL_FOR_TEST, [*server_args])
+    return _references[key]
+
+
 def _mem_fraction_for_experts(model, share):
     """A --mem-fraction-static whose budget holds the model's non-expert weights, 2 GiB for the
     KV cache and buffers, and ``share`` of its experts (bf16 Qwen MoE)."""
@@ -182,8 +259,9 @@ def _mem_fraction_for_experts(model, share):
     return (weights - experts + share * experts + (2 << 30)) / free
 
 
-def _serve_and_score(model, base_url, other_args, log=None):
-    """With ``log``, the server's output is copied into it."""
+def _serve_and_score(model, base_url, other_args, log=None, env=None):
+    """With ``log``, the server's output is copied into it; ``env`` adds to the server's
+    environment."""
     args = SERVER_ARGS
     if "--mem-fraction-static" in other_args:
         i = args.index("--mem-fraction-static")
@@ -194,7 +272,7 @@ def _serve_and_score(model, base_url, other_args, log=None):
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=args + other_args,
         # Compile DeepGEMM kernels lazily for the few shapes the prompts use.
-        env={"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0"},
+        env={"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0", **(env or {})},
         return_stdout_stderr=(log, log) if log is not None else None,
     )
     try:

@@ -19,6 +19,8 @@ import torch
 from PIL import Image
 from transformers.utils.hub import cached_file
 
+from sglang.srt.hf_transformers import resolve_image_processor_backend
+from sglang.srt.hf_transformers.common import resolve_runai_obj_uri
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.muse_spark_omni import MuseSparkForConditionalGeneration
 from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
@@ -33,8 +35,6 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.runtime_context import get_mm, get_model
-from sglang.srt.utils.hf_transformers import resolve_image_processor_backend
-from sglang.srt.utils.hf_transformers.common import resolve_runai_obj_uri
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)
