@@ -2231,24 +2231,21 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     if _is_xpu:
         from sgl_kernel import sgl_per_token_group_quant_8bit
 
-        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        fp8_info = torch.finfo(torch.float8_e4m3fn)
         q_input = torch.empty_like(x, dtype=torch.float8_e4m3fn)
         scale_u8 = torch.empty(
             (x.shape[0], k // 32), device=x.device, dtype=torch.uint8
         )
         if x.shape[0] > 0:
             sgl_per_token_group_quant_8bit(
-                x,
-                q_input,
-                scale_u8,
-                32,
-                1e-10,
-                -fp8_max,
-                fp8_max,
-                True,
-                False,
-                None,
-                False,
+                input=x,
+                output_q=q_input,
+                output_s=scale_u8,
+                group_size=32,
+                eps=1e-10,
+                fp8_min=fp8_info.min,
+                fp8_max=fp8_info.max,
+                scale_ue8m0=True,
             )
         return q_input, scale_u8
     if _is_cuda:
