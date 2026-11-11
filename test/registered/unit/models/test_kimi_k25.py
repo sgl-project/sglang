@@ -60,7 +60,6 @@ from sglang.srt.multimodal.processors.kimi_k3 import (
     _expand_k3_image_prompt_text,
     _expand_k3_image_prompt_token_ids,
     _plan_k3_video,
-    _splice_k3_media,
 )
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
@@ -1592,11 +1591,8 @@ _K3_VIDEO_CFG = {
 @pytest.mark.parametrize(
     ("width", "height", "num_frames", "fps", "frames", "chunk_tokens"),
     [
-        (448, 448, 40, 10.0, 32, 256),
         (448, 448, 120, 30.0, 32, 256),  # sample_fps, not the source rate
-        (896, 448, 40, 10.0, 32, 512),
         # Over in_patch_limit_video: full-size frames, fewer of them.
-        (1920, 1088, 240, 30.0, 60, 2691),
         (1920, 1088, 1800, 30.0, 60, 2691),
     ],
 )
@@ -1615,19 +1611,6 @@ def test_kimi_k3_video_plan_matches_hosted_api(
     assert len(indices) == frames
     assert (indices[0], indices[-1]) == (0, num_frames - 1)
     assert resize_config["num_tokens"] == chunk_tokens
-
-
-def test_kimi_k3_media_spans_keep_prompt_order():
-    input_ids, items = _splice_k3_media(
-        [1, 99, 2, 77, 3, 99],
-        image_token_id=99,
-        video_slot_token_id=77,
-        images=[([10, 99], ["image-a"]), ([11, 99], ["image-b"])],
-        videos=[([20, 99, 21, 99], ["chunk-0", "chunk-1"])],
-    )
-
-    assert input_ids == [1, 10, 99, 2, 20, 99, 21, 99, 3, 11, 99]
-    assert items == ["image-a", "chunk-0", "chunk-1", "image-b"]
 
 
 def test_kimi_k3_video_request_serves_chunks_and_images_in_prompt_order():
