@@ -93,6 +93,8 @@ class DcpCandidateAllGather:
         self.out: Optional[torch.Tensor] = None
         self.prefix_handle = None
         self.group_name = group.device_group.group_name
+        if get_platform().is_hip:  # no NVLS multimem: keep the group all-gather
+            return
         if not all(in_the_same_node_as(group.cpu_group)) and not is_one_nvlink_clique(
             group.cpu_group, group.device
         ):
@@ -219,6 +221,9 @@ class DcpTopKMerge:
         # the certificate counts rank q's keys as positions p % world == q
         assert group.rank_in_group == dcp_rank, (group.rank_in_group, dcp_rank)
 
+        if get_platform().is_hip:
+            print_info_once("DSA DCP top-k merge off: it needs NVLink multicast")
+            return None
         world = group.world_size
         worlds = (8, 16) if megakernel_enabled() else (8,)
         if world not in worlds or topk != 2048:
