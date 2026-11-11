@@ -1215,13 +1215,14 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 assert_retired(cache, service)
                 cache.sanity_check()
 
-    def test_shared_root_serializes_while_resident_other_host_scope_finishes(self):
+    def test_shared_root_serializes_while_disjoint_scope_starts(self):
         with hicache(self, namespace_keys=True) as owner:
             _, cache, service, _ = owner
             scopes = [
                 cache_fixtures.target(cache_salt="shared"),
                 cache_fixtures.target((1, 11, 12, 13), cache_salt="shared"),
                 cache_fixtures.target(cache_salt="resident"),
+                cache_fixtures.target((20, 21, 22, 23), cache_salt="shared"),
             ]
             self._cold_scopes(owner, scopes)
             self.assertEqual(
@@ -1248,10 +1249,12 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     )
                     resident = self._restore(service, scopes[2], "resident-again")
                     self.assertEqual(resident.status, Status.COMPLETED)
-                    self.assertEqual(len(cache.ongoing_prefetch), 1)
+                    disjoint = self._restore(service, scopes[3], "disjoint")
+                    self.assertEqual(len(cache.ongoing_prefetch), 2)
                     release.set()
                     self.assertEqual(wait(service, first).status, Status.COMPLETED)
                     self.assertEqual(wait(service, second).status, Status.COMPLETED)
+                    self.assertEqual(wait(service, disjoint).status, Status.COMPLETED)
             finally:
                 release.set()
             assert_retired(cache, service)

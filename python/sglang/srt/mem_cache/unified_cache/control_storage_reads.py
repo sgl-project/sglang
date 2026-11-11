@@ -82,9 +82,9 @@ class _Interest:
 class StorageCacheReads:
     """Shared one-prefix restores with complete-scope approval and real fences.
 
-    Cold host scopes pipeline across independent salt domains with bounded
-    admission. A domain serializes until publication. Compatible readers
-    share one interest-independent physical job.
+    Cold host scopes pipeline across independent radix branches with bounded
+    admission. Reads sharing a radix root page serialize until publication.
+    Compatible readers share one interest-independent physical job.
     """
 
     def __init__(self, executor):
@@ -513,8 +513,12 @@ class StorageCacheReads:
         ]
         if len(active) >= self.executor.config.max_concurrent_storage_reads:
             return "storage_concurrency_limit"
+        page_size = self.cache.page_size
+        root_page = job.tokens[:page_size]
         if any(
             job.compatibility.cache_salt == other.compatibility.cache_salt
+            and job.compatibility.extra_key == other.compatibility.extra_key
+            and root_page == other.tokens[:page_size]
             for other in active
         ):
             return "shared_prefix_serialization"
