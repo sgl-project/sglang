@@ -623,7 +623,25 @@ def forward_dsa_core_npu(
         q_pe = dsa_token_shard_redistribute_heads(q_pe, dsa_token_shard_plan)
         # A separate name is load-bearing: topk_indices is returned for the
         # next layer, and rebinding it would hand that a slice of a slice.
-        if getattr(forward_batch, "npu_indexer_topk_is_local", False):
+        topk_is_local = getattr(forward_batch, "npu_indexer_topk_is_local", None)
+        if topk_is_local is None:
+            # No indexer ran on this stage: a PP stage starting on a skip-top-k
+            # layer reuses the previous stage's top-k on a fresh batch, and the
+            # flag was set on that batch, not this one. Classify by width --
+            # this rank's rows or the full batch -- because slicing a local
+            # tensor again gives every rank the wrong rows with no shape error.
+            if topk_indices.shape[0] == dsa_token_shard_plan.rows:
+                topk_is_local = True
+            elif topk_indices.shape[0] == dsa_token_shard_rows:
+                topk_is_local = False
+            else:
+                raise RuntimeError(
+                    f"DSA top-k carries {topk_indices.shape[0]} rows, neither "
+                    f"this rank's {dsa_token_shard_plan.rows} nor the batch's "
+                    f"{dsa_token_shard_rows}; refusing to guess its layout"
+                )
+            forward_batch.npu_indexer_topk_is_local = topk_is_local
+        if topk_is_local:
             # Checked, not assumed: a full-width tensor here gives every rank
             # but 0 the wrong rows with no shape error.
             if topk_indices.shape[0] != dsa_token_shard_plan.rows:

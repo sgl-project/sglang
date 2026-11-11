@@ -24,7 +24,10 @@ Usage:
     python test_dsa_token_shard_plan.py
 """
 
+import importlib
+import importlib.machinery
 import itertools
+import sys
 import types
 import unittest
 from unittest import mock
@@ -216,6 +219,35 @@ class TestTokenShardRefusesPrefillCp(CustomTestCase):
 
     def test_refused_under_prefill_cp(self):
         self.assertIsNone(self._plan(prefill_cp=True))
+
+
+class TestTokenShardRefusesScatteredInput(CustomTestCase):
+    """The attention input is already sliced across the TP group; slicing it
+    again would cut every rank's share twice."""
+
+    def _plan(self, input_scattered):
+        batch = types.SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[16384],
+            extend_prefix_lens_cpu=[0],
+            input_ids=torch.zeros(16384, dtype=torch.int64),
+            attn_cp_metadata=None,
+        )
+        ctx = types.SimpleNamespace(input_scattered=input_scattered)
+        with (
+            mock.patch(
+                "sglang.srt.layers.attention.dsa.dsa_token_shard.get_attn_tp_context",
+                return_value=ctx,
+            ),
+            get_parallel().override(attn_tp_size=16, attn_tp_rank=3, dcp_enabled=False),
+        ):
+            return _build_dsa_token_shard_plan(batch)
+
+    def test_planned_with_a_full_width_input(self):
+        self.assertIsNotNone(self._plan(input_scattered=False))
+
+    def test_refused_with_a_scattered_input(self):
+        self.assertIsNone(self._plan(input_scattered=True))
 
 
 class TestTokenShardRefusesDpMaxLenPadding(CustomTestCase):
@@ -425,6 +457,131 @@ class TestTokenShardPlumbing(CustomTestCase):
         self.assertIs(batch.npu_dsa_token_shard_cu_query_lens, out)
         again = dsa_token_shard_cumulative_query_lens(batch, plan, torch.device("cpu"))
         self.assertIs(again, out)
+
+
+def _npu_mla_module():
+    """Import the NPU MLA module on CPU CI.
+
+    Its top-level ``torch_npu`` / ``sgl_kernel_npu`` imports are shimmed for
+    the import only and removed afterwards: the imported module keeps its
+    references to the fakes, and no other test sees them in ``sys.modules``.
+    """
+    module_name = (
+        "sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu"
+    )
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+
+    fakes = {}
+
+    def fake(name, **attrs):
+        m = types.ModuleType(name)
+        m.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
+        for key, val in attrs.items():
+            setattr(m, key, val)
+        fakes[name] = m
+
+    fake("torch_npu")
+    fake("sgl_kernel_npu")
+    fake("sgl_kernel_npu.norm")
+    fake("sgl_kernel_npu.norm.fused_split_qk_norm", fused_split_qk_norm=None)
+    try:
+        sys.modules.update(fakes)
+        module = importlib.import_module(module_name)
+    finally:
+        for name in fakes:
+            sys.modules.pop(name, None)
+    return module
+
+
+class TestReusedTopkAcrossPpStage(CustomTestCase):
+    """A PP stage that starts on a skip-top-k layer reuses the previous stage's
+    top-k on a fresh batch, so the indexer's local-layout flag is unset there.
+
+    Without the width classification, the unset flag read as "full width" and
+    core sliced a local top-k a second time: the slice of a plan.rows-wide
+    tensor is empty rows plus zero padding, so every rank past the boundary
+    attended on zeroed indices and no shape error fired.
+    """
+
+    HEADS = 2
+    DIM = 4
+    KV = 8  # kv_lora_rank; the mock attention returns 4 * KV per row
+    TOKENS = 17  # tp=4: rows=5, num_tokens_pad=20, slices [10,15) and [15,20)
+
+    def _core(self, tp_rank, topk, preset_local=None):
+        mod = _npu_mla_module()
+        plan = plan_dsa_token_shard([self.TOKENS], [117], 4, tp_rank)
+        batch = types.SimpleNamespace()
+        if preset_local is not None:
+            batch.npu_indexer_topk_is_local = preset_local
+        m = types.SimpleNamespace(
+            attn_mqa_for_dsa_token_shard=mock.Mock(
+                return_value=torch.zeros(plan.rows, 4, self.KV)
+            ),
+            num_local_heads=self.HEADS,
+            kv_lora_rank=self.KV,
+            v_head_dim=self.DIM,
+            w_vc=torch.zeros(self.KV, self.DIM),
+            o_proj=mock.Mock(return_value=(torch.zeros(self.TOKENS, 32), None)),
+            next_skip_topk=False,
+        )
+        mod.torch_npu.npu_transpose_batchmatmul = lambda attn, w, **kwargs: torch.zeros(
+            attn.shape[0], self.HEADS, self.DIM
+        )
+        q = torch.zeros(self.TOKENS, self.HEADS, self.DIM)
+        backend = types.SimpleNamespace(
+            uses_dcp_partial_attention=lambda forward_batch: False
+        )
+        with (
+            mock.patch.object(mod, "get_mla_dcp_backend", return_value=backend),
+            mock.patch.object(mod, "get_dsa_token_shard_plan", return_value=plan),
+            mock.patch.object(
+                mod, "dsa_token_shard_redistribute_heads", side_effect=lambda x, p: x
+            ),
+            mock.patch.object(
+                mod,
+                "dsa_token_shard_restore_tokens",
+                side_effect=lambda x, p, num_rows: x,
+            ),
+            mock.patch.object(
+                mod.forward_context, "get_attn_backend", return_value=object()
+            ),
+        ):
+            mod.forward_dsa_core_npu(m, q, q, q, q, topk, batch, None, None, False)
+        return (
+            plan,
+            batch,
+            m.attn_mqa_for_dsa_token_shard.call_args.kwargs["topk_indices"],
+        )
+
+    def test_local_topk_is_not_sliced_again(self):
+        plan = plan_dsa_token_shard([self.TOKENS], [117], 4, 0)
+        local = torch.arange(plan.rows * 4, dtype=torch.int32).reshape(plan.rows, 4)
+        for tp_rank in (2, 3):
+            with self.subTest(tp_rank=tp_rank):
+                _, batch, got = self._core(tp_rank, local)
+                self.assertIs(got, local)
+                self.assertTrue(batch.npu_indexer_topk_is_local)
+
+    def test_full_width_topk_is_sliced_once(self):
+        plan = plan_dsa_token_shard([self.TOKENS], [117], 4, 2)
+        full = torch.arange(self.TOKENS * 4, dtype=torch.int32).reshape(self.TOKENS, 4)
+        _, batch, got = self._core(2, full)
+        self.assertFalse(batch.npu_indexer_topk_is_local)
+        torch.testing.assert_close(got, full[plan.local_start : plan.local_end])
+
+    def test_flag_set_by_the_indexer_still_wins(self):
+        # Same-stage reuse: the indexer set the flag, so no classification.
+        local = torch.zeros(5, 4, dtype=torch.int32)
+        _, batch, got = self._core(2, local, preset_local=True)
+        self.assertIs(got, local)
+        self.assertTrue(batch.npu_indexer_topk_is_local)
+
+    def test_unexpected_width_refuses_to_guess(self):
+        with self.assertRaises(RuntimeError):
+            self._core(2, torch.zeros(7, 4, dtype=torch.int32))
 
 
 if __name__ == "__main__":
