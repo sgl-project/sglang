@@ -283,17 +283,7 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             and stream.is_contiguous()
         )
 
-    def _ensure_cached_weights(self, branch_dtype: torch.dtype) -> None:
-        """Cache the weight tensors the Triton kernel reads (called once)."""
-        if hasattr(self, "_weights_cached"):
-            return
-
-        def cache(name: str, value: torch.Tensor) -> None:
-            # nn.Module.__setattr__ registers Parameter values. These are
-            # inference-only kernel views owned by the source modules, so keep
-            # detached ordinary tensors outside this op's state_dict.
-            object.__setattr__(self, name, value.detach())
-
+    def _cached_weight_values(self, branch_dtype: torch.dtype):
         device = None
         # Find a parameter to determine device
         for mod in (self._post_norm, self._pre_norm):
@@ -313,8 +303,6 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             if self._pre_norm.has_weight
             else torch.empty(0, dtype=torch.bfloat16, device=device)
         )
-        cache("_cc_post_weight", post_weight)
-        cache("_cc_pre_weight", pre_weight)
         if self._use_residual_gate:
             ra = self._residual_add
             if ra._alpha is not None:
@@ -332,10 +320,46 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
         else:
             cc_alpha = torch.empty(0, dtype=torch.float32, device=device)
             cc_beta = torch.empty(0, dtype=torch.float32, device=device)
-        cache("_cc_alpha", cc_alpha)
-        cache("_cc_beta", cc_beta)
-        cache("_cc_empty_fp32", torch.empty(0, dtype=torch.float32, device=device))
+        return device, {
+            "_cc_post_weight": post_weight,
+            "_cc_pre_weight": pre_weight,
+            "_cc_alpha": cc_alpha,
+            "_cc_beta": cc_beta,
+        }
+
+    def _ensure_cached_weights(self, branch_dtype: torch.dtype) -> None:
+        """Cache the weight tensors the Triton kernel reads (called once)."""
+        if hasattr(self, "_weights_cached"):
+            return
+        device, values = self._cached_weight_values(branch_dtype)
+        for name, value in values.items():
+            # Plain attributes, so they stay out of this op's state_dict;
+            # owned copies, so refresh_cached_weights can rewrite them in place.
+            object.__setattr__(self, name, value.detach().clone())
+        object.__setattr__(
+            self, "_cc_empty_fp32", torch.empty(0, dtype=torch.float32, device=device)
+        )
         object.__setattr__(self, "_weights_cached", True)
+
+    @torch.no_grad()
+    def refresh_cached_weights(self, branch_dtype: torch.dtype | None = None) -> None:
+        # In place: captured CUDA graphs hold the addresses of these copies.
+        if not hasattr(self, "_weights_cached"):
+            if branch_dtype is not None:
+                self._ensure_cached_weights(branch_dtype)
+            return
+        dtype = branch_dtype if branch_dtype is not None else self._cc_post_weight.dtype
+        _, values = self._cached_weight_values(dtype)
+        for name, value in values.items():
+            current = getattr(self, name)
+            if (
+                current.shape == value.shape
+                and current.dtype == value.dtype
+                and current.device == value.device
+            ):
+                current.copy_(value)
+            else:
+                object.__setattr__(self, name, value.detach().clone())
 
     def forward_triton(
         self,
