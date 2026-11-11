@@ -440,6 +440,9 @@ class NomasDecodingStage(DecodingStage):
     tail frames dropped.
     """
 
+    # forward pushes each chunk through the session's streaming decoder.
+    skip_decode_supported = False
+
     def forward(self, batch, server_args):
         if batch.session is not None:
             return self._forward_session(batch, server_args)

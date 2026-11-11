@@ -20,12 +20,22 @@ TokenSpaceProcessor.process(media, IDs)
   strategy loading options -> load kwargs
   worker_thread_device d -> IO and processor threads start on device d
   worker_thread_device d, no processor pool -> inline processing on device d
+  item feature cache, [B A] after [A] with another prompt -> only B loaded, same output
+  item feature cache, same image on another device -> loaded again
+  item feature cache, same image on another GPU (serving vs a trainer rank) -> reused
+  one map, processors of another checkpoint, mm_process_config or library version -> loaded again
+  item feature cache, check rate 1 -> a hit is computed again, equal to the cache, not rewritten;
+      the global random stream is untouched
+  item feature cache, a sampled hit computes to other features -> RuntimeError
+  item feature cache, a slow or failing write -> the request returns first; a failure is logged
 
 get_mm_processor -> TokenSpaceSGLangProcessor
   each strategy and serving spec keep the legacy processor's loader and worker defaults
   registered serving spec -> mm_tokens, IO threads, item split; none -> the defaults
   tokenizer + strategy -> served output; caller IDs never decoded
   --allowed-media-domains / max file size -> the core's media URL policy
+  budget or trusted URLs without --enable-token-space-preprocess-cache -> the core caches nothing
+  --token-space-preprocess-cache-dir -> the core caches on disk; the check rate reaches the core
   adjacent images -> two offsets from mm_spans, not one scanned run
   equal features, different grids -> different item hashes
   equal feature bytes, different feature shapes -> different item hashes
@@ -36,14 +46,17 @@ import asyncio
 import base64
 import contextlib
 import io
+import random
+import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import torch
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from tokenizers import Tokenizer, models, pre_tokenizers
-from transformers import PreTrainedTokenizerFast
+from transformers import PretrainedConfig, PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.entrypoints.openai.serving_chat import _collect_message_media
@@ -53,9 +66,11 @@ from sglang.srt.managers.multimodal_processor import (
     get_mm_processor,
     import_processors,
 )
+from sglang.srt.multimodal.cache import DiskPreprocessCache, MultimodalPreprocessCache
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
+from sglang.srt.multimodal.token_space_mm_process import processor as processor_module
 from sglang.srt.multimodal.token_space_mm_process.expansion import (
     expand_token_placeholders,
 )
@@ -189,6 +204,8 @@ class _ImageVideoStrategy(TokenSpaceProcessStrategy):
         }
 
 
+_CHECKPOINT = PretrainedConfig(name_or_path="ckpt")
+
 _IMAGES_THEN_VIDEO = [(Modality.IMAGE,), (Modality.IMAGE,), (Modality.VIDEO,)]
 
 
@@ -221,11 +238,25 @@ class TestLocateMedia(unittest.TestCase):
 
 
 class TestTokenSpaceProcessor(unittest.TestCase):
-    def _processor(self, strategy_class=_ImageWidthStrategy):
+    def _processor(
+        self,
+        strategy_class=_ImageWidthStrategy,
+        hf_config=None,
+        mm_process_config=None,
+        item_feature_cache=None,
+        keep_mm_features_on_device=False,
+        item_feature_cache_check_rate=None,
+    ):
         processor = TokenSpaceProcessor.for_strategy(strategy_class)(
-            None,
+            hf_config,
             _bare_tokenizer(),
-            processor_config=MultimodalProcessorConfig(mm_processor_worker_num=1),
+            processor_config=MultimodalProcessorConfig(
+                mm_process_config=mm_process_config or {},
+                mm_processor_worker_num=1,
+                keep_mm_features_on_device=keep_mm_features_on_device,
+            ),
+            item_feature_cache=item_feature_cache,
+            item_feature_cache_check_rate=item_feature_cache_check_rate,
         )
         self.addCleanup(processor.shutdown)
         return processor
@@ -322,37 +353,238 @@ class TestTokenSpaceProcessor(unittest.TestCase):
         self.assertEqual(device.call_count, 2)  # the item, then the output
         device.assert_called_with(3)
 
+    def test_item_feature_cache_reuses_an_image_across_prompts(self):
+        """Keys leave out the prompt, and a partial hit keeps every item in its place."""
+        two, three = Image.new("RGB", (2, 1)), Image.new("RGB", (3, 1))
+        processor = self._processor(hf_config=_CHECKPOINT, item_feature_cache={})
+        load = AsyncMock(wraps=processor._load_media_lists)
+        with patch.object(processor, "_load_media_lists", load):
+            asyncio.run(processor.process([two], input_ids=[1, IMAGE]))
+            output = asyncio.run(
+                processor.process([three, two], input_ids=[IMAGE, 2, IMAGE])
+            )
+        self.assertEqual(load.await_args.args[0], [three])
+        expected = asyncio.run(
+            self._processor().process([three, two], input_ids=[IMAGE, 2, IMAGE])
+        )
+        self.assertEqual(output.keys(), expected.keys())
+        for name in ("input_ids", "pixel_values"):
+            self.assertTrue(torch.equal(output[name], expected[name]))
+        self.assertEqual(output["mm_spans"], expected["mm_spans"])
+
+    def test_item_feature_cache_misses_when_the_device_changes(self):
+        """The preprocessing device can change pixels, so it is part of every key."""
+        image = Image.new("RGB", (2, 1))
+        processor = self._processor(hf_config=_CHECKPOINT, item_feature_cache={})
+        load = AsyncMock(wraps=processor._load_media_lists)
+        with patch.object(processor, "_load_media_lists", load):
+            for image_device in (None, None, "cpu"):
+                asyncio.run(
+                    processor.process(
+                        [image], input_ids=[1, IMAGE], image_device=image_device
+                    )
+                )
+        self.assertEqual(
+            [call.args[0] for call in load.await_args_list], [[image], None, [image]]
+        )
+
+    def test_item_feature_cache_reuses_features_from_another_gpu(self):
+        """Serving on cuda:0 without a video device, then a trainer rank on cuda:3 with one."""
+        image = Image.new("RGB", (2, 1))
+        processor = self._processor(hf_config=_CHECKPOINT, item_feature_cache={})
+        load = AsyncMock(wraps=processor._load_media_lists)
+        with (
+            patch.object(processor, "_load_media_lists", load),
+            patch.object(
+                processor,
+                "_temporary_fast_processor_cuda_pool",
+                lambda device: contextlib.nullcontext(),
+            ),
+        ):
+            asyncio.run(
+                processor.process([image], input_ids=[1, IMAGE], image_device="cuda:0")
+            )
+            asyncio.run(
+                processor.process(
+                    [image],
+                    input_ids=[1, IMAGE],
+                    image_device="cuda:3",
+                    video_device="cuda:3",
+                )
+            )
+        self.assertEqual(
+            [call.args[0] for call in load.await_args_list], [[image], None]
+        )
+
+    def test_item_feature_cache_hit_joins_the_misses_on_their_device(self):
+        """With features kept on the device, a hit loaded on the CPU must not meet a miss in torch.cat."""
+        image = Image.new("RGB", (2, 1))
+        item_feature_cache = {}
+        asyncio.run(
+            self._processor(
+                hf_config=_CHECKPOINT, item_feature_cache=item_feature_cache
+            ).process([image], input_ids=[1, IMAGE], image_device="meta")
+        )
+        (cached,) = item_feature_cache.values()
+        self.assertEqual(cached["pixel_values"].device.type, "cpu")
+
+        processor = self._processor(
+            hf_config=_CHECKPOINT,
+            item_feature_cache=item_feature_cache,
+            keep_mm_features_on_device=True,
+        )
+        output = asyncio.run(
+            processor.process([image], input_ids=[1, IMAGE], image_device="meta")
+        )
+        self.assertEqual(output["pixel_values"].device.type, "meta")
+
+    def test_item_feature_cache_sampled_hit_is_computed_again_and_checked(self):
+        """A checked hit is loaded like a miss, must equal the cache, and is not rewritten."""
+        image = Image.new("RGB", (2, 1))
+        item_feature_cache = {}
+        processor = self._processor(
+            hf_config=_CHECKPOINT, item_feature_cache=item_feature_cache
+        )
+        expected = asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
+        ((key, cached),) = item_feature_cache.items()
+
+        processor = self._processor(
+            hf_config=_CHECKPOINT,
+            item_feature_cache=item_feature_cache,
+            item_feature_cache_check_rate=1,
+        )
+        load = AsyncMock(wraps=processor._load_media_lists)
+        global_random_state = random.getstate()
+        with patch.object(processor, "_load_media_lists", load):
+            output = asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
+        # A trainer seeds the global stream; sampling must not draw from it.
+        self.assertEqual(random.getstate(), global_random_state)
+        self.assertEqual(load.await_args.args[0], [image])
+        self.assertTrue(torch.equal(output["pixel_values"], expected["pixel_values"]))
+        self.assertIs(item_feature_cache[key], cached)
+
+        cached["pixel_values"] = cached["pixel_values"] + 1
+        with self.assertRaisesRegex(RuntimeError, "other pixel_values"):
+            asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
+
+    def test_item_feature_cache_writes_behind_the_request(self):
+        """A request returns with its features while the cache write is still running."""
+        image = Image.new("RGB", (2, 1))
+        written = {}
+        release = threading.Event()
+
+        class _SlowCache(dict):
+            def __setitem__(self, key, value):
+                release.wait(timeout=10)
+                written[key] = value
+
+        processor = self._processor(
+            hf_config=_CHECKPOINT, item_feature_cache=_SlowCache()
+        )
+
+        async def run():
+            output = await processor.process([image], input_ids=[1, IMAGE])
+            self.assertEqual(written, {})
+            release.set()
+            return output
+
+        output = asyncio.run(run())
+        self.assertEqual(len(written), 1)
+        (cached,) = written.values()
+        self.assertTrue(torch.equal(cached["pixel_values"], output["pixel_values"]))
+
+        class _FailingCache(dict):
+            def __setitem__(self, key, value):
+                raise OSError("disk full")
+
+        processor = self._processor(
+            hf_config=_CHECKPOINT, item_feature_cache=_FailingCache()
+        )
+        with self.assertLogs(processor_module.logger, level="WARNING") as logs:
+            asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
+        self.assertIn("disk full", "\n".join(logs.output))
+
+    def test_item_feature_cache_is_shared_only_by_matching_processors(self):
+        """A trainer and serving may share one map; another checkpoint, config or upgrade must miss."""
+        image = Image.new("RGB", (2, 1))
+        item_feature_cache = {}
+        loaded = []
+        for name_or_path, mm_process_config, transformers_version in (
+            ("ckpt", {}, "5.0"),
+            ("ckpt", {}, "5.0"),
+            ("other", {}, "5.0"),
+            ("ckpt", {"image": {"max_pixels": 4}}, "5.0"),
+            ("ckpt", {}, "5.1"),
+        ):
+            processor = self._processor(
+                hf_config=PretrainedConfig(name_or_path=name_or_path),
+                mm_process_config=mm_process_config,
+                item_feature_cache=item_feature_cache,
+            )
+            load = AsyncMock(wraps=processor._load_media_lists)
+            with (
+                patch.object(processor, "_load_media_lists", load),
+                patch("transformers.__version__", transformers_version),
+            ):
+                asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
+            loaded.append(load.await_args.args[0])
+        self.assertEqual(loaded, [[image], None, [image], [image], [image]])
+
     def test_media_sources_must_be_lists(self):
         # A bare source would otherwise be iterated item by item, e.g. a URL per character.
         with self.assertRaisesRegex(TypeError, "must be a list or None"):
             asyncio.run(self._processor().process("image.png", input_ids=[1, IMAGE]))
 
-    def test_strategy_loading_options_reach_the_loader(self):
-        class LoaderOptionsStrategy(_ImageWidthStrategy):
+    def test_strategy_loader_options_reach_the_decoded_media(self):
+        """The strategy's loader options act on the IO path itself: what `process_image` receives
+        is decided by the strategy's attributes and the server's config, not by kwargs the core forwards."""
+        seen = []
+
+        class _RecordingStrategy(_ImageWidthStrategy):
             audio_sample_rate = 24000
+
+            def process_image(self, image, processor, preprocess_kwargs, **kwargs):
+                seen.append((image.mode, image.getpixel((0, 0))))
+                return super().process_image(
+                    image, processor, preprocess_kwargs, **kwargs
+                )
+
+        class _KeepAlphaStrategy(_RecordingStrategy):
             discard_alpha_channel = False
 
-        processor = self._processor(LoaderOptionsStrategy)
-        load = AsyncMock(return_value=([Image.new("RGB", (1, 1))], [], []))
-        with patch.object(processor, "_load_media_lists", load):
-            asyncio.run(processor.process(["image"], input_ids=[1, IMAGE]))
-        load.assert_awaited_once_with(
-            ["image"],
-            None,
-            None,
-            audio_sample_rate=24000,
-            discard_alpha_channel=False,
-            video_decode_device=None,
-        )
+        rgba = io.BytesIO()
+        Image.new("RGBA", (2, 1), (10, 20, 30, 0)).save(rgba, format="PNG")
+        for strategy_class, mm_process_config, expected in (
+            (_RecordingStrategy, None, ("RGB", (10, 20, 30))),
+            (
+                _RecordingStrategy,
+                {"image_rgb_conversion": "white"},
+                ("RGB", (255, 255, 255)),
+            ),
+            (_KeepAlphaStrategy, None, ("RGBA", (10, 20, 30, 0))),
+        ):
+            seen.clear()
+            processor = self._processor(
+                strategy_class, mm_process_config=mm_process_config
+            )
+            asyncio.run(processor.process([rgba.getvalue()], input_ids=[1, IMAGE]))
+            self.assertEqual(seen, [expected])
+        with patch(
+            "sglang.srt.multimodal.multimodal_processor_mixin.load_audio"
+        ) as load_audio:
+            _RecordingStrategy(None, None).load_audio("clip.wav")
+        load_audio.assert_called_once_with("clip.wav", 24000)
 
 
 # Class attributes the media loader and worker pools read.
 _LOADER_ATTRIBUTES = (
     "gpu_image_decode",
-    "smart_rgb_conversion",
+    "rgb_conversion",
     "video_preprocessing_device",
     "supports_mm_processor_concurrency",
 )
+# A strategy that composites alpha as the model's reference pipeline does, where the legacy processor only drops it.
+_STRATEGY_RGB_CONVERSION = {"QwenTokenSpaceProcessStrategy": "white"}
 
 
 class _StopInit(Exception):
@@ -367,7 +599,14 @@ def _legacy_defaults(processor_cls, hf_config):
         contextlib.suppress(_StopInit),
     ):
         processor_cls.__init__(processor, hf_config, None, None)
-    defaults = {name: getattr(processor, name) for name in _LOADER_ATTRIBUTES}
+    defaults = {
+        name: getattr(processor, name)
+        for name in _LOADER_ATTRIBUTES
+        if name != "rgb_conversion"
+    }
+    defaults["rgb_conversion"] = (
+        "smart" if processor.smart_rgb_conversion else "convert"
+    )
     # None and an unset worker default both mean the base's own choice.
     defaults["auto_mm_processor_worker_num"] = (
         processor.auto_mm_processor_worker_num or 2
@@ -378,13 +617,17 @@ def _legacy_defaults(processor_cls, hf_config):
 
 def _token_space_defaults(strategy_class, hf_config):
     core_cls = TokenSpaceProcessor.for_strategy(strategy_class)
-    defaults = {name: getattr(core_cls, name) for name in _LOADER_ATTRIBUTES}
+    defaults = {
+        "supports_mm_processor_concurrency": core_cls.supports_mm_processor_concurrency
+    }
     # The wrapper's auto count when preprocessing does not compete with the scheduler.
     defaults["auto_mm_processor_worker_num"] = 2
     # Serving takes the IO thread default from the serving spec, not the core.
     serving_spec = serving_spec_for(hf_config)(hf_config)
     defaults["auto_mm_io_worker_num"] = serving_spec.auto_mm_io_worker_num
-    defaults["video_preprocessing_device"] = strategy_class.video_preprocessing_device
+    # The strategy's loader defaults apply per instance; the core class keeps the mixin's.
+    for name in ("gpu_image_decode", "rgb_conversion", "video_preprocessing_device"):
+        defaults[name] = getattr(strategy_class, name)
     return defaults
 
 
@@ -399,12 +642,14 @@ _MODEL_TYPES_BY_ARCH = {
     "Qwen3_5ForCausalLMMTP": ("qwen3_5",),
     "Qwen3OmniMoeForConditionalGeneration": ("qwen3_omni_moe",),
     "Qwen4ExpForConditionalGeneration": ("qwen4_exp",),
+    "InklingForConditionalGeneration": ("inkling_mm_model",),
 }
 
 
 class TestTokenSpaceSGLangProcessor(unittest.TestCase):
     def test_strategies_keep_the_legacy_processor_defaults(self):
-        """A token-space model loads and schedules media like the legacy processor it replaces."""
+        """A token-space model loads and schedules media like the legacy processor it replaces,
+        except the alpha compositing `_STRATEGY_RGB_CONVERSION` records for it."""
         import_processors("sglang.srt.multimodal.processors")
         register_token_space_models()
         legacy = {
@@ -417,6 +662,9 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
                 hf_config = SimpleNamespace(model_type=model_type, architectures=[arch])
                 hf_config.thinker_config = hf_config
                 expected = _legacy_defaults(legacy[arch], hf_config)
+                expected["rgb_conversion"] = _STRATEGY_RGB_CONVERSION.get(
+                    strategy_class.__name__, expected["rgb_conversion"]
+                )
                 with self.subTest(arch=arch, model_type=model_type):
                     self.assertEqual(
                         _token_space_defaults(strategy_class, hf_config), expected
@@ -543,6 +791,58 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
             )(None, server_args, _bare_tokenizer(), None)
         self.addCleanup(processor.shutdown)
         configure.assert_called_once_with(["media.example.com"], 7)
+
+    def test_served_core_caches_only_when_enabled(self):
+        """The switch picks the cache: a budget or trusted URLs alone must not turn it on."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        for cache_args, cache_type in (
+            (
+                dict(
+                    mm_preprocess_cache_size_mb=8,
+                    token_space_preprocess_cache_trust_url=True,
+                ),
+                type(None),
+            ),
+            (
+                dict(
+                    mm_preprocess_cache_size_mb=8,
+                    token_space_preprocess_cache_trust_url=True,
+                    enable_token_space_preprocess_cache=True,
+                ),
+                MultimodalPreprocessCache,
+            ),
+            (
+                dict(
+                    token_space_preprocess_cache_trust_url=True,
+                    enable_token_space_preprocess_cache=True,
+                    token_space_preprocess_cache_dir=directory.name,
+                    token_space_preprocess_cache_check_rate=0.5,
+                ),
+                DiskPreprocessCache,
+            ),
+        ):
+            with self.subTest(**cache_args):
+                reset_context()
+                self.addCleanup(reset_context)
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    model_impl="sglang",
+                    mm_process_config={},
+                    enable_token_space_processor=True,
+                    mm_processor_worker_num=1,
+                    **cache_args,
+                )
+                publish(server_args, role="test")
+                processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
+                    _ImageWidthStrategy, TokenSpaceServingSpec
+                )(None, server_args, _bare_tokenizer(), None)
+                self.addCleanup(processor.shutdown)
+                self.assertIsInstance(processor._core._item_feature_cache, cache_type)
+                self.assertEqual(
+                    processor._core._item_feature_cache_check_rate,
+                    cache_args.get("token_space_preprocess_cache_check_rate"),
+                )
 
     def test_chat_media_reach_a_partially_expanded_request(self):
         """Chat sends every turn's image; only the new turn's placeholder expands."""
@@ -683,6 +983,58 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
             self._item_hash(_PixelShapeStrategy, (1, 2)),
             self._item_hash(_PixelShapeStrategy, (2, 1)),
         )
+
+
+class TestStrategyLoaders(unittest.TestCase):
+    """The IO path decodes every source with the strategy's loaders, the shared ones by default."""
+
+    def _processor(self, strategy_class):
+        processor = TokenSpaceProcessor.for_strategy(strategy_class)(
+            None,
+            _bare_tokenizer(),
+            processor_config=MultimodalProcessorConfig(mm_processor_worker_num=1),
+        )
+        self.addCleanup(processor.shutdown)
+        return processor
+
+    def test_sources_go_through_the_strategy_loaders(self):
+        png = io.BytesIO()
+        Image.new("RGB", (3, 1)).save(png, format="PNG")
+
+        class _ReversedImageStrategy(_ImageWidthStrategy):
+            def load_image(self, source):
+                return Image.open(io.BytesIO(source)).transpose(Image.ROTATE_90)
+
+        # Default: the shared loader decodes the bytes; override: the strategy's own decode.
+        for strategy_class, width in (
+            (_ImageWidthStrategy, 3),
+            (_ReversedImageStrategy, 1),
+        ):
+            output = asyncio.run(
+                self._processor(strategy_class).process(
+                    [png.getvalue()], input_ids=[1, IMAGE]
+                )
+            )
+            self.assertEqual(output["input_ids"].tolist(), [[1] + [IMAGE] * width])
+
+    def test_loader_failures_classify_as_the_mixins(self):
+        """A client media error becomes a ValueError; anything else a RuntimeError, as legacy loading.
+
+        An undecodable image is an OSError subclass that the mixin lists as a client error, so the
+        classification must come from `media_load_errors`, not from the core's own except clauses.
+        """
+
+        class _FailingStrategy(_ImageWidthStrategy):
+            def load_image(self, source):
+                raise {"bad": UnidentifiedImageError, "io": OSError}[source](
+                    "cannot decode"
+                )
+
+        processor = self._processor(_FailingStrategy)
+        with self.assertRaises(ValueError):
+            asyncio.run(processor.process(["bad"], input_ids=[1, IMAGE]))
+        with self.assertRaises(RuntimeError):
+            asyncio.run(processor.process(["io"], input_ids=[1, IMAGE]))
 
 
 if __name__ == "__main__":

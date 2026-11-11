@@ -1,10 +1,12 @@
 """Content-addressed caches used by multimodal preprocessing."""
 
+from sglang.srt.multimodal.cache.disk_cache import DiskPreprocessCache
 from sglang.srt.multimodal.cache.identity import (
     CONTENT_HASH_PREFIX,
     MediaSnapshot,
     PreprocessFingerprintProvider,
     build_artifact_key,
+    build_cache_key,
     build_processor_fingerprint,
     media_preprocess_kwargs,
     parse_content_hash,
@@ -24,10 +26,12 @@ __all__ = [
     "CacheSizeProvider",
     "CacheLookup",
     "CacheMiss",
+    "DiskPreprocessCache",
     "MediaSnapshot",
     "MultimodalPreprocessCache",
     "PreprocessFingerprintProvider",
     "build_artifact_key",
+    "build_cache_key",
     "build_processor_fingerprint",
     "estimate_cache_size_bytes",
     "media_preprocess_kwargs",

@@ -4110,6 +4110,25 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         "large_hopper_qwen3_vl_model_type",
         return_value="qwen3_vl",
     )
+    def test_disk_preprocess_cache_keeps_cuda_ipc(self, _mock_model_type):
+        """A disk preprocess cache retains no IPC tensors, so a memory budget beside it must not cost cuda_ipc."""
+        updates = qwen3_vl_module._qwen3vl_hopper_serving_overrides(
+            self._args(
+                mm_preprocess_cache_size_mb=256,
+                token_space_preprocess_cache_trust_url=True,
+                enable_token_space_preprocess_cache=True,
+                token_space_preprocess_cache_dir="/shared/cache",
+            ),
+            None,
+        )
+
+        self.assertEqual(updates["mm_feature_transport"], "cuda_ipc")
+
+    @patch.object(
+        qwen3_vl_module,
+        "large_hopper_qwen3_vl_model_type",
+        return_value="qwen3_vl",
+    )
     def test_multinode_does_not_auto_select_cuda_ipc(self, _mock_model_type):
         updates = qwen3_vl_module._qwen3vl_hopper_serving_overrides(
             self._args(nnodes=2), None
