@@ -10,6 +10,11 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     get_tp_world_size,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_group,
+    get_ulysses_parallel_rank,
+    get_ulysses_parallel_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import (
     USPAttention,
@@ -253,6 +258,7 @@ class ZImageAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.qk_norm = qk_norm
+        self._head_padding_buffers: list[torch.Tensor | None] = [None, None, None]
         self.enable_zimage_qk_fusion = (
             quant_config is None and norm_cls is ZImageRMSNorm
         )
@@ -333,6 +339,30 @@ class ZImageAttention(nn.Module):
             softmax_scale=None,
             causal=False,
         )
+
+    def _pad_heads(
+        self, tensor: torch.Tensor, *, slot: int, pad_heads: int, reuse: bool
+    ) -> torch.Tensor:
+        if not reuse:
+            return torch.cat(
+                [
+                    tensor,
+                    tensor.new_zeros((*tensor.shape[:2], pad_heads, tensor.shape[3])),
+                ],
+                dim=2,
+            )
+        shape = (*tensor.shape[:2], tensor.shape[2] + pad_heads, tensor.shape[3])
+        buffer = self._head_padding_buffers[slot]
+        if (
+            buffer is None
+            or buffer.shape != shape
+            or buffer.dtype != tensor.dtype
+            or buffer.device != tensor.device
+        ):
+            buffer = tensor.new_zeros(shape)
+            self._head_padding_buffers[slot] = buffer
+        buffer[:, :, : tensor.shape[2]].copy_(tensor)
+        return buffer
 
     def forward(
         self,
@@ -493,6 +523,27 @@ class ZImageAttention(nn.Module):
                 allow_inplace=self.enable_zimage_qk_fusion,
             )
 
+        pad_heads = 0
+        if not skip_sequence_parallel_override:
+            pad_heads = -q.shape[2] % get_ulysses_parallel_world_size()
+        if pad_heads:
+            if q.shape[2] != k.shape[2]:
+                raise ValueError(
+                    "Ulysses head padding requires matching Q and KV heads"
+                )
+            reuse_padding = (
+                not torch.is_grad_enabled()
+                and not torch.compiler.is_compiling()
+                and not is_in_breakable_cuda_graph()
+                and not torch.cuda.is_current_stream_capturing()
+            )
+            q, k, v = (
+                self._pad_heads(
+                    tensor, slot=slot, pad_heads=pad_heads, reuse=reuse_padding
+                )
+                for slot, tensor in enumerate((q, k, v))
+            )
+
         hidden_states = self.attn(
             q,
             k,
@@ -503,6 +554,8 @@ class ZImageAttention(nn.Module):
             num_replicated_suffix=num_replicated_suffix,
             skip_sequence_parallel_override=skip_sequence_parallel_override,
         )
+        if pad_heads:
+            hidden_states = hidden_states[:, :, :-pad_heads, :]
         hidden_states = hidden_states.flatten(2)
 
         hidden_states, _ = self.to_out[0](hidden_states)
@@ -926,6 +979,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self._rope_caches: dict[str, tuple] = {}
         # (image cos/sin, caption cos/sin) -> their [image, caption] concatenation
         self._unified_freqs_cis: tuple | None = None
+        self._sharded_unified_freqs: tuple | None = None
         self.layer_names = ["layers"]
 
     def unpatchify(
@@ -972,6 +1026,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         patch_size: int,
         f_patch_size: int,
         image_seq_len_target: int | None = None,
+        image_sp_unpadded: bool = False,
         caption_valid_lens: torch.Tensor | None = None,
         caption_valid_mask: torch.Tensor | None = None,
     ):
@@ -1058,10 +1113,17 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 F_tokens * H_tokens * W_tokens, pF * pH * pW * C
             )
             image_ori_len = image.size(0)
-            image_attn_len = max(
-                image_seq_len_target or 0,
-                self._ceil_to_multiple(image_ori_len, SEQ_MULTI_OF),
-            )
+            if image_sp_unpadded:
+                if image_seq_len_target != image_ori_len:
+                    raise ValueError(
+                        "Unpadded SP target must equal the real image length"
+                    )
+                image_attn_len = image_ori_len
+            else:
+                image_attn_len = max(
+                    image_seq_len_target or 0,
+                    self._ceil_to_multiple(image_ori_len, SEQ_MULTI_OF),
+                )
             target_image_seq_len = max(
                 target_image_seq_len,
                 image_attn_len,
@@ -1517,6 +1579,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         f_patch_size=1,
         freqs_cis=None,
         image_seq_len_target: int | None = None,
+        image_sp_unpadded: bool = False,
         encoder_hidden_states_mask=None,
         caption_valid_lens: torch.Tensor | None = None,
         **kwargs,
@@ -1528,6 +1591,16 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         cap_feats = self._as_caption_list(encoder_hidden_states)
         input_images = x
         input_cap_feats = cap_feats
+        if image_sp_unpadded and (
+            get_sp_world_size() <= 1
+            or get_sp_world_size() != get_ulysses_parallel_world_size()
+            or torch.is_grad_enabled()
+            or torch.compiler.is_compiling()
+            or is_in_breakable_cuda_graph()
+            or torch.cuda.is_current_stream_capturing()
+            or kwargs.get("_use_caption_valid_mask", False)
+        ):
+            raise ValueError("Unpadded SP requires dense eager Ulysses inference")
         caption_valid_mask = None
         if kwargs.pop("_use_caption_valid_mask", False):
             caption_valid_mask = self._caption_valid_mask_from_mask(
@@ -1554,6 +1627,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             patch_size,
             f_patch_size,
             image_seq_len_target=image_seq_len_target,
+            image_sp_unpadded=image_sp_unpadded,
             caption_valid_lens=caption_valid_lens,
             caption_valid_mask=caption_valid_mask,
         )
@@ -1630,6 +1704,53 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             "unified", unified_freqs_cis
         )
         num_replicated_suffix = cap_seq_len
+        ulysses_size = get_ulysses_parallel_world_size()
+        shard_unified = (
+            ulysses_size > 1
+            and get_sp_world_size() == ulysses_size
+            and unified_attn_mask is None
+            and (x.shape[1] * ulysses_size + cap_seq_len) % ulysses_size == 0
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and not is_in_breakable_cuda_graph()
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        image_local_len = x.shape[1]
+        if shard_unified:
+            rank = get_ulysses_parallel_rank()
+            group = get_sp_group().ulysses_group
+            gathered = [torch.empty_like(x) for _ in range(ulysses_size)]
+            torch.distributed.all_gather(gathered, x.contiguous(), group=group)
+            unified = torch.cat([*gathered, cap_feats], dim=1)
+            unified = unified.chunk(ulysses_size, dim=1)[rank].contiguous()
+            sources = (*x_freqs_cis, *cap_freqs_cis)
+            layout = (ulysses_size, rank, x.shape, cap_seq_len, group)
+            cached_freqs = self._sharded_unified_freqs
+            if (
+                cached_freqs is not None
+                and cached_freqs[0] == layout
+                and all(a is b for a, b in zip(cached_freqs[1], sources, strict=True))
+            ):
+                unified_freqs_cis = cached_freqs[2]
+            else:
+                sharded_freqs = []
+                for image_freq, cap_freq in zip(x_freqs_cis, cap_freqs_cis):
+                    gathered_freqs = [
+                        torch.empty_like(image_freq) for _ in range(ulysses_size)
+                    ]
+                    torch.distributed.all_gather(
+                        gathered_freqs, image_freq.contiguous(), group=group
+                    )
+                    global_freq = torch.cat([*gathered_freqs, cap_freq], dim=-2)
+                    sharded_freqs.append(
+                        global_freq.chunk(ulysses_size, dim=-2)[rank].contiguous()
+                    )
+                unified_freqs_cis = tuple(sharded_freqs)
+                self._sharded_unified_freqs = (layout, sources, unified_freqs_cis)
+            unified_rope_cos_sin_cache, unified_rope_positions = self._get_rope_cache(
+                "unified_sharded", unified_freqs_cis
+            )
+            num_replicated_suffix = 0
 
         for layer in self.layers:
             unified = layer(
@@ -1643,6 +1764,13 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 num_replicated_suffix=num_replicated_suffix,
             )
 
+        if shard_unified:
+            gathered = [torch.empty_like(unified) for _ in range(ulysses_size)]
+            torch.distributed.all_gather(gathered, unified.contiguous(), group=group)
+            unified = torch.cat(gathered, dim=1)
+            unified = unified[:, rank * image_local_len : (rank + 1) * image_local_len]
+        else:
+            unified = unified[:, :image_local_len]
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
             unified, adaln_input
         )

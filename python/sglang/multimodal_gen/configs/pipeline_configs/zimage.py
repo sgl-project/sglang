@@ -6,6 +6,7 @@ from typing import Callable
 import torch
 import torch.distributed as dist
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
@@ -31,6 +32,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
+    get_ulysses_parallel_world_size,
 )
 
 
@@ -101,6 +103,50 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     SEQ_LEN_MULTIPLE: int = 32
     PATCH_SIZE: int = 2
     F_PATCH_SIZE: int = 1
+    _allow_unpadded_sp: bool = field(default=False, init=False, repr=False)
+
+    def validate_server_args(self, server_args) -> None:
+        super().validate_server_args(server_args)
+        self._allow_unpadded_sp = not (
+            server_args.enable_torch_compile or server_args.enable_breakable_cuda_graph
+        )
+
+    def _can_use_unpadded_sp(self, batch, *, local_seq_lens, sp_size) -> bool:
+        if (
+            not self._allow_unpadded_sp
+            or sp_size <= 1
+            or sp_size != get_ulysses_parallel_world_size()
+            or torch.is_grad_enabled()
+            or torch.compiler.is_compiling()
+            or batch.enable_teacache
+            or batch.enable_spectrum
+            or (
+                batch.enable_cache_dit
+                if batch.enable_cache_dit is not None
+                else envs.SGLANG_CACHE_DIT_ENABLED
+            )
+            or len(set(local_seq_lens)) != 1
+            or min(local_seq_lens) <= 0
+            or sum(local_seq_lens) % self.SEQ_LEN_MULTIPLE
+        ):
+            return False
+        caption_lens = batch.prompt_seq_lens
+        if caption_lens is None:
+            return False
+        lengths = list(caption_lens[0])
+        if batch.do_classifier_free_guidance:
+            if batch.negative_prompt_seq_lens is None:
+                return False
+            lengths.extend(batch.negative_prompt_seq_lens[0])
+        padded_lengths = {
+            self._ceil_to_multiple(length, self.SEQ_LEN_MULTIPLE) for length in lengths
+        }
+        return (
+            bool(lengths)
+            and min(lengths) > 0
+            and len(padded_lengths) == 1
+            and (sum(local_seq_lens) + next(iter(padded_lengths))) % sp_size == 0
+        )
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
@@ -174,6 +220,11 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
             img_seq_target = self._ceil_to_multiple(
                 max(local_seq_lens), self.SEQ_LEN_MULTIPLE
             )
+            image_sp_unpadded = self._can_use_unpadded_sp(
+                batch, local_seq_lens=local_seq_lens, sp_size=sp_size
+            )
+            if image_sp_unpadded:
+                img_seq_target = local_seq_lens[rank]
             total_pad_tokens = img_seq_target * sp_size - (H_tok * W_tok)
             shard_options.append(
                 (
@@ -183,10 +234,13 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
                     shard_axis,
                     axis_sizes,
                     img_seq_target,
+                    image_sp_unpadded,
                 )
             )
 
-        _, _, _, shard_axis, axis_sizes, img_seq_target = min(shard_options)
+        _, _, _, shard_axis, axis_sizes, img_seq_target, image_sp_unpadded = min(
+            shard_options
+        )
         axis_start_tok = sum(axis_sizes[:rank])
         axis_local_tok = axis_sizes[rank]
 
@@ -215,16 +269,12 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
             "local_h_tok": local_h_tok,
             "local_w_tok": local_w_tok,
             "img_seq_target": img_seq_target,
+            "image_sp_unpadded": image_sp_unpadded,
         }
-        batch._zimage_sp_plan = plan
         return plan
 
     def _get_zimage_sp_plan(self, batch) -> dict:
-        plan = getattr(batch, "_zimage_sp_plan", None)
-        sp_size = get_sp_world_size()
-        if plan is None or plan.get("sp_size") != sp_size:
-            plan = self._build_zimage_sp_plan(batch)
-        return plan
+        return self._build_zimage_sp_plan(batch)
 
     def _pad_text_embed_for_dit(self, embed: torch.Tensor) -> torch.Tensor:
         target_len = self._ceil_to_multiple(embed.shape[0], self.SEQ_LEN_MULTIPLE)
@@ -501,6 +551,11 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
                 if get_sp_world_size() > 1
                 else None
             ),
+            "image_sp_unpadded": (
+                self._get_zimage_sp_plan(batch)["image_sp_unpadded"]
+                if get_sp_world_size() > 1
+                else False
+            ),
             "caption_valid_lens": torch.tensor(
                 self.require_text_seq_lens(batch, 0),
                 device=device,
@@ -529,6 +584,11 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
                 self._get_zimage_sp_plan(batch)["img_seq_target"]
                 if get_sp_world_size() > 1
                 else None
+            ),
+            "image_sp_unpadded": (
+                self._get_zimage_sp_plan(batch)["image_sp_unpadded"]
+                if get_sp_world_size() > 1
+                else False
             ),
             "caption_valid_lens": torch.tensor(
                 self.require_text_seq_lens(batch, 0, negative=use_negative_embeds),
