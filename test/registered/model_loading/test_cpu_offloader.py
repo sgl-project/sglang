@@ -11,9 +11,9 @@ from torch.nn import functional as F
 
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear
+from sglang.srt.layers.offloader import OffloaderV1, OffloaderV2
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_loader.loader import PreshardedModelLoader
-from sglang.srt.utils.offloader import OffloaderV1, OffloaderV2
 from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -81,6 +81,58 @@ class TestCpuOffloader(CustomTestCase):
         if self.device is None:
             self.skipTest("An accelerator is required to exercise CPU offload")
 
+    @unittest.skipUnless(
+        torch.cuda.is_available() and not torch.version.hip,
+        "CUDA GDN input projections",
+    )
+    def test_gdn_input_projections_after_cpu_offload(self) -> None:
+        """Offloaded GDN projections must not retain a host-only fused weight (#47896)."""
+        from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+
+        class InputProjections(nn.Module):
+            forward = Qwen3_5GatedDeltaNet._forward_input_proj
+
+            def __init__(self, device):
+                super().__init__()
+                self._fused_in_proj_weight = None
+                self._fused_input_proj_cpu_enabled = SimpleNamespace(value=False)
+                self.alt_stream = None
+                for name, width in (("in_proj_qkvz", 8), ("in_proj_ba", 4)):
+                    projection = MergedColumnParallelLinear(
+                        4,
+                        [width],
+                        bias=False,
+                        params_dtype=torch.bfloat16,
+                        parallel_group="replicated",
+                    ).to(device)
+                    projection.weight.data.normal_()
+                    setattr(self, name, projection)
+
+        for offloaded in (
+            ("in_proj_qkvz",),
+            ("in_proj_ba",),
+            ("in_proj_qkvz", "in_proj_ba"),
+        ):
+            with self.subTest(offloaded=offloaded), torch.no_grad():
+                model = InputProjections(self.device)
+                inputs = torch.randn((2, 4), dtype=torch.bfloat16, device=self.device)
+                expected = model(inputs)
+                offloader = OffloaderV1(cpu_offload_max_bytes=1024**2)
+                projections = [model.get_submodule(name) for name in offloaded]
+                for projection in projections:
+                    offloader.maybe_offload_to_cpu(projection)
+
+                with patch(
+                    "sglang.srt.models.qwen3_5.get_lora",
+                    return_value=SimpleNamespace(enable_lora=False, lora_paths=None),
+                ):
+                    Qwen3_5GatedDeltaNet.finalize_fused_in_proj(model)
+
+                self.assertIsNone(model._fused_in_proj_weight)
+                torch.testing.assert_close(model(inputs), expected)
+                for projection in projections:
+                    self.assertEqual(projection.weight.device.type, "cpu")
+
     def test_cpu_offloaded_gemma_weight_fills_device_buffer(self) -> None:
         norm = GemmaRMSNorm(16).to(self.device)
         norm = OffloaderV1(cpu_offload_max_bytes=1024**2).maybe_offload_to_cpu(norm)
@@ -140,10 +192,10 @@ class TestCpuOffloader(CustomTestCase):
             # The cached view is held outside the selected projection submodule.
             with (
                 patch(
-                    "sglang.srt.utils.offloader.get_parallel",
+                    "sglang.srt.layers.offloader.get_parallel",
                     return_value=SimpleNamespace(dp_rank=0, num_dp_ranks=1),
                 ),
-                patch("sglang.srt.utils.offloader.get_stream", return_value=None),
+                patch("sglang.srt.layers.offloader.get_stream", return_value=None),
                 patch("torch.cuda.memory_allocated", return_value=0),
                 patch.dict(os.environ, {"SGLANG_RUN_ID": "test-cpu-offloader"}),
             ):

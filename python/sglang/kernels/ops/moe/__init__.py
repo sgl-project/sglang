@@ -61,14 +61,6 @@ register_kernel(
         capabilities=_HIP,
     )
 )
-register_kernel(
-    KernelSpec(
-        op="moe.topk_softmax",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.moe.moe_topk_softmax:topk_softmax",
-        capabilities=CUDA_ONLY,
-    )
-)
 
 
 register_kernel(
@@ -187,37 +179,7 @@ def topk_softmax(
     )
 
 
-def situ_and_mul_masked_post_quant(
-    input: torch.Tensor,
-    output: torch.Tensor,
-    output_scale: torch.Tensor,
-    quant_group_size: int,
-    masked_m: torch.Tensor,
-    beta: float,
-    linear_beta: float,
-    scale_ue8m0: bool = False,
-    topk: int = 8,
-    transposed: bool = False,
-    swizzle: bool = False,
-) -> None:
-    from .kimi_k3_situ_and_mul_quant import situ_and_mul_masked_post_quant as impl
-
-    return impl(
-        input,
-        output,
-        output_scale,
-        quant_group_size,
-        masked_m,
-        beta,
-        linear_beta,
-        scale_ue8m0,
-        topk,
-        transposed,
-        swizzle,
-    )
-
-
-__all__ = ["situ_and_mul_masked_post_quant", "moe_align_block_size", "topk_softmax"]
+__all__ = ["moe_align_block_size", "topk_softmax"]
 
 
 # Triton kernels migrated from srt/layers/moe (RFC #29630, Phase 2.5);
@@ -363,6 +325,45 @@ register_kernel(
         op="moe.muse_spark_post_expert_finalize",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton:fused_post_expert_norm_weighted_sum",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
+# Muse Spark on gfx950 (MI355X): Triton kernels the ROCm Muse Spark model and the aiter /
+# Triton attention backends dispatch to by shape; registered for inventory.
+_MUSE_SPARK_GFX950_KERNELS = [
+    (
+        "router_pooler_topk",
+        "router_pooler_topk",
+        "FP32 router + BF16 pooler + sigmoid top-8 / RMSNorm epilogue",
+    ),
+    (
+        "router_pooler_topk",
+        "joint_router_pooler_topk",
+        "packed router/pooler split-K GEMM + top-8 / RMSNorm epilogue",
+    ),
+    (
+        "mxfp4_compact_a4_moe",
+        "compact_a4_experts",
+        "A4W4 MXFP4 experts for small verify batches (32 local experts, top-8)",
+    ),
+]
+for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"moe.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.moe.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _mod, _fn, _desc
+register_kernel(
+    KernelSpec(
+        op="moe.multi_router_topk",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.multi_router:multi_router_topk",
         capabilities=CUDA_ONLY,
     )
 )

@@ -247,10 +247,10 @@ void ipm_solve(tvm::ffi::TensorView A, tvm::ffi::TensorView b, tvm::ffi::TensorV
   using namespace host;
 
   SymbolicDevice device_;
-  TensorMatcher({NC, NV}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(A);
-  TensorMatcher({NC}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(b);
-  TensorMatcher({NV}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(c);
-  TensorMatcher({NV}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(result);
+  TensorMatcher({NC, NV}).with_dtype<float>().with_device<kDLGPU>(device_).verify(A);
+  TensorMatcher({NC}).with_dtype<float>().with_device<kDLGPU>(device_).verify(b);
+  TensorMatcher({NV}).with_dtype<float>().with_device<kDLGPU>(device_).verify(c);
+  TensorMatcher({NV}).with_dtype<float>().with_device<kDLGPU>(device_).verify(result);
 
   const DLDevice device = device_.unwrap();
   const size_t smem_bytes = sizeof(ipm_smem<NC, NV>);
