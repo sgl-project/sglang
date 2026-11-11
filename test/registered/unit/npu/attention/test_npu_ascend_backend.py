@@ -55,6 +55,11 @@ class TestUnoGraphKvLengths(unittest.TestCase):
         )
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
         backend.graph_metadata = {bs: metadata}
+        backend.dense_mla_dcp_target = False
+        backend.dsa_dcp_target = False
+        backend.use_flash_mla = False
+        backend.use_paged_mtp = False
+        backend.use_quant_flash_attn = False
         backend.is_hybrid_swa = False
         backend.use_sliding_window_kv_pool = False
         backend.speculative_num_draft_tokens = 8

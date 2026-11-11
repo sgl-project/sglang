@@ -125,7 +125,7 @@ class TestUnoWorkerLifecycle(CustomTestCase):
                         req_to_token=table
                     )
                     worker.model_runner.model_config = SimpleNamespace(vocab_size=vocab)
-                    worker.model_runner.kv_index_translator = SimpleNamespace(
+                    worker.model_runner.runner_ids = SimpleNamespace(
                         bind_own_plan=Mock()
                     )
                     kv = torch.full((batch_size * capacity,), -1, dtype=torch.int64)

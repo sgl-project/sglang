@@ -668,8 +668,7 @@ class AscendAttnBackend(AttentionBackend):
                     forward_batch.spec_algorithm is not None
                     and forward_batch.spec_algorithm.is_dflash()
                 ):
-                    # dflash_worker_v2 already publishes seq_lens_cpu as prefix +
-                    # one verify block, which already covers the draft block.
+                    # UNO and DFlash publish final host lengths including the query block.
                     seq_lens_max = forward_batch.seq_lens_cpu.max().item()
                 else:
                     # Overlap scheduling can publish the CPU sequence length one
@@ -1263,8 +1262,8 @@ class AscendAttnBackend(AttentionBackend):
             )
         if seq_lens_cpu is not None:
             # Compute the host-side KV lengths visible to this attention step. Target
-            # verify adds the draft block except for DFlash, whose seq_lens_cpu already
-            # includes it; speculative decode adds tokens through the current draft step.
+            # Live UNO and DFlash host lengths already include the query block.
+            # UNO capture still supplies dummy prefixes, so add the width there.
             attention_kv_lens_cpu = seq_lens_cpu[:bs].int()
             if (
                 forward_mode.is_target_verify()
