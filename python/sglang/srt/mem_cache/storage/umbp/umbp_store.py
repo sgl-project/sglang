@@ -1187,7 +1187,11 @@ class UMBPStore(HiCacheStorage):
 
     def _anchor_keys(self, keys) -> tuple[list[str], int]:
         suffixes = self._anchor_key_suffixes()
-        return [f"{key}{suffix}" for key in keys for suffix in suffixes], len(suffixes)
+        prefix = f"{self.config_prefix}_" if self.config_prefix else ""
+        return (
+            [f"{prefix}{key}{suffix}" for key in keys for suffix in suffixes],
+            len(suffixes),
+        )
 
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
