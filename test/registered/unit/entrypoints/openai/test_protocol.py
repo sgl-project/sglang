@@ -246,6 +246,15 @@ class TestChatCompletionRequest(CustomTestCase):
         )
         self.assertEqual(request2.tool_choice, "auto")
 
+    def test_message_tools_indices_default_is_not_shared(self):
+        """Requests built without validation still get their own empty list."""
+        first = ChatCompletionRequest.model_construct()
+        first._message_tools_indices.append(0)
+
+        self.assertEqual(
+            ChatCompletionRequest.model_construct()._message_tools_indices, []
+        )
+
     def test_chat_completion_reasoning_effort(self):
         """Test chat completion with reasoning effort"""
         messages = [{"role": "user", "content": "Hello"}]

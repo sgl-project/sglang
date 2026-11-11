@@ -1074,8 +1074,11 @@ class ChatCompletionRequest(PDRoutingFields):
     # by set_tool_choice_default.
     _tool_choice_explicit: bool = PrivateAttr(default=False)
     # Indices of the messages the client sent a non-empty `tools` on, including
-    # user messages, whose model drops the field.
-    _message_tools_indices: List[int] = PrivateAttr(default_factory=list)
+    # user messages, whose model drops the field. A default rather than
+    # `default_factory=list`: pydantic copies it per instance, while for a builtin
+    # factory it calls `inspect.signature` twice per validated request, and each
+    # call copies `sys.modules` (~0.15 ms with the ~8k modules of a server).
+    _message_tools_indices: List[int] = PrivateAttr(default=[])
     parallel_tool_calls: bool = True
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
