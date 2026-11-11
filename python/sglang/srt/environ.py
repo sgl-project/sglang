@@ -2252,9 +2252,6 @@ class Envs:
     # ===================================================================
     # Fuse the unpooler all-gather into the FFN-boundary norm-residual kernel.
     SGLANG_ENABLE_MUSE_SPARK_AG_NORM_FUSION = EnvBool(True)
-    # Use the experimental FlyDSL split-K paged GQA kernel for Muse Spark's
-    # short-window decode layers on gfx950.
-    SGLANG_ROCM_MUSE_FLYDSL_DECODE = EnvBool(False)
     # Muse Spark on MI355X (gfx950): AgentX fast paths, all on by default. Each
     # variable is the off-switch of one optimization; the paths are shape-gated, so
     # they only engage on the Muse Spark shapes they were measured on.

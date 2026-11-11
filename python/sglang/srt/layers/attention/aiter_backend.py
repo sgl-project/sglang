@@ -96,14 +96,6 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
-try:
-    from aiter.ops.flydsl.muse_paged_decode import (
-        muse_paged_gqa_decode_flydsl,
-        prepare_muse_paged_gqa_decode_scratch,
-    )
-except ImportError:
-    muse_paged_gqa_decode_flydsl = None
-    prepare_muse_paged_gqa_decode_scratch = None
 
 try:
     from sglang.kernels.ops.attention.muse_extend_gluon import (
@@ -879,25 +871,6 @@ class AiterAttnBackend(AttentionBackend):
                 chunk if chunk is not None and chunk > 0 else self.max_context_len
             )
 
-        # Opt-in Muse SWA decode: replace unified_attention_2d with a split-K
-        # FlyDSL kernel. Keep this shape-gated so Qwen/Kimi/DSV4 dispatch is
-        # unchanged; full-attention Muse layers retain unified_attention_3d.
-        self.use_muse_flydsl_decode = (
-            envs.SGLANG_ROCM_MUSE_FLYDSL_DECODE.get()
-            and muse_paged_gqa_decode_flydsl is not None
-            and is_gfx95_supported()
-            and self.page_size == 16
-            and self.head_dim == 64
-            and self.num_head == self.num_kv_head * 8
-            and self.input_dtype == torch.bfloat16
-        )
-        if self.use_muse_flydsl_decode:
-            prepare_muse_paged_gqa_decode_scratch(
-                self.device,
-                batches=range(1, 9),
-                num_kv_heads=self.num_kv_head,
-                num_splits=128,
-            )
         # Decode metadata format. unified_attention and pa_decode_gluon (the
         # SHUFFLE 5D decode kernel) both read kv_indices as a 2-D
         # (bs, max_num_blocks_per_seq) page table; the remaining decode kernels
@@ -5734,61 +5707,29 @@ class AiterAttnBackend(AttentionBackend):
                 if self.kv_cache_dtype == fp8_dtype:
                     q, q_descale = self._quantize_q_fp8(q)
 
-                use_muse_flydsl = (
-                    self.use_muse_flydsl_decode
-                    and bs <= 8
-                    and window_size[0] > 0
-                    and window_size[0] + 1 == 2047
-                    and self.kv_cache_dtype != fp8_dtype
-                    and sinks is None
+                unified_attention(
+                    q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k=k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    v=v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                    ),
+                    out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    cu_seqlens_q=self.forward_metadata.qo_indptr,
+                    seqused_k=forward_batch.seq_lens,
+                    max_seqlen_q=self.forward_metadata.max_q_len,
+                    max_seqlen_k=max_kv_len,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=window_size,
+                    block_table=page_table,
+                    softcap=layer.logit_cap,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    sinks=sinks,
                 )
-                if use_muse_flydsl:
-                    muse_paged_gqa_decode_flydsl(
-                        q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                        k_cache=k_cache.view(
-                            -1,
-                            self.page_size,
-                            layer.tp_k_head_num,
-                            layer.qk_head_dim,
-                        ),
-                        v_cache=v_cache.view(
-                            -1,
-                            self.page_size,
-                            layer.tp_v_head_num,
-                            layer.v_head_dim,
-                        ),
-                        seq_lens=forward_batch.seq_lens,
-                        block_table=page_table,
-                        out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                        softmax_scale=self.scale,
-                        window_size=2047,
-                        num_splits=128,
-                        segment_size=16,
-                    )
-                else:
-                    unified_attention(
-                        q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                        k=k_cache.view(
-                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
-                        ),
-                        v=v_cache.view(
-                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-                        ),
-                        out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                        cu_seqlens_q=self.forward_metadata.qo_indptr,
-                        seqused_k=forward_batch.seq_lens,
-                        max_seqlen_q=self.forward_metadata.max_q_len,
-                        max_seqlen_k=max_kv_len,
-                        softmax_scale=layer.scaling,
-                        causal=True,
-                        window_size=window_size,
-                        block_table=page_table,
-                        softcap=layer.logit_cap,
-                        q_descale=q_descale,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                        sinks=sinks,
-                    )
             else:
                 self._reject_paged_decode_sliding_window(layer)
                 # Drop FP8 KV upcast: keep paged cache in native FP8 and use ``fp8_e4m3`` for

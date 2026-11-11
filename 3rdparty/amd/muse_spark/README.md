@@ -26,18 +26,15 @@ Apply them in a container built from `docker/rocm.Dockerfile`:
 ```bash
 AITER_ROOT=/sgl-workspace/aiter \
   3rdparty/amd/muse_spark/apply_aiter_patches.sh
-
-# Also install the experimental Plan C short-window decode kernel:
-ENABLE_PLAN_C=1 AITER_ROOT=/sgl-workspace/aiter \
-  3rdparty/amd/muse_spark/apply_aiter_patches.sh
 ```
+
+Both patches are optional: without them the aiter backend keeps aiter's own
+unified-attention tiles and tuned GEMM tables.
 
 `MUSE_MOE_BACKEND=triton` is the default on HIP. Set it to `flydsl` for the
 optimized FlyDSL experts (`sglang.kernels.ops.moe.muse_moe_gemm` /
 `muse_moe_finalize`, no aiter patch needed), or `native` for a correctness
-fallback. Plan C
-short-window attention remains opt-in with `SGLANG_ROCM_MUSE_FLYDSL_DECODE=1`; its
-aiter kernel is under `patches/experimental`.
+fallback.
 
 Launch commands for MI355X are in the Muse Spark cookbook page
 (`docs/src/snippets/configs/meta-models/muse-spark.jsx`).
