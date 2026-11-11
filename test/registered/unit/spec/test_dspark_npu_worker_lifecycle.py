@@ -27,6 +27,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.models.dspark import DSparkConfidenceHead, VanillaMarkov
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.dspark_components import (
+    dspark_draft_sampler,
     dspark_planner,
     dspark_verify,
     dspark_worker_v2,
@@ -36,6 +37,48 @@ from sglang.srt.speculative.spec_tp_sync import SpecTpSync
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+@pytest.mark.parametrize("device_type", ["cuda", "xpu", "npu"])
+@pytest.mark.parametrize("capturing", [False, True])
+def test_draft_sampler_capture_query_is_device_specific(device_type, capturing):
+    sampler = dspark_draft_sampler.DsparkDraftSampler.__new__(
+        dspark_draft_sampler.DsparkDraftSampler
+    )
+    sampler.step_logits = None
+    sampler.max_bs, sampler.gamma = 2, 3
+    sampler.sharded_accept = False
+    sampler.markov_head = SimpleNamespace(
+        vocab_shard=None, step_logits_dtype=lambda dtype: dtype
+    )
+    sampler.model = SimpleNamespace(
+        lm_head=SimpleNamespace(org_vocab_size=4), markov_head=sampler.markov_head
+    )
+    base_logits = torch.zeros(2, 3, 4)
+    with (
+        patch.object(dspark_draft_sampler, "_is_npu", device_type == "npu"),
+        patch.object(dspark_draft_sampler, "_is_xpu", device_type == "xpu"),
+        patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=capturing
+        ) as cuda_query,
+        patch.object(
+            torch.xpu, "is_current_stream_capturing", return_value=capturing
+        ) as xpu_query,
+        patch.object(
+            dspark_draft_sampler, "is_device_stream_capturing", return_value=capturing
+        ) as npu_query,
+    ):
+        if capturing:
+            with pytest.raises(AssertionError):
+                sampler._step_logits(base_logits)
+            assert sampler.step_logits is None
+        else:
+            output = sampler._step_logits(base_logits)
+            assert output.shape == (2, 3, 4)
+            assert sampler._step_logits(base_logits) is output
+        assert cuda_query.call_count == int(device_type == "cuda")
+        assert xpu_query.call_count == int(device_type == "xpu")
+        assert npu_query.call_count == int(device_type == "npu")
 
 
 def _cpu_scatter_into(*, compact, verify_lens, out, stride, fill_value):
@@ -170,6 +213,8 @@ def test_dense_worker_constructor_to_draft_sampler_warmup(
         envs.SGLANG_SIMULATE_ACC_LEN.override(1.0 if profile else 0.0),
         patch.object(dspark_worker_v2, "_is_npu", True),
         patch.object(dspark_planner, "_is_npu", True),
+        patch.object(dspark_draft_sampler, "_is_npu", True),
+        patch.object(dspark_verify, "_is_npu", True),
         patch.object(
             dspark_worker_v2, "draft_uses_compressed_kv_attention", return_value=False
         ),
