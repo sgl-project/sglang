@@ -1,18 +1,19 @@
-"""MI35x InferenceX AgentX curves, one point per run.
+"""MI35x InferenceX AgentX curve for Qwen3.5-397B-A17B MXFP4 with EAGLE MTP,
+one point per run.
 
-Runs the point AGENTX_POINT (``tp2-c1``, ``tp2-dpa-c64``, ...) of the InferenceX
-AgentX sweep AGENTX_CONFIG_KEY (an amd-master.yaml key, e.g.
-``dsv41flash-fp4-mi355x-sglang-agentic-dspark`` or
-``qwen3.5-fp4-mi355x-sglang-agentic-mtp``) against this checkout. The point's
-server flags, env, golden acceptance length and the AgentX client all come from
-InferenceX at INFERENCEX_COMMIT, bound by its own srt-slurm planner, so a result
-is comparable with InferenceX's for the same image. The only departures are CI
-ones: no power telemetry, server and router addresses.
+Runs the point AGENTX_POINT (``tp2-c1``, ``tp2-c16``, ...) of InferenceX's
+``qwen3.5-fp4-mi355x-sglang-agentic-mtp`` sweep against this checkout. The
+point's server flags, env, KV-offload budget, golden acceptance length and the
+AgentX client all come from InferenceX at INFERENCEX_COMMIT, bound by its own
+srt-slurm planner, so a result is comparable with InferenceX's for the same
+image. The only departures are CI ones: no power telemetry, server and router
+addresses.
 
 Reports rather than gates: fails only when the server, router or client fails,
-including InferenceX's result validation.
+including InferenceX's result validation. The harness follows
+test_dsv41_flash_agentx_mi35x.py.
 
-Registry: nightly-perf-8-gpu-mi35x-agentx suite
+Registry: nightly-perf-8-gpu-mi35x-qwen35-mxfp4-agentx suite
 """
 
 import json
@@ -38,14 +39,16 @@ from sglang.test.test_utils import (
 
 # Register for AMD CI - one AgentX point: model load, up to an hour of warmup,
 # then InferenceX's one-hour measurement window.
-register_amd_ci(est_time=10800, suite="nightly-perf-8-gpu-mi35x-agentx", nightly=True)
+register_amd_ci(
+    est_time=10800, suite="nightly-perf-8-gpu-mi35x-qwen35-mxfp4-agentx", nightly=True
+)
 
 INFERENCEX_REPO = "https://github.com/SemiAnalysisAI/InferenceX.git"
 INFERENCEX_COMMIT = "4538f1bc9784426ae92da31b7e8daae4ba637b84"
+CONFIG_KEY = "qwen3.5-fp4-mi355x-sglang-agentic-mtp"
 # What InferenceX's benchmark workflow sets for every AgentX point.
 THINKING_MODE = "thinking_on"
 
-CONFIG_KEY = os.environ.get("AGENTX_CONFIG_KEY", "")
 POINT = os.environ.get("AGENTX_POINT", "")
 SERVER_LAUNCH_TIMEOUT = 5400
 ROUTER_READY_TIMEOUT = 600
@@ -343,9 +346,9 @@ def _write_artifacts(
         "client_exit_code": client_exit_code,
         "aggregate": aggregate,
     }
-    (artifact_dir / f"agentx-{CONFIG_KEY}-{POINT}.json").write_text(json.dumps(record))
-    (artifact_dir / f"agentx-{CONFIG_KEY}-{POINT}.md").write_text(
-        f"### AgentX on MI35x: {CONFIG_KEY} {POINT}\n\n"
+    (artifact_dir / f"agentx-qwen35-mxfp4-{POINT}.json").write_text(json.dumps(record))
+    (artifact_dir / f"agentx-qwen35-mxfp4-{POINT}.md").write_text(
+        f"### Qwen3.5 MXFP4 MTP AgentX on MI35x: {POINT}\n\n"
         + SUMMARY_HEADER
         + _summary_row(point=POINT, aggregate=aggregate)
     )
@@ -353,23 +356,20 @@ def _write_artifacts(
 
 # Not CustomTestCase: its CI retry would rerun a failed two-hour point and report
 # the second attempt's numbers as a pass.
-@unittest.skipUnless(
-    CONFIG_KEY and POINT, "AGENTX_CONFIG_KEY and AGENTX_POINT are not both set"
-)
-class TestAgentXMI35x(unittest.TestCase):
+@unittest.skipUnless(POINT, "AGENTX_POINT is not set")
+class TestQwen35MXFP4AgentXMI35x(unittest.TestCase):
     def test_agentx_point(self):
         e2e = _checkout_inferencex()
         variant, recipe, environment = _bind_point(e2e=e2e, point=POINT)
         print(
-            f"AgentX {CONFIG_KEY} {POINT}: {variant} at InferenceX {INFERENCEX_COMMIT}",
-            flush=True,
+            f"AgentX {POINT}: {variant} at InferenceX {INFERENCEX_COMMIT}", flush=True
         )
         frontend = recipe.get("frontend") or {}
         if frontend.get("type") not in ("sglang", "sglang-router"):
             raise ValueError(f"Unsupported frontend {frontend.get('type')!r}")
 
         model, served_model_name, other_args, server_env = _server_launch(recipe)
-        result_dir = Path(tempfile.mkdtemp(prefix=f"agentx-{CONFIG_KEY}-{POINT}-"))
+        result_dir = Path(tempfile.mkdtemp(prefix=f"agentx-{POINT}-"))
         result_filename = f"agentx_{CONFIG_KEY}_{POINT}"
         worker_url = DEFAULT_URL_FOR_TEST
         server = popen_launch_server(
