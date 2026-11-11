@@ -161,6 +161,53 @@ class TestFusedExperts:
                 activation="relu",
             )
 
+    def test_valid_topk_ids_still_compute(self):
+        m, n, k, e, topk = 2, 32, 32, 4, 2
+        a = torch.randn((m, k), dtype=dtype) / 10
+        w1 = make_bf16_weights(e, 2 * n, k)
+        w2 = make_bf16_weights(e, k, n)
+        topk_weights, topk_ids, score = make_routing(
+            m, e, topk, dtype=dtype, return_score=True
+        )
+        torch_output = torch_naive_fused_moe(a, w1, w2, score, topk, False)
+        packed_w1 = kernel.convert_weight_packed(w1) if prepack else w1
+        packed_w2 = kernel.convert_weight_packed(w2) if prepack else w2
+        fused_output = run_fused_experts(
+            a,
+            packed_w1,
+            packed_w2,
+            topk_weights,
+            topk_ids,
+            quant=CPUQuantMethod.UNQUANT,
+            is_vnni=prepack,
+            inplace=True,
+        )
+
+        atol = rtol = precision[torch_output.dtype]
+        torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
+
+    @pytest.mark.parametrize("bad_id", [-1, 4])
+    def test_out_of_range_topk_ids_is_rejected(self, bad_id):
+        m, n, k, e, topk = 2, 32, 32, 4, 2
+        a = torch.randn((m, k), dtype=dtype) / 10
+        w1 = make_bf16_weights(e, 2 * n, k)
+        w2 = make_bf16_weights(e, k, n)
+        topk_weights, topk_ids = make_routing(m, e, topk, dtype=dtype)
+        topk_ids[0, 0] = bad_id
+        packed_w1 = kernel.convert_weight_packed(w1) if prepack else w1
+        packed_w2 = kernel.convert_weight_packed(w2) if prepack else w2
+
+        with pytest.raises(RuntimeError, match="out of range"):
+            run_fused_experts(
+                a,
+                packed_w1,
+                packed_w2,
+                topk_weights,
+                topk_ids,
+                quant=CPUQuantMethod.UNQUANT,
+                is_vnni=prepack,
+            )
+
     @pytest.mark.parametrize("m", [2, 114])
     @pytest.mark.parametrize("n", [32])
     @pytest.mark.parametrize("k", [32])
