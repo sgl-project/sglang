@@ -472,7 +472,17 @@ def hc_fused_mix(h, weights: HcFusedWeights, sumsq=None):
                 f"got {sumsq.dtype} {list(sumsq.shape)}"
             )
         np_, ss_out = sumsq.shape[1] // _HC, False
-    constexprs = (mb, k, weights.rp, weights.r, weights.ni, _SPLIT_K, np_, ss_out, weights.eps)
+    constexprs = (
+        mb,
+        k,
+        weights.rp,
+        weights.r,
+        weights.ni,
+        _SPLIT_K,
+        np_,
+        ss_out,
+        weights.eps,
+    )
     _dispatch(
         _launch, constexprs,
         h, weights.down, weights.up, weights.w1, p, sumsq, t, g, sc, out, *constexprs,
