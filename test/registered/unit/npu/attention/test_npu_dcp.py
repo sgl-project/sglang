@@ -358,12 +358,21 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
         )
         for mode in ("prefill", "decode", "verify"):
             with self.subTest(mode=mode):
-                metadata = self._metadata()
+                mock_op.reset_mock()
+                metadata = SimpleNamespace(
+                    dcp_block_tables=torch.tensor([[1], [2]], dtype=torch.int32),
+                    dcp_seq_lens=torch.tensor([5, 6], dtype=torch.int32),
+                    dcp_spec_block_tables=torch.tensor([[1], [1]], dtype=torch.int32),
+                    dcp_spec_seq_lens=torch.tensor([7, 8], dtype=torch.int32),
+                )
                 verify = mode == "verify"
-                query_lens = torch.tensor([1, 2], dtype=torch.int32)
+                # Verify starts with one cumulative endpoint for two draft tokens.
+                query_lens = torch.tensor([1, 2] if mode == "decode" else [2])
+                expected_query_lens = torch.tensor(
+                    [2] if mode == "prefill" else [1, 2], dtype=torch.int32
+                )
                 if mode == "prefill":
                     # Two query rows, one request, and one real KV length.
-                    query_lens = torch.tensor([2], dtype=torch.int32)
                     metadata.dcp_block_tables = metadata.dcp_block_tables[:1]
                     metadata.dcp_seq_lens = torch.tensor([128], dtype=torch.int32)
                 out, lse = forward_dcp_sparse_attention(
@@ -376,16 +385,21 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
                     forward_metadata=metadata,
                     forward_batch=SimpleNamespace(forward_mode=_Mode(verify)),
                     speculative_num_draft_tokens=2 if verify else None,
-                    scaling=1.0,
+                    scaling=0.25,
                     fp8_attention=mock_op,
                 )
+                mock_op.assert_called_once()
                 call = mock_op.call_args.kwargs
                 self.assertIs(call["query"], q)
                 self.assertIs(call["query_rope"], rope)
                 self.assertEqual(call["packed_kv"].data_ptr(), packed.data_ptr())
                 self.assertEqual(call["packed_kv"].dtype, torch.uint8)
+                self.assertEqual(call["packed_kv"].shape, packed.shape)
                 self.assertIs(call["sparse_indices"], topk)
-                torch.testing.assert_close(call["actual_seq_lengths_query"], query_lens)
+                self.assertEqual(call["scale_value"], 0.25)
+                torch.testing.assert_close(
+                    call["actual_seq_lengths_query"], expected_query_lens
+                )
                 self.assertIs(
                     call["block_table"],
                     metadata.dcp_spec_block_tables
