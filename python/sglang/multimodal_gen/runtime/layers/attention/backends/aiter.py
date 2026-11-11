@@ -229,6 +229,52 @@ def _fmha_fp8_prefill_attention(
     )
 
 
+# aiter's MHA v4 BF16 kernel: 8-9% faster than flash_attn_func (fmha v3) at
+# MiniMax-H3's MI350X shapes (7-56 heads, 9k-42k rows); both are BF16 flash
+# attention with FP32 accumulation, so this is a same-class kernel swap.
+_mha_v4_packed = None
+if USE_AITER_GFX95:
+    try:
+        from aiter.ops.mha_v4 import AttentionFormat as _MhaV4Format
+        from aiter.ops.mha_v4 import AttentionScaleMode as _MhaV4ScaleMode
+        from aiter.ops.mha_v4 import mha_v4_packed as _mha_v4_packed
+    except ImportError:
+        pass
+
+
+def _mha_v4_bf16(q, k, v, softmax_scale):
+    """BSHD bf16 attention; q/k/v only need a unit-stride head dim."""
+    bf16, none = _MhaV4Format.BF16, _MhaV4ScaleMode.NONE
+    # the descale operands are unused for BF16; aiter takes any tensor there
+    return _mha_v4_packed(
+        q,
+        k,
+        v,
+        q,
+        k,
+        v,
+        bf16,
+        bf16,
+        bf16,
+        none,
+        none,
+        none,
+        softmax_scale=softmax_scale,
+    )
+
+
+def _can_use_mha_v4_bf16(query, key, value, causal: bool, dropout_p: float) -> bool:
+    """[S, H, D] packed rows that MHA v4's BF16 row serves."""
+    return (
+        _mha_v4_packed is not None
+        and not causal
+        and dropout_p == 0.0
+        and query.dtype == key.dtype == value.dtype == torch.bfloat16
+        and query.shape[-1] == key.shape[-1] == value.shape[-1] == 128
+        and query.shape[1] == key.shape[1] == value.shape[1]
+    )
+
+
 @functools.lru_cache(maxsize=64)
 def _cu_seqlens(bounds: tuple[int, ...], device: torch.device) -> torch.Tensor:
     # one upload per bounds and device; callers must not mutate the result
@@ -439,15 +485,23 @@ class AITerImpl(AttentionImpl):
             # its rows the varlen kernel's bytes, reads strided q/k/v, and is
             # 9-14% faster at MiniMax-H3's MI350X shapes. Padding rows are
             # zeroed, as the FA path leaves them; no live row attends to them.
-            live = aiter.flash_attn_func(
-                query[None, :used],
-                key[None, :used],
-                value[None, :used],
-                dropout_p=self.dropout_p,
-                softmax_scale=self.softmax_scale,
-                causal=self.causal,
-                how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
-            )[0]
+            if _can_use_mha_v4_bf16(query, key, value, self.causal, self.dropout_p):
+                live = _mha_v4_bf16(
+                    query[None, :used],
+                    key[None, :used],
+                    value[None, :used],
+                    self.softmax_scale,
+                )[0]
+            else:
+                live = aiter.flash_attn_func(
+                    query[None, :used],
+                    key[None, :used],
+                    value[None, :used],
+                    dropout_p=self.dropout_p,
+                    softmax_scale=self.softmax_scale,
+                    causal=self.causal,
+                    how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
+                )[0]
             if used == query.shape[0]:
                 return live
             output = query.new_empty(query.shape[0], query.shape[1], value.shape[2])

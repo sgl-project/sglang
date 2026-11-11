@@ -92,7 +92,8 @@ if __name__ == "__main__":
 @pytest.mark.parametrize("pad", [0, 24])
 def test_one_live_sequence_matches_the_varlen_kernel(pad):
     """A packed single sequence (plus trailing padding) runs the batch kernel:
-    its live rows get the varlen kernel's bytes and the padding rows are zero."""
+    its live rows get the varlen kernel's bytes (MHA v4's own bytes where that
+    kernel serves the call) and the padding rows are zero."""
     impl = _impl_cls()(
         num_heads=4,
         head_size=HEAD_SIZE,
@@ -112,5 +113,14 @@ def test_one_live_sequence_matches_the_varlen_kernel(pad):
     )
     # without host bounds the call keeps the varlen kernel
     ref = impl.forward_varlen(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=used)
-    assert torch.equal(out[:used], ref[:used])
+    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
+
+    if backend._can_use_mha_v4_bf16(q, k, v, False, 0.0):
+        live = (t[None, :used].contiguous() for t in (q, k, v))
+        expected = backend._mha_v4_bf16(*live, HEAD_SIZE**-0.5)
+        # strided views and contiguous copies give the same bytes
+        assert torch.equal(out[:used], expected[0])
+        torch.testing.assert_close(out[:used], ref[:used], atol=2e-2, rtol=2e-2)
+    else:
+        assert torch.equal(out[:used], ref[:used])
     assert not out[used:].any()
