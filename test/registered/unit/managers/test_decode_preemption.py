@@ -18,6 +18,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
 )
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -243,6 +244,9 @@ class TestPreemptDecodeRelease(CustomTestCase):
         # The point of preempting instead of retracting: the KV is checkpointed
         # into the radix tree, so the request resumes from its own cache; OOM
         # retraction drops the uncached tail.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
         keep = _running("keep", input_len=10, output_len=5)
         victim = _running("victim", input_len=10, output_len=7)
         victim.kv.req_pool_idx = 3  # decoding: holds a KV row
@@ -253,12 +257,18 @@ class TestPreemptDecodeRelease(CustomTestCase):
             hisparse_coordinator=None,
             uocr_runtime=None,
             send_abort_output=Mock(),
+            stream_output=Mock(),
         )
         batch = ScheduleBatch.__new__(ScheduleBatch)
         batch.reqs = [keep, victim]
         batch.filter_batch = Mock()
 
-        with patch.object(request_retirer, "release_kv_cache") as rel:
+        def _release(req, tree_cache, *, checkpoint):
+            req.kv.req_pool_idx = None  # what freeing the row does
+
+        with patch.object(
+            request_retirer, "release_kv_cache", side_effect=_release
+        ) as rel:
             preempted = batch.preempt_decode((1,), retirer)
         rel.assert_called_once_with(victim, tree_cache, checkpoint=True)
         self.assertEqual(preempted, [victim])
@@ -284,7 +294,7 @@ class TestSchedulerPreemptGlue(CustomTestCase):
         sched.new_token_ratio_tracker = SimpleNamespace(current=0.5)
         sched.logical_page_size = PAGE
         sched.decode_offload_manager = None
-        sched.chunked_req = None
+        sched.chunked_reqs = []
         sched.request_retirer = Mock()
         requeued = []
         sched._add_request_to_queue = lambda req, is_retracted=False: requeued.append(
