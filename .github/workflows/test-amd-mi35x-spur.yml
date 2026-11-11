@@ -1,0 +1,120 @@
+name: Test AMD MI35x (Spur)
+
+# AMD CI suites on MI35x nodes scheduled through Spur. The runner submits one
+# single-node job per leg through scripts/ci/slurm/launch_amd_ci_mi35x.sh, which
+# runs the same container steps as the linux-mi35x-gpu-* jobs in
+# pr-test-amd.yml. Cluster settings come from the runner's environment (see the
+# launcher's header).
+#
+# The schedule runs stage-b-test-1-gpu-small-amd-mi35x, whose ARC pool
+# (linux-mi35x-gpu-1) queues for hours, at the same times as pr-test-amd.yml's
+# rocm10 schedule. pr-test-amd.yml keeps its copy while the two are compared.
+on:
+  schedule:
+    - cron: '0 1,13 * * *'  # rocm10, same times as pr-test-amd.yml
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to test. Leave empty for the dispatching ref.'
+        required: false
+        default: ''
+      rocm_version:
+        description: 'ROCm image line'
+        required: false
+        default: 'rocm10'
+        type: choice
+        options: [rocm10, rocm724, rocm720]
+      suite:
+        description: 'Suite to run'
+        required: false
+        default: 'stage-a-test-1-gpu-small-amd'
+        type: choice
+        options: [stage-a-test-1-gpu-small-amd, stage-b-test-1-gpu-small-amd-mi35x, all]
+
+# sbatch exports the launcher's environment to the cluster job, where
+# amd_ci_start_container.sh logs in to Docker Hub (the cluster's anonymous
+# pulls hit the rate limit) and passes HF_TOKEN into the container. HF_TOKEN
+# comes from the runner's .env, not a repo secret; do not set it here, since
+# even an empty value overrides the runner's.
+env:
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+concurrency:
+  # Per event, so a manual run never cancels a scheduled one in progress.
+  group: test-amd-mi35x-spur-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stage-a-test-1-gpu-small-amd-mi35x-spur:
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.suite == 'stage-a-test-1-gpu-small-amd' || inputs.suite == 'all')
+    runs-on: linux-sglang-mi35x-spur
+    timeout-minutes: 120
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Run suite on a cluster node
+        timeout-minutes: 110
+        run: |
+          bash scripts/ci/slurm/launch_amd_ci_mi35x.sh \
+            --suite stage-a-test-1-gpu-small-amd \
+            --gpus 1 \
+            --rocm-version "${{ inputs.rocm_version || 'rocm10' }}"
+
+      - name: Cancel cluster jobs on failure/cancel
+        if: failure() || cancelled()
+        continue-on-error: true
+        run: |
+          # Same prefix launch_amd_ci_mi35x.sh names its jobs with. %200j widens
+          # the name column; Spur's squeue does not accept --me.
+          PREFIX="amd-ci-${RUNNER_NAME}-${GITHUB_RUN_ID}-"
+          JOBS=$(squeue --noheader --format="%i %200j" | grep -F "$PREFIX" | awk '{print $1}' || true)
+          if [ -n "$JOBS" ]; then
+            echo "Cancelling: $JOBS"
+            scancel $JOBS
+          fi
+
+  stage-b-test-1-gpu-small-amd-mi35x-spur:
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      (github.event_name == 'schedule' ||
+       inputs.suite == 'stage-b-test-1-gpu-small-amd-mi35x' || inputs.suite == 'all')
+    runs-on: linux-sglang-mi35x-spur
+    timeout-minutes: 120
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      # Scheduled runs keep going past a failing file so every file reports,
+      # as pr-test-amd.yml's scheduled runs do.
+      - name: Run suite on a cluster node
+        timeout-minutes: 110
+        run: |
+          bash scripts/ci/slurm/launch_amd_ci_mi35x.sh \
+            --suite stage-b-test-1-gpu-small-amd-mi35x \
+            --gpus 1 \
+            --rocm-version "${{ inputs.rocm_version || 'rocm10' }}" \
+            -- ${{ github.event_name == 'schedule' && '--continue-on-error' || '' }}
+
+      - name: Cancel cluster jobs on failure/cancel
+        if: failure() || cancelled()
+        continue-on-error: true
+        run: |
+          # Same prefix launch_amd_ci_mi35x.sh names its jobs with. %200j widens
+          # the name column; Spur's squeue does not accept --me.
+          PREFIX="amd-ci-${RUNNER_NAME}-${GITHUB_RUN_ID}-"
+          JOBS=$(squeue --noheader --format="%i %200j" | grep -F "$PREFIX" | awk '{print $1}' || true)
+          if [ -n "$JOBS" ]; then
+            echo "Cancelling: $JOBS"
+            scancel $JOBS
+          fi

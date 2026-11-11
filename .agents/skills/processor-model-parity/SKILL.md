@@ -13,9 +13,12 @@ the implementation, and SGLang code exists only where the two differ.
 
 Scope: the request -> prompt -> token ids path, plus the checks that let hosts
 serve the model's OpenAI requests through `/generate` (see "OpenAI layer").
-Multimodal preprocessing is not covered here: `render_request` fails on media
+Chat rendering with media is not covered here: `render_request` fails on media
 content parts, so hosts send those chats to the engine. The fixture generator
 serves every checkpoint text-only, so a media case records that rejection.
+
+Image preprocessing (`src/mm/`) has its own skill:
+[`processor-mm-parity`](../processor-mm-parity/SKILL.md).
 
 ## Done means
 
@@ -78,13 +81,12 @@ renders the model:
      It also reads the server's `--tool-call-parser` and whether the tokenizer has
      a chat template. If the deployment depends on the parser, set
      `tool_call_parser` in the fixture, and add it to `ChatFormatterOptions` in the
-     same PR. Note any per-checkpoint state the server resolves once (DeepSeek-V4's
-     effort profile reads `encoding/encoding_dsv4.py`).
+     same PR. Note any per-checkpoint state the server resolves once.
    - That spec's branch in `serving_chat._apply_jinja_template` / `_encode_messages`:
      message dumping, content flattening, `_handle_last_assistant_message`, system
      insertion, tools, model-specific fields, the encoder or `apply_chat_template`
      call, and how the prompt is tokenized.
-   - The encoder itself (for example `encoding_dsv4.py`), line by line. History
+   - The encoder itself (for example deepseek-recipe), line by line. History
      rules live there: dropped turns, `</think>` on empty reasoning, argument
      formatting, and the errors it raises.
 
@@ -145,11 +147,15 @@ renders the model:
   inserted empty system turns. (`task_action`, `task_after_developer`, `consecutive_task`, `mid_system`)
 - **History**: the encoder's rules for earlier turns: reasoning kept or dropped,
   whole turns dropped, closing tags on empty reasoning. (`multi_turn`, `thinking_multi_turn`)
-- **Tokens**: Python's `tokenizer.encode` adds special tokens by default; the
-  continuation prefix is encoded alone and loses a leading BOS
+- **Tokens**: Python encodes the rendered prompt without the tokenizer's own
+  special tokens (`_render_and_encode_chat_template` passes
+  `add_special_tokens=False` to a tokenizer that adds them), and the continuation
+  prefix alone with them, less a leading BOS
   (`_append_assistant_prefix_to_prompt_ids`). `tests/parity.rs` does both, using the
   fixture's `bos_token_id`; `render_prompt` returns the prefix as its own segment so
-  hosts keep that boundary. (`continuation_bos`, `continuation_after_text`)
+  hosts keep that boundary. A template that prints `{{ bos_token }}` itself (StepFun)
+  over a tokenizer that adds BOS (`add_bos_token`) shows the difference.
+  (`continuation_bos`, `continuation_after_text`, StepFun's `continuation_starts_with_bos`)
 - **Errors**: reject what Python rejects. A case Python raises on is recorded with
   `error`, and `tests/parity.rs` then requires `render_request` to fail. That
   includes pydantic rejections and Python crashes (a 500 is still a rejection).
@@ -174,7 +180,15 @@ writes:
   something, so extend it;
 - the fixture-level `config` (the `config.json` fields the processor reads, plus
   resolved overrides such as the effort profile), `bos_token_id`, and for a Jinja
-  checkpoint its `chat_template`, so the test renders offline.
+  checkpoint its `chat_template` and the `special_tokens` its template context
+  carries (`bos_token`, `eos_token`, `unk_token`), so the test renders offline.
+
+The tokenizer is loaded with SGLang's `get_tokenizer`, which restores the
+`tokenizer.json` pipeline a transformers v5 tokenizer class rebuilds
+(`_fix_v5_tokenizer_components`): a bare `AutoTokenizer` can drop newlines
+(StepFun's `LlamaTokenizerFast` declaration). A multimodal engine tokenizes through
+its processor (`hf_transformers/processor.py`), which does not apply that fix, so
+check its tokenizer against `get_tokenizer`'s before trusting the token ids.
 
 ```sh
 cd rust/sglang-processor
@@ -184,7 +198,7 @@ PYTHONPATH=$REPO/python HF_HUB_CACHE=<hub cache> HF_HUB_OFFLINE=1 \
 
 When a new spec needs more, extend `serving_chat()` in the script (one place):
 - **More server state:** set the extra attribute that `__init__` resolves, for
-  example `_dsv41_default_reasoning_effort`.
+  example the chat encoding adapter (`_encoding_adapter`).
 
 A spec that tokenizes inside `apply_chat_template(tokenize=True)` (Kimi K3) is
 recorded by the template's text output. Its `render_request` returns the
@@ -205,8 +219,8 @@ cargo check -p sglang-processor --no-default-features --features render,tokenize
 The token check loads the pinned commit's snapshot from the cache. When the
 snapshot is missing, the test prints `token ids not checked` (visible with
 `-- --nocapture`), so confirm that line is absent before claiming token parity.
-With the snapshot cached, the test also checks that the checkpoint resolves the
-fixture's recorded DeepSeek-V4 profile.
+A formatter that encodes its own prompts (DeepSeek-V4 and V4.1, through
+`encode_request`) is checked with the checkpoint's own tokenizer.
 
 ## OpenAI layer
 
@@ -220,6 +234,9 @@ OpenAI layer:
   `tests/scripts/generate_tool_parity.py`: SGLang's `FunctionCallParser` on
   chunked outputs, replayed by the test in `src/tool_call/models/mod.rs`. A tool
   parser is served once `src/tool_call/models/` ports it.
+- DeepSeek-V4 and V4.1 have neither: deepseek-recipe parses their output ids
+  (`src/deepseek_output.rs`), as `serving_deepseek_recipe.py` does, and the
+  openai fixture checks it.
 - `tests/fixtures/openai_parity/<model-id>.json`, from
   `tests/scripts/generate_openai_parity.py --model <dir> --engine-url <engine>`:
   the `/generate` body `OpenAIServingChat` builds for each case, a live engine's
