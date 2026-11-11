@@ -135,9 +135,7 @@ def test_predictor_query_time_in_token_latencies(
             predict_infer_time=predict,
         ),
     )
-    req = SimpleNamespace(
-        rid="r1", extend_input_len=4, prefix_indices=[], output_ids=[]
-    )
+    req = SimpleNamespace(rid="r1", extend_input_len=4, prefix_len=0, output_ids=[])
     batch = SimpleNamespace(
         reqs=[req],
         forward_mode=SimpleNamespace(
@@ -239,9 +237,7 @@ def _run_one_offline_iteration(monkeypatch, predictor_delay, predicted_latency=0
         hook, "INFERENCE_PREDICTOR", SimpleNamespace(predict_infer_time=predict)
     )
 
-    req = SimpleNamespace(
-        rid="r1", extend_input_len=4, prefix_indices=[], output_ids=[]
-    )
+    req = SimpleNamespace(rid="r1", extend_input_len=4, prefix_len=0, output_ids=[])
     batch = SimpleNamespace(
         reqs=[req],
         forward_mode=SimpleNamespace(
