@@ -124,7 +124,6 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "allowed_media_domains",
     # The Rust media fetcher caps a download at this field's default, 64 MiB.
     "media_url_max_file_size_mb",
-    "enable_cache_report",
     "enable_trace",
     "warmups",
     "completion_template",
@@ -270,26 +269,18 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
                 "PP + speculative decoding (MTP) is only supported on prefill nodes "
                 "(disaggregation-mode=prefill)"
             )
+    # Stage 0 relays its received requests to the next stage every
+    # iteration, but later stages only receive on the iterations the recv
+    # skipper lets through, so the stages fall out of step.
+    assert cfg.scheduler_recv_interval <= 1, (
+        "--scheduler-recv-interval > 1 is not supported with pipeline "
+        "parallelism; use --scheduler-recv-interval 1"
+    )
     assert cfg.min_free_slots_delay is None, (
         "--min-free-slots-delay is not supported with pipeline "
         "parallelism: allocatable slots per microbatch are bounded by "
         "pp-max-micro-batch-size, so the threshold may never be reached"
     )
-
-
-def check_rust_server_request_logging(cfg: Any) -> None:
-    """The Rust server logs requests as text to stdout only."""
-    if cfg.log_requests_format != "text":
-        raise ValueError(
-            f"--log-requests-format {cfg.log_requests_format} is not supported "
-            "with SGLANG_RUST_SERVER; it logs requests in the text format"
-        )
-    # `stdout` is the default target, matched as `create_log_targets` does.
-    if any(target.lower() != "stdout" for target in cfg.log_requests_target or ()):
-        raise ValueError(
-            f"--log-requests-target {' '.join(cfg.log_requests_target)} is not "
-            "supported with SGLANG_RUST_SERVER; it logs requests to stdout"
-        )
 
 
 def check_server_args(server_args: Any):
@@ -318,9 +309,6 @@ def check_server_args(server_args: Any):
 
     if cfg.pp_size > 1:
         check_pipeline_parallel_compat(cfg)
-
-    if envs.SGLANG_RUST_SERVER.get() and cfg.log_requests:
-        check_rust_server_request_logging(cfg)
 
     assert not (cfg.dp_size > 1 and cfg.nnodes != 1), (
         "multi-node data-parallel replicas are not supported; use attention DP "
@@ -402,6 +390,13 @@ def check_server_args(server_args: Any):
         ], (
             f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{cfg.schedule_policy}' is not supported."
         )
+        if cfg.enable_unified_memory and not cfg.disable_priority_preemption:
+            logger.warning(
+                "--enable-unified-memory turns priority preemption off: a "
+                "higher-priority request is admitted first but does not retract "
+                "running requests. Pass --disable-priority-preemption to silence "
+                "this warning."
+            )
         if cfg.default_priority_value is None:
             logger.warning(
                 "--default-priority-value is not set while --enable-priority-scheduling is enabled. "

@@ -56,6 +56,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    PD_KINDS,
+    ListKind,
+    assert_empty,
+)
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
@@ -466,7 +471,7 @@ class SchedulerWeightUpdaterManager:
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         scheduler = self.scheduler
         if not self.is_fully_idle(
-            ignore_waiting=scheduler is not None and scheduler._engine_paused
+            ignore_waiting=scheduler is not None and scheduler.pause_state.paused
         ):
             return ReleaseMemoryOccupationReqOutput(
                 success=False,
@@ -485,14 +490,12 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
+                # Held requests keep no KV and wait out the release.
+                assert_empty(scheduler.request_lists(), PD_KINDS - {ListKind.PD_HELD})
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                    for queue_name in (
-                        "disagg_decode_transfer_queue",
-                        "disagg_decode_prealloc_queue",
-                    ):
-                        queue = getattr(scheduler, queue_name, None)
-                        if queue is not None:
-                            queue.release_memory_occupation()
+                    queue = getattr(scheduler, "disagg_decode_prealloc_queue", None)
+                    if queue is not None:
+                        queue.release_memory_occupation()
                 elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
@@ -543,13 +546,9 @@ class SchedulerWeightUpdaterManager:
             scheduler = self.scheduler
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                    for queue_name in (
-                        "disagg_decode_transfer_queue",
-                        "disagg_decode_prealloc_queue",
-                    ):
-                        queue = getattr(scheduler, queue_name, None)
-                        if queue is not None:
-                            queue.resume_memory_occupation()
+                    queue = getattr(scheduler, "disagg_decode_prealloc_queue", None)
+                    if queue is not None:
+                        queue.resume_memory_occupation()
                 elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
