@@ -349,6 +349,57 @@ pub struct UpdateWeightVersionResponse {
     #[prost(string, optional, tag = "3")]
     pub new_version: ::core::option::Option<::prost::alloc::string::String>,
 }
+/// `/add_external_corpus`: exactly one of `file_path` (a JSONL file of strings
+/// on the server) or `documents`; `token_chunks` is for pre-tokenized input.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AddExternalCorpusRequest {
+    /// Minted when absent.
+    #[prost(string, optional, tag = "1")]
+    pub corpus_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub file_path: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "3")]
+    pub documents: ::core::option::Option<StringList>,
+    #[prost(message, optional, tag = "4")]
+    pub token_chunks: ::core::option::Option<TokenIdsList>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AddExternalCorpusResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub corpus_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub loaded_token_count: i64,
+}
+/// `/remove_external_corpus`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoveExternalCorpusRequest {
+    #[prost(string, optional, tag = "1")]
+    pub corpus_id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoveExternalCorpusResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
+/// `/list_external_corpora`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListExternalCorporaRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListExternalCorporaResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    /// Corpus id to its token count; every rank loads the same set.
+    #[prost(map = "string, int64", tag = "2")]
+    pub corpus_token_counts: ::std::collections::HashMap<::prost::alloc::string::String, i64>,
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+}
 /// Python's `matched` key, `Union\[str, int, List[int]\]`: the three wire shapes
 /// are disjoint, so shape alone picks the arm (untagged).
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

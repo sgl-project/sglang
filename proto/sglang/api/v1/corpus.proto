@@ -1,0 +1,45 @@
+// External n-gram corpus management for NGRAM speculative decoding: the
+// frontend tokenizes the documents, every DP rank loads the same chunks.
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/api/v1/common.proto";
+import "sglang/json/v1/options.proto";
+
+// `/add_external_corpus`: exactly one of `file_path` (a JSONL file of strings
+// on the server) or `documents`; `token_chunks` is for pre-tokenized input.
+message AddExternalCorpusRequest {
+  // Minted when absent.
+  optional string corpus_id = 1;
+  optional string file_path = 2;
+  optional StringList documents = 3;
+  optional TokenIdsList token_chunks = 4;
+}
+
+message AddExternalCorpusResponse {
+  bool success = 1;
+  string corpus_id = 2;
+  string message = 3;
+  int64 loaded_token_count = 4;
+}
+
+// `/remove_external_corpus`.
+message RemoveExternalCorpusRequest {
+  optional string corpus_id = 1;
+}
+
+message RemoveExternalCorpusResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// `/list_external_corpora`.
+message ListExternalCorporaRequest {}
+
+message ListExternalCorporaResponse {
+  bool success = 1;
+  // Corpus id to its token count; every rank loads the same set.
+  map<string, int64> corpus_token_counts = 2;
+  string message = 3;
+}

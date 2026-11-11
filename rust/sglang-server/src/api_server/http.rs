@@ -1,5 +1,6 @@
 pub(crate) mod app;
 mod auth;
+mod corpus;
 mod dp_relay;
 pub(crate) mod generate_hook;
 mod hicache;

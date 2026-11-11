@@ -436,6 +436,103 @@ class UpdateWeightVersionResponse(msgspec.Struct, kw_only=True, frozen=True):
         return encode_UpdateWeightVersionResponse(self)
 
 
+class AddExternalCorpusRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AddExternalCorpusRequest: JSON object (unknown keys ignored)."""
+
+    corpus_id: Optional[str] = None
+    file_path: Optional[str] = None
+    documents: Optional[StringList] = None
+    token_chunks: Optional[TokenIdsList] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AddExternalCorpusRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AddExternalCorpusRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AddExternalCorpusRequest(self)
+
+
+class AddExternalCorpusResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AddExternalCorpusResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    corpus_id: str = ""
+    message: str = ""
+    loaded_token_count: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AddExternalCorpusResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AddExternalCorpusResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AddExternalCorpusResponse(self)
+
+
+class RemoveExternalCorpusRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.RemoveExternalCorpusRequest: JSON object (unknown keys ignored)."""
+
+    corpus_id: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "RemoveExternalCorpusRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_RemoveExternalCorpusRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_RemoveExternalCorpusRequest(self)
+
+
+class RemoveExternalCorpusResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.RemoveExternalCorpusResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    message: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "RemoveExternalCorpusResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_RemoveExternalCorpusResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_RemoveExternalCorpusResponse(self)
+
+
+class ListExternalCorporaRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ListExternalCorporaRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ListExternalCorporaRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ListExternalCorporaRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ListExternalCorporaRequest(self)
+
+
+class ListExternalCorporaResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ListExternalCorporaResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+    corpus_token_counts: Dict[str, int] = {}
+    message: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ListExternalCorporaResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ListExternalCorporaResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ListExternalCorporaResponse(self)
+
+
 class FinishStop(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.FinishStop: JSON object (unknown keys ignored)."""
 
@@ -2387,6 +2484,124 @@ def encode_UpdateWeightVersionResponse(v: UpdateWeightVersionResponse) -> Dict[s
     d["message"] = v.message
     if v.new_version is not None:
         d["new_version"] = v.new_version
+    return d
+
+
+def decode_AddExternalCorpusRequest(value: Any) -> AddExternalCorpusRequest:
+    m = _expect_map(value, expected="struct AddExternalCorpusRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "corpus_id":
+            kw["corpus_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "file_path":
+            kw["file_path"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "documents":
+            kw["documents"] = None if x is None else decode_StringList(x)
+        elif key == "token_chunks":
+            kw["token_chunks"] = None if x is None else decode_TokenIdsList(x)
+    return AddExternalCorpusRequest(**kw)
+
+
+def encode_AddExternalCorpusRequest(v: AddExternalCorpusRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.corpus_id is not None:
+        d["corpus_id"] = v.corpus_id
+    if v.file_path is not None:
+        d["file_path"] = v.file_path
+    if v.documents is not None:
+        d["documents"] = encode_StringList(v.documents)
+    if v.token_chunks is not None:
+        d["token_chunks"] = encode_TokenIdsList(v.token_chunks)
+    return d
+
+
+def decode_AddExternalCorpusResponse(value: Any) -> AddExternalCorpusResponse:
+    m = _expect_map(value, expected="struct AddExternalCorpusResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "corpus_id":
+            kw["corpus_id"] = _expect_str(x, expected="a string")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+        elif key == "loaded_token_count":
+            kw["loaded_token_count"] = _expect_int(x, expected="i64")
+    return AddExternalCorpusResponse(**kw)
+
+
+def encode_AddExternalCorpusResponse(v: AddExternalCorpusResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["corpus_id"] = v.corpus_id
+    d["message"] = v.message
+    d["loaded_token_count"] = v.loaded_token_count
+    return d
+
+
+def decode_RemoveExternalCorpusRequest(value: Any) -> RemoveExternalCorpusRequest:
+    m = _expect_map(value, expected="struct RemoveExternalCorpusRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "corpus_id":
+            kw["corpus_id"] = None if x is None else _expect_str(x, expected="a string")
+    return RemoveExternalCorpusRequest(**kw)
+
+
+def encode_RemoveExternalCorpusRequest(v: RemoveExternalCorpusRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.corpus_id is not None:
+        d["corpus_id"] = v.corpus_id
+    return d
+
+
+def decode_RemoveExternalCorpusResponse(value: Any) -> RemoveExternalCorpusResponse:
+    m = _expect_map(value, expected="struct RemoveExternalCorpusResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+    return RemoveExternalCorpusResponse(**kw)
+
+
+def encode_RemoveExternalCorpusResponse(v: RemoveExternalCorpusResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    d["message"] = v.message
+    return d
+
+
+def decode_ListExternalCorporaRequest(value: Any) -> ListExternalCorporaRequest:
+    m = _expect_map(value, expected="struct ListExternalCorporaRequest")
+    return ListExternalCorporaRequest()
+
+
+def encode_ListExternalCorporaRequest(v: ListExternalCorporaRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_ListExternalCorporaResponse(value: Any) -> ListExternalCorporaResponse:
+    m = _expect_map(value, expected="struct ListExternalCorporaResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+        elif key == "corpus_token_counts":
+            kw["corpus_token_counts"] = {} if x is None else {k: _expect_int(e, expected="i64") for k, e in _expect_map(x, expected="a map").items()}
+        elif key == "message":
+            kw["message"] = _expect_str(x, expected="a string")
+    return ListExternalCorporaResponse(**kw)
+
+
+def encode_ListExternalCorporaResponse(v: ListExternalCorporaResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    if v.corpus_token_counts:
+        d["corpus_token_counts"] = dict(v.corpus_token_counts)
+    d["message"] = v.message
     return d
 
 

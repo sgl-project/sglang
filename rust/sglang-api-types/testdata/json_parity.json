@@ -761,6 +761,34 @@
       "canonical": "{\"normal_text\":\"\",\"calls\":[{\"tool_index\":-1,\"name\":null,\"parameters\":\"{}\"}]}"
     },
     {
+      "type": "AddExternalCorpusRequest",
+      "name": "pre-tokenized chunks are a bare list of bare lists",
+      "input": {
+        "corpus_id": "c",
+        "token_chunks": [
+          [
+            1,
+            2
+          ],
+          [
+            3
+          ]
+        ]
+      },
+      "canonical": "{\"corpus_id\":\"c\",\"token_chunks\":[[1,2],[3]]}"
+    },
+    {
+      "type": "ListExternalCorporaResponse",
+      "name": "counts are a plain string-keyed object",
+      "input": {
+        "success": true,
+        "corpus_token_counts": {
+          "c": 3
+        }
+      },
+      "canonical": "{\"success\":true,\"corpus_token_counts\":{\"c\":3},\"message\":\"\"}"
+    },
+    {
       "type": "PauseGenerationRequest",
       "name": "mode defaults to abort as in Python",
       "input": {},

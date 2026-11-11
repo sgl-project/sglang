@@ -13,7 +13,7 @@ use tonic::{Request, Response, Status};
 use super::{info, native_api};
 use crate::api_server::core::{HealthStatus, ReceivedAs};
 use crate::api_server::handlers::{
-    AbortEnding, CoreHandle, HiCacheError, HiCacheManager, LORA_DISABLED, ToolSpec,
+    AbortEnding, CoreHandle, CorpusSource, HiCacheError, HiCacheManager, LORA_DISABLED, ToolSpec,
     WeightGroupOutcome, WeightUpdateOutcome, parse_function_call, separate_reasoning,
 };
 use crate::api_server::http::weights::{decode_payloads, json_object};
@@ -501,6 +501,56 @@ impl SglangService for GrpcService {
             }),
             reasoning_text,
             text,
+        }))
+    }
+
+    async fn add_external_corpus(
+        &self,
+        request: Request<api::AddExternalCorpusRequest>,
+    ) -> Result<Response<api::AddExternalCorpusResponse>, Status> {
+        let request = request.into_inner();
+        let outcome = self
+            .core
+            .add_external_corpus(CorpusSource {
+                corpus_id: request.corpus_id,
+                file_path: request.file_path,
+                documents: request.documents.map(|list| list.items),
+                token_chunks: request
+                    .token_chunks
+                    .map(|list| list.items.into_iter().map(|ids| ids.ids).collect()),
+            })
+            .await;
+        Ok(Response::new(api::AddExternalCorpusResponse {
+            success: outcome.success,
+            corpus_id: outcome.corpus_id,
+            message: outcome.message,
+            loaded_token_count: outcome.loaded_token_count,
+        }))
+    }
+
+    async fn remove_external_corpus(
+        &self,
+        request: Request<api::RemoveExternalCorpusRequest>,
+    ) -> Result<Response<api::RemoveExternalCorpusResponse>, Status> {
+        let Some(corpus_id) = request.into_inner().corpus_id.filter(|id| !id.is_empty()) else {
+            return Err(Status::invalid_argument("corpus_id is required."));
+        };
+        let outcome = self.core.remove_external_corpus(corpus_id).await;
+        Ok(Response::new(api::RemoveExternalCorpusResponse {
+            success: outcome.success,
+            message: outcome.message,
+        }))
+    }
+
+    async fn list_external_corpora(
+        &self,
+        _request: Request<api::ListExternalCorporaRequest>,
+    ) -> Result<Response<api::ListExternalCorporaResponse>, Status> {
+        let listing = self.core.list_external_corpora().await;
+        Ok(Response::new(api::ListExternalCorporaResponse {
+            success: listing.success,
+            corpus_token_counts: listing.corpus_token_counts.into_iter().collect(),
+            message: listing.message,
         }))
     }
 
