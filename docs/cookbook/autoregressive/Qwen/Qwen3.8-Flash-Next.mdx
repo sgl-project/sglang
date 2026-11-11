@@ -315,7 +315,7 @@ Carried over from Qwen3-Next and refined through the Qwen3.5–Qwen3.8 series: a
 
 **Context length:** 262,144 native, extensible to 1,000,000 tokens with YaRN. **License:** see [the model card's LICENSE](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE).
 
-**Recommended generation:** Qwen has not published sampling recommendations for this preview. SGLang applies the checkpoint's own `generation_config.json`, so leave `temperature` / `top_p` unset unless you have a measured reason not to.
+**Recommended generation:** Qwen publishes a preset per mode. For thinking mode use `temperature=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0.0`, `presence_penalty=0.0`, `repetition_penalty=1.0`; for instruct (non-thinking) mode use `temperature=0.7`, `top_p=0.80`, `top_k=20`, `min_p=0.0`, `presence_penalty=1.5`, `repetition_penalty=1.0`. The checkpoint's `generation_config.json` already ships the thinking preset (`temperature=1.0`, `top_k=20`, `top_p=0.95`), so leaving `temperature` / `top_p` unset is right for thinking mode — but it does not match the instruct preset, so set those values explicitly when you run with `enable_thinking: false`.
 
 Each precision is its own repository:
 
@@ -366,9 +366,9 @@ The `model` argument in the examples below is the BF16 repo id. Every precision 
 
 ### 2.1 Reasoning
 
-Qwen3.8-Flash-Next **always** reasons — thinking cannot be turned off. `--reasoning-parser auto` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) lets SGLang pick the matching parser from the checkpoint's chat template, and splits the thinking into `reasoning_content`, leaving `content` as the answer alone. The resolved name is logged at startup if you want to pin it explicitly later.
+Qwen3.8-Flash-Next **thinks by default**, but thinking can be turned off: set `"chat_template_kwargs": {"enable_thinking": false}` per request, or `--default-chat-template-kwargs '{"enable_thinking": false}'` server-wide. The template then pre-fills an empty `<think></think>` block, so generation starts directly at the answer.
 
-Depth is requested with `reasoning_effort`. Qwen documents `xhigh` (the default), `medium` and `low` for the hosted model; SGLang forwards whatever you pass into the checkpoint's chat template.
+`--reasoning-parser auto` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) picks the matching parser from the chat template and splits the thinking into `reasoning_content`. Depth is requested with `reasoning_effort`: `xhigh` (the default), `medium`, or `low` — other values are rejected, and it has no effect while thinking is disabled. Thinking blocks are preserved by default (`preserve_thinking: true`); set `"chat_template_kwargs": {"preserve_thinking": false}` to keep only the latest turn's.
 
 <Accordion title="Reasoning Example (Python)">
 
@@ -391,7 +391,8 @@ print("Answer:", msg.content)
 <Accordion title="Example Output">
 
 ```text Output
-Pending update — a sample transcript will be added here once the weights are public.
+Reasoning: We need answer simple arithmetic. Need compute 15% of 240. 0.15*240 = 36. Could show brief. Final concise.
+Answer: 15% of 240 is **36**.
 ```
 
 </Accordion>
@@ -400,7 +401,7 @@ Pending update — a sample transcript will be added here once the weights are p
 
 Add `--tool-call-parser auto` (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`. As with the reasoning parser, SGLang resolves the concrete detector from the chat template at startup. No Deploy cell sets it, so this is an opt-in: add the flag to the generated command, or flip the chip in the Playground.
 
-Because this model always thinks, the final assistant turn can put text in `reasoning_content` rather than `content` — print both so a bare `None` doesn't mislead you.
+With thinking on (the default), a generation that stops inside the reasoning block — for example at the `max_tokens` cap — leaves `content` empty and puts the partial reasoning in `reasoning_content`; with `enable_thinking: false` the answer lands in `content` directly. Print both so a bare `None` doesn't mislead you.
 
 <Accordion title="Tool Calling Example (Python)">
 
@@ -434,8 +435,11 @@ resp = client.chat.completions.create(
 )
 msg = resp.choices[0].message
 print("Reasoning:", getattr(msg, "reasoning_content", None))
-print("Content:", msg.content)
-print("Tool calls:", msg.tool_calls)
+print("Content:", repr(msg.content))
+print("Tool calls:", [
+    (tc.function.name, tc.function.arguments)
+    for tc in (msg.tool_calls or [])
+])
 ```
 
 </Accordion>
@@ -443,7 +447,9 @@ print("Tool calls:", msg.tool_calls)
 <Accordion title="Example Output">
 
 ```text Output
-Pending update — a sample transcript will be added here once the weights are public.
+Reasoning: The user wants to know the weather in Beijing. I have a tool to get the weather.
+Content: ''
+Tool calls: [('get_weather', '{"location": "Beijing"}')]
 ```
 
 </Accordion>
