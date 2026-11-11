@@ -72,6 +72,11 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         super().__init__(model_runner, record_nolora_graph=forward_width > 1, **kwargs)
 
     def capture_prepare(self, size, num_tokens=None):
+        if str(self.model_runner.device).startswith("npu"):
+            # Ascend aliases seq_lens while deriving final KV lengths. Each
+            # bucket and LoRA variant must start from dummy prefix lengths.
+            self.buffers.seq_lens.fill_(self.seq_len_fill_value)
+            self.buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
         forward_batch, attn_backend, pp_proxy_tensors = super().capture_prepare(
             size, num_tokens=num_tokens
         )

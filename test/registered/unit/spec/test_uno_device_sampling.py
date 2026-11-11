@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.speculative.uno_cuda_graph_runner import UnoDecodeCudaGraphRunner
 from sglang.srt.speculative.uno_utils import (
     _dense_rejection_torch,
     _sparse_rejection_from_support,
@@ -20,6 +21,30 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestUnoDeviceSampling(CustomTestCase):
+    def test_npu_capture_resets_prefix_for_each_variant_and_bucket(self):
+        runner = UnoDecodeCudaGraphRunner.__new__(UnoDecodeCudaGraphRunner)
+        runner.model_runner = SimpleNamespace(device="npu")
+        runner.seq_len_fill_value = 0
+        runner.buffers = SimpleNamespace(
+            seq_lens=torch.full((64,), 8, dtype=torch.int32),
+            seq_lens_cpu=torch.full((64,), 8, dtype=torch.int32),
+        )
+
+        def prepare(size, num_tokens=None):
+            self.assertEqual(torch.count_nonzero(runner.buffers.seq_lens).item(), 0)
+            self.assertEqual(torch.count_nonzero(runner.buffers.seq_lens_cpu).item(), 0)
+            runner.buffers.seq_lens[:size].add_(8)
+            return SimpleNamespace(lora_ids=["synthetic"]), None, None
+
+        with patch.object(
+            UnoDecodeCudaGraphRunner.__bases__[0],
+            "capture_prepare",
+            side_effect=prepare,
+        ):
+            for bs in (64, 64, 1, 1):
+                batch, _, _ = runner.capture_prepare(bs, num_tokens=bs * 8)
+                self.assertIsNone(batch.lora_ids)
+
     def test_torch_topk_fallback_matches_reference(self):
         logits = torch.tensor([[0.1, 0.9, -0.2, 0.4]], dtype=torch.float32)
         expected_values, expected_indices = torch.topk(logits, k=3, dim=-1)
