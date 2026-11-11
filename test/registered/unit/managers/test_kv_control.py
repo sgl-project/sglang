@@ -587,7 +587,8 @@ class TestPublicKVProtocol(CustomTestCase):
         payload = movement()
         payload["target"] = {"kind": "session", "namespace": "ns", "session_id": "live"}
         result = submit(control, action("prefetch", payload)).results[0]
-        self.assertEqual(result.status, Status.UNSUPPORTED)
+        self.assertEqual(result.status, Status.REJECTED)
+        self.assertEqual(result.update.code, "invalid_payload")
         legacy = submit(
             control, action("copy_to", movement()), message_id="legacy"
         ).results[0]

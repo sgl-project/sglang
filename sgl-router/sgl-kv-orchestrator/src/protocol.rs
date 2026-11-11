@@ -43,7 +43,7 @@ pub struct Location {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Transfer {
-    // Validated union retains all legacy Content/Tokens/Session selectors.
+    // The Engine accepts concrete prefixes; the Router resolves session selectors.
     pub target: Value,
     pub source: Location,
     pub destination: Location,
@@ -207,55 +207,6 @@ fn validate_target(target: &Value) -> Result<(), Error> {
                 return Err(Error::InvalidPayload);
             }
             previous.insert(b.component, b.end_token);
-        }
-    } else if target["kind"] == "content" {
-        let components = target["components"]
-            .as_array()
-            .ok_or(Error::InvalidPayload)?;
-        if position(target, "token_count", 0) == 0
-            || components
-                .iter()
-                .map(Value::to_string)
-                .collect::<HashSet<_>>()
-                .len()
-                != components.len()
-        {
-            return Err(Error::InvalidPayload);
-        }
-        let spans = target["spans"].as_array().ok_or(Error::InvalidPayload)?;
-        let mut by_component: HashMap<String, Vec<&Value>> = HashMap::new();
-        for span in spans {
-            let start = position(span, "start_token", 0);
-            let end = position(span, "end_token", 0);
-            let kind = span["coverage_kind"].as_str().unwrap_or("tokens");
-            if position(span, "dependency_start", 0) > start
-                || start > end
-                || end == 0
-                || end > position(target, "token_count", 0)
-                || (kind == "checkpoint") != (start == end)
-                || (kind == "window" && position(span, "window_size", 0) == 0)
-                || (kind != "window" && !span["window_size"].is_null())
-                || !components.contains(&span["component"])
-            {
-                return Err(Error::InvalidPayload);
-            }
-            by_component
-                .entry(span["component"].to_string())
-                .or_default()
-                .push(span);
-        }
-        for spans in by_component.values_mut() {
-            spans.sort_by_key(|s| position(s, "start_token", 0));
-            for pair in spans.windows(2) {
-                if position(pair[0], "end_token", 0) > position(pair[1], "start_token", 0)
-                    || pair[0]["start_token"] == pair[1]["start_token"]
-                    || pair[0]["coverage_kind"].as_str().unwrap_or("tokens")
-                        != pair[1]["coverage_kind"].as_str().unwrap_or("tokens")
-                    || pair[0]["window_size"] != pair[1]["window_size"]
-                {
-                    return Err(Error::InvalidPayload);
-                }
-            }
         }
     }
     Ok(())

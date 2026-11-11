@@ -14,13 +14,7 @@
             {
               "anyOf": [
                 {
-                  "$ref": "#/$defs/ContentTarget"
-                },
-                {
                   "$ref": "#/$defs/TokensTarget"
-                },
-                {
-                  "$ref": "#/$defs/SessionTarget"
                 },
                 {
                   "$ref": "#/$defs/PrefixTarget"
@@ -29,9 +23,7 @@
               "discriminator": {
                 "propertyName": "kind",
                 "mapping": {
-                  "content": "#/$defs/ContentTarget",
                   "tokens": "#/$defs/TokensTarget",
-                  "session": "#/$defs/SessionTarget",
                   "prefix": "#/$defs/PrefixTarget"
                 }
               }
@@ -66,179 +58,6 @@
         "target",
         "source",
         "destination"
-      ],
-      "additionalProperties": false
-    },
-    "ContentTarget": {
-      "title": "ContentTarget",
-      "type": "object",
-      "properties": {
-        "kind": {
-          "enum": [
-            "content"
-          ]
-        },
-        "cache_salt": {
-          "anyOf": [
-            {
-              "type": "string",
-              "maxLength": 256,
-              "minLength": 1
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "extra_key": {
-          "anyOf": [
-            {
-              "type": "string",
-              "maxLength": 256,
-              "minLength": 1
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "layout_id": {
-          "anyOf": [
-            {
-              "type": "string",
-              "maxLength": 256,
-              "minLength": 1
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "is_multimodal": {
-          "type": "boolean",
-          "default": false
-        },
-        "namespace": {
-          "type": "string",
-          "maxLength": 256,
-          "minLength": 1
-        },
-        "token_count": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991
-        },
-        "components": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "maxLength": 256,
-            "minLength": 1
-          },
-          "maxItems": 64,
-          "minItems": 1
-        },
-        "spans": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ContentSpan"
-          },
-          "maxItems": 4096
-        },
-        "start_token": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991,
-          "default": 0
-        },
-        "end_token": {
-          "anyOf": [
-            {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 9007199254740991
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "allow_clip": {
-          "type": "boolean",
-          "default": false
-        }
-      },
-      "required": [
-        "kind",
-        "namespace",
-        "token_count",
-        "components",
-        "spans"
-      ],
-      "additionalProperties": false
-    },
-    "ContentSpan": {
-      "title": "ContentSpan",
-      "description": "One indivisible logical descriptor, never an allocator address.\n\n    component identifies a FULL/SWA/Mamba component in the namespace's layout.\n    dependency_start describes earlier state required to reuse this descriptor;\n    it does not assert that such state is known or resident.",
-      "type": "object",
-      "properties": {
-        "content_id": {
-          "type": "string",
-          "maxLength": 256,
-          "minLength": 1
-        },
-        "component": {
-          "type": "string",
-          "maxLength": 256,
-          "minLength": 1
-        },
-        "start_token": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991
-        },
-        "end_token": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991
-        },
-        "dependency_start": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991,
-          "default": 0
-        },
-        "coverage_kind": {
-          "enum": [
-            "checkpoint",
-            "tokens",
-            "window"
-          ],
-          "default": "tokens"
-        },
-        "window_size": {
-          "anyOf": [
-            {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 9007199254740991
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        }
-      },
-      "required": [
-        "content_id",
-        "component",
-        "start_token",
-        "end_token"
       ],
       "additionalProperties": false
     },
@@ -337,82 +156,6 @@
         "kind",
         "namespace",
         "token_ids"
-      ],
-      "additionalProperties": false
-    },
-    "SessionTarget": {
-      "title": "SessionTarget",
-      "type": "object",
-      "properties": {
-        "kind": {
-          "enum": [
-            "session"
-          ]
-        },
-        "namespace": {
-          "type": "string",
-          "maxLength": 256,
-          "minLength": 1
-        },
-        "session_id": {
-          "type": "string",
-          "maxLength": 256,
-          "minLength": 1
-        },
-        "continuation_id": {
-          "anyOf": [
-            {
-              "type": "string",
-              "maxLength": 256,
-              "minLength": 1
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "expected_revision": {
-          "anyOf": [
-            {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 9007199254740991
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "start_token": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991,
-          "default": 0
-        },
-        "end_token": {
-          "anyOf": [
-            {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 9007199254740991
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "allow_clip": {
-          "type": "boolean",
-          "default": false
-        }
-      },
-      "required": [
-        "kind",
-        "namespace",
-        "session_id"
       ],
       "additionalProperties": false
     },
@@ -645,13 +388,7 @@
             {
               "anyOf": [
                 {
-                  "$ref": "#/$defs/ContentTarget"
-                },
-                {
                   "$ref": "#/$defs/TokensTarget"
-                },
-                {
-                  "$ref": "#/$defs/SessionTarget"
                 },
                 {
                   "$ref": "#/$defs/PrefixTarget"
@@ -660,9 +397,7 @@
               "discriminator": {
                 "propertyName": "kind",
                 "mapping": {
-                  "content": "#/$defs/ContentTarget",
                   "tokens": "#/$defs/TokensTarget",
-                  "session": "#/$defs/SessionTarget",
                   "prefix": "#/$defs/PrefixTarget"
                 }
               }

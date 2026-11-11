@@ -107,18 +107,6 @@ def cache_compatibility(target) -> CacheCompatibility:
     )
 
 
-class ContentTarget(CacheCompatibility, tag="content", tag_field="kind", kw_only=True):
-    namespace: Identifier
-    token_count: Position
-    components: Annotated[
-        tuple[Identifier, ...], msgspec.Meta(min_length=1, max_length=64)
-    ]
-    spans: Annotated[tuple[ContentSpan, ...], msgspec.Meta(max_length=4096)]
-    start_token: Position = 0
-    end_token: Position | None = None
-    allow_clip: bool = False
-
-
 class TokensTarget(CacheCompatibility, tag="tokens", tag_field="kind", kw_only=True):
     namespace: Identifier
     token_ids: Annotated[
@@ -129,18 +117,7 @@ class TokensTarget(CacheCompatibility, tag="tokens", tag_field="kind", kw_only=T
     allow_clip: bool = False
 
 
-class SessionTarget(Value, tag="session", tag_field="kind"):
-    namespace: Identifier
-    session_id: Identifier
-    continuation_id: Identifier | None = None
-    expected_revision: Position | None = None
-    start_token: Position = 0
-    end_token: Position | None = None
-    allow_clip: bool = False
-
-
-LogicalTarget: TypeAlias = ContentTarget | TokensTarget | SessionTarget
-Target: TypeAlias = LogicalTarget | Literal["request_cached"]
+Target: TypeAlias = TokensTarget | Literal["request_cached"]
 
 
 class ResolvedTarget(Value):
@@ -453,7 +430,7 @@ def validated(value, schema):
         raise ControlError("invalid_payload", str(error)[:4096]) from error
 
 
-def validate_target(target: LogicalTarget | PrefixTarget) -> None:
+def validate_target(target: TokensTarget | PrefixTarget) -> None:
     if isinstance(target, PrefixTarget):
         validate_prefix(target)
         return
@@ -461,51 +438,6 @@ def validate_target(target: LogicalTarget | PrefixTarget) -> None:
         raise ControlError(
             "invalid_payload", "Token ranges must be nonempty and half-open"
         )
-    if isinstance(target, ContentTarget):
-        if not target.token_count or len(set(target.components)) != len(
-            target.components
-        ):
-            raise ControlError(
-                "invalid_payload", "Content needs a length and unique components"
-            )
-        by_component: dict[str, list[ContentSpan]] = {}
-        for span in target.spans:
-            if (
-                not 0
-                <= span.dependency_start
-                <= span.start_token
-                <= span.end_token
-                <= target.token_count
-            ):
-                raise ControlError(
-                    "invalid_payload", "Invalid content or dependency range"
-                )
-            if (span.coverage_kind == "checkpoint") != (
-                span.start_token == span.end_token
-            ) or span.end_token == 0:
-                raise ControlError(
-                    "invalid_payload",
-                    "Checkpoint descriptors are nonzero points; token spans are nonempty",
-                )
-            if (span.coverage_kind == "window" and not span.window_size) or (
-                span.coverage_kind != "window" and span.window_size is not None
-            ):
-                raise ControlError(
-                    "invalid_payload",
-                    "Window descriptors require a positive window size",
-                )
-            if span.component not in target.components:
-                raise ControlError("invalid_payload", "Undeclared content component")
-            by_component.setdefault(span.component, []).append(span)
-        for spans in by_component.values():
-            ordered = sorted(spans, key=lambda span: span.start_token)
-            if len({(s.coverage_kind, s.window_size) for s in spans}) > 1 or any(
-                a.end_token > b.start_token or a.start_token == b.start_token
-                for a, b in zip(ordered, ordered[1:])
-            ):
-                raise ControlError(
-                    "invalid_payload", "Overlapping component descriptors"
-                )
 
 
 def validate_prefix(target: PrefixTarget) -> None:

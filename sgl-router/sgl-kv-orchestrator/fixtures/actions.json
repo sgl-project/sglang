@@ -442,7 +442,7 @@
         "timeout_ms": 5000
       }
     },
-    "valid": true
+    "valid": false
   },
   {
     "name": "legacy_content",
@@ -479,7 +479,7 @@
         "timeout_ms": 5000
       }
     },
-    "valid": true
+    "valid": false
   },
   {
     "name": "bad_hash_9223372036854775808",
