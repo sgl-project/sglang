@@ -1,3 +1,4 @@
+import dataclasses
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -241,6 +242,37 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
                     [(span.version, span.start, span.end) for span in spans],
                     [("v0", 0, 1), ("v1", 1, 4)],
                 )
+
+    def test_batch_field_snapshot_matches_the_dataclass_walk(self) -> None:
+        """The instance-dict snapshot records and restores the same field values."""
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        for fast in (False, True):
+            with (
+                self.subTest(fast=fast),
+                patch.object(scheduler_module, "_BATCH_FIELD_SNAPSHOT", fast),
+            ):
+                scheduler = self._scheduler()
+                scheduler.batch_record_ct = 0
+                scheduler.batch_record_buf = [None, None]
+                scheduler.uocr_runtime = None
+                batch = self._batch()
+                batch.forward_mode = ForwardMode.DECODE
+                batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
+                before = dict(batch.__dict__)
+                with scheduler._forward_isolation(batch, overlap=True):
+                    batch.out_cache_loc = torch.tensor([4, 5])
+                    batch.forward_mode = ForwardMode.TARGET_VERIFY
+                    batch.spec_info = object()
+                self.assertEqual(batch.__dict__.keys(), before.keys())
+                for name, value in before.items():
+                    self.assertIs(batch.__dict__[name], value, name)
+                recorded, snapshot = scheduler.batch_record_buf[1]
+                self.assertIs(recorded, batch)
+                names = [f.name for f in dataclasses.fields(batch)]
+                self.assertEqual(len(snapshot), len(names))
+                for name, value in zip(names, snapshot):
+                    self.assertIs(value, before[name], name)
 
     def test_result_copy_finishes_before_slot_indices_are_consumed(self) -> None:
         """Pending slot copies complete before the tracker reads their contents."""

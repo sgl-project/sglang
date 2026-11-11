@@ -335,6 +335,12 @@ class Envs:
     SGLANG_OPT_RESULT_COPY_PINNED_RING = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # The forward isolation's ScheduleBatch snapshot / restore and its 2-iter keep-alive record
+    # read the fields from the instance dict (one cached itemgetter) instead of
+    # dataclasses.fields() + getattr / setattr per field.
+    SGLANG_OPT_SCHEDULE_BATCH_FIELD_SNAPSHOT = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading

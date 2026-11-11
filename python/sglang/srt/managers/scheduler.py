@@ -16,6 +16,7 @@ import dataclasses
 import faulthandler
 import logging
 import math
+import operator
 import os
 import signal
 import sys
@@ -446,6 +447,20 @@ logger = logging.getLogger(__name__)
 
 # Cap on rids printed per --log-schedule-decisions line.
 _MAX_LOGGED_RIDS = 16
+
+_BATCH_FIELD_SNAPSHOT = envs.SGLANG_OPT_SCHEDULE_BATCH_FIELD_SNAPSHOT.get()
+_BATCH_FIELD_GETTERS: dict = {}
+
+
+def _batch_field_getter(cls) -> tuple:
+    """(field names, itemgetter over an instance __dict__) of a dataclass, built once.
+    Plain dataclass fields live in the instance dict, so reading / updating it is
+    getattr / setattr without the per-field Python calls."""
+    entry = _BATCH_FIELD_GETTERS.get(cls)
+    if entry is None:
+        names = tuple(f.name for f in dataclasses.fields(cls))
+        entry = _BATCH_FIELD_GETTERS[cls] = (names, operator.itemgetter(*names))
+    return entry
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -5175,9 +5190,12 @@ class Scheduler(
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
         # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
-        attr_snapshot = [
-            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
-        ]
+        if _BATCH_FIELD_SNAPSHOT:
+            attr_snapshot = list(_batch_field_getter(type(batch))[1](batch.__dict__))
+        else:
+            attr_snapshot = [
+                getattr(batch, f.name, None) for f in dataclasses.fields(batch)
+            ]
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         retired = self.batch_record_buf[self.batch_record_ct]
         # List (not tuple) so that workers can register additional refs via
@@ -5211,11 +5229,15 @@ class Scheduler(
         """
         # 1. snapshot
         snapshot_v2_full = not batch.spec_algorithm.is_none()
-        sched_snapshot = (
-            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
-            if snapshot_v2_full
-            else None
-        )
+        if _BATCH_FIELD_SNAPSHOT and snapshot_v2_full:
+            names, getter = _batch_field_getter(type(batch))
+            sched_snapshot = dict(zip(names, getter(batch.__dict__)))
+        else:
+            sched_snapshot = (
+                {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+                if snapshot_v2_full
+                else None
+            )
         sched_sampling_info = batch.sampling_info
 
         # 2. sampling_info substitute
@@ -5229,7 +5251,9 @@ class Scheduler(
         try:
             yield
         finally:
-            if snapshot_v2_full:
+            if snapshot_v2_full and _BATCH_FIELD_SNAPSHOT:
+                batch.__dict__.update(sched_snapshot)
+            elif snapshot_v2_full:
                 for name, value in sched_snapshot.items():
                     setattr(batch, name, value)
             else:
