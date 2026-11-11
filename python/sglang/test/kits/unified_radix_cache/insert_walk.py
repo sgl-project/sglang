@@ -1,10 +1,8 @@
 from array import array
 from types import SimpleNamespace
 
-from sglang.srt.managers.schedule_batch import (
-    FINISH_LENGTH,
-    Req,
-)
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
@@ -219,8 +217,12 @@ class SegmentLockFuzzFixtures(UnifiedRadixCacheFixtures):
                     cache.evict(
                         EvictParams(
                             num_tokens=rng.randrange(0, 32),
-                            swa_num_tokens=rng.randrange(0, 32),
                             mamba_num=rng.randrange(0, 4) if self.cfg.has_mamba else 0,
+                            window_num_tokens={
+                                cache.window_sub_pool_of_slot(
+                                    ComponentType.SWA
+                                ): rng.randrange(0, 32)
+                            },
                         )
                     )
             except AssertionError:

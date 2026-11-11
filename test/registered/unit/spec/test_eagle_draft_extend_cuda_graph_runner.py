@@ -16,6 +16,7 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
 from sglang.srt.speculative import eagle_draft_extend_cuda_graph_runner as mod
+from sglang.srt.speculative import eagle_megakernel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -32,6 +33,7 @@ class TestEagleDraftExtendCudaGraphRunner(unittest.TestCase):
         model_runner = SimpleNamespace(
             device="cpu",
             model=SimpleNamespace(),
+            kv_cache_configurator=SimpleNamespace(modelslim_cache_layout=None),
             device_timer=None,
             model_config=SimpleNamespace(
                 dtype=torch.float32,
@@ -45,7 +47,7 @@ class TestEagleDraftExtendCudaGraphRunner(unittest.TestCase):
         )
         worker = SimpleNamespace(
             draft_runner=model_runner,
-            megakernel=None,
+            draft_runtime=eagle_megakernel.STOCK_EAGLE_DRAFT_RUNTIME,
             draft_extend_attn_backend=attn_backend,
             speculative_algorithm=SimpleNamespace(is_standalone=lambda: False),
             seed_dsa_topk_from_draft_extend=False,
@@ -86,7 +88,6 @@ class TestEagleDraftExtendCudaGraphRunner(unittest.TestCase):
 
         with contextlib.ExitStack() as stack:
             replacements = {
-                "megakernel_graph_variants": None,
                 "get_exec": runtime,
                 "get_parallel": SimpleNamespace(pp_size=1),
                 "deployment_attn_dp_size": 1,
@@ -104,6 +105,11 @@ class TestEagleDraftExtendCudaGraphRunner(unittest.TestCase):
             }
             for name, result in replacements.items():
                 stack.enter_context(mock.patch.object(mod, name, return_value=result))
+            stack.enter_context(
+                mock.patch.object(
+                    eagle_megakernel, "megakernel_graph_variants", return_value=None
+                )
+            )
             stack.enter_context(
                 mock.patch.object(
                     mod, "resolve_decode_backend", side_effect=resolve_backend

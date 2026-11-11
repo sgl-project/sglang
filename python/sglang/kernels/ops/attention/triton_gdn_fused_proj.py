@@ -652,6 +652,12 @@ def fused_qkv_split_gdn_prefill_kernel(
     HEAD_K: tl.constexpr,
     HEAD_V: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    NORMALIZE_QK: tl.constexpr,
+    BLOCK_Q_HEADS: tl.constexpr,
+    BLOCK_K_HEADS: tl.constexpr,
+    BLOCK_HEAD_Q: tl.constexpr,
+    BLOCK_HEAD_K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
 ):
     i_t = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_SIZE)
@@ -662,22 +668,72 @@ def fused_qkv_split_gdn_prefill_kernel(
     qk_dim: tl.constexpr = q_dim + k_dim
     qkv_dim: tl.constexpr = qk_dim + v_dim
 
-    mask = offsets < qkv_dim
-    values = tl.load(
-        mixed_qkv + i_t * MIXED_QKV_STRIDE_T + offsets * MIXED_QKV_STRIDE_D,
-        mask=mask,
-    )
+    if NORMALIZE_QK:
+        q_heads = tl.arange(0, BLOCK_Q_HEADS)[:, None]
+        q_cols = tl.arange(0, BLOCK_HEAD_Q)[None, :]
+        q_offsets = q_heads * HEAD_Q + q_cols
+        q_mask = (q_heads < NUM_Q_HEADS) & (q_cols < HEAD_Q)
+        q_values = tl.load(
+            mixed_qkv + i_t * MIXED_QKV_STRIDE_T + q_offsets * MIXED_QKV_STRIDE_D,
+            mask=q_mask,
+            other=0,
+        ).to(tl.float32)
+        q_norm = tl.sqrt(tl.sum(q_values * q_values, 1) + 1e-6)[:, None]
+        # Match both arithmetic paths in FLA's l2norm_fwd.
+        if HEAD_Q <= 512:
+            q_values = q_values / q_norm
+        else:
+            q_values = q_values * (1 / q_norm)
+        tl.store(
+            q + i_t * q_dim + q_offsets, q_values.to(q.dtype.element_ty), mask=q_mask
+        )
 
-    q_mask = offsets < q_dim
-    tl.store(q + i_t * q_dim + offsets, values, mask=q_mask)
+        k_heads = tl.arange(0, BLOCK_K_HEADS)[:, None]
+        k_cols = tl.arange(0, BLOCK_HEAD_K)[None, :]
+        k_offsets = k_heads * HEAD_K + k_cols
+        k_mask = (k_heads < NUM_K_HEADS) & (k_cols < HEAD_K)
+        k_values = tl.load(
+            mixed_qkv
+            + i_t * MIXED_QKV_STRIDE_T
+            + (q_dim + k_offsets) * MIXED_QKV_STRIDE_D,
+            mask=k_mask,
+            other=0,
+        ).to(tl.float32)
+        k_norm = tl.sqrt(tl.sum(k_values * k_values, 1) + 1e-6)[:, None]
+        if HEAD_K <= 512:
+            k_values = k_values / k_norm
+        else:
+            k_values = k_values * (1 / k_norm)
+        tl.store(
+            k + i_t * k_dim + k_offsets, k_values.to(k.dtype.element_ty), mask=k_mask
+        )
+        v_offsets = tl.arange(0, BLOCK_V)
+        v_mask = v_offsets < v_dim
+        v_values = tl.load(
+            mixed_qkv
+            + i_t * MIXED_QKV_STRIDE_T
+            + (qk_dim + v_offsets) * MIXED_QKV_STRIDE_D,
+            mask=v_mask,
+            other=0,
+        )
+        tl.store(v + i_t * v_dim + v_offsets, v_values, mask=v_mask)
+    else:
+        mask = offsets < qkv_dim
+        values = tl.load(
+            mixed_qkv + i_t * MIXED_QKV_STRIDE_T + offsets * MIXED_QKV_STRIDE_D,
+            mask=mask,
+        )
 
-    k_offsets = offsets - q_dim
-    k_mask = (offsets >= q_dim) & (offsets < qk_dim)
-    tl.store(k + i_t * k_dim + k_offsets, values, mask=k_mask)
+        q_mask = offsets < q_dim
+        tl.store(q + i_t * q_dim + offsets, values, mask=q_mask)
 
-    v_offsets = offsets - qk_dim
-    v_mask = (offsets >= qk_dim) & (offsets < qkv_dim)
-    tl.store(v + i_t * v_dim + v_offsets, values, mask=v_mask)
+        k_offsets = offsets - q_dim
+        k_mask = (offsets >= q_dim) & (offsets < qk_dim)
+        tl.store(k + i_t * k_dim + k_offsets, values, mask=k_mask)
+
+        v_offsets = offsets - qk_dim
+        v_mask = (offsets >= qk_dim) & (offsets < qkv_dim)
+        tl.store(v + i_t * v_dim + v_offsets, values, mask=v_mask)
 
 
 def fused_qkv_split_gdn_prefill(
@@ -688,6 +744,8 @@ def fused_qkv_split_gdn_prefill(
     head_q: int,
     head_k: int,
     head_v: int,
+    *,
+    normalize_qk: bool = False,
 ):
     """Split packed post-conv GDN QKV into contiguous FLA prefill tensors.
 
@@ -695,6 +753,9 @@ def fused_qkv_split_gdn_prefill(
     chunk kernels consume separate contiguous `[1, T, H, D]` tensors, so this
     fused split replaces three independent `aten::copy_` kernels from the
     generic FLA input guard. `mixed_qkv` may be a strided `[T, qkv_dim]` view.
+    Optional Q/K normalization uses FLA's epsilon and output-dtype cast. Its
+    FP32 reduction order can differ from standalone FLA normalization, so
+    bitwise parity is not guaranteed.
     """
     seq_len = mixed_qkv.shape[0]
     q = torch.empty(
@@ -730,6 +791,12 @@ def fused_qkv_split_gdn_prefill(
         head_k,
         head_v,
         BLOCK_SIZE=triton.next_power_of_2(qkv_dim),
+        NORMALIZE_QK=normalize_qk,
+        BLOCK_Q_HEADS=triton.next_power_of_2(num_q_heads),
+        BLOCK_K_HEADS=triton.next_power_of_2(num_k_heads),
+        BLOCK_HEAD_Q=triton.next_power_of_2(head_q),
+        BLOCK_HEAD_K=triton.next_power_of_2(head_k),
+        BLOCK_V=triton.next_power_of_2(num_v_heads * head_v),
         num_warps=8,
         num_stages=3,
     )

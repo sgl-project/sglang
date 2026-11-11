@@ -8,6 +8,7 @@ from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CUDA_ONLY,
+    CapabilityRequirement,
     KernelBackend,
     KernelSpec,
 )
@@ -105,6 +106,7 @@ _TRITON_KERNELS = [
     ("fp8_kernel", "dequant_group_fp8_to_bf16"),
     ("fp8_kernel", "per_tensor_quant_mla_fp8"),
     ("fp8_kernel", "per_token_group_quant_mla_deep_gemm_masked_fp8"),
+    ("fp8_kernel", "block_quant_fp8"),
     ("int8_kernel", "per_token_quant_int8"),
     ("int8_kernel", "per_token_group_quant_int8"),
     ("awq_triton", "awq_dequantize_triton"),
@@ -121,6 +123,33 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="quantization.mxfp8_quantize_swizzled",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.mxfp8_swizzled_triton:mxfp8_quantize_swizzled",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="quantization.mxfp8_group_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.mxfp8_group_quant:mxfp8_group_quant",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="quantization.mxfp4_dequant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.mxfp4_dequant:mxfp4_dequant",
+        capabilities=CUDA_ONLY,
+    )
+)
 
 register_kernel(
     KernelSpec(
@@ -150,3 +179,24 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+
+
+# Muse Spark on gfx950 (MI355X): Triton kernels the ROCm Muse Spark model and the aiter /
+# Triton attention backends dispatch to by shape; registered for inventory.
+_MUSE_SPARK_GFX950_KERNELS = [
+    (
+        "mxfp4_quant_rows",
+        "mxfp4_quant_rows",
+        "per-row MXFP4 (E8M0 per 32) activation quant, runtime M",
+    ),
+]
+for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"quantization.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.quantization.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _mod, _fn, _desc

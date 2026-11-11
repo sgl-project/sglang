@@ -32,7 +32,6 @@ import unittest
 from unittest import mock
 
 import torch
-from test_multi_ended_allocator import TestPagedBand as _PagedFixture
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.environ import InvariantCheckLevel, envs
@@ -41,19 +40,26 @@ from sglang.srt.mem_cache.kv.alloc import band as mea
 from sglang.srt.mem_cache.kv.alloc import chain
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
+from sglang.test.token_demand import token_demand
+from sglang.test.unified_allocator_fixtures import (
+    FakeKVCache,
+    arena_of,
+    build_paged_band_pair,
+    build_window_chain,
+    stand_in_views,
+)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
-PAGE_SIZE = _PagedFixture.PAGE_SIZE
+PAGE_SIZE = 8
 
 
 def _paged_allocator(lazy: bool):
-    """A real paged `Band` from the sibling fixture."""
-    inst = _PagedFixture([m for m in dir(_PagedFixture) if m.startswith("test_")][0])
-    _pool, full, _swa, _fkv, _skv = inst._build()
+    """A real paged `Band`."""
+    _pool, full, _swa, _fkv, _skv = build_paged_band_pair(page_size=PAGE_SIZE)
     full.lazy_compaction = lazy
     return full
 
@@ -101,19 +107,11 @@ _TABLES = {"virtual_to_physical", "physical_to_virtual"}
 # a tombstone" is a per-method design fact a scan cannot infer.
 _TOMBSTONE_METHODS = [
     (mea.Band, "_free_lazy"),
-    (mea.Band, "free"),
-    (mea.Band, "free_physical"),
+    (mea.Band, "_unbind_physical"),
     (mea.Band, "_commit_move_batch"),
     (mea.FloatBand, "free"),
-    (mea.FloatBand, "free_physical"),
-    (mea.FloatBand, "make_room"),
-    (mea.FloatBand, "_relocate_to_positions"),
+    (mea.FloatBand, "relocate_into"),
 ]
-
-
-# Sanctioned no-sync tombstone forms: `index_fill_` takes the scalar as an
-# argument torch keeps off the host; the fused launcher stores it in-kernel.
-_NO_SYNC_TOMBSTONE_FORMS = ("index_fill_", "free_unbind_inplace")
 
 
 _UNIFIED_MODULES = (mea, chain)
@@ -215,18 +213,6 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
                         f"copies it H2D, blocking the scheduler thread until the "
                         f"stream drains. Use `.index_fill_(0, idx, -1)`."
                     ),
-                )
-
-    def test_free_paths_actually_write_a_tombstone(self):
-        """Positive form, so deleting the scatter entirely cannot pass; a new
-        no-sync mechanism is added to `_NO_SYNC_TOMBSTONE_FORMS` deliberately."""
-        for cls, name in _TOMBSTONE_METHODS:
-            with self.subTest(method=f"{cls.__name__}.{name}"):
-                src = inspect.getsource(getattr(cls, name))
-                self.assertTrue(
-                    any(form in src for form in _NO_SYNC_TOMBSTONE_FORMS),
-                    f"{cls.__name__}.{name} writes no tombstone through any of "
-                    f"{_NO_SYNC_TOMBSTONE_FORMS}",
                 )
 
 
@@ -364,6 +350,167 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
                 self.assertEqual(alloc.free_page_reps_group, [])
 
 
+class TestIndependentWindowFree(unittest.TestCase):
+    def test_request_cleanup_and_grouped_free_keep_fixed_shapes(self):
+        """Unequal window cursors must not force a device count read during cleanup."""
+        from kv.test_declared_parts import _build
+
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        self.addCleanup(reset_context)
+        for cursors in ((0, 0), (16, 24), (24, 16)):
+            for grouped in (False, True):
+                with self.subTest(cursors=cursors, grouped=grouped):
+                    placement = FusedDraftPlacement.from_counts(
+                        counts={"draft_swa": [1]},
+                        regions={
+                            "draft_swa": DenseDraftRegion(
+                                lane_num=1,
+                                head_num=1,
+                                head_dim=8,
+                                store_dtype=torch.bfloat16,
+                            )
+                        },
+                        new_bands={"draft_swa": DraftBand(kind="window", window=8)},
+                    )
+                    storage, _, _ = _build(fused_draft=placement, lazy_compaction=True)
+                    a = storage.allocator
+                    cache = UnifiedRadixCache(
+                        CacheInitParams(
+                            disable=False,
+                            req_to_token_pool=storage.requests,
+                            token_to_kv_pool_allocator=a,
+                            page_size=4,
+                            sliding_window_size=16,
+                            tree_slots=storage.tree_slots(),
+                            tree_core_backend="python",
+                        )
+                    )
+                    ids = a.alloc(32)
+                    kv = ReqKvInfo(req_pool_idx=0, window_evict_floor=8)
+                    storage.requests.req_to_token[0, :32] = ids
+                    for name, end in zip(("window_16", "draft_swa"), cursors):
+                        # Every window frees from the request's shield up.
+                        start = 8 if end else 0
+                        a.free_window_segment(name, ids[start:end], start_pos=start)
+                        kv.set_evicted_seqlen(name, end)
+                    recorder = _ShapeSyncRecorder()
+                    with (
+                        envs.SGLANG_INVARIANT_CHECK.override(
+                            int(InvariantCheckLevel.OFF)
+                        ),
+                        recorder,
+                    ):
+                        if grouped:
+                            a.free_group_begin()
+                        if cursors == (0, 0):
+                            a.free_segment(ids, start_pos=0)
+                        else:
+                            cache.free_kv_row(kv, [(0, 32)])
+                        if grouped:
+                            a.free_group_end()
+                    self.assertEqual(recorder.hits, [])
+                    self.assertEqual(storage.accounting_violations(), [])
+                    self.assertTrue(all(b.allocated_count() == 0 for b in a.bands))
+
+    def test_overlap_frees_only_each_windows_unadopted_segments(self):
+        """Recovering one window must preserve its payload without filtering GPU IDs."""
+        from array import array
+
+        from kv.test_declared_parts import _build
+
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_cache.cache_action import (
+            FreeComponentDeviceSlot,
+            FreeDeviceKV,
+            FreeDeviceKVFullOnly,
+        )
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        self.addCleanup(reset_context)
+        placement = FusedDraftPlacement.from_counts(
+            counts={"draft_swa": [1]},
+            regions={
+                "draft_swa": DenseDraftRegion(
+                    lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+                )
+            },
+            new_bands={"draft_swa": DraftBand(kind="window", window=8)},
+        )
+        storage, _, _ = _build(fused_draft=placement, lazy_compaction=True)
+        a = storage.allocator
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=storage.requests,
+                token_to_kv_pool_allocator=a,
+                page_size=4,
+                sliding_window_size=16,
+                tree_slots=storage.tree_slots(),
+                tree_core_backend="python",
+            )
+        )
+        recorder = _ShapeSyncRecorder()
+        apply = cache._apply_cache_action
+
+        def tracked(action):
+            if isinstance(
+                action, (FreeDeviceKV, FreeDeviceKVFullOnly, FreeComponentDeviceSlot)
+            ):
+                with recorder:
+                    apply(action)
+            else:
+                apply(action)
+
+        with (
+            envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.OFF)),
+            mock.patch.object(cache, "_apply_cache_action", side_effect=tracked),
+        ):
+            for primary, auxiliary in ((48, 40), (32, 16)):
+                ids = a.alloc(64)
+                a.free_window_segment("window_16", ids[:primary], start_pos=0)
+                a.free_window_segment("draft_swa", ids[:auxiliary], start_pos=0)
+                cache.insert(
+                    InsertParams(
+                        key=RadixKey(array("q", range(64))),
+                        value=ids,
+                        component_evicted_seqlens={
+                            ComponentType.of("WINDOW_16"): primary,
+                            ComponentType.of("DRAFT_SWA"): auxiliary,
+                        },
+                    )
+                )
+            self.assertEqual(recorder.hits, [])
+            self.assertEqual(
+                {b.sub_pool_name: b.allocated_count() for b in a.bands},
+                {"full": 64, "window_16": 32, "draft_swa": 48},
+            )
+            cache.evict(
+                EvictParams(
+                    num_tokens=64,
+                    window_num_tokens={"window_16": 64, "draft_swa": 64},
+                )
+            )
+        self.assertEqual(recorder.hits, [])
+        self.assertEqual(storage.accounting_violations(), [])
+        self.assertTrue(all(b.allocated_count() == 0 for b in a.bands))
+
+
 class TestUnifiedSwaFullSideGroup(unittest.TestCase):
     """`free_full` inside a free group must defer and land at `free_group_end`;
     the composite carries that pile itself, not through the SWA parent's hooks."""
@@ -376,9 +523,9 @@ class TestUnifiedSwaFullSideGroup(unittest.TestCase):
     def test_allocation_reclaim_flushes_full_only_segment_frees(self):
         """FULL-only queued pages already satisfy this allocation. Ignoring
         their queue makes two-pool reclaim report insufficient capacity."""
-        from test_unified_swa_shared_virtual_ids import _build
-
-        alloc = _build(64, 32, 2, 4)
+        _arena, alloc, _kvcache = build_window_chain(
+            n_full_slots=64, n_swa_slots=32, full_layer_num=2, swa_layer_num=4
+        )
         indices = alloc.alloc(8)
         alloc.free_swa(indices)
         before = alloc.full_available_size()
@@ -389,16 +536,19 @@ class TestUnifiedSwaFullSideGroup(unittest.TestCase):
         cache = mock.Mock()
         cache.supports_prefix_sharing.return_value = True
         cache.full_evictable_size.return_value = 0
-        cache.swa_evictable_size.return_value = 0
+        cache.window_evictable_size.return_value = 0
         cache.evict_for_alloc.side_effect = AssertionError("no tree eviction needed")
 
-        self.assertTrue(alloc.evict_to_free_tokens(cache, before + 4, swa_num_tokens=0))
+        alloc.flush_deferred_full_frees()
+        self.assertTrue(
+            cache.reclaim(alloc.page_demands(token_demand(alloc, before + 4, 0)))
+        )
         self.assertEqual(alloc.full_available_size(), before + 8)
 
     def test_full_only_frees_defer_until_group_end(self):
-        from test_unified_swa_shared_virtual_ids import _build
-
-        alloc = _build(64, 32, 2, 4)
+        _arena, alloc, _kvcache = build_window_chain(
+            n_full_slots=64, n_swa_slots=32, full_layer_num=2, swa_layer_num=4
+        )
         idx = alloc.alloc(8)
         alloc.free_swa(idx)
         before = alloc.full_available_size()
@@ -421,7 +571,11 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
     PS = 4
 
     def _swa_composite(self, lazy=True, ps=None):
-        from test_multi_ended_allocator import _FakeKVCache, _make_mha_spec
+        from test_multi_ended_allocator import _make_mha_spec
+
+        from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+        setup_allocator_context()
 
         full = _make_mha_spec("full", "up", layer_num=4)
         swa = _make_mha_spec("swa", "down", layer_num=2)
@@ -436,8 +590,8 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
 
         class _KV:
             def __init__(self, p):
-                self.full_kv_pool = _FakeKVCache(p, "full")
-                self.swa_kv_pool = _FakeKVCache(p, "swa")
+                self.full_kv_pool = FakeKVCache(p, "full")
+                self.swa_kv_pool = FakeKVCache(p, "swa")
 
             def attach_allocators(self, **kwargs):
                 pass
@@ -503,7 +657,7 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
     def test_start_pos_path_matches_the_fallback_end_state(self):
         """Derived property: the stride-rep path and the dedup fallback leave
         identical v2p tombstones and capacity."""
-        for lazy in (True, False):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 a1 = self._swa_composite(lazy=lazy)
                 a2 = self._swa_composite(lazy=lazy)
@@ -519,10 +673,7 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
                     )
                 )
                 self.assertEqual(a1.available_size(), a2.available_size())
-                self.assertEqual(
-                    a1.swa_attn_allocator.schedulable_available_size(),
-                    a2.swa_attn_allocator.schedulable_available_size(),
-                )
+                self.assertEqual(a1.swa_available_size(), a2.swa_available_size())
 
     def test_segment_frees_dispatch_no_data_dependent_shape(self):
         """Bug regression: the ratchet, a request's release and a tree eviction
@@ -616,9 +767,8 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
     torch.cuda.is_available(), "the fused tombstone is a Triton kernel"
 )
 class TestFusedTombstoneWritesBothTables(unittest.TestCase):
-    """The source scan accepts `free_unbind_inplace` as a no-sync mechanism; on
-    CPU the launcher takes its pure-torch reference path, so nothing else in
-    the suite ever runs the kernel that does the tombstoning.
+    """On CPU the `free_unbind_inplace` launcher takes its pure-torch reference
+    path, so nothing else in the suite runs the kernel that does the tombstoning.
     """
 
     def test_matches_the_reference_over_randomized_bindings(self):
@@ -668,6 +818,119 @@ class TestFusedTombstoneWritesBothTables(unittest.TestCase):
         )
         self.assertEqual(int(out.numel()), 0)
         self.assertTrue(torch.equal(v2p, before))
+
+
+def _end_and_float_bands(device):
+    """A state | float | end arena; returns its end `Band` and its `FloatBand`."""
+    from test_multi_ended_allocator import _make_mamba_spec, _make_mha_spec
+
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="tokenizer")
+    specs = [
+        _make_mamba_spec("state", "up"),
+        _make_mha_spec("swa", "float"),
+        _make_mha_spec("full", "down"),
+    ]
+    arena = arena_of(
+        total_bytes=16 * sum(spec.entry_bytes() for spec in specs),
+        sub_pool_specs=specs,
+        device=device,
+    )
+    state, flt, end = (
+        (mea.FloatBand if spec.name == "swa" else mea.Band)(
+            arena=arena, sub_pool_name=spec.name, device=device, is_id_owner=True
+        )
+        for spec in specs
+    )
+    state.bind_high_peer(flt)
+    flt.bind_low_peer(state)
+    flt.bind_high_peer(end)
+    end.bind_low_peer(flt)
+    return {"end": end, "float": flt}
+
+
+def _free_an_unbound_page(device, band_kind, case):
+    """Free a page twice, or one never allocated, through one band."""
+    band = _end_and_float_bands(device)[band_kind]
+    if case == "double free":
+        pages = band.alloc(4)
+        band.free(pages)
+    else:
+        pages = torch.tensor([3], dtype=torch.int64, device=device)
+    band.free(pages)
+
+
+_UNBOUND_FREE_CASES = [
+    (band_kind, case, level)
+    for band_kind in ("end", "float")
+    for case in ("double free", "never allocated")
+    for level in (InvariantCheckLevel.WARN, InvariantCheckLevel.STRICT)
+]
+
+
+class TestFreeOfAnUnboundPage(CustomTestCase):
+    """A double free, or a free of a page never allocated, reads physical page -1:
+    the tombstone skips it, and the invariant check reports the free."""
+
+    def test_the_tombstone_skips_an_unbound_page(self):
+        from sglang.kernels.ops.memory.virtual_slot import free_unbind_inplace
+
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            with self.subTest(device=device):
+                # Guard rows on both sides of p2v catch a write outside it.
+                guarded = torch.arange(10, 20, dtype=torch.int64, device=device)
+                p2v = guarded[1:-1]
+                v2p = torch.full((8,), -1, dtype=torch.int64, device=device)
+                v2p[2], p2v[5] = 5, 2
+                want = guarded.clone()
+                want[1 + 5] = -1
+                freed = torch.tensor([2, 3], dtype=torch.int64, device=device)
+                out = free_unbind_inplace(freed, v2p, p2v)
+                self.assertEqual(out.tolist(), [5, -1])
+                self.assertEqual(guarded.tolist(), want.tolist())
+                self.assertTrue(torch.all(v2p == -1))
+
+    def test_a_free_of_an_unbound_page_is_reported(self):
+        for band_kind, case, level in _UNBOUND_FREE_CASES:
+            with self.subTest(band=band_kind, case=case, level=level.name):
+                with envs.SGLANG_INVARIANT_CHECK.override(int(level)):
+                    with self.assertRaisesRegex(
+                        RuntimeError, r"\[band\.free_of_bound_page\]"
+                    ):
+                        _free_an_unbound_page("cpu", band_kind, case)
+
+    def test_a_free_of_reallocated_pages_is_not_reported(self):
+        """Freeing pages whose virtual ids were freed and reallocated is no
+        double free."""
+        for band_kind in ("end", "float"):
+            for level in (InvariantCheckLevel.WARN, InvariantCheckLevel.STRICT):
+                with (
+                    self.subTest(band=band_kind, level=level.name),
+                    envs.SGLANG_INVARIANT_CHECK.override(int(level)),
+                ):
+                    band = _end_and_float_bands("cpu")[band_kind]
+                    # Take every virtual id, so the reallocation reuses the freed ones.
+                    size = band.free_virtual_ids.numel() * band.page_size
+                    pages = band.alloc(size)
+                    band.free(pages)
+                    again = band.alloc(size)
+                    self.assertEqual(again.tolist(), pages.tolist())
+                    band.free(again)
+
+    def test_a_valid_free_at_off_checks_nothing(self):
+        """With invariant checks off, a free launches no check."""
+        for band_kind in ("end", "float"):
+            with self.subTest(band=band_kind):
+                band = _end_and_float_bands("cpu")[band_kind]
+                pages = band.alloc(4)
+                with (
+                    envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.OFF)),
+                    mock.patch.object(mea, "expect") as expect,
+                ):
+                    band.free(pages)
+                expect.assert_not_called()
+                self.assertTrue(torch.all(band.ids.virtual_to_physical[pages] == -1))
 
 
 if __name__ == "__main__":

@@ -74,7 +74,7 @@ fn engine_keeps_normalizer(class: &str, normalizer: &serde_json::Value) -> bool 
 }
 
 /// Special tokens SGLang's `tokenizer(text)` puts around a prompt and [`encode`] leaves out.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct PromptAffixes {
     pub prefix: Vec<u32>,
     pub suffix: Vec<u32>,
@@ -424,9 +424,17 @@ fn download_tokenizer(repo_id: &str) -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
+/// FIPS builds never contact HuggingFace Hub: hf-hub's HTTP client (ureq)
+/// hardcodes ring for TLS, which is not a FIPS-validated module.
+const FIPS_NO_HUB: &str = "FIPS builds do not download from HuggingFace Hub (its TLS client \
+                           is not FIPS-validated); pass --tokenizer-path with a local tokenizer file";
+
 /// Download `file` from a HuggingFace repo id and return the cached local path.
 fn download_repo_file(repo_id: &str, file: &str) -> Result<std::path::PathBuf> {
     use hf_hub::api::sync::ApiBuilder;
+    if cfg!(feature = "fips") {
+        anyhow::bail!("{FIPS_NO_HUB}");
+    }
     let api = ApiBuilder::from_env()
         .build()
         .context("initialize HuggingFace Hub client")?;
@@ -440,6 +448,9 @@ fn download_repo_file(repo_id: &str, file: &str) -> Result<std::path::PathBuf> {
 /// download individually, which is cache-first.
 fn list_repo_files(repo_id: &str) -> Option<std::collections::HashSet<String>> {
     use hf_hub::api::sync::ApiBuilder;
+    if cfg!(feature = "fips") {
+        return None;
+    }
     let listing = ApiBuilder::from_env()
         .build()
         .context("initialize HuggingFace Hub client")

@@ -3,7 +3,6 @@
 Shared by KimiVLImageProcessor and KimiK2_5VLImageProcessor.
 """
 
-import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Union
@@ -21,9 +20,9 @@ from sglang.srt.multimodal.cache import (
     parse_content_hash,
     snapshot_media,
 )
+from sglang.srt.multimodal.cache.digest import media_identity
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 
-_KIMI_IMAGE_IDENTITY_TAG = b"sglang-kimi-image-identity-v1"
 _CALLER_IDENTITY_KEYS = ("hash", "pad_value", "pad_values", "identity")
 
 
@@ -42,15 +41,15 @@ def unwrap_kimi_images(images):
 
 
 def kimi_image_identity(content_config_digest: str, grid_thw: Sequence[int]) -> bytes:
-    """Full SHA-256 image identity: content and preprocessing config, then grid."""
+    """Bind a full source/config digest to the image's token grid."""
     digest = parse_content_hash(content_config_digest)
     if digest is None:
         raise ValueError("Kimi image identity requires a content digest")
-    hasher = hashlib.sha256(_KIMI_IMAGE_IDENTITY_TAG)
-    hasher.update(bytes.fromhex(digest[len(CONTENT_HASH_PREFIX) :]))
-    for dim in grid_thw:
-        hasher.update(int(dim).to_bytes(8, byteorder="big", signed=True))
-    return hasher.digest()
+    return media_identity(
+        bytes.fromhex(digest[len(CONTENT_HASH_PREFIX) :]),
+        modality="image",
+        metadata=tuple(int(dim) for dim in grid_thw),
+    )
 
 
 def _item_grid_thw(item: MultimodalDataItem) -> List[int]:
@@ -132,10 +131,10 @@ class KimiGridMMDataMixin:
     def assign_kimi_image_identities(
         self, mm_items: List[MultimodalDataItem], images: Optional[List[Any]]
     ) -> None:
-        """Give each image item a full content+config+grid identity.
+        """Identify raw images by source/config/grid, or prepared inputs by value.
 
-        Source images identify processor-computed items; preprocessed or
-        precomputed inputs are identified by their own tensor contents.
+        Prepared inputs use the common typed identity, including their format
+        and encoder metadata. Only digests, not full features, leave the GPU.
         """
         if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
             return
@@ -146,15 +145,20 @@ class KimiGridMMDataMixin:
             and all(item.format == MultimodalInputFormat.NORMAL for item in image_items)
         )
         for index, item in enumerate(image_items):
-            if use_sources:
-                source = images[index]
-            elif item.feature is not None:
-                source = item.feature
-            else:
-                source = item.precomputed_embeddings
+            grid = _item_grid_thw(item)
+            if not use_sources:
+                if item.feature is None and item.precomputed_embeddings is None:
+                    raise ValueError(
+                        "Kimi prepared image requires features or embeddings"
+                    )
+                # Recompute from the prepared input, not a caller's hash hint.
+                item.bind_processor_fingerprint(self._kimi_config_fingerprint())
+                item.clear_identity()
+                item.set_pad_value()
+                continue
             item.set_identity(
                 kimi_image_identity(
-                    self.kimi_content_config_digest(source), _item_grid_thw(item)
+                    self.kimi_content_config_digest(images[index]), grid
                 )
             )
 
