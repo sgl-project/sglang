@@ -133,13 +133,17 @@ async def get_loads(
 
     include_set = set(include_list) if include_list else None
 
-    if format == "prometheus":
-        return _format_loads_prometheus(load_results, include_set)
+    # `to_dict` is what rejects an unknown section, and it runs here rather than
+    # in `get_loads`, which never reads `include`. Both response shapes are
+    # built inside this try so that rejection is a 400 like any other bad
+    # request argument instead of an unhandled ValueError (HTTP 500).
+    try:
+        if format == "prometheus":
+            return _format_loads_prometheus(load_results, include_set)
 
-    loads = []
-    for load in load_results:
-        d = load.to_dict(include_set)
-        loads.append(d)
+        loads = [load.to_dict(include_set) for load in load_results]
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
