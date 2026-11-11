@@ -416,9 +416,7 @@ class Fp8Config(QuantizationConfig):
             if is_layer_skipped(
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
             ):
-                return UnquantizedFusedMoEMethod(
-                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
-                )
+                return UnquantizedFusedMoEMethod(layer.use_flashinfer_trtllm_moe)
 
             if is_npu() and self.use_mxfp8:
                 from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
