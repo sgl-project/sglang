@@ -253,13 +253,16 @@ class TestIntelXpuGDNDispatch(CustomTestCase):
                 b=sentinel.b,
                 A_log=sentinel.A_log,
                 dt_bias=sentinel.dt_bias,
-                has_initial_state=sentinel.has_initial_state,
+                extend_prefix_lens=torch.tensor([0, 3]),
                 needs_track_state=False,
             )
         self.assertEqual(result[0].shape, v.shape)
         self.assertIsNone(result[1])
         self.assertIsNone(result[2])
         sycl.assert_called_once()
+        torch.testing.assert_close(
+            sycl.call_args.kwargs["has_initial_state"], torch.tensor([False, True])
+        )
         triton.assert_not_called()
 
     def test_decode_clamps_padded_state_indices(self):

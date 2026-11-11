@@ -143,7 +143,7 @@ class XpuGDNKernel(TritonGDNKernel):
             cache_indices,
             num_prefills=cache_indices.numel(),
             num_decodes=0,
-            has_initial_state=kwargs["has_initial_state"],
+            has_initial_state=kwargs["extend_prefix_lens"] > 0,
         )
         return out, None, None
 

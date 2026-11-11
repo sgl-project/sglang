@@ -1543,7 +1543,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 b=b,
                 A_log=layer.A_log,
                 dt_bias=layer.dt_bias,
-                has_initial_state=forward_batch.extend_prefix_lens > 0,
                 output=kwargs.get("linear_attn_output"),
                 layer_id=layer.layer_id,
                 extend_prefix_lens=forward_batch.extend_prefix_lens,

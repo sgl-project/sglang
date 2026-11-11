@@ -240,10 +240,7 @@ class TestTrackMambaStateDtype(CustomTestCase):
                         self.assertIs(
                             kwargs["extend_prefix_lens"], batch.extend_prefix_lens
                         )
-                        torch.testing.assert_close(
-                            kwargs["has_initial_state"],
-                            batch.extend_prefix_lens > 0,
-                        )
+                        self.assertNotIn("has_initial_state", kwargs)
                         torch.testing.assert_close(
                             kwargs["cache_indices"], expected_indices
                         )
