@@ -21,9 +21,8 @@ if TYPE_CHECKING:
 KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
 
-# Kimi has no dedicated video padding token, so we use "<|media_content|>" instead.
-# This must match in multimodal/processors/kimi_k3.py
 KIMI_K3_IMAGE_SLOT = "<|media_pad|>"
+# Kimi has no dedicated video padding token, so we use "<|media_content|>" instead.
 KIMI_K3_VIDEO_SLOT = "<|media_content|>"
 
 

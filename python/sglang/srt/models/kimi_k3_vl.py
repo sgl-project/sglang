@@ -198,9 +198,9 @@ class Learnable2DInterpPosEmbDividedFixed(nn.Module):
         self.weight = nn.Parameter(torch.empty(height, width, dim))
         self.register_buffer(
             "time_weight",
-            torch.from_numpy(get_1d_sincos_pos_embed(dim, num_frames))
-            .float()
-            .unsqueeze(1),
+            torch.tensor(
+                get_1d_sincos_pos_embed(dim, num_frames), dtype=torch.float32
+            ).unsqueeze(1),
             persistent=False,
         )
 
@@ -225,7 +225,7 @@ class Learnable2DInterpPosEmbDividedFixed(nn.Module):
             else:
                 pos_emb_3d = pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[
                     0:t
-                ].to(device=pos_emb_2d.device, dtype=pos_emb_2d.dtype)
+                ].to(pos_emb_2d.dtype)
 
             pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
 

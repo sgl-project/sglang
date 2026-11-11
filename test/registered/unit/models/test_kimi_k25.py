@@ -49,6 +49,7 @@ from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.srt.multimodal.processors.kimi_common import (
     KimiGridMMDataMixin,
     kimi_image_identity,
@@ -75,6 +76,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.runtime_context import get_context, get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -1560,7 +1562,9 @@ def test_kimi_k3_rejects_unsupported_modalities(request_obj, extra_kwargs):
     processor.load_mm_data.assert_not_awaited()
 
 
-class _Video:
+class _Video(VideoDecoderWrapper):
+    avg_fps = frame_shape = None  # shadow the decoder-backed properties
+
     def __init__(self, *, num_frames, fps, height, width):
         self.avg_fps = fps
         self.frame_shape = (height, width)
@@ -1645,7 +1649,9 @@ def test_kimi_k3_video_request_serves_chunks_and_images_in_prompt_order():
             [(1, 2, 2)],
         ),
     )
+    processor.mm_processor_executor = None
     processor.io_executor = ThreadPoolExecutor(1)
+    processor.hash_executor = MultimodalHashExecutor(max_workers=1)
     processor.fast_load_mm_data = AsyncMock(
         return_value=SimpleNamespace(
             images=[Image.new("RGB", (28, 28))],
@@ -1665,6 +1671,7 @@ def test_kimi_k3_video_request_serves_chunks_and_images_in_prompt_order():
         )
     finally:
         processor.io_executor.shutdown()
+        processor.hash_executor.shutdown()
 
     # 8 of 10 frames at 8 fps: two 4-frame chunks of 2 tokens, then the image.
     assert output.input_ids == [1, 5, 5, 99, 99, 5, 99, 99, 5, 5, 99, 5]
@@ -1677,6 +1684,7 @@ def test_kimi_k3_video_request_serves_chunks_and_images_in_prompt_order():
         item.model_specific_data["image_grid_thw"].tolist() for item in output.mm_items
     ] == [[[4, 2, 4]], [[4, 2, 4]], [[1, 2, 2]]]
     assert [item.feature.shape[0] for item in output.mm_items] == [32, 32, 4]
+    assert all(item.pad_value is not None for item in output.mm_items)
 
 
 if __name__ == "__main__":
