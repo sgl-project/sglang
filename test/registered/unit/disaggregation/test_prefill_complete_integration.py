@@ -28,6 +28,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -299,7 +300,6 @@ class TestAllocationIntegration(CustomTestCase):
         queue.transfer_queue = SimpleNamespace(
             queue=decode_queue(ListKind.PD_RECEIVING)
         )
-        queue.pending_reqs = []
         queue._num_published_destinations = 0
         queue.pp_size, queue.tp_rank = 1, 0
         queue.gloo_group = object()
@@ -381,7 +381,7 @@ class TestAllocationIntegration(CustomTestCase):
             patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
             patch("sglang.srt.disaggregation.prefill.release_kv_cache"),
         ):
-            launched.join([req])
+            move([req], launched)
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
                 scheduler, req
             )
@@ -398,8 +398,8 @@ class TestAllocationIntegration(CustomTestCase):
             with get_context().override_server_args(
                 disaggregation_decode_allocation_policy="early"
             ):
-                scheduler.waiting_queue.clear()
-                launched.join([req])
+                scheduler.waiting_queue._drop_all()
+                move([req], launched)
                 SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
                     scheduler, req
                 )
@@ -453,7 +453,7 @@ class TestAllocationIntegration(CustomTestCase):
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
         )
-        scheduler.prefill_launched_reqs.join([req])
+        move([req], scheduler.prefill_launched_reqs)
         with (
             patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
             patch("sglang.srt.disaggregation.prefill.release_kv_cache"),
@@ -494,7 +494,7 @@ class TestAllocationIntegration(CustomTestCase):
                                 ListKind.PREFILL_LAUNCHED
                             ),
                         )
-                        scheduler.chunked_reqs.join([req])
+                        move([req], scheduler.chunked_reqs)
                         scheduler.checkpoint_disagg_prefill = MethodType(
                             SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill,
                             scheduler,
@@ -566,7 +566,7 @@ class TestAllocationIntegration(CustomTestCase):
         scheduler.tree_cache = Mock()
         scheduler.scheduler_stage_metrics = None
         scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
-        scheduler.disagg_prefill_transfer_queue.join(reqs)
+        move(reqs, scheduler.disagg_prefill_transfer_queue)
         scheduler.attn_cp_cpu_group = scheduler.attn_tp_cpu_group = object()
         scheduler.output_streamer = Mock()
         scheduler.send_kv_chunk = Mock()
@@ -627,8 +627,9 @@ class TestAllocationIntegration(CustomTestCase):
         pool.alloc(reqs)
         scheduler.waiting_queue = []
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        # The requeue moves the request out of the transfer queue.
         scheduler.optimistic_release_and_requeue = Mock(
-            side_effect=lambda req: pool.free(req)
+            side_effect=lambda req: (pool.free(req), req.owner_list._leave([req]))
         )
         with get_context().override_server_args(
             disaggregation_decode_allocation_policy="early"
@@ -865,7 +866,6 @@ class TestAllocationIntegration(CustomTestCase):
     def test_normal_bootstrap_keeps_room_without_dispatching_recompute(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._check_if_req_exceed_kv_capacity = Mock(return_value=False)
-        queue.pending_reqs = []
         req = SimpleNamespace(
             bootstrap_room=7,
             bootstrap_host="prefill",
@@ -893,7 +893,6 @@ class TestAllocationIntegration(CustomTestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._check_if_req_exceed_kv_capacity = Mock(return_value=False)
         queue.queue = []
-        queue.pending_reqs = []
         queue._create_receiver_and_enqueue = Mock()
         queue._init_receiver = Mock()
         req = SimpleNamespace(
