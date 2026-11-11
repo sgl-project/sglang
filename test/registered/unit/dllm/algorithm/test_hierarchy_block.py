@@ -162,6 +162,7 @@ class TestHierarchyBlockRun(unittest.TestCase):
 
         self.assertEqual(next_ids[0].tolist(), targets[0][:8])
         # Position 0 holds a prompt token, so the carried token is not used.
+        self.assertEqual(batch.input_ids.view(2, 8)[1, :3].tolist(), [1, 2, 3])
         self.assertEqual(next_ids[1].tolist(), targets[1][3:8])
         self.assertEqual(states, [18, 25])
         # One causal forward seeds after the prompt tail, one writes the KV.
