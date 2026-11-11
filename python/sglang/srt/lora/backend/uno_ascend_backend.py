@@ -126,6 +126,19 @@ class UnoAscendLoRABackend(AscendLoRABackend):
             raise ValueError("UNO Ascend requires CPU output offsets (no device sync).")
         return output_offset_cpu.tolist()
 
+    def run_lora_a_embedding(
+        self, input_ids, weights, vocab_size, extra_embeddings=None, *args, **kwargs
+    ):
+        if extra_embeddings is not None:
+            raise ValueError("UNO Ascend does not support added embedding tokens.")
+        route = self._route(input_ids.shape[0])
+        # B applies scaling once, just as for the linear projections. The
+        # inherited Ascend embedding lookup scales A and would apply it twice.
+        ids = input_ids.clamp(0, weights.shape[2] - 1).long()
+        hidden = weights[route.weight_index, : route.rank, ids].t().contiguous()
+        hidden.view(route.batch_size, route.forward_width, -1)[:, 0].zero_()
+        return hidden
+
     def run_lora_a_sgemm(self, x, weights, *args, stack_num=1, **kwargs):
         return self._shrink(x, weights, stack_num)
 

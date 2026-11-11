@@ -161,6 +161,22 @@ class TestUnoAscendLoRA(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "token route"):
             self.backend._route(512)
 
+    def test_embedding_scales_once_and_keeps_seed_base_only(self):
+        for reverse in (False, True):
+            slot = self.prepare(2, 128, reverse=reverse)
+            torch.manual_seed(37906)
+            ids = torch.arange(16) % 11
+            a = torch.randn(2, 128, 11) * 0.02
+            b = torch.randn(2, 24, 128) * 0.02
+            base = torch.randn(16, 24)
+            expected = base.clone()
+            expected += (a[slot, :, ids].t() @ b[slot].t()) * 16
+            expected[::8] = base[::8]
+            hidden = self.backend.run_lora_a_embedding(ids, a, 11)
+            actual = self.backend.run_lora_b_sgemm(hidden, b, base_output=base.clone())
+            torch.testing.assert_close(actual, expected)
+            torch.testing.assert_close(actual[::8], base[::8], atol=0, rtol=0)
+
     def test_invalid_route_and_token_count_fail_before_matmul(self):
         with self.assertRaises(ValueError):
             self.backend.prepare_lora_token_segments(

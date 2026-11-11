@@ -339,8 +339,17 @@ class NPUCudaGraphBackend(BaseGraphBackend):
                 is_encoder_decoder=runner.is_encoder_decoder,
             )
             runner.attn_backend.init_forward_metadata_out_graph(fb_view)
-        # Preserve the legacy NPU pre-planned replay key.
-        runner._replay_graph_key = runner._make_graph_key(runner.bs)
+        if runner.model_runner.spec_algorithm.is_uno():
+            runner._replay_graph_key = runner._make_graph_key(
+                runner.bs,
+                variant_label=runner._resolve_lora_variant(forward_batch),
+                attention_variant=runner._resolve_attention_variant(
+                    forward_batch, runner.bs
+                ),
+            )
+        else:
+            # Preserve the legacy NPU pre-planned replay key.
+            runner._replay_graph_key = runner._make_graph_key(runner.bs)
         return True
 
     @contextmanager

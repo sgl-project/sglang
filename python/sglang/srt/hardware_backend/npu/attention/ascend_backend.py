@@ -774,7 +774,9 @@ class AscendAttnBackend(AttentionBackend):
         ):
             if self.forward_metadata.seq_lens_cpu_int is not None:
                 self.forward_metadata.seq_lens_cpu_int = (
-                    self.forward_metadata.seq_lens_cpu_int + self.speculative_step_id + 1
+                    self.forward_metadata.seq_lens_cpu_int
+                    + self.speculative_step_id
+                    + 1
                 )
             else:
                 # Mirrorless decode: apply the draft offset to the device
@@ -1988,7 +1990,6 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: torch.Tensor = None,
     ):
-
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()

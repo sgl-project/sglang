@@ -167,7 +167,6 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         finally:
             self._lora_state.reset()
 
-
     def get_spec_info(self, num_tokens: int, ragged_verify_layout=None):
         if self._tree_draft_mode:
             return UnoForwardInput(

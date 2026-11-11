@@ -22,7 +22,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 class TestUnoWorkerLifecycle(CustomTestCase):
     def test_linear_worker_import_does_not_require_cuda_tree_module(self):
         worker_path = Path(uno_info.__file__).with_name("uno_worker_v2.py")
-        with patch.dict(sys.modules, {"sglang.srt.speculative.uno_tree": None}):
+        with patch.dict(sys.modules, {"sglang.kernels.ops.speculative.uno_tree": None}):
             namespace = runpy.run_path(str(worker_path))
         self.assertIn("UnoWorkerV2", namespace)
 
