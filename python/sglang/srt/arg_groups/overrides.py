@@ -53,7 +53,10 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
 
 logger = logging.getLogger(__name__)
-from sglang.srt.configs.quant_utils import get_quantization_config
+from sglang.srt.configs.quant_utils import (
+    LOADER_RESOLVED_QUANT_METHODS,
+    get_quantization_config,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
@@ -942,7 +945,9 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
                         "keeping bf16 for DeepSeek-arch model on sm100"
                     )
             else:
-                overrides["quantization"] = quantization = quant_method
+                quantization = quant_method
+                if quant_method not in LOADER_RESOLVED_QUANT_METHODS:
+                    overrides["quantization"] = quant_method
         if (
             view.moe_a2a_backend == "none"
             and view.moe_runner_backend == "auto"
