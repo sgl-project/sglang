@@ -805,7 +805,12 @@ class HybridCacheController(BaseHiCacheController):
         host_indices = self.alloc_prefetch_host_buffers(operation, hit_tokens)
         shared = uses_shared_host_layout(self.mem_pool_host.anchor_entry.host_pool)
         if host_indices is None and not shared:
-            evict_host(hit_tokens)
+            reclaim_tokens = hit_tokens
+            if not self.is_kv_sharded and not self.prefetch_completion_sync_groups:
+                # Available rows can satisfy part of a local, unsharded read.
+                reclaim_tokens -= self.mem_pool_host.available_size()
+            if reclaim_tokens > 0:
+                evict_host(reclaim_tokens)
             host_indices = self.alloc_prefetch_host_buffers(operation, hit_tokens)
         if host_indices is not None or not allow_partial:
             return host_indices, hit_tokens

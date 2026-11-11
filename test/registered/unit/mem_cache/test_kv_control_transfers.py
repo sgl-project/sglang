@@ -581,6 +581,38 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
         service.progress()
         return span
 
+    def test_ordinary_restore_evicts_only_the_host_shortfall(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            target = cache_fixtures.target()
+            self._cold_scopes(owner, (target,))
+            hot = self._host_pressure(owner, leave_free=2)
+            self.assertEqual(len(hot[0][1]), 2)
+            request = CacheRequestHandle("ordinary-shortfall", 0)
+            try:
+                with (
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    self._ordinary_prefetch(cache, service, target, request)
+                    self.assertEqual(
+                        self._consume_ordinary_prefetch(cache, service, request),
+                        (4, 0),
+                    )
+                    self.assertIsNone(hot[0][0].component_data[FULL].host_value)
+                    self.assertTrue(
+                        all(
+                            n.component_data[FULL].host_value is not None
+                            for n, _ in hot[1:]
+                        )
+                    )
+            finally:
+                cache.release_aborted_request(request)
+            assert_retired(cache, service)
+            cache.sanity_check()
+
     def test_completed_read_releases_staging_before_new_host_eviction(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
