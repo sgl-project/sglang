@@ -2691,5 +2691,72 @@ def test_wan_text_kv_lives_for_one_loop_of_one_request():
         assert gone() is None
 
 
+@torch.inference_mode()
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("mode", ["fused", "strided", "fp32", "mismatch"])
+def test_hidream_rope_dispatch_and_fallback(monkeypatch, mode):
+    """Preserve GQA and batch-specific tables, including the native fallback."""
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.models.dits import hidream_o1_image as hidream
+
+    gate = BitExactFusionGate("HiDream RoPE test")
+    monkeypatch.setattr(hidream, "_HIDREAM_ROPE", gate)
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    dtype = torch.float32 if mode == "fp32" else torch.bfloat16
+    qkv = torch.randn(2, 17, 12 * 128, device="cuda", dtype=dtype, generator=generator)
+    angles = torch.randn(2, 17, 128, device="cuda", generator=generator)
+    cos, sin = angles.cos().to(dtype), angles.sin().to(dtype)
+    norm = (lambda x: x) if mode == "strided" else lambda x: x.contiguous()
+    captured = []
+
+    def attention(q, k, v, *, attn_mask):
+        captured.append((q, k, v))
+        return q
+
+    # Run the real attention forward; isolate its RoPE from projection weights
+    # and SDPA so a Q/K rounding mismatch cannot disappear in a later cast.
+    layer = SimpleNamespace(
+        num_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        q_size=8 * 128,
+        kv_size=2 * 128,
+        qkv_proj=lambda x: (x, None),
+        q_norm=norm,
+        k_norm=norm,
+        attn=attention,
+        o_proj=lambda x: (x, None),
+    )
+    fused = MagicMock(
+        side_effect=(
+            (lambda x, cos, sin: torch.zeros_like(x))
+            if mode == "mismatch"
+            else hidream.fused_rope_rotate_half_bitexact
+        )
+    )
+    monkeypatch.setattr(hidream, "fused_rope_rotate_half_bitexact", fused)
+    mask = torch.zeros(1, 1, 17, 17, device="cuda", dtype=dtype)
+    for x in (qkv, qkv * 2):
+        original = x.clone()
+        q, k, v = x.split([8 * 128, 2 * 128, 2 * 128], dim=-1)
+        expected_q, expected_k = hidream.qwen3_apply_rotary_pos_emb(
+            norm(q.reshape(2, 17, 8, 128)),
+            norm(k.reshape(2, 17, 2, 128)),
+            cos.unsqueeze(2),
+            sin.unsqueeze(2),
+        )
+        hidream.HiDreamO1Attention.forward(layer, x, cos, sin, mask)
+        actual_q, actual_k, actual_v = captured[-1]
+        assert torch.equal(actual_q, expected_q) and torch.equal(actual_k, expected_k)
+        assert torch.equal(actual_v, v.reshape(2, 17, 2, 128))
+        assert torch.equal(x, original)
+    assert (
+        fused.call_count == {"fused": 4, "strided": 0, "fp32": 0, "mismatch": 2}[mode]
+    )
+    assert gate.verified == (mode == "fused")
+    assert gate.disabled == (mode == "mismatch")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

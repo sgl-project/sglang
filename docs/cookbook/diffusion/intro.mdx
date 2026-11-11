@@ -129,6 +129,12 @@ Video models denoise a bounded latent video sequence for each request. Use these
     img="/cards/logos/mova.png"
   />
   <Card
+    title="MiniMax-H3-Image"
+    mode="card"
+    href="/cookbook/diffusion/MiniMax/MiniMax-H3-Image"
+    img="/cards/logos/minimax.png"
+  />
+  <Card
     title="MiniMax-H3"
     mode="card"
     href="/cookbook/diffusion/MiniMax/MiniMax-H3"

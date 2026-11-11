@@ -107,14 +107,21 @@ def _case_build_out_tokens(tc):
     for cl_dtype in (torch.int32, torch.int64):
         # Bonus insertion swept through every position 0..gamma.
         cl = (torch.arange(bs, device=DEVICE) % (gamma + 1)).to(cl_dtype)
-        tc._parity(
+        # Rejected drafts (id beyond the target vocab) must not reach out_tokens.
+        draft_tokens = _ri(0, VOCAB, (bs, gamma))
+        draft_tokens[:, -1] = VOCAB + 10_000
+        got, _ = tc._parity(
             dspark_verify_window.BuildOutTokens,
-            draft_tokens=_ri(0, VOCAB, (bs, gamma)),
+            draft_tokens=draft_tokens,
             correct_len=cl,
             bonus=_ri(0, VOCAB, (bs,)),
             verify_num_draft_tokens=gamma + 1,
             gamma=gamma,
         )
+        # Slots past the bonus position (rejected drafts / tail) must be 0.
+        pos = torch.arange(gamma + 1, device=DEVICE)[None, :]
+        rejected = pos > cl.to(torch.int64)[:, None]
+        tc.assertTrue((got[rejected] == 0).all().item())
 
 
 def _case_build_ragged_verify_window(tc):
@@ -147,10 +154,14 @@ def _case_build_ragged_verify_window(tc):
 def _case_cap_correct_len(tc):
     torch.manual_seed(6)
     bs, nd = 64, 6
-    verify_lens = _ri(1, nd + 1, (bs,), torch.int32)
+    # verify_lens == 0 (padded graph rows) must clamp to 0, never -1.
+    verify_lens = _ri(0, nd + 1, (bs,), torch.int32)
     for cl_dtype in (torch.int32, torch.int64):
         cl = (torch.arange(bs, device=DEVICE) % (nd + 1)).to(cl_dtype)
-        tc._parity(dspark_accept.CapCorrectLen, correct_len=cl, verify_lens=verify_lens)
+        (capped, _trim), _ = tc._parity(
+            dspark_accept.CapCorrectLen, correct_len=cl, verify_lens=verify_lens
+        )
+        tc.assertGreaterEqual(int(capped.min().item()), 0)
 
 
 def _case_causal_swa_page_indices(tc):
@@ -441,13 +452,15 @@ def _case_scatter_compact_to_strided(tc):
         compact = torch.randn(
             graph_num_tokens, dim, dtype=torch.bfloat16, device=DEVICE
         )
-        tc._parity(
-            dspark_verify_window.ScatterCompactToStrided,
-            compact=compact,
-            layout=_layout(verify_lens, graph_num_tokens),
-            fill_value=0.0,
-            verify_num_draft_tokens=t,
-        )
+        for fill_value, point_mass_fill in ((0.0, False), (-1.0e4, True)):
+            tc._parity(
+                dspark_verify_window.ScatterCompactToStrided,
+                compact=compact,
+                layout=_layout(verify_lens, graph_num_tokens),
+                fill_value=fill_value,
+                verify_num_draft_tokens=t,
+                point_mass_fill=point_mass_fill,
+            )
 
 
 def _case_schedule_verify_lens_topk(tc):

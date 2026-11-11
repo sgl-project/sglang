@@ -80,7 +80,10 @@ _POOLS = {
 def _write_loc():
     # Different full and window ids, so a write at the wrong side's ids shows.
     loc = torch.tensor([3, 7, 11], device=_DEV)
-    return KVWriteLoc(loc, swa_loc=torch.tensor([2, 5, 9], device=_DEV))
+    return KVWriteLoc(
+        loc,
+        window_locs={SWAKVPool.WINDOW_SUB_POOL: torch.tensor([2, 5, 9], device=_DEV)},
+    )
 
 
 class TestKVLayerAccess(CustomTestCase):
@@ -165,7 +168,14 @@ class TestKVLayerAccess(CustomTestCase):
                         rope = torch.full((1, 1, 2), 3.0, dtype=pool.dtype, device=_DEV)
                         layer = SimpleNamespace(layer_id=layer_id)
                         kv.store_mla(
-                            layer, KVWriteLoc(loc, window_loc, full_loc), nope, rope
+                            layer,
+                            KVWriteLoc(
+                                loc,
+                                full_loc=full_loc,
+                                window_locs={SWAKVPool.WINDOW_SUB_POOL: window_loc},
+                            ),
+                            nope,
+                            rope,
                         )
                         expected = torch.zeros_like(buffer)
                         slot = (
