@@ -3,7 +3,7 @@ concrete adapters load only when selected."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Protocol, Union
 
 import msgspec
 
@@ -17,9 +17,27 @@ if TYPE_CHECKING:
         UsageInfo,
     )
     from sglang.srt.function_call.core_types import ToolCallItem
+    from sglang.srt.multimodal.media_io import ImageData
 
 EncodingBackend = Literal["builtin", "recipe"]
 HistoryToolCallArguments = Literal["strict", "lenient", "as_sent"]
+NativeProtocol = Literal["responses", "messages"]
+
+
+class NativePrompt(msgspec.Struct, frozen=True, kw_only=True):
+    """A Responses or Messages request rendered from its own wire form."""
+
+    prompt_ids: list[int]
+    tools: list[Tool]
+    """The tools the model can call after the request's history: those loaded from
+    the start and those the history has loaded since."""
+    image_data: list[ImageData] = []
+    """The images the prompt's placeholders stand for, in order."""
+    namespace_names: dict[str, tuple[str, str]] = {}
+    """The call name of each namespace member, mapped to its namespace and the
+    name the request gives it there."""
+    continued_turn: Optional[dict[str, Any]] = None
+    """The final assistant message the prompt continues, as a chat message."""
 
 
 class ChatOutputHooks(msgspec.Struct, frozen=True, kw_only=True):
@@ -216,6 +234,25 @@ class ChatEncodingOutputAdapter(Protocol):
     ) -> ResponsesOutputStream: ...
 
 
+class NativeRequestEncoder(Protocol):
+    def encode_native(
+        self,
+        *,
+        protocol: NativeProtocol,
+        body: dict[str, Any],
+        thinking: bool,
+        effort: Union[str, int, float, None],
+        response_schema: Optional[dict[str, Any]],
+        continue_final_message: bool,
+    ) -> NativePrompt:
+        """``body`` carries the request's conversation, tools and, for
+        ``tool_choice="none"``, its choice; ``thinking`` and ``effort`` are the
+        handler's decisions, as for ``encode_messages``. ``response_schema`` is
+        the JSON schema the answer follows; a trailing assistant turn is continued
+        under ``continue_final_message`` and otherwise re-sent as a user turn."""
+        ...
+
+
 class ChatEncodingAdapter(Protocol):
     collects_openai_media: bool
     """Whether media still has to be collected from the OpenAI messages after
@@ -243,6 +280,12 @@ class ChatEncodingAdapter(Protocol):
     @property
     def output(self) -> Optional[ChatEncodingOutputAdapter]:
         """None when the configured parsers leave output to the text parsers."""
+        ...
+
+    @property
+    def native_encoder(self) -> Optional[NativeRequestEncoder]:
+        """None when Responses and Messages requests that load tools mid-conversation
+        have no rendering of their own wire form."""
         ...
 
     def encode_messages(
