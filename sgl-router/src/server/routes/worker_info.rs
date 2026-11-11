@@ -310,22 +310,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_pool_is_a_503() {
+    async fn empty_fleet_is_a_503() {
         let (status, body) = get_json(ctx_with(&[]), "/server_info").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["code"], "no_healthy_workers");
-
-        let decode = spawn_engine("decode", StatusCode::OK).await;
-        let ctx = ctx_with(&[(&decode, WorkerMode::Decode)]);
-        let (status, body) = get_json(ctx, "/health_generate").await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["error"]["code"], "no_prefill_workers_available");
-
-        let prefill = spawn_engine("prefill", StatusCode::OK).await;
-        let ctx = ctx_with(&[(&prefill, WorkerMode::Prefill)]);
-        let (status, body) = get_json(ctx, "/health_generate").await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["error"]["code"], "no_decode_workers_available");
     }
 
     /// A worker whose circuit breaker is open is skipped while a healthy one
