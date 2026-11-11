@@ -92,9 +92,7 @@ class PraxisPipeline(ComposedPipelineBase):
         )
         # A repo id gives the diffusers repo; a path may name the repo or its vae folder.
         vae = PraxisVAE(
-            vae_dir / "vae"
-            if (vae_dir / "vae").is_dir()
-            else vae_dir,
+            vae_dir / "vae" if (vae_dir / "vae").is_dir() else vae_dir,
             device=device,
         )
         text_encoder = PraxisTextEncoder(

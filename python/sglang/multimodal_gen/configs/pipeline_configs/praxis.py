@@ -16,10 +16,8 @@ from sglang.multimodal_gen.configs.models.dits.praxis import (
     PraxisArchConfig,
     PraxisDiTConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 PRAXIS_HF_PATHS = [
     "runwayml/praxis-1-droid-lerobot",

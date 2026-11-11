@@ -1708,17 +1708,17 @@
                     ]
                   },
                   {
-                    "group": "Runway",
-                    "tag": "NEW",
-                    "pages": [
-                      "cookbook/vla/Runway/Praxis-1"
-                    ]
-                  },
-                  {
                     "group": "OpenPI",
                     "tag": "NEW",
                     "pages": [
                       "cookbook/vla/OpenPI/Pi0.5"
+                    ]
+                  },
+                  {
+                    "group": "Runway",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/vla/Runway/Praxis-1"
                     ]
                   }
                 ]
