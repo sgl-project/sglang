@@ -5071,6 +5071,7 @@ class Scheduler(
             ),
             new_token_ratio=self.new_token_ratio_tracker.current,
             page_size=self.logical_page_size,
+            chunked_req=self.chunked_req,
         )
         if plan is None:
             return
@@ -5078,7 +5079,6 @@ class Scheduler(
             # Pending offload copies may still read the device KV being released.
             self.decode_offload_manager.drain_before_retraction()
         preempted = batch.preempt_decode(plan.victim_indices, self.request_retirer)
-        self.running_reqs.leave(preempted)
         self.decode_preemptor.on_preempted(plan, preempted, now_s)
         for req in preempted:
             self._add_request_to_queue(req, is_retracted=True)

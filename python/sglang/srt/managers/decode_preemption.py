@@ -113,6 +113,37 @@ def _starving_target(
     return None
 
 
+def _token_prefix(req: Req, n: int):
+    ids = req.origin_input_ids
+    return ids[:n] if n <= len(ids) else [*ids, *req.output_ids][:n]
+
+
+def _common_prefix_len(a: Req, b: Req, limit: int) -> int:
+    pa, pb = _token_prefix(a, limit), _token_prefix(b, limit)
+    # Block compares first; only the mismatching block is scanned per token.
+    for lo in range(0, limit, 4096):
+        hi = min(lo + 4096, limit)
+        if list(pa[lo:hi]) != list(pb[lo:hi]):
+            return lo + next(
+                i for i, (x, y) in enumerate(zip(pa[lo:hi], pb[lo:hi])) if x != y
+            )
+    return limit
+
+
+def released_tokens(victim: Req, lockers: Iterable[Req], page_size: int) -> int:
+    """KV tokens that releasing victim makes free or evictable: its own KV plus
+    the part of its tree prefix [0, cache_protected_len) that no locker (a
+    request that stays) also locks. A locker locks its own protected prefix, so
+    it shares the victim's lock up to their common token prefix."""
+    protected = victim.kv.cache_protected_len
+    still_locked = 0
+    for other in lockers:
+        limit = min(protected, other.kv.cache_protected_len)
+        if other is not victim and limit > still_locked:
+            still_locked = max(still_locked, _common_prefix_len(victim, other, limit))
+    return victim.kv.kv_allocated_len - (still_locked - still_locked % page_size)
+
+
 def plan_decode_preemption(
     *,
     now_s: float,
@@ -125,11 +156,13 @@ def plan_decode_preemption(
     quantum_tokens: int,
     max_per_req: int,
     preferred_rid: Optional[str] = None,
+    chunked_req: Optional[Req] = None,
 ) -> Optional[DecodePreemptionPlan]:
     """The fewest longest-attained decodes whose release lets the first
     starving waiter fit, or None when it already fits (its wait has another
     cause) or no eligible set covers the deficit. have_tokens is the pool's
-    available plus evictable KV tokens."""
+    available plus evictable KV tokens; the in-flight chunked_req also locks a
+    tree prefix."""
     target = _starving_target(
         waiting_queue, now_s=now_s, wait_s=wait_s, preferred_rid=preferred_rid
     )
@@ -154,12 +187,17 @@ def plan_decode_preemption(
             -len(running_reqs[i].origin_input_ids),
         ),
     )
+    other_lockers = [chunked_req] if chunked_req is not None else []
     chosen: List[int] = []
     freed = 0.0
     for i in candidates:
-        req = running_reqs[i]
         chosen.append(i)
-        freed += len(req.origin_input_ids) + len(req.output_ids) + reserves[i]
+        # Chosen victims no longer lock: a prefix only they share frees once,
+        # credited to the last of them.
+        stays = [r for j, r in enumerate(running_reqs) if j not in chosen]
+        freed += reserves[i] + released_tokens(
+            running_reqs[i], [*stays, *other_lockers], page_size
+        )
         if freed >= deficit:
             return DecodePreemptionPlan(
                 target_rid=target.rid,
@@ -229,6 +267,7 @@ class DecodePreemptor:
         have_tokens: int,
         new_token_ratio: float,
         page_size: int,
+        chunked_req: Optional[Req],
     ) -> Optional[DecodePreemptionPlan]:
         if now_s - self._last_plan_s < PREEMPT_COOLDOWN_S:
             return None
@@ -243,6 +282,7 @@ class DecodePreemptor:
             quantum_tokens=self.quantum_tokens,
             max_per_req=self.max_per_req,
             preferred_rid=self._target_rid,
+            chunked_req=chunked_req,
         )
 
     def on_preempted(

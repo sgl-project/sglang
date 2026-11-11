@@ -104,8 +104,9 @@ class RequestRetirer:
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
-    def retract(self, req: Req, *, offload_kv: bool) -> bool:
-        """Release a retracted request's memory uncheckpointed; return whether it can resume."""
+    def retract(self, req: Req, *, offload_kv: bool, checkpoint: bool = False) -> bool:
+        """Release a retracted request's memory; return whether it can resume. With
+        ``checkpoint`` the tree first keeps its KV, so it resumes from that cache."""
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
             self.hisparse_coordinator.release_request(req)
 
@@ -123,18 +124,9 @@ class RequestRetirer:
             )
         else:
             resumable = req.resumable_by_rebootstrap
-        # TODO (csy): for preempted requests, we may want to insert into the tree
         if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+            release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
         return resumable
-
-    def release_for_resume(self, req: Req) -> None:
-        """Release a decoding request that will resume (uniboost decode
-        time-slicing) into the radix tree, so it resumes from its own cached
-        KV; retract instead frees it uncheckpointed to make room now."""
-        if req.kv.holds_kv and self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.retract_req(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=True)
 
     def abort_retracted(self, req: Req, *, reason: FINISH_ABORT) -> None:
         """Abort a retracted request that will not be requeued. Not finished in place:

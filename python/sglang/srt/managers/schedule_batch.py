@@ -3129,7 +3129,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         drop = set(indices)
         preempted = [self.reqs[i] for i in sorted(drop)]
         for req in preempted:
-            request_retirer.release_for_resume(req)
+            request_retirer.retract(req, offload_kv=False, checkpoint=True)
             req.reset_for_retract()
         self.filter_batch(
             keep_indices=[i for i in range(len(self.reqs)) if i not in drop]

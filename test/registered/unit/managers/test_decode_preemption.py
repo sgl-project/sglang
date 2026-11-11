@@ -7,6 +7,7 @@ from sglang.srt.managers.decode_preemption import (
     PREEMPT_COOLDOWN_S,
     DecodePreemptor,
     plan_decode_preemption,
+    released_tokens,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS
@@ -27,11 +28,11 @@ PAGE = 64
 MAX_NEW = 8192  # above the clip, so every reserve is CLIP * ratio
 
 
-def _req(rid, *, input_len, output_len=0, device_prefix=0, queued_at=None):
+def _req(rid, *, input_len, output_len=0, device_prefix=0, queued_at=None, ids=None):
     req = Req(
         rid,
         "",
-        array("q", [1] * input_len),
+        array("q", ids if ids is not None else [1] * input_len),
         SamplingParams(max_new_tokens=MAX_NEW),
     )
     req.output_ids.extend([2] * output_len)
@@ -40,8 +41,16 @@ def _req(rid, *, input_len, output_len=0, device_prefix=0, queued_at=None):
     return req
 
 
-def _running(rid, *, input_len, output_len):
-    return _req(rid, input_len=input_len, output_len=output_len)
+def _running(rid, *, input_len, output_len, shared_prefix=0):
+    """A decoding request whose prompt is in the tree and locked by it. Its
+    prompt is its own token ids, except the first shared_prefix tokens, which
+    every request built with shared_prefix shares."""
+    own = abs(hash(rid)) % 1_000_000 * 1_000_000
+    ids = [*range(shared_prefix), *range(own, own + input_len - shared_prefix)]
+    req = _req(rid, input_len=input_len, output_len=output_len, ids=ids)
+    req.kv.cache_protected_len = input_len
+    req.kv.kv_allocated_len = input_len + output_len
+    return req
 
 
 def _plan(waiting, running, have, **kw):
@@ -140,6 +149,35 @@ class TestPlanDecodePreemption(CustomTestCase):
         self.assertIsNone(_plan([recent], running, have=0))
 
 
+class TestReleasedTokens(CustomTestCase):
+    def test_a_prefix_another_running_request_locks_is_not_freed(self):
+        # Releasing a decode frees only what nothing else locks: a prefix shared
+        # with a request that keeps running stays locked in the tree.
+        shared = 1_000 * PAGE
+        victim = _running(
+            "v", input_len=100_000, output_len=4_000, shared_prefix=shared
+        )
+        stays = _running("s", input_len=80_000, output_len=10, shared_prefix=shared)
+        self.assertEqual(released_tokens(victim, [], PAGE), 104_000)
+        self.assertEqual(released_tokens(victim, [stays], PAGE), 104_000 - shared)
+
+    def test_two_victims_on_one_context_free_it_once(self):
+        # A shared context counted per victim would make the deficit look
+        # covered while the waiter still does not fit.
+        waiter = _req("w", input_len=150_000, queued_at=0.0)
+        shared = 1_400 * PAGE
+        a = _running("a", input_len=100_000, output_len=3_000, shared_prefix=shared)
+        b = _running("b", input_len=100_000, output_len=2_000, shared_prefix=shared)
+        need = 150_000 + CLIP_MAX_NEW_TOKENS + PAGE
+        reserves = 2 * CLIP_MAX_NEW_TOKENS * 0.5
+        freed_both = 103_000 + 102_000 - shared + reserves
+        have = int(need + reserves - freed_both)
+        self.assertIsNone(_plan([waiter], [a, b], have=have - 1))
+        plan = _plan([waiter], [a, b], have=have)
+        self.assertEqual(plan.victim_indices, (0, 1))
+        self.assertEqual(plan.freed_tokens, int(freed_both))
+
+
 class TestDecodePreemptor(CustomTestCase):
     def test_reserved_waiter_heads_the_queue_until_admitted(self):
         # The released memory must reach the waiter: it heads the sorted queue
@@ -156,6 +194,7 @@ class TestDecodePreemptor(CustomTestCase):
             have_tokens=0,
             new_token_ratio=0.5,
             page_size=PAGE,
+            chunked_req=None,
         )
         pre.on_preempted(plan, [victim], now_s=100.0)
         self.assertEqual(victim.num_preemptions, 1)
@@ -177,6 +216,7 @@ class TestDecodePreemptor(CustomTestCase):
                 have_tokens=0,
                 new_token_ratio=0.5,
                 page_size=PAGE,
+                chunked_req=None,
             )
         )
 
@@ -205,6 +245,7 @@ class TestPreemptDecodeRelease(CustomTestCase):
         # retraction drops the uncached tail.
         keep = _running("keep", input_len=10, output_len=5)
         victim = _running("victim", input_len=10, output_len=7)
+        victim.kv.req_pool_idx = 3  # decoding: holds a KV row
         tree_cache = object()
         retirer = RequestRetirer(
             tree_cache=tree_cache,
@@ -228,10 +269,9 @@ class TestPreemptDecodeRelease(CustomTestCase):
 
 
 class TestSchedulerPreemptGlue(CustomTestCase):
-    def test_released_decodes_leave_running_and_rejoin_the_waiting_queue(self):
+    def test_released_decodes_rejoin_the_waiting_queue(self):
         # A released request is no longer in any batch; if it does not
-        # re-enter the waiting queue it never finishes, and if it stays in the
-        # running set the scheduler counts it twice.
+        # re-enter the waiting queue it never finishes.
         sched = Scheduler.__new__(Scheduler)
         waiter = _req("w", input_len=100_000, queued_at=0.0)
         victim = _running("v", input_len=200_000, output_len=6_000)
@@ -244,7 +284,7 @@ class TestSchedulerPreemptGlue(CustomTestCase):
         sched.new_token_ratio_tracker = SimpleNamespace(current=0.5)
         sched.logical_page_size = PAGE
         sched.decode_offload_manager = None
-        sched.running_reqs = Mock()
+        sched.chunked_req = None
         sched.request_retirer = Mock()
         requeued = []
         sched._add_request_to_queue = lambda req, is_retracted=False: requeued.append(
@@ -257,7 +297,6 @@ class TestSchedulerPreemptGlue(CustomTestCase):
         with patch("time.perf_counter", return_value=100.0):
             sched._preempt_for_starving_waiters(batch)
         batch.preempt_decode.assert_called_once_with((0,), sched.request_retirer)
-        sched.running_reqs.leave.assert_called_once_with([victim])
         self.assertEqual(requeued, [(victim, True)])
 
 
