@@ -193,6 +193,8 @@ def _quick_all_reduce_tp4_int4(monkeypatch, first_min_bytes):
     quick_reduce.use_fp16_kernels = 1
     quick_reduce.qr_max_size = 2048 * MB
     quick_reduce.first_min_bytes = first_min_bytes
+    # No FlyDSL INT4 engine: the HIP kernel's input rules apply.
+    quick_reduce._flydsl_int4 = None
     return quick_reduce
 
 
