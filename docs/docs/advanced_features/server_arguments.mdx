@@ -270,6 +270,24 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-decode-warmup`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Before the scheduler reports ready, run one prefill and one speculative decode round on dummy requests at each --decode-warmup-batch-sizes, so the first decode round's one-time costs (JIT builds, first-call setup) land at startup. The requests sample with --preferred-sampling-params, else the SamplingParams defaults, as a request without sampling parameters on the native or Engine path; with the OpenAI server's --sampling-defaults model, set --preferred-sampling-params to the served mode. They never enter the radix tree, and their slots and the RNG states are restored. EAGLE v2 speculative decoding only; skipped with a warning on PD prefill, pipeline, DP-attention or HiSparse servers. A failed round stops the server. Requires <code>SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--decode-warmup-batch-sizes`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Batch sizes of the --enable-decode-warmup rounds, each capped at --max-running-requests.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`[16, 4, 2, 1]`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int (one or more)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--decode-warmup-prompt-len`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Prompt tokens per dummy request of the --enable-decode-warmup rounds, capped so each batch fits the prefill budget.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`2048`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--nccl-port`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The port for NCCL distributed environment setup. Defaults to a random port.</td>

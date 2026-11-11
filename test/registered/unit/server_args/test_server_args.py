@@ -1544,6 +1544,66 @@ class TestFreezeGcAfterStartupArgs(unittest.TestCase):
             self._check(freeze_gc_after_startup=True)
 
 
+class TestDecodeWarmupArgs(unittest.TestCase):
+    """--enable-decode-warmup and its round shape: off by default, a runtime
+    optimization under SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION, positive sizes."""
+
+    @staticmethod
+    def _check(**kwargs):
+        ServerArgs(
+            model_path="dummy",
+            served_model_name="dummy",
+            chunked_prefill_size=-1,
+            **kwargs,
+        ).check_server_args()
+
+    def test_cli_flags_and_defaults(self):
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+            args = prepare_server_args(
+                [
+                    "--model-path",
+                    "dummy",
+                    "--enable-decode-warmup",
+                    "--decode-warmup-batch-sizes",
+                    "8",
+                    "1",
+                    "--decode-warmup-prompt-len",
+                    "8192",
+                ]
+            )
+        self.assertTrue(args.enable_decode_warmup)
+        self.assertEqual(args.decode_warmup_batch_sizes, [8, 1])
+        self.assertEqual(args.decode_warmup_prompt_len, 8192)
+        defaults = ServerArgs(model_path="dummy")
+        self.assertFalse(defaults.enable_decode_warmup)
+        self.assertEqual(defaults.decode_warmup_batch_sizes, [16, 4, 2, 1])
+        self.assertEqual(defaults.decode_warmup_prompt_len, 2048)
+
+    def test_invalid_sizes_are_refused(self):
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+            for sizes, prompt in (([], 2048), ([4, 0], 2048), ([4], 0)):
+                with (
+                    self.subTest(sizes=sizes, prompt=prompt),
+                    self.assertRaisesRegex(ValueError, "decode-warmup"),
+                ):
+                    self._check(
+                        enable_decode_warmup=True,
+                        decode_warmup_batch_sizes=sizes,
+                        decode_warmup_prompt_len=prompt,
+                    )
+            # Off, the shape is not checked.
+            self._check(decode_warmup_batch_sizes=[], decode_warmup_prompt_len=0)
+
+    def test_requires_the_runtime_master(self):
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION=1"
+            ):
+                self._check(enable_decode_warmup=True)
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+            self._check(enable_decode_warmup=True)
+
+
 class TestKV4Compatibility(unittest.TestCase):
     def setUp(self):
         self._use_mla_backend_patcher = patch(

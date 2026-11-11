@@ -7136,6 +7136,16 @@ def run_scheduler_process(
     try:
         scheduler = Scheduler(server_args, port_args)
 
+        if get_serving().enable_decode_warmup:
+            from sglang.srt.managers.startup_warmup import run_decode_warmup
+
+            run_decode_warmup(
+                scheduler,
+                batch_sizes=get_serving().decode_warmup_batch_sizes,
+                prompt_len=get_serving().decode_warmup_prompt_len,
+                sampling=get_serving().preferred_sampling_params,
+            )
+
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 

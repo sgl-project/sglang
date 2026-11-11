@@ -574,5 +574,8 @@ POSITIONAL_FIELD_ORDER = (
     "disaggregation_max_top_logprobs_num",
     "shortest_prefill_aging_factor",
     "freeze_gc_after_startup",
+    "enable_decode_warmup",
+    "decode_warmup_batch_sizes",
+    "decode_warmup_prompt_len",
 )
 # fmt: on
