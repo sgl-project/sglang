@@ -86,10 +86,9 @@ _EDITORS = {
     "managers/scheduler_components/request_list.py",
     "managers/scheduler_components/request_retirer.py",
 }
-# The other code that edits a list directly, with its number of edits. Each
-# entry takes a request out before or without its release (a step's finished
-# requests, a deferred release, a staged request retracted), or edits a list
-# the retirer does not reach.
+# The other code that edits a list directly, with its count: each takes a
+# request out before or without its release, or edits a list the retirer does
+# not reach.
 _DIRECT_EDITS = {
     "disaggregation/decode.py:DecodeTransferQueue.resolve_deferred_releases": 1,
     "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.process_prefill_chunk": 1,
@@ -196,6 +195,23 @@ class TestMove(CustomTestCase):
         queue._drop_all()
 
         self.assertEqual([r.owner_list for r in (a, b, c)], [None, None, None])
+
+    def test_a_request_moved_on_reads_as_gone(self):
+        a, b = _reqs("ab")
+        queue = IndexedReqList(ListKind.WAITING)
+        move([a, b], queue)
+        other = KeyedReqList(ListKind.DECODING)
+
+        move([a], other)
+
+        self.assertEqual(list(queue), [b])
+        self.assertIs(queue[0], b)
+        self.assertEqual(list(queue.items()), [b])
+        self.assertEqual(len(queue), 1)
+        self.assertNotIn(a, queue)
+        queue._drop_all()
+        self.assertIs(a.owner_list, other)
+        self.assertIsNone(b.owner_list)
 
     def test_a_request_back_in_the_list_it_left_is_in_it_once(self):
         a, b = _reqs("ab")

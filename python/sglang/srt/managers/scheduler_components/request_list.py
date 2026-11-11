@@ -162,7 +162,8 @@ class IndexedReqList(ReqList):
         self._abort = abort
         self._req_of = req_of
         # May still hold items whose request left: a leave only clears the
-        # owner, and the next read or join drops those items in one pass.
+        # owner; the next iteration, index, join or reorder drops them in one
+        # pass.
         self._items: List[Any] = []
         self._num_left = 0
 

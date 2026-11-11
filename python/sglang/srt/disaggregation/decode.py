@@ -189,10 +189,9 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 @dataclass
 class _HostStagedAdmissionStats:
-    # One transfer pass: running/retracted/waiting queues do not change. The
-    # device transfer count is read once, at the first admission: an entry
-    # released before it is not counted. Only admission changes it after
-    # that. Allocator and radix-cache counters stay live.
+    # One transfer pass: running/retracted/waiting queues do not change; the
+    # device transfer count is read at the first admission and changes only by
+    # admission after it. Allocator and radix-cache counters stay live.
     retractable_tokens: Optional[int] = None
     retractable_window_tokens: Optional[Dict[str, int]] = None
     max_req_tokens: Optional[int] = None

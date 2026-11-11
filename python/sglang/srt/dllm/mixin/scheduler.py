@@ -470,17 +470,14 @@ class DllmManager:
         return [req for req in last_batch.reqs if req in self.waiting_queue]
 
     def is_empty(self) -> bool:
-        """Check if the waiting queue is empty or DLLM is not configured."""
         if self.dllm_config is None:
             return True
         return len(self.waiting_queue) == 0
 
     def filter_finished_reqs(self) -> None:
-        """Remove finished requests from the waiting queue."""
         self.take(lambda req: req.finished())
 
     def take(self, pred: Callable[[Req], bool]) -> List[Req]:
-        """Drop and return requests matching `pred`."""
         taken = [req for req in self.waiting_queue if pred(req)]
         self.waiting_queue._leave(taken)
         return taken

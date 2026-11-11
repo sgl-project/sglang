@@ -248,15 +248,16 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
 
     def test_staged_are_the_last_rounds_requests_still_waiting(self):
         manager = DllmManager(SimpleNamespace(max_running_requests=4), abort=None)
-        new, ran, aborted = (
-            Mock(rid=rid, owner_list=None) for rid in ("new", "ran", "aborted")
+        first, second, aborted, unrun = (
+            Mock(rid=rid, owner_list=None)
+            for rid in ("first", "second", "aborted", "unrun")
         )
-        move([new, ran, aborted], manager.waiting_queue)
+        move([first, second, aborted, unrun], manager.waiting_queue)
         manager.take(lambda req: req is aborted)
 
         # In the round's order, not the queue's.
-        last_batch = SimpleNamespace(reqs=[aborted, ran, new])
-        self.assertEqual(manager.staged_reqs(last_batch), [ran, new])
+        last_batch = SimpleNamespace(reqs=[aborted, second, first])
+        self.assertEqual(manager.staged_reqs(last_batch), [second, first])
         self.assertEqual(manager.staged_reqs(None), [])
 
 

@@ -698,7 +698,8 @@ class SchedulerInvariantChecker:
 
     def _check_ended_requests(self) -> None:
         """At idle, every request the scheduler kept is in a list (held, parked,
-        deferred) or has sent its final output and exited through the retirer."""
+        deferred) or has sent its final output and exited through the retirer;
+        a decode offload's exit waits for its copy."""
         self.unended = {
             req for req in self.unended if req.send_via is None or req.exit_via is None
         }

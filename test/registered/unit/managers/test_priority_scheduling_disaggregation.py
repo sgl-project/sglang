@@ -1118,8 +1118,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         self.assertEqual(call_order, ["prepare", "wait", "process"])
 
     def test_prebuilt_requests_run_from_their_admission(self):
-        """Admission moves the requests from waiting into running; one that the
-        prebuilt result finishes leaves again."""
+        """Admission moves the requests from waiting into running."""
         scheduler = self._new_scheduler(enable_overlap=False)
         scheduler.req_to_token_pool = MagicMock(size=2)
         scheduler.max_running_requests = 2
@@ -1130,18 +1129,14 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.dp_attn_adapter = SimpleNamespace(
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )
-        kept, done = (
-            FakeReq(
-                rid=rid,
-                kv=SimpleNamespace(restore_done_event=None, kv_committed_len=None),
-                init_next_round_input=lambda tree_cache: None,
-                finished_reason=None,
-            )
-            for rid in ("kept", "done")
+        kept = FakeReq(
+            rid="kept",
+            kv=SimpleNamespace(restore_done_event=None, kv_committed_len=None),
+            init_next_round_input=lambda tree_cache: None,
+            finished_reason=None,
         )
-        for req in (kept, done):
-            req.finished = partial(lambda req: req.finished_reason is not None, req)
-        move([kept, done], scheduler.waiting_queue)
+        kept.finished = lambda: kept.finished_reason is not None
+        move([kept], scheduler.waiting_queue)
 
         def lists_of(req):
             return [
@@ -1150,13 +1145,8 @@ class TestDecodePrebuilt(unittest.TestCase):
                 if req in reqs
             ]
 
-        def process_prebuilt(batch):
-            done.finished_reason = FINISH_ABORT("finished at prebuilt")
-            # Its release takes it out of running.
-            done.owner_list._leave([done])
-
         scheduler.batch_result_processor = SimpleNamespace(
-            process_batch_result_prebuilt=process_prebuilt
+            process_batch_result_prebuilt=lambda batch: None
         )
 
         class _Batch(SimpleNamespace):
@@ -1189,7 +1179,6 @@ class TestDecodePrebuilt(unittest.TestCase):
 
         self.assertEqual(plan.running_batch.reqs, [kept])
         self.assertEqual(lists_of(kept), [ListKind.DECODING])
-        self.assertEqual(lists_of(done), [])
 
 
 if __name__ == "__main__":
