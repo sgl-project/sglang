@@ -218,6 +218,8 @@ def triton_sparse_mla_decode_splitk(
                     and topk >= 2048
                     and _page_offsets_fit_i32(kv.shape[0], kv_dim)
                 ),
+                # a runtime per-row key bound under 3 stages corrupts rows past two tiles
+                PIPE_STAGES=1 if use_topk_length else 3,
                 num_warps=fused_num_warps,
                 num_stages=2,
             )
