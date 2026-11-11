@@ -9,11 +9,13 @@ import logging
 from typing import Any, Optional, Sequence
 
 import msgspec
+import torch
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.decl import (
     KVLayerDecl,
+    RequestLifetime,
     StateLifetime,
     WindowLifetime,
 )
@@ -27,7 +29,7 @@ from sglang.srt.mem_cache.kv.plan import (
     PlannedSubPool,
     plan_kv_storage,
 )
-from sglang.srt.mem_cache.kv.requests import RequestTable, StateTracking
+from sglang.srt.mem_cache.kv.requests import RequestTable, RowUnits, StateTracking
 from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
 from sglang.srt.mem_cache.kv.sizing import (
     KVSizingInputs,
@@ -110,12 +112,25 @@ def _build_request_table(
     )
 
 
+def _request_parts_of(
+    plan: KVStoragePlan, arena: KVArena, owner: str
+) -> dict[str, torch.Tensor]:
+    """The request sub-pools' views of the parts sub-pool ``owner`` declared,
+    by their names within ``owner``."""
+    prefix = f"{owner}."
+    return {
+        name.removeprefix(prefix): view
+        for sub_pool in plan.requests()
+        for name, view in sub_pool.spec.part_views(arena).items()
+        if name.startswith(prefix)
+    }
+
+
 def _build_state_storage(
     plan: KVStoragePlan,
     arena: KVArena,
     ctx: UnifiedBuildContext,
     scratch: FixedMemory,
-    request_memory: FixedMemory,
 ) -> StateStorage:
     """The state sub-pool's storage, without its slots: those come from the
     chain allocator's state band (`_wire_mamba_slot_allocator`)."""
@@ -126,11 +141,7 @@ def _build_state_storage(
         spec=state.spec,
         mamba_layer_ids=layer_ids,
         enable_memory_saver=ctx.enable_memory_saver,
-        request_parts={
-            name.removeprefix(f"{state.name}."): tensor
-            for name, tensor in request_memory.tensors.items()
-            if name.startswith(f"{state.name}.")
-        },
+        request_parts=_request_parts_of(plan, arena, state.name),
         intermediate_ssm=scratch.tensors.get(f"{state.name}.intermediate_ssm"),
         intermediate_conv_window=(
             [
@@ -217,12 +228,6 @@ def build_kv_storage(
         device=ctx.device,
         enable_memory_saver=ctx.enable_memory_saver,
     )
-    request_memory = FixedMemory(
-        [d.part for d in plan.request_parts],
-        rows=sized.request_rows,
-        device=ctx.device,
-        enable_memory_saver=ctx.enable_memory_saver,
-    )
     for sub_pool in plan.sub_pools:
         parts = [d.part for d in plan.derived_parts if d.sub_pool == sub_pool.name]
         if parts:
@@ -232,7 +237,11 @@ def build_kv_storage(
                 device=ctx.device,
                 enable_memory_saver=ctx.enable_memory_saver,
             )
-    token_sub_pools = [s for s in plan.owner_first() if s is not state]
+    token_sub_pools = [
+        s
+        for s in plan.owner_first()
+        if s is not state and not isinstance(s.lifetime, RequestLifetime)
+    ]
     views = {s.name: _build_token_view(s, arena, plan, ctx) for s in token_sub_pools}
     # Without a window, capacity uses the configured cap;
     # window chains use the owner's current arena slots.
@@ -271,7 +280,7 @@ def build_kv_storage(
     req_to_token_pool = _build_request_table(plan, ctx, sized)
     state_storage = None
     if state is not None:
-        state_storage = _build_state_storage(plan, arena, ctx, scratch, request_memory)
+        state_storage = _build_state_storage(plan, arena, ctx, scratch)
         views[state.name] = state_storage.pool
     legacy_capacities = {}
     if window is not None and state is not None:
@@ -288,6 +297,7 @@ def build_kv_storage(
             windows=tuple(
                 s.name for s in plan.sub_pools if isinstance(s.lifetime, WindowLifetime)
             ),
+            requests=tuple(s.name for s in plan.requests()),
         ),
         kvcache=token_to_kv_pool,
         views=views,
@@ -297,6 +307,7 @@ def build_kv_storage(
         forward_stream=ctx.forward_stream,
         lazy_compaction=ctx.lazy_compaction,
         full_cap_tokens=sized.full_cap_tokens,
+        request_rows=sized.request_rows,
         **legacy_capacities,
     )
     if window is None:
@@ -318,7 +329,12 @@ def build_kv_storage(
         )
         allocator.state = state_storage
     allocator.plan = plan
-    allocator.request_memory = request_memory
+    if plan.requests():
+        req_to_token_pool.bind_row_units(
+            RowUnits(
+                bind=allocator.alloc_request_rows, free=allocator.free_request_rows
+            )
+        )
     allocator.storage = KVStorage(
         plan=plan,
         sized=sized,
@@ -327,7 +343,6 @@ def build_kv_storage(
         start_layer=ctx.start_layer,
         requests=req_to_token_pool,
         scratch=scratch,
-        request_memory=request_memory,
     )
     _log_banner(
         "UNIFIED MEMORY POOL ENABLED -- sub-pools %s"
