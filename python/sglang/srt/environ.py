@@ -942,6 +942,8 @@ class Envs:
     SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(None)
     # With the master: CTA quota of the page_first Mamba state load.
     SGLANG_HICACHE_MAMBA_LOAD_BLOCK_QUOTA = EnvInt(None)
+    # With the master: the Mamba host pool's GB of --hicache-size (sglang#47867).
+    SGLANG_HICACHE_MAMBA_SIZE_GB = EnvFloat(None)
     # Seconds between cache-residency counter logs; 0 disables them.
     SGLANG_HICACHE_RESIDENCY_LOG_INTERVAL = EnvInt(300)
     # Base token count for each MLA/DSA dedup broadcast chunk.
