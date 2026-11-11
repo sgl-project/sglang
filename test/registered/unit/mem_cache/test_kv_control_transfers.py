@@ -581,6 +581,115 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
         service.progress()
         return span
 
+    def test_queued_reads_do_not_evict_host_cache_before_io_is_ready(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        for cancel in (False, True):
+            with (
+                self.subTest(cancel=cancel),
+                hicache(self, namespace_keys=True) as owner,
+            ):
+                _, cache, service, dma = owner
+                scopes = [cache_fixtures.target(range(i, i + 24)) for i in (1, 25, 49)]
+                self._cold_scopes(owner, scopes)
+                hot = seed(cache, range(129, 193))
+                backup_prefix(cache, dma, hot, evict=True)
+                cc = cache.cache_controller
+                entered, release = threading.Event(), threading.Event()
+                original = cc.page_get_func
+                requests = [
+                    CacheRequestHandle(f"bounded-read-{i}", 0) for i in range(3)
+                ]
+
+                def blocked_get(*args, **kwargs):
+                    entered.set()
+                    assert release.wait(5)
+                    return original(*args, **kwargs)
+
+                def started():
+                    cache.drain_storage_control_queues()
+                    return entered.is_set()
+
+                borrowed = None
+                try:
+                    with (
+                        patch.object(cc, "page_get_func", blocked_get),
+                        patch.object(cache, "prefetch_threshold", 1),
+                        patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                    ):
+                        self._ordinary_prefetch(cache, service, scopes[0], requests[0])
+                        wait_for(service, started)
+                        for scope, request in zip(scopes[1:], requests[1:]):
+                            self._ordinary_prefetch(cache, service, scope, request)
+
+                        def queried():
+                            cache.drain_storage_control_queues()
+                            return all(
+                                cache.ongoing_prefetch[r].operation.storage_hit_count
+                                == 24
+                                for r in requests
+                            )
+
+                        wait_for(service, queried)
+                        cache.drain_storage_control_queues()
+                        self.assertIsNotNone(hot.component_data[FULL].host_value)
+                        self.assertIsNone(
+                            cache.ongoing_prefetch[requests[2]].host_indices
+                        )
+                        self.assertEqual(cc.prefetch_buffer.qsize(), 1)
+                        cache.drain_storage_control_queues_local()
+                        self.assertIsNone(
+                            cache.ongoing_prefetch[requests[2]].host_indices
+                        )
+                        if cancel:
+                            borrowed = self._restore(
+                                service, scopes[2], "deferred-owner"
+                            )
+                            cache.release_aborted_request(requests[2])
+                            service.control.cancel(borrowed.ref)
+                            self.assertEqual(
+                                wait(service, borrowed).status, Status.CANCELLED
+                            )
+                            self.assertFalse(release.is_set())
+                            self.assertNotIn(requests[2], cache.ongoing_prefetch)
+                        release.set()
+                        for request in requests[:2] if cancel else requests:
+                            self.assertEqual(
+                                self._consume_ordinary_prefetch(
+                                    cache, service, request
+                                ),
+                                (24, 0),
+                            )
+                        pool = cache.host_pool_group.anchor_entry.host_pool
+                        for index, target in enumerate(
+                            scopes[:2] if cancel else scopes
+                        ):
+                            for node, *_ in service.control.executor._walk(
+                                target.token_ids,
+                                service.control.executor._compatibility(target),
+                            ):
+                                indices = node.component_data[FULL].host_value
+                                self.assertIsNotNone(indices)
+                                self.assertTrue(
+                                    torch.all(
+                                        pool.k_buffer[0][indices] == 7 + index * 2
+                                    )
+                                )
+                                self.assertTrue(
+                                    torch.all(
+                                        pool.v_buffer[0][indices] == 8 + index * 2
+                                    )
+                                )
+                finally:
+                    release.set()
+                    for request in requests:
+                        if request in cache.ongoing_prefetch:
+                            self._consume_ordinary_prefetch(cache, service, request)
+                    if borrowed is not None:
+                        wait(service, borrowed)
+                assert_retired(cache, service)
+                cache.sanity_check()
+
     def test_cancelled_queued_read_drains_before_later_storage_io(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
@@ -611,10 +720,10 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     first = self._restore(service, scopes[0], "active")
                     results.append(first)
                     wait_for(service, entered[0].is_set)
-                    self._ordinary_prefetch(cache, service, scopes[1], request)
                     cancelled = self._restore(service, scopes[2], "cancel-queued")
                     results.append(cancelled)
-                    wait_for(service, lambda: cc.prefetch_buffer.qsize() == 2)
+                    wait_for(service, lambda: cc.prefetch_buffer.qsize() == 1)
+                    self._ordinary_prefetch(cache, service, scopes[1], request)
                     self.assertFalse(
                         service.control.cancel(cancelled.ref).update.quiescent
                     )

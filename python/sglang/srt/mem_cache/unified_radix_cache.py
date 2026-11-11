@@ -3273,11 +3273,17 @@ class UnifiedRadixCache(BasePrefixCache):
                     yield item
 
         buffer_mode = self.host_memory_mode == "buffer_only"
+        defer_read_staging = (
+            not buffer_mode
+            and self._native_storage_reads() is not None
+            and len(self.tree_components) == 1
+            and BASE_COMPONENT_TYPE in self.tree_components
+            and not cc.prefetch_completion_sync_groups
+        )
 
         def _try_alloc_storage_hit(operation) -> bool:
             """Allocate the hit-sized bounce and launch the transfer.
-            Returns False when staging pressure defers the allocation
-            (buffer mode parks and retries; cache mode revokes)."""
+            Return False when staging or I/O pressure defers the allocation."""
             request = operation.handle
             info = self.ongoing_prefetch.get(request)
             hit_tokens = operation.storage_hit_count
@@ -3287,6 +3293,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.revoke_pending_prefetch(request)
                 return True
 
+            if defer_read_staging and not cc.prefetch_buffer.empty():
+                # The single I/O consumer needs at most one ready successor.
+                # Keep later hits allocation-free instead of evicting useful L2
+                # entries while they wait for storage I/O.
+                return False
             if buffer_mode and cc.prefetch_rate_limited():
                 # Pool is load-saturated: hold the KNOWN hit until staged
                 # prefetches ahead of us are consumed. The op stays in
@@ -3387,6 +3398,17 @@ class UnifiedRadixCache(BasePrefixCache):
             return True
 
         def _drain_and_alloc_storage_hit():
+            deferred_ahead = False
+            if defer_read_staging and log_metrics:
+                # The existing owner table also owns cancellation/reset. No
+                # separate queue may retain a retired request or its buffers.
+                for info in tuple(self.ongoing_prefetch.values()):
+                    operation = info.operation
+                    if getattr(operation, "waiting_for_io_slot", False):
+                        if not _try_alloc_storage_hit(operation):
+                            deferred_ahead = True
+                            break
+                        operation.waiting_for_io_slot = False
             # Parked hits first (FIFO fairness with retries; buffer only).
             if buffer_mode:
                 parked = self.buffer_pipeline.pending_hit_allocs
@@ -3444,13 +3466,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._account_prefetch_outcome(operation, revoked=False)
                 # A parked hit keeps its turn: a newer hit must not take the
                 # staging or anchor budget the parked head is waiting for.
-                parked_ahead = buffer_mode and bool(
-                    self.buffer_pipeline.pending_hit_allocs
+                parked_ahead = deferred_ahead or (
+                    buffer_mode and bool(self.buffer_pipeline.pending_hit_allocs)
                 )
                 if parked_ahead or not _try_alloc_storage_hit(operation):
                     # Counted once at first parking, not per retry tick.
                     self._prefetch_outcome_stats["declined_rate_limited"] += 1
-                    self.buffer_pipeline.pending_hit_allocs.append(operation)
+                    if buffer_mode:
+                        self.buffer_pipeline.pending_hit_allocs.append(operation)
+                    else:
+                        operation.waiting_for_io_slot = True
+                        deferred_ahead = True
 
         def _drain_ack_prefetch():
             for ack in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):
