@@ -474,6 +474,19 @@ class PrefillBootstrapQueue:
             self.is_mla_backend,
             **kv_manager_kwargs,
         )
+        if kv_args.kv_page_row_head_layout is not None:
+            from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+
+            # Page-row KV (and the draft KV next to it) is head-sliced with a GPU gather.
+            if isinstance(kv_manager, MooncakeKVManager):
+                kv_manager.set_gather_kv_tensors(
+                    row_tensors=self.token_to_kv_pool.get_sparse_kv_tensors(),
+                    draft_tensors=(
+                        draft_kv_pool._pd_registerable_tensors()
+                        if draft_kv_pool is not None
+                        else []
+                    ),
+                )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()

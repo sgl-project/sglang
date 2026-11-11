@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import dataclasses
 import logging
 import os
@@ -288,6 +289,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        # Prefill with page-row KV: the row and draft KV tensors whose decode-rank
+        # head slices are gathered on the GPU before the transfer (set_gather_kv_tensors),
+        # and each transfer thread's registered scratch for it.
+        self.gather_row_tensors: Optional[List[torch.Tensor]] = None
+        self.gather_draft_tensors: Optional[List[torch.Tensor]] = None
+        self._gather_local = threading.local()
         self.max_transfer_batch_indices = (
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
         )
@@ -567,6 +574,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             "page_size": page_size,
             "slot_layer_ids": list(slot_layer_ids or []),
         }
+
+    def set_gather_kv_tensors(
+        self,
+        *,
+        row_tensors: List[torch.Tensor],
+        draft_tensors: List[torch.Tensor],
+    ) -> None:
+        """The page-row KV ([pages, row_bytes] per layer) and draft KV ([slots, heads,
+        head_dim]) tensors behind kv_data_ptrs, in that order: send_kvcache_page_row_slice
+        gathers a decode rank's heads of them on the GPU and sends whole decode pages."""
+        self.gather_row_tensors = list(row_tensors)
+        self.gather_draft_tensors = list(draft_tensors)
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
         self.engine.batch_register([ptr], [size])
@@ -2114,6 +2133,40 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
             return -1
 
+        rows = self.gather_row_tensors
+        dst_covered = sum(num_heads * per_head for _, per_head in dst_segments)
+        if (
+            rows is not None
+            and len(rows) == num_rows
+            and dst_head_start == 0
+            and dst_covered == dst_row_bytes
+        ):
+            # The decode rank holds exactly these heads: gather its whole rows.
+            def gather_rows(row):
+                def gather(idx, out):
+                    picked = row.index_select(0, idx)
+                    for (src_off, per_head), (dst_off, _) in zip(
+                        src_segments, dst_segments
+                    ):
+                        lo = src_off + src_head_start * per_head
+                        out[:, dst_off : dst_off + num_heads * per_head].copy_(
+                            picked[:, lo : lo + num_heads * per_head]
+                        )
+
+                return gather
+
+            ret = self._send_gathered_pages(
+                mooncake_session_id,
+                src_pages=prefill_kv_indices,
+                dst_pages=dst_kv_indices,
+                gathers=[gather_rows(rows[i]) for i, _ in pairs],
+                dst_ptrs=[dst_kv_ptrs[j] for _, j in pairs],
+                page_bytes=dst_row_bytes,
+                device=rows[0].device,
+            )
+        else:
+            ret = None
+
         def process_layer(src_ptr: int, dst_ptr: int) -> int:
             src_addrs, dst_addrs, lengths = build_page_row_head_slice_blocks(
                 src_ptr=src_ptr,
@@ -2137,11 +2190,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 lengths.tolist(),
             )
 
-        futures = [
-            executor.submit(process_layer, kv_args.kv_data_ptrs[i], dst_kv_ptrs[j])
-            for i, j in pairs
-        ]
-        ret = self._await_transfer_futures(futures)
+        if ret is None:
+            futures = [
+                executor.submit(process_layer, kv_args.kv_data_ptrs[i], dst_kv_ptrs[j])
+                for i, j in pairs
+            ]
+            ret = self._await_transfer_futures(futures)
         if ret != 0 or kv_args.num_draft_entries == 0:
             return ret
 
@@ -2158,6 +2212,46 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"{dst_draft_item_lens} on the decode peer"
             )
             return -1
+        dst_draft_item_len = next(iter(dst_draft_item_lens))
+        drafts = self.gather_draft_tensors
+        if drafts and len(drafts) == kv_args.num_draft_entries and dst_head_start == 0:
+            page_size = kv_args.page_size
+            head_dim = drafts[0].shape[-1]
+            page_bytes = page_size * num_heads * head_dim * drafts[0].element_size()
+            if page_bytes == dst_draft_item_len:
+                # The decode rank holds exactly these heads: gather its whole pages.
+                def gather_draft(t):
+                    paged = t[: t.shape[0] // page_size * page_size].view(
+                        -1, page_size, t.shape[1], head_dim
+                    )[:, :, src_head_start : src_head_start + num_heads]
+
+                    def gather(idx, out):
+                        torch.index_select(
+                            paged,
+                            0,
+                            idx,
+                            out=out.view(t.dtype).view(
+                                -1, page_size, num_heads, head_dim
+                            ),
+                        )
+
+                    return gather
+
+                draft_pairs = build_transfer_entry_pairs(
+                    draft_layer_ids,
+                    dst_layer_ids,
+                    len(draft_layer_ids),
+                    len(dst_kv_ptrs),
+                )
+                return self._send_gathered_pages(
+                    mooncake_session_id,
+                    src_pages=prefill_kv_indices,
+                    dst_pages=dst_kv_indices,
+                    gathers=[gather_draft(drafts[i]) for i, _ in draft_pairs],
+                    dst_ptrs=[dst_kv_ptrs[j] for _, j in draft_pairs],
+                    page_bytes=page_bytes,
+                    device=drafts[0].device,
+                )
         return self.send_kvcache_slice(
             mooncake_session_id,
             prefill_kv_indices,
@@ -2165,13 +2259,91 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_kv_indices,
             dst_tp_rank,
             dst_attn_tp_size,
-            dst_draft_item_lens.pop(),
+            dst_draft_item_len,
             executor,
             dst_layer_ids=dst_layer_ids,
             src_data_ptrs=kv_args.kv_data_ptrs[num_rows:],
             src_layer_ids=draft_layer_ids,
             src_item_lens=kv_args.kv_item_lens[num_rows:],
         )
+
+    def _gather_scratch(self, device: torch.device):
+        """This transfer thread's registered GPU scratch and gather stream."""
+        local = self._gather_local
+        if getattr(local, "buf", None) is None:
+            nbytes = envs.SGLANG_DISAGG_GATHER_SCRATCH_MB.get() << 20
+            buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
+            # High priority: ROCm puts it on a hardware queue of its own, where a
+            # normal-priority stream could share the forward's in-order queue
+            # (GPU_MAX_HW_QUEUES) and wait for the forward in flight.
+            local.stream = (
+                torch.cuda.Stream(device=device, priority=-1)
+                if device.type == "cuda"
+                else None
+            )
+            self.engine.batch_register([buf.data_ptr()], [nbytes])
+            local.buf = buf
+        return local.buf, local.stream
+
+    def _send_gathered_pages(
+        self,
+        mooncake_session_id: str,
+        *,
+        src_pages: npt.NDArray[np.int32],
+        dst_pages: npt.NDArray[np.int32],
+        gathers: list,
+        dst_ptrs: list[int],
+        page_bytes: int,
+        device: torch.device,
+    ) -> int:
+        """Move src_pages of several entries to dst_pages of a decode rank whose page
+        is page_bytes. gathers[e](src_page_ids, out) writes entry e's decode pages
+        for those source pages into out ([n, page_bytes] uint8) on the GPU; the
+        scratch is then copied with one transfer per run of consecutive decode pages.
+        """
+        buf, stream = self._gather_scratch(device)
+        pages_per_round = max(1, buf.numel() // (page_bytes * len(gathers)))
+        base = buf.data_ptr()
+
+        # Every GPU op here runs on the scratch's own stream: on this thread's default
+        # (legacy null) stream the page-id upload would wait for the forward in flight.
+        def on_stream():
+            if stream is None:
+                return contextlib.nullcontext()
+            return torch.cuda.stream(stream)
+
+        with on_stream():
+            src_all = torch.as_tensor(
+                np.asarray(src_pages, dtype=np.int64), device=device
+            )
+        for start in range(0, len(src_pages), pages_per_round):
+            end = min(len(src_pages), start + pages_per_round)
+            n = end - start
+            with on_stream():
+                for e, gather in enumerate(gathers):
+                    out = buf[e * n * page_bytes : (e + 1) * n * page_bytes]
+                    gather(src_all[start:end], out.view(n, page_bytes))
+            if stream is not None:
+                stream.synchronize()
+            dst = np.asarray(dst_pages[start:end], dtype=np.int64)
+            # Runs of consecutive decode pages: the scratch is contiguous in page order.
+            breaks = np.flatnonzero(np.diff(dst) != 1) + 1
+            run_starts = np.concatenate(([0], breaks))
+            run_lens = np.diff(np.concatenate((run_starts, [n])))
+            src_addrs, dst_addrs, lengths = [], [], []
+            for e, dst_ptr in enumerate(dst_ptrs):
+                src_addrs.append(base + (e * n + run_starts) * page_bytes)
+                dst_addrs.append(dst_ptr + dst[run_starts] * page_bytes)
+                lengths.append(run_lens * page_bytes)
+            ret = self.engine.batch_transfer_sync(
+                mooncake_session_id,
+                np.concatenate(src_addrs).tolist(),
+                np.concatenate(dst_addrs).tolist(),
+                np.concatenate(lengths).tolist(),
+            )
+            if ret != 0:
+                return ret
+        return 0
 
     def send_aux(
         self,

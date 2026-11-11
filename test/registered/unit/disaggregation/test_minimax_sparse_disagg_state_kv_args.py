@@ -1,5 +1,6 @@
 import concurrent.futures
 import ctypes
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -18,6 +19,7 @@ from sglang.srt.disaggregation.utils import (
     get_kv_page_row_head_layout,
     setup_state_kv_args,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MiniMaxSparseKVPool
 from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
@@ -398,10 +400,182 @@ class TestMiniMaxFp8Staging(unittest.TestCase):
 class _MemcpyEngine:
     """Fake transfer engine: the peers share this process's memory."""
 
+    def __init__(self):
+        self.copies = 0
+
+    def batch_register(self, ptrs, lengths):
+        pass
+
     def batch_transfer_sync(self, session_id, src_addrs, dst_addrs, lengths):
+        self.copies += len(src_addrs)
         for src, dst, length in zip(src_addrs, dst_addrs, lengths):
             ctypes.memmove(dst, src, length)
         return 0
+
+
+def _randomize(tensor: torch.Tensor) -> None:
+    raw = tensor.view(torch.uint8)
+    raw.copy_(torch.randint(0, 256, raw.shape, dtype=torch.uint8))
+
+
+def _transfer_kv_args(pool, draft, *, kv_heads: int, tp_rank: int) -> KVArgs:
+    ptrs, lens, item_lens = pool.get_sparse_kv_buf_infos()
+    draft_ptrs, draft_lens, draft_item_lens = draft.get_contiguous_buf_infos()
+    kv_args = KVArgs()
+    kv_args.engine_rank = tp_rank
+    kv_args.kv_data_ptrs = ptrs + draft_ptrs
+    kv_args.kv_data_lens = lens + draft_lens
+    kv_args.kv_item_lens = item_lens + draft_item_lens
+    kv_args.num_draft_entries = len(draft_ptrs)
+    kv_args.kv_layer_ids = _kv_ids(pool, draft)
+    kv_args.kv_head_num = kv_heads
+    kv_args.total_kv_head_num = 4
+    kv_args.page_size = 128
+    kv_args.kv_page_row_head_layout = get_kv_page_row_head_layout(pool)
+    return kv_args
+
+
+def _page_row_manager(stage, stage_draft) -> MooncakeKVManager:
+    manager = object.__new__(MooncakeKVManager)
+    manager.kv_args = _transfer_kv_args(stage, stage_draft, kv_heads=4, tp_rank=0)
+    manager.attn_tp_size = 1
+    manager.pp_size = 4
+    manager.engine = _MemcpyEngine()
+    manager.enable_deferred_decode_kv_release = False
+    manager.gather_row_tensors = manager.gather_draft_tensors = None
+    manager._gather_local = threading.local()
+    return manager
+
+
+class TestMiniMaxNvfp4PageRowHeadSlicing(unittest.TestCase):
+    """PP4 x TP1 prefill (last stage, layers 45-59 + DSpark draft) to a TP4 / TP2
+    decode, bit-exact on random bytes: each decode rank receives exactly its KV
+    heads of every NVFP4 page-row component and of the bf16 draft KV, at the
+    decode's (non-contiguous) pages, and nothing else in its pools changes.
+    Token-major slicing (send_kvcache_slice) scrambles these head-major rows."""
+
+    START, END = 45, 60
+    SRC_PAGES = np.array([5, 2, 7, 3], dtype=np.int32)
+    DST_PAGES = np.array([11, 3, 16, 4], dtype=np.int32)
+
+    def _run(self, dst_tp: int, gather: bool = False, dst_pages=None):
+        stage = _m31_pool(self.START, self.END, nvfp4=True, size=1024)
+        stage_draft = _draft_pool(4, 1024)
+        _randomize(stage.main_pool.slab)
+        for buffer in stage_draft.k_buffer + stage_draft.v_buffer:
+            _randomize(buffer)
+        manager = _page_row_manager(stage, stage_draft)
+        if gather:
+            manager.set_gather_kv_tensors(
+                row_tensors=stage.get_sparse_kv_tensors(),
+                draft_tensors=stage_draft.k_buffer + stage_draft.v_buffer,
+            )
+        dst_pages = self.DST_PAGES if dst_pages is None else dst_pages
+
+        heads = 4 // dst_tp
+        executor = concurrent.futures.ThreadPoolExecutor(4)
+        self.addCleanup(executor.shutdown)
+        for rank in range(dst_tp):
+            with self.subTest(dst_tp=dst_tp, rank=rank):
+                decode = _m31_pool(0, M31_LAYERS, nvfp4=True, kv_heads=heads, size=2048)
+                decode_draft = _draft_pool(heads, 2048)
+                _randomize(decode.main_pool.slab)
+                for buffer in decode_draft.k_buffer + decode_draft.v_buffer:
+                    _randomize(buffer)
+                expected = decode.main_pool.slab.clone()
+                expected_draft = [
+                    b.clone() for b in decode_draft.k_buffer + decode_draft.v_buffer
+                ]
+                dst = _transfer_kv_args(
+                    decode, decode_draft, kv_heads=heads, tp_rank=rank
+                )
+                rc = manager.send_kvcache_page_row_slice(
+                    "session",
+                    self.SRC_PAGES,
+                    dst.kv_data_ptrs,
+                    dst_pages,
+                    rank,
+                    dst_tp,
+                    dst.kv_item_lens,
+                    executor,
+                    dst.kv_layer_ids,
+                )
+                self.assertEqual(rc, 0)
+
+                received = decode.main_pool.slab.clone()
+                decode.main_pool.slab.copy_(expected)
+                head_slice = slice(rank * heads, (rank + 1) * heads)
+                src_main, dst_main = stage.main_pool, decode.main_pool
+                for name in (
+                    "k_buffer",
+                    "k_scale_buffer",
+                    "v_buffer",
+                    "v_scale_buffer",
+                ):
+                    for layer in range(self.START, self.END):
+                        src_view = getattr(src_main, name)[layer - self.START]
+                        dst_view = getattr(dst_main, name)[layer]
+                        for sp, dp in zip(self.SRC_PAGES, dst_pages):
+                            dst_view[dp] = src_view[sp][head_slice]
+                self.assertTrue(torch.equal(received, decode.main_pool.slab))
+
+                # Bit patterns: random bf16 bytes hold NaNs, which never compare equal.
+                src_draft = stage_draft.k_buffer + stage_draft.v_buffer
+                dst_draft = decode_draft.k_buffer + decode_draft.v_buffer
+                for i, buffer in enumerate(expected_draft):
+                    bits = buffer.view(torch.int16)
+                    for sp, dp in zip(self.SRC_PAGES, dst_pages):
+                        bits[dp * 128 : (dp + 1) * 128] = src_draft[i].view(
+                            torch.int16
+                        )[sp * 128 : (sp + 1) * 128, head_slice]
+                    self.assertTrue(torch.equal(dst_draft[i].view(torch.int16), bits))
+        return manager.engine.copies
+
+    def test_tp1_to_tp4(self):
+        self._run(dst_tp=4)
+
+    def test_tp1_to_tp2(self):
+        self._run(dst_tp=2)
+
+    def test_gathered_tp1_to_tp4(self):
+        # Gathered: one copy per (entry, run of consecutive decode pages) instead of
+        # one per (row, page, component) and per (draft entry, token). 1 MiB of scratch
+        # holds 3 of the 4 pages' draft KV, so the gather also runs in two rounds.
+        rows, draft_entries = self.END - self.START, 2 * M31_DRAFT_LAYERS
+        pages = len(self.SRC_PAGES)
+        with envs.SGLANG_DISAGG_GATHER_SCRATCH_MB.override(1):
+            gathered = self._run(dst_tp=4, gather=True)
+        sliced = self._run(dst_tp=4)
+        self.assertEqual(sliced, 4 * (rows * pages * 4 + draft_entries * pages * 128))
+        # DST_PAGES has no two consecutive pages; rounds split runs too
+        self.assertEqual(gathered, 4 * (rows * pages + draft_entries * pages))
+
+    def test_gathered_consecutive_decode_pages(self):
+        pages = np.array([8, 9, 10, 11], dtype=np.int32)
+        gathered = self._run(dst_tp=4, gather=True, dst_pages=pages)
+        self.assertEqual(gathered, 4 * (self.END - self.START + 2 * M31_DRAFT_LAYERS))
+
+    def test_gathered_tp1_to_tp2(self):
+        self._run(dst_tp=2, gather=True)
+
+    def test_mismatched_row_geometry_fails_the_transfer(self):
+        stage = _m31_pool(self.START, self.END, nvfp4=True)
+        manager = _page_row_manager(stage, _draft_pool(4, 256))
+        # An FP8 (token-major) decode registers K and V per layer, not page rows.
+        decode = _m31_pool(0, M31_LAYERS, nvfp4=False, kv_heads=1)
+        dst = _transfer_kv_args(decode, _draft_pool(1, 256), kv_heads=1, tp_rank=0)
+        rc = manager.send_kvcache_page_row_slice(
+            "session",
+            self.SRC_PAGES[:1],
+            dst.kv_data_ptrs,
+            self.DST_PAGES[:1],
+            0,
+            4,
+            dst.kv_item_lens,
+            None,
+            dst.kv_layer_ids,
+        )
+        self.assertEqual(rc, -1)
 
 
 def _fill_randn(tensor: torch.Tensor) -> None:
@@ -572,141 +746,6 @@ class TestMiniMaxHandshakeAcrossAttentionTP(unittest.TestCase):
     def test_nixl_still_rejects(self):
         with self.assertRaisesRegex(RuntimeError, "matching attention TP sizes"):
             self._ensure(NixlKVManager)
-
-
-def _randomize(tensor: torch.Tensor) -> None:
-    raw = tensor.view(torch.uint8)
-    raw.copy_(torch.randint(0, 256, raw.shape, dtype=torch.uint8))
-
-
-def _transfer_kv_args(pool, draft, *, kv_heads: int, tp_rank: int) -> KVArgs:
-    ptrs, lens, item_lens = pool.get_sparse_kv_buf_infos()
-    draft_ptrs, draft_lens, draft_item_lens = draft.get_contiguous_buf_infos()
-    kv_args = KVArgs()
-    kv_args.engine_rank = tp_rank
-    kv_args.kv_data_ptrs = ptrs + draft_ptrs
-    kv_args.kv_data_lens = lens + draft_lens
-    kv_args.kv_item_lens = item_lens + draft_item_lens
-    kv_args.num_draft_entries = len(draft_ptrs)
-    kv_args.kv_layer_ids = _kv_ids(pool, draft)
-    kv_args.kv_head_num = kv_heads
-    kv_args.total_kv_head_num = 4
-    kv_args.page_size = 128
-    kv_args.kv_page_row_head_layout = get_kv_page_row_head_layout(pool)
-    return kv_args
-
-
-def _page_row_manager(stage, stage_draft) -> MooncakeKVManager:
-    manager = object.__new__(MooncakeKVManager)
-    manager.kv_args = _transfer_kv_args(stage, stage_draft, kv_heads=4, tp_rank=0)
-    manager.attn_tp_size = 1
-    manager.pp_size = 4
-    manager.engine = _MemcpyEngine()
-    manager.enable_deferred_decode_kv_release = False
-    return manager
-
-
-class TestMiniMaxNvfp4PageRowHeadSlicing(unittest.TestCase):
-    """PP4 x TP1 prefill (last stage, layers 45-59 + DSpark draft) to a TP4 / TP2
-    decode, bit-exact on random bytes: each decode rank receives exactly its KV
-    heads of every NVFP4 page-row component and of the bf16 draft KV, at the
-    decode's (non-contiguous) pages, and nothing else in its pools changes.
-    Token-major slicing (send_kvcache_slice) scrambles these head-major rows."""
-
-    START, END = 45, 60
-    SRC_PAGES = np.array([5, 2, 7, 3], dtype=np.int32)
-    DST_PAGES = np.array([11, 3, 16, 4], dtype=np.int32)
-
-    def _run(self, dst_tp: int):
-        stage = _m31_pool(self.START, self.END, nvfp4=True, size=1024)
-        stage_draft = _draft_pool(4, 1024)
-        _randomize(stage.main_pool.slab)
-        for buffer in stage_draft.k_buffer + stage_draft.v_buffer:
-            _randomize(buffer)
-        manager = _page_row_manager(stage, stage_draft)
-
-        heads = 4 // dst_tp
-        executor = concurrent.futures.ThreadPoolExecutor(4)
-        self.addCleanup(executor.shutdown)
-        for rank in range(dst_tp):
-            with self.subTest(dst_tp=dst_tp, rank=rank):
-                decode = _m31_pool(0, M31_LAYERS, nvfp4=True, kv_heads=heads, size=2048)
-                decode_draft = _draft_pool(heads, 2048)
-                _randomize(decode.main_pool.slab)
-                for buffer in decode_draft.k_buffer + decode_draft.v_buffer:
-                    _randomize(buffer)
-                expected = decode.main_pool.slab.clone()
-                expected_draft = [
-                    b.clone() for b in decode_draft.k_buffer + decode_draft.v_buffer
-                ]
-                dst = _transfer_kv_args(
-                    decode, decode_draft, kv_heads=heads, tp_rank=rank
-                )
-                rc = manager.send_kvcache_page_row_slice(
-                    "session",
-                    self.SRC_PAGES,
-                    dst.kv_data_ptrs,
-                    self.DST_PAGES,
-                    rank,
-                    dst_tp,
-                    dst.kv_item_lens,
-                    executor,
-                    dst.kv_layer_ids,
-                )
-                self.assertEqual(rc, 0)
-
-                received = decode.main_pool.slab.clone()
-                decode.main_pool.slab.copy_(expected)
-                head_slice = slice(rank * heads, (rank + 1) * heads)
-                src_main, dst_main = stage.main_pool, decode.main_pool
-                for name in (
-                    "k_buffer",
-                    "k_scale_buffer",
-                    "v_buffer",
-                    "v_scale_buffer",
-                ):
-                    for layer in range(self.START, self.END):
-                        src_view = getattr(src_main, name)[layer - self.START]
-                        dst_view = getattr(dst_main, name)[layer]
-                        for sp, dp in zip(self.SRC_PAGES, self.DST_PAGES):
-                            dst_view[dp] = src_view[sp][head_slice]
-                self.assertTrue(torch.equal(received, decode.main_pool.slab))
-
-                # Bit patterns: random bf16 bytes hold NaNs, which never compare equal.
-                src_draft = stage_draft.k_buffer + stage_draft.v_buffer
-                dst_draft = decode_draft.k_buffer + decode_draft.v_buffer
-                for i, buffer in enumerate(expected_draft):
-                    bits = buffer.view(torch.int16)
-                    for sp, dp in zip(self.SRC_PAGES, self.DST_PAGES):
-                        bits[dp * 128 : (dp + 1) * 128] = src_draft[i].view(
-                            torch.int16
-                        )[sp * 128 : (sp + 1) * 128, head_slice]
-                    self.assertTrue(torch.equal(dst_draft[i].view(torch.int16), bits))
-
-    def test_tp1_to_tp4(self):
-        self._run(dst_tp=4)
-
-    def test_tp1_to_tp2(self):
-        self._run(dst_tp=2)
-
-    def test_mismatched_row_geometry_fails_the_transfer(self):
-        stage = _m31_pool(self.START, self.END, nvfp4=True)
-        manager = _page_row_manager(stage, _draft_pool(4, 256))
-        # An FP8 (token-major) decode registers K and V per layer, not page rows.
-        decode = _m31_pool(0, M31_LAYERS, nvfp4=False, kv_heads=1)
-        dst = _transfer_kv_args(decode, _draft_pool(1, 256), kv_heads=1, tp_rank=0)
-        rc = manager.send_kvcache_page_row_slice(
-            "session",
-            self.SRC_PAGES[:1],
-            dst.kv_data_ptrs,
-            self.DST_PAGES[:1],
-            0,
-            4,
-            dst.kv_item_lens,
-            None,
-            dst.kv_layer_ids,
-        )
-        self.assertEqual(rc, -1)
 
 
 if __name__ == "__main__":

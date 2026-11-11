@@ -769,6 +769,10 @@ class MiniMaxM3Nvfp4KVPool(MiniMaxSparseKVPool):
     def get_sparse_kv_buf_infos(self):
         return self.main_pool.get_contiguous_buf_infos()
 
+    def get_sparse_kv_tensors(self):
+        """The [pages, row_bytes] page rows behind get_sparse_kv_buf_infos."""
+        return list(self.main_pool.rows)
+
     def page_row_head_layout(self, head_num: int) -> tuple[list[tuple[int, int]], int]:
         """main_page_row_head_layout of this pool's rows for a rank with head_num heads."""
         return main_page_row_head_layout(
