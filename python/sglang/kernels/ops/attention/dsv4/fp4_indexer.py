@@ -24,6 +24,74 @@ INDEX_K_SLOT_BYTES = INDEX_K_PAYLOAD_BYTES.value + INDEX_K_SCALE_BYTES.value
 _PAGED_BALANCED_MAX_BATCH = 4096
 
 
+@triton.jit(do_not_specialize=["length"])
+def _finish_prefill_indexer_topk_kernel(
+    indices,
+    slots,
+    tokens,
+    lengths,
+    raw,
+    pages,
+    length,
+    K: tl.constexpr,
+    I0: tl.constexpr,
+    I1: tl.constexpr,
+    S: tl.constexpr,
+    T: tl.constexpr,
+    L: tl.constexpr,
+    R0: tl.constexpr,
+    R1: tl.constexpr,
+    P0: tl.constexpr,
+    P1: tl.constexpr,
+    WRITE_PAGES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    idx = tl.load(indices + row * I0 + cols * I1, cols < K, -1).to(tl.int32)
+    idx = tl.sort(tl.where((idx >= 0) & (idx < length), idx, length), descending=False)
+    token = tl.load(tokens + row * T).to(tl.int64)
+    visible = tl.minimum(tl.load(lengths + row * L), length)
+    valid = (cols < K) & (idx < visible)
+    if WRITE_PAGES:
+        slot = tl.load(slots + idx * S, valid, -1)
+        tl.store(pages + token * P0 + cols * P1, slot, cols < K)
+    tl.store(raw + token * R0 + cols * R1, tl.where(valid, idx, -1), cols < K)
+
+
+def finish_prefill_indexer_topk(
+    indices: torch.Tensor,
+    slots: torch.Tensor,
+    tokens: torch.Tensor,
+    lengths: torch.Tensor,
+    raw_indices: torch.Tensor,
+    page_indices: torch.Tensor | None,
+    length: int,
+) -> None:
+    """Sort selected positions and write their physical slots in one launch."""
+    rows, k = indices.shape
+    if rows and k:
+        _finish_prefill_indexer_topk_kernel[(rows,)](
+            indices,
+            slots,
+            tokens,
+            lengths,
+            raw_indices,
+            page_indices,
+            length,
+            k,
+            *indices.stride(),
+            slots.stride(0),
+            tokens.stride(0),
+            lengths.stride(0),
+            *raw_indices.stride(),
+            *(page_indices.stride() if page_indices is not None else (0, 0)),
+            page_indices is not None,
+            triton.next_power_of_2(k),
+            num_warps=4,
+        )
+
+
 @triton.jit
 def _finish_paged_indexer_topk_kernel(
     Indices,
