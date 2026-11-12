@@ -17,6 +17,7 @@ from sglang.kernels.ops.attention.kda_fused_decode_aiter_hip import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, print_warning_once
+from sglang.srt.utils.log_utils import rank0_log
 
 logger = logging.getLogger(__name__)
 
@@ -282,10 +283,9 @@ def warn_rejected_once(batch: str) -> None:
     if _REJECTION_LOGGED:
         return
     _REJECTION_LOGGED = True
-    logger.warning(
-        "K3 HIP fused KDA verify rejected a batch: %s; verify runs the unfused chain "
-        "(logged once)",
-        batch,
+    rank0_log(
+        f"K3 HIP fused KDA verify rejected a batch: {batch}; "
+        "verify runs the unfused chain (logged once)"
     )
 
 

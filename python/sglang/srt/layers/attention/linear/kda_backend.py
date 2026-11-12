@@ -1349,20 +1349,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if layer._k3_deferred_f_b:
             from sglang.kernels.ops.attention import kda_fused_verify_aiter_hip
 
-            request_ring = (
-                replayssm_on
-                and self.state_pool is not None
-                and self.state_pool.replayssm_request_ring
+            rejection = self._hip_fused_verify_rejection(
+                ragged_layout=ragged_layout,
+                retrieve_parent_token=retrieve_parent_token,
+                replayssm_on=replayssm_on,
             )
-            # The fused verify covers the dense chain with a slot-indexed ring only.
-            if ragged_layout is not None:
-                rejection = "ragged verify layout"
-            elif retrieve_parent_token is not None:
-                rejection = "tree verify"
-            elif request_ring:
-                rejection = "request-indexed ReplaySSM ring"
-            else:
-                rejection = None
             if rejection is not None:
                 kda_fused_verify_aiter_hip.warn_rejected_once(rejection)
             else:
@@ -1574,6 +1565,29 @@ class KDAAttnBackend(MambaAttnBackendBase):
             covered = dense_token_indices < (batch_size * draft_token_num)
             core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
         return core_attn_out
+
+    def _hip_fused_verify_rejection(
+        self,
+        *,
+        ragged_layout,
+        retrieve_parent_token: Optional[torch.Tensor],
+        replayssm_on: bool,
+    ) -> Optional[str]:
+        """Why the AITER fused verify cannot run this batch, or None if it can."""
+        if ragged_layout is not None:
+            return "ragged verify layout"
+        if retrieve_parent_token is not None:
+            return "tree verify"
+        if (
+            replayssm_on
+            and self.state_pool is not None
+            and self.state_pool.replayssm_request_ring
+        ):
+            return "request-indexed ReplaySSM ring"
+        # Fused accept leaves `temporal` stale, but the AITER kernel reads it.
+        if self.accept_lens_pool is not None:
+            return "fused-accept state"
+        return None
 
     def _can_run_fused_chain_verify(
         self,

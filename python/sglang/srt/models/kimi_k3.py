@@ -113,6 +113,7 @@ from sglang.srt.managers.mm_utils import (
     prepare_mm_inputs,
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
+from sglang.srt.mem_cache.kv_cache_configurator import host_only_mamba_checkpoint
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -2367,6 +2368,19 @@ class KimiK3DeltaAttention(nn.Module):
         # Only the full-rank gate projection can hand f_a over unprojected.
         if not self.use_full_rank_gate:
             return
+        if (get_spec().speculative_eagle_topk or 1) > 1:
+            print_warning_once(
+                "Kimi-K3 fused KDA verify stays off: it covers chain verify only, "
+                "not tree speculative decoding (speculative_eagle_topk > 1)"
+            )
+            return
+        replay_ring = get_exec().mamba.enable_linear_replayssm_spec
+        if replay_ring and host_only_mamba_checkpoint():
+            print_warning_once(
+                "Kimi-K3 fused KDA verify stays off: host-only mamba checkpoints "
+                "use the request-indexed ReplaySSM ring"
+            )
+            return
         num_draft_tokens = get_spec().speculative_num_draft_tokens or 0
         layer = self.attn
         f_b_weight, norm_weight, norm_eps, a_log = layer._k3_hip_fused_decode_args
@@ -2375,12 +2389,6 @@ class KimiK3DeltaAttention(nn.Module):
             state_dtype=state_dtype,
             num_draft_tokens=num_draft_tokens,
         ):
-            return
-        if (get_spec().speculative_eagle_topk or 1) > 1:
-            print_warning_once(
-                "Kimi-K3 fused KDA verify stays off: it covers chain verify only, "
-                "not tree speculative decoding (speculative_eagle_topk > 1)"
-            )
             return
         kda_fused_verify_aiter_hip.warmup(
             f_b_weight=f_b_weight,
@@ -2392,7 +2400,7 @@ class KimiK3DeltaAttention(nn.Module):
             norm_eps=norm_eps,
             state_dtype=state_dtype,
             num_draft_tokens=num_draft_tokens,
-            replay_ring=get_exec().mamba.enable_linear_replayssm_spec,
+            replay_ring=replay_ring,
         )
         # The warmed draft-token count is the only one the verify may run.
         layer._k3_hip_fused_verify_args = (
