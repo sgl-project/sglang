@@ -17,8 +17,9 @@ still match eager sampling. On CPU too: the pool presize (its own switch) is siz
 the largest decode-graph batch and taken once, inside the first capture before its
 body."""
 
+import random
 import unittest
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +27,7 @@ import torch
 
 from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
@@ -35,6 +37,7 @@ from sglang.srt.speculative import (
     eagle_utils,
     eagle_worker_common,
     eagle_worker_v2,
+    post_verify_late_join,
     spec_utils,
     staged_next_draft,
 )
@@ -1568,6 +1571,229 @@ class TestFusedAcceptMatchesUnfused(CustomTestCase):
                         )
                 for stock, optimized in zip(*outputs):
                     self.assertTrue(torch.equal(stock, optimized))
+
+
+class _LateJoinGpu:
+    """A fake GPU timeline: commit ``n`` is the n-th side-stream replay; commits <= ``completed`` have finished."""
+
+    def __init__(self):
+        self.pending = 0
+        self.completed = 0
+        self.waits = []  # the commit sequence each stream wait covers
+
+
+class _LateJoinEvent:
+    gpu = None
+
+    def __init__(self):
+        self.seq = None
+
+    def record(self, stream=None):
+        self.seq = _LateJoinEvent.gpu.pending
+
+    def query(self):
+        return self.seq is None or self.seq <= _LateJoinEvent.gpu.completed
+
+    def synchronize(self):
+        _LateJoinEvent.gpu.completed = max(_LateJoinEvent.gpu.completed, self.seq)
+
+
+class _LateJoinStream:
+    def wait_event(self, event):
+        _LateJoinEvent.gpu.waits.append(event.seq)
+
+
+def _late_join_fake_cuda(gpu):
+    _LateJoinEvent.gpu = gpu
+    stack = ExitStack()
+    stack.enter_context(patch.object(torch.cuda, "Event", _LateJoinEvent))
+    stream = _LateJoinStream()
+    stack.enter_context(patch.object(torch.cuda, "current_stream", lambda *a: stream))
+    return stack
+
+
+def _late_join_schedule(seed, *, active, size=64, steps=400):
+    """A serving-like schedule of commits, frees of finished rows, group and direct allocations and GPU progress.
+
+    Returns (hand-outs of a slot a running commit still writes without a covering wait, hand-outs that waited
+    needlessly, total waits, the slot order)."""
+    rng = random.Random(seed)
+    gpu = _LateJoinGpu()
+    graphs = SimpleNamespace(
+        _commit_pending=False, _commit_done=_LateJoinEvent(), _side_stream=None
+    )
+    misses = needless = 0
+    order = []
+    with (
+        _late_join_fake_cuda(gpu),
+        patch.object(post_verify_late_join, "_graphs", graphs if active else None),
+    ):
+        alloc = MambaSlotAllocator(size=size, device="cpu")
+        live, written_by, freed_under = set(), {}, {}
+
+        def hand_out(slot, waits_before):
+            nonlocal misses, needless
+            order.append(slot)
+            seq = freed_under.pop(slot, 0)
+            running = seq > gpu.completed
+            covered = any(w is not None and w >= seq for w in gpu.waits[waits_before:])
+            misses += running and not covered
+            needless += not running and len(gpu.waits) > waits_before
+            live.add(slot)
+
+        for _ in range(steps):
+            if live:  # a decode pass: the commit replays over the batch's slots
+                gpu.pending += 1
+                graphs._commit_pending = True
+                graphs._commit_done.seq = gpu.pending
+                for slot in live:
+                    written_by[slot] = gpu.pending
+            for slot in [
+                s for s in sorted(live) if rng.random() < 0.08
+            ]:  # finished rows
+                live.discard(slot)
+                freed_under[slot] = written_by.get(slot, 0)
+                alloc.free(torch.tensor([slot]))
+            if rng.random() < 0.5:
+                gpu.completed = max(gpu.completed, gpu.pending - rng.choice([0, 0, 1]))
+            if rng.random() < 0.6:
+                n = rng.randint(1, 6)
+                alloc.alloc_group_begin(n)
+                for _ in range(rng.randint(0, n + 1)):
+                    waits_before = len(gpu.waits)
+                    got = alloc.alloc(1)
+                    if got is None:
+                        break
+                    hand_out(int(got[0]), waits_before)
+                alloc.alloc_group_end()
+            if rng.random() < 0.4 and alloc.available_size() >= 2:
+                waits_before = len(gpu.waits)
+                for slot in alloc.alloc(rng.choice([1, 2])).tolist():
+                    hand_out(slot, waits_before)
+            if rng.random() < 0.3:  # the next verify joined
+                graphs._commit_pending = False
+            if rng.random() < 0.05:
+                gpu.completed = gpu.pending
+    return misses, needless, len(gpu.waits), order
+
+
+class TestPostVerifyLateJoin(CustomTestCase):
+    def test_no_slot_reaches_a_new_owner_before_its_commit(self):
+        """A finished row's slot is freed while its commit may still run; whoever takes it next must wait first.
+        Inactive, the allocator hands out the same slots in the same order and never waits."""
+        total_waits = 0
+        for seed in range(150):
+            misses, needless, waits, order_on = _late_join_schedule(seed, active=True)
+            self.assertEqual(misses, 0, seed)
+            total_waits += waits
+            _, _, waits_off, order_off = _late_join_schedule(seed, active=False)
+            self.assertEqual(waits_off, 0, seed)
+            self.assertEqual(order_on, order_off, seed)
+        self.assertGreater(total_waits, 0)  # the schedules do exercise the guard
+
+    def _refusal(self, **overrides):
+        shape = dict(
+            mode="null",
+            tp=1,
+            pp=1,
+            no_overlap=False,
+            unified=False,
+            int8=False,
+            extra=True,
+        )
+        shape.update(overrides)
+        ns = SimpleNamespace
+        getters = dict(
+            get_disagg=lambda: ns(disaggregation_mode=shape["mode"]),
+            get_parallel=lambda: ns(tp_size=shape["tp"], pp_size=shape["pp"]),
+            get_schedule=lambda: ns(disable_overlap_schedule=shape["no_overlap"]),
+            get_memory=lambda: ns(enable_unified_memory=shape["unified"]),
+            get_exec=lambda: ns(
+                mamba=ns(
+                    enable_int8_mamba_checkpoint=shape["int8"],
+                    enable_mamba_extra_buffer=shape["extra"],
+                )
+            ),
+        )
+        with ExitStack() as stack:
+            for name, fn in getters.items():
+                stack.enter_context(patch(f"sglang.srt.runtime_context.{name}", fn))
+            return post_verify_late_join.late_join_refusal()
+
+    def test_only_the_guarded_shape_is_accepted(self):
+        self.assertIsNone(self._refusal())
+        for overrides in (
+            dict(mode="decode"),
+            dict(mode="prefill"),
+            dict(tp=2),
+            dict(pp=2),
+            dict(no_overlap=True),
+            dict(unified=True),
+            dict(int8=True),
+            dict(extra=False),
+        ):
+            self.assertIsNotNone(self._refusal(**overrides), overrides)
+
+    def test_wait_orders_and_keeps_the_join_sync_finishes_it(self):
+        gpu = _LateJoinGpu()
+        with _late_join_fake_cuda(gpu):
+            graphs = SimpleNamespace(
+                _commit_pending=False, _commit_done=_LateJoinEvent(), _side_stream=None
+            )
+            with patch.object(post_verify_late_join, "_graphs", None):
+                self.assertFalse(
+                    post_verify_late_join.wait("x") or post_verify_late_join.sync("x")
+                )
+            with patch.object(post_verify_late_join, "_graphs", graphs):
+                # nothing pending
+                self.assertFalse(
+                    post_verify_late_join.wait("x") or post_verify_late_join.sync("x")
+                )
+                gpu.pending = 5
+                graphs._commit_done.seq = 5
+                graphs._commit_pending = True
+                d2h = _LateJoinStream()
+                self.assertTrue(post_verify_late_join.wait("hicache_write", stream=d2h))
+                self.assertEqual(gpu.waits[-1], 5)
+                self.assertTrue(
+                    graphs._commit_pending
+                )  # the forward stream still joins
+                self.assertTrue(post_verify_late_join.sync("idle_pass"))
+                self.assertEqual(gpu.completed, 5)
+                self.assertFalse(graphs._commit_pending)
+                self.assertFalse(post_verify_late_join.sync("idle_pass"))
+
+    def test_the_switch_moves_the_join_only_when_the_guard_accepts(self):
+        """SGLANG_OPT_POST_VERIFY_LATE_JOIN (opt-in, under the runtime master): accepted, the worker joins before
+        the verify instead of after the draft extend and presizes the pool; refused or off, the early join stays."""
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        for value, refusal, expected in (
+            (None, None, False),
+            ("1", None, True),
+            ("1", "tp=2 pp=1", False),
+        ):
+            with (
+                self.subTest(value=value, refusal=refusal),
+                master.override(True),
+                envs.SGLANG_OPT_SPEC_POST_VERIFY_EXTEND_LAYOUT.override("0"),
+                envs.SGLANG_OPT_POST_VERIFY_POOL_PRESIZE.override("0"),
+                envs.SGLANG_OPT_POST_VERIFY_LATE_JOIN.override(value)
+                if value
+                else nullcontext(),
+                patch.object(
+                    post_verify_late_join, "late_join_refusal", return_value=refusal
+                ),
+                patch.object(post_verify_late_join, "_graphs", None),
+            ):
+                worker = _worker(switch=True)
+                self.assertIs(worker._late_join, expected)
+                self.assertIs(post_verify_late_join._graphs is not None, expected)
+                self.assertIs(
+                    worker._post_verify_graphs._graphs.presize is not None, expected
+                )
+                with patch.object(worker._post_verify_graphs, "join") as join:
+                    _verify_kwargs(worker)
+                self.assertEqual(join.call_count, int(expected))
 
 
 if __name__ == "__main__":

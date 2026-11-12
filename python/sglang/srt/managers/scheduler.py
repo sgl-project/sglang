@@ -399,6 +399,7 @@ from sglang.srt.rust_server.server import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.speculative import post_verify_late_join
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
@@ -2287,6 +2288,8 @@ class Scheduler(
             else:
                 batch_result = None
                 self._sched_idled = True
+                # No batch carries the late join; finish the commit before results free its rows.
+                post_verify_late_join.sync("idle_pass")
 
             # Process the last batch
             if self.last_batch:
@@ -2406,6 +2409,11 @@ class Scheduler(
                 self._dispatch_tokenized_mm_requests(recv_req, vmm_errors)
                 continue
 
+            if not self._tokenized_requests(recv_req) and not isinstance(
+                recv_req, AbortReq
+            ):
+                # A control request may touch state a late-joined commit writes.
+                post_verify_late_join.sync("control_request")
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 if self.rust_server is None and isinstance(output, RpcReqOutput):
@@ -5145,6 +5153,8 @@ class Scheduler(
             if self.decode_offload_manager is not None:
                 # Pending offload copies may still read the device KV that retraction frees.
                 self.decode_offload_manager.drain_before_retraction()
+            # A late-joined commit may still write the rows retraction frees.
+            post_verify_late_join.wait("retract")
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
             mamba_allocator = self.tree_cache.token_to_kv_pool_allocator.state_slots
@@ -6275,6 +6285,7 @@ class Scheduler(
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle(ignore_waiting=self.pause_state.paused):
+            post_verify_late_join.sync("flush")
             self.cur_batch_for_debug = None
             self.last_batch = None
             if self.uocr_runtime is not None:

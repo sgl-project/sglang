@@ -490,6 +490,10 @@ class Envs:
     SGLANG_OPT_POST_VERIFY_POOL_PRESIZE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # The post-verify side-stream Mamba state commit joins before the next verify or
+    # prefill, with every other reader and writer of that state ordered after it
+    # (speculative/post_verify_late_join.py). Opt-in.
+    SGLANG_OPT_POST_VERIFY_LATE_JOIN = EnvRuntimeBool(False)
     # HiCache Mamba side-state rows (PLE short-conv / n-gram) of a checkpoint slot are
     # backed up to the pinned host pool by a stream-ordered kernel instead of blocking copies
     # (and loaded the same way under SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT); same bytes.

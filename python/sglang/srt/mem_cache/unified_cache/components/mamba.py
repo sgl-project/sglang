@@ -284,6 +284,7 @@ class MambaComponent(TreeComponent):
         self, host_indices: torch.Tensor, device_indices: torch.Tensor
     ) -> None:
         from sglang.srt.managers.cache_controller import CacheOperation
+        from sglang.srt.speculative import post_verify_late_join
 
         controller = self.cache.cache_controller
         if controller is None or controller.l2_transfer_engine is None:
@@ -291,6 +292,10 @@ class MambaComponent(TreeComponent):
                 "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT requires the hicache "
                 "transfer engine"
             )
+        # A late-joined post-verify commit may still write the slot (as start_writing).
+        post_verify_late_join.wait(
+            "hicache_write", stream=controller.l2_transfer_engine.device_to_host_stream
+        )
         transfer = PoolTransfer(
             name=PoolName.MAMBA,
             host_indices=host_indices,

@@ -59,7 +59,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative import eagle_megakernel
+from sglang.srt.speculative import eagle_megakernel, post_verify_late_join
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
@@ -1343,6 +1343,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
     # Initialized with the post-verify graphs; class defaults let unit-test
     # harnesses construct workers without __init__.
     _post_verify_graphs: Optional[EaglePostVerifyGraphs] = None
+    # SGLANG_OPT_POST_VERIFY_LATE_JOIN, once activated: the side-stream commit joins
+    # before the next verify or prefill.
+    _late_join = False
     _simulated_acc_len_rng: Optional[torch.Generator] = None
     _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
     # SGLANG_OPT_SPEC_STAGED_NEXT_DRAFT: which decode rounds take the staged draft inputs
@@ -1449,6 +1452,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
         ):
             self._init_post_verify_graphs()
+        if (
+            envs.SGLANG_OPT_POST_VERIFY_LATE_JOIN.get()
+            and self._post_verify_graphs is None
+        ):
+            post_verify_late_join.refused("no post-verify graphs to join")
 
     def _init_post_verify_graphs(self) -> None:
         # A key is captured at its first rounds, which attention-DP ranks do not reach
@@ -1469,7 +1477,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             simulated_acc_len_rng=self._simulated_acc_len_rng,
             speculative_runtime_hooks=self._speculative_runtime_hooks,
         )
-        if envs.SGLANG_OPT_POST_VERIFY_POOL_PRESIZE.get():
+        if envs.SGLANG_OPT_POST_VERIFY_LATE_JOIN.get():
+            refusal = post_verify_late_join.late_join_refusal()
+            if refusal is None:
+                self._late_join = True
+                post_verify_late_join.activate(self._post_verify_graphs._graphs)
+            else:
+                post_verify_late_join.refused(refusal)
+        if self._late_join or envs.SGLANG_OPT_POST_VERIFY_POOL_PRESIZE.get():
             self._post_verify_graphs.enable_pool_presize()
 
     def _init_staged_next_draft(self) -> None:
@@ -1553,6 +1568,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             if self._staged_draft is not None:
                 self._staged_draft.forget()
+            if self._late_join and self._post_verify_graphs is not None:
+                # a prefill may write a mamba slot the pending commit still folds into
+                self._post_verify_graphs.join()
             if not (
                 batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination
             ):
@@ -1645,7 +1663,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                             self._post_verify_graphs.next_draft,
                             batch_output.new_seq_lens,
                         )
-            if self._post_verify_graphs is not None:
+            if self._post_verify_graphs is not None and not self._late_join:
                 # The mamba state commit may still run on a side stream.
                 self._post_verify_graphs.join()
 
@@ -1818,7 +1836,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             spec_stage_span("draft_extend"),
         ):
             self.draft_worker._draft_extend_for_decode(batch, result)
-        if self._post_verify_graphs is not None:
+        if self._post_verify_graphs is not None and not self._late_join:
             self._post_verify_graphs.join()
         return result
 
@@ -2131,6 +2149,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING: the compact top-k branch, when
         # every request allows it, in the post-verify graphs and the eager verify
         max_top_k = compact_verify_max_top_k(batch)
+        if self._late_join and self._post_verify_graphs is not None:
+            # the verify reads the GDN checkpoint / ring / cursors the pending commit writes
+            self._post_verify_graphs.join()
         return run_eagle_verify(
             batch,
             speculative_runtime_hooks=self._speculative_runtime_hooks,
