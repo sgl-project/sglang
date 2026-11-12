@@ -61,8 +61,7 @@ Page-major entries make each layer's rows strided, so only backends audited for 
 
 | Layers | Page-major allow-list |
 |---|---|
-| MHA full and sliding-window attention | `triton`, `fa3`, `fa4`, `flashinfer`, `trtllm_mha` |
-| MHA/GQA full attention with equal K/V head dims, BF16 query/KV, page size 1, no window layers | Experimental `aiter` on AMD ROCm, disabled by default; see [AITER configuration](#aiter-configuration) |
+| MHA full and sliding-window attention | `triton`, `fa3`, `fa4`, `flashinfer`, `trtllm_mha`; experimental `aiter` on AMD ROCm with [explicit opt-in](#aiter-configuration) |
 | MHA with asymmetric K/V head dims | `triton`, `fa3`, `fa4` |
 | MLA full attention | `triton`, `fa3`, `trtllm_mla`, `flashinfer`, `cutedsl_mla`, `flashmla` |
 | Linear attention, decode | `triton`, `flashinfer`; also `cutedsl` and `helion` on MLA (KDA) hybrids |
@@ -71,7 +70,7 @@ Page-major entries make each layer's rows strided, so only backends audited for 
 
 `fa3` and `fa4` still refuse two kinds of model when the backend is built: local-attention models, such as Llama 4, whose default backend on SM90 is `fa3` (`FlashAttentionBackend._maybe_init_local_attn_builder`), and models that decode with prefill-aware SWA (`FlashAttentionBackend.__init__`).
 
-The AITER arena path rejects prefill graphs. For other attention backends except `fa3` and `fa4`, the FULL prefill CUDA-graph backend is disabled with a warning; decode capture and the other prefill graph backends are unaffected.
+For attention backends except `fa3` and `fa4`, the FULL prefill CUDA-graph backend is disabled with a warning; decode capture and the other prefill graph backends are unaffected.
 
 ## Quick start
 
@@ -88,9 +87,11 @@ python3 -m sglang.launch_server \
 
 ### AITER configuration
 
-On AMD ROCm Linux, the AITER arena path uses unified attention for ordinary BF16 MHA/GQA full-attention layers. GQA is included in SGLang's MHA branch: query heads may share KV heads. MLA uses compressed latent KV and is not supported by this adapter. This path requires page size 1 and equal K/V head dimensions. Use an AITER build containing the strided-cache address-span fix [ROCm/aiter#6661](https://github.com/ROCm/aiter/pull/6661). The SGLang HIP KV writer must compile and load successfully; this path refuses the fallback writer because it can overwrite the reserved padding sink.
+On AMD ROCm Linux, the AITER arena path uses unified attention for ordinary BF16 MHA/GQA full-attention and sliding-window layers. GQA is included in SGLang's MHA branch: query heads may share KV heads. MLA uses compressed latent KV and is not supported by this adapter. This path requires equal K/V head dimensions. The SGLang HIP KV writer must compile and load successfully; this path refuses the fallback writer because it can overwrite the reserved padding sink.
 
-This experimental path is disabled by default. Set `SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1` only after installing an AITER build containing the fix; the flag does not check the installed AITER revision. The opt-in remains necessary until the fixed dependency is qualified in the default CI image. Static-pool AITER and other unified-memory backends do not use this flag.
+Use an AITER build containing the strided-cache address-span fix [#6661](https://github.com/ROCm/aiter/pull/6661), the Triton and Gluon V-page-tail fixes [#6475](https://github.com/ROCm/aiter/pull/6475) and [#6755](https://github.com/ROCm/aiter/pull/6755), and the Gluon block-table-prefetch fix [#7539](https://github.com/ROCm/aiter/pull/7539).
+
+This experimental path is disabled by default. Set `SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1` only after installing an AITER build containing these fixes; the flag does not check the installed AITER revision. The opt-in remains necessary until the fixed dependency is qualified in the default CI image. Static-pool AITER and other unified-memory backends do not use this flag.
 
 For Qwen3.5-4B on one GPU (TP1), disable online MXFP4 conversion to keep its GDN projections in BF16:
 
@@ -108,14 +109,14 @@ python3 -m sglang.launch_server \
   --cuda-graph-backend-prefill disabled
 ```
 
-The arena selects AITER unified attention automatically; `SGLANG_USE_AITER_UNIFIED_ATTN` is not required. Decode can use eager execution or full CUDA-graph replay. This AITER path does not support MLA, sliding-window layers, asymmetric K/V dimensions, FP8 KV, speculative decoding, HiCache, context parallelism, PD disaggregation, deterministic inference or prefill graphs. These restrictions apply even where the general unified-memory feature table below lists support.
+The arena selects AITER unified attention automatically; `SGLANG_USE_AITER_UNIFIED_ATTN` is not required. Decode can use eager execution or full CUDA-graph replay. This AITER path does not support MLA, asymmetric K/V dimensions, FP8 KV, speculative decoding, HiCache, context parallelism, PD disaggregation or deterministic inference. These restrictions apply even where the general unified-memory feature table below lists support.
 
 ## Flags and environment variables
 
 | Flag or variable | Effect under unified memory |
 |---|---|
 | `--enable-unified-memory` | Builds the arena, the per-sub-pool views and one allocator over all of them. Implies `--enable-page-major-kv-layout`. |
-| `SGLANG_ENABLE_AITER_UNIFIED_MEMORY` | Opts into the experimental AITER arena reader; defaults to `0`. Requires an AITER build containing [ROCm/aiter#6661](https://github.com/ROCm/aiter/pull/6661). |
+| `SGLANG_ENABLE_AITER_UNIFIED_MEMORY` | Opts into the experimental AITER arena reader; defaults to `0`. Requires the AITER fixes listed in [AITER configuration](#aiter-configuration). |
 | `--mem-fraction-static` | The arena's byte budget comes from the static memory fraction, as for separate pools. If the arena cannot hold the floor of one request at batch size 1 (its window rows, its state slots and the sink), startup fails and names the terms (`kv/sizing.py::check_bs1_floor`). Whether a whole request fits, its full-attention tokens included, is checked at the memory clip and at admission. |
 | `--max-total-tokens` | Sizes the arena: its bytes are the smallest budget, within the measured one, whose sizing gives at least that many full-attention tokens, with windows and state sized by the same rules. It sizes the full-attention target; it does not cap how far full attention can grow into the arena at run time. |
 | `--max-running-requests` | Bounds the concurrency the sizing solves for. The result is also capped at half the full-attention tokens. |

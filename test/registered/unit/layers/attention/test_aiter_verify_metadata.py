@@ -217,5 +217,47 @@ class TestAiterDecodeWorkspace(CustomTestCase):
         self.assertEqual(allocated, {"nhd": True, "vectorized_5d": False})
 
 
+class TestAiterArenaPageTables(CustomTestCase):
+    def test_prefill_preserves_full_and_window_physical_page_ids(self):
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import ReadTable
+
+        plan = object()
+        full = torch.tensor([[91, 73, 85], [37, 45, 0]], dtype=torch.int32)
+        window = torch.tensor([[0, 11, 19], [13, 27, 0]], dtype=torch.int32)
+        calls = []
+
+        def read_table(actual_plan, *, kind=IdSpaceKind.FULL, rows):
+            self.assertIs(actual_plan, plan)
+            self.assertEqual(rows, 2)
+            calls.append(kind)
+            ids = full if kind == IdSpaceKind.FULL else window
+            return ReadTable(
+                ids=ids,
+                row_ids=torch.arange(2),
+                row_stride=ids.stride(0),
+                entry_page_size=16,
+                is_translated=True,
+            )
+
+        backend = aiter_backend.AiterAttnBackend.__new__(aiter_backend.AiterAttnBackend)
+        backend.use_unified_memory = True
+        backend.use_sliding_window_kv_pool = True
+        backend.page_size = 16
+        backend.runner_ids = SimpleNamespace(read_table=read_table)
+        actual_full, actual_window = backend._build_extend_unified_page_table(
+            2,
+            torch.tensor([33, 17]),
+            torch.tensor([5, 2]),
+            33,
+            plan=plan,
+        )
+        # These are page IDs in batch order already, including a retired window
+        # page. Sampling every 16th entry or dividing the IDs again is incorrect.
+        self.assertIs(actual_full, full)
+        self.assertIs(actual_window, window)
+        self.assertEqual(calls, [IdSpaceKind.FULL, IdSpaceKind.SLIDING_WINDOW])
+
+
 if __name__ == "__main__":
     unittest.main()

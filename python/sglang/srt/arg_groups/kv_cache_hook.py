@@ -854,17 +854,12 @@ def handle_page_major_kv_layout(server_args: Any):
     if "aiter" in backends and not use_mla_backend(server_args):
         assert envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.get(), (
             "AITER unified memory is experimental and disabled by default. "
-            "Set SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1 only with an AITER build "
-            "containing https://github.com/ROCm/aiter/pull/6661."
+            "Set SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1 only with the AITER "
+            "fixes listed in the unified-memory documentation."
         )
-        # Only the ordinary unified-attention reader consumes the arena's
-        # translated page table. Other AITER routes still read virtual ids.
-        assert not model_config.has_asymmetric_kv and not model_config.is_hybrid_swa, (
-            "--enable-unified-memory with aiter requires full MHA attention "
-            "with equal K/V head dimensions and no sliding-window layers."
-        )
-        assert cfg.page_size == 1, (
-            "--enable-unified-memory with aiter requires --page-size 1."
+        # Unified attention consumes translated full and window page tables.
+        assert not model_config.has_asymmetric_kv, (
+            "--enable-unified-memory with aiter requires equal K/V head dimensions."
         )
         # Auto is checked against the actual query/KV dtypes by the backend.
         assert cfg.dtype in ("auto", "bfloat16") and cfg.kv_cache_dtype in (
@@ -886,13 +881,6 @@ def handle_page_major_kv_layout(server_args: Any):
         )
         assert not cfg.enable_deterministic_inference, (
             "--enable-unified-memory with aiter does not support deterministic inference."
-        )
-        assert (
-            cfg.cuda_graph_config is None
-            or cfg.cuda_graph_config.prefill.backend == Backend.DISABLED
-        ), (
-            "--enable-unified-memory with aiter requires "
-            "--cuda-graph-backend-prefill disabled."
         )
         allowed_full.add("aiter")
     assert backends <= allowed_full, (

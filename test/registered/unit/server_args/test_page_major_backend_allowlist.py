@@ -247,9 +247,19 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
             )
             self.assertTrue(_accepts("triton", use_mla=False))
 
-    def test_aiter_full_mha_bf16_page_one(self):
+    def test_aiter_bf16_mha_and_swa_pages(self):
         with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override("1"):
-            self.assertTrue(_accepts("aiter", use_mla=False))
+            for is_hybrid_swa in (False, True):
+                for page_size in (1, 16, 64):
+                    with self.subTest(swa=is_hybrid_swa, page_size=page_size):
+                        self.assertTrue(
+                            _accepts(
+                                "aiter",
+                                use_mla=False,
+                                is_hybrid_swa=is_hybrid_swa,
+                                page_size=page_size,
+                            )
+                        )
             self.assertTrue(
                 _accepts(
                     "aiter", use_mla=False, dtype="bfloat16", kv_cache_dtype="bf16"
@@ -260,13 +270,25 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 _accepts("triton", use_mla=False, decode_attention_backend="aiter")
             )
 
+    def test_aiter_defers_prefill_graph_policy_to_unified_handler(self):
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
+            for backend in (Backend.FULL, Backend.BREAKABLE):
+                with self.subTest(prefill=backend):
+                    self.assertTrue(
+                        _accepts(
+                            "aiter",
+                            use_mla=False,
+                            cuda_graph_config=CudaGraphConfig.from_dict(
+                                {"prefill": {"backend": backend}}
+                            ),
+                        )
+                    )
+
     def test_aiter_rejects_unimplemented_arena_contracts(self):
         cases = [
             {"use_mla": True},
             {"has_asymmetric_kv": True},
-            {"is_hybrid_swa": True},
             {"unified": False},
-            {"page_size": 16},
             {"dtype": "float16"},
             {"kv_cache_dtype": "fp8_e4m3"},
             {"speculative_algorithm": "EAGLE"},
@@ -277,14 +299,6 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
             {"enable_prefill_cp": True},
             {"enable_deterministic_inference": True},
         ]
-        for backend in (Backend.FULL, Backend.BREAKABLE):
-            cases.append(
-                {
-                    "cuda_graph_config": CudaGraphConfig.from_dict(
-                        {"prefill": {"backend": backend}}
-                    )
-                }
-            )
         with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
             for case in cases:
                 with self.subTest(case=case):

@@ -20,7 +20,7 @@ register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 @unittest.skipUnless(
     envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.get(),
-    "requires SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1 and AITER with ROCm/aiter#6661",
+    "requires SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1 and the documented AITER fixes",
 )
 @unittest.skipUnless(is_hip(), "AMD ROCm required")
 class TestUnifiedQwenHybridAiter(_qwen_recipe.TestUnifiedQwenHybridTriton):
