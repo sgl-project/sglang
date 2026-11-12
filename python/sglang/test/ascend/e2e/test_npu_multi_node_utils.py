@@ -537,6 +537,17 @@ def launch_pd_mix_node(model_config):
 
     host_ip = get_host_ip()
     logger.info(f"Starting node, {host_ip=} {other_args=}")
+
+    # The npu_memcache L3 backend connects to the Ascend MemCache MetaService
+    # as soon as the model server starts, so the service must already be
+    # listening. All pods use the same master node IP (read from the ConfigMap
+    # above) and only the pod owning that IP can bind it, so just the master
+    # node hosts the service.
+    meta_service_process = None
+    if "--hicache-storage-backend-extra-config" in other_args:
+        if host_ip == master_node_ip:
+            meta_service_process = start_meta_service(master_node_ip)
+
     try:
         process = popen_launch_server(
             model_config["model_path"],
@@ -549,6 +560,9 @@ def launch_pd_mix_node(model_config):
     except Exception as e:
         raise RuntimeError(f"Failed to start node on {host_ip}: {e}")
 
+    # Expose the MetaService process (None when this node does not host it)
+    # so callers can stop it during tearDown.
+    process.meta_service_process = meta_service_process
     return process
 
 
@@ -729,11 +743,12 @@ def launch_pd_separation_node(model_config):
     # as soon as the model server starts, so the service must already be
     # listening. It is enabled through the storage backend extra config flag,
     # which only the prefill side carries. All pods use the same prefill node
-    # IP (read from the ConfigMap above) so there is a single MetaService
-    # address regardless of where each pod runs.
+    # IP (read from the ConfigMap above) and only the pod owning that IP can
+    # bind it, so just the master prefill pod hosts the service.
     meta_service_process = None
     if "--hicache-storage-backend-extra-config" in service_args:
-        meta_service_process = start_meta_service(master_prefill_ip)
+        if host_ip == master_prefill_ip:
+            meta_service_process = start_meta_service(master_prefill_ip)
 
     other_args.extend(service_args)
 
