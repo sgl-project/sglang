@@ -290,7 +290,9 @@ class BufferModePipeline:
         # Window slots beyond the tree's first, each with its own host pool.
         self._further_window_components = tuple(further_window_components)
         self._swa_tail_only = envs.SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP.get()
-        self._mamba_request_end_only = envs.SGLANG_HICACHE_MAMBA_REQUEST_END_ONLY.get()
+        self._mamba_request_end_only = (
+            envs.SGLANG_ENABLE_HICACHE_MAMBA_REQUEST_END_ONLY_BACKUP.get()
+        )
         # Metadata-only pending-write backlog cap, measured in unique FULL
         # snapshot spans; beyond it new spans are dropped at admission.
         self.write_backlog_cap = write_backlog_cap

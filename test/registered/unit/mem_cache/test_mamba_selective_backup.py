@@ -58,7 +58,7 @@ def pipeline(selective):
         ComponentType.MAMBA: {PoolName.MAMBA: ["h2"]}
     }
     cache.tree_core.collect_path_info.return_value = ((SimpleNamespace(path_end=4),),)
-    with envs.SGLANG_HICACHE_MAMBA_REQUEST_END_ONLY.override(selective):
+    with envs.SGLANG_ENABLE_HICACHE_MAMBA_REQUEST_END_ONLY_BACKUP.override(selective):
         result = BufferModePipeline(cache, swa_component=None, write_backlog_cap=128)
     result._backup_oversize = lambda *args: False
     return result, cache
