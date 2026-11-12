@@ -21,6 +21,7 @@ from sglang.kernels.ops.speculative.verify_sampling import (
     chain_speculative_sampling_triton,
     tree_speculative_sampling_target_only,
 )
+from sglang.kernels.ops.speculative.verify_target_probs import verify_target_probs
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
@@ -603,6 +604,63 @@ def _apply_joint_top_k_top_p(
     return probs
 
 
+def _apply_verify_penalties(
+    logits: torch.Tensor, sampling_info: SamplingBatchInfo, draft_token_num: int
+) -> None:
+    """Penalties and logit bias on the verify logits, in place (unfused path)."""
+    from sglang.srt.sampling.penaltylib.repetition_penalty import (
+        apply_scaling_penalties,
+    )
+
+    if sampling_info.acc_additive_penalties is not None:
+        logits.add_(
+            torch.repeat_interleave(
+                sampling_info.acc_additive_penalties, draft_token_num, dim=0
+            )
+        )
+    if sampling_info.acc_scaling_penalties is not None:
+        apply_scaling_penalties(
+            logits,
+            torch.repeat_interleave(
+                sampling_info.acc_scaling_penalties, draft_token_num, dim=0
+            ),
+        )
+    if sampling_info.logit_bias is not None:
+        logits.add_(
+            torch.repeat_interleave(sampling_info.logit_bias, draft_token_num, dim=0)
+        )
+
+
+def _fused_front_end_applies(
+    *,
+    logits: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    dense_sampling: bool,
+    grammar_mask: Optional[GrammarMask],
+    watermark: bool,
+) -> bool:
+    """Whether the dense sampling branch can build target_probs with
+    ``verify_target_probs``. Grammar masks and watermarking act between the
+    penalties and the softmax, so they keep the unfused path."""
+    if not (_is_cuda and dense_sampling and grammar_mask is None and not watermark):
+        return False
+    if logits.dim() != 2 or logits.stride(-1) != 1:
+        return False
+    bs = sampling_info.temperatures.shape[0]
+    for t in (
+        sampling_info.acc_additive_penalties,
+        sampling_info.acc_scaling_penalties,
+        sampling_info.logit_bias,
+    ):
+        if t is not None and (
+            t.dtype != torch.float32
+            or not t.is_contiguous()
+            or tuple(t.shape) != (bs, logits.shape[-1])
+        ):
+            return False
+    return True
+
+
 def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
     """The support for eagle_sample's compact top-k branch under
     SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING, or None for the dense branch: every
@@ -762,9 +820,6 @@ def eagle_sample(
         is_dp_attention_enabled,
     )
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.sampling.penaltylib.repetition_penalty import (
-        apply_scaling_penalties,
-    )
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
@@ -803,28 +858,33 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
+    use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+    greedy = _verify_uses_greedy(
+        is_all_greedy=sampling_info.is_all_greedy,
+        is_cpu=_is_cpu,
+        is_hip=_is_hip,
+        is_xpu=_is_xpu,
+        use_rejection_sampling=use_rejection_sampling,
+    )
+    sparse = not greedy and _can_use_sparse_uno_tree_target_sampling(
+        uno_target_max_top_k,
+        sampling_info,
+    )
+    # The dense sampling branch applies penalties inside the fused softmax.
+    fuse_front_end = _fused_front_end_applies(
+        logits=next_token_logits,
+        sampling_info=sampling_info,
+        dense_sampling=not greedy and not sparse and vocab_shard is None,
+        grammar_mask=grammar_mask,
+        watermark=watermark_state is not None
+        and sampling_info.has_watermark_candidates,
+    )
+
     # Apply penalty
     # This is a relaxed version of penalties for speculative decoding.
-    if sampling_info.acc_additive_penalties is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.acc_additive_penalties,
-                verify_input.draft_token_num,
-                dim=0,
-            )
-        )
-    if sampling_info.acc_scaling_penalties is not None:
-        apply_scaling_penalties(
-            next_token_logits,
-            torch.repeat_interleave(
-                sampling_info.acc_scaling_penalties, verify_input.draft_token_num, dim=0
-            ),
-        )
-    if sampling_info.logit_bias is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.logit_bias, verify_input.draft_token_num, dim=0
-            )
+    if not fuse_front_end:
+        _apply_verify_penalties(
+            next_token_logits, sampling_info, verify_input.draft_token_num
         )
 
     # Apply grammar mask if provided
@@ -873,18 +933,6 @@ def eagle_sample(
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
-    use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-    greedy = _verify_uses_greedy(
-        is_all_greedy=sampling_info.is_all_greedy,
-        is_cpu=_is_cpu,
-        is_hip=_is_hip,
-        is_xpu=_is_xpu,
-        use_rejection_sampling=use_rejection_sampling,
-    )
-    sparse = not greedy and _can_use_sparse_uno_tree_target_sampling(
-        uno_target_max_top_k,
-        sampling_info,
-    )
     sharded_predict = None
     if vocab_shard is not None:
         temperatures = None
@@ -1064,11 +1112,24 @@ def eagle_sample(
         else:
             sampling_fn = tree_speculative_sampling_target_only
 
-        target_probs = sampling_softmax(
-            next_token_logits,
-            temperatures=sampling_info.temperatures,
-            rows_per_request=verify_input.draft_token_num,
-        )  # (bs * num_draft_tokens, vocab_size)
+        if fuse_front_end:
+            # Penalized logits are written back so later readers of
+            # logits_output.next_token_logits see what the unfused path leaves.
+            target_probs = verify_target_probs(
+                next_token_logits,
+                rows_per_request=verify_input.draft_token_num,
+                temperatures=sampling_info.temperatures,
+                additive_penalties=sampling_info.acc_additive_penalties,
+                scaling_penalties=sampling_info.acc_scaling_penalties,
+                logit_bias=sampling_info.logit_bias,
+                write_back_logits=True,
+            )
+        else:
+            target_probs = sampling_softmax(
+                next_token_logits,
+                temperatures=sampling_info.temperatures,
+                rows_per_request=verify_input.draft_token_num,
+            )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         target_probs = _apply_joint_top_k_top_p(
             target_probs,

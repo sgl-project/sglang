@@ -80,6 +80,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="speculative.verify_target_probs",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.speculative.verify_target_probs:verify_target_probs",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="speculative.pack_verify_mask_into",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.speculative.pack_verify_mask:pack_verify_mask_into",
