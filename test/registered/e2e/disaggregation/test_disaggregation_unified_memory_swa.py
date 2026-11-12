@@ -13,7 +13,7 @@ That makes three ways to be silently wrong rather than loud:
   * shipping the SWA side's KERNEL-FACING ids, which the read path uses, in
     place of its physical ones;
   * letting compaction relocate a page mid-transfer, which the SWA allocator
-    had no `set_disagg_move_gate` to prevent.
+    nothing kept the SWA allocator's pages in place against.
 
 Logprob parity against a non-PD unified reference catches all three; GSM8K on
 gpt-oss is too noisy to (single-server unified and static both score 0.570 at
@@ -29,7 +29,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
 
-register_cuda_ci(est_time=1200, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=109, stage="extra-a", runner_config="2-gpu-large")
 
 UNIFIED_SWA_ARGS = [
     "--skip-tokenizer-init",

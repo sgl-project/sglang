@@ -39,7 +39,7 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 # Bf16 workspace per-token width, matching ``dequantize_k_cache_paged_dsv4``'s
 # output: 448 fp8 nope (dequanted) + 64 bf16 rope = 512.
@@ -48,6 +48,7 @@ DSV4_Q8KV8_PREFILL_ENV = "SGLANG_DSV4_Q8KV8_PREFILL"
 DSV4_Q8KV8_PREFILL_LOG_ENV = "SGLANG_DSV4_Q8KV8_PREFILL_LOG"
 
 from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
+    SPARSE_PREFILL_TOPK_ALIGNMENT,
     build_swa_token_ids,
     combine_topk_swa_indices,
     combined_topk_width,
@@ -61,6 +62,10 @@ def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
     variable remains as a debug override while the runtime path is being
     hardened: truthy values force Q8 on, falsy values force it off.
     """
+    # An explicit native-H16 choice takes precedence over the legacy Q8 override.
+    if dsv4_prefill_backend == "cutedsl_h16":
+        return False
+
     env_value = os.getenv(DSV4_Q8KV8_PREFILL_ENV)
     if env_value is not None:
         return env_value.lower() in {
@@ -133,14 +138,18 @@ class CompressedGather:
     # chunk-invariant per request; subsequent layers only overwrite that prefix.
     combined_indices: Optional[torch.Tensor] = None
     combined_lens: Optional[torch.Tensor] = None
+    # Valid only for this forward's gather layout. Each ratio has its own
+    # workspace; its compressed prefix survives consumer layers' SWA writes.
+    dequantized_source: Optional[tuple[int, int]] = None
 
 
 @dataclass
 class SparsePrefillChunkCache:
     """Cache prefill-chunk metadata shared across layers.
 
-    Fields depend on request/token mappings and compressed page tables, not
-    per-layer k_cache; per-layer top-k combinations are recomputed into reused
+    Gather layouts depend on request/token mappings and compressed page tables.
+    Shared-source dequantization keys live only for this forward; per-layer
+    top-k combinations are recomputed into reused
     buffers.
     """
 
@@ -175,6 +184,8 @@ class SparsePrefillChunkCache:
     # Compressed caches keyed by compress ratio: c128 (every block, combined once
     # per chunk) and the top-k ratios (combined per layer).
     compressed: Dict[int, CompressedGather] = field(default_factory=dict)
+    # C128 is chunk-invariant; reuse fixed-width H16 indices across its layers.
+    c128_padded_combined_indices: Optional[torch.Tensor] = None
     # Per-layer scratch only: combine overwrites all entries before attention.
     # c0/c128 are cached across layers and must retain separate storage.
     low_ratio_combined: dict = field(default_factory=dict)
@@ -182,6 +193,9 @@ class SparsePrefillChunkCache:
     swa_lengths: Optional[torch.Tensor] = None
     # Host lengths avoid a device synchronization when sizing ragged gathers.
     seq_lens_cpu: Optional[list[int]] = None
+    # CP can leave a request with no query rows on this rank. Such requests
+    # have no representative page-table row and must not be gathered.
+    query_lens_cpu: Optional[list[int]] = None
 
     @classmethod
     def build(
@@ -200,6 +214,7 @@ class SparsePrefillChunkCache:
         total_swa: int,
         request_window_layout=None,
         seq_lens_cpu: Optional[list[int]] = None,
+        query_lens_cpu: Optional[list[int]] = None,
     ) -> "SparsePrefillChunkCache":
         """``query_lens`` / ``query_pos``: the rows this forward runs (the extend, or
         a CP rank's interleaved share of it); the SWA gather spans the whole extend."""
@@ -236,6 +251,7 @@ class SparsePrefillChunkCache:
         cache = cls(
             num_reqs=num_reqs,
             seq_lens_cpu=seq_lens_cpu,
+            query_lens_cpu=query_lens_cpu,
             num_qo_tokens=num_qo_tokens,
             max_seq_len=max_seq_len,
             swa_window_size=swa_window_size,
@@ -374,6 +390,25 @@ class SparsePrefillChunkCache:
         self.compressed[128] = gather
         return gather
 
+    def get_c128_combined(self, padded_width: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cache a fixed C128 width so changing chunk lengths reuse the H16 JIT."""
+        gather = self.compressed[128]
+        indices, lengths = gather.combined_indices, gather.combined_lens
+        assert indices is not None and lengths is not None
+        padding = padded_width - indices.shape[1]
+        if padding < 0 or padded_width % SPARSE_PREFILL_TOPK_ALIGNMENT:
+            raise ValueError("C128 width must be aligned and at least the live width")
+        if padding == 0:
+            return indices, lengths
+        if (
+            self.c128_padded_combined_indices is None
+            or self.c128_padded_combined_indices.shape[1] != padded_width
+        ):
+            self.c128_padded_combined_indices = torch.nn.functional.pad(
+                indices, (0, padding), value=-1
+            )
+        return self.c128_padded_combined_indices, lengths
+
     def ensure_compressed(
         self,
         compress_ratio: int,
@@ -404,6 +439,13 @@ class SparsePrefillChunkCache:
         if seq_lens_cpu is None:
             seq_lens_cpu = self.seq_lens.tolist()
         lengths_cpu = [int(length) // compress_ratio for length in seq_lens_cpu]
+        if self.query_lens_cpu is not None:
+            lengths_cpu = [
+                length if queries else 0
+                for length, queries in zip(
+                    lengths_cpu, self.query_lens_cpu, strict=True
+                )
+            ]
         total_compressed = sum(lengths_cpu)
         lengths = async_h2d(lengths_cpu, dtype=torch.int32, device=device)
         ends = lengths.cumsum(0, dtype=torch.int32)

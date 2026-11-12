@@ -19,6 +19,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
+import traceback
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -53,6 +54,8 @@ from sglang.srt.layers.quantization.fp8_activation import DenseSiluAndMulQuant
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -63,15 +66,14 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.models.utils import (
+    can_run_silu_fp4_quant_fusion,
+    maybe_enable_silu_fp4_quant_fusion,
+    silu_and_mul_fp4_quant,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import (
-    add_prefix,
-    is_npu,
-    is_xpu,
-    make_pp_layers,
-)
-from sglang.utils import get_exception_traceback
+from sglang.srt.utils import is_npu, is_xpu
 
 _is_xpu = is_xpu()
 
@@ -120,6 +122,10 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
         self.dual_gemm = DualGemm(self.gate_up_proj, self.down_proj, hidden_size)
         self.activation_quant = DenseSiluAndMulQuant(self.down_proj)
+        # Off unless the decoder layer enables the fused SiLU+mul+NVFP4 quant path.
+        self._enable_silu_fp4_quant_fusion = False
+        self._masked_m_cache: dict = {}
+        self._down_input_scale_inv_1d = None
 
     def forward(
         self,
@@ -130,7 +136,9 @@ class LlamaMLP(nn.Module):
             x = self.dual_gemm(x, self.gate_up_proj)
         else:
             gate_up, _ = self.gate_up_proj(x)
-            if forward_batch is not None and forward_batch.forward_mode.is_decode():
+            if can_run_silu_fp4_quant_fusion(self, gate_up):
+                x = silu_and_mul_fp4_quant(self, gate_up)
+            elif forward_batch is not None and forward_batch.forward_mode.is_decode():
                 x = self.activation_quant.forward_decode(
                     gate_up, self.act_fn, self.down_proj
                 )
@@ -363,6 +371,7 @@ class LlamaDecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
             reduce_results=not stage_boundaries,
         )
+        maybe_enable_silu_fp4_quant_fusion(self.mlp)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -634,46 +643,6 @@ class LlamaForCausalLM(nn.Module):
         else:
             return hidden_states
 
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-        input_embeds: torch.Tensor = None,
-    ) -> Optional[LogitsProcessorOutput]:
-        start, end = split_interval
-        # embed
-        if start == 0:
-            residual_batch.start(forward_batch)
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-        # decoder layer
-        for i in range(start, end):
-            layer = self.model.layers[i]
-            forward_batch.hidden_states = layer(
-                positions,
-                forward_batch.hidden_states,
-                forward_batch,
-            )
-
-        if end == self.model.config.num_hidden_layers:
-            # norm
-            forward_batch.hidden_states = residual_batch.final_norm(
-                forward_batch.hidden_states, forward_batch, self.model.norm
-            )
-            # logits process
-            result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            result = None
-
-        return result
-
     @property
     def start_layer(self):
         return self.model.start_layer
@@ -885,7 +854,7 @@ class LlamaForCausalLM(nn.Module):
 
         except Exception:
             logger.error(
-                f"Error getting weights by name {name} in LlamaForCausalLM: {get_exception_traceback()}"
+                f"Error getting weights by name {name} in LlamaForCausalLM: {traceback.format_exc()}"
             )
             return None
 
