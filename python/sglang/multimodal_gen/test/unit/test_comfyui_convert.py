@@ -352,6 +352,56 @@ def test_promoted_weight_dtype_fed_by_a_link_outside_is_disconnected() -> None:
     assert any("input link on subgraph instance" in r for r in report.reminders)
 
 
+def test_promoted_weight_dtype_shared_with_another_loader_is_left_alone() -> None:
+    """Resetting a shared input would also change the stock loader next to it."""
+    wf = _promoted_dtype_workflow(proxy=False)
+    sg = wf["definitions"]["subgraphs"][0]
+    sg["nodes"].append({"id": 9, "type": "UNETLoader", "mode": 0,
+                        "inputs": [{"name": "weight_dtype", "type": "COMBO",
+                                    "widget": {"name": "weight_dtype"}, "link": 5}],
+                        "outputs": [{"name": "MODEL", "type": "MODEL", "links": []}],
+                        "properties": {}, "widgets_values": [LTX, "default"]})  # fmt: skip
+    sg["links"].append({"id": 5, "origin_id": -10, "origin_slot": 1, "target_id": 9,
+                        "target_slot": 0, "type": "COMBO"})  # fmt: skip
+    sg["inputs"][1]["linkIds"].append(5)
+    out, report = convert_workflow(wf)
+    nodes = _nodes(out)
+    assert _nodes(out["definitions"]["subgraphs"][0])[3]["type"] == "UNETLoader"
+    assert nodes[5]["widgets_values"] == [H3, "fp8_e4m3fn"]
+    assert nodes[8]["widgets_values"] == [H3, "fp8_e5m2"]
+    assert any("shared with other nodes" in r for r in report.reminders)
+
+
+def test_weight_dtype_promoted_to_an_outer_subgraph_is_left_alone() -> None:
+    """The outer value is not reset, so a converted loader would fail at load."""
+    wf = _promoted_dtype_workflow(proxy=False)
+    second = wf["nodes"].pop()
+    second["inputs"][1]["link"] = 20
+    outer = {
+        "id": "a1b2c3d4-0000-4000-8000-000000000002", "version": 1, "name": "Outer",
+        "state": {"lastGroupId": 0, "lastNodeId": 8, "lastLinkId": 20, "lastRerouteId": 0},
+        "revision": 0, "config": {},
+        "inputNode": {"id": -10, "bounding": [0, 0, 120, 60]},
+        "outputNode": {"id": -20, "bounding": [900, 0, 120, 60]},
+        "inputs": [{"id": "in-1", "name": "weight_dtype", "type": "COMBO", "linkIds": [20]}],
+        "outputs": [], "widgets": [], "nodes": [second], "groups": [],
+        "links": [{"id": 20, "origin_id": -10, "origin_slot": 0, "target_id": 8,
+                   "target_slot": 1, "type": "COMBO"}],
+        "extra": {},
+    }  # fmt: skip
+    wf["definitions"]["subgraphs"].append(outer)
+    wf["nodes"].append({"id": 9, "type": outer["id"], "mode": 0,
+                        "inputs": [{"name": "weight_dtype", "type": "COMBO",
+                                    "widget": {"name": "weight_dtype"}, "link": None}],
+                        "outputs": [], "properties": {},
+                        "widgets_values": ["fp8_e4m3fn"]})  # fmt: skip
+    wf["state"]["lastNodeId"] = 9
+    out, report = convert_workflow(wf)
+    assert _nodes(out["definitions"]["subgraphs"][0])[3]["type"] == "UNETLoader"
+    assert _nodes(out)[5]["widgets_values"] == [H3, "fp8_e4m3fn"]
+    assert any("to an outer subgraph" in r for r in report.reminders)
+
+
 def test_lora_inside_subgraph_traces_its_model_through_the_instance() -> None:
     """Subgraph that takes MODEL in: its LoRA is on an SGLD model only via the parent."""
     wf = _subgraph_workflow()

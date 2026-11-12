@@ -228,6 +228,26 @@ class _UIConverter:
             names.append(values[idx] if idx is not None and idx < len(values) else own)
         return names or [own]
 
+    def dtype_conflict(self, g, node):
+        """Why ``node``'s weight_dtype cannot be reset to 'default' without touching
+        another node or an outer subgraph; None if it can."""
+        promoted = self.promoted(g, node, "weight_dtype")
+        if promoted is None:
+            return None
+        slot = next(i for i, x in enumerate(g.data["inputs"]) if x["name"] == promoted)
+        if len(g.data["inputs"][slot].get("linkIds") or []) > 1:
+            return "its weight_dtype is a subgraph input shared with other nodes"
+        for pg, inst in self.instances(g):
+            outer = next(
+                (i for i in inst.get("inputs") or [] if i.get("name") == promoted),
+                None,
+            )
+            link = pg.links.get(outer.get("link")) if outer else None
+            if link and _lget(link, "origin_id") == SG_INPUT:
+                at = _label(f"{pg.where}{inst['id']}", inst)
+                return f"its weight_dtype is promoted through {at} to an outer subgraph"
+        return None
+
     def reset_weight_dtype(self, g, node, where):
         """weight_dtype set from outside the loader's widget would override the
         'default' the SGLD loader needs: a link (e.g. a PrimitiveNode) is dropped,
@@ -258,12 +278,6 @@ class _UIConverter:
                 None,
             )
             link = pg.links.get(outer.get("link")) if outer else None
-            if link and _lget(link, "origin_id") == SG_INPUT:
-                self.report.reminders.append(
-                    f"{where}: weight_dtype is promoted through {at} to an outer "
-                    "subgraph; set it to `default` there by hand."
-                )
-                continue
             if link:
                 pg.drop_link(outer["link"])
                 outer["link"] = None
@@ -289,6 +303,13 @@ class _UIConverter:
                         f"({', '.join(map(str, names))}); left unchanged."
                     )
                 if not all(sgld):
+                    continue
+                conflict = self.dtype_conflict(g, node)
+                if conflict:
+                    self.report.reminders.append(
+                        f"{where}: {conflict}; left unchanged. Set it to `default` "
+                        "for this loader by hand to run it on SGLD."
+                    )
                     continue
                 values = list(node.get("widgets_values") or [names[0]])
                 # SGLDUNETLoader has UNETLoader's widgets (the GGUF loader lacks
