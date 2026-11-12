@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Tuple, Union
 
@@ -80,35 +79,6 @@ class TLRUStrategy(EvictionStrategy):
         cached_without_this_node = node._tlru_cached_prefix_len - len(node.key)
         tel_safe = cached_without_this_node >= budget
         return (-1 if tel_safe else 0, node.last_access_time)
-
-
-class GDSStrategy(EvictionStrategy):
-    """GreedyDual-Size over recurrent-state checkpoints (FlashState,
-    https://flashstate.ai).
-
-    A checkpoint's priority is its stamp, the eviction watermark at its last use,
-    plus the prefill it costs to rebuild from the nearest shallower checkpoint.
-    Full KV is not ranked here: it stays in recency order, which is why
-    get_priority matches LRUStrategy.
-    """
-
-    # Defaults are FlashState's GLM-5.3-Flash fit, in seconds; only the ratio
-    # d/e affects the order, and other models may want their own.
-    def __init__(self, d: float = 1.862e-5, e: float = 3.33e-6):
-        if not (math.isfinite(d) and math.isfinite(e)) or min(d, e) < 0 or d == e == 0:
-            raise ValueError(
-                "--radix-eviction-policy gds requires finite, non-negative 'd' and "
-                f"'e' with at least one positive, got d={d}, e={e}."
-            )
-        self.d = d
-        self.e = e
-
-    def get_priority(self, node: TreeNode) -> float:
-        return node.last_access_time
-
-    def restore_cost(self, start: int, end: int) -> float:
-        """Seconds of full-model prefill over tokens [start, end)."""
-        return self.d * (end - start) + self.e * (end**2 - start**2) / 2e5
 
 
 class SLRUStrategy(EvictionStrategy):
