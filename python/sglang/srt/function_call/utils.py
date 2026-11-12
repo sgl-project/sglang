@@ -1,6 +1,7 @@
 import ast
 import threading
 import warnings
+from copy import deepcopy
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
@@ -9,6 +10,7 @@ import orjson
 import partial_json_parser
 from partial_json_parser.core.options import Allow
 
+from sglang.srt.constrained.json_schema_validation import _iter_subschemas
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 
 _STANDARD_JSON_SCHEMA_TYPES = {
@@ -120,14 +122,10 @@ _SCHEMA_IDENTIFIER_KEYWORDS = ("$id", "$anchor", "$dynamicAnchor")
 
 def without_schema_identifiers(schema: Any) -> Any:
     """Return a copy of a JSON Schema without identifier keywords, for metaschema checks."""
-    if isinstance(schema, dict):
-        return {
-            key: without_schema_identifiers(value)
-            for key, value in schema.items()
-            if key not in _SCHEMA_IDENTIFIER_KEYWORDS
-        }
-    if isinstance(schema, list):
-        return [without_schema_identifiers(item) for item in schema]
+    schema = deepcopy(schema)
+    for subschema, _ in _iter_subschemas(schema):
+        for keyword in _SCHEMA_IDENTIFIER_KEYWORDS:
+            subschema.pop(keyword, None)
     return schema
 
 
