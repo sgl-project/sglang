@@ -223,6 +223,11 @@ class GraphSlot:
 
     # runtime
     buffer: Optional[torch.Tensor] = field(default=None, repr=False)
+    # (buffer, {n: head view}): the views fill_from / copy_slots write, kept while
+    # ``buffer`` stays bound (views of a static buffer are the same every replay).
+    _head_views: Optional[Tuple[torch.Tensor, Dict[int, torch.Tensor]]] = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.axis not in ("bs", "tokens", "none"):
@@ -245,6 +250,23 @@ class GraphSlot:
         if self.axis == "tokens":
             return raw_num_tokens
         return self.buffer.shape[0] if self.buffer is not None else 0
+
+    def head(self, n: int) -> torch.Tensor:
+        """The buffer's leading ``n`` rows as ``fill_from`` writes them
+        (``slice_fn`` when set; the whole buffer for axis ``"none"``)."""
+        cache = self._head_views
+        if cache is None or cache[0] is not self.buffer:
+            cache = self._head_views = (self.buffer, {})
+        view = cache[1].get(n)
+        if view is None:
+            if self.slice_fn is not None:
+                view = self.slice_fn(self.buffer, n)
+            elif self.axis == "none":
+                view = self.buffer
+            else:
+                view = self.buffer[:n]
+            cache[1][n] = view
+        return view
 
     def slice_for(self, padded_bs: int, padded_num_tokens: int) -> torch.Tensor:
         """Return the ``[:padded_n]`` slice of the buffer consumed by callers.
@@ -493,13 +515,7 @@ class CudaGraphBufferRegistry:
                     # Non-tensor FB fields (e.g. dicts, dataclasses) are not
                     # auto-copied — caller handles via source_fn or post_fill.
                     continue
-                raw_n = slot._raw_n(raw_bs, raw_num_tokens)
-                if slot.slice_fn is not None:
-                    dst = slot.slice_fn(slot.buffer, raw_n)
-                elif slot.axis == "none":
-                    dst = slot.buffer
-                else:
-                    dst = slot.buffer[:raw_n]
+                dst = slot.head(slot._raw_n(raw_bs, raw_num_tokens))
             # foreach_copy_ requires same-device tensors per call — bucket
             # by device.
             if dst.device.type == "cpu":
@@ -530,7 +546,12 @@ class CudaGraphBufferRegistry:
         dsts: List[torch.Tensor] = []
         srcs: List[torch.Tensor] = []
         for name, src in sources.items():
-            dst = self._slots[name].buffer[: src.shape[0]]
+            slot = self._slots[name]
+            dst = (
+                slot.head(src.shape[0])
+                if slot.slice_fn is None and slot.axis != "none"
+                else slot.buffer[: src.shape[0]]
+            )
             if not same_tensor_view(dst, src):
                 dsts.append(dst)
                 srcs.append(src)
