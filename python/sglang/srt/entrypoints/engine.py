@@ -327,13 +327,8 @@ class Engine(EngineScoreMixin, EngineBase):
         self.server_args = server_args
         logger.info(f"server_args={_server_args_for_logging(server_args)}")
 
-        # Rust Server is not supported with the offline Engine API
-        if envs.SGLANG_RUST_SERVER.get():
-            raise ValueError(
-                "SGLANG_RUST_SERVER is not supported with the offline Engine "
-                "API; it only replaces the HTTP server path (`sglang serve`). "
-                "Unset SGLANG_RUST_SERVER to use sgl.Engine."
-            )
+        self._rust_engine_mode = envs.SGLANG_RUST_SERVER.get()
+        self._rust_engine_client = None
 
         # Pre-initialize tokenizer_manager so the atexit handler in
         # shutdown() won't hit AttributeError.
@@ -367,6 +362,16 @@ class Engine(EngineScoreMixin, EngineBase):
         if tokenizer_manager is not None:
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
+
+        if self._rust_engine_mode:
+            # The embedded Rust server owns tokenization and the scheduler
+            # handoff in this mode. Engine calls enter through its native
+            # listener rather than creating a second Python TokenizerManager.
+            from sglang.srt.rust_server.offline_engine import RustOfflineEngineClient
+
+            self._rust_engine_client = RustOfflineEngineClient(
+                server_args.host, server_args.port
+            )
 
         if isinstance(tokenizer_manager, MultiTokenizerRouter):
             # --tokenizer-worker-num > 1: the router only bridges tokenizer workers to
@@ -545,6 +550,30 @@ class Engine(EngineScoreMixin, EngineBase):
             session_params=session_params,
             priority=priority,
         )
+        rust_engine_client = getattr(self, "_rust_engine_client", None)
+        if rust_engine_client is not None:
+            from sglang.srt.rust_server.offline_engine import generation_request_body
+
+            body = generation_request_body(obj)
+            request = rust_engine_client.generate(body, stream=stream)
+            if stream:
+                async_iterator = self.loop.run_until_complete(request)
+
+                def rust_stream_wrapper():
+                    try:
+                        while True:
+                            try:
+                                yield self.loop.run_until_complete(
+                                    async_iterator.__anext__()
+                                )
+                            except StopAsyncIteration:
+                                break
+                    finally:
+                        self.loop.run_until_complete(async_iterator.aclose())
+
+                return rust_stream_wrapper()
+            return self.loop.run_until_complete(request)
+
         generator = self.tokenizer_manager.generate_request(obj, None)
 
         if stream:
@@ -660,6 +689,13 @@ class Engine(EngineScoreMixin, EngineBase):
             session_params=session_params,
             priority=priority,
         )
+        rust_engine_client = getattr(self, "_rust_engine_client", None)
+        if rust_engine_client is not None:
+            from sglang.srt.rust_server.offline_engine import generation_request_body
+
+            body = generation_request_body(obj)
+            return await rust_engine_client.generate(body, stream=stream)
+
         generator = self.tokenizer_manager.generate_request(obj, None)
 
         if stream is True:

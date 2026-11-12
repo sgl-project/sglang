@@ -3,7 +3,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use safetensors::Dtype;
 use serde::Deserialize;
+
+use crate::checkpoint::{CheckpointError, SafeTensorCheckpoint};
 
 /// Validated dense Llama causal-language-model configuration.
 #[derive(Clone, Debug, PartialEq)]
@@ -102,6 +105,104 @@ impl LlamaConfig {
         }
         Ok(())
     }
+
+    /// Tensor names and shapes expected by the dense Hugging Face Llama layout.
+    pub fn expected_tensor_shapes(&self) -> Vec<TensorSpec> {
+        let mut specs = vec![TensorSpec {
+            name: "model.embed_tokens.weight".into(),
+            shape: vec![self.vocab_size, self.hidden_size],
+        }];
+        for layer in 0..self.num_hidden_layers {
+            let prefix = format!("model.layers.{layer}");
+            let kv_width = self.num_key_value_heads * self.head_dim;
+            let query_width = self.num_attention_heads * self.head_dim;
+            specs.extend([
+                TensorSpec {
+                    name: format!("{prefix}.self_attn.q_proj.weight"),
+                    shape: vec![query_width, self.hidden_size],
+                },
+                TensorSpec {
+                    name: format!("{prefix}.self_attn.k_proj.weight"),
+                    shape: vec![kv_width, self.hidden_size],
+                },
+                TensorSpec {
+                    name: format!("{prefix}.self_attn.v_proj.weight"),
+                    shape: vec![kv_width, self.hidden_size],
+                },
+                TensorSpec {
+                    name: format!("{prefix}.self_attn.o_proj.weight"),
+                    shape: vec![self.hidden_size, query_width],
+                },
+                TensorSpec {
+                    name: format!("{prefix}.mlp.gate_proj.weight"),
+                    shape: vec![self.intermediate_size, self.hidden_size],
+                },
+                TensorSpec {
+                    name: format!("{prefix}.mlp.up_proj.weight"),
+                    shape: vec![self.intermediate_size, self.hidden_size],
+                },
+                TensorSpec {
+                    name: format!("{prefix}.mlp.down_proj.weight"),
+                    shape: vec![self.hidden_size, self.intermediate_size],
+                },
+                TensorSpec {
+                    name: format!("{prefix}.input_layernorm.weight"),
+                    shape: vec![self.hidden_size],
+                },
+                TensorSpec {
+                    name: format!("{prefix}.post_attention_layernorm.weight"),
+                    shape: vec![self.hidden_size],
+                },
+            ]);
+        }
+        specs.push(TensorSpec {
+            name: "model.norm.weight".into(),
+            shape: vec![self.hidden_size],
+        });
+        if !self.tie_word_embeddings {
+            specs.push(TensorSpec {
+                name: "lm_head.weight".into(),
+                shape: vec![self.vocab_size, self.hidden_size],
+            });
+        }
+        specs
+    }
+
+    /// Validate required tensor presence, shape, and supported floating dtype.
+    pub fn validate_checkpoint(
+        &self,
+        checkpoint: &SafeTensorCheckpoint,
+    ) -> Result<(), ModelConfigError> {
+        for spec in self.expected_tensor_shapes() {
+            let tensor = checkpoint.tensor(&spec.name).map_err(|error| match error {
+                CheckpointError::TensorNotFound(name) => ModelConfigError::MissingTensor(name),
+                other => ModelConfigError::Checkpoint(other.to_string()),
+            })?;
+            if tensor.shape() != spec.shape {
+                return Err(ModelConfigError::TensorShapeMismatch {
+                    name: spec.name,
+                    expected: spec.shape,
+                    actual: tensor.shape().to_vec(),
+                });
+            }
+            if !matches!(tensor.dtype(), Dtype::F32 | Dtype::F16 | Dtype::BF16) {
+                return Err(ModelConfigError::UnsupportedTensorDtype {
+                    name: spec.name,
+                    dtype: tensor.dtype(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One required named tensor in a model checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorSpec {
+    /// Hugging Face safetensors key.
+    pub name: String,
+    /// Expected dimensions in checkpoint order.
+    pub shape: Vec<usize>,
 }
 
 impl TryFrom<RawLlamaConfig> for LlamaConfig {
@@ -182,6 +283,18 @@ pub enum ModelConfigError {
     InconsistentKeyValueHeads,
     #[error("invalid model scalar: {0}")]
     InvalidScalar(&'static str),
+    #[error("required model tensor is missing: {0}")]
+    MissingTensor(String),
+    #[error("invalid checkpoint for model: {0}")]
+    Checkpoint(String),
+    #[error("tensor {name} has shape {actual:?}; expected {expected:?}")]
+    TensorShapeMismatch {
+        name: String,
+        expected: Vec<usize>,
+        actual: Vec<usize>,
+    },
+    #[error("tensor {name} has unsupported dtype {dtype:?}")]
+    UnsupportedTensorDtype { name: String, dtype: Dtype },
 }
 
 #[cfg(test)]
@@ -189,6 +302,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use safetensors::tensor::{TensorView, serialize};
 
     fn write_config(contents: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -202,6 +316,19 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("config.json"), contents).unwrap();
         dir
+    }
+
+    fn write_checkpoint(dir: &Path, specs: &[TensorSpec], omit: Option<&str>) {
+        for (index, spec) in specs.iter().enumerate() {
+            if omit == Some(spec.name.as_str()) {
+                continue;
+            }
+            let count: usize = spec.shape.iter().product();
+            let data = vec![0_u8; count * 4];
+            let tensor = TensorView::new(Dtype::F32, spec.shape.clone(), &data).unwrap();
+            let bytes = serialize([(spec.name.as_str(), tensor)], None).unwrap();
+            fs::write(dir.join(format!("shard-{index:05}.safetensors")), bytes).unwrap();
+        }
     }
 
     const VALID: &str = r#"{
@@ -256,6 +383,50 @@ mod tests {
         assert!(matches!(
             LlamaConfig::from_path(&dir),
             Err(ModelConfigError::InconsistentKeyValueHeads)
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn validates_llama_checkpoint_shapes_and_required_tensors() {
+        let config_dir = write_config(VALID);
+        let config = LlamaConfig::from_path(&config_dir).unwrap();
+        let checkpoint_dir = config_dir.join("weights");
+        fs::create_dir_all(&checkpoint_dir).unwrap();
+        let specs = config.expected_tensor_shapes();
+        write_checkpoint(&checkpoint_dir, &specs, None);
+        let checkpoint = SafeTensorCheckpoint::open(&checkpoint_dir).unwrap();
+        config.validate_checkpoint(&checkpoint).unwrap();
+        drop(checkpoint);
+
+        fs::remove_dir_all(&checkpoint_dir).unwrap();
+        fs::create_dir_all(&checkpoint_dir).unwrap();
+        write_checkpoint(&checkpoint_dir, &specs, Some("lm_head.weight"));
+        let checkpoint = SafeTensorCheckpoint::open(&checkpoint_dir).unwrap();
+        assert!(matches!(
+            config.validate_checkpoint(&checkpoint),
+            Err(ModelConfigError::MissingTensor(name)) if name == "lm_head.weight"
+        ));
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_wrong_llama_tensor_shape() {
+        let dir = write_config(VALID);
+        let config = LlamaConfig::from_path(&dir).unwrap();
+        let checkpoint_dir = dir.join("weights");
+        fs::create_dir_all(&checkpoint_dir).unwrap();
+        let mut specs = config.expected_tensor_shapes();
+        let embedding = specs
+            .iter_mut()
+            .find(|spec| spec.name == "model.embed_tokens.weight")
+            .unwrap();
+        embedding.shape = vec![config.vocab_size, config.hidden_size - 1];
+        write_checkpoint(&checkpoint_dir, &specs, None);
+        let checkpoint = SafeTensorCheckpoint::open(&checkpoint_dir).unwrap();
+        assert!(matches!(
+            config.validate_checkpoint(&checkpoint),
+            Err(ModelConfigError::TensorShapeMismatch { name, .. }) if name == "model.embed_tokens.weight"
         ));
         fs::remove_dir_all(dir).unwrap();
     }
