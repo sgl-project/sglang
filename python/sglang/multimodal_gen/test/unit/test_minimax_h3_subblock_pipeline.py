@@ -93,7 +93,9 @@ def test_missing_mask_only_errors_for_sparse(sparse_enabled):
         first_segment_sparse_query_block_mask=None,
     )
     if sparse_enabled:
-        with pytest.raises(ValueError, match="requires subblock_sparse_query_block_mask"):
+        with pytest.raises(
+            ValueError, match="requires subblock_sparse_query_block_mask"
+        ):
             attend(q, q, q)
         impl.forward_varlen.assert_not_called()
     else:
