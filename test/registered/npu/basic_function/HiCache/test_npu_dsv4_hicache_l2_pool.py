@@ -24,6 +24,7 @@ class TestDSV4PoolAssembly(CustomTestCase):
             NPUDeepSeekV4IndexerPool,
             NPUDeepSeekV4SingleKVPool,
         )
+
         indexer_pool = NPUDeepSeekV4IndexerPool.__new__(NPUDeepSeekV4IndexerPool)
         indexer_pool._kernel_page_size = 32
         indexer_pool.index_k_buffer = k_buffer
