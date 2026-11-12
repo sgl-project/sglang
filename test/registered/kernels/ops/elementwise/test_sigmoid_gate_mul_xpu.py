@@ -1,4 +1,5 @@
 import sys
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -62,6 +63,22 @@ def test_fused_sigmoid_mul_flat_gate(inplace):
     out = fused_sigmoid_mul(x, gate, inplace=inplace)
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
     assert (out.data_ptr() == x_ptr) == inplace
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_rounded_sigmoid_keeps_triton_path(dtype):
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+    torch.manual_seed(0)
+    x = torch.randn(7, 1024, dtype=dtype, device=DEVICE)
+    gate = torch.randn_like(x)
+    expected = (x.float() * torch.sigmoid(gate.float()).to(dtype).float()).to(dtype)
+    with patch(
+        "sgl_kernel.fused_sigmoid_mul",
+        side_effect=AssertionError("SYCL does not support rounded sigmoid"),
+    ):
+        out = fused_sigmoid_mul(x, gate, round_sigmoid=True)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

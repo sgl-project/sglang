@@ -339,7 +339,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             multimodal_rotary_embedding(
                 query,
                 key,
-                self.cos_sin_cache,
+                self.cos_sin_cache_as(query.dtype),
                 positions,
                 self.mrope_section,
                 self.head_size,

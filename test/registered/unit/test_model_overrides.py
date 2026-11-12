@@ -995,7 +995,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             with self.assertRaisesRegex(ValueError, "compressed QSA indexer"):
                 self._construct(*qwen4, qsa_indexer_dtype="fp8_e4m3")
         with override_platform(
-            is_cuda=False, is_hip=True, is_sm90=False, is_sm100=False
+            is_cuda=False, is_hip=True, is_xpu=False, is_sm90=False, is_sm100=False
         ):
             with self.assertRaisesRegex(ValueError, "SM90/SM100"):
                 self._construct(
