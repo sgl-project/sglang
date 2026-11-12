@@ -63,14 +63,12 @@ class Inkling2MTPWorker(DSparkWorkerV2):
     def init_attention_backends(self):
         super().init_attention_backends()
         draft_runner = self.draft_model_runner
-        backend = "triton" if get_platform().is_hip else "fa4"
+        backend, name = ("triton", "Triton") if get_platform().is_hip else ("fa4", "FA4")
         if (
             draft_runner.prefill_attention_backend_str != backend
             or draft_runner.decode_attention_backend_str != backend
         ):
-            raise ValueError(
-                "Inkling2 MTP requires FA4 draft attention (Triton on ROCm)"
-            )
+            raise ValueError(f"Inkling2 MTP requires {name} draft attention")
         draft_pool = draft_runner.token_to_kv_pool
         if isinstance(draft_pool, SWAKVPool):
             draft_window = draft_runner.sliding_window_size + 1
