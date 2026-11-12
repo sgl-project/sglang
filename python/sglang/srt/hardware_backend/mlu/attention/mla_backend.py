@@ -7,10 +7,12 @@ import torch
 import torch_mlu_ops
 
 from sglang.srt.configs.model_config import is_deepseek_dsa
-from sglang.srt.hardware_backend.mlu.attention.mha_backend import (
+from sglang.srt.hardware_backend.mlu.attention.metadata import (
     ForwardMetadata,
-    MLUMHABackend,
+    build_forward_metadata,
 )
+from sglang.srt.hardware_backend.mlu.attention.utils import validate_attention
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -39,31 +41,37 @@ class MLUMhaChunkKVRunner:
         layer: "RadixAttention",
         forward_batch: "ForwardBatch",
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        meta = self.attn_backend.forward_metadata
+        forward_metadata = self.attn_backend.forward_metadata
         attend_prefix_cache = bool(forward_batch.attn_attend_prefix_cache)
         if attend_prefix_cache:
             chunk_idx = forward_batch.prefix_chunk_idx
             cu_seqlens_kv = forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
             max_seq_len_kv = forward_batch.prefix_chunk_max_seq_lens[chunk_idx]
         elif forward_batch.mha_one_shot:
-            cu_seqlens_kv, max_seq_len_kv = meta.cu_seqlens_kv, meta.max_seq_len_kv
+            cu_seqlens_kv, max_seq_len_kv = (
+                forward_metadata.cu_seqlens_kv,
+                forward_metadata.max_seq_len_kv,
+            )
         else:
-            cu_seqlens_kv, max_seq_len_kv = meta.cu_seqlens_q, meta.max_seq_len_q
+            cu_seqlens_kv, max_seq_len_kv = (
+                forward_metadata.cu_seqlens_q,
+                forward_metadata.max_seq_len_q,
+            )
         return_lse = bool(attend_prefix_cache or forward_batch.mha_return_lse)
         result = torch_mlu_ops.flash_attention(
             q=q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k=k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim),
             v=v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim),
             out=None,
-            cu_seq_lens_q=meta.cu_seqlens_q,
+            cu_seq_lens_q=forward_metadata.cu_seqlens_q,
             cu_seq_lens_kv=cu_seqlens_kv,
             alibi_slope=None,
             attn_bias=None,
-            max_seq_len_q=meta.max_seq_len_q,
+            max_seq_len_q=forward_metadata.max_seq_len_q,
             max_seq_len_kv=max_seq_len_kv,
             softmax_scale=layer.scaling,
             is_causal=not attend_prefix_cache,
-            compute_dtype=torch.float32,
+            compute_dtype=torch.float16,
             return_lse=return_lse,
             block_tables=None,
             out_dtype=q.dtype,
@@ -76,9 +84,15 @@ class MLUMhaChunkKVRunner:
         return result
 
 
-class MLUMLABackend(MLUMHABackend):
+class MLUMLABackend(AttentionBackend):
     def __init__(self, model_runner: "ModelRunner"):
-        super().__init__(model_runner)
+        self.device = model_runner.device
+        self.page_size = model_runner.page_size
+        self.max_context_len = model_runner.model_config.context_len
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.forward_metadata = None
         if is_deepseek_dsa(model_runner.model_config.hf_config):
             raise NotImplementedError("MLU MLA does not support DSA yet.")
         if self.kv_cache_dtype != torch.bfloat16:
@@ -89,27 +103,33 @@ class MLUMLABackend(MLUMHABackend):
         self.mha_chunk_kv_runner = MLUMhaChunkKVRunner(self)
 
     def init_forward_metadata(self, forward_batch: "ForwardBatch") -> None:
-        super().init_forward_metadata(forward_batch)
         if forward_batch.forward_mode.is_idle():
             return
-        self.forward_metadata = MLAForwardMetadata(**vars(self.forward_metadata))
+        self.forward_metadata = build_forward_metadata(
+            forward_batch,
+            self.req_to_token,
+            self.page_size,
+            self.max_context_len,
+            metadata_cls=MLAForwardMetadata,
+        )
         if forward_batch.forward_mode.is_decode():
             return
-        meta = self.forward_metadata
-        if meta.is_uncached_prefill:
+        forward_metadata = self.forward_metadata
+        if forward_metadata.is_uncached_prefill:
             return
-        num_prefill_reqs = meta.mixed_prefill_reqs
+        num_prefill_reqs = forward_metadata.mixed_prefill_reqs
         if num_prefill_reqs < 0:
             num_prefill_reqs = forward_batch.batch_size
         # Physical slots, in packed request order. Build once, reuse across layers.
         rows = self.req_to_token[
-            forward_batch.req_pool_indices[:num_prefill_reqs], : meta.max_seq_len_kv
+            forward_batch.req_pool_indices[:num_prefill_reqs],
+            : forward_metadata.max_seq_len_kv,
         ]
         mask = (
-            torch.arange(meta.max_seq_len_kv, device=self.device)[None, :]
-            < meta.seq_lens[:num_prefill_reqs, None]
+            torch.arange(forward_metadata.max_seq_len_kv, device=self.device)[None, :]
+            < forward_metadata.seq_lens[:num_prefill_reqs, None]
         )
-        meta.prefill_kv_indices = rows[mask].long()
+        forward_metadata.prefill_kv_indices = rows[mask].long()
 
     def forward_decode(
         self,
@@ -121,9 +141,7 @@ class MLUMLABackend(MLUMHABackend):
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        self._validate_attention(
-            layer, kwargs.get("sinks"), kwargs.get("return_lse", False)
-        )
+        validate_attention(layer, kwargs.get("sinks"), kwargs.get("return_lse", False))
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, None
@@ -141,9 +159,7 @@ class MLUMLABackend(MLUMHABackend):
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        self._validate_attention(
-            layer, kwargs.get("sinks"), kwargs.get("return_lse", False)
-        )
+        validate_attention(layer, kwargs.get("sinks"), kwargs.get("return_lse", False))
         # MHA expands the latent cache in the model and has already stored KV.
         is_latent = (
             layer.tp_k_head_num == 1
@@ -164,12 +180,14 @@ class MLUMLABackend(MLUMHABackend):
                 layer, forward_batch.out_cache_loc, k, None
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        meta = self.forward_metadata
-        num_prefill_reqs = meta.mixed_prefill_reqs
+        forward_metadata = self.forward_metadata
+        num_prefill_reqs = forward_metadata.mixed_prefill_reqs
         if num_prefill_reqs == 0:
             return self._forward_mla_decode(q, layer)
         num_prefill_tokens = (
-            meta.mixed_prefill_tokens if num_prefill_reqs >= 0 else q.shape[0]
+            forward_metadata.mixed_prefill_tokens
+            if num_prefill_reqs >= 0
+            else q.shape[0]
         )
         prefill = self._forward_mla_prefill(q[:num_prefill_tokens], k, layer)
         if num_prefill_tokens == q.shape[0]:
@@ -190,8 +208,8 @@ class MLUMLABackend(MLUMHABackend):
         k: torch.Tensor | None,
         layer: "RadixAttention",
     ) -> torch.Tensor:
-        meta = self.forward_metadata
-        if meta.is_uncached_prefill:
+        forward_metadata = self.forward_metadata
+        if forward_metadata.is_uncached_prefill:
             if k is None:
                 raise NotImplementedError(
                     "MLU MLA prefill without a cached prefix requires explicit K; "
@@ -202,22 +220,22 @@ class MLUMLABackend(MLUMHABackend):
             ]
         else:
             prefill_k = self.token_to_kv_pool.get_key_buffer(layer.layer_id)[
-                meta.prefill_kv_indices
+                forward_metadata.prefill_kv_indices
             ]
         return torch_mlu_ops.flash_attention(
             q=q,
             k=prefill_k,
             v=prefill_k[..., : self.kv_lora_rank],
             out=None,
-            cu_seq_lens_q=meta.cu_seqlens_q,
-            cu_seq_lens_kv=meta.cu_seqlens_kv,
+            cu_seq_lens_q=forward_metadata.cu_seqlens_q,
+            cu_seq_lens_kv=forward_metadata.cu_seqlens_kv,
             alibi_slope=None,
             attn_bias=None,
-            max_seq_len_q=meta.max_seq_len_q,
-            max_seq_len_kv=meta.max_seq_len_kv,
+            max_seq_len_q=forward_metadata.max_seq_len_q,
+            max_seq_len_kv=forward_metadata.max_seq_len_kv,
             softmax_scale=layer.scaling,
             is_causal=True,
-            compute_dtype=torch.float32,
+            compute_dtype=torch.float16,
             return_lse=False,
             block_tables=None,
             out_dtype=q.dtype,
@@ -229,7 +247,7 @@ class MLUMLABackend(MLUMHABackend):
         layer: "RadixAttention",
         start_req: int = 0,
     ) -> torch.Tensor:
-        meta = self.forward_metadata
+        forward_metadata = self.forward_metadata
         cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
             -1, 1, self.page_size, layer.qk_head_dim
         )
@@ -238,8 +256,8 @@ class MLUMLABackend(MLUMHABackend):
             k_cache=cache,
             v_cache=None,
             out=None,
-            block_tables=meta.block_tables[start_req:],
-            context_lens=meta.seq_lens[start_req:],
+            block_tables=forward_metadata.block_tables[start_req:],
+            context_lens=forward_metadata.seq_lens[start_req:],
             k_cache_quant_scale=None,
             v_cache_quant_scale=None,
             alibi_slopes=None,
@@ -248,7 +266,7 @@ class MLUMLABackend(MLUMHABackend):
             windows_size_right=-1,
             softmax_scale=layer.scaling,
             head_size_v=layer.v_head_dim,
-            compute_dtype=torch.float32,
+            compute_dtype=torch.float16,
             q_quant_scale=None,
             out_quant_scale=None,
         )
