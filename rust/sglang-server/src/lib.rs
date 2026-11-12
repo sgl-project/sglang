@@ -337,6 +337,12 @@ impl Server {
         self.rt.begin_drain(force);
     }
 
+    /// Python's `--warmups` finished: health may answer 200 once startup
+    /// warmup has too. Only meaningful with `ServerArgs.custom_warmups_pending`.
+    pub fn finish_custom_warmups(&self) {
+        self.rt.finish_custom_warmups();
+    }
+
     /// Whether a drain has begun and every listener has closed since, its
     /// end released if held (see [`Server::hold_drain_end`]): the scheduler
     /// may stop.

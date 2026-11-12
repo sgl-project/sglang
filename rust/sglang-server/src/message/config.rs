@@ -185,6 +185,9 @@ pub struct ServerArgs {
     /// `--gc-threshold`: the thresholds the scheduler ranks set when they
     /// freeze their garbage collectors after startup; `None` keeps Python's.
     pub gc_threshold: Option<Vec<i64>>,
+    /// Keep health at 503 until Python reports that its `--warmups` finished
+    /// ([`crate::Server::finish_custom_warmups`]).
+    pub custom_warmups_pending: bool,
     /// Extra headers on a successful `/health_generate` response, for a router
     /// that reads deployment metadata off the deep health probe.
     pub health_generate_headers: BTreeMap<String, String>,
@@ -304,6 +307,7 @@ impl ServerArgs {
         skip_tokenizer_init,
         skip_server_warmup,
         gc_threshold,
+        custom_warmups_pending,
         health_generate_headers,
         default_priority_value,
         enable_request_header_overrides,
@@ -368,6 +372,7 @@ impl ServerArgs {
         skip_tokenizer_init: bool,
         skip_server_warmup: bool,
         gc_threshold: Option<Vec<i64>>,
+        custom_warmups_pending: bool,
         health_generate_headers: BTreeMap<String, String>,
         default_priority_value: Option<i64>,
         enable_request_header_overrides: bool,
@@ -430,6 +435,7 @@ impl ServerArgs {
             skip_tokenizer_init,
             skip_server_warmup,
             gc_threshold,
+            custom_warmups_pending,
             health_generate_headers,
             default_priority_value,
             enable_request_header_overrides,
@@ -499,6 +505,7 @@ impl Default for ServerArgs {
             skip_tokenizer_init: false,
             skip_server_warmup: false,
             gc_threshold: None,
+            custom_warmups_pending: false,
             health_generate_headers: BTreeMap::new(),
             default_priority_value: None,
             enable_request_header_overrides: false,

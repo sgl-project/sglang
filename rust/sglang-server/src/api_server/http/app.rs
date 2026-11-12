@@ -49,13 +49,16 @@ pub(super) struct AppState {
 /// Once warm (or with the warmup skipped, or past the PD exception), the
 /// scheduler ranks freeze their garbage collectors, as after Python's
 /// post-warmup `/freeze_gc`: the objects startup allocated then stay out of
-/// every later full collection.
+/// every later full collection. Python runs `--warmups` before its startup
+/// warmup, so this waits for them first (see
+/// [`CoreHandle::custom_warmups_finished`]); its timeout starts after them.
 async fn startup_warmup(
     core: CoreHandle,
     server_args: Arc<ServerArgs>,
     timeout: Duration,
     startup_failure: flume::Sender<String>,
 ) {
+    core.custom_warmups_finished().await;
     if !core.is_ready() {
         let error = match tokio::time::timeout(
             timeout,
@@ -425,5 +428,59 @@ mod tests {
             assert!(intake_rx.is_empty(), "{case}: froze GC more than once");
             assert!(failure_rx.is_empty(), "{case}: reported a failure");
         }
+    }
+
+    /// The startup warmup waits for Python's `--warmups`, as Python runs them
+    /// first: no warmup generation and no GC freeze while they run.
+    #[tokio::test]
+    async fn startup_warmup_runs_after_custom_warmups() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let core = CoreHandle::new(
+            intake_tx,
+            flume::unbounded().0,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: false,
+                is_disaggregation: false,
+                mm_limits: Vec::new(),
+                multimodal: false,
+                metadata: CoreMetadata::default(),
+                metrics: None,
+                request_log: None,
+                peer_endpoints: Vec::new(),
+                generate_validator: None,
+            },
+        );
+        core.hold_for_custom_warmups();
+        let (failure_tx, failure_rx) = flume::bounded(1);
+        let warmup = tokio::spawn(startup_warmup(
+            core.clone(),
+            Arc::new(ServerArgs::default()),
+            Duration::from_secs(60),
+            failure_tx,
+        ));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(intake_rx.is_empty(), "warmed up during the custom warmups");
+        assert!(!core.is_ready());
+
+        core.finish_custom_warmups();
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("the warmup generation must come first");
+        };
+        assert!(admission.try_accept());
+        request
+            .sink
+            .try_send(ResponseItem::Done(ChunkEvent::default()))
+            .unwrap();
+        let TmEvent::OneWay { queued, .. } = intake_rx.recv_async().await.unwrap() else {
+            panic!("expected the FreezeGCReq");
+        };
+        queued.send(Ok(())).unwrap();
+        warmup.await.unwrap();
+        assert!(core.is_serving());
+        assert!(failure_rx.is_empty());
     }
 }

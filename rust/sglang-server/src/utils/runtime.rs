@@ -186,6 +186,11 @@ impl Runtime {
         self.core.begin_drain(force);
     }
 
+    /// Python's `--warmups` finished (see [`CoreHandle::finish_custom_warmups`]).
+    pub fn finish_custom_warmups(&self) {
+        self.core.finish_custom_warmups();
+    }
+
     /// Whether a drain has begun and every listener has since closed, its
     /// end released if held: the scheduler may stop. The other stages keep
     /// running until [`Runtime::request_shutdown`].
@@ -536,6 +541,9 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         },
     );
     core.set_graceful_close_timeout(cfg.rust_server_args.graceful_close_timeout);
+    if cfg.server_args.custom_warmups_pending {
+        core.hold_for_custom_warmups();
+    }
 
     // --- HTTP + optional gRPC adapters (one tokio runtime, I/O bound) ---
     let listeners_closed = Arc::new(AtomicBool::new(false));
@@ -1955,6 +1963,31 @@ mod tests {
         }
         rt.request_shutdown();
         assert_eq!(rt.wait_startup_failure(), None);
+    }
+
+    /// With `custom_warmups_pending`, the server is not serving and freezes no
+    /// garbage collector until Python reports its `--warmups` finished, as
+    /// Python freezes only after them, with or without a startup warmup.
+    #[test]
+    fn custom_warmups_hold_health_and_the_gc_freeze() {
+        let (http_addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(http_addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            custom_warmups_pending: true,
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
+        assert!(rt.core.is_ready(), "the startup warmup is skipped");
+        assert!(!rt.core.is_serving());
+        assert!(
+            !rt.to_scheduler_rx
+                .wait(std::time::Duration::from_millis(200)),
+            "froze GC before the custom warmups finished"
+        );
+        rt.finish_custom_warmups();
+        assert!(rt.core.is_serving());
+        take_startup_freeze_gc(&rt);
+        rt.request_shutdown();
     }
 
     /// End to end over the configured socket: the generated api.v1 client
