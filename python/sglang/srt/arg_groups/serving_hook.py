@@ -233,6 +233,15 @@ def handle_load_balance_method(server_args: Any):
         )
         return
 
+    if cfg.load_balance_method == "prefix_affinity":
+        if cfg.prefix_affinity_max_load_skew < 1.0:
+            raise ValueError(
+                "--prefix-affinity-max-load-skew must be >= 1.0, got "
+                f"{cfg.prefix_affinity_max_load_skew}"
+            )
+        if cfg.prefix_affinity_min_load_diff < 0:
+            raise ValueError("--prefix-affinity-min-load-diff must be >= 0")
+
 
 def handle_grammar_backend(server_args: Any):
     cfg = resolving_view(server_args)

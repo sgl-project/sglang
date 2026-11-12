@@ -1264,10 +1264,42 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--load-balance-method`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The load balancing strategy for data parallelism. The `total_tokens` algorithm can only be used when DP attention is applied. This algorithm performs load balancing based on the real-time token load of the DP workers.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>round_robin</code>, <code>follow_bootstrap_room</code>, <code>total_requests</code>, <code>total_tokens</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>round_robin</code>, <code>follow_bootstrap_room</code>, <code>total_requests</code>, <code>total_tokens</code>, <code>prefix_affinity</code></td>
+    </tr>
+    <tr>
+      <td>`--prefix-affinity-fallback`</td>
+      <td>Load-balancing policy used when a request has no routing key and token-prefix fallback is disabled or unavailable.</td>
+      <td>`total_tokens`</td>
+      <td>`round_robin`, `total_requests`, `total_tokens`</td>
+    </tr>
+    <tr>
+      <td>`--prefix-affinity-max-load-skew`</td>
+      <td>Relative overload threshold against the average running plus waiting request count across live ranks. A rank is skipped only when both this threshold and the absolute load-difference threshold are exceeded.</td>
+      <td>`1.5`</td>
+      <td>Float, at least `1.0`</td>
+    </tr>
+    <tr>
+      <td>`--prefix-affinity-min-load-diff`</td>
+      <td>Allowed running plus waiting request-count difference from the least-loaded live rank before the relative overload guard may spill affinity. Set `0` for the original relative-only guard. Uses load before dispatch.</td>
+      <td>`4`</td>
+      <td>Nonnegative integer</td>
+    </tr>
+    <tr>
+      <td>`--prefix-affinity-hash-tokens`</td>
+      <td>Number of leading input tokens hashed when no explicit routing key is supplied. Sessions sharing this entire prefix have the same fallback key; use a session-specific `x-smg-routing-key` header to distinguish them.</td>
+      <td>`4096`</td>
+      <td>Integer; at most `0` disables token-prefix hashing</td>
+    </tr>
+    <tr>
+      <td>`--prefix-affinity-disable-token-fallback`</td>
+      <td>Send requests without an explicit routing key directly to the fallback load balancer instead of hashing their token prefix.</td>
+      <td>`False`</td>
+      <td>Boolean flag</td>
     </tr>
   </tbody>
 </table>
+
+`prefix_affinity` is an opt-in, single-instance session-affinity policy, not a cache-content index. Use explicit session routing keys when requests share a common system prefix. Preserving affinity can reduce repeated prefill work, but can also reduce throughput when a key has little prefix reuse or concentrates traffic on a few ranks. SMG's DP-aware `cache_aware` policy provides content-aware routing through a separate gateway; benchmark the policy and overload thresholds against your workload.
 
 ## Multi-node distributed serving
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>

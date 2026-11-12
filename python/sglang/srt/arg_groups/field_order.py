@@ -570,5 +570,10 @@ POSITIONAL_FIELD_ORDER = (
     "layernorm_sp_min_tokens",
     "paged_experts_host_memory_gb",
     "_max_running_requests_explicitly_set",
+    "prefix_affinity_fallback",
+    "prefix_affinity_max_load_skew",
+    "prefix_affinity_hash_tokens",
+    "prefix_affinity_disable_token_fallback",
+    "prefix_affinity_min_load_diff",
 )
 # fmt: on

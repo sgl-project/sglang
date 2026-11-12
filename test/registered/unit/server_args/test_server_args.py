@@ -1730,6 +1730,23 @@ class TestLoraForwardDomains(unittest.TestCase):
                     check_lora_server_args(args)
 
 
+class TestPrefixAffinityValidation(CustomTestCase):
+    def test_negative_absolute_gap_is_rejected_but_zero_is_supported(self):
+        """A negative gap would silently remove the intended burst protection."""
+        for value in (-1, 0, 8):
+            with self.subTest(value=value):
+                args = ServerArgs(
+                    model_path="dummy",
+                    load_balance_method="prefix_affinity",
+                    prefix_affinity_min_load_diff=value,
+                )
+                if value < 0:
+                    with self.assertRaisesRegex(ValueError, "min-load-diff"):
+                        handle_load_balance_method(args)
+                else:
+                    handle_load_balance_method(args)
+
+
 class TestLoadBalanceMethod(unittest.TestCase):
     def _load_balance_args(self, **kwargs):
         server_args = ServerArgs(model_path="dummy", **kwargs)

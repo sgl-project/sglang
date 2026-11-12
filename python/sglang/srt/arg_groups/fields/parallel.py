@@ -102,9 +102,44 @@ class Parallel(msgspec.Struct):
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "prefix_affinity",
             ],
         ),
     ] = "auto"
+    prefix_affinity_fallback: A[
+        str,
+        Arg(
+            help=(
+                "Load-balance method used by 'prefix_affinity' when it cannot honor "
+                "affinity (no routing key and token fallback disabled or unusable, "
+                "or all live ranks over the load-skew threshold)."
+            ),
+            choices=["round_robin", "total_requests", "total_tokens"],
+        ),
+    ] = "total_tokens"
+    prefix_affinity_max_load_skew: A[
+        float,
+        "For 'prefix_affinity': a rank is considered overloaded when its load exceeds "
+        "this multiple of the average load across live ranks AND exceeds the "
+        "absolute load-difference threshold. Must be >= 1.0.",
+    ] = 1.5
+    prefix_affinity_min_load_diff: A[
+        int,
+        "For 'prefix_affinity': preserve affinity unless a rank exceeds the "
+        "least-loaded live rank by more than this many running plus waiting "
+        "requests AND exceeds the relative load-skew threshold. Must be >= 0; "
+        "0 restores the relative-only guard.",
+    ] = 4
+    prefix_affinity_hash_tokens: A[
+        int,
+        "For 'prefix_affinity': number of leading input tokens hashed for the "
+        "token-prefix fallback key when a request has no routing key.",
+    ] = 4096
+    prefix_affinity_disable_token_fallback: A[
+        bool,
+        "For 'prefix_affinity': disable the token-prefix fallback key so that requests "
+        "without an explicit routing key go straight to the fallback load-balance method.",
+    ] = False
     attn_cp_size: A[
         int,
         Arg(
