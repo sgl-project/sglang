@@ -100,6 +100,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
+from sglang.srt.utils.device import is_float4_e2m1fn_x2
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -1948,6 +1949,8 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    # 352 B/token NVFP4 DSA rows read by the prims_ts backend
+    dsa_kv_cache_store_nvfp4: bool = False
     rows_are_dcp_collapsed: bool = False
 
     @property
@@ -4420,6 +4423,10 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "dsa_kv_cache_store_fp8", False)
 
     @property
+    def dsa_kv_cache_store_nvfp4(self) -> bool:
+        return getattr(self.full_kv_pool, "dsa_kv_cache_store_nvfp4", False)
+
+    @property
     def kv_scale_ue8m0(self) -> bool:
         return getattr(self.full_kv_pool, "kv_scale_ue8m0", False)
 
@@ -4895,11 +4902,31 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
+        self.dsa_kv_cache_store_nvfp4 = use_dsa and is_float4_e2m1fn_x2(dtype)
+        if self.dsa_kv_cache_store_nvfp4:
+            from sglang.srt.layers.attention.dsa.prims_k_cache import (
+                PRIMS_NVFP4_BYTES_PER_TOKEN,
+            )
+
+            if not (
+                (kv_lora_rank, qk_rope_head_dim) == (512, 64)
+                and override_kv_cache_dim == PRIMS_NVFP4_BYTES_PER_TOKEN
+                and page_size == 64
+                and not dcp_replicated
+            ):
+                raise ValueError(
+                    "DSA NVFP4 KV needs 512+64 MLA rows of "
+                    f"{PRIMS_NVFP4_BYTES_PER_TOKEN} B, page size 64 and no DCP; got "
+                    f"{kv_lora_rank=}, {qk_rope_head_dim=}, {override_kv_cache_dim=}, "
+                    f"{page_size=}, {dcp_replicated=}"
+                )
+            # Packed bytes; prims_k_cache encodes and decodes them.
+            self.store_dtype = torch.uint8
         # When override_kv_cache_dim is provided with dsa model, we assume the
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.dsa_kv_cache_store_fp8
+            if self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_nvfp4
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -5005,6 +5032,9 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        if self.dsa_kv_cache_store_nvfp4:
+            # uint8[slots, 1, 352]; K and V share the packed latent row.
+            return self.kv_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
 
@@ -5014,6 +5044,8 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        if self.dsa_kv_cache_store_nvfp4:
+            return self.kv_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer][
                 ..., : self.kv_lora_rank
@@ -5069,6 +5101,9 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         assert not self.dsa_kv_cache_store_fp8
+        assert not self.dsa_kv_cache_store_nvfp4, (
+            "DSA NVFP4 KV is written from BF16 NoPE/RoPE via set_mla_kv_buffer"
+        )
         # No DCP-aware variant is possible: the two backends reaching this door
         # disagree on the loc space (flashinfer-MLA widened, Triton collapsed).
         assert (
@@ -5103,7 +5138,13 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             self.write_loc_is_dcp_resolved
             and (self.use_dsa or self.dsa_kv_cache_store_fp8)
         ), "the DSA write paths have no resolved-loc variant"
-        if (
+        if self.dsa_kv_cache_store_nvfp4:
+            from sglang.srt.layers.attention.dsa.prims_k_cache import (
+                quantize_prims_k_cache_into,
+            )
+
+            quantize_prims_k_cache_into(cache_k_nope, cache_k_rope, dst_buffer, loc)
+        elif (
             _is_hip
             and self.use_dsa
             and self.dtype == fp8_dtype
@@ -5199,6 +5240,15 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         kv_buffer = self.get_key_buffer(layer_id)
+        if self.dsa_kv_cache_store_nvfp4:
+            from sglang.srt.layers.attention.dsa.prims_k_cache import (
+                dequantize_prims_k_cache_paged,
+            )
+
+            decoded = dequantize_prims_k_cache_paged(
+                kv_buffer, loc, dtype=dst_dtype or torch.bfloat16
+            )
+            return decoded[..., : self.kv_lora_rank], decoded[..., self.kv_lora_rank :]
         dst_dtype = dst_dtype or self.dtype
         cache_k_nope = torch.empty(
             (loc.shape[0], 1, self.kv_lora_rank),
