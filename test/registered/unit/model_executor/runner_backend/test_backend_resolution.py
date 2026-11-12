@@ -42,8 +42,12 @@ def _make_exec_config(
 ):
     return SimpleNamespace(
         graph=SimpleNamespace(
-            cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(backend=backend)),
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(backend=backend),
+                prefill=SimpleNamespace(backend=backend),
+            ),
             debug_cuda_graph=debug_cuda_graph,
+            enable_profile_cuda_graph=False,
         ),
         features=SimpleNamespace(
             enable_memory_saver=enable_memory_saver,
@@ -209,30 +213,17 @@ class TestGroupedBackendResolution(CustomTestCase):
         attention_warmup=False,
         cuda=True,
     ):
-        runner = SimpleNamespace(
-            model_runner=SimpleNamespace(
-                device="cuda",
-                lora_manager=manager,
-                attn_backend=SimpleNamespace(
-                    requires_per_shape_decode_graph_warmup=False
-                ),
-            ),
-            enable_profile_cuda_graph=profile,
-            attn_backend=SimpleNamespace(
-                requires_per_shape_decode_graph_warmup=attention_warmup
-            ),
-        )
-        graph = SimpleNamespace(
-            cuda_graph_config=SimpleNamespace(
-                decode=SimpleNamespace(backend=backend or Backend.FULL),
-                prefill=SimpleNamespace(backend=backend or Backend.BREAKABLE),
-            ),
+        runner = _make_graph_runner(device="cuda")
+        runner.model_runner.lora_manager = manager
+        runner.enable_profile_cuda_graph = profile
+        runner.attn_backend.requires_per_shape_decode_graph_warmup = attention_warmup
+        config = _make_exec_config(
+            backend=backend
+            or (Backend.FULL if phase == "decode" else Backend.BREAKABLE),
             debug_cuda_graph=debug,
-            enable_profile_cuda_graph=profile,
         )
-        config = SimpleNamespace(
-            graph=graph, features=SimpleNamespace(enable_memory_saver=False)
-        )
+        config.graph.enable_profile_cuda_graph = profile
+        flags = SimpleNamespace(capture=SimpleNamespace(enable_torch_compile=compile))
         envs = SimpleNamespace(
             SGLANG_ENABLE_GRAPH_POOL_PRECARVE=SimpleNamespace(get=lambda: precarve),
             SGLANG_ENABLE_GRAPH_POOL_BORROW=SimpleNamespace(get=lambda: borrow),
@@ -242,28 +233,17 @@ class TestGroupedBackendResolution(CustomTestCase):
             is_out_of_tree=custom,
             full_backend_cls=_OtherCaptureBackend if custom else None,
         )
-        with (
-            mock.patch.object(backend_utils, "get_exec", return_value=config),
-            mock.patch.object(
-                backend_utils,
-                "get_memory",
-                return_value=SimpleNamespace(enable_hierarchical_cache=False),
-            ),
-            mock.patch.object(
-                backend_utils,
-                "get_flags",
-                return_value=SimpleNamespace(
-                    capture=SimpleNamespace(enable_torch_compile=compile)
-                ),
-            ),
-            mock.patch.object(backend_utils, "envs", envs),
-            mock.patch.object(backend_utils, "current_platform", platform),
-            mock.patch.object(backend_utils, "FullCudaGraphBackend", _CaptureBackend),
-            mock.patch.object(
-                backend_utils, "BreakableCudaGraphBackend", _CaptureBackend
-            ),
+        with mock.patch.multiple(
+            backend_utils,
+            get_exec=lambda: config,
+            get_memory=lambda: SimpleNamespace(enable_hierarchical_cache=False),
+            get_flags=lambda: flags,
+            envs=envs,
+            current_platform=platform,
+            FullCudaGraphBackend=_CaptureBackend,
+            BreakableCudaGraphBackend=_CaptureBackend,
         ):
-            return getattr(backend_utils, "resolve_" + phase + "_backend")(runner)
+            return getattr(backend_utils, f"resolve_{phase}_backend")(runner)
 
     def test_supported_paths_and_eligibility(self):
         def dense(workspace, expert):
@@ -332,13 +312,11 @@ class TestGroupedBackendResolution(CustomTestCase):
                     sparse, "get_platform", return_value=SimpleNamespace(is_sm90=sm90)
                 ):
                     self.assertEqual(
-                        leaf.requires_per_shape_decode_graph_warmup, expected
-                    )
-                    self.assertEqual(
-                        hybrid.requires_per_shape_decode_graph_warmup, expected
-                    )
-                    self.assertEqual(
-                        tbo.requires_per_shape_decode_graph_warmup, expected
+                        [
+                            b.requires_per_shape_decode_graph_warmup
+                            for b in (leaf, hybrid, tbo)
+                        ],
+                        [expected] * 3,
                     )
                     self.assertEqual(
                         AttentionBackend.requires_per_shape_decode_graph_warmup.fget(

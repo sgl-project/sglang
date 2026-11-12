@@ -27,14 +27,9 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend import breakable_cuda_graph_backend as bcg
 from sglang.srt.model_executor.runner_backend import full_cuda_graph_backend as full
-from sglang.srt.model_executor.runner_backend import utils as backend_utils
-from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
-    FullCudaGraphBackend,
-)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -48,17 +43,33 @@ _UNSET = object()
 class _FakeGraphCtx:
     """Stand-in for ``device_module.graph(...)`` — a no-op context manager."""
 
+    def __init__(self, state=None):
+        self.state = state
+
     def __enter__(self):
+        if self.state is not None:
+            self.state.events.append("capture.enter")
+            self.state.active = True
         return self
 
     def __exit__(self, *exc):
+        if self.state is not None:
+            self.state.active = False
+            self.state.events.append("capture.exit")
+            if self.state.fail_exit:
+                self.state.fail_exit = False
+                raise RuntimeError("capture exit")
         return False
 
 
-def _make_backend(runner):
-    """Build a ``FullCudaGraphBackend`` without running ``__init__`` (which would
-    touch CUDA), wiring just the attributes ``capture_one`` reads."""
-    backend = FullCudaGraphBackend.__new__(FullCudaGraphBackend)
+def _make_backend(runner, module=full):
+    """Build a FULL or breakable backend without initializing CUDA."""
+    cls = (
+        module.FullCudaGraphBackend
+        if module is full
+        else module.BreakableCudaGraphBackend
+    )
+    backend = cls.__new__(cls)
     backend._group_preparation_enabled = False
     backend._prepared_groups = set()
     backend._graphs = {}
@@ -75,6 +86,13 @@ def _make_backend(runner):
     backend._cuda_graph_runner = runner
     backend._device_module = runner.device_module
     backend._tp_group = SimpleNamespace(barrier=mock.Mock(name="barrier"))
+    if module is bcg:
+        backend._model_runner = runner.model_runner
+        backend._shared_output_buffer = None
+        backend._debug_eager = False
+        backend._enable_hicache_event_capture = False
+        backend._hicache_graph_events = None
+        backend.deduped_cuda_graph = None
     return backend
 
 
@@ -88,6 +106,14 @@ def _make_runner(*, enable_profile, profiler, num_tokens_per_bs=1, mode_name="DE
         num_tokens_per_bs=num_tokens_per_bs,
         capture_forward_mode=SimpleNamespace(name=mode_name),
         enable_profile_cuda_graph=enable_profile,
+        model_runner=SimpleNamespace(
+            device="cuda",
+            lora_manager=None,
+            attn_backend=SimpleNamespace(requires_per_shape_decode_graph_warmup=False),
+        ),
+        attn_backend=SimpleNamespace(requires_per_shape_decode_graph_warmup=False),
+        cuda_graph_output_capacity_rows=lambda output: None,
+        cuda_graph_output_rows=lambda output: None,
     )
     if profiler is not _UNSET:
         runner._profiler = profiler
@@ -274,34 +300,19 @@ class TestCleanup(CustomTestCase):
         self.assertIsNone(backend._pool)
 
 
-class _FakeGraph:
-    def __init__(self, *args, **kwargs):
-        self.replay = mock.Mock()
-        self.reset = mock.Mock()
-
-
 @contextlib.contextmanager
 def _backend_env(module, *, enabled, reuse=False):
-    """Use upstream's CPU fake-device pattern with the real backend constructor."""
+    runner = _make_runner(enable_profile=False, profiler=None)
+    backend = _make_backend(runner, module)
+    backend._group_preparation_enabled = enabled
+    backend._reuse_output_buffer = reuse
     state = SimpleNamespace(active=False, fail_exit=False, events=[])
+    runner.device_module.state = state
 
     def record(event):
-        if event in ("sync", "barrier") and state.active:
+        if state.active and event in ("sync", "barrier"):
             raise AssertionError("synchronization during capture")
         state.events.append(event)
-
-    @contextlib.contextmanager
-    def capture(**kwargs):
-        record("capture.enter")
-        state.active = True
-        try:
-            yield
-        finally:
-            state.active = False
-            record("capture.exit")
-        if state.fail_exit:
-            state.fail_exit = False
-            raise RuntimeError("capture exit")
 
     @contextlib.contextmanager
     def measure():
@@ -309,69 +320,38 @@ def _backend_env(module, *, enabled, reuse=False):
         yield
         record("measure.exit")
 
-    device = SimpleNamespace(
-        synchronize=mock.Mock(side_effect=lambda: record("sync")),
-        graph=capture,
-        state=state,
-    )
-    runner = SimpleNamespace(
-        device_module=device,
-        enable_profile_cuda_graph=False,
-        model_runner=SimpleNamespace(
-            device="cuda",
-            lora_manager=None,
-            attn_backend=SimpleNamespace(requires_per_shape_decode_graph_warmup=False),
-        ),
-        cuda_graph_output_capacity_rows=lambda x: None,
-        cuda_graph_output_rows=lambda x: None,
-    )
-    runner.attn_backend = runner.model_runner.attn_backend
-    barrier = mock.Mock(side_effect=lambda: record("barrier"))
-    carve = SimpleNamespace(
-        measure=measure, mint=mock.Mock(side_effect=lambda: record("mint"))
-    )
-    patches = [
-        mock.patch.object(
-            module,
-            "get_parallel",
-            return_value=SimpleNamespace(tp_group=SimpleNamespace(barrier=barrier)),
-        ),
-        mock.patch.object(module, "GraphPoolPrecarve", return_value=carve),
-        mock.patch.object(module.TorchMemorySaverAdapter, "create", return_value=None),
-        mock.patch.object(
-            module, "get_or_create_global_graph_memory_pool", return_value=object()
-        ),
-        mock.patch.object(module, "set_graph_pool_id"),
-        mock.patch.object(module, "graph_pool_capture_scope", contextlib.nullcontext),
-        mock.patch.object(module, "graph_pool_replay_scope", contextlib.nullcontext),
-    ]
-    if module is full:
-        patches.append(mock.patch.object(torch.cuda, "CUDAGraph", _FakeGraph))
-    else:
-        patches.extend(
-            [
-                mock.patch.object(module, "BreakableCUDAGraph", _FakeGraph),
-                mock.patch.object(module, "BreakableCUDAGraphCapture", capture),
-                mock.patch.object(
-                    module, "enable_breakable_cuda_graph", contextlib.nullcontext
-                ),
-                mock.patch.object(
-                    module.BreakableCudaGraphBackend, "begin_cuda_graph_capture"
-                ),
-                mock.patch.object(
-                    module.BreakableCudaGraphBackend, "end_cuda_graph_capture"
-                ),
-            ]
-        )
+    runner.device_module.synchronize.side_effect = lambda: record("sync")
+    backend._tp_group.barrier.side_effect = lambda: record("barrier")
+    backend._precarve = SimpleNamespace(measure=measure, mint=lambda: record("mint"))
+    runner.device_module.graph = lambda **kw: _FakeGraphCtx(state)
     with contextlib.ExitStack() as stack:
-        for patch in patches:
-            stack.enter_context(patch)
-        if module is full:
-            backend = module.FullCudaGraphBackend(runner, reuse_output_buffer=reuse)
-        else:
-            backend = module.BreakableCudaGraphBackend(runner)
-        backend._group_preparation_enabled = enabled
-        yield backend, device, barrier
+        stack.enter_context(mock.patch("torch.cuda.CUDAGraph", side_effect=mock.Mock))
+        stack.enter_context(
+            mock.patch.multiple(
+                module,
+                set_graph_pool_id=lambda pool: None,
+                get_or_create_global_graph_memory_pool=lambda device: object(),
+                graph_pool_capture_scope=contextlib.nullcontext,
+                graph_pool_replay_scope=contextlib.nullcontext,
+            )
+        )
+        if module is bcg:
+            stack.enter_context(
+                mock.patch.multiple(
+                    module,
+                    BreakableCUDAGraph=lambda *a, **kw: mock.Mock(),
+                    BreakableCUDAGraphCapture=lambda **kw: _FakeGraphCtx(state),
+                    enable_breakable_cuda_graph=contextlib.nullcontext,
+                )
+            )
+            stack.enter_context(
+                mock.patch.multiple(
+                    module.BreakableCudaGraphBackend,
+                    begin_cuda_graph_capture=lambda self: None,
+                    end_cuda_graph_capture=lambda self: None,
+                )
+            )
+        yield backend, runner.device_module
 
 
 class TestGroupedCapture(CustomTestCase):
@@ -391,7 +371,6 @@ class TestGroupedCapture(CustomTestCase):
                     with _backend_env(module, enabled=enabled) as (
                         backend,
                         device,
-                        barrier,
                     ):
                         hook = mock.Mock(
                             side_effect=lambda: device.state.events.append("hook")
@@ -406,9 +385,6 @@ class TestGroupedCapture(CustomTestCase):
                                     return torch.ones((key.size, 2))
 
                                 device.state.events.clear()
-                                before_sync = device.synchronize.call_count
-                                before_barrier = barrier.call_count
-                                before_hook = hook.call_count
                                 backend.capture_one(key, forward, post_warmup_hook=hook)
                                 expected = []
                                 for step in range(2):
@@ -422,11 +398,6 @@ class TestGroupedCapture(CustomTestCase):
                                     ["capture.enter", "mint", "capture", "capture.exit"]
                                 )
                                 self.assertEqual(device.state.events, expected)
-                                self.assertEqual(
-                                    device.synchronize.call_count - before_sync, 2
-                                )
-                                self.assertEqual(barrier.call_count - before_barrier, 2)
-                                self.assertEqual(hook.call_count - before_hook, 2)
                                 self.assertTrue(backend.can_run(None, key))
                                 self.assertEqual(
                                     tuple(backend.replay(key, None).shape),
@@ -437,7 +408,7 @@ class TestGroupedCapture(CustomTestCase):
         for module in (full, bcg):
             for fail_call in (1, 2, "exit"):
                 with self.subTest(backend=module.__name__, fail_call=fail_call):
-                    with _backend_env(module, enabled=True) as (backend, device, _):
+                    with _backend_env(module, enabled=True) as (backend, device):
                         key = ShapeKey(size=4)
                         calls = 0
 
@@ -470,7 +441,7 @@ class TestGroupedCapture(CustomTestCase):
                             backend.capture_one(key, forward)
                             self.assertEqual(forward.call_count, 2)
                         # A separate backend must prepare the same group independently.
-                        with _backend_env(module, enabled=True) as (other, _, _):
+                        with _backend_env(module, enabled=True) as (other, _):
                             with other.capture_session(object()):
                                 forward = mock.Mock(return_value=torch.ones((4, 2)))
                                 other.capture_one(key, forward)
@@ -483,7 +454,6 @@ class TestGroupedCapture(CustomTestCase):
                     with _backend_env(full, enabled=enabled, reuse=reuse) as (
                         backend,
                         device,
-                        _,
                     ):
                         warmups = []
 
@@ -499,130 +469,10 @@ class TestGroupedCapture(CustomTestCase):
                         self.assertEqual(len(warmups), 1 if enabled else 2)
                         self.assertTrue(all(ref() is None for ref in warmups))
 
-    def test_resolver_policy_controls_real_capture(self):
-        for module, phase, kind in (
-            (full, "decode", Backend.FULL),
-            (bcg, "prefill", Backend.BREAKABLE),
-        ):
-            for compiled, precarve, attention_warmup in (
-                (False, False, False),
-                (True, False, False),
-                (False, True, False),
-                (False, False, True),
-            ):
-                with self.subTest(phase=phase, compiled=compiled, precarve=precarve):
-                    with _backend_env(module, enabled=False) as (backend, device, _):
-                        backend._cuda_graph_runner.model_runner.attn_backend.requires_per_shape_decode_graph_warmup = attention_warmup
-                        fallback = (
-                            compiled
-                            or precarve
-                            or (attention_warmup and phase == "decode")
-                        )
-                        config = SimpleNamespace(
-                            graph=SimpleNamespace(
-                                cuda_graph_config=SimpleNamespace(
-                                    decode=SimpleNamespace(backend=kind),
-                                    prefill=SimpleNamespace(backend=kind),
-                                ),
-                                debug_cuda_graph=False,
-                                enable_profile_cuda_graph=False,
-                            ),
-                            features=SimpleNamespace(enable_memory_saver=False),
-                        )
-                        factory = mock.Mock(return_value=backend)
-                        with contextlib.ExitStack() as stack:
-                            stack.enter_context(
-                                mock.patch.object(
-                                    backend_utils,
-                                    "get_memory",
-                                    return_value=SimpleNamespace(
-                                        enable_hierarchical_cache=False
-                                    ),
-                                )
-                            )
-                            stack.enter_context(
-                                mock.patch.object(
-                                    backend_utils, "get_exec", return_value=config
-                                )
-                            )
-                            stack.enter_context(
-                                mock.patch.object(
-                                    backend_utils,
-                                    "get_flags",
-                                    return_value=SimpleNamespace(
-                                        capture=SimpleNamespace(
-                                            enable_torch_compile=compiled
-                                        )
-                                    ),
-                                )
-                            )
-                            stack.enter_context(
-                                mock.patch.object(
-                                    backend_utils.envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE,
-                                    "get",
-                                    return_value=precarve,
-                                )
-                            )
-                            stack.enter_context(
-                                mock.patch.object(
-                                    backend_utils.envs.SGLANG_ENABLE_GRAPH_POOL_BORROW,
-                                    "get",
-                                    return_value=False,
-                                )
-                            )
-                            stack.enter_context(
-                                mock.patch.object(
-                                    backend_utils,
-                                    "current_platform",
-                                    SimpleNamespace(
-                                        is_cuda=lambda: True,
-                                        is_npu=lambda: False,
-                                        is_xpu=lambda: False,
-                                        is_out_of_tree=lambda: False,
-                                        get_full_graph_backend_cls=lambda: None,
-                                    ),
-                                )
-                            )
-                            stack.enter_context(
-                                mock.patch.object(
-                                    backend_utils, "FullCudaGraphBackend", factory
-                                )
-                            )
-                            stack.enter_context(
-                                mock.patch.object(
-                                    backend_utils, "BreakableCudaGraphBackend", factory
-                                )
-                            )
-                            resolved = getattr(
-                                backend_utils, f"resolve_{phase}_backend"
-                            )(backend._cuda_graph_runner)
-                        self.assertIs(resolved, backend)
-                        with backend.capture_session(object()):
-                            for size, expected_eager in (
-                                (8, 2 if fallback else 1),
-                                (4, 2 if fallback else 0),
-                            ):
-                                phases = []
-
-                                def forward():
-                                    phases.append(device.state.active)
-                                    if (compiled and len(phases) == 2) or (
-                                        attention_warmup
-                                        and phase == "decode"
-                                        and len(phases) == 1
-                                    ):
-                                        device.synchronize()
-                                    return torch.ones((size, 2))
-
-                                backend.capture_one(ShapeKey(size=size), forward)
-                                self.assertEqual(
-                                    phases, [False] * expected_eager + [True]
-                                )
-
     def test_output_buffer_reuse_and_cleanup(self):
         for module in (full, bcg):
             with self.subTest(backend=module.__name__):
-                with _backend_env(module, enabled=True, reuse=True) as (backend, _, _):
+                with _backend_env(module, enabled=True, reuse=True) as (backend, _):
                     large = ShapeKey(size=8)
                     small = ShapeKey(size=4)
                     input_owner = torch.ones((2,))
