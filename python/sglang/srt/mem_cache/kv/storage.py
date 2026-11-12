@@ -9,6 +9,7 @@ code outside the KV package loops over them instead of naming a combination.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -139,6 +140,8 @@ class KVStorage:
         self._plan = plan
         self.sized = sized
         self._allocator = allocator
+        # State slots taken ahead for one batch's takes (`lease_state_slots`).
+        self._state_lease: Optional[torch.Tensor] = None
         self.start_layer = start_layer
         # The request table: rows, who holds each, and the ids they hold.
         self.requests = requests
@@ -676,8 +679,31 @@ class KVStorage:
     # -- the prefix tree's state effects: the tree decides, the storage executes --
 
     def take_state_slots(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
-        """``count`` free state slots of ``sub_pool``; None when none are free."""
+        """``count`` free state slots of ``sub_pool``; None when none are free.
+        Inside `lease_state_slots`, served from the leased slots while they last."""
+        lease = self._state_lease
+        if lease is not None and count <= len(lease):
+            self._state_lease = lease[count:]
+            return lease[:count]
         return self._allocator.state_slots.alloc(count)
+
+    @contextmanager
+    def lease_state_slots(self, sub_pool: str, count: int):
+        """Take, in one take, the ``count`` slots of ``sub_pool`` that takes
+        of a slot each will ask inside this context, when all of them fit now;
+        each take of the state band is a layout search and a bind. The slots
+        no take asked for go back on exit. When they do not all fit, nothing is
+        leased and every take, with its eviction on a shortfall, runs alone."""
+        assert self._state_lease is None, "state slot leases do not nest"
+        slots = self._allocator.state_slots
+        if count > 1 and slots.slots_fit(count):
+            self._state_lease = slots.alloc(count)
+        try:
+            yield
+        finally:
+            lease, self._state_lease = self._state_lease, None
+            if lease is not None and len(lease) > 0:
+                slots.free(lease)
 
     def free_state_slots(self, sub_pool: str, slots: torch.Tensor) -> None:
         self._allocator.state_slots.free(slots)
