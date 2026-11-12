@@ -314,7 +314,11 @@ def splitk_linear_chunks(
     layer: torch.nn.Module, weight: torch.Tensor, parts: int
 ) -> tuple[torch.Tensor, ...]:
     """One transposed, chunk-wide copy of ``weight`` per K chunk, cached on
-    ``layer`` until the weight storage changes (load, ``.to()``, offload)."""
+    ``layer`` until the weight storage changes (load, ``.to()``, offload).
+
+    The cache is keyed on ``weight.data_ptr()``, so an in-place weight update
+    that keeps the storage (``param.data.copy_``, as in the post-training weight
+    sync) has to clear ``layer._splitk_chunks`` to get fresh copies."""
     cached = getattr(layer, "_splitk_chunks", None)
     if cached is not None and cached[0] == weight.data_ptr():
         return cached[1]
