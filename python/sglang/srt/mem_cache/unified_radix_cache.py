@@ -789,7 +789,16 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def evict(self, params: EvictParams) -> EvictResult:
+        if params.mamba_num > 0:
+            self._reap_parked_mamba_slots()
         return self._evict(params)
+
+    def _reap_parked_mamba_slots(self) -> None:
+        # Host-only checkpoints need the HiCache controller; without it nothing parks.
+        if self.cache_controller is not None and self._mamba_host_only_checkpoint():
+            # Host-only keeps no device Mamba state in the tree, so the slots a finished
+            # request parked (its checkpoint still copying to host) are the only reclaim.
+            self.components[ComponentType.MAMBA].reap_parked_slots(force=True)
 
     @rank_consensus(same_params=True, same_results=True)
     def evict_for_alloc(self, demand: KVDemand) -> EvictResult:
@@ -804,6 +813,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         if self.disable:
             return EvictResult()
+        if demand.state_slots > 0:
+            self._reap_parked_mamba_slots()
         return super().evict_for_alloc(demand)
 
     def reclaim_jointly(
@@ -4424,6 +4435,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 "write_back duplicate-reclaim victims diverged across TP ranks"
             )
 
+        if self._mamba_host_only_checkpoint():
+            self.components[ComponentType.MAMBA].reap_parked_slots()
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
@@ -4909,9 +4922,14 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def mamba_protected_size(self) -> int:
-        return self.tree_core.mamba_protected_size() + (
+        size = self.tree_core.mamba_protected_size() + (
             self.linker.prefetch_size(PoolName.MAMBA) if self.linker is not None else 0
         )
+        if self._mamba_host_only_checkpoint():
+            # Parked slots (a finished request's checkpoint still copying to host)
+            # are neither free, evictable nor held by a request.
+            size += self.components[ComponentType.MAMBA].parked_slot_count()
+        return size
 
     def total_size(self) -> tuple[int, int]:
         return self.tree_core.total_size()

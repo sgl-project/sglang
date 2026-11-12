@@ -97,6 +97,13 @@ class InsertParams:
     # waits until the insert key is known, so a leaf that already has mamba
     # never pays the D2H.
     mamba_host_src: Optional[torch.Tensor] = None
+    # The request frees mamba_host_src right after the insert (finished), so
+    # the host waits for the copy; otherwise later forwards and loads wait on it.
+    mamba_host_src_freed: bool = False
+    # Finished request's tracking-slot index for mamba_host_src: the slot is parked
+    # (kept out of the free list) until its copy lands, instead of a host wait.
+    mamba_host_src_keep_idx: Optional[int] = None
+    mamba_host_parked: bool = False
     # Both mamba values stay empty and the leaf already holds the checkpoint.
     allow_missing_mamba: bool = False
     # The ping-pong slot prepare picked; cleanup keeps that same slot.
