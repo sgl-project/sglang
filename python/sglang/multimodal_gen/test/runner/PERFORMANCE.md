@@ -168,7 +168,9 @@ cases, on `main` as well as on PRs. Its `runner_overrides` give each of the two
 pools its own loading and E2E references, keyed `h100-computable-d-` and
 `h100-computable-e-` so that a future `h100-computable-dx` pool does not match.
 Other runners keep the defaults.
-Stage/step and memory references and all tolerances are unchanged.
+Memory references and all tolerances are unchanged. Stage/step references keep
+their defaults except for `ltx_2_3_hq_pipeline`, whose per-pool overrides are
+described below.
 
 Scheduled PR Test Base runs, 2026-10-18 to 2026-11-06 (127 jobs; one `computable-d` job was still running):
 
@@ -182,7 +184,7 @@ The slowdown covers the whole server startup, not particular models. Median
 time from `Starting server...` to the scheduler binding is 10 s on `novita`,
 11 s on `computable-e` and 14 s on `computable-d`. From `Loading pipeline
 modules...` to `All workers are ready` it is 13 s, 19 s and 21 s. Denoise steps
-run at the same speed.
+are not uniformly slower; the LTX HQ exception is described below.
 
 ### Calibration
 
@@ -221,9 +223,13 @@ against 0 of 10 and 10 of 11 without these references. Override maps such as
 `stages_ms` and `denoise_step_ms` merge into the defaults, so unlisted stages
 and steps keep their default references.
 
-These references describe slower hosts, not slower code. On these pools a
-loading regression must exceed the host's own minimum by 40% before it fails.
-When the hosts are fixed or leave the pool, remove their entries.
+These references describe observed timings on each runner pool. Calibration
+across different runs and source revisions does not by itself establish a host
+cause or rule out a code regression. In particular, passing the adjusted LTX HQ
+guard is not evidence that its denoise slowdown has been explained or fixed;
+that requires controlled same-environment comparisons. On these pools a loading
+regression must exceed the host's own minimum by 40% before it fails. When the
+hosts are fixed or leave the pool, remove their entries.
 
 ## Initial loading references
 
