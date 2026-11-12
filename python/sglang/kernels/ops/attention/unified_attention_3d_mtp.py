@@ -35,6 +35,7 @@ head_dim 256) is the only config known to match today.
 """
 
 import math
+from typing import Optional
 
 import torch
 import triton
@@ -47,6 +48,9 @@ from sglang.kernels.arch import current_arch
 # gfx950 assembly MTP-verify attention (in-tree .s, assembled at first use)
 from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
     AsmKernelUnavailable as _AsmKernelUnavailable,
+)
+from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
+    alloc_seg_plan as _alloc_seg_plan,
 )
 from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
     asm_kernel_available as _asm_kernel_available,
