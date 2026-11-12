@@ -24,6 +24,8 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     CancellationRetirementOutput,
     CancellationRetirementReq,
+    msgpack_decode,
+    msgpack_encode,
 )
 from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch  # noqa: E402
@@ -366,6 +368,79 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         self.assertTrue(old.finished())
         self.assertEqual(list(scheduler.waiting_queue), [])
         self.assertIsInstance(replacement.to_finish, FINISH_ABORT)
+
+    def test_rust_control_correlation_distinct_from_target_rid(self):
+        """Rust replies route on correlation rid; lookup uses target_rid."""
+        encoded = CancellationRetirementReq(
+            rid="corr",
+            cancellation_id="op",
+            request_instance_id="internal",
+            target_rid="internal",
+        )
+        decoded = msgpack_decode(msgpack_encode(encoded))
+        self.assertIsInstance(decoded, CancellationRetirementReq)
+        self.assertEqual(decoded.rid, "corr")
+        self.assertEqual(decoded.target_rid, "internal")
+        http_shaped = msgpack_decode(
+            msgpack_encode(
+                CancellationRetirementReq(
+                    rid="http-rid",
+                    cancellation_id="http-op",
+                    request_instance_id="http-instance",
+                )
+            )
+        )
+        self.assertIsNone(http_shaped.target_rid)
+
+        scheduler = self._scheduler()
+        target = self._req(scheduler, rid="internal-gen", instance="internal-gen")
+        move([target], scheduler.waiting_queue)
+
+        def on_terminal(req):
+            self.assertIs(req, target)
+            self.assertTrue(req.finished())
+            self.assertTrue(req.kv.holds_kv)
+            scheduler._check_cancellation_retirements()
+            self.assertEqual(self.outputs, [])
+
+        self.abort_observer = on_terminal
+        control = CancellationRetirementReq(
+            rid="rust-control-corr",
+            cancellation_id="rust-op-a",
+            request_instance_id=target.request_instance_id,
+            target_rid=target.rid,
+        )
+        scheduler.handle_cancellation_retirement(control)
+        self.assertEqual(len(self.outputs), 1)
+        out, route = self.outputs[-1]
+        self.assertEqual(out.status, "retired")
+        self.assertEqual(out.rid, "rust-control-corr")
+        self.assertIs(route, control)
+        self.assertFalse(target.kv.holds_kv)
+        self.assertTrue(target.kv.is_kv_released)
+        # HTTP-shaped request without target_rid still uses rid as identity.
+        other = self._req(scheduler, rid="http-target", instance="http-instance")
+        move([other], scheduler.waiting_queue)
+        http_control = CancellationRetirementReq(
+            rid=other.rid,
+            cancellation_id="http-op",
+            request_instance_id=other.request_instance_id,
+        )
+        scheduler.handle_cancellation_retirement(http_control)
+        self.assertEqual(self.outputs[-1][0].status, "retired")
+        self.assertEqual(self.outputs[-1][0].rid, other.rid)
+
+    def test_rust_server_presence_no_longer_excludes_retirement_scope(self):
+        scheduler = self._scheduler()
+        scheduler.rust_server = object()
+        self.assertEqual(scheduler._cancellation_retirement_scope_error(), "")
+        # Multimodal still fails closed; only the unconditional rust_server
+        # exclusion was removed for this Rust text integration.
+        scheduler.model_config.is_multimodal = True
+        self.assertEqual(
+            scheduler._cancellation_retirement_scope_error(),
+            "unsupported_execution_mode",
+        )
 
 
 if __name__ == "__main__":

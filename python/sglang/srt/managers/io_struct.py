@@ -2549,6 +2549,9 @@ class AbortReq(BaseReq, kw_only=True):
 class CancellationRetirementReq(BaseReq, kw_only=True):
     cancellation_id: str
     request_instance_id: str
+    # Append-only: Rust control replies route on rid; target_rid names the
+    # original internal generation RID. HTTP leaves this None and uses rid.
+    target_rid: Optional[str] = None
 
 
 class CancellationRetirementOutput(BaseReq, kw_only=True):

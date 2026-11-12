@@ -6506,8 +6506,7 @@ class Scheduler(
         ):
             return "unsupported_cache_ownership"
         if (
-            self.rust_server is not None
-            or not self.spec_algorithm.is_none()
+            not self.spec_algorithm.is_none()
             or self.dllm_config is not None
             or self.uocr_runtime is not None
             or self.model_config.is_multimodal
@@ -6615,9 +6614,12 @@ class Scheduler(
         entries = getattr(self, "_cancellation_retirements", None)
         if entries is None:
             entries = self._cancellation_retirements = {}
+        # rid remains the control-reply correlation id; target_rid (or rid for
+        # HTTP) is the generation identity used for lookup and the registry.
+        target_rid = recv_req.target_rid or recv_req.rid
         if (entry := entries.get(recv_req.cancellation_id)) is not None:
             if (entry.rid, entry.request_instance_id) != (
-                recv_req.rid,
+                target_rid,
                 recv_req.request_instance_id,
             ):
                 self._reply_cancellation_retirement(
@@ -6650,7 +6652,7 @@ class Scheduler(
                 return
             del entries[completed]
         entry = _CancellationRetirement(
-            rid=recv_req.rid,
+            rid=target_rid,
             request_instance_id=recv_req.request_instance_id,
             expires_at=time.monotonic() + CANCELLATION_RETIREMENT_TTL_S,
             replies={recv_req.http_worker_ipc: recv_req},
@@ -6675,7 +6677,7 @@ class Scheduler(
         matches = [
             req
             for req in candidates
-            if req.rid == recv_req.rid
+            if req.rid == target_rid
             and req.request_instance_id == recv_req.request_instance_id
             and recv_req.request_instance_id
         ]

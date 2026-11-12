@@ -92,6 +92,11 @@ impl GrpcService {
             },
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn core(&self) -> &CoreHandle {
+        &self.core
+    }
 }
 
 /// A zero timeout would expire every call at once; like the legacy gRPC
@@ -277,8 +282,6 @@ impl SglangService for GrpcService {
                 "provide either a nonempty rid or abort_all=true, not both",
             ));
         }
-        // Opt-in retirement wait is DRAFT / NOT IMPLEMENTED: validate, then
-        // UNIMPLEMENTED before any core abort. No capture/replay registry yet.
         if !request.cancellation_id.is_empty() && request.wait_for_retirement_ms.is_none() {
             return Err(Status::invalid_argument(
                 "cancellation_id requires wait_for_retirement_ms",
@@ -300,9 +303,15 @@ impl SglangService for GrpcService {
                     "wait_for_retirement_ms must be <= 30000",
                 ));
             }
-            return Err(Status::unimplemented(
-                "wait_for_retirement_ms is not implemented yet",
-            ));
+            let outcome = self
+                .core
+                .abort_and_wait(&request.rid, &request.cancellation_id, wait_ms)
+                .await
+                .map_err(native_api::status)?;
+            return Ok(Response::new(api::AbortResponse {
+                success: outcome.success,
+                retirement_confirmed: outcome.retirement_confirmed,
+            }));
         }
         Ok(Response::new(api::AbortResponse {
             success: self.core.abort(
@@ -430,6 +439,20 @@ mod tests {
                 sink,
                 admission,
             }
+        }
+
+        async fn next_control(&self) -> RuntimeRequest {
+            let TmEvent::Intake { request, admission } = self
+                .intake_rx
+                .recv_async()
+                .await
+                .expect("control submitted")
+            else {
+                panic!("expected control intake");
+            };
+            assert!(admission.try_accept());
+            assert!(matches!(request.kind, RequestKind::Control(_)));
+            request
         }
     }
 
@@ -1397,57 +1420,6 @@ mod tests {
         assert!(harness.abort_rx.try_recv().is_err());
     }
 
-    /// Opt-in retirement wait is rejected before any cancel; generation can
-    /// still finish normally afterward.
-    #[tokio::test]
-    async fn abort_wait_for_retirement_is_unimplemented_without_cancelling() {
-        let harness = Harness::new(2, false, Duration::from_secs(1));
-        let mut stream = harness
-            .service
-            .generate(Request::new(ids_request(&[1], Some("retire-me"))))
-            .await
-            .unwrap()
-            .into_inner();
-        let intake = harness.next_generation().await;
-        assert!(intake.admission.try_accept());
-        intake
-            .sink
-            .try_send(ResponseItem::Frame(chunk(&intake.rid, "first", 1, false)))
-            .unwrap();
-        assert_eq!(frame(stream.next().await.unwrap().unwrap()).text, "first");
-        for (wait_ms, cancellation_id) in [(0, "op-retire-me".into()), (30_000, "é".repeat(64))] {
-            let error = harness
-                .service
-                .abort(Request::new(api::AbortRequest {
-                    rid: "retire-me".into(),
-                    abort_all: false,
-                    wait_for_retirement_ms: Some(wait_ms),
-                    cancellation_id,
-                }))
-                .await
-                .unwrap_err();
-            assert_eq!(error.code(), Code::Unimplemented);
-        }
-        assert!(harness.abort_rx.try_recv().is_err());
-        assert!(stream.next().now_or_never().is_none());
-        intake
-            .sink
-            .try_send(ResponseItem::Done(chunk(&intake.rid, " final", 2, true)))
-            .unwrap();
-        let finished = frame(stream.next().await.unwrap().unwrap());
-        assert_eq!(finished.text, "first final");
-        assert!(
-            meta(&finished)
-                .finish_reason
-                .as_ref()
-                .is_some_and(|reason| {
-                    matches!(reason.kind, Some(api::finish_reason::Kind::Stop(_)))
-                })
-        );
-        assert!(stream.next().await.is_none());
-        assert!(harness.abort_rx.try_recv().is_err());
-    }
-
     /// Invalid opt-in bounds do not cancel; legacy Abort still cancels afterward.
     #[tokio::test]
     async fn abort_wait_for_retirement_rejects_invalid_without_cancelling() {
@@ -1523,5 +1495,425 @@ mod tests {
         let error = stream_error(stream.next().await.unwrap().unwrap());
         assert_eq!(error.error.unwrap().code, 499);
         assert!(stream.next().await.is_none());
+    }
+
+    /// Pending after a zero poll, then retired only after an independent
+    /// matching control reply; retries reuse the operation without another
+    /// cancel. Feature flag required for supported text mode.
+    #[tokio::test]
+    async fn abort_wait_for_retirement_pending_then_retired_on_matching_reply() {
+        let harness = Harness::new(4, false, Duration::from_secs(2));
+        harness
+            .service
+            .core()
+            .set_cancel_retirement_receipts_enabled(true);
+        let mut stream = harness
+            .service
+            .generate(Request::new(ids_request(&[1], Some("retire-me"))))
+            .await
+            .unwrap()
+            .into_inner();
+        let intake = harness.next_generation().await;
+        assert!(intake.admission.try_accept());
+        intake
+            .sink
+            .try_send(ResponseItem::Frame(chunk(&intake.rid, "first", 1, false)))
+            .unwrap();
+        assert_eq!(frame(stream.next().await.unwrap().unwrap()).text, "first");
+
+        let pending = harness
+            .service
+            .abort(Request::new(api::AbortRequest {
+                rid: "retire-me".into(),
+                abort_all: false,
+                wait_for_retirement_ms: Some(0),
+                cancellation_id: "op-retire-me".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(pending.success);
+        assert!(!pending.retirement_confirmed);
+
+        let control = harness.next_control().await;
+        let RequestKind::Control(boxed) = control.kind else {
+            panic!("expected control");
+        };
+        let crate::message::io_struct::ControlRequest::CancellationRetirementReq(req) = *boxed
+        else {
+            panic!("expected CancellationRetirementReq");
+        };
+        assert_eq!(req.target_rid(), Some(intake.rid.as_str()));
+        assert_eq!(req.request_instance_id(), intake.rid.as_str());
+
+        // Retry must not emit another cancel or recapture a reused public RID.
+        let again = harness
+            .service
+            .abort(Request::new(api::AbortRequest {
+                rid: "retire-me".into(),
+                abort_all: false,
+                wait_for_retirement_ms: Some(0),
+                cancellation_id: "op-retire-me".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(again.success);
+        assert!(!again.retirement_confirmed);
+        assert!(harness.intake_rx.try_recv().is_err());
+
+        let payload = crate::message::io_struct::CancellationRetirementOutput {
+            rid: req.get_rid().to_owned(),
+            cancellation_id: req.cancellation_id().to_owned(),
+            request_instance_id: req.request_instance_id().to_owned(),
+            status: crate::message::io_struct::CancellationRetirementStatus::Retired,
+            reason: String::new(),
+        }
+        .encode()
+        .unwrap();
+        control
+            .sink
+            .try_send(ResponseItem::Control(payload))
+            .unwrap();
+
+        let retired = harness
+            .service
+            .abort(Request::new(api::AbortRequest {
+                rid: "retire-me".into(),
+                abort_all: false,
+                wait_for_retirement_ms: Some(1_000),
+                cancellation_id: "op-retire-me".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(retired.success);
+        assert!(retired.retirement_confirmed);
+
+        // Positive proof notifies CancelledError via Local cleanup only.
+        assert!(matches!(
+            harness.abort_rx.try_recv(),
+            Ok(AbortSource::Local(rid)) if rid == intake.rid
+        ));
+        assert!(harness.abort_rx.try_recv().is_err());
+
+        // Public RID reuse must not receive the prior Local abort.
+        let mut reused = harness
+            .service
+            .generate(Request::new(ids_request(&[1], Some("retire-me"))))
+            .await
+            .unwrap()
+            .into_inner();
+        let reuse_intake = harness.next_generation().await;
+        assert_ne!(reuse_intake.rid, intake.rid);
+        assert!(reuse_intake.admission.try_accept());
+        assert!(harness.abort_rx.try_recv().is_err());
+        let _ = (stream, reused);
+    }
+
+    /// Zero-poll waiter fully gone, then reply with no receivers; replay still
+    /// confirms without another capture/control.
+    #[tokio::test]
+    async fn abort_wait_zero_receiver_reply_is_retained_for_replay() {
+        let harness = Harness::new(4, false, Duration::from_secs(2));
+        harness
+            .service
+            .core()
+            .set_cancel_retirement_receipts_enabled(true);
+        let mut stream = harness
+            .service
+            .generate(Request::new(ids_request(&[1], Some("zero-rx"))))
+            .await
+            .unwrap()
+            .into_inner();
+        let intake = harness.next_generation().await;
+        assert!(intake.admission.try_accept());
+
+        let pending = harness
+            .service
+            .abort(Request::new(api::AbortRequest {
+                rid: "zero-rx".into(),
+                abort_all: false,
+                wait_for_retirement_ms: Some(0),
+                cancellation_id: "op-zero-rx".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(pending.success);
+        assert!(!pending.retirement_confirmed);
+
+        let control = harness.next_control().await;
+        let RequestKind::Control(boxed) = control.kind else {
+            panic!("expected control");
+        };
+        let crate::message::io_struct::ControlRequest::CancellationRetirementReq(req) = *boxed
+        else {
+            panic!("expected CancellationRetirementReq");
+        };
+
+        // First waiter is fully gone: no live receivers before the reply.
+        while harness
+            .service
+            .core()
+            .retirement_receiver_count("op-zero-rx")
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            harness
+                .service
+                .core()
+                .retirement_receiver_count("op-zero-rx"),
+            0
+        );
+
+        let payload = crate::message::io_struct::CancellationRetirementOutput {
+            rid: req.get_rid().to_owned(),
+            cancellation_id: req.cancellation_id().to_owned(),
+            request_instance_id: req.request_instance_id().to_owned(),
+            status: crate::message::io_struct::CancellationRetirementStatus::Retired,
+            reason: String::new(),
+        }
+        .encode()
+        .unwrap();
+        control
+            .sink
+            .try_send(ResponseItem::Control(payload))
+            .unwrap();
+
+        while !harness
+            .service
+            .core()
+            .retirement_outcome_published("op-zero-rx")
+        {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            harness
+                .service
+                .core()
+                .retirement_receiver_count("op-zero-rx"),
+            0
+        );
+
+        let retired = harness
+            .service
+            .abort(Request::new(api::AbortRequest {
+                rid: "zero-rx".into(),
+                abort_all: false,
+                wait_for_retirement_ms: Some(1_000),
+                cancellation_id: "op-zero-rx".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(retired.success);
+        assert!(retired.retirement_confirmed);
+        assert!(harness.intake_rx.try_recv().is_err());
+        let _ = stream;
+    }
+
+    /// Lost/late scheduler reply after the original retention window never
+    /// becomes a positive result (paused Tokio time; no real-minute sleep).
+    #[tokio::test(start_paused = true)]
+    async fn abort_wait_expiry_rejects_late_positive_reply() {
+        let harness = Harness::new(4, false, Duration::from_secs(2));
+        harness
+            .service
+            .core()
+            .set_cancel_retirement_receipts_enabled(true);
+        let mut stream = harness
+            .service
+            .generate(Request::new(ids_request(&[1], Some("expire-me"))))
+            .await
+            .unwrap()
+            .into_inner();
+        let intake = harness.next_generation().await;
+        assert!(intake.admission.try_accept());
+
+        let pending = harness
+            .service
+            .abort(Request::new(api::AbortRequest {
+                rid: "expire-me".into(),
+                abort_all: false,
+                wait_for_retirement_ms: Some(0),
+                cancellation_id: "op-expire".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(pending.success);
+        assert!(!pending.retirement_confirmed);
+
+        let control = harness.next_control().await;
+        let RequestKind::Control(boxed) = control.kind else {
+            panic!("expected control");
+        };
+        let crate::message::io_struct::ControlRequest::CancellationRetirementReq(req) = *boxed
+        else {
+            panic!("expected CancellationRetirementReq");
+        };
+
+        while harness
+            .service
+            .core()
+            .retirement_receiver_count("op-expire")
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(
+            std::time::Duration::from_secs(300) + std::time::Duration::from_millis(1),
+        )
+        .await;
+        while !harness
+            .service
+            .core()
+            .retirement_outcome_published("op-expire")
+        {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            harness.service.core().retirement_outcome("op-expire"),
+            Some(Err(crate::api_server::core::CoreError::FailedPrecondition(
+                _
+            )))
+        ));
+
+        let payload = crate::message::io_struct::CancellationRetirementOutput {
+            rid: req.get_rid().to_owned(),
+            cancellation_id: req.cancellation_id().to_owned(),
+            request_instance_id: req.request_instance_id().to_owned(),
+            status: crate::message::io_struct::CancellationRetirementStatus::Retired,
+            reason: String::new(),
+        }
+        .encode()
+        .unwrap();
+        let _ = control.sink.try_send(ResponseItem::Control(payload));
+        // Late positive reply must not overwrite the expiry outcome.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            harness.service.core().retirement_outcome("op-expire"),
+            Some(Err(crate::api_server::core::CoreError::FailedPrecondition(
+                _
+            )))
+        ));
+        let _ = (stream, intake);
+    }
+
+    #[tokio::test]
+    async fn abort_wait_mismatched_receipt_identity_fails_closed() {
+        let harness = Harness::new(4, false, Duration::from_secs(2));
+        harness
+            .service
+            .core()
+            .set_cancel_retirement_receipts_enabled(true);
+
+        // Wrong correlation rid / cancellation_id / request_instance_id each fail closed.
+        let cases = ["rid", "op", "instance"];
+        for (i, which) in cases.iter().enumerate() {
+            let public = format!("bad-id-{i}");
+            let op = format!("op-bad-id-{i}");
+            let mut stream = harness
+                .service
+                .generate(Request::new(ids_request(&[1], Some(&public))))
+                .await
+                .unwrap()
+                .into_inner();
+            let intake = harness.next_generation().await;
+            assert!(intake.admission.try_accept());
+            assert!(
+                harness
+                    .service
+                    .abort(Request::new(api::AbortRequest {
+                        rid: public.clone(),
+                        abort_all: false,
+                        wait_for_retirement_ms: Some(0),
+                        cancellation_id: op.clone(),
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .success
+            );
+            let control = harness.next_control().await;
+            let RequestKind::Control(boxed) = control.kind else {
+                panic!("expected control");
+            };
+            let crate::message::io_struct::ControlRequest::CancellationRetirementReq(req) = *boxed
+            else {
+                panic!("expected CancellationRetirementReq");
+            };
+            let mut output = crate::message::io_struct::CancellationRetirementOutput {
+                rid: req.get_rid().to_owned(),
+                cancellation_id: req.cancellation_id().to_owned(),
+                request_instance_id: req.request_instance_id().to_owned(),
+                status: crate::message::io_struct::CancellationRetirementStatus::Retired,
+                reason: String::new(),
+            };
+            match *which {
+                "rid" => output.rid = "wrong-corr".into(),
+                "op" => output.cancellation_id = "wrong-op".into(),
+                "instance" => output.request_instance_id = "wrong-instance".into(),
+                _ => unreachable!(),
+            }
+            control
+                .sink
+                .try_send(ResponseItem::Control(output.encode().unwrap()))
+                .unwrap();
+            let error = harness
+                .service
+                .abort(Request::new(api::AbortRequest {
+                    rid: public,
+                    abort_all: false,
+                    wait_for_retirement_ms: Some(1_000),
+                    cancellation_id: op,
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Code::FailedPrecondition, "case {which}");
+            let _ = (stream, intake);
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_wait_for_retirement_unknown_and_disabled_fail_closed() {
+        let harness = Harness::new(2, false, Duration::from_secs(1));
+        harness
+            .service
+            .core()
+            .set_cancel_retirement_receipts_enabled(true);
+        let error = harness
+            .service
+            .abort(Request::new(api::AbortRequest {
+                rid: "gone".into(),
+                abort_all: false,
+                wait_for_retirement_ms: Some(0),
+                cancellation_id: "op-gone".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+
+        harness
+            .service
+            .core()
+            .set_cancel_retirement_receipts_enabled(false);
+        let error = harness
+            .service
+            .abort(Request::new(api::AbortRequest {
+                rid: "gone".into(),
+                abort_all: false,
+                wait_for_retirement_ms: Some(0),
+                cancellation_id: "op-disabled".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Unimplemented);
     }
 }

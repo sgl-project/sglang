@@ -146,6 +146,15 @@ control_messages! {
         profile_stages: Option<Vec<String>>,
         detailed_annotations: bool,
     }
+
+    /// Opt-in cancellation retirement receipt. `rid` is the control-response
+    /// correlation id; `target_rid` names the original internal generation rid
+    /// (HTTP leaves it nil and uses `rid` as the target).
+    CancellationRetirementReq {
+        cancellation_id: String,
+        request_instance_id: String,
+        target_rid: Option<String>,
+    }
 }
 
 /// The client-settable fields of a profiling start: Python's `ProfileReq`
@@ -344,6 +353,67 @@ impl ProfileReq {
     }
 }
 
+impl CancellationRetirementReq {
+    pub fn new(
+        rid: String,
+        cancellation_id: String,
+        request_instance_id: String,
+        target_rid: Option<String>,
+    ) -> Self {
+        Self {
+            rid,
+            cancellation_id,
+            request_instance_id,
+            target_rid,
+        }
+    }
+
+    pub fn cancellation_id(&self) -> &str {
+        &self.cancellation_id
+    }
+
+    pub fn request_instance_id(&self) -> &str {
+        &self.request_instance_id
+    }
+
+    pub fn target_rid(&self) -> Option<&str> {
+        self.target_rid.as_deref()
+    }
+}
+
+/// Scheduler / local `CancellationRetirementOutput` named map (`asdict` →
+/// msgpack). Extra Python fields such as `http_worker_ipc` are ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CancellationRetirementOutput {
+    pub(crate) rid: String,
+    pub(crate) cancellation_id: String,
+    pub(crate) request_instance_id: String,
+    pub(crate) status: CancellationRetirementStatus,
+    #[serde(default)]
+    pub(crate) reason: String,
+}
+
+/// Exact Python `Literal["retired", "unknown", "unsupported"]` statuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CancellationRetirementStatus {
+    Retired,
+    Unknown,
+    Unsupported,
+}
+
+impl CancellationRetirementOutput {
+    pub(crate) fn encode(&self) -> Result<bytes::Bytes, Error> {
+        rmp_serde::to_vec_named(self)
+            .map(bytes::Bytes::from)
+            .map_err(|e| Error::Codec(e.to_string()))
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        rmp_serde::from_slice(bytes).map_err(|e| Error::Codec(e.to_string()))
+    }
+}
+
 impl AbortReq {
     pub fn new(rid: String, abort_all: bool) -> Self {
         Self {
@@ -404,6 +474,71 @@ mod tests {
         assert_eq!(arr[3].as_bool(), Some(false));
         assert!(arr[4].is_nil());
         assert!(arr[5].is_nil());
+    }
+
+    #[test]
+    fn cancellation_retirement_req_msgpack_shape_and_output_decode() {
+        let b = CancellationRetirementReq::new(
+            "corr".into(),
+            "rust-op".into(),
+            "internal-rid".into(),
+            Some("internal-rid".into()),
+        )
+        .encode()
+        .unwrap();
+        let val = rmpv::decode::read_value(&mut &b[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert_eq!(
+            arr.len(),
+            6,
+            "CancellationRetirementReq = [tag, rid, http_ipc, cancellation_id, request_instance_id, target_rid]"
+        );
+        assert_eq!(arr[0].as_str(), Some("CancellationRetirementReq"));
+        assert_eq!(arr[1].as_str(), Some("corr"));
+        assert!(arr[2].is_nil());
+        assert_eq!(arr[3].as_str(), Some("rust-op"));
+        assert_eq!(arr[4].as_str(), Some("internal-rid"));
+        assert_eq!(arr[5].as_str(), Some("internal-rid"));
+
+        let named = CancellationRetirementOutput {
+            rid: "corr".into(),
+            cancellation_id: "rust-op".into(),
+            request_instance_id: "internal-rid".into(),
+            status: CancellationRetirementStatus::Retired,
+            reason: String::new(),
+        }
+        .encode()
+        .unwrap();
+        let decoded = CancellationRetirementOutput::decode(&named).unwrap();
+        assert_eq!(decoded.status, CancellationRetirementStatus::Retired);
+        assert_eq!(decoded.rid, "corr");
+        assert_eq!(decoded.cancellation_id, "rust-op");
+        // Python asdict may include http_worker_ipc; ignore extras.
+        let with_ipc = rmp_serde::to_vec_named(&serde_json::json!({
+            "rid": "corr",
+            "http_worker_ipc": null,
+            "cancellation_id": "rust-op",
+            "request_instance_id": "internal-rid",
+            "status": "retired",
+            "reason": "",
+        }))
+        .unwrap();
+        assert_eq!(
+            CancellationRetirementOutput::decode(&with_ipc)
+                .unwrap()
+                .status,
+            CancellationRetirementStatus::Retired
+        );
+        assert!(CancellationRetirementOutput::decode(b"\xc0").is_err());
+        let bad_status = rmp_serde::to_vec_named(&serde_json::json!({
+            "rid": "corr",
+            "cancellation_id": "rust-op",
+            "request_instance_id": "internal-rid",
+            "status": "done",
+            "reason": "",
+        }))
+        .unwrap();
+        assert!(CancellationRetirementOutput::decode(&bad_status).is_err());
     }
 
     /// `decode` reads an `AbortReq` back from its own wire bytes, tells
