@@ -68,7 +68,45 @@ def check_prepared_sage_route(
     group = get_sp_group().ulysses_group
     if group is None or dist.get_world_size(group) != world:
         return result("process group mismatch")
-    blocks = (max_seqlen + 63) // 64
-    if (q.shape[1] // world) * blocks * blocks > 2**29:
-        return result("routing metadata exceeds per-call limit")
     return result()
+
+
+def resolve_prepared_sage_route(
+    q,
+    k,
+    v,
+    *,
+    cu_seqlens_host,
+    max_seqlen,
+    ulysses_active,
+    ring_active,
+    transport=None,
+):
+    """Resolve rank-consistent hardware and packed geometry before exchange."""
+    from sglang.multimodal_gen.runtime.distributed import sage_ulysses
+
+    group = None
+    if transport is None:
+        if (
+            not q.is_cuda
+            or torch.compiler.is_compiling()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return SimpleNamespace(enabled=False, reason="not eager CUDA"), group
+        group = get_sp_group().ulysses_group
+        if group is None or not sage_ulysses._hardware_supported_by_all_ranks(
+            group, q.device
+        ):
+            return SimpleNamespace(enabled=False, reason="not eager SM120"), group
+    return (
+        check_prepared_sage_route(
+            q,
+            k,
+            v,
+            cu_seqlens_host=cu_seqlens_host,
+            max_seqlen=max_seqlen,
+            ulysses_active=ulysses_active,
+            ring_active=ring_active,
+        ),
+        group,
+    )

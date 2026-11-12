@@ -210,28 +210,11 @@ def prepared_subblock_sage_attention_forward(
     ):
         return None
     from sglang.multimodal_gen.runtime.distributed import sage_ulysses
+    from sglang.multimodal_gen.runtime.distributed.sage_ulysses_route import (
+        resolve_prepared_sage_route,
+    )
 
-    group = None
-    if transport is None:
-        # Execution mode and packed metadata agree across the SGLang ranks.
-        if (
-            not query.is_cuda
-            or torch.compiler.is_compiling()
-            or torch.cuda.is_current_stream_capturing()
-        ):
-            return None
-        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-            get_sp_group,
-        )
-
-        group = get_sp_group().ulysses_group
-        if group is None or not sage_ulysses._hardware_supported_by_all_ranks(
-            group, query.device
-        ):
-            return None
-    from .sage_ulysses_route import check_prepared_sage_route
-
-    decision = check_prepared_sage_route(
+    decision, group = resolve_prepared_sage_route(
         query,
         key,
         value,
@@ -239,6 +222,7 @@ def prepared_subblock_sage_attention_forward(
         max_seqlen=max_seqlen,
         ulysses_active=ulysses_active,
         ring_active=ring_active,
+        transport=transport,
     )
     if not decision.enabled:
         logger.info_once(
@@ -246,6 +230,13 @@ def prepared_subblock_sage_attention_forward(
         )
         return None
     used = cu_seqlens_host[1]
+    blocks = (used + BLOCK - 1) // BLOCK
+    world = cu_seqlens_host[2] // query.shape[0]
+    if (query.shape[1] // world) * blocks * blocks > 2**29:
+        logger.info_once(
+            "Prepared SubBlock Sage declined: routing metadata exceeds per-call limit"
+        )
+        return None
     if (
         query_block_mask is None
         or query_block_mask.numel() != (used + BLOCK - 1) // BLOCK

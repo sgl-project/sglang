@@ -19,12 +19,13 @@ import torch.distributed as dist
 def main():
     import os
 
-    from sglang.multimodal_gen.runtime.distributed import parallel_state, sage_ulysses
+    from sglang.multimodal_gen.runtime.distributed import (
+        parallel_state,
+        sage_ulysses,
+    )
+    from sglang.multimodal_gen.runtime.distributed import sage_ulysses_route as route
     from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
         prepared_sage_attention as adapter,
-    )
-    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
-        sage_ulysses_route as route,
     )
     from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
         SubBlockSparseSchedule,

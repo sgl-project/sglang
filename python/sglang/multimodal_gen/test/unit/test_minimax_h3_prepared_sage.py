@@ -106,9 +106,7 @@ def test_subblock_consumer_rejects_an_incompatible_quantized_layout():
 
 @pytest.mark.parametrize("eligible", [True, False])
 def test_prepared_forward_reuses_operands_and_gathers_once(monkeypatch, eligible):
-    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
-        sage_ulysses_route as routing,
-    )
+    from sglang.multimodal_gen.runtime.distributed import sage_ulysses_route as routing
 
     monkeypatch.setattr(
         routing,
@@ -361,16 +359,14 @@ def test_invalid_prepared_qkv_configuration_is_rejected(monkeypatch, config):
         "heads",
         "documents",
         "live_length",
-        "metadata",
+        "long_sequence",
         "compile",
     ],
 )
 def test_geometry_guards_precede_collectives(monkeypatch, case):
     from contextlib import nullcontext
 
-    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
-        sage_ulysses_route as route,
-    )
+    from sglang.multimodal_gen.runtime.distributed import sage_ulysses_route as route
 
     monkeypatch.setattr(torch.version, "hip", "test" if case == "rocm" else None)
     monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_PREPARED_SAGE_QKV", raising=False)
@@ -392,8 +388,8 @@ def test_geometry_guards_precede_collectives(monkeypatch, case):
     monkeypatch.setattr(
         route.dist, "get_world_size", lambda group: 3 if case == "group" else 4
     )
-    total = 2**21 if case == "metadata" else 256
-    used = total - 17 if case == "metadata" else 130
+    total = 2**21 if case == "long_sequence" else 256
+    used = total - 17 if case == "long_sequence" else 130
     q = SimpleNamespace(
         shape=(
             total // 4,
@@ -416,7 +412,7 @@ def test_geometry_guards_precede_collectives(monkeypatch, case):
             ulysses_active=True,
             ring_active=case == "ring",
         )
-    assert result.enabled is (case == "valid")
+    assert result.enabled is (case in ("valid", "long_sequence"))
 
 
 def test_transport_cache_replaces_geometries_without_a_lifetime_limit(monkeypatch):
@@ -655,3 +651,38 @@ def test_prepared_exchange_zeros_only_rank_local_padding(monkeypatch, rank):
         assert torch.all(operand[:valid] == i)
         assert not operand[valid:].count_nonzero()
         torch.testing.assert_close(sent[0], operand, rtol=0, atol=0)
+
+
+def test_subblock_routing_budget_declines_before_shared_exchange(monkeypatch):
+    from sglang.multimodal_gen.runtime.distributed import sage_ulysses_route
+
+    monkeypatch.setattr(
+        sage_ulysses_route,
+        "check_prepared_sage_route",
+        lambda *args, **kwargs: SimpleNamespace(enabled=True, reason=None),
+    )
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Oversized sparse routing metadata must decline before exchange")
+
+    total = 2**21
+    q = SimpleNamespace(shape=(total // 4, 8, 128))
+    impl = SimpleNamespace(
+        schedule=SimpleNamespace(quantize_before_a2a=True, min_seq_len=0),
+        layer_enabled=True,
+        _step_enabled=lambda: True,
+    )
+    assert (
+        attention_backend.prepared_subblock_sage_attention_forward(
+            q,
+            q,
+            q,
+            impl=impl,
+            cu_seqlens_host=(0, total - 17, total),
+            max_seqlen=total - 17,
+            ulysses_active=True,
+            ring_active=False,
+            transport=SimpleNamespace(exchange=unexpected),
+        )
+        is None
+    )

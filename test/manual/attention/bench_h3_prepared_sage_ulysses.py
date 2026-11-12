@@ -18,12 +18,12 @@ import torch.distributed as dist
 
 @torch.inference_mode()
 def main():
-    from sglang.multimodal_gen.runtime.distributed import sage_ulysses
+    from sglang.multimodal_gen.runtime.distributed import (
+        sage_ulysses,
+    )
+    from sglang.multimodal_gen.runtime.distributed import sage_ulysses_route as route
     from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
         prepared_sage_attention as adapter,
-    )
-    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
-        sage_ulysses_route as route,
     )
     from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
         SubBlockSparseSchedule,

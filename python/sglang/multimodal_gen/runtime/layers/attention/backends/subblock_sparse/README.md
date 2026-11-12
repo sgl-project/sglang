@@ -254,13 +254,38 @@ Communication and attention are separate components:
   returns floating output in the global BSHD/head-sharded layout for gather.
   Its H3 wrapper owns schedule, geometry and query-mask admission.
 
-The communication wrapper has no dependency on SubBlock or CAKE. Another
-consumer, such as dense SageAttention, can use the same exchange when it
-accepts the record's quantization layout and scales. An ordinary BF16 Sage
-entry point that quantizes its inputs again is not a direct consumer.
-Consumer output must match the record's global shape and `input_dtype`, with
-padding rows cleared. This PR wires the SubBlock/CAKE consumer only; it does
-not add or claim validation of a dense Sage consumer.
+The communication wrapper has no dependency on SubBlock or CAKE.
+`backends/prepared_sage_attn.py` also provides `PreparedDenseSageAttention`.
+It calls SageAttention2's native INT8-QK/FP8-PV per-warp kernel directly with
+NHD views of the live Q/K prefix, the received permuted V and all three scale
+tensors. It uses FP16 short-term accumulation with an FP32 buffer, matching
+FlashInfer's Sage2 V range of 2.25. There is no BF16 reconstruction,
+requantization, SubBlock routing or CAKE layout packing in the dense consumer.
+Its output matches the record's global shape and `input_dtype`; padding rows
+are cleared before gather.
+The native Sage extension launches on CUDA's default stream. The dense
+consumer bridges a different incoming compute stream before and after that
+launch, preserving the ordering between prepared exchange, attention and
+output gather without synchronizing the device.
+
+For dense Sage on the H3 transformer, enable:
+
+```bash
+--attention-backend sage_attn \
+--component-attention-backends text_encoder=torch_sdpa \
+--attention-backend-config '{"quantize_before_a2a":true}'
+```
+
+The dense option defaults to `false`. It requires SageAttention built for
+SM120 with
+`sageattention.sm89_compile.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf`.
+The optional kernel is resolved before prepared QKV exchange. The TRT-LLM
+Gen Sage implementation cannot be combined with this opt-in because it uses
+a different quantization contract. Causal/dropout calls and unsupported
+geometry retain the existing path before prepared exchange. Dense Sage has
+no SubBlock routing-metadata limit. Both consumers share transport workspaces,
+geometry replacement and teardown. The dense CUDA/multi-GPU validation entry
+point below has not been run for this revision.
 
 Supported calls are inference on SM120, head dimension 128, Ulysses degree 4
 or 8, and one live packed H3 document followed by padding. Ring, training,
@@ -297,8 +322,9 @@ establish equivalence to BF16 routing.
 Validation entry points:
 
 ```bash
-python -m pytest python/sglang/multimodal_gen/test/unit/test_minimax_h3_prepared_sage.py python/sglang/multimodal_gen/test/unit/test_cake_prepost_kernels.py -q
+python -m pytest python/sglang/multimodal_gen/test/unit/test_minimax_h3_prepared_sage.py python/sglang/multimodal_gen/test/unit/test_cake_prepost_kernels.py python/sglang/multimodal_gen/test/unit/test_prepared_dense_sage.py -q
 torchrun --standalone --nproc_per_node=4 test/manual/attention/test_h3_prepared_sage_ulysses.py
+torchrun --standalone --nproc_per_node=4 test/manual/attention/test_h3_prepared_dense_sage_ulysses.py
 H3_BENCH_RESULT=result.json torchrun --standalone --nproc_per_node=4 test/manual/attention/bench_h3_prepared_sage_ulysses.py
 ```
 
