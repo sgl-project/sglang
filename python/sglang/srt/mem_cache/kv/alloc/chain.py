@@ -258,6 +258,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     stage_capacity: Optional[StageCapacity] = None
     # Every stage's simulated snapshot, kept until the capacity epoch moves.
     _stage_memo: Tuple[Optional[int], Tuple[ChainSnapshot, ...]] = (None, ())
+    # The state sub-pool's band; None without recurrent state.
+    mamba_allocator: Optional[Band] = None
 
     # Base init writes `self.size`; the chain computes its capacity.
     @property
@@ -484,7 +486,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def _snapshot_key_now(self) -> int:
         """The chain's capacity epoch and, per band, its compaction mode, which
-        is not a capacity field."""
+        is not a capacity field. Every capacity read goes through here, so the
+        state slots an open free group holds back are freed first: the bands
+        share the arena, and a free outside a group would have given them back."""
+        self._settle_state_free_group()
         epoch = bits = 0
         for band in self.bands:
             epoch += band._capacity_epoch
@@ -697,6 +702,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def units_fit(self, demands: Dict[str, int]) -> bool:
         """Whether a take of these units (pages of a token sub-pool, slots of the
         state sub-pool) succeeds now by the take's own checks, on every PP stage."""
+        state = self.mamba_allocator
+        if state is not None and state.sub_pool_name in demands:
+            self._settle_state_free_group()
         return self._ask(
             "units_fit",
             lambda: _units_key(demands),
@@ -1635,6 +1643,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         demands = {name: n for name, n in demands.items() if n > 0}
         if not demands:
             return {}
+        # Before the operation: a take of any band sees the state slots an
+        # open free group holds back as free, as an immediate free would.
+        self._settle_state_free_group()
         with allocator_operation(self.members) as op:
             op.declare_takes(demands)
             with self._relief(demands) as plan:
@@ -2083,6 +2094,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         state = self.mamba_allocator
         if need_size <= 0:
             return torch.empty(0, dtype=torch.int64, device=self.device)
+        self._settle_state_free_group()
         demands = {state.sub_pool_name: need_size}
         decided = self._decided_take(demands)
         if decided is False:
@@ -2282,6 +2294,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self.free_page_reps_group = []
         self.full_page_reps_group = []
         self.full_free_group = []
+        # A retire batch's state slots go back in one free of the state band.
+        if self.mamba_allocator is not None:
+            self.mamba_allocator.free_group_begin()
 
     def free_group_end(self) -> None:
         pending, self.free_page_reps_group = self.free_page_reps_group, None
@@ -2292,6 +2307,18 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self.free_full(torch.cat(full_free_group))
         if pending or full_pending:
             self._release_page_reps(pending, full_pending)
+        if self.mamba_allocator is not None:
+            self.mamba_allocator.free_group_end()
+
+    def _settle_state_free_group(self) -> None:
+        """Free the state slots an open free group holds back, so a take or a
+        capacity read of any band inside the group sees them as a free outside
+        it would. A retire batch's frees with no take or read between them
+        still reach the state band as one free."""
+        state = self.mamba_allocator
+        if state is not None and state.free_group:
+            state.free_group_end()
+            state.free_group_begin()
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
         """Fixed-shape counterpart of `free()` for a segment whose window pages

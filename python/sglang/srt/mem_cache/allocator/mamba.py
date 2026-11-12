@@ -84,7 +84,8 @@ class MambaSlotAllocator:
         self.free_slots = self.free_slots[need_size:]
         return select_index
 
-    def free(self, free_index: torch.Tensor):
+    def free(self, free_index: torch.Tensor, *, owned: bool = False):
+        # ``owned`` matters only to a deferred free; this one frees at once.
         if free_index.numel() == 0:
             return
         self.free_slots = torch.cat((self.free_slots, free_index))
