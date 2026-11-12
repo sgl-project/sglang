@@ -467,6 +467,8 @@ class Engine(EngineScoreMixin, EngineBase):
         video_data: Optional[MultimodalDataInputFormat] = None,
         # See GenerateReqInput.mm_hashes / async_generate for the contract.
         mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
+        # See GenerateReqInput.mm_routing_labels.
+        mm_routing_labels: Optional[Union[List[str], List[List[str]]]] = None,
         # SHA-256 identities for the original media contents. See
         # GenerateReqInput.mm_content_hashes.
         mm_content_hashes: Optional[
@@ -517,6 +519,7 @@ class Engine(EngineScoreMixin, EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             mm_hashes=mm_hashes,
+            mm_routing_labels=mm_routing_labels,
             mm_content_hashes=mm_content_hashes,
             cache_salt=cache_salt,
             return_logprob=return_logprob,
@@ -581,6 +584,8 @@ class Engine(EngineScoreMixin, EngineBase):
         # the server-computed full content/configuration identity and cannot
         # force cache sharing. See GenerateReqInput.mm_hashes.
         mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
+        # See GenerateReqInput.mm_routing_labels.
+        mm_routing_labels: Optional[Union[List[str], List[List[str]]]] = None,
         mm_content_hashes: Optional[
             Union[List[Optional[str]], List[List[Optional[str]]]]
         ] = None,
@@ -629,6 +634,7 @@ class Engine(EngineScoreMixin, EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             mm_hashes=mm_hashes,
+            mm_routing_labels=mm_routing_labels,
             mm_content_hashes=mm_content_hashes,
             cache_salt=cache_salt,
             return_logprob=return_logprob,
@@ -2041,7 +2047,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.7.3",
+                "0.7.4",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",

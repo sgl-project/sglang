@@ -780,6 +780,25 @@ class MambaPool:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
                 L = linear_replayssm_cache_len
+                if enable_linear_replayssm_spec and not cache_params.is_kda:
+                    # The GDN verify writes its window at ring positions
+                    # [write_pos, write_pos + T) and drops stores past L; the
+                    # commit folds early enough to keep the window inside the
+                    # ring only if a whole window fits. The compact commit
+                    # reduces over the whole ring with tl.dot, which needs at
+                    # least 16 positions.
+                    if L & (L - 1) != 0:
+                        raise ValueError(
+                            "spec-verify ring length --linear-replayssm-cache-len "
+                            f"must be a power of two, got {L}"
+                        )
+                    min_len = max(16, speculative_num_draft_tokens or 0)
+                    if L < min_len:
+                        raise ValueError(
+                            "spec-verify ring too small: --linear-replayssm-cache-len "
+                            f"{L} < {min_len} (at least 16 and the draft tokens, "
+                            f"{speculative_num_draft_tokens})"
+                        )
                 # GDN speculative replay is request-lifetime scratch. KDA stays
                 # on every mamba slot unless host-only checkpoints index the
                 # ring by req_pool_idx (see replayssm_request_ring).
@@ -1946,6 +1965,9 @@ class KVCache(abc.ABC):
     # Whether get_cpu_copy/load_cpu_copy carry the recurrent state. False when the
     # state lives on the request pool instead, and the caller has to move it.
     cpu_copy_carries_mamba: bool = False
+    # A draft pool whose rows are the target's sliding-window ids
+    # (SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV), not its full-attention ids.
+    follows_target_swa_ids: bool = False
 
     @abc.abstractmethod
     def __init__(
@@ -2184,15 +2206,25 @@ def _set_mha_kv_buffer_prefix_valid(
             f"head_dim={pool.head_dim} v_head_dim={pool.v_head_dim}."
         )
 
-    fused_k_scale = _resolve_fused_scale(
-        k_scale,
-        getattr(layer, "k_scale", None),
-        getattr(layer, "k_scale_float", None),
+    # No scale on ROCm: the eager fallback below is a plain saturating cast, which the fused kernel does
+    # bit-exactly at scale 1.0 (one launch instead of five per layer).
+    fused_k_scale = (
+        1.0
+        if _is_hip and k_scale is None
+        else _resolve_fused_scale(
+            k_scale,
+            getattr(layer, "k_scale", None),
+            getattr(layer, "k_scale_float", None),
+        )
     )
-    fused_v_scale = _resolve_fused_scale(
-        v_scale,
-        getattr(layer, "v_scale", None),
-        getattr(layer, "v_scale_float", None),
+    fused_v_scale = (
+        1.0
+        if _is_hip and v_scale is None
+        else _resolve_fused_scale(
+            v_scale,
+            getattr(layer, "v_scale", None),
+            getattr(layer, "v_scale_float", None),
+        )
     )
     # fuse quantization and writing into the same kernel
     if (

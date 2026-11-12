@@ -365,11 +365,21 @@ def get_model_short_name(model_id: str) -> str:
 
 
 def _normalize_hf_cache_path(path: str) -> str:
-    """Normalize a local HuggingFace cache path before substring matching.
+    """Normalize a local HuggingFace cache path before matching repo directories.
 
-    We match registered repo ids like ``org/repo`` against cache fragments like ``models--org--repo`` that appear in snapshot/blob paths.
+    We match registered repo ids like ``org/repo`` against cache directories like ``models--org--repo`` that appear in snapshot/blob paths.
     """
     return os.path.normpath(path).lower().replace("\\", "/")
+
+
+def _in_hf_cache_repo(normalized_path: str, repo_id: str) -> bool:
+    """Whether a normalized path lies in the HF cache directory of ``repo_id``.
+
+    The cache directory must be a whole path component, so the cache of
+    ``org/repo`` does not claim the cache of ``org/repo-image``.
+    """
+    cache_repo_dir = f"models--{repo_id.lower().replace('/', '--')}"
+    return cache_repo_dir in normalized_path.split("/")
 
 
 def _match_registered_hf_path(model_path: str) -> Optional[str]:
@@ -401,15 +411,12 @@ def _match_registered_hf_path(model_path: str) -> Optional[str]:
     # when its basename is only the snapshot hash.
     # Example:
     #    /xxx/models--black-forest-labs--FLUX.2-dev-NVFP4/snapshots/142b87e70bc3006937b7093d89ff287b5f59f071
-    # -> models--black-forest-labs--flux.2-dev-nvfp4 (to match with cache_repo_fragment)
+    # -> models--black-forest-labs--flux.2-dev-nvfp4 (a whole path component)
     normalized_model_path = _normalize_hf_cache_path(model_path)
     for registered_model_hf_id in all_model_hf_paths:
         if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
             continue
-        cache_repo_fragment = (
-            f"models--{registered_model_hf_id.lower().replace('/', '--')}"
-        )
-        if cache_repo_fragment in normalized_model_path:
+        if _in_hf_cache_repo(normalized_model_path, registered_model_hf_id):
             logger.debug(
                 "Resolved HuggingFace cache path '%s' to registered model '%s'.",
                 model_path,
@@ -736,7 +743,7 @@ def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
         if "/" in pattern and (
             normalized_model_path == pattern
             or model_short_name == get_model_short_name(pattern)
-            or f"models--{pattern.replace('/', '--')}" in normalized_model_path
+            or _in_hf_cache_repo(normalized_model_path, pattern)
         ):
             return pipeline_name
     return None
