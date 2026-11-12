@@ -17,12 +17,12 @@ INTERMEDIATE = 640
 GROUP = 128
 
 
-def _triton_scheme(*, sym=True):
+def _triton_scheme(*, actorder=None):
     # Bypass __init__, which needs a full CompressedTensorsConfig.
     scheme = CompressedTensorsWNA16TritonMoE.__new__(CompressedTensorsWNA16TritonMoE)
     scheme.group_size = GROUP
-    scheme.sym = sym
-    scheme.actorder = None
+    scheme.sym = True
+    scheme.actorder = actorder
     scheme.strategy = "group"
     scheme.packed_factor = 8
     return scheme
@@ -54,11 +54,7 @@ def _fused_moe_shell(*, tp_size, tp_rank, experts):
     return layer
 
 
-def _load_w2(*, tp_size, tp_rank, packed, scales, experts):
-    """Load w2 through the real FusedMoE loader and return the Triton quant info."""
-    layer = _fused_moe_shell(tp_size=tp_size, tp_rank=tp_rank, experts=experts)
-    scheme = _triton_scheme()
-    layer.scheme = layer.quant_method = scheme
+def _create(scheme, layer, tp_size, experts):
     scheme.create_weights(
         layer,
         experts,
@@ -67,81 +63,66 @@ def _load_w2(*, tp_size, tp_rank, packed, scales, experts):
         torch.float32,
         weight_loader=layer.weight_loader,
     )
-    for expert in range(experts):
-        for param, source, name in (
-            (layer.w2_weight_packed, packed + expert, "w2_weight_packed"),
-            (layer.w2_weight_scale, scales + expert, "w2_weight_scale"),
-        ):
-            param.weight_loader(param, source, name, "w2", expert)
-    layer.w13_weight_packed.data.zero_()
-    scheme.process_weights_after_loading(layer)
-    return scheme.get_triton_quant_info(layer)
 
 
-class TestWNA16TritonMoETPSplitScales(CustomTestCase):
-    def test_each_k_element_gets_its_checkpoint_group_scale(self):
-        """Every local K element of w2 must get its own checkpoint group's scale.
+class TestWNA16MoETPGroupAlignment(CustomTestCase):
+    def test_rejects_shards_that_split_a_scale_group(self):
+        """640 / tp is not a multiple of 128 at tp 2, 4 and 8; loading must fail early.
 
-        At moe_tp_size=4, K=640 shards to 160 = 128 + 32. Narrowing the 5 checkpoint
-        groups by integer division gave each rank the scales of the wrong K range.
+        Without the check each rank narrows whole scale groups and pairs its K range
+        with the wrong scales (or reads past them in the kernel).
         """
+        for tp_size in (2, 4, 8):
+            shard = INTERMEDIATE // tp_size
+            with self.subTest(tp_size=tp_size):
+                layer = _fused_moe_shell(tp_size=tp_size, tp_rank=0, experts=1)
+                with self.assertRaisesRegex(
+                    ValueError, rf"\({shard}\).*group_size \({GROUP}\)"
+                ):
+                    _create(_triton_scheme(), layer, tp_size, experts=1)
+
+    def test_full_w2_scales_are_not_rejected(self):
+        """Grouped actorder loads the full w2 scales on every rank, so no split happens."""
+        layer = _fused_moe_shell(tp_size=4, tp_rank=1, experts=1)
+        _create(_triton_scheme(actorder="group"), layer, 4, experts=1)
+        self.assertEqual(layer.w2_weight_scale.shape[1], INTERMEDIATE // GROUP)
+
+    def test_aligned_shards_load_their_own_scales(self):
+        """At tp 1 and 5 every shard holds whole groups and gets its own scales."""
         experts = 2
         packed = torch.arange(HIDDEN * INTERMEDIATE // 8, dtype=torch.int32).view(
             HIDDEN, INTERMEDIATE // 8
         )
         scales = torch.arange(HIDDEN * INTERMEDIATE // GROUP, dtype=torch.float32)
         scales = scales.view(HIDDEN, INTERMEDIATE // GROUP) + 1
-        for tp_size in (1, 2, 4, 8):
+        for tp_size in (1, 5):
             shard = INTERMEDIATE // tp_size
             for rank in range(tp_size):
                 with self.subTest(tp_size=tp_size, rank=rank):
-                    info = _load_w2(
-                        tp_size=tp_size,
-                        tp_rank=rank,
-                        packed=packed,
-                        scales=scales,
-                        experts=experts,
+                    layer = _fused_moe_shell(
+                        tp_size=tp_size, tp_rank=rank, experts=experts
                     )
-                    local_group = info.w2_block_shape[1]
-                    self.assertEqual(shard % local_group, 0)
-                    self.assertEqual(GROUP % local_group, 0)
-                    k_range = slice(rank * shard, (rank + 1) * shard)
+                    scheme = _triton_scheme()
+                    layer.scheme = layer.quant_method = scheme
+                    _create(scheme, layer, tp_size, experts)
                     for expert in range(experts):
-                        expected_packed = (packed + expert)[
-                            :, rank * shard // 8 : (rank + 1) * shard // 8
-                        ]
+                        for param, source, name in (
+                            (
+                                layer.w2_weight_packed,
+                                packed + expert,
+                                "w2_weight_packed",
+                            ),
+                            (layer.w2_weight_scale, scales + expert, "w2_weight_scale"),
+                        ):
+                            param.weight_loader(param, source, name, "w2", expert)
+                    layer.w13_weight_packed.data.zero_()
+                    scheme.process_weights_after_loading(layer)
+                    info = scheme.get_triton_quant_info(layer)
+                    groups = slice(rank * shard // GROUP, (rank + 1) * shard // GROUP)
+                    for expert in range(experts):
                         torch.testing.assert_close(
-                            info.w2_weight[expert],
-                            expected_packed.contiguous().view(torch.uint8),
+                            info.w2_scale[expert], (scales + expert)[:, groups]
                         )
-                        per_element = info.w2_scale[expert].repeat_interleave(
-                            local_group, dim=1
-                        )
-                        expected = (scales + expert).repeat_interleave(GROUP, dim=1)
-                        torch.testing.assert_close(per_element, expected[:, k_range])
-
-    def test_split_rejects_layouts_it_cannot_remap(self):
-        """Group splitting assumes full symmetric checkpoint scales; fail loudly otherwise.
-
-        Presharded checkpoints are already narrowed, and asymmetric zero points are
-        not split, so either would silently pair weights with the wrong scales.
-        """
-        for name, presharded, sym in (
-            ("presharded", True, True),
-            ("asymmetric", False, False),
-        ):
-            with self.subTest(name):
-                layer = _fused_moe_shell(tp_size=4, tp_rank=1, experts=1)
-                layer.use_presharded_weights = presharded
-                with self.assertRaisesRegex(ValueError, "Splitting W2 scale groups"):
-                    _triton_scheme(sym=sym).create_weights(
-                        layer,
-                        1,
-                        HIDDEN,
-                        INTERMEDIATE // 4,
-                        torch.float32,
-                        weight_loader=layer.weight_loader,
-                    )
 
 
 if __name__ == "__main__":

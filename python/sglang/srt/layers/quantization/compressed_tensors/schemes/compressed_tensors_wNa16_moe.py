@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import enum
 import logging
-import math
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -59,17 +58,6 @@ if _use_aiter:
 logger = logging.getLogger(__name__)
 
 
-def _split_k_groups(weight_loader, factor: int):
-    def loader(param, loaded_weight, *args, **kwargs):
-        # Checkpoint scale is [..., N, K // group_size]; splitting each group
-        # along K lets the generic TP narrow land on exactly this rank's K range.
-        return weight_loader(
-            param, loaded_weight.repeat_interleave(factor, dim=-1), *args, **kwargs
-        )
-
-    return loader
-
-
 class GPTQMarlinState(Enum):
     REPACK = enum.auto()
     READY = enum.auto()
@@ -109,32 +97,6 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
     def get_min_capability(cls) -> int:
         # ampere and up
         return 80
-
-    def _w2_scale_group_size(self, intermediate_size_per_partition: int) -> int:
-        return self.group_size
-
-    def _split_w2_scale_attrs(
-        self,
-        extra_weight_attrs: dict,
-        w2_group_size: int,
-        use_presharded_weights: bool,
-    ) -> dict:
-        if (
-            use_presharded_weights
-            or not self.sym
-            or self.actorder not in (None, "static")
-        ):
-            raise ValueError(
-                f"Splitting W2 scale groups ({self.group_size} -> {w2_group_size}) "
-                "requires symmetric, non-presharded weights without dynamic actorder"
-            )
-        return {
-            **extra_weight_attrs,
-            "weight_loader": _split_k_groups(
-                extra_weight_attrs["weight_loader"],
-                factor=self.group_size // w2_group_size,
-            ),
-        }
 
     def create_weights(
         self,
@@ -193,12 +155,20 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         if self.strategy == "channel":
             num_groups_w2 = num_groups_w13 = 1
             self.group_size = -1
-            layer.w2_group_size = -1
         else:
-            layer.w2_group_size = self._w2_scale_group_size(
-                intermediate_size_per_partition
-            )
-            num_groups_w2 = w2_scales_size // layer.w2_group_size
+            if (
+                not load_full_w2
+                and intermediate_size_per_partition % self.group_size != 0
+            ):
+                # Each rank narrows whole scale groups, so a shard that starts
+                # or ends mid-group would pair its K range with the wrong scales.
+                raise ValueError(
+                    "Compressed-tensors WNA16 MoE needs the per-rank intermediate "
+                    f"size ({intermediate_size_per_partition}) to be divisible by "
+                    f"group_size ({self.group_size}). Use a tensor parallel size "
+                    "that keeps whole groups per rank, or enable expert parallelism."
+                )
+            num_groups_w2 = w2_scales_size // self.group_size
             num_groups_w13 = hidden_size // self.group_size
 
         w13_scale = torch.nn.Parameter(
@@ -218,14 +188,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_scale)
-        w2_scale_attrs = extra_weight_attrs
-        if layer.w2_group_size != self.group_size:
-            w2_scale_attrs = self._split_w2_scale_attrs(
-                extra_weight_attrs,
-                w2_group_size=layer.w2_group_size,
-                use_presharded_weights=layer.use_presharded_weights,
-            )
-        set_weight_attrs(w2_scale, w2_scale_attrs)
+        set_weight_attrs(w2_scale, extra_weight_attrs)
         set_weight_attrs(w2_scale, {"load_full_w2": load_full_w2})
 
         w2_weight_shape = torch.nn.Parameter(
@@ -555,11 +518,6 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
     instead of the Marlin-specific format.
     """
 
-    def _w2_scale_group_size(self, intermediate_size_per_partition: int) -> int:
-        # A TP shard can start or end mid-group (e.g. 640 / 4 = 160 vs 128);
-        # on a gcd grid every local group lies inside one checkpoint group.
-        return math.gcd(self.group_size, intermediate_size_per_partition)
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "is_triton_converted", False):
             return
@@ -604,7 +562,6 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             block_shape=[0, self.group_size],
-            w2_block_shape=[0, layer.w2_group_size],
         )
 
     def apply_weights(

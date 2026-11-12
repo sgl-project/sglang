@@ -199,7 +199,6 @@ def inplace_fused_experts(
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
-    w2_block_shape: Optional[List[int]] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -234,7 +233,6 @@ def inplace_fused_experts(
         gate_up_interleaved=gate_up_interleaved,
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
-        w2_block_shape=w2_block_shape,
     )
 
 
@@ -272,7 +270,6 @@ def outplace_fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
     no_combine_keep_router_weight: bool = False,
-    w2_block_shape: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -308,7 +305,6 @@ def outplace_fused_experts(
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         no_combine_keep_router_weight=no_combine_keep_router_weight,
-        w2_block_shape=w2_block_shape,
     )
 
 
@@ -334,7 +330,6 @@ def fused_experts(
     block_shape: Optional[List[int]] = None,
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
-    w2_block_shape: Optional[List[int]] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -374,7 +369,6 @@ def fused_experts(
             gate_up_interleaved=moe_runner_config.gate_up_interleaved,
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
-            w2_block_shape=w2_block_shape,
         )
         return hidden_states
     else:
@@ -411,7 +405,6 @@ def fused_experts(
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
             no_combine_keep_router_weight=moe_runner_config.no_combine_keep_router_weight,
-            w2_block_shape=w2_block_shape,
         )
 
 
@@ -580,7 +573,6 @@ def _fused_moe_kernel_sequence(
     fuse_swiglu_interleaved: bool = False,
     defer_sum: bool = False,
     no_combine_keep_router_weight: bool = False,
-    w2_block_shape: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -994,7 +986,7 @@ def _fused_moe_kernel_sequence(
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
-        block_shape=w2_block_shape or block_shape,
+        block_shape=block_shape,
         a_use_tma=down_moe_use_tma,
         b_use_tma=down_moe_use_tma,
         filter_expert=filter_expert,
@@ -1162,7 +1154,6 @@ def fused_experts_impl(
     fuse_swiglu_interleaved: bool = False,
     defer_sum: bool = False,
     no_combine_keep_router_weight: bool = False,
-    w2_block_shape: Optional[List[int]] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -1245,7 +1236,6 @@ def fused_experts_impl(
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         defer_sum=defer_sum,
         no_combine_keep_router_weight=no_combine_keep_router_weight,
-        w2_block_shape=w2_block_shape,
     )
 
 
