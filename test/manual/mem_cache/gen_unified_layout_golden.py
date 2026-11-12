@@ -6,12 +6,17 @@ Regenerate it only for an intended layout or sizing change, and explain the delt
 
 The bs=1 floor terms are read from the builder's boot error at a one-byte
 budget, so the golden pins what a too-small budget reports.
+
+``--fused-draft-only`` regenerates the fused-draft layouts alone and keeps
+every other literal as it is:
+    python test/manual/mem_cache/gen_unified_layout_golden.py --fused-draft-only
 """
 
 import importlib.util
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import msgspec
@@ -68,8 +73,21 @@ def _compact(value, indent=0) -> str:
     return json.dumps(value)
 
 
+def _fused_draft_layouts(module) -> dict:
+    layouts = {}
+    for name in module._FUSED:
+        setup_allocator_context()
+        layouts[name] = json.loads(json.dumps(module.fused_case_summary(name)))
+    return layouts
+
+
 def main():
     module = _load_test_module()
+    if "--fused-draft-only" in sys.argv[1:]:
+        golden = json.loads(_OUT.read_text())
+        golden["fused_draft_layouts"] = _fused_draft_layouts(module)
+        _OUT.write_text(_compact(golden) + "\n")
+        return
     layouts = {}
     for name, geometry in module._CONFIGS.items():
         setup_allocator_context()
@@ -105,6 +123,7 @@ def main():
         "source": f"test/manual/mem_cache/gen_unified_layout_golden.py at {commit}",
         "layouts": layouts,
         "bs1_floors": floors,
+        "fused_draft_layouts": _fused_draft_layouts(module),
     }
     _OUT.write_text(_compact(golden) + "\n")
 

@@ -1933,5 +1933,1510 @@
    "budget_at_floor": 7312,
    "minimum_usable_budget": 8208
   }
+ },
+ "fused_draft_layouts": {
+  "plain_swa": {
+   "chain": [["window_32", "up"], ["full", "down"]],
+   "bands": {
+    "window_32": [64, 16, "up", true, false],
+    "full": [128, 16, "down", true, false]
+   },
+   "sink_bytes": 2048,
+   "target": {
+    "layers": {
+     "0": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [208, 2, 8], [64, 8, 1], "torch.bfloat16"],
+      "value": [32, [208, 2, 8], [64, 8, 1], "torch.bfloat16"]
+     },
+     "1": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [64, [208, 2, 8], [64, 8, 1], "torch.bfloat16"],
+      "value": [96, [208, 2, 8], [64, 8, 1], "torch.bfloat16"]
+     },
+     "2": {
+      "sub_pool": "window_32",
+      "index": 0,
+      "key": [0, [416, 1, 8], [32, 8, 1], "torch.bfloat16"],
+      "value": [16, [416, 1, 8], [32, 8, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "window_32",
+      "index": 1,
+      "key": [32, [416, 1, 8], [32, 8, 1], "torch.bfloat16"],
+      "value": [48, [416, 1, 8], [32, 8, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [0, 1],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     },
+     "window_32": {
+      "layer_ids": [2, 3],
+      "token_replicas": 1,
+      "head_num": 1,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "drafts": []
+  },
+  "plain_mla_kda": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [1600, 1, "up", false, false],
+    "full": [96, 16, "down", true, false]
+   },
+   "sink_bytes": 1600,
+   "target": {
+    "layers": {
+     "1": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [208, 1, 24], [48, 24, 1], "torch.bfloat16"],
+      "value": [0, [208, 1, 16], [48, 24, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [48, [208, 1, 24], [48, 24, 1], "torch.bfloat16"],
+      "value": [48, [208, 1, 16], [48, 24, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [1, 3],
+      "token_replicas": 1,
+      "head_num": null,
+      "head_dim": null,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [2, 12, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [192, [2, 12, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [384, [2, 12, 3, 16], [48, 800, 16, 1], "torch.bfloat16"]],
+    "temporal": [576, [2, 12, 2, 8, 8], [128, 400, 64, 8, 1], "torch.float32"]
+   },
+   "drafts": []
+  },
+  "plain_gdn": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [2112, 1, "up", false, false],
+    "full": [128, 16, "down", true, false]
+   },
+   "sink_bytes": 2112,
+   "target": {
+    "layers": {
+     "3": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [208, 2, 16], [64, 16, 1], "torch.bfloat16"],
+      "value": [64, [208, 2, 16], [64, 16, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [3],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 16,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [3, 12, 3, 24], [72, 1056, 24, 1], "torch.bfloat16"]],
+    "temporal": [448, [3, 12, 2, 8, 8], [128, 528, 64, 8, 1], "torch.float32"],
+    "extra": {
+     "short_conv": [1984, [2, 12, 2, 16], [32, 1056, 16, 1], "torch.bfloat16"]
+    }
+   },
+   "drafts": []
+  },
+  "plain_dsa": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [1600, 1, "up", false, false],
+    "full": [590, 16, "down", true, true]
+   },
+   "sink_bytes": 9440,
+   "target": {
+    "layers": {
+     "1": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [9, 16, 1, 160], [9440, 160, 160, 1], "torch.float8_e4m3fn"],
+      "value": null
+     },
+     "3": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [2560, [9, 16, 1, 160], [9440, 160, 160, 1], "torch.float8_e4m3fn"],
+      "value": null
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [1, 3],
+      "token_replicas": 1,
+      "head_num": null,
+      "head_dim": null,
+      "dtype": "torch.float8_e4m3fn"
+     }
+    }
+   },
+   "target_parts": {
+    "index_k": {
+     "1": [5120, [9, 2112], [9440, 1], "torch.uint8"],
+     "3": [7232, [9, 2112], [9440, 1], "torch.uint8"]
+    }
+   },
+   "target_state": {
+    "conv": [[0, [2, 57, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [192, [2, 57, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [384, [2, 57, 3, 16], [48, 800, 16, 1], "torch.bfloat16"]],
+    "temporal": [576, [2, 57, 2, 8, 8], [128, 400, 64, 8, 1], "torch.float32"]
+   },
+   "drafts": []
+  },
+  "mha_asym_v_in_mha": {
+   "chain": [["window_32", "up"], ["full", "down"]],
+   "bands": {
+    "window_32": [64, 16, "up", true, false],
+    "full": [224, 16, "down", true, false]
+   },
+   "sink_bytes": 3584,
+   "target": {
+    "layers": {
+     "0": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [176, 2, 8], [112, 8, 1], "torch.bfloat16"],
+      "value": [32, [176, 2, 8], [112, 8, 1], "torch.bfloat16"]
+     },
+     "1": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [64, [176, 2, 8], [112, 8, 1], "torch.bfloat16"],
+      "value": [96, [176, 2, 8], [112, 8, 1], "torch.bfloat16"]
+     },
+     "2": {
+      "sub_pool": "window_32",
+      "index": 0,
+      "key": [0, [624, 1, 8], [32, 8, 1], "torch.bfloat16"],
+      "value": [16, [624, 1, 8], [32, 8, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "window_32",
+      "index": 1,
+      "key": [32, [624, 1, 8], [32, 8, 1], "torch.bfloat16"],
+      "value": [48, [624, 1, 8], [32, 8, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [0, 1],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     },
+     "window_32": {
+      "layer_ids": [2, 3],
+      "token_replicas": 1,
+      "head_num": 1,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "placement": {
+    "regions": {
+     "full": 1
+    },
+    "runners": [{"full": [0, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 224
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [128, [176, 2, 16], [112, 16, 1], "torch.bfloat16"], "value": [192, [176, 2, 8], [112, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 2, "head_dim": 16, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 2, "head_dim": 16}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "mha_padded_in_mha": {
+   "chain": [["window_32", "up"], ["full", "down"]],
+   "bands": {
+    "window_32": [64, 16, "up", true, false],
+    "full": [288, 16, "down", true, false]
+   },
+   "sink_bytes": 4608,
+   "target": {
+    "layers": {
+     "0": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [160, 2, 8], [144, 8, 1], "torch.bfloat16"],
+      "value": [32, [160, 2, 8], [144, 8, 1], "torch.bfloat16"]
+     },
+     "1": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [64, [160, 2, 8], [144, 8, 1], "torch.bfloat16"],
+      "value": [96, [160, 2, 8], [144, 8, 1], "torch.bfloat16"]
+     },
+     "2": {
+      "sub_pool": "window_32",
+      "index": 0,
+      "key": [0, [768, 1, 8], [32, 8, 1], "torch.bfloat16"],
+      "value": [16, [768, 1, 8], [32, 8, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "window_32",
+      "index": 1,
+      "key": [32, [768, 1, 8], [32, 8, 1], "torch.bfloat16"],
+      "value": [48, [768, 1, 8], [32, 8, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [0, 1],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     },
+     "window_32": {
+      "layer_ids": [2, 3],
+      "token_replicas": 1,
+      "head_num": 1,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "placement": {
+    "regions": {
+     "full": 2
+    },
+    "runners": [{"full": [0, 2]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 288
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [128, [160, 3, 8], [144, 8, 1], "torch.bfloat16"], "value": [176, [160, 3, 4], [144, 4, 1], "torch.bfloat16"]}, "1": {"sub_pool": "full", "index": 1, "key": [208, [160, 3, 8], [144, 8, 1], "torch.bfloat16"], "value": [256, [160, 3, 4], [144, 4, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0, 1], "token_replicas": 1, "head_num": 3, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 3, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "mha_in_mla": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [1600, 1, "up", false, false],
+    "full": [160, 16, "down", true, false]
+   },
+   "sink_bytes": 2560,
+   "target": {
+    "layers": {
+     "1": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [176, 1, 24], [80, 24, 1], "torch.bfloat16"],
+      "value": [0, [176, 1, 16], [80, 24, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [48, [176, 1, 24], [80, 24, 1], "torch.bfloat16"],
+      "value": [48, [176, 1, 16], [80, 24, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [1, 3],
+      "token_replicas": 1,
+      "head_num": null,
+      "head_dim": null,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [2, 18, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [192, [2, 18, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [384, [2, 18, 3, 16], [48, 800, 16, 1], "torch.bfloat16"]],
+    "temporal": [576, [2, 18, 2, 8, 8], [128, 400, 64, 8, 1], "torch.float32"]
+   },
+   "placement": {
+    "regions": {
+     "full": 1
+    },
+    "runners": [{"full": [0, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 160
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [96, [176, 2, 8], [80, 8, 1], "torch.bfloat16"], "value": [128, [176, 2, 8], [80, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 2, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 2, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "mla_in_mla": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [1600, 1, "up", false, false],
+    "full": [160, 16, "down", true, false]
+   },
+   "sink_bytes": 2560,
+   "target": {
+    "layers": {
+     "1": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [176, 1, 24], [80, 24, 1], "torch.bfloat16"],
+      "value": [0, [176, 1, 16], [80, 24, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [48, [176, 1, 24], [80, 24, 1], "torch.bfloat16"],
+      "value": [48, [176, 1, 16], [80, 24, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [1, 3],
+      "token_replicas": 1,
+      "head_num": null,
+      "head_dim": null,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [2, 18, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [192, [2, 18, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [384, [2, 18, 3, 16], [48, 800, 16, 1], "torch.bfloat16"]],
+    "temporal": [576, [2, 18, 2, 8, 8], [128, 400, 64, 8, 1], "torch.float32"]
+   },
+   "placement": {
+    "regions": {
+     "full": 1
+    },
+    "runners": [{"full": [0, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 160
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [96, [176, 1, 24], [80, 24, 1], "torch.bfloat16"], "value": [96, [176, 1, 16], [80, 24, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 1, "head_dim": 24, "dtype": "torch.bfloat16"}}}, "pool": {"routed": true, "head_num": 1, "head_dim": 24}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "mha_after_odd_host": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [192, 1, "up", false, false],
+    "full": [96, 16, "down", true, false]
+   },
+   "sink_bytes": 1536,
+   "target": {
+    "layers": {
+     "1": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [144, 1, 24], [48, 24, 1], "torch.bfloat16"],
+      "value": [0, [144, 1, 16], [48, 24, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [1],
+      "token_replicas": 1,
+      "head_num": null,
+      "head_dim": null,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [1, 76, 3, 8], [24, 96, 8, 1], "torch.bfloat16"]],
+    "temporal": [64, [1, 76, 1, 4, 8], [32, 48, 32, 8, 1], "torch.float32"]
+   },
+   "placement": {
+    "regions": {
+     "full": 1
+    },
+    "runners": [{"full": [0, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 96
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [48, [144, 1, 8], [48, 8, 1], "torch.bfloat16"], "value": [64, [144, 1, 8], [48, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 1, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 1, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "replicas2_odd_host": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [192, 1, "up", false, false],
+    "full": [192, 16, "down", true, false]
+   },
+   "sink_bytes": 3072,
+   "target": {
+    "layers": {
+     "1": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [144, 1, 24], [96, 24, 1], "torch.bfloat16"],
+      "value": [0, [144, 1, 16], [96, 24, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [1],
+      "token_replicas": 1,
+      "head_num": null,
+      "head_dim": null,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [1, 148, 3, 8], [24, 96, 8, 1], "torch.bfloat16"]],
+    "temporal": [64, [1, 148, 1, 4, 8], [32, 48, 32, 8, 1], "torch.float32"]
+   },
+   "placement": {
+    "regions": {
+     "full": 1
+    },
+    "runners": [{"full": [0, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 192
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [48, [288, 1, 8], [48, 8, 1], "torch.bfloat16"], "value": [64, [288, 1, 8], [48, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 2, "head_num": 1, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 1, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 2, "write": [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177], "read_v2p": [0, 0, 10, 11, 6, 7, 14, 15]}}}]
+  },
+  "mla_in_mha": {
+   "chain": [["window_32", "up"], ["full", "down"]],
+   "bands": {
+    "window_32": [64, 16, "up", true, false],
+    "full": [192, 16, "down", true, false]
+   },
+   "sink_bytes": 3072,
+   "target": {
+    "layers": {
+     "0": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [176, 2, 8], [96, 8, 1], "torch.bfloat16"],
+      "value": [32, [176, 2, 8], [96, 8, 1], "torch.bfloat16"]
+     },
+     "1": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [64, [176, 2, 8], [96, 8, 1], "torch.bfloat16"],
+      "value": [96, [176, 2, 8], [96, 8, 1], "torch.bfloat16"]
+     },
+     "2": {
+      "sub_pool": "window_32",
+      "index": 0,
+      "key": [0, [560, 1, 8], [32, 8, 1], "torch.bfloat16"],
+      "value": [16, [560, 1, 8], [32, 8, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "window_32",
+      "index": 1,
+      "key": [32, [560, 1, 8], [32, 8, 1], "torch.bfloat16"],
+      "value": [48, [560, 1, 8], [32, 8, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [0, 1],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     },
+     "window_32": {
+      "layer_ids": [2, 3],
+      "token_replicas": 1,
+      "head_num": 1,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "placement": {
+    "regions": {
+     "full": 1
+    },
+    "runners": [{"full": [0, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 192
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [128, [176, 1, 24], [96, 24, 1], "torch.bfloat16"], "value": [128, [176, 1, 16], [96, 24, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 1, "head_dim": 24, "dtype": "torch.bfloat16"}}}, "pool": {"routed": true, "head_num": 1, "head_dim": 24}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "mha_in_gdn": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [2112, 1, "up", false, false],
+    "full": [256, 16, "down", true, false]
+   },
+   "sink_bytes": 4096,
+   "target": {
+    "layers": {
+     "3": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [176, 2, 16], [128, 16, 1], "torch.bfloat16"],
+      "value": [64, [176, 2, 16], [128, 16, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [3],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 16,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [3, 21, 3, 24], [72, 1056, 24, 1], "torch.bfloat16"]],
+    "temporal": [448, [3, 21, 2, 8, 8], [128, 528, 64, 8, 1], "torch.float32"],
+    "extra": {
+     "short_conv": [1984, [2, 21, 2, 16], [32, 1056, 16, 1], "torch.bfloat16"]
+    }
+   },
+   "placement": {
+    "regions": {
+     "full": 1
+    },
+    "runners": [{"full": [0, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 256
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [128, [176, 2, 16], [128, 16, 1], "torch.bfloat16"], "value": [192, [176, 2, 16], [128, 16, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 2, "head_dim": 16, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 2, "head_dim": 16}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "state_per_depth": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [3200, 1, "up", false, false],
+    "full": [160, 16, "down", true, false]
+   },
+   "sink_bytes": 3200,
+   "target": {
+    "layers": {
+     "1": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [224, 1, 24], [80, 24, 1], "torch.bfloat16"],
+      "value": [0, [224, 1, 16], [80, 24, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [48, [224, 1, 24], [80, 24, 1], "torch.bfloat16"],
+      "value": [48, [224, 1, 16], [80, 24, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [1, 3],
+      "token_replicas": 1,
+      "head_num": null,
+      "head_dim": null,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [2, 11, 3, 16], [48, 1600, 16, 1], "torch.bfloat16"], [192, [2, 11, 3, 16], [48, 1600, 16, 1], "torch.bfloat16"], [384, [2, 11, 3, 16], [48, 1600, 16, 1], "torch.bfloat16"]],
+    "temporal": [576, [2, 11, 2, 8, 8], [128, 800, 64, 8, 1], "torch.float32"]
+   },
+   "placement": {
+    "regions": {
+     "full": 2,
+     "mamba": 2
+    },
+    "runners": [{"full": [0, 1], "mamba": [0, 1]}, {"full": [1, 1], "mamba": [1, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 160,
+    "mamba": 3200
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [96, [224, 1, 8], [80, 8, 1], "torch.bfloat16"], "value": [112, [224, 1, 8], [80, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 1, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 1, "head_dim": 8}, "state": {"layer_map": [[0, 0]], "conv": [[1600, [1, 11, 3, 16], [48, 1600, 16, 1], "torch.bfloat16"], [1792, [1, 11, 3, 16], [48, 1600, 16, 1], "torch.bfloat16"], [1984, [1, 11, 3, 16], [48, 1600, 16, 1], "torch.bfloat16"]], "temporal": [2176, [1, 11, 2, 8, 8], [128, 800, 64, 8, 1], "torch.float32"]}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}, {"kv": {"layers": {"1": {"sub_pool": "full", "index": 0, "key": [128, [224, 1, 8], [80, 8, 1], "torch.bfloat16"], "value": [144, [224, 1, 8], [80, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [1], "token_replicas": 1, "head_num": 1, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 1, "head_dim": 8}, "state": {"layer_map": [[1, 0]], "conv": [[1696, [1, 11, 3, 16], [48, 1600, 16, 1], "torch.bfloat16"], [1888, [1, 11, 3, 16], [48, 1600, 16, 1], "torch.bfloat16"], [2080, [1, 11, 3, 16], [48, 1600, 16, 1], "torch.bfloat16"]], "temporal": [2688, [1, 11, 2, 8, 8], [128, 800, 64, 8, 1], "torch.float32"]}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "state_mixed_dtypes": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [3520, 1, "up", false, false],
+    "full": [384, 16, "down", true, false]
+   },
+   "sink_bytes": 6144,
+   "target": {
+    "layers": {
+     "3": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [176, 2, 16], [192, 16, 1], "torch.bfloat16"],
+      "value": [64, [176, 2, 16], [192, 16, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [3],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 16,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [3, 19, 3, 24], [72, 1760, 24, 1], "torch.bfloat16"]],
+    "temporal": [448, [3, 19, 2, 8, 8], [128, 880, 64, 8, 1], "torch.float32"],
+    "extra": {
+     "short_conv": [1984, [2, 19, 2, 16], [32, 1760, 16, 1], "torch.bfloat16"]
+    }
+   },
+   "placement": {
+    "regions": {
+     "full": 2,
+     "mamba": 2
+    },
+    "runners": [{"full": [0, 1], "mamba": [0, 1]}, {"full": [1, 1], "mamba": [1, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 384,
+    "mamba": 3520
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [128, [176, 2, 16], [192, 16, 1], "torch.bfloat16"], "value": [192, [176, 2, 16], [192, 16, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 2, "head_dim": 16, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 2, "head_dim": 16}, "state": {"layer_map": [[0, 0]], "conv": [[2112, [1, 19, 3, 24], [72, 1760, 24, 1], "torch.float16"], [2400, [1, 19, 2, 8], [16, 1760, 8, 1], "torch.float16"]], "temporal": [2496, [1, 19, 2, 8, 8], [128, 880, 64, 8, 1], "torch.float32"]}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}, {"kv": {"layers": {"1": {"sub_pool": "full", "index": 0, "key": [256, [176, 2, 16], [192, 16, 1], "torch.bfloat16"], "value": [320, [176, 2, 16], [192, 16, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [1], "token_replicas": 1, "head_num": 2, "head_dim": 16, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 2, "head_dim": 16}, "state": {"layer_map": [[1, 0]], "conv": [[2256, [1, 19, 3, 24], [72, 1760, 24, 1], "torch.float16"], [2432, [1, 19, 2, 8], [16, 1760, 8, 1], "torch.float16"]], "temporal": [3008, [1, 19, 2, 8, 8], [128, 880, 64, 8, 1], "torch.float32"]}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "fp8_draft_in_bf16": {
+   "chain": [["window_32", "up"], ["full", "down"]],
+   "bands": {
+    "window_32": [64, 16, "up", true, false],
+    "full": [160, 16, "down", true, false]
+   },
+   "sink_bytes": 2560,
+   "target": {
+    "layers": {
+     "0": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [192, 2, 8], [80, 8, 1], "torch.bfloat16"],
+      "value": [32, [192, 2, 8], [80, 8, 1], "torch.bfloat16"]
+     },
+     "1": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [64, [192, 2, 8], [80, 8, 1], "torch.bfloat16"],
+      "value": [96, [192, 2, 8], [80, 8, 1], "torch.bfloat16"]
+     },
+     "2": {
+      "sub_pool": "window_32",
+      "index": 0,
+      "key": [0, [480, 1, 8], [32, 8, 1], "torch.bfloat16"],
+      "value": [16, [480, 1, 8], [32, 8, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "window_32",
+      "index": 1,
+      "key": [32, [480, 1, 8], [32, 8, 1], "torch.bfloat16"],
+      "value": [48, [480, 1, 8], [32, 8, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [0, 1],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     },
+     "window_32": {
+      "layer_ids": [2, 3],
+      "token_replicas": 1,
+      "head_num": 1,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "placement": {
+    "regions": {
+     "full": 1
+    },
+    "runners": [{"full": [0, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 160
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [128, [192, 2, 8], [160, 8, 1], "torch.float8_e4m3fn"], "value": [144, [192, 2, 8], [160, 8, 1], "torch.float8_e4m3fn"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 2, "head_dim": 8, "dtype": "torch.float8_e4m3fn"}}}, "pool": {"routed": false, "head_num": 2, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "bf16_draft_in_fp8": {
+   "chain": [["window_32", "up"], ["full", "down"]],
+   "bands": {
+    "window_32": [64, 16, "up", true, false],
+    "full": [128, 16, "down", true, false]
+   },
+   "sink_bytes": 2048,
+   "target": {
+    "layers": {
+     "0": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [208, 2, 8], [128, 8, 1], "torch.float8_e4m3fn"],
+      "value": [16, [208, 2, 8], [128, 8, 1], "torch.float8_e4m3fn"]
+     },
+     "1": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [32, [208, 2, 8], [128, 8, 1], "torch.float8_e4m3fn"],
+      "value": [48, [208, 2, 8], [128, 8, 1], "torch.float8_e4m3fn"]
+     },
+     "2": {
+      "sub_pool": "window_32",
+      "index": 0,
+      "key": [0, [416, 2, 8], [64, 8, 1], "torch.float8_e4m3fn"],
+      "value": [16, [416, 2, 8], [64, 8, 1], "torch.float8_e4m3fn"]
+     },
+     "3": {
+      "sub_pool": "window_32",
+      "index": 1,
+      "key": [32, [416, 2, 8], [64, 8, 1], "torch.float8_e4m3fn"],
+      "value": [48, [416, 2, 8], [64, 8, 1], "torch.float8_e4m3fn"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [0, 1],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 8,
+      "dtype": "torch.float8_e4m3fn"
+     },
+     "window_32": {
+      "layer_ids": [2, 3],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 8,
+      "dtype": "torch.float8_e4m3fn"
+     }
+    }
+   },
+   "placement": {
+    "regions": {
+     "full": 1
+    },
+    "runners": [{"full": [0, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 128
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [64, [208, 2, 8], [64, 8, 1], "torch.bfloat16"], "value": [96, [208, 2, 8], [64, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 2, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 2, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "fp8_latent_in_bf16": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [1600, 1, "up", false, false],
+    "full": [128, 16, "down", true, false]
+   },
+   "sink_bytes": 2048,
+   "target": {
+    "layers": {
+     "1": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [192, 1, 24], [64, 24, 1], "torch.bfloat16"],
+      "value": [0, [192, 1, 16], [64, 24, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [48, [192, 1, 24], [64, 24, 1], "torch.bfloat16"],
+      "value": [48, [192, 1, 16], [64, 24, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [1, 3],
+      "token_replicas": 1,
+      "head_num": null,
+      "head_dim": null,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [2, 15, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [192, [2, 15, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [384, [2, 15, 3, 16], [48, 800, 16, 1], "torch.bfloat16"]],
+    "temporal": [576, [2, 15, 2, 8, 8], [128, 400, 64, 8, 1], "torch.float32"]
+   },
+   "placement": {
+    "regions": {
+     "full": 1
+    },
+    "runners": [{"full": [0, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 128
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [96, [192, 1, 24], [128, 24, 1], "torch.float8_e4m3fn"], "value": [96, [192, 1, 16], [128, 24, 1], "torch.float8_e4m3fn"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 1, "head_dim": 24, "dtype": "torch.float8_e4m3fn"}}}, "pool": {"routed": true, "head_num": 1, "head_dim": 24}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "replicas2_mha_host": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [2112, 1, "up", false, false],
+    "full": [256, 16, "down", true, false]
+   },
+   "sink_bytes": 4096,
+   "target": {
+    "layers": {
+     "3": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [176, 2, 16], [128, 16, 1], "torch.bfloat16"],
+      "value": [128, [176, 2, 16], [128, 16, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [3],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 16,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [3, 21, 3, 24], [72, 1056, 24, 1], "torch.bfloat16"]],
+    "temporal": [448, [3, 21, 2, 8, 8], [128, 528, 64, 8, 1], "torch.float32"],
+    "extra": {
+     "short_conv": [1984, [2, 21, 2, 16], [32, 1056, 16, 1], "torch.bfloat16"]
+    }
+   },
+   "placement": {
+    "regions": {
+     "full": 1
+    },
+    "runners": [{"full": [0, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 256
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [64, [352, 2, 8], [64, 8, 1], "torch.bfloat16"], "value": [96, [352, 2, 8], [64, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 2, "head_num": 2, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 2, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 2, "write": [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177], "read_v2p": [0, 0, 10, 11, 6, 7, 14, 15]}}}]
+  },
+  "replicas4_mha_host": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [2112, 1, "up", false, false],
+    "full": [512, 16, "down", true, false]
+   },
+   "sink_bytes": 8192,
+   "target": {
+    "layers": {
+     "3": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [160, 2, 16], [256, 16, 1], "torch.bfloat16"],
+      "value": [128, [160, 2, 16], [256, 16, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [3],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 16,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [3, 38, 3, 24], [72, 1056, 24, 1], "torch.bfloat16"]],
+    "temporal": [448, [3, 38, 2, 8, 8], [128, 528, 64, 8, 1], "torch.float32"],
+    "extra": {
+     "short_conv": [1984, [2, 38, 2, 16], [32, 1056, 16, 1], "torch.bfloat16"]
+    }
+   },
+   "placement": {
+    "regions": {
+     "full": 1
+    },
+    "runners": [{"full": [0, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 512
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [64, [640, 2, 8], [64, 8, 1], "torch.bfloat16"], "value": [96, [640, 2, 8], [64, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 4, "head_num": 2, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 2, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 4, "write": [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49], "read_v2p": [0, 0, 0, 0, 20, 21, 22, 23]}}}]
+  },
+  "replicas2_mla_host": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [1600, 1, "up", false, false],
+    "full": [192, 16, "down", true, false]
+   },
+   "sink_bytes": 3072,
+   "target": {
+    "layers": {
+     "1": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [176, 1, 24], [96, 24, 1], "torch.bfloat16"],
+      "value": [0, [176, 1, 16], [96, 24, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [96, [176, 1, 24], [96, 24, 1], "torch.bfloat16"],
+      "value": [96, [176, 1, 16], [96, 24, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [1, 3],
+      "token_replicas": 1,
+      "head_num": null,
+      "head_dim": null,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [2, 21, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [192, [2, 21, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [384, [2, 21, 3, 16], [48, 800, 16, 1], "torch.bfloat16"]],
+    "temporal": [576, [2, 21, 2, 8, 8], [128, 400, 64, 8, 1], "torch.float32"]
+   },
+   "placement": {
+    "regions": {
+     "full": 1
+    },
+    "runners": [{"full": [0, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 192
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [48, [352, 1, 24], [48, 24, 1], "torch.bfloat16"], "value": [48, [352, 1, 16], [48, 24, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 2, "head_num": 1, "head_dim": 24, "dtype": "torch.bfloat16"}}}, "pool": {"routed": true, "head_num": 1, "head_dim": 24}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 2, "write": [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177], "read_v2p": [0, 0, 10, 11, 6, 7, 14, 15]}}}]
+  },
+  "replicas4_mla_host": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [1600, 1, "up", false, false],
+    "full": [512, 16, "down", true, false]
+   },
+   "sink_bytes": 8192,
+   "target": {
+    "layers": {
+     "1": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [144, 1, 24], [256, 24, 1], "torch.bfloat16"],
+      "value": [0, [144, 1, 16], [256, 24, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [128, [144, 1, 24], [256, 24, 1], "torch.bfloat16"],
+      "value": [128, [144, 1, 16], [256, 24, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [1, 3],
+      "token_replicas": 1,
+      "head_num": null,
+      "head_dim": null,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [2, 50, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [192, [2, 50, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [384, [2, 50, 3, 16], [48, 800, 16, 1], "torch.bfloat16"]],
+    "temporal": [576, [2, 50, 2, 8, 8], [128, 400, 64, 8, 1], "torch.float32"]
+   },
+   "placement": {
+    "regions": {
+     "full": 1
+    },
+    "runners": [{"full": [0, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 512
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [48, [576, 2, 8], [64, 8, 1], "torch.bfloat16"], "value": [80, [576, 2, 8], [64, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 4, "head_num": 2, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 2, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 4, "write": [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49], "read_v2p": [0, 0, 0, 0, 20, 21, 22, 23]}}}]
+  },
+  "replicated_three_runners": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [2112, 1, "up", false, false],
+    "full": [320, 16, "down", true, false]
+   },
+   "sink_bytes": 5120,
+   "target": {
+    "layers": {
+     "3": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [160, 2, 16], [160, 16, 1], "torch.bfloat16"],
+      "value": [64, [160, 2, 16], [160, 16, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [3],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 16,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [3, 25, 3, 24], [72, 1056, 24, 1], "torch.bfloat16"]],
+    "temporal": [448, [3, 25, 2, 8, 8], [128, 528, 64, 8, 1], "torch.float32"],
+    "extra": {
+     "short_conv": [1984, [2, 25, 2, 16], [32, 1056, 16, 1], "torch.bfloat16"]
+    }
+   },
+   "placement": {
+    "regions": {
+     "full": 6
+    },
+    "runners": [{"full": [0, 2]}, {"full": [2, 2]}, {"full": [4, 2]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 320
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [128, [160, 1, 8], [160, 8, 1], "torch.bfloat16"], "value": [144, [160, 1, 8], [160, 8, 1], "torch.bfloat16"]}, "1": {"sub_pool": "full", "index": 1, "key": [160, [160, 1, 8], [160, 8, 1], "torch.bfloat16"], "value": [176, [160, 1, 8], [160, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0, 1], "token_replicas": 1, "head_num": 1, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 1, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}, {"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [192, [160, 1, 8], [160, 8, 1], "torch.bfloat16"], "value": [208, [160, 1, 8], [160, 8, 1], "torch.bfloat16"]}, "1": {"sub_pool": "full", "index": 1, "key": [224, [160, 1, 8], [160, 8, 1], "torch.bfloat16"], "value": [240, [160, 1, 8], [160, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0, 1], "token_replicas": 1, "head_num": 1, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 1, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}, {"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [256, [160, 1, 8], [160, 8, 1], "torch.bfloat16"], "value": [272, [160, 1, 8], [160, 8, 1], "torch.bfloat16"]}, "1": {"sub_pool": "full", "index": 1, "key": [288, [160, 1, 8], [160, 8, 1], "torch.bfloat16"], "value": [304, [160, 1, 8], [160, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0, 1], "token_replicas": 1, "head_num": 1, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 1, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "per_depth_two_runners": {
+   "chain": [["mamba", "up"], ["full", "down"]],
+   "bands": {
+    "mamba": [1600, 1, "up", false, false],
+    "full": [192, 16, "down", true, false]
+   },
+   "sink_bytes": 3072,
+   "target": {
+    "layers": {
+     "1": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [176, 1, 24], [96, 24, 1], "torch.bfloat16"],
+      "value": [0, [176, 1, 16], [96, 24, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [48, [176, 1, 24], [96, 24, 1], "torch.bfloat16"],
+      "value": [48, [176, 1, 16], [96, 24, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [1, 3],
+      "token_replicas": 1,
+      "head_num": null,
+      "head_dim": null,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [2, 21, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [192, [2, 21, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [384, [2, 21, 3, 16], [48, 800, 16, 1], "torch.bfloat16"]],
+    "temporal": [576, [2, 21, 2, 8, 8], [128, 400, 64, 8, 1], "torch.float32"]
+   },
+   "placement": {
+    "regions": {
+     "full": 2
+    },
+    "runners": [{"full": [0, 1]}, {"full": [1, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 192
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [96, [176, 1, 24], [96, 24, 1], "torch.bfloat16"], "value": [96, [176, 1, 16], [96, 24, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 1, "head_dim": 24, "dtype": "torch.bfloat16"}}}, "pool": {"routed": true, "head_num": 1, "head_dim": 24}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}, {"kv": {"layers": {"1": {"sub_pool": "full", "index": 0, "key": [144, [176, 1, 24], [96, 24, 1], "torch.bfloat16"], "value": [144, [176, 1, 16], [96, 24, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [1], "token_replicas": 1, "head_num": 1, "head_dim": 24, "dtype": "torch.bfloat16"}}}, "pool": {"routed": true, "head_num": 1, "head_dim": 24}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "per_depth_full_and_window": {
+   "chain": [["window_32", "up"], ["full", "down"]],
+   "bands": {
+    "window_32": [96, 16, "up", true, false],
+    "full": [256, 16, "down", true, false]
+   },
+   "sink_bytes": 4096,
+   "target": {
+    "layers": {
+     "0": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [192, 2, 8], [128, 8, 1], "torch.bfloat16"],
+      "value": [32, [192, 2, 8], [128, 8, 1], "torch.bfloat16"]
+     },
+     "1": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [64, [192, 2, 8], [128, 8, 1], "torch.bfloat16"],
+      "value": [96, [192, 2, 8], [128, 8, 1], "torch.bfloat16"]
+     },
+     "2": {
+      "sub_pool": "window_32",
+      "index": 0,
+      "key": [0, [512, 1, 8], [48, 8, 1], "torch.bfloat16"],
+      "value": [16, [512, 1, 8], [48, 8, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "window_32",
+      "index": 1,
+      "key": [32, [512, 1, 8], [48, 8, 1], "torch.bfloat16"],
+      "value": [48, [512, 1, 8], [48, 8, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [0, 1],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     },
+     "window_32": {
+      "layer_ids": [2, 3],
+      "token_replicas": 1,
+      "head_num": 1,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "placement": {
+    "regions": {
+     "full": 2,
+     "window_32": 1
+    },
+    "runners": [{"full": [0, 1]}, {"window_32": [0, 1]}, {"full": [1, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+     "window_32": "window"
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 256,
+    "window_32": 96
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [128, [192, 2, 8], [128, 8, 1], "torch.bfloat16"], "value": [160, [192, 2, 8], [128, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 2, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 2, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}, {"kv": {"layers": {"1": {"sub_pool": "window_32", "index": 0, "key": [64, [512, 1, 8], [48, 8, 1], "torch.bfloat16"], "value": [80, [512, 1, 8], [48, 8, 1], "torch.bfloat16"]}}, "views": {"window_32": {"layer_ids": [1], "token_replicas": 1, "head_num": 1, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": true, "head_num": 1, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}, "window_32": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}, {"kv": {"layers": {"2": {"sub_pool": "full", "index": 0, "key": [192, [192, 2, 8], [128, 8, 1], "torch.bfloat16"], "value": [224, [192, 2, 8], [128, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [2], "token_replicas": 1, "head_num": 2, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": false, "head_num": 2, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "matched_window": {
+   "chain": [["window_32", "up"], ["full", "down"]],
+   "bands": {
+    "window_32": [96, 16, "up", true, false],
+    "full": [192, 16, "down", true, false]
+   },
+   "sink_bytes": 3072,
+   "target": {
+    "layers": {
+     "0": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [208, 2, 8], [96, 8, 1], "torch.bfloat16"],
+      "value": [32, [208, 2, 8], [96, 8, 1], "torch.bfloat16"]
+     },
+     "1": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [64, [208, 2, 8], [96, 8, 1], "torch.bfloat16"],
+      "value": [96, [208, 2, 8], [96, 8, 1], "torch.bfloat16"]
+     },
+     "2": {
+      "sub_pool": "window_32",
+      "index": 0,
+      "key": [0, [416, 1, 8], [48, 8, 1], "torch.bfloat16"],
+      "value": [16, [416, 1, 8], [48, 8, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "window_32",
+      "index": 1,
+      "key": [32, [416, 1, 8], [48, 8, 1], "torch.bfloat16"],
+      "value": [48, [416, 1, 8], [48, 8, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [0, 1],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     },
+     "window_32": {
+      "layer_ids": [2, 3],
+      "token_replicas": 1,
+      "head_num": 1,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "placement": {
+    "regions": {
+     "full": 1,
+     "window_32": 1
+    },
+    "runners": [{"full": [0, 1], "window_32": [0, 1]}],
+    "new_bands": {
+
+    },
+    "hosted": {
+     "window_32": "window"
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 192,
+    "window_32": 96
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [128, [208, 2, 8], [96, 8, 1], "torch.bfloat16"], "value": [160, [208, 2, 8], [96, 8, 1], "torch.bfloat16"]}, "1": {"sub_pool": "window_32", "index": 0, "key": [64, [416, 1, 8], [48, 8, 1], "torch.bfloat16"], "value": [80, [416, 1, 8], [48, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 2, "head_dim": 8, "dtype": "torch.bfloat16"}, "window_32": {"layer_ids": [1], "token_replicas": 1, "head_num": 1, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": true, "head_num": 2, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}, "window_32": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "unmatched_window_mha": {
+   "chain": [["mamba", "up"], ["window_64", "float"], ["window_32", "float"], ["full", "down"]],
+   "bands": {
+    "mamba": [192, 1, "up", false, false],
+    "window_64": [64, 16, "float", true, false],
+    "window_32": [32, 16, "float", true, false],
+    "full": [64, 16, "down", true, false]
+   },
+   "sink_bytes": 1024,
+   "target": {
+    "layers": {
+     "0": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [336, 1, 8], [32, 8, 1], "torch.bfloat16"],
+      "value": [16, [336, 1, 8], [32, 8, 1], "torch.bfloat16"]
+     },
+     "1": {
+      "sub_pool": "window_32",
+      "index": 0,
+      "key": [0, [688, 1, 8], [16, 8, 1], "torch.bfloat16"],
+      "value": [16, [688, 1, 8], [16, 8, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [0],
+      "token_replicas": 1,
+      "head_num": 1,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     },
+     "window_32": {
+      "layer_ids": [1],
+      "token_replicas": 1,
+      "head_num": 1,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     },
+     "window_64": {
+      "layer_ids": [],
+      "token_replicas": 1,
+      "head_num": 2,
+      "head_dim": 8,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [1, 116, 3, 8], [24, 96, 8, 1], "torch.bfloat16"]],
+    "temporal": [64, [1, 116, 1, 4, 8], [32, 48, 32, 8, 1], "torch.float32"]
+   },
+   "placement": {
+    "regions": {
+     "full": 1,
+     "window_64": 1
+    },
+    "runners": [{"full": [0, 1], "window_64": [0, 1]}],
+    "new_bands": {
+     "window_64": ["window", 64]
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 64,
+    "window_64": 64
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [32, [336, 1, 8], [32, 8, 1], "torch.bfloat16"], "value": [48, [336, 1, 8], [32, 8, 1], "torch.bfloat16"]}, "1": {"sub_pool": "window_64", "index": 0, "key": [0, [336, 2, 8], [32, 8, 1], "torch.bfloat16"], "value": [32, [336, 2, 8], [32, 8, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 1, "head_dim": 8, "dtype": "torch.bfloat16"}, "window_64": {"layer_ids": [1], "token_replicas": 1, "head_num": 2, "head_dim": 8, "dtype": "torch.bfloat16"}}}, "pool": {"routed": true, "head_num": 1, "head_dim": 8}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}, "window_64": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  },
+  "unmatched_window_mla": {
+   "chain": [["mamba", "up"], ["window_128", "float"], ["full", "down"]],
+   "bands": {
+    "mamba": [1600, 1, "up", false, false],
+    "window_128": [64, 16, "float", true, false],
+    "full": [160, 16, "down", true, false]
+   },
+   "sink_bytes": 2560,
+   "target": {
+    "layers": {
+     "1": {
+      "sub_pool": "full",
+      "index": 0,
+      "key": [0, [176, 1, 24], [80, 24, 1], "torch.bfloat16"],
+      "value": [0, [176, 1, 16], [80, 24, 1], "torch.bfloat16"]
+     },
+     "3": {
+      "sub_pool": "full",
+      "index": 1,
+      "key": [48, [176, 1, 24], [80, 24, 1], "torch.bfloat16"],
+      "value": [48, [176, 1, 16], [80, 24, 1], "torch.bfloat16"]
+     }
+    },
+    "views": {
+     "full": {
+      "layer_ids": [1, 3],
+      "token_replicas": 1,
+      "head_num": null,
+      "head_dim": null,
+      "dtype": "torch.bfloat16"
+     },
+     "window_128": {
+      "layer_ids": [],
+      "token_replicas": 1,
+      "head_num": null,
+      "head_dim": null,
+      "dtype": "torch.bfloat16"
+     }
+    }
+   },
+   "target_state": {
+    "conv": [[0, [2, 18, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [192, [2, 18, 3, 16], [48, 800, 16, 1], "torch.bfloat16"], [384, [2, 18, 3, 16], [48, 800, 16, 1], "torch.bfloat16"]],
+    "temporal": [576, [2, 18, 2, 8, 8], [128, 400, 64, 8, 1], "torch.float32"]
+   },
+   "placement": {
+    "regions": {
+     "full": 1,
+     "window_128": 1
+    },
+    "runners": [{"full": [0, 1], "window_128": [0, 1]}],
+    "new_bands": {
+     "window_128": ["window", 128]
+    },
+    "hosted": {
+
+    }
+   },
+   "fused_entry_bytes": {
+    "full": 160,
+    "window_128": 64
+   },
+   "drafts": [{"kv": {"layers": {"0": {"sub_pool": "full", "index": 0, "key": [96, [176, 1, 24], [80, 24, 1], "torch.bfloat16"], "value": [96, [176, 1, 16], [80, 24, 1], "torch.bfloat16"]}, "1": {"sub_pool": "window_128", "index": 0, "key": [0, [448, 1, 24], [32, 24, 1], "torch.bfloat16"], "value": [0, [448, 1, 16], [32, 24, 1], "torch.bfloat16"]}}, "views": {"full": {"layer_ids": [0], "token_replicas": 1, "head_num": 1, "head_dim": 24, "dtype": "torch.bfloat16"}, "window_128": {"layer_ids": [1], "token_replicas": 1, "head_num": 1, "head_dim": 24, "dtype": "torch.bfloat16"}}}, "pool": {"routed": true, "head_num": 1, "head_dim": 24}, "ids": {"is_fused_draft": true, "full": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}, "window_128": {"token_replicas": 1, "write": [14, 15, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 112, 113], "read_v2p": [0, 5, 3, 7, -1, -1, -1, -1]}}}]
+  }
  }
 }

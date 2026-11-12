@@ -1048,3 +1048,293 @@ def unified_layout_summary(bundle) -> dict:
         # re-checks the stored floor.
         out["bs1_floor_terms"] = tuple(bundle.token_to_kv_pool._bs1_floor_terms)
     return out
+
+
+# -- fused draft layouts --------------------------------------------------------
+
+
+def build_declared_bundle(
+    decls,
+    *,
+    page_size: int,
+    full_tokens: int,
+    window_tokens: Optional[int] = None,
+    state_slots: int = 0,
+    state_cache_params=None,
+    fused_draft: Optional[FusedDraftPlacement] = None,
+    max_num_reqs: int = 4,
+    context_len: int = 256,
+):
+    """Build the unified pool stack for arbitrary declarations, sized by token
+    and slot counts, through the plan, sizing and builder production uses."""
+    layer_ids = sorted({d.layer_id for d in decls})
+    sizing = KVSizingInputs(
+        full_tokens=full_tokens,
+        window_tokens=window_tokens,
+        state_slots=state_slots,
+        context_len=context_len,
+        alignment=1,
+    )
+    ctx = UnifiedBuildContext(
+        device="cpu",
+        start_layer=0,
+        end_layer=max(layer_ids) + 1,
+        enable_memory_saver=False,
+        need_sort=False,
+        lazy_compaction=True,
+        head_num=1,
+        head_dim=8,
+        max_num_reqs=max_num_reqs,
+        model_context_len=context_len,
+        extra_max_context_len=1,
+        state_cache_params=state_cache_params,
+        disable_overlap_schedule=True,
+    )
+    return storage_parts(
+        build_unified_pools(
+            decls=decls,
+            page_size=page_size,
+            sizing=sizing,
+            ctx=ctx,
+            fused_draft=fused_draft,
+        )
+    )
+
+
+def bind_test_draft(
+    bundle,
+    placement: FusedDraftPlacement,
+    runner: int,
+    *,
+    kv_layer_ids,
+    window_layer_ids=(),
+    state_layer_ids=(),
+    num_depths: int = 1,
+):
+    """Bind draft runner ``runner`` to its fused lanes through the production
+    binders, with the draft model's facts the binders read given directly:
+    its attention layer ids, the ids its config routes to the window side and
+    the depth ids that keep recurrent state."""
+    from unittest.mock import patch
+
+    from sglang.srt.mem_cache import unified_draft_pool
+
+    allocator = bundle.token_to_kv_pool_allocator
+    model_config = SimpleNamespace(num_nextn_predict_layers=num_depths)
+    with (
+        patch.object(
+            unified_draft_pool,
+            "draft_kv_layer_ids",
+            lambda model: list(kv_layer_ids),
+        ),
+        patch.object(
+            unified_draft_pool,
+            "draft_swa_layer_ids",
+            lambda mc: tuple(window_layer_ids),
+        ),
+        patch.object(
+            unified_draft_pool,
+            "draft_state_layer_ids",
+            lambda mc, num_depths: tuple(state_layer_ids),
+        ),
+    ):
+        return unified_draft_pool.bind_fused_draft(
+            placement=placement,
+            runner=runner,
+            arena=allocator.arena,
+            plan=allocator.plan,
+            owner=allocator.roles.owner,
+            target_state=allocator.state,
+            model=None,
+            model_config=model_config,
+            req_to_token_pool=bundle.req_to_token_pool,
+            page_size=allocator.page_size,
+        )
+
+
+def _bytes_fact(tensor: Optional[torch.Tensor], raw_base: int):
+    """Where a view sits in the arena and how it walks it: byte offset from
+    the arena's first byte, shape, element strides and dtype."""
+    if tensor is None:
+        return None
+    return (
+        tensor.data_ptr() - raw_base,
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype),
+    )
+
+
+def _layer_facts(layer, raw_base: int) -> dict:
+    """A routed layer's key (or latent) and value, as its readers take them."""
+    try:
+        value = layer.value()
+    except NotImplementedError:
+        value = None
+    return {
+        "key": _bytes_fact(layer.key(), raw_base),
+        "value": _bytes_fact(value, raw_base),
+    }
+
+
+def _router_facts(router, raw_base: int) -> dict:
+    """Every routed layer of a pool: its sub-pool, its index there and the
+    bytes of its views, then each sub-pool's view facts."""
+    layers = {}
+    for layer_id in router.layer_ids():
+        layer = router.layer(layer_id)
+        layers[layer_id] = {
+            "sub_pool": layer.route.sub_pool,
+            "index": layer.route.index,
+            **_layer_facts(layer, raw_base),
+        }
+    views = {}
+    for sub_pool in router.sub_pools():
+        view = router.view(sub_pool.name)
+        # Facts a view states, where its kind states them (a target view
+        # replicates no tokens, and a latent view has no head count).
+        views[sub_pool.name] = {
+            "layer_ids": tuple(sub_pool.layer_ids),
+            "token_replicas": getattr(view, "token_replicas", 1),
+            "head_num": getattr(view, "head_num", None),
+            "head_dim": getattr(view, "head_dim", None),
+            "dtype": str(view.dtype),
+        }
+    return {"layers": layers, "views": views}
+
+
+def _state_facts(pool, raw_base: int) -> dict:
+    cache = pool.mamba_cache
+    out = {
+        "conv": tuple(_bytes_fact(c, raw_base) for c in cache.conv),
+        "temporal": _bytes_fact(cache.temporal, raw_base),
+    }
+    extra = getattr(pool, "extra_views", None) or {}
+    if extra:
+        out["extra"] = {name: _bytes_fact(v, raw_base) for name, v in extra.items()}
+    return out
+
+
+def _draft_id_facts(bundle, pool) -> dict:
+    """How a fused draft runner's ids name its rows: per sub-pool, the write
+    of a page-spanning run of virtual token ids once virtual pages 1..3 sit on
+    physical pages 5, 3 and 7, and the head of its expanded read table."""
+    from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+
+    allocator = bundle.token_to_kv_pool_allocator
+    runner_ids = RunnerIds(
+        req_to_token=bundle.req_to_token_pool.req_to_token,
+        token_to_kv_pool_allocator=allocator,
+        token_to_kv_pool=pool,
+        page_size=allocator.page_size,
+        device="cpu",
+        is_draft_worker=True,
+    )
+    page = allocator.page_size
+    out = {"is_fused_draft": runner_ids.is_fused_draft}
+    for name, space in sorted(runner_ids._spaces.items()):
+        # Over how many logical tokens each stored row repeats (1: none).
+        key = space.key
+        replicated = isinstance(key, tuple) and len(key) == 3 and key[1] == "replicated"
+        out[name] = {"token_replicas": key[2] if replicated else 1}
+    for name, band in (
+        (allocator.roles.owner, allocator.full_attn_allocator),
+        *allocator.window_allocators.items(),
+    ):
+        ids = band.ids
+        ids.reset()
+        ids.bind(
+            torch.tensor([1, 2, 3], dtype=torch.int64),
+            torch.tensor([5, 3, 7], dtype=torch.int64),
+        )
+    for name, space in sorted(runner_ids._spaces.items()):
+        virtual = torch.arange(page - 2, 3 * page + 2, dtype=torch.int64)
+        if space.prepare_read is not None:
+            space.prepare_read()
+        out[name]["write"] = tuple(space.ids(virtual).tolist())
+        if space.read_v2p is not None:
+            out[name]["read_v2p"] = tuple(space.read_v2p[:8].tolist())
+    for _, band in (
+        ("owner", allocator.full_attn_allocator),
+        *allocator.window_allocators.items(),
+    ):
+        band.ids.reset()
+    return out
+
+
+def fused_draft_layout_summary(bundle, placement, bindings) -> dict:
+    """Plain data pinning every byte a target and its fused draft runners
+    address, read off the built views (offsets from the arena's first byte,
+    shapes, strides, dtypes) rather than off layout specs: the chain, each
+    band, the sink, the placement, the target's routed layers and state, and
+    each draft runner's routed layers, state and id spaces."""
+    arena = bundle.arena
+    allocator = bundle.token_to_kv_pool_allocator
+    plan = allocator.plan
+    raw_base = arena.raw.data_ptr()
+    out = {
+        "chain": tuple((b.name, b.grow_direction) for b in arena.bands),
+        "bands": {
+            b.name: (
+                b.entry_bytes,
+                b.unit_entries,
+                b.grow_direction,
+                b.zero_on_handout,
+                b.copies_whole_units,
+            )
+            for b in arena.bands
+        },
+        "sink_bytes": plan.sink_bytes(),
+        "target": _router_facts(bundle.token_to_kv_pool.layer_router, raw_base),
+    }
+    router = bundle.token_to_kv_pool.layer_router
+    parts = {}
+    for part in sorted(router._part_views):
+        indices = router.part_indices(part)
+        if not indices:
+            continue
+        parts[part] = {
+            layer_id: _bytes_fact(
+                getattr(
+                    router.layer(layer_id, part).view, "get_index_k_with_scale_buffer"
+                )(router.layer(layer_id, part).view_layer_id),
+                raw_base,
+            )
+            for layer_id in indices
+        }
+    if parts:
+        out["target_parts"] = parts
+    if allocator.state is not None:
+        out["target_state"] = _state_facts(allocator.state.pool, raw_base)
+    if placement is not None:
+        out["placement"] = {
+            "regions": {h: placement.region(h).lane_num for h in placement.hosts()},
+            "runners": tuple(dict(sorted(r.ranges.items())) for r in placement.runners),
+            "new_bands": {
+                n: (b.kind, b.window) for n, b in sorted(placement.new_bands.items())
+            },
+            "hosted": dict(sorted(placement.hosted.items())),
+        }
+        out["fused_entry_bytes"] = {
+            h: plan.sub_pool(h).spec.entry_bytes() for h in placement.hosts()
+        }
+    drafts = []
+    for binding in bindings:
+        draft = {}
+        pool = binding.token_to_kv_pool
+        draft["kv"] = _router_facts(pool.layer_router, raw_base)
+        draft["pool"] = {
+            "routed": pool
+            is not pool.layer_router.view(pool.layer_router.sub_pools()[0].name),
+            "head_num": pool.head_num,
+            "head_dim": pool.head_dim,
+        }
+        if binding.state is not allocator.state:
+            draft["state"] = {
+                "layer_map": tuple(sorted(binding.state.layer_map.items())),
+                **_state_facts(binding.state.pool, raw_base),
+            }
+        draft["ids"] = _draft_id_facts(bundle, pool)
+        drafts.append(draft)
+    out["drafts"] = tuple(drafts)
+    return out
