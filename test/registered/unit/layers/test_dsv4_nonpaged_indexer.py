@@ -1023,20 +1023,28 @@ class TestFullTopKDecodeDeepSelectGate(CustomTestCase):
 
     def test_hopper_keeps_select_decode(self):
         self.assertFalse(
-            self._use_deep_select_decode(sm=9, use_deep_gemm_decode=False, supported=True)
+            self._use_deep_select_decode(
+                sm=9, use_deep_gemm_decode=False, supported=True
+            )
         )
 
     def test_non_hopper_uses_deep_select_when_supported(self):
         self.assertTrue(
-            self._use_deep_select_decode(sm=10, use_deep_gemm_decode=False, supported=True)
+            self._use_deep_select_decode(
+                sm=10, use_deep_gemm_decode=False, supported=True
+            )
         )
 
     def test_deep_gemm_decode_and_unsupported_device_disable_deep_select(self):
         self.assertFalse(
-            self._use_deep_select_decode(sm=10, use_deep_gemm_decode=True, supported=True)
+            self._use_deep_select_decode(
+                sm=10, use_deep_gemm_decode=True, supported=True
+            )
         )
         self.assertFalse(
-            self._use_deep_select_decode(sm=10, use_deep_gemm_decode=False, supported=False)
+            self._use_deep_select_decode(
+                sm=10, use_deep_gemm_decode=False, supported=False
+            )
         )
 
 
