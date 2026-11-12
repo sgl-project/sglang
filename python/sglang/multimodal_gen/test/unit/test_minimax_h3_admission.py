@@ -694,6 +694,20 @@ def test_high_fp8_admission_keeps_the_denoise_schedule():
             stage.forward(batch, args)
 
 
+def test_high_quality_cache_schedule_is_the_audited_static_mask():
+    """quality="high" runs exactly the step schedule the 4xH200 audit measured;
+    reusing the stack before step 15 changes the layout of the sample."""
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage._minimax_h3_quality = "high"
+
+    _, policy, mask, _ = stage._cache_dit_scm_masks(50)
+
+    assert policy == "static"
+    assert "".join(map(str, mask)) == (
+        "11111111111111101010101010000000100000001000000011"
+    )
+
+
 def test_quality_admission_fails_closed_outside_validated_request():
     metadata = MiniMaxH3ReleaseMetadata.from_model_index(
         {
