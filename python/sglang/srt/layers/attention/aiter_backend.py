@@ -170,7 +170,9 @@ _use_fp8_prefill_attn = (
 _use_mla_prefix_fused_k = get_bool_env_var("SGLANG_AITER_MLA_PREFIX_FUSED_K", "False")
 
 # On top of the fused prefix K path: FP8 q/k/v into the gfx1250 ASM FP8 varlen
-# FMHA (hd192x128).
+# FMHA (hd192x128). Needs aiter with ROCm/aiter#7375; the gfx1250 pin in
+# docker/rocm.Dockerfile (07ff5f318) predates it, and older aiter runs a
+# different FP8 kernel here.
 _use_gfx1250_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_GFX1250_FP8_PREFILL_ATTN", "False")
     and is_gfx1250_supported()
@@ -2502,10 +2504,18 @@ class AiterAttnBackend(AttentionBackend):
         )
         return merge_state_triton(out_a, lse_a, out_b, lse_b.view(n_rows, num_heads))
 
-    def _use_mla_prefix_fused_k(self, layer: RadixAttention) -> bool:
+    def _mla_prefix_fused_k_applies(self, layer: RadixAttention) -> bool:
         # MXFP4 kv_b_proj + FP8 prefill already fuses split/cat into its GEMM.
         return _use_mla_prefix_fused_k and not (
             self.use_fp8_prefill_attn and layer.kv_b_proj.weight.dtype == torch.uint8
+        )
+
+    def _mla_prefix_fp8_fmha_applies(self, layer: RadixAttention) -> bool:
+        # The gfx1250 ASM FP8 varlen FMHA only covers hd192x128.
+        return (
+            _use_gfx1250_fp8_prefill_attn
+            and layer.qk_head_dim == 192
+            and layer.v_head_dim == 128
         )
 
     def _mla_prefix_attn_fused(
@@ -2516,6 +2526,7 @@ class AiterAttnBackend(AttentionBackend):
         qk_nope_head_dim: int,
     ) -> torch.Tensor:
         """MHA prefill over the cached latent at ``kv_indices`` (prefix + chunk)."""
+        use_fp8_fmha = self._mla_prefix_fp8_fmha_applies(layer)
         kvc, k_pe = self.kv_layers.read(layer.layer_id).read_mla(
             layer, kv_indices, q.dtype
         )
@@ -2525,13 +2536,13 @@ class AiterAttnBackend(AttentionBackend):
         k_nope, v = torch.split(kv, [qk_nope_head_dim, layer.v_head_dim], dim=-1)
         k = kv.new_empty(
             (kv.shape[0], kv.shape[1], layer.qk_head_dim),
-            dtype=fp8_dtype if _use_gfx1250_fp8_prefill_attn else kv.dtype,
+            dtype=fp8_dtype if use_fp8_fmha else kv.dtype,
         )
         concat_and_cast_mha_k_triton(k, k_nope, k_pe)
         md = self.forward_metadata
-        if _use_gfx1250_fp8_prefill_attn:
+        if use_fp8_fmha:
             # Unit scales, as in mla_fp8_prefill_attn on gfx950.
-            return flash_attn_varlen_fp8_pertensor_func(
+            o = flash_attn_varlen_fp8_pertensor_func(
                 q.to(fp8_dtype),
                 k,
                 v.to(fp8_dtype),
@@ -2545,6 +2556,7 @@ class AiterAttnBackend(AttentionBackend):
                 softmax_scale=layer.scaling,
                 causal=True,
             )
+            return o.to(q.dtype)
         if self.use_fp8_prefill_attn:
             return self.mla_fp8_prefill_attn(q, k, v, layer)
         return flash_attn_varlen_func(
@@ -4726,7 +4738,11 @@ class AiterAttnBackend(AttentionBackend):
                     return output
                 elif layer.qk_head_dim != (
                     kv_lora_rank + qk_rope_head_dim
-                ) and self._use_mla_prefix_fused_k(layer):
+                ) and self._mla_prefix_fused_k_applies(layer):
+                    assert (
+                        forward_batch.extend_prefix_lens.shape
+                        == forward_batch.extend_seq_lens.shape
+                    )
                     return self._mla_prefix_attn_fused(
                         q, layer, kv_indices, qk_nope_head_dim
                     )
