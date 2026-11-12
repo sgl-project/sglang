@@ -503,7 +503,10 @@ and use these attention options:
 ```
 
 Attention precision is independent of linear-weight quantization. Keep
-`--quantization` unchanged when comparing attention backends.
+`--quantization` unchanged when comparing attention backends. Use
+`'{"precision":"bf16"}'` for an explicit native floating-point baseline.
+Quantized attention applies to DiT self-attention; the refiner and text encoder
+do not inherit the DiT quantization settings.
 
 ## 4. Generate video and audio
 

@@ -1002,30 +1002,81 @@ Both `sage_attn` and `sol_attn` are approximate. The default DiT backend remains
 On Ascend NPU, `fa` can use the public `mindiesd.quant_attention` API for
 FP8, MXFP8, and MXFP4 attention. This integration targets MiniMax-H3;
 Wan/FLUX support is out of scope. Omitting `precision` preserves the existing
-native Ascend FA behavior and does not require MindIE-SD.
+native Ascend FA behavior, including its opt-in MXFP8 path. Set `precision=bf16`
+to explicitly select native floating-point attention. Neither requires MindIE-SD.
 
 When FA is an internal dense fallback for another selected backend, that
 backend's `precision` does not enable quantized FA.
+The denoising stage passes configuration through `AscendFAMetadata`; the FA
+constructor does not read global server arguments. Quantization applies to DiT
+self-attention. H3 refiners and cross-attention do not inherit its quantized path.
 
 #### Install the optional SDK
 
-Install the official [MindIE-SD 3.2.0 wheel](https://pypi.org/project/mindiesd/3.2.0/#files)
-in your existing Linux Ascend environment:
+Use Linux with an Ascend 950 (A5), the CANN toolkit/operator packages, and a
+matching Torch/TorchNPU installation. Activate the Python environment that runs
+SGLang before building: the SDK's native extension uses that environment's Torch
+ABI. Keep SGLang's Torch 2.10 installation; the SDK's root `requirements.txt`
+pins Torch/TorchNPU 2.9 and must not replace it.
+
+Build the fixed `3.2.0` release in a user-owned directory:
+
+```bash
+# Adjust this path to your CANN installation.
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+git clone --branch 3.2.0 --depth 1 https://gitcode.com/Ascend/MindIE-SD.git
+cd MindIE-SD
+# Release commit: 65bd01133998ab018052fdb6f55dea5a873e584f
+python3 -m pip install "setuptools>=65.5" build wheel "cmake<4.1"
+
+# 3.2.0 makes build/vendors read-only before the following AICPU copy.
+# Restore owner write permission between those two build steps.
+python3 - <<'PY'
+from pathlib import Path
+
+path = Path("build/build_ops.sh")
+source = path.read_text(encoding="utf-8")
+marker = "    sync_aicpu_ops_to_transformer_vendor\n"
+assert source.count(marker) == 1
+source = source.replace(
+    marker,
+    '    chmod u+w "${current_script_dir}/vendors"\n' + marker,
+    1,
+)
+path.write_text(source, encoding="utf-8")
+PY
+
+MINDIE_SD_VERSION_OVERRIDE=3.2.0 ASCEND_COMPUTE_UNIT=ascend950 \
+  python3 -m build --wheel --no-isolation
+python3 -m pip install --no-deps dist/mindiesd-3.2.0-*.whl
+```
+
+The release still defaults its package version to `3.1.0`, so the build command
+sets the release version explicitly. The permission workaround addresses the non-root `customize_transformer`
+directory creation failure in the release's
+[build script](https://gitcode.com/Ascend/MindIE-SD/blob/3.2.0/build/build_ops.sh).
+It does not require root or disable operator builds. You also need the CANN
+development toolchain; see the pinned
+[installation guide](https://gitcode.com/Ascend/MindIE-SD/blob/3.2.0/docs/en/installation.md)
+and [build guide](https://gitcode.com/Ascend/MindIE-SD/blob/3.2.0/docs/en/developer_guide/build_guide.md).
+
+Alternatively, install the official [3.2.0 wheel](https://pypi.org/project/mindiesd/3.2.0/#files)
+when its Python, architecture, glibc, and Torch ABI match your environment:
 
 ```bash
 python3 -m pip install --no-deps --only-binary=:all: "mindiesd==3.2.0"
 ```
 
-Wheels are available for Python 3.11/3.12 on x86_64 (glibc 2.34+) and Python 3.12
-on aarch64 (glibc 2.35+). `--no-deps` preserves your installed Torch/TorchNPU.
-Use a compatible CANN/TorchNPU stack as described in the upstream
-[installation guide](https://gitcode.com/Ascend/MindIE-SD/blob/dev/docs/en/installation.md).
-For installation from source, follow the upstream
-[build guide](https://gitcode.com/Ascend/MindIE-SD/blob/dev/docs/en/developer_guide/build_guide.md).
+`--no-deps` preserves the installed Torch/TorchNPU versions; it does not guarantee
+binary compatibility. The historical H3 runs used the source-built
+`3.1.0+fb774c4.c8v16` SDK. The fixed 3.2.0 source recipe and published wheels
+still need end-to-end validation in the target environment.
 
-Source-build validation used Ascend 950, PyTorch 2.10.0, TorchNPU 2.10.0,
-and CANN 9.2.0-beta.2. The published 3.2.0 wheel has not yet been rerun with
-this integration.
+| Environment | Validation status |
+| --- | --- |
+| Ascend 950, Torch/TorchNPU 2.10.0, CANN 9.2.0-beta.2, custom SDK `3.1.0+fb774c4.c8v16` | H3 generation/performance runs for FP8, MXFP8, and MXFP4; not model-quality parity. |
+| Ascend 950, CANN 9.1.1, official SDK 3.2.0 | Pending integration validation; do not infer support from an import check. |
+| Ascend 910 / 910B / 910_93 | These A5 quantized attention paths are not supported; use native FA. |
 
 On the target NPU host, activate the CANN environment and check the public API:
 
@@ -1040,10 +1091,16 @@ libraries, and operator failures raise errors rather than falling back to native
 
 | Parameter | Type | Description | Default |
 | --- | --- | --- | --- |
-| `precision` | `str` | `fp8`, `mxfp8`, or `mxfp4`; selects MindIE-SD. | Unset (native FA) |
+| `precision` | `str` | `bf16` selects native floating-point FA; `fp8`, `mxfp8`, or `mxfp4` selects MindIE-SD. | Unset (existing native selection) |
 | `fp8_fa_mode` | `str` | FP8 only; `HIGH_PRECISION` or `C8V16_TILING512` (head dimension 128). | `HIGH_PRECISION` |
 | `head_chunk_size` | `int` | MHA heads per SD call. Use `0` to disable chunking, or another positive integer. | `4` |
 | `qk_rotation` | `bool` | Apply online Q/K rotation before quantization. | `true`; `false` for checkpoints with offline Q/K rotation |
+
+`C8V16_TILING512` is an alternative FP8 compute/tiling mode for head dimension
+128. It changes the V block layout and the fused kernel's internal precision
+setting; Q/K/V still pass through SDK quantization. Compare its latency and
+numerical quality with `HIGH_PRECISION` on your workload before choosing it.
+See the [SDK implementation](https://gitcode.com/Ascend/MindIE-SD/blob/3.2.0/mindiesd/layers/flash_attn/fused_infer_attention_score.py).
 
 For example, run MiniMax-H3 on two NPUs with FP8 C8V16 and the default chunk size:
 
@@ -1061,8 +1118,9 @@ sglang generate \
 ```
 
 For MXFP8 or MXFP4, use `'{"precision":"mxfp8"}'` or
-`'{"precision":"mxfp4"}'`. H3 defaults its text encoder to `torch_sdpa` for this
-configuration; explicit component/role overrides take precedence. Attention
+`'{"precision":"mxfp4"}'`. Use `'{"precision":"bf16"}'` for a native
+floating-point attention baseline, even when native MXFP8 is enabled in the
+environment. The text encoder keeps its normal backend selection. Attention
 precision is independent of linear-weight quantization. Add `--quantization mxfp8`
 only if online MXFP8 linear weights are also wanted.
 
