@@ -217,10 +217,15 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     node_rank = server_args.node_rank
     local_num_gpus = num_gpus // nnodes
     rank_offset = node_rank * local_num_gpus
+    local_gpu_ids = server_args.gpu_ids
+    if local_gpu_ids is None:
+        local_gpu_ids = list(range(local_num_gpus))
+    if len(local_gpu_ids) != local_num_gpus:
+        raise ValueError("--gpu-ids must contain one device per local worker")
     server_args_payload = ServerArgsPayload.capture(server_args)
     processes = _start_scheduler_processes(
         server_args_payload,
-        [(i, rank_offset + i) for i in range(local_num_gpus)],
+        [(gpu_id, rank_offset + i) for i, gpu_id in enumerate(local_gpu_ids)],
         "sglang-diffusionWorker-",
     )
 
