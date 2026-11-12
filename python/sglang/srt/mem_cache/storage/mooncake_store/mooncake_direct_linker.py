@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+import time
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from copy import deepcopy
@@ -49,6 +50,71 @@ def _storage_suffix(
         parts.append(f"tp{tp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
+
+
+_LEASE_RENEW_ATTEMPTS = 4
+
+
+def _shared_pool_suffix(
+    *,
+    tp_shared: bool,
+    tp_rank: int,
+    attn_cp_rank: int,
+    pp_rank: int,
+    dcp_sharded: bool,
+    dcp_size: int,
+    dcp_rank: int,
+) -> str:
+    """Key suffix for a pool whose pages are byte-identical across attention TP.
+    The versioned shared term keeps it from aliasing an older per-rank object."""
+    parts = ["tpshared_v1" if tp_shared else f"tp{tp_rank}"]
+    if dcp_sharded:
+        parts.append(f"dcp{dcp_size}r{dcp_rank}")
+    parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
+    return "_".join(parts)
+
+
+def _storage_sharing(
+    pools,
+    *,
+    rank_replicated: bool,
+    tp_rank: int,
+    tp_size: int,
+    attn_cp_rank: int,
+    pp_rank: int,
+    offload_owner: bool,
+    dcp_size: int,
+    dcp_rank: int,
+):
+    """Per-pool key suffixes and the pools this rank offloads. A pool replicated
+    across attention TP is written by TP rank 0 (or the first DCP block) only."""
+    dcp_sharded = {name for name, pool in pools.items() if pool.dcp_sharded}
+    tp_shared = {
+        name
+        for name, pool in pools.items()
+        if not rank_replicated and tp_size > 1 and pool.tp_replicated
+    }
+    suffixes = {
+        name: _shared_pool_suffix(
+            tp_shared=name in tp_shared,
+            tp_rank=tp_rank,
+            attn_cp_rank=attn_cp_rank,
+            pp_rank=pp_rank,
+            dcp_sharded=name in dcp_sharded,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+        )
+        for name in tp_shared | dcp_sharded
+    }
+    offload_pools = {
+        name
+        for name in pools
+        if offload_owner
+        and (
+            name not in tp_shared or tp_rank < (dcp_size if name in dcp_sharded else 1)
+        )
+    }
+    return suffixes, offload_pools, tp_shared
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
@@ -125,14 +191,28 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
+        self.storage.pool_suffixes, self.offload_pools, tp_shared = _storage_sharing(
+            self.pools,
+            rank_replicated=rank_replicated,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            attn_cp_rank=params.attn_cp_rank,
+            pp_rank=params.pp_rank,
+            offload_owner=self.offload_owner,
+            dcp_size=get_parallel().attn_dcp_size,
+            dcp_rank=get_parallel().attn_dcp_rank,
+        )
         logger.info(
             "Mooncake direct linker storage topology: "
-            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
+            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s, "
+            "tp_shared=%s, offload_pools=%s",
             rank_replicated,
             tp_rank,
             tp_size,
             self.offload_owner,
             storage_suffix,
+            sorted(tp_shared),
+            sorted(self.offload_pools),
         )
 
         self.register_buffers()
@@ -481,10 +561,54 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 offsets[start : start + step],
             )
 
+    def _get_layer_ranges(self, keys, ptrs, sizes, offsets):
+        store = self.storage.store
+        result = store.batch_get_into_multi_buffer_ranges(keys, ptrs, sizes, offsets)
+        if result is None or isinstance(result, int):
+            return result
+        result = list(result)
+        if len(result) != len(keys):
+            return result
+        expected = [sum(item) for item in sizes]
+        # A long load can outlive its read leases: the first read of a lapsed key
+        # reports -707, later reads -600. A renewal can race reads still in flight
+        # on the old lease, so renew and retry a few times with backoff.
+        for attempt in range(_LEASE_RENEW_ATTEMPTS):
+            expired = [
+                i
+                for i, (value, want) in enumerate(zip(result, expected))
+                if value != want
+            ]
+            if not expired or any(result[i] not in (-707, -600) for i in expired):
+                return result
+            if attempt:
+                time.sleep(0.05 * 2 ** (attempt - 1))
+            lapsed = list(dict.fromkeys(keys[i] for i in expired))
+            renewed = list(store.batch_get_session_start(lapsed))
+            if renewed != [0] * len(lapsed):
+                raise RuntimeError(
+                    f"Mooncake get session renewal failed: keys={len(lapsed)}, "
+                    f"result_sample={renewed[:8]}"
+                )
+            retried = store.batch_get_into_multi_buffer_ranges(
+                [keys[i] for i in expired],
+                [ptrs[i] for i in expired],
+                [sizes[i] for i in expired],
+                [offsets[i] for i in expired],
+            )
+            if retried is None or isinstance(retried, int):
+                return retried
+            retried = list(retried)
+            if len(retried) != len(expired):
+                raise RuntimeError(
+                    "Mooncake renewed range get returned wrong result count"
+                )
+            for index, value in zip(expired, retried):
+                result[index] = value
+        return result
+
     def _range_get(self, name: PoolName, keys, ptrs, sizes, offsets) -> None:
-        result = self.storage.store.batch_get_into_multi_buffer_ranges(
-            keys, ptrs, sizes, offsets
-        )
+        result = self._get_layer_ranges(keys, ptrs, sizes, offsets)
         expected = [sum(item) for item in sizes]
         if result is None or isinstance(result, int) or list(result) != expected:
             raise RuntimeError(
@@ -499,7 +623,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         self.freeze_gc_once()
-        if not self.offload_owner:
+        expanded = [t for t in expanded if t.name in self.offload_pools]
+        if not expanded:
             self.offload_results.put(True)
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
