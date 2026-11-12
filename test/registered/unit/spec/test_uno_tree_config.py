@@ -12,7 +12,8 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _xpu_linear_args(decode_graph_backend):
+def _xpu_args(*, decode_graph_backend, attention_backend="intel_xpu", tree=False):
+    """Startup args for UNO on XPU: linear 8/1/8, or tree 8/16/8."""
     return SimpleNamespace(
         device="xpu",
         cuda_graph_config=SimpleNamespace(
@@ -23,8 +24,11 @@ def _xpu_linear_args(decode_graph_backend):
         speculative_draft_model_path=None,
         uno_lora_path="/tmp/uno-lora",
         speculative_num_draft_tokens=8,
-        speculative_num_steps=1,
-        speculative_eagle_topk=1,
+        speculative_num_steps=7 if tree else 1,
+        speculative_eagle_topk=16 if tree else 1,
+        enable_two_batch_overlap=False,
+        speculative_accept_threshold_single=1.0,
+        speculative_accept_threshold_acc=1.0,
         tp_size=1,
         pp_size=1,
         attn_cp_size=1,
@@ -32,7 +36,7 @@ def _xpu_linear_args(decode_graph_backend):
         lora_paths=None,
         speculative_use_rejection_sampling=False,
         enable_mixed_chunk=False,
-        attention_backend="intel_xpu",
+        attention_backend=attention_backend,
         prefill_attention_backend=None,
         decode_attention_backend=None,
     )
@@ -57,14 +61,34 @@ class TestUnoXpuConfig(CustomTestCase):
         ):
             _handle_uno(server_args)
 
-    def test_eager_intel_xpu_is_accepted(self):
-        """XPU with its native attention backend and no decode graph starts."""
-        self._handle(_xpu_linear_args(Backend.DISABLED))
+    def test_supported_xpu_configs_start(self):
+        """Linear UNO runs with or without XPU decode graphs on either XPU
+        attention backend; tree UNO with graphs runs on triton."""
+        for decode_graph_backend in (Backend.DISABLED, Backend.FULL):
+            for attention_backend in ("intel_xpu", "triton"):
+                with self.subTest(
+                    decode_graph_backend=decode_graph_backend,
+                    attention_backend=attention_backend,
+                ):
+                    self._handle(
+                        _xpu_args(
+                            decode_graph_backend=decode_graph_backend,
+                            attention_backend=attention_backend,
+                        )
+                    )
+        self._handle(
+            _xpu_args(
+                decode_graph_backend=Backend.FULL,
+                attention_backend="triton",
+                tree=True,
+            )
+        )
 
-    def test_decode_graph_is_rejected(self):
-        """The XPU graph runner would replay UNO's draft without its LoRA."""
-        with self.assertRaisesRegex(ValueError, "decode graphs"):
-            self._handle(_xpu_linear_args(Backend.FULL))
+    def test_intel_xpu_tree_graph_is_rejected(self):
+        """intel_xpu graphs lack tree-verify metadata, so a captured tree
+        verify would attend through stale cascade metadata."""
+        with self.assertRaisesRegex(ValueError, "requires --attention-backend triton"):
+            self._handle(_xpu_args(decode_graph_backend=Backend.FULL, tree=True))
 
 
 class TestUnoTreeConfig(CustomTestCase):

@@ -1,7 +1,8 @@
 """Single-adapter LoRA backend for UNO draft forwards.
 
 Parallel-linear layers overlap LoRA-A with the base GEMM on an auxiliary device
-stream. Other dense LoRA layers use the inherited Triton implementation.
+stream (inline on XPU). Other dense LoRA layers use the inherited Triton
+implementation.
 Single-request cuBLAS batches operate only on draft rows; larger batches use
 one ``mm``/``addmm_`` over all rows and zero the seed-row LoRA hidden states
 between the two GEMMs.
@@ -38,7 +39,8 @@ class _UnoSingleAdapterRoute:
 @dataclass(frozen=True)
 class _PendingLoRAA:
     output: torch.Tensor
-    producer_stream: torch.Stream
+    # None when LoRA-A ran inline on the consumer stream.
+    producer_stream: Optional[torch.Stream]
 
 
 class UnoCublasLoRABackend(TritonLoRABackend):
@@ -66,6 +68,10 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         super().__init__(max_loras_per_batch, device, **kwargs)
         # torch.cuda on CUDA/ROCm, torch.xpu on XPU.
         self._device_module = torch.get_device_module(device)
+        # Workaround: on Arc Pro B60 (torch 2.14+xpu), UNO's batch>1 XPU graphs
+        # with this side-stream fork crash with UR_RESULT_ERROR_OUT_OF_RESOURCES
+        # or hang on replay; drop once that replay works.
+        self._use_lora_a_side_stream = torch.device(device).type != "xpu"
         # Different CUDA-graph runners may capture and replay on different main
         # streams. Give each main stream its own LoRA-A side stream so concurrently
         # replayed graphs do not serialize or interfere through one shared stream.
@@ -410,7 +416,8 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         *,
         num_slices: int = 1,
     ) -> None:
-        """Launch LoRA-A on the auxiliary stream before the base GEMM."""
+        """Launch LoRA-A before the base GEMM, on the auxiliary stream when
+        enabled."""
 
         if self._pending_lora_a is not None:
             raise RuntimeError("Previous UNO LoRA-A overlap was not consumed.")
@@ -419,6 +426,13 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         out_dim = num_slices * route.rank
         lora_input = self._lora_a_input(x, route)
         active_a = weights[route.weight_index, :out_dim]
+
+        if not self._use_lora_a_side_stream:
+            self._pending_lora_a = _PendingLoRAA(
+                output=self._compute_lora_a(lora_input, active_a, route),
+                producer_stream=None,
+            )
+            return
 
         device_module = self._device_module
         main_stream = device_module.current_stream(x.device)
@@ -454,7 +468,8 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         pending: _PendingLoRAA,
     ) -> torch.Tensor:
         self._pending_lora_a = None
-        self._device_module.current_stream(pending.output.device).wait_stream(
-            pending.producer_stream
-        )
+        if pending.producer_stream is not None:
+            self._device_module.current_stream(pending.output.device).wait_stream(
+                pending.producer_stream
+            )
         return pending.output

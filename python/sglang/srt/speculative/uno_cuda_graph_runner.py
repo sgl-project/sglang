@@ -27,6 +27,14 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         tree_draft_width=None,
         **kwargs,
     ):
+        if model_runner.device == "xpu":
+            from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import (
+                prepare_xpu_graph_capture,
+            )
+
+            # The XPU platform runner is not in this class's bases.
+            prepare_xpu_graph_capture()
+
         candidate_top_k = get_spec().speculative_eagle_topk
         self._tree_mode = candidate_top_k > 1
         self._tree_draft_mode = tree_draft_width is not None
