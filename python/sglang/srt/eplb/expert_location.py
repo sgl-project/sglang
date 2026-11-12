@@ -19,7 +19,7 @@ import logging
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, List, Optional
+from typing import TYPE_CHECKING, Iterable, List, Literal, Optional
 
 import torch
 import torch.distributed
@@ -512,17 +512,52 @@ def _normalize_layer_ids(
     return normalized_layer_ids
 
 
-def get_global_expert_location_metadata():
+TARGET_EXPERT_LOCATION_FAMILY = "target"
+DRAFT_EXPERT_LOCATION_FAMILY = "draft"
+ExpertLocationFamily = Literal["target", "draft"]
 
-    return get_resources().expert_location_metadata
+
+def get_global_expert_location_metadata(
+    family: ExpertLocationFamily = TARGET_EXPERT_LOCATION_FAMILY,
+):
+    resources = get_resources()
+    if family == DRAFT_EXPERT_LOCATION_FAMILY:
+        return resources.draft_expert_location_metadata
+    assert family == TARGET_EXPERT_LOCATION_FAMILY, f"{family=}"
+    return resources.expert_location_metadata
 
 
-def set_global_expert_location_metadata(value, allow_overwrite=False):
-
+def set_global_expert_location_metadata(
+    value,
+    allow_overwrite=False,
+    family: ExpertLocationFamily = TARGET_EXPERT_LOCATION_FAMILY,
+):
     resources = get_resources()
     if not allow_overwrite:
-        assert resources.expert_location_metadata is None
-    resources.expert_location_metadata = value
+        assert get_global_expert_location_metadata(family) is None
+    if family == DRAFT_EXPERT_LOCATION_FAMILY:
+        resources.draft_expert_location_metadata = value
+    else:
+        assert family == TARGET_EXPERT_LOCATION_FAMILY, f"{family=}"
+        resources.expert_location_metadata = value
+
+
+def resolve_layer_expert_location_family(
+    requested: Optional[ExpertLocationFamily], *, is_draft: bool
+) -> Optional[ExpertLocationFamily]:
+    """The placement a MoE layer follows: a draft layer only the draft family it
+    asks for, a target layer only the target's; None keeps the trivial layout."""
+    own_family = (
+        DRAFT_EXPERT_LOCATION_FAMILY if is_draft else TARGET_EXPERT_LOCATION_FAMILY
+    )
+    return requested if requested == own_family else None
+
+
+def draft_expert_location_family() -> Optional[ExpertLocationFamily]:
+    """The family to request for a DeepSeek-V4 draft MoE layer being built."""
+    if get_global_expert_location_metadata(DRAFT_EXPERT_LOCATION_FAMILY) is None:
+        return None
+    return DRAFT_EXPERT_LOCATION_FAMILY
 
 
 def append_trivial_expert_slots(

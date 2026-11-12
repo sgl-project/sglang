@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Callable, List
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
+import msgspec
 import torch.cuda
 import torch.distributed as dist
 from torch import nn
@@ -12,6 +13,7 @@ from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import (
+    ExpertLocationFamily,
     ExpertLocationMetadata,
     format_expert_location_layout,
     format_expert_location_layout_diff,
@@ -24,6 +26,16 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 logger = logging.getLogger(__name__)
+
+
+class EPLBFamily(msgspec.Struct, frozen=True):
+    """A model other than the target (the DSpark draft) whose MoE layers follow
+    their own placement family, rebalanced in the target's pause."""
+
+    name: ExpertLocationFamily
+    model_config: Any
+    get_model: Callable[[], nn.Module]
+    expert_location_updater: ExpertLocationUpdater
 
 
 class EPLBManager:
@@ -51,6 +63,7 @@ class EPLBManager:
         self._rebalance_num_iterations = get_exec().moe.eplb_rebalance_num_iterations
         self._rebalance_disabled_reason = None
         self._rebalance_disabled_logged = False
+        self._extra_families: List[EPLBFamily] = []
 
         # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
         assert (
@@ -68,6 +81,17 @@ class EPLBManager:
         )
 
         self._main_generator = self._entrypoint()
+
+    def register_family(self, family: EPLBFamily):
+        metadata = get_global_expert_location_metadata(family.name)
+        assert metadata is not None
+        # One updater rank layout serves both families.
+        assert metadata.ep_size == get_global_expert_location_metadata().ep_size
+        self._extra_families.append(family)
+        recorder = get_global_expert_distribution_recorder(family.name)
+        if not recorder.recording:
+            recorder.start_record()
+        logger.info(f"[EPLBManager] {family.name} family joins the rebalance.")
 
     def on_forward_pass_end(self):
         next(self._main_generator)
@@ -120,6 +144,18 @@ class EPLBManager:
             torch.get_device_module().synchronize()
             time_start = time.time()
 
+        yield from self._rebalance_target(is_post_scale_rebalance)
+        for family in self._extra_families:
+            yield from self._rebalance_family(family)
+
+        msg = f"[EPLBManager] rebalance end"
+        if enable_timing:
+            torch.get_device_module().synchronize()
+            time_end = time.time()
+            msg += f" time={time_end - time_start:.3f}s"
+        logger.info(msg)
+
+    def _rebalance_target(self, is_post_scale_rebalance: bool):
         dump_record_output = get_global_expert_distribution_recorder().dump_record(
             output_mode="object"
         )
@@ -177,12 +213,35 @@ class EPLBManager:
 
         self._log_rebalance_layout_after_update(update_layer_ids=all_update_layer_ids)
 
-        msg = f"[EPLBManager] rebalance end"
-        if enable_timing:
-            torch.get_device_module().synchronize()
-            time_end = time.time()
-            msg += f" time={time_end - time_start:.3f}s"
-        logger.info(msg)
+    def _rebalance_family(self, family: EPLBFamily):
+        dump_record_output = get_global_expert_distribution_recorder(
+            family.name
+        ).dump_record(output_mode="object")
+        if not self._check_rebalance_needed(
+            dump_record_output["average_utilization_rate_over_window"]
+        ):
+            return
+        expert_location_metadata = ExpertLocationMetadata.init_by_eplb(
+            family.model_config, dump_record_output["logical_count"]
+        )
+        model = family.get_model()
+        update_layer_ids_chunks = self._compute_update_layer_ids_chunks(model)
+        for chunk_layer_ids in update_layer_ids_chunks:
+            if len(update_layer_ids_chunks) > 1:
+                yield
+            missing = family.expert_location_updater.update(
+                model.routed_experts_weights_of_layer,
+                expert_location_metadata,
+                update_layer_ids=chunk_layer_ids,
+                nnodes=get_parallel().nnodes,
+                rank=get_parallel().tp_rank,
+                family=family.name,
+            )
+            assert not missing, f"{family.name} family lost experts {missing}"
+        logger.info(
+            f"[EPLBManager] {family.name} family rebalanced "
+            f"{sum(map(len, update_layer_ids_chunks))} layers"
+        )
 
     def _compute_expert_location_metadata(
         self, logical_count, *, broadcast_over_world: bool
@@ -237,10 +296,11 @@ class EPLBManager:
 
         return True
 
-    def _compute_update_layer_ids_chunks(self) -> List[List[int]]:
-        all_layer_ids = sorted(
-            list(self._get_model().routed_experts_weights_of_layer.keys())
-        )
+    def _compute_update_layer_ids_chunks(
+        self, model: Optional[nn.Module] = None
+    ) -> List[List[int]]:
+        model = self._get_model() if model is None else model
+        all_layer_ids = sorted(list(model.routed_experts_weights_of_layer.keys()))
         chunk_size = self._rebalance_layers_per_chunk or 1000000
         return list(_chunk_list(all_layer_ids, chunk_size=chunk_size))
 

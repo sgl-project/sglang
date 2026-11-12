@@ -10,6 +10,11 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
+from sglang.srt.eplb.expert_location import (
+    TARGET_EXPERT_LOCATION_FAMILY,
+    ExpertLocationFamily,
+    resolve_layer_expert_location_family,
+)
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
@@ -46,11 +51,17 @@ class HashTopK(nn.Module):
         apply_routed_scaling_factor_on_output=False,
         layer_id: Optional[int] = None,
         is_draft: Optional[bool] = None,
+        expert_location_family: Optional[
+            ExpertLocationFamily
+        ] = TARGET_EXPERT_LOCATION_FAMILY,
     ):
         super().__init__()
         self.layer_id = layer_id
         self.is_draft = (
             get_flags().moe.in_speculative_scope if is_draft is None else is_draft
+        )
+        self.expert_location_family = resolve_layer_expert_location_family(
+            expert_location_family, is_draft=self.is_draft
         )
 
         self.shared_experts = get_model().shared_experts
@@ -79,7 +90,9 @@ class HashTopK(nn.Module):
             )
 
     def routing_inputs(self):
-        return resolve_routing_inputs(layer_id=self.layer_id, is_draft=self.is_draft)
+        return resolve_routing_inputs(
+            layer_id=self.layer_id, expert_location_family=self.expert_location_family
+        )
 
     @property
     def num_shared_topk_slots(self) -> int:
@@ -235,7 +248,7 @@ class HashTopK(nn.Module):
     ):
         num_token_non_padded, expert_location_dispatch_info = resolve_routing_inputs(
             layer_id=self.layer_id,
-            is_draft=self.is_draft,
+            expert_location_family=self.expert_location_family,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
         )

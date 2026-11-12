@@ -235,8 +235,11 @@ def _local_expert_ids(layer, expert_id: int) -> List[int]:
     so they need the same expert placement: EPLB's physical replicas, then the
     expert-parallel slice this rank stores.
     """
-    metadata = get_global_expert_location_metadata()
-    if metadata is None or not layer.uses_expert_location:
+    family = layer.expert_location_family
+    metadata = (
+        get_global_expert_location_metadata(family) if family is not None else None
+    )
+    if metadata is None:
         physical = [expert_id]
     else:
         physical = metadata.logical_to_all_physical(layer.layer_id, expert_id)
