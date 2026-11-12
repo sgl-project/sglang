@@ -3408,18 +3408,22 @@ class UnifiedRadixCache(BasePrefixCache):
             cc.prefetch_buffer.put(operation)
             return True
 
+        def _is_speculative(operation):
+            demands = getattr(operation, "native_demands", None)
+            return demands is not None and not demands
+
         def _drain_and_alloc_storage_hit():
-            deferred_ahead = False
-            if defer_read_staging and log_metrics:
-                # The existing owner table also owns cancellation/reset. No
-                # separate queue may retain a retired request or its buffers.
-                for info in tuple(self.ongoing_prefetch.values()):
-                    operation = info.operation
-                    if getattr(operation, "host_allocation_deferred", False):
-                        if not _try_alloc_storage_hit(operation):
-                            if operation.host_allocation_deferred == "io":
-                                deferred_ahead = True
-                                break
+            # Use the existing owner table for parked local hits, including
+            # cancellation/reset. The detach drain must not stage reads.
+            local_hits = (
+                [
+                    info.operation
+                    for info in self.ongoing_prefetch.values()
+                    if getattr(info.operation, "host_allocation_deferred", False)
+                ]
+                if defer_read_staging and log_metrics
+                else []
+            )
             # Parked hits first (FIFO fairness with retries; buffer only).
             if buffer_mode:
                 parked = self.buffer_pipeline.pending_hit_allocs
@@ -3475,10 +3479,13 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.revoke_pending_prefetch(request)
                     continue
                 self._account_prefetch_outcome(operation, revoked=False)
+                if defer_read_staging:
+                    local_hits.append(operation)
+                    continue
                 # A parked hit keeps its turn: a newer hit must not take the
                 # staging or anchor budget the parked head is waiting for.
-                parked_ahead = deferred_ahead or (
-                    buffer_mode and bool(self.buffer_pipeline.pending_hit_allocs)
+                parked_ahead = buffer_mode and bool(
+                    self.buffer_pipeline.pending_hit_allocs
                 )
                 if parked_ahead:
                     operation.host_allocation_deferred = "io"
@@ -3487,8 +3494,22 @@ class UnifiedRadixCache(BasePrefixCache):
                     self._prefetch_outcome_stats["declined_rate_limited"] += 1
                     if buffer_mode:
                         self.buffer_pipeline.pending_hit_allocs.append(operation)
-                    else:
-                        deferred_ahead = operation.host_allocation_deferred == "io"
+
+            # Preserve order within each class and leave already-staged reads
+            # alone. A hint with a joined request counts as demand.
+            if len(local_hits) > 1:
+                local_hits.sort(key=_is_speculative)
+            io_busy = False
+            for operation in local_hits:
+                was_parked = getattr(operation, "host_allocation_deferred", False)
+                if io_busy:
+                    operation.host_allocation_deferred = "io"
+                elif _try_alloc_storage_hit(operation):
+                    continue
+                else:
+                    io_busy = operation.host_allocation_deferred == "io"
+                if not was_parked:
+                    self._prefetch_outcome_stats["declined_rate_limited"] += 1
 
         def _drain_ack_prefetch():
             for ack in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):

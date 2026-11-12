@@ -479,6 +479,7 @@ class StorageCacheReads:
 
     def _observe_publication(self, job):
         job.operation.native_quiescent = False
+        job.operation.native_demands = job.demands
         job.operation.native_on_publish = lambda node: self._published(job, node)
         if not job.borrowed:
             job.operation.native_allocate_host = lambda count: self._allocate_host(

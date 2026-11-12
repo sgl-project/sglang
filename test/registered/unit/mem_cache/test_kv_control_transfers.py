@@ -820,6 +820,77 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 assert_retired(cache, service)
                 cache.sanity_check()
 
+    def test_demand_stages_before_speculation_without_reordering_issued_reads(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            scopes = [cache_fixtures.target(range(i, i + 4)) for i in (1, 5, 9, 13, 17)]
+            self._cold_scopes(owner, scopes)
+            cc = cache.cache_controller
+            reads = service.control.executor.storage_reads
+            first, staged, joined, demand = [
+                CacheRequestHandle(name, 0)
+                for name in ("first", "staged", "joined", "demand")
+            ]
+            entered, release = threading.Event(), threading.Event()
+            calls = []
+            get = cc.page_get_func
+
+            def observe_get(operation, *args, **kwargs):
+                calls.append(operation.handle)
+                if operation.handle == first:
+                    entered.set()
+                    assert release.wait(5)
+                return get(operation, *args, **kwargs)
+
+            def ready(condition):
+                cache.drain_storage_control_queues()
+                return condition()
+
+            def parked(handle):
+                info = cache.ongoing_prefetch.get(handle)
+                return info is not None and getattr(
+                    info.operation, "host_allocation_deferred", None
+                )
+
+            try:
+                with (
+                    patch.object(cc, "page_get_func", observe_get),
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    self._ordinary_prefetch(cache, service, scopes[0], first)
+                    wait_for(service, lambda: ready(entered.is_set))
+                    self._ordinary_prefetch(cache, service, scopes[1], staged)
+                    wait_for(
+                        service, lambda: ready(lambda: cc.prefetch_buffer.qsize() == 1)
+                    )
+                    hint = self._restore(service, scopes[2], "speculation")
+                    hint_handle = reads.interests[hint.ref.operation_id].job.handle
+                    wait_for(service, lambda: ready(lambda: parked(hint_handle)))
+                    shared = self._restore(service, scopes[3], "soon-demand")
+                    shared_handle = reads.interests[shared.ref.operation_id].job.handle
+                    wait_for(service, lambda: ready(lambda: parked(shared_handle)))
+                    self._ordinary_prefetch(cache, service, scopes[3], joined)
+                    self.assertEqual(reads.demands[joined].job.handle, shared_handle)
+                    self._ordinary_prefetch(cache, service, scopes[4], demand)
+                    wait_for(service, lambda: ready(lambda: parked(demand)))
+                    release.set()
+                    for request in (first, staged, joined, demand):
+                        self.assertEqual(
+                            self._consume_ordinary_prefetch(cache, service, request),
+                            (4, 0),
+                        )
+                    self.assertEqual(wait(service, hint).status, Status.COMPLETED)
+                    self.assertEqual(wait(service, shared).status, Status.COMPLETED)
+            finally:
+                release.set()
+                for request in (first, staged, joined, demand):
+                    cache.release_aborted_request(request)
+            assert_retired(cache, service)
+            self.assertEqual(calls, [first, staged, shared_handle, demand, hint_handle])
+
     def test_cancelled_queued_read_drains_before_later_storage_io(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
