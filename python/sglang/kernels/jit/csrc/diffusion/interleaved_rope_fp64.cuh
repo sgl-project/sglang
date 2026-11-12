@@ -23,6 +23,43 @@ constexpr uint32_t kMaxGrid = 65535;
 template <typename T>
 SGL_DEVICE device::AlignedVector<T, 2> rotate_pair(device::AlignedVector<T, 2> input, double cos, double sin) {
   static_assert(std::is_same_v<T, bf16_t>);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+  // Directed FP32 bounds enclose each separately rounded FP64 operation.
+  // Matching finite BF16 endpoint bits certify the original two-stage rounding;
+  // ambiguous boundaries and nonfinite values use the FP64 expression below.
+  const float a = static_cast<float>(input[0]);
+  const float b = static_cast<float>(input[1]);
+  const float cl = __double2float_rd(cos), ch = __double2float_ru(cos);
+  const float sl = __double2float_rd(sin), sh = __double2float_ru(sin);
+  if (isfinite(a) && isfinite(b) && isfinite(cl) && isfinite(ch) && isfinite(sl) && isfinite(sh)) {
+    device::AlignedVector<T, 2> output;
+    if (a == 0.0f && b == 0.0f) {
+      // Finite products of signed zeros preserve their signs at either precision.
+      output[0] = static_cast<T>(__fsub_rn(__fmul_rn(a, cl), __fmul_rn(b, sl)));
+      output[1] = static_cast<T>(__fadd_rn(__fmul_rn(a, sl), __fmul_rn(b, cl)));
+      return output;
+    }
+    const float acl = __fmul_rd(a, a < 0 ? ch : cl);
+    const float ach = __fmul_ru(a, a < 0 ? cl : ch);
+    const float asl = __fmul_rd(a, a < 0 ? sh : sl);
+    const float ash = __fmul_ru(a, a < 0 ? sl : sh);
+    const float bcl = __fmul_rd(b, b < 0 ? ch : cl);
+    const float bch = __fmul_ru(b, b < 0 ? cl : ch);
+    const float bsl = __fmul_rd(b, b < 0 ? sh : sl);
+    const float bsh = __fmul_ru(b, b < 0 ? sl : sh);
+    const T lo0 = static_cast<T>(__fsub_rd(acl, bsh));
+    const T hi0 = static_cast<T>(__fsub_ru(ach, bsl));
+    const T lo1 = static_cast<T>(__fadd_rd(asl, bcl));
+    const T hi1 = static_cast<T>(__fadd_ru(ash, bch));
+    const auto bits0 = __bfloat16_as_ushort(lo0), bits1 = __bfloat16_as_ushort(lo1);
+    if (bits0 == __bfloat16_as_ushort(hi0) && bits1 == __bfloat16_as_ushort(hi1) && (bits0 & 0x7f80) != 0x7f80 &&
+        (bits1 & 0x7f80) != 0x7f80) {
+      output[0] = lo0;
+      output[1] = lo1;
+      return output;
+    }
+  }
+#endif
   const double x1 = static_cast<double>(input[0]);
   const double x2 = static_cast<double>(input[1]);
   const double x1_cos = __dmul_rn(x1, cos);

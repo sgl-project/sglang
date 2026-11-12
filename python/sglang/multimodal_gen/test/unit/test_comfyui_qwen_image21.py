@@ -45,6 +45,11 @@ def test_checkpoint_spec_splits_fused_gate_up_and_int8_scales() -> None:
         (f"{mlp}.gate_up.weight", gate_up),
         (f"{mlp}.gate_up.weight_scale", scale),
         (f"{mlp}.gate_up.comfy_quant", torch.zeros(3)),
+        # Turbo files carry per-layer attention kernel hints the worker ignores.
+        (
+            "transformer_blocks.1.attn.comfy_attention.config",
+            torch.zeros(3, dtype=torch.uint8),
+        ),
         ("img_in.weight", torch.ones(1)),
     ]
     spec = get_comfyui_checkpoint_spec("QwenImage21Pipeline")
@@ -209,3 +214,37 @@ def test_comfyui_stages_and_cfg_parallel_rejection(monkeypatch) -> None:
     ]
     with pytest.raises(ValueError, match="enable_cfg_parallel"):
         create(pipe, SimpleNamespace(enable_cfg_parallel=True))
+
+
+def test_odd_latent_sides_survive_the_rounded_request_size(monkeypatch) -> None:
+    """ComfyUI latents can have odd sides (1776 px -> 111 rows) while the request
+    size is rounded to 32 px (1760); the final reshape must use the latent's own
+    sides, not the rounded request size."""
+    from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
+        QwenImage21PipelineConfig,
+    )
+
+    monkeypatch.setattr(stage_mod, "_cache_fits", lambda need, device: True)
+    x = torch.randn(1, 64, 3, 2)
+    req = SimpleNamespace(
+        extra={
+            "comfyui_session_id": "r:odd",
+            "comfyui_cond_key": "pos",
+            COND_EXTRA_KEY: dict(image_slots=[], ref_latents=[], final_sigma=None),
+        },
+        latents=x.clone(),
+        timesteps=torch.tensor([500.0]),
+        prompt_embeds=[torch.randn(1, 5, 16)],
+        height=32,
+        width=32,
+    )
+    bind_comfyui_session(req)
+    try:
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(dit_config=_DIT_CONFIG)
+        )
+        req = stage_mod.QwenImage21ComfyUIConditionStage().forward(req, server_args)
+    finally:
+        release_comfyui_session("r:odd")
+    out = QwenImage21PipelineConfig().post_denoising_loop(req.latents, req)
+    assert torch.equal(out[:, :, 0], x)

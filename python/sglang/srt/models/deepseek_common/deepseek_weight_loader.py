@@ -23,11 +23,18 @@ import torch.nn as nn
 import tqdm
 from transformers import PretrainedConfig
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsLinearMethod,
+)
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsWNA16,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
@@ -62,9 +69,11 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
+    fuse_qkv_a_proj_tensors,
     is_wint4afp8_or_wint4a16_config,
 )
-from sglang.srt.utils import bind_or_assign, log_info_on_rank0
+from sglang.srt.models.utils import bind_or_assign
+from sglang.srt.utils import log_info_on_rank0
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
@@ -510,22 +519,12 @@ class DeepseekV2WeightLoaderMixin:
                                 q_a_proj_weight = cached_a_proj[q_a_proj_name]
                                 kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
 
-                                if q_a_proj_weight.shape == torch.Size(
-                                    []
-                                ) and kv_a_proj_weight.shape == torch.Size([]):
-                                    fused_weight = q_a_proj_weight
-                                else:
-                                    cat_dim = 0
-                                    if self.quant_config is not None and (
-                                        self.quant_config.get_name() == "awq"
-                                        or self.quant_config.get_name() == "awq_marlin"
-                                        or self.quant_config.get_name() == "moe_wna16"
-                                    ):
-                                        cat_dim = 1
-
-                                    fused_weight = torch.cat(
-                                        [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
-                                    )
+                                fused_weight = fuse_qkv_a_proj_tensors(
+                                    name,
+                                    q_a=q_a_proj_weight,
+                                    kv_a=kv_a_proj_weight,
+                                    quant_config=self.quant_config,
+                                )
 
                                 param_name = (
                                     name.replace(
@@ -692,6 +691,21 @@ class DeepseekV2WeightLoaderMixin:
                     raise ValueError(
                         "AWQ dequantize function is not supported for the current device"
                     )
+            elif isinstance(
+                self_attn.kv_b_proj.quant_method, CompressedTensorsLinearMethod
+            ) and isinstance(self_attn.kv_b_proj.scheme, CompressedTensorsWNA16):
+                # Still in the checkpoint layout: the kernel repack runs after
+                # load_weights.
+                w = self_attn.kv_b_proj.scheme.dequantize_weight(self_attn.kv_b_proj)
+                # Once repacked it cannot be read back, so an online update's
+                # post_load_weights could not rebuild w_kc/w_vc. Refuse updates
+                # before they write any weight.
+                self_attn.kv_b_proj._derived_weight_cache_error = (
+                    "Online weight updates are not supported for compressed-"
+                    "tensors WNA16 MLA checkpoints: the absorbed w_kc/w_vc "
+                    "weights are built from kv_b_proj before its kernel repack "
+                    "and cannot be rebuilt afterwards."
+                )
             else:
                 w = self_attn.kv_b_proj.weight
 
@@ -750,7 +764,7 @@ class DeepseekV2WeightLoaderMixin:
                     ):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                            and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                            and (_is_musa or current_arch().is_sm(9))
                             and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                         ):
                             block_scale = weight_scale
