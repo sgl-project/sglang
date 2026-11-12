@@ -20,6 +20,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.layernorm_sp import is_muse_spark_architecture
 from sglang.srt.layers.logits_processor import (
     LogitsProcessor,
     LogitsProcessorOutput,
@@ -457,6 +458,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
+        self._draft_compact_page_size = self._compact_draft_alignment_for_backend(
+            self.page_size,
+            bundle.resolved_attention_backend,
+            target_worker.model_runner.model_config.hf_config.architectures,
+        )
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
         self.selector = self.draft_model.candidate_selector
@@ -1267,13 +1273,31 @@ class DFlashWorkerV2(BaseSpecWorker):
             context="DFLASH req_to_token segment gather",
         )
 
+    @staticmethod
+    def _compact_draft_alignment_for_backend(
+        page_size: int, backend: str, architectures: Optional[List[str]] = None
+    ) -> int:
+        # Muse Spark on ROCm: Triton reads individual token slots, so the compact
+        # suffix need not start at a physical page boundary. Keep the 16-token
+        # logical origin that defines the existing draft softmax and reduction
+        # partitions. Other models and backends keep the page alignment.
+        if (
+            torch.version.hip is not None
+            and architectures
+            and is_muse_spark_architecture(architectures[0])
+            and backend == "triton"
+            and page_size in (32, 64, 128)
+        ):
+            return 16
+        return page_size
+
     def _compute_compact_draft_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
         assert self.draft_window_size is not None
         visible_lens = torch.clamp(
             seq_lens.to(dtype=torch.int32, device=self.device),
             max=int(self.draft_window_size),
         )
-        if self.page_size <= 1:
+        if self._draft_compact_page_size <= 1:
             return visible_lens
 
         # Paged FA backends derive the page table from local token positions, so the
@@ -1282,7 +1306,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_i64 = seq_lens.to(torch.int64)
         visible_lens_i64 = visible_lens.to(torch.int64)
         visible_start = seq_lens_i64 - visible_lens_i64
-        aligned_start = visible_start - torch.remainder(visible_start, self.page_size)
+        aligned_start = visible_start - torch.remainder(
+            visible_start, self._draft_compact_page_size
+        )
         return (seq_lens_i64 - aligned_start).to(torch.int32)
 
     def _compute_compact_draft_seq_lens_host(
@@ -1298,7 +1324,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         """
         assert self.draft_window_size is not None
         bound = int(self.draft_window_size) + (
-            self.page_size if self.page_size > 1 else 0
+            self._draft_compact_page_size if self._draft_compact_page_size > 1 else 0
         )
         lens = host_seq_lens.to(dtype=torch.int64, device="cpu")
         out.copy_(torch.clamp(lens, max=bound).to(torch.int32))
@@ -1321,7 +1347,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Compact device lengths never exceed the window plus one page.
             out.fill_(
                 int(self.draft_window_size)
-                + (self.page_size if self.page_size > 1 else 0)
+                + (
+                    self._draft_compact_page_size
+                    if self._draft_compact_page_size > 1
+                    else 0
+                )
             )
 
     def _rebuild_compact_draft_cache(
