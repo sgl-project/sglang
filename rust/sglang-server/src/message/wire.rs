@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use sglang_api_types::api::v1 as api;
 
 use super::multimodal::{MediaHints, MmDataInput, MmItem};
+use super::request::GenerateRequest;
 use super::sampling::{CustomParamValue, SamplingParams, WatermarkRequestConfig};
 use super::types::{OneOrMany, TokenIds};
 use crate::utils::error::Error;
@@ -86,7 +87,10 @@ pub fn media_item(item: api::MediaItem) -> Result<MmItem, Error> {
         // `load_image` reduces an item to `.url` the same way).
         Some(Value::Ref(r)) if !r.url.is_empty() => Ok(MmItem::Ref {
             url: r.url,
-            hints: MediaHints { fps: r.fps },
+            hints: MediaHints {
+                fps: r.fps,
+                detail: r.detail,
+            },
         }),
         Some(Value::Ref(_)) => Err(Error::Validation(
             "a multimodal item object needs a non-empty `url`".into(),
@@ -293,6 +297,57 @@ pub fn fill_preferred_sampling(
     serde_json::from_value(body["sampling_params"].take()).map_err(|e| e.to_string())
 }
 
+/// Which requests of a `/generate` body sent their own `max_new_tokens`, read
+/// before any launch-time fill: a single (or absent) `sampling_params` object
+/// answers for every item, a list answers per object. Only a value the client
+/// sent is checked against the context window; see
+/// [`GenerateRequest::max_new_tokens_defaulted`].
+#[derive(Debug)]
+pub enum ClientMaxNewTokens {
+    One(bool),
+    Many(Vec<bool>),
+}
+
+impl ClientMaxNewTokens {
+    /// From a JSON body: a present key counts, even an explicit null.
+    pub fn of_json(body: &serde_json::Value) -> Self {
+        let sent = |params: &serde_json::Value| params.get("max_new_tokens").is_some();
+        match body.get("sampling_params") {
+            Some(serde_json::Value::Array(items)) => Self::Many(items.iter().map(sent).collect()),
+            Some(params) => Self::One(sent(params)),
+            None => Self::One(false),
+        }
+    }
+
+    /// From a protobuf request, which has no null: a set field counts.
+    pub fn of_proto(params: Option<&api::SamplingParamsOrList>) -> Self {
+        use api::sampling_params_or_list::Value;
+        let sent = |params: &api::SamplingParams| params.max_new_tokens.is_some();
+        match params.and_then(|params| params.value.as_ref()) {
+            Some(Value::Many(list)) => Self::Many(list.items.iter().map(sent).collect()),
+            Some(Value::One(params)) => Self::One(sent(params)),
+            None => Self::One(false),
+        }
+    }
+
+    /// Mark the requests `into_requests` fanned the body out to, which has
+    /// matched a list's length to the batch.
+    pub fn mark(&self, requests: &mut [GenerateRequest]) {
+        match self {
+            Self::One(sent) => {
+                for request in requests {
+                    request.max_new_tokens_defaulted = !sent;
+                }
+            }
+            Self::Many(sent) => {
+                for (request, sent) in requests.iter_mut().zip(sent) {
+                    request.max_new_tokens_defaulted = !sent;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,7 +448,10 @@ mod tests {
             conv(r#"{"url": "u", "detail": "high", "fps": 2.0}"#),
             MmDataInput::One(MmItem::Ref {
                 url: "u".into(),
-                hints: MediaHints { fps: Some(2.0) },
+                hints: MediaHints {
+                    fps: Some(2.0),
+                    detail: Some("high".into()),
+                },
             })
         );
         assert_eq!(

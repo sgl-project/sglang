@@ -1,9 +1,9 @@
 ---
 title: Wan-Animate-2
 tag: NEW
-description: Run Wan-Animate-2 character animation (reference image + reference video) with SGLang Diffusion.
+description: Run Wan-Animate-2 character animation (reference image + reference video) with SGLang Diffusion, with the base or the distilled checkpoint.
 metatags:
-    description: "Deploy and use the Wan2.2-Animate-2 14B character-animation model with SGLang Diffusion: reference-image + reference-video conditioning, single-expert native pipeline, config-file and /v1/videos invocation, and multi-GPU presets."
+    description: "Deploy and use the Wan2.2-Animate-2 14B character-animation model (base and distilled checkpoints) with SGLang Diffusion: reference-image + reference-video conditioning, single-expert native pipeline, config-file and /v1/videos invocation, and multi-GPU presets."
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
@@ -18,7 +18,9 @@ import { config } from '/src/snippets/configs/Wan/wan-animate-2.jsx';
 ## 1. Quick start
 
 Follow the [installation guide](/docs/sglang-diffusion/installation) on Linux with
-NVIDIA CUDA, then select a verified recipe.
+NVIDIA CUDA, then select a verified recipe. **Checkpoint weights** under **Setup**
+switches between the base and the distilled checkpoint; the server flags and the
+Request command follow that choice.
 
 <Deployment config={config} />
 
@@ -36,17 +38,38 @@ image-only conditioning of the other Wan2.2 checkpoints, it animates a **referen
 image** so that it follows the motion of a **reference video**, producing a new clip
 of that subject performing the reference video's motion.
 
-Use **`Wan-AI/Wan2.2-Animate-2-14B-Diffusers`** as `--model-path`. The distilled
-checkpoint (`Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers`, `log_scale=-1.3`,
-10 steps, no CFG) is not supported in this release.
+Two checkpoints are supported; select one under **Checkpoint weights** or pass it
+as `--model-path`:
+
+| Variant | `--model-path` | Steps | `guidance_scale` | `log_scale` | CFG parallel |
+| --- | --- | ---: | ---: | ---: | --- |
+| Base | `Wan-AI/Wan2.2-Animate-2-14B-Diffusers` | `40` | `3.0` | `0` | yes |
+| Distilled | `Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers` | `10` | `1.0` | `-1.3` | rejected at startup |
+
+The distilled checkpoint differs in its transformer weights, in the
+attention-score bias `log_scale` (the official distillation value, applied by
+default because the published `transformer/config.json` carries no such key) and
+in the two defaults above. The distilled checkpoint is sampled with DPM-Solver++
+2M on the official sigma grid, like the base checkpoint: that is what the model
+authors' command-line implementation runs for both checkpoints. The
+`FlowMatchEulerDiscreteScheduler` named in the distilled repo's
+`scheduler/scheduler_config.json` is read only by the Diffusers pipeline (which
+also omits the `log_scale` bias) and is not used here; on the same seed it lands
+1.8 dB farther from the authors' output. `--scheduler-class-override` is ignored
+for this checkpoint and logged. A local directory routes by the pipeline class in
+its `modular_model_index.json` (`WanAnimate2DistilledModularPipeline` /
+`WanAnimate2ModularPipeline`) or by a `distill` token in the directory name (in a
+path that also contains `wan2.2-animate-2` or `wan_animate_2`); the detectors are
+checked in registration order, the distilled one first, so either signal selects
+the distilled entry. `--model-id Wan2.2-Animate-2-14B-Distilled-Diffusers` pins
+the variant explicitly.
 
 Unlike the A14B T2V/I2V checkpoints, Wan-Animate-2 is a **single-expert** model:
-it has one `guidance_scale` (default `3.0`), no low-noise expert
-(`guidance_scale_2`) and no boundary switching. Diffusers >= 0.40.0 serves
-Wan-Animate-2 as a modular pipeline (`WanAnimate2ModularPipeline`); SGLang
-implements the model natively and loads the same
-`Wan-AI/Wan2.2-Animate-2-14B-Diffusers` checkpoint. There is no diffusers backend
-fallback.
+it has one `guidance_scale` (see the variant table), no low-noise expert
+(`guidance_scale_2`) and no boundary switching. Diffusers >= 0.40.0
+serves Wan-Animate-2 as a modular pipeline (`WanAnimate2ModularPipeline`); SGLang
+implements the model natively and loads the same checkpoints. There is no diffusers
+backend fallback.
 
 <Warning>
 Wan-Animate-2 is served through the native `WanAnimate2Pipeline`, selected
@@ -77,13 +100,19 @@ video URLs use SGLang's shared media loader before decoding, without a disk cach
 
 | Parameter | Default | Notes |
 | --- | --- | --- |
-| Resolution (`width`×`height`, the API's `size`) | `640`×`800` | A pixel-area budget, not the output dimensions: the frame keeps the reference image's aspect ratio and is the largest 16-aligned canvas with at most `width × height` pixels (see **Output resolution** below). `720`×`1280` is the larger supported budget. |
+| Resolution (`width`×`height`, the API's `size`) | `640`×`800` | A pixel-area budget, not the output dimensions: the frame keeps the reference image's aspect ratio and is the largest 16-aligned canvas with at most `width × height` pixels (see **Output resolution** below). `720`×`1280` is the larger budget. |
 | `clip_len` | `37` | Per-clip denoising chunk length; must be `4k+1` (VAE temporal stride 4), e.g. `37`, `65`, `81`. Other values are rounded to `4k+1` with the same `k` and the rounding is logged (`40` becomes `41`; `38` and `39` become `37`); values below `5` are rejected. |
 | `fps` | `16` | The reference video is resampled to this rate and the output MP4 is written at it; duration is preserved. |
-| `num_inference_steps` | `40` | Fewer steps (e.g. `20`) run faster. |
-| `guidance_scale` | `3.0` | Single expert; there is no `guidance_scale_2`. |
+| `num_inference_steps` | `40` (`10` for the distilled checkpoint) | Fewer steps (e.g. `20`) run faster on the base checkpoint. |
+| `guidance_scale` | `3.0` (`1.0` for the distilled checkpoint) | Single expert; there is no `guidance_scale_2`. The distilled checkpoint samples at `1.0` only (one branch per step); a request with any other value is rejected at admission (HTTP 400 online, `ValueError` offline), see [section 6](#6-troubleshooting). |
 | `prompt_ref` | `人物动作的参考视频` ("reference video of the character's motion") | Text for the reference-video branch. The official demo conditions that branch on this fixed description of the reference video rather than on the scene prompt; leave it unchanged unless reproducing a different reference setup. |
 | `enable_audio` | `true` | Keep the reference video's audio track on the output (see **Audio** below). Per request, like `clip_len`. |
+
+The distilled checkpoint inherits every other default. The official distilled demo
+defaults to `clip_len` 81, `size` 720×1280 and `fps` 24; the distilled rows in
+[section 5.3](#5-3-distilled-checkpoint-on-gb200) were measured at `clip_len` 37
+and `size` 640×800. `clip_len` 81 at the 640×800 budget runs on one 189 GB GPU at
+about 230 s.
 
 **Output length.** The output has as many frames as the (resampled) reference
 video, not `clip_len`. The video is generated clip by clip with `clip_len` frames
@@ -96,8 +125,9 @@ it unset.
 **Output resolution.** `width`×`height` (the API's `size`) is a pixel-area budget,
 not the output dimensions. The reference image's aspect ratio is kept, the frame is
 the largest canvas with at most `width × height` pixels whose sides are multiples of
-16, and the reference image and the driving-video frames are letterboxed onto it;
-the output MP4 has the canvas size. At the default `640`×`800` (512,000 pixels) a
+16, and the reference image is letterboxed onto it; the driving-video frames are
+fitted the same way to their own canvas at the same budget. The output MP4 has
+the canvas size. At the default `640`×`800` (512,000 pixels) a
 9:16 reference gives `528`×`944`, a 1:1 reference gives `704`×`704`, and only a 4:5
 reference gives exactly `640`×`800`. To obtain a specific output size, request a
 budget with the same aspect ratio as the reference image (for a 9:16 image,
@@ -163,6 +193,12 @@ For two B300 GPUs, set **GPUs / node** to **2** and **Memory policy** to **CFG p
 **Auto** CFG parallelism enables the measured two-GPU recipe. The RTX 4090 entry
 selects its single-GPU memory recipe.
 
+With **Checkpoint weights** set to the distilled checkpoint, CFG parallelism is
+off (one branch per step), **Auto** topology resolves to Ulysses across the GPUs
+and **Auto** text encoder to CPU offload, the policy of the measured GB200
+recipes (1, 2 and 4 GPUs, resident or DiT layerwise offload, Ulysses or tensor
+parallel); see the [distilled benchmark](#5-3-distilled-checkpoint-on-gb200).
+
 Routing to the native Wan-Animate-2 pipeline is automatic from the checkpoint's
 `model_index.json` (`_class_name: WanAnimate2Pipeline`); pass
 `--pipeline-class-name WanAnimate2Pipeline` only for a local mirror that lacks
@@ -176,7 +212,7 @@ acceleration features and their runtime requirements.
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use.
 - `--tp-size {TP_SIZE}`: Tensor parallelism size.
 - `--ulysses-degree {ULYSSES_DEGREE}`: DeepSpeed-Ulysses-style sequence parallelism (USP). The **ring degree must be 1** for this model; `--ring-degree` greater than 1 is rejected with `NotImplementedError`. Combines with `--tp-size`: Ulysses splits the TP-local attention heads, so `--tp-size` must divide the 40 heads and `--ulysses-degree` must divide the per-shard count (see [section 3.3](#3-3-multi-gpu-and-memory-presets)).
-- `--enable-cfg-parallel`: Split the guided and unguided branches across GPUs.
+- `--enable-cfg-parallel`: Split the guided and unguided branches across GPUs. Base checkpoint only: the distilled checkpoint has one branch and rejects the flag at startup.
 - `--text-encoder-cpu-offload`: CPU-offload the text encoder to save memory; it is moved to the GPU for the one encode per request.
 
 ### 3.3 Multi-GPU and memory presets
@@ -194,6 +230,22 @@ acceleration features and their runtime requirements.
 | FSDP sharding | `--use-fsdp-inference` is **not supported** | Rejected at startup, before any weights load; use `--tp-size` to shard the DiT or `--dit-layerwise-offload` to cut peak memory. |
 | 4+ GPUs, TP x Ulysses | `--num-gpus 4 --tp-size 2 --ulysses-degree 2` | Tensor parallel across attention heads, Ulysses across the TP-local heads: `--tp-size` must divide the 40 heads and `--ulysses-degree` the per-shard count (`40 / tp`). The memory-leaning 4-GPU layout: about 33 GiB peak per GPU (25 GiB torch reserved), the lowest 4-GPU peak after `--tp-size 4`, at about 13 percent slower than CFG-parallel x tensor parallel and 27 percent slower than the default CFG-parallel x Ulysses layout; use the default for speed and this layout for memory. CFG-parallel can be added on top with twice the GPUs (`--num-gpus 8 --enable-cfg-parallel --tp-size 2 --ulysses-degree 2`). |
 
+The distilled checkpoint (`Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers`) runs
+one branch per step, so the CFG-parallel rows above do not apply to it. The rows
+below are the picker's distilled recipes, all measured with
+`--text-encoder-cpu-offload` (its **Auto** text-encoder policy) on 189 GB GB200
+GPUs; the 80 to 96 GB advice is inferred from their peaks. The measurements, with
+the request-phase and whole-run peaks defined, are in
+[section 5.3](#5-3-distilled-checkpoint-on-gb200).
+
+| Target | Recommended server flags | Notes |
+| --- | --- | --- |
+| Distilled, 1 GPU, no offload, needs about 96 GiB over the whole run (69.5 GiB during the request) | *(no extra flags)* | DiT resident, the fastest single-GPU form. The whole-run peak sets the 96 GiB figure: it includes the server warmup's synthetic requests, one of which runs at the largest supported budget, 720×1280. |
+| Distilled, 1 GPU, 80 to 96 GB | `--dit-layerwise-offload --layerwise-offload-components transformer` | Streams the DiT layer by layer at the same speed, with the output identical to the resident DiT, at about 40 GiB peak per GPU during the request (65 GiB over the whole run) versus 69.5 GiB resident. |
+| Distilled, 2 GPUs | `--num-gpus 2 --ulysses-degree 2` | The fastest 2-GPU layout, 1.73x one GPU; the automatic 2-GPU assignment resolves to it. On 80 GB cards add `--dit-layerwise-offload --layerwise-offload-components transformer` (same speed, identical output); `--tp-size 2` is the resident lower-memory alternative. |
+| Distilled, 4 GPUs | `--num-gpus 4 --ulysses-degree 4` | The fastest 4-GPU layout, 2.69x one GPU; the automatic 4-GPU assignment resolves to it. Lower-memory alternatives, fastest first: layerwise offload on top (identical output), `--tp-size 2 --ulysses-degree 2` and `--tp-size 4`. |
+| Distilled, CFG parallel | `--enable-cfg-parallel` / `--cfg-parallel-size 2` are **rejected** | The server refuses to start with `Wan_Animate_2_14B_Distilled_Config does not support CFG parallelism`: the distilled model runs one branch per step, so there is nothing to split; use `--ulysses-degree` or `--tp-size`. |
+
 ## 4. Model Invocation
 
 ### 4.1 Generate offline with a config file
@@ -208,8 +260,6 @@ video_path: /path/to/reference_video.mp4
 clip_len: 37
 height: 800
 width: 640
-num_inference_steps: 40
-guidance_scale: 3.0
 fps: 16
 seed: 42
 ```
@@ -224,7 +274,11 @@ sglang generate \
 
 Any value in the YAML can also be passed as a CLI flag (for example
 `--image-path`, `--video-path`, `--num-inference-steps`, `--guidance-scale`,
-`--seed`).
+`--seed`). The examples on this page set neither `num_inference_steps` nor
+`guidance_scale`: each checkpoint takes the defaults of the variant table in
+[section 2](#2-model-capabilities); set them only to override the defaults (the
+distilled checkpoint accepts `guidance_scale` 1.0 only). The picker's Request
+command sets both for the selected checkpoint.
 
 ### 4.2 Serve and request over HTTP
 
@@ -240,8 +294,6 @@ job_id=$(curl -sS -X POST http://127.0.0.1:30010/v1/videos \
   --form-string "video_path=/path/to/reference_video.mp4" \
   --form-string "clip_len=37" \
   --form-string "size=640x800" \
-  --form-string "num_inference_steps=40" \
-  --form-string "guidance_scale=3.0" \
   --form-string "fps=16" \
   --form-string "seed=42" \
   --form-string "enable_audio=false" \
@@ -275,7 +327,6 @@ video = client.videos.create(
     extra_body={
         "video_path": "/path/to/reference_video.mp4",
         "clip_len": 37,
-        "guidance_scale": 3.0,
         "enable_audio": False,  # silent output; the reference video's audio is kept by default
     },
 )
@@ -299,6 +350,9 @@ For DiT-only offload, choose **DiT layerwise offload** in the picker instead.
 On RTX 4090, prefix the command with `PYTORCH_ALLOC_CONF=expandable_segments:True`
 as shown in its hardware preset; memory mode alone OOMed in the tested workload.
 Lowering `clip_len` also reduces memory, but shortens each clip's temporal context.
+The distilled checkpoint has the same DiT, so the same flags apply with the same
+effect; its layerwise-offload rows are in
+[section 5.3](#5-3-distilled-checkpoint-on-gb200).
 
 ## 5. Benchmark
 
@@ -420,7 +474,63 @@ synchronizes the device so the per-stage timings are accurate.
   </Tab>
 </Tabs>
 
-### 5.3 Native regression coverage
+### 5.3 Distilled checkpoint on GB200
+
+`Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers` on the GB200 node of
+[section 5.2](#5-2-gb200-reference-benchmark) with the same inputs at the distilled
+defaults (10 steps, `guidance_scale` 1.0, seed 123, `clip_len` 37, `size` 640x800,
+`fps` 30). The rows were measured through the server, not through
+`sglang generate`, so the two GB200 tables are not like for like: the command
+below plus the row's flags, then two identical `/v1/videos` requests per server
+(the request of [section 4.2](#4-2-serve-and-request-over-http) with the benchmark
+inputs). These rows are the picker's verified GB200 recipes.
+
+```bash Command
+sglang serve \
+  --model-path Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers \
+  --num-gpus 1 --text-encoder-cpu-offload --warmup-mode server \
+  --port 30010
+```
+
+E2E is the server's `Pixel data generated` time for the steady state, the second
+identical request on the same server. Peak is the `nvidia-smi` maximum over ranks
+during the request.
+
+**Result** (peak memory per GPU from `nvidia-smi`):
+
+| Config | GPUs | Extra flags | E2E (s) | Peak per GPU (GiB) |
+| --- | ---: | --- | ---: | ---: |
+| 1 GPU, DiT resident | 1 | none | 150.2 | 69.5 |
+| 1 GPU, layerwise DiT offload | 1 | `--dit-layerwise-offload --layerwise-offload-components transformer` | 150.0 | 39.7 |
+| 2 GPUs, Ulysses (= framework default) | 2 | `--ulysses-degree 2` | 87.0 | 60.1 |
+| 2 GPUs, Ulysses, layerwise DiT offload | 2 | `--ulysses-degree 2 --dit-layerwise-offload --layerwise-offload-components transformer` | 86.3 | 31.4 |
+| 2 GPUs, tensor parallel | 2 | `--tp-size 2` | 97.1 | 40.0 |
+| 4 GPUs, Ulysses (= framework default) | 4 | `--ulysses-degree 4` | 55.8 | 51.0 |
+| 4 GPUs, Ulysses, layerwise DiT offload | 4 | `--ulysses-degree 4 --dit-layerwise-offload --layerwise-offload-components transformer` | 58.0 | 21.5 |
+| 4 GPUs, tensor parallel x Ulysses | 4 | `--tp-size 2 --ulysses-degree 2` | 59.3 | 35.3 |
+| 4 GPUs, tensor parallel | 4 | `--tp-size 4` | 64.1 | 30.4 |
+
+Whole-run peaks, which include the server warmup's synthetic requests (one at the
+largest supported budget, 720x1280, to decide whether the DiT stays resident), are
+higher: 95.5 / 64.8 / 72.3 / 41.9 / 47.3 / 57.4 / 27.3 / 38.9 / 37.8 GiB in row order.
+
+The first request after the server warmup adds a one-time flex-attention autotune
+when its frame geometry differs from the warmup shapes (about 16 s on 1 GPU, 12 to
+13 s on 2, 9 s on 4). With one branch per step there is no CFG split to
+parallelize, so Ulysses is the distilled
+checkpoint's fastest layout: 1.73x faster than one GPU on 2 GPUs and 2.69x on 4.
+The framework default for `--num-gpus 2` and `--num-gpus 4` resolves to the same
+Ulysses layout and produces the same output; the explicit flag pins it. Layerwise
+DiT offload costs about 2 s and leaves the output identical. Tensor parallel x
+Ulysses is the memory-leaning 4-GPU layout, 6 percent slower than Ulysses 4 at 31
+percent less memory and faster than `--tp-size 4`; tensor parallelism alone is 12
+to 15 percent slower than Ulysses with the lowest peak. With the default encoder
+and VAE parallel settings no multi-GPU layout is bit-identical to the single GPU
+(Ulysses 2 and tensor parallel 4 are the closest, above 36 dB PSNR).
+`--enable-torch-compile` is not faster than eager on this model and is not
+recommended.
+
+### 5.4 Native regression coverage
 
 A separate regression used two B300 GPUs, CFG-parallel with replicated encoders
 and serial VAE decode, a 576x1024 area budget, 40 steps, `clip_len=37`, CFG=3,
@@ -451,6 +561,9 @@ accuracy must be validated separately with pinned versions and aligned settings.
 - **OOM**: lower `clip_len` (for example `37` instead of `65`/`81`) or add `--dit-layerwise-offload --layerwise-offload-components transformer`.
 - **`--ring-degree` greater than 1** is rejected at startup with `NotImplementedError`. Use `--ulysses-degree` for sequence parallelism and keep the ring degree at 1.
 - **`--ulysses-degree` that does not divide the TP-local attention heads** (40 / `--tp-size`; with TP 1, degrees 3, 6, 16, ... are rejected) fails at startup with `ValueError`; with TP 1 use 2, 4, 5, 8, 10, 20 or 40. The same check covers leftover GPUs auto-assigned to sequence parallelism (for example `--num-gpus 8 --tp-size 2` runs TP 2 x Ulysses 4).
+- **`--enable-cfg-parallel` (or `--cfg-parallel-size 2`) with the distilled checkpoint**: the server refuses to start with `Wan_Animate_2_14B_Distilled_Config does not support CFG parallelism`. The distilled model runs one branch per step, so there is nothing to split; use `--ulysses-degree` or `--tp-size` for multiple GPUs.
+- **`guidance_scale` other than `1.0` with the distilled checkpoint**: the request is rejected at admission (HTTP 400 on `/v1/videos`, `ValueError` offline) with `guidance_scale=<value> is not supported by the distilled Wan-Animate-2 checkpoint: it samples at guidance_scale 1.0 only (the distilled recipe has no unconditional branch); omit the field or set it to 1.0.` The distilled checkpoint runs one branch per step; omit the field or set it to `1.0`.
+- **`The expanded size of the tensor (N) must match the existing size (M)`** at the first denoising step (the request fails): the reference image and the reference video have different aspect ratios and at the requested `size` the video's 16-aligned grid has more tokens per frame than the image's. With this page's inputs it happens at the 720×1280 budget on both checkpoints; use the 640×800 budget.
 - **FSDP** (`--use-fsdp-inference`) is not supported for this model and is rejected at startup; use `--tp-size` or DiT layerwise offload for memory.
 - **`--attention-backend`** (or `--component-attention-backends transformer=...`) is rejected at startup with `ValueError`: the in-context self-attention runs on torch `flex_attention` only. The text encoder still accepts `--component-attention-backends text_encoder=<backend>`.
 - **`enable_teacache` / `enable_spectrum`** request fields are rejected with `ValueError`: every block runs at every step, so the cache heuristics do not apply.

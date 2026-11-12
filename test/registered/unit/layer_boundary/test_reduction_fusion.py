@@ -27,7 +27,7 @@ from sglang.srt.layers.moe import (
     post_experts_all_reduce,
 )
 from sglang.srt.layers.moe import utils as moe_utils
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.test.boundary_fixtures import identity_input, sp_region_steps, stub_plan
 from sglang.test.ci.ci_register import register_cpu_ci

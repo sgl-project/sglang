@@ -3,7 +3,7 @@
 //
 // ASCEND (A3/A5): single-node recipes transcribed from local runs, kept
 // `in-progress` until they are re-run on a release build. TODO(NPU) marks what
-// is still missing (images, checkpoint slugs, Playground gating).
+// is still missing (images, Playground gating).
 
 export const config = {
   modelName: "DeepSeek-V4",
@@ -47,23 +47,20 @@ export const config = {
     { id: "pro-official", label: "Pro Official", subtitle: "1.6T · 0813" },
   ],
   // Quantization switches by platform, the way kimi-k3's does: CUDA/ROCm see
-  // FP8 / FP4, the Ascend chips see the NPU set (MXFP4 / Modelslim / NVFP4).
+  // FP8 / FP4 / NVFP4. Ascend is resolved per chip — the A3 Series serves the
+  // ModelSlim W8A8 checkpoint, the 950PR/DT Series (a5) serves the FP8 one.
   // `showWhen` on a legacy match dim is enough — the engine filters the row
   // before rendering, and a hidden pick is re-seated on the next visible option,
   // so switching hardware never leaves a value the other platform cannot run.
   quantizations: [
-    { id: "fp8", label: "FP8", showWhen: (s) => !config.isNpuHw(s) },
+    { id: "fp8", label: "FP8",
+      showWhen: (s) => !config.isNpuHw(s) || s.hw === "a5" },
     { id: "fp4", label: "FP4", showWhen: (s) => !config.isNpuHw(s) },
-    // Ascend set — kimi-k3's three. Only Modelslim (W8A8) has a recipe so far, so the
-    // other two render greyed (cell availability) rather than hidden.
-    // TODO(NPU): MXFP4 is the 950PR/DT checkpoint and NVFP4 is kimi-k3's
-    // Blackwell-only entry; confirm both for DeepSeek-V4 before wiring cells.
-    { id: "mxfp4", label: "MXFP4", subtitle: "NPU checkpoint",
-      showWhen: (s) => config.isNpuHw(s) },
+    // A3 Series only: the ModelScope W8A8 build is the only Ascend checkpoint
+    // wired for this model; the 950PR/DT runs the FP8 checkpoint above.
     { id: "modelslim", label: "Modelslim (W8A8)", subtitle: "ModelScope NPU checkpoint",
-      showWhen: (s) => config.isNpuHw(s) },
-    // Shared by both: a real NVIDIA checkpoint and kimi-k3's third NPU value.
-    { id: "nvfp4", label: "NVFP4" },
+      showWhen: (s) => s.hw === "a3" },
+    { id: "nvfp4", label: "NVFP4", showWhen: (s) => !config.isNpuHw(s) },
   ],
   strategies: [
     { id: "low-latency",    label: "Low-Latency"    },
@@ -129,8 +126,6 @@ export const config = {
     const env = [
       "HSA_NO_SCRATCH_RECLAIM=0",
       "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
-      "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-      "SGLANG_OPT_USE_AITER_BATCHED_GEMM=1",
       "AITER_BF16_FP8_MOE_BOUND=0",
       "TORCH_BLAS_PREFER_HIPBLASLT=1",
       ...(dp ? [
@@ -154,7 +149,6 @@ export const config = {
         ]),
       ] : []),
       ...(dp && prefill ? [
-        "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1",
         "SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4",
         "MORI_SHMEM_HEAP_SIZE=8G",
       ] : []),
@@ -194,7 +188,10 @@ export const config = {
   },
 
   modelNames: {
-    "flash-official|modelslim": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    // A3 Series serves the ModelScope W8A8 build; the 950PR/DT (a5) serves the
+    // official FP8 checkpoint.
+    "flash-official|modelslim": "Eco-Tech/DeepSeek-V4-Flash-0731-w8a8",
+    "flash-official|fp8": "deepseek-ai/DeepSeek-V4-Flash-0731",
     "flash|fp4": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|nvfp4": "nvidia/DeepSeek-V4-Flash-NVFP4",
@@ -232,7 +229,7 @@ export const config = {
   // Reproduce commands for the Benchmark card's "⚡ Reproduce" modal.
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
+`python3 -m sglang.benchmark.serving \\
   --backend sglang \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
@@ -366,8 +363,8 @@ sgl-eval run mmmu_pro \\
     gb300: "lmsysorg/sglang:latest",
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
-    mi300x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi30x-20261016",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261016",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi30x-20261028",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261028",
     // TODO(NPU): `a3:` / `a5:` images (kimi-k3: quay.io/ascend/sglang:
     // main-cann9.1.0-a3 and the swr.cn-southwest-2 950PR/DT tag).
   },
@@ -471,10 +468,8 @@ sgl-eval run mmmu_pro \\
           //
           // Two implementations sit behind one option. On Blackwell it is the
           // DeepGEMM MegaMoE, tuned through the Quantization knob below. On
-          // MI355X it is Aiter MegaMoEv2 (sgl-project/sglang#35619), and the
-          // a2a backend alone only selects the hook: without
-          // SGLANG_AMD_USE_FLYDSL_MEGA_MOE the call falls through to the
-          // DeepGEMM path, which has no ROCm kernel. MTPR has to cover the
+          // MI355X it is Aiter MegaMoEv2 (sgl-project/sglang#35619), which the
+          // a2a backend selects on ROCm. MTPR has to cover the
           // per-rank prefill chunk (--chunked-prefill-size / dp_size, i.e.
           // 65536 / 8 on the DP8 recipes); tokens past it silently fall back to
           // fused MoE. MegaMoEv2 also addresses its dispatch/combine buffers
@@ -490,14 +485,12 @@ sgl-eval run mmmu_pro \\
                           label: "MORI MegaMoE" }],
             flags: ["--moe-a2a-backend megamoe"],
             requiresHw: ["b200", "b300", "gb200", "gb300", "mi355x"],
-            env: ["SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1",
-                  "SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=8192",
+            env: ["SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=8192",
                   "SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4",
                   "MORI_SHMEM_HEAP_SIZE=8G"],
             envOverrides: [
               { when: { hw: ["mi355x"], variant: ["pro", "pro-official"], quant: ["fp4"] },
-                env: ["SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1",
-                      "SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4", "MORI_SHMEM_HEAP_SIZE=8G"] },
+                env: ["SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4", "MORI_SHMEM_HEAP_SIZE=8G"] },
             ],
             envWhen: { hw: ["mi355x"] } },
           { id: "flashinfer_mxfp4",  label: "FlashInfer (MXFP4)",
@@ -847,7 +840,6 @@ sgl-eval run mmmu_pro \\
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["high-throughput"] },
           env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1",
-                "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1",
                 // Default MTPR 8192 covers the per-rank chunk: 65536 / 8.
                 "SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4",
                 // Static heap mode is the default. The 8 GiB size overrides
@@ -2134,7 +2126,7 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
+      env: ["SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2153,7 +2145,7 @@ sgl-eval run mmmu_pro \\
       // DSpark is incompatible with DP attention -> target-only.
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096", "SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096", "SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2171,7 +2163,7 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320", "SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320", "SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2421,7 +2413,7 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1", "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2444,7 +2436,7 @@ sgl-eval run mmmu_pro \\
       // DSpark + DP Attention is documented in cookbook §3.7, not this cell.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1", "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2471,7 +2463,7 @@ sgl-eval run mmmu_pro \\
       // above (§3.8), not this cell.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1", "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -3070,7 +3062,6 @@ sgl-eval run mmmu_pro \\
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3100,7 +3091,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3133,7 +3123,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3167,9 +3156,6 @@ sgl-eval run mmmu_pro \\
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3194,9 +3180,6 @@ sgl-eval run mmmu_pro \\
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3229,9 +3212,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3266,9 +3246,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3307,9 +3284,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3344,9 +3318,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3383,9 +3354,6 @@ sgl-eval run mmmu_pro \\
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3418,9 +3386,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3459,9 +3424,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3498,9 +3460,6 @@ sgl-eval run mmmu_pro \\
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3534,9 +3493,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3575,9 +3531,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3614,9 +3567,6 @@ sgl-eval run mmmu_pro \\
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3649,9 +3599,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3690,9 +3637,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -4121,15 +4065,14 @@ sgl-eval run mmmu_pro \\
       pd: true, nnodes: 1, verified: false, env: [], flags: [] },
 
     // Ascend, transcribed from the recipes that were actually run (single node).
-    // TODO(NPU): images + checkpoint slugs; keep `in-progress` until re-run on a
-    // release build.
+    // TODO(NPU): images; keep `in-progress` until re-run on a release build.
     {
       match: { hw: "a3", variant: "flash-official", quant: "modelslim", strategy: "balanced", nodes: "single" },
       verified: false,
       verificationStatus: "in-progress",
       env: [
         "SGLANG_RAGGED_VERIFY_MODE=static",
-        "SGLANG_DSPARK_FAST_KERNEL=0",
+        "SGLANG_DSV4_FP4_EXPERTS=False",
       ],
       flags: [
         "--trust-remote-code",
@@ -4162,7 +4105,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "a5", variant: "flash-official", quant: "modelslim", strategy: "balanced", nodes: "single" },
+      match: { hw: "a5", variant: "flash-official", quant: "fp8", strategy: "balanced", nodes: "single" },
       verified: false,
       verificationStatus: "in-progress",
       env: [
@@ -4211,7 +4154,7 @@ sgl-eval run mmmu_pro \\
         "--reasoning-parser deepseek-v4",
         "--speculative-algorithm DSPARK",
         "--speculative-draft-model-path {{MODEL_NAME}}",
-        "--speculative-draft-model-quantization modelslim",
+        "--speculative-draft-model-quantization fp8",
         "--speculative-draft-attention-backend ascend",
         "--speculative-num-draft-tokens 6",
         "--speculative-dspark-block-size 5",

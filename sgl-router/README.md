@@ -19,7 +19,8 @@ Related docs: [ARCHITECTURE.md](ARCHITECTURE.md) (routing design and bucket
 configuration), [REFERENCE.md](REFERENCE.md) (detailed feature behavior),
 [monitoring/README.md](monitoring/README.md) (metrics and
 Grafana), [BENCHMARKS.md](BENCHMARKS.md),
-[sgl-kv-indexer/README.md](sgl-kv-indexer/README.md) (external KV indexer).
+[sgl-kv-indexer/README.md](sgl-kv-indexer/README.md) (external KV indexer),
+[EXAMPLES.md](EXAMPLES.md) (GLM-5.3-Flash and DeepSeek-V4.1-Flash, end to end).
 
 ## Architecture
 
@@ -82,7 +83,11 @@ curl http://localhost:30000/v1/chat/completions \
   -d '{"model": "qwen3", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-`--model-id` is required. `--tokenizer-path` takes a local `tokenizer.json` or a
+`--model-id` is required. `--model-alias` (repeatable) serves another `model`
+name as `--model-id`, for example a gateway that sends the engine's
+`--model-path`. Aliases are forwarded as `--model-id`, preserving an optional
+`:adapter` LoRA suffix; names containing colons, such as `s3://bucket/model`,
+are matched in full. `/v1/models` lists only `--model-id`. `--tokenizer-path` takes a local `tokenizer.json` or a
 HuggingFace repo id; when omitted, the tokenizer for `--model-id` is downloaded
 from HuggingFace (honoring `HF_TOKEN` / `HF_HOME`). `sgl-router --help` lists
 every flag.
@@ -100,8 +105,14 @@ every flag.
 | `POST /v1/tokenize`, `/v1/detokenize` | Tokenize with the router's tokenizer |
 | `GET /v1/models` | The served model |
 | `POST /flush_cache` | Fan out a cache flush to every worker |
-| `GET /healthz`, `/readyz` | Liveness and readiness |
+| `GET /server_info`, `/model_info`, `/health_generate` | Answered by one healthy worker (a prefill worker under P/D; `/health_generate` also runs on one of its decode peers and returns the decode's answer when both pass); `/get_server_info` and `/get_model_info` are aliases |
+| `GET /healthz`, `/readyz` | Liveness and readiness; `/health`, `/liveness`, and `/readiness` are aliases |
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
+
+sgl-model-gateway endpoints for features the router does not provide yet
+(the Responses and Conversations APIs, `/parse/*`, `/workers`,
+`/v1/tokenizers`, `/wasm`, `/ha/*`, `/v1/loads`, `/get_loads`,
+`/engine_metrics`) answer `501` with error code `unsupported_endpoint`.
 
 Both edges speak cleartext HTTP/2 where the peer does; see
 [operations](#operations). With `--grpc-port`, the router also serves the
@@ -111,7 +122,7 @@ engine's [native gRPC](#native-grpc) API.
 
 | Area | Flags |
 | --- | --- |
-| Model | `--model-id`, `--tokenizer-path`, `--no-tokenizer` |
+| Model | `--model-id`, `--model-alias`, `--tokenizer-path`, `--no-tokenizer` |
 | Engines | `--worker-urls`, or `--service-discovery` with `--selector` (plain) or `--prefill-selector` + `--decode-selector` (P/D) |
 | Routing | `--chat-routing reorg`, `--policy`, `--bucket-config`, `--affinity-*`, `--session-id-header` |
 | Admission | `--max-inflight-requests`, `--max-waiting-requests`, `--max-pending-prefill-tokens`, `--max-running-usage`, `--max-kv-usage` |
@@ -167,6 +178,9 @@ For the full selection rules see ARCHITECTURE.md:
 and [configuration examples](ARCHITECTURE.md#2-configuration-examples).
 
 ## Deployment examples
+
+For complete model deployments (engine flags, router flags, prefer vs balanced
+affinity), see [EXAMPLES.md](EXAMPLES.md).
 
 Static workers, plain engines:
 
@@ -271,7 +285,8 @@ tools) go to the engine's own route unchanged. See
 conditions, and [chat rendering](REFERENCE.md#chat-rendering) plus the
 per-model sections ([DeepSeek V4 and V4.1](REFERENCE.md#deepseek-v4-and-v41),
 [GLM-5.3](REFERENCE.md#glm-53), [Qwen3.8](REFERENCE.md#qwen38),
-[Kimi-K3](REFERENCE.md#kimi-k3)) for which chats forward `input_ids`.
+[Kimi-K3](REFERENCE.md#kimi-k3), [MiniMax-M3](REFERENCE.md#minimax-m3),
+[StepFun](REFERENCE.md#stepfun)) for which chats forward `input_ids`.
 
 ### Anthropic Messages
 
@@ -353,6 +368,28 @@ unset fields inherit the CLI flags. See
 - **Upgrading**: the `cache_aware_zmq` policy and the legacy cache and balance
   threshold flags were removed; see
   [upgrading](REFERENCE.md#upgrading-from-cache_aware_zmq).
+
+### FIPS builds
+
+For deployments that require FIPS 140-validated cryptography, build with the
+opt-in `fips` cargo feature. The router then uses the aws-lc-rs FIPS module as
+its TLS provider (outbound connections to workers and the Kubernetes API) and
+exits at startup unless FIPS mode is active. Default builds are unchanged.
+
+```bash
+cargo build --release --features fips
+# or the container image
+docker build -f docker/sgl-router.Dockerfile --build-arg CARGO_FEATURES=fips .
+```
+
+- The FIPS module builds from source and needs cmake, Go and clang, on a glibc
+  (not musl) target. The Dockerfile installs them when `fips` is requested;
+  `RUNTIME_BASE_IMAGE` selects the runtime base, e.g. a FIPS-mode OS image.
+- FIPS builds do not download tokenizers from Hugging Face Hub (its HTTP
+  client cannot use the FIPS module): pass a local `--tokenizer-path`, or
+  `--no-tokenizer` for load-only policies.
+- On macOS, the FIPS module links as a shared library; set
+  `DYLD_LIBRARY_PATH` to its build output directory to run a native build.
 
 ## License
 
