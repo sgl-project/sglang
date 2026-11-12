@@ -724,8 +724,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         ] = None,  # True leaves a zero-row compressed tail
         is_draft_worker: bool = False,
         use_combined_kv_buffer: bool = False,
+        # Accepted to stay compatible with the generic hybrid DSA pool
+        # contract; both are inert on NPU (no Kimi-K3.1 fp8 scales / fp4 indexer).
+        kv_scale_ue8m0: bool = False,
+        use_fp4_indexer: bool = False,
         modelslim_cache_layout=None,
     ):
+        if use_fp4_indexer:
+            raise ValueError("FP4 indexer KV cache is not supported on NPU.")
+        self.kv_scale_ue8m0 = kv_scale_ue8m0
         self.kpool_use_compress = index_kpool > 1 and index_kpool_compress
         assert index_kpool <= 1 or self.kpool_use_compress, (
             "NPU KPool requires index_kpool_compress=True when index_kpool > 1"
