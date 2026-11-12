@@ -10,6 +10,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+from unittest import mock
 
 import pytest
 import torch
@@ -22,6 +23,11 @@ from sglang.kernels.ops.communication import gemma4_ar_fusion
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
+)
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.communication import gemma4_ar_fusion as fusion_glue
+from sglang.srt.layers.quantization.fp8_utils import (
+    deepgemm_w8a8_block_fp8_linear_with_fallback,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -209,6 +215,84 @@ def test_final(hidden: int, rows: int):
     torch.testing.assert_close(residual, out[row0 : row0 + mine])
     for i, other in enumerate(all_out):
         assert torch.equal(other, out), f"out differs on rank {i}"
+
+
+@pytest.mark.parametrize("rows", [512, 1024])
+def test_site_reads_a_gemm_written_partial(rows: int):
+    """The model path: the block-FP8 GEMM that produces the partial writes the
+    site's symmetric buffer itself (RowParallelLinear's ``output_tensor``), with
+    no staging copy. Same result as the GEMM computed on its own."""
+    if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        pytest.skip("DeepGEMM unavailable")
+    hidden, k = HIDDENS[0], 1024
+    coord = _init()
+    partial_buf, out_buf, scales_buf = _buffers(hidden)
+    residual_all, w_a, w_b, scalar = _inputs(rows, hidden, 2)
+    g = torch.Generator(device="cuda").manual_seed(3)  # the same weight on every rank
+    weight = (40 * torch.randn(hidden, k, device="cuda", generator=g)).to(
+        torch.float8_e4m3fn
+    )
+    weight_scale = torch.full((hidden // GROUP, k // GROUP), 1e-3, device="cuda")
+    x = torch.randn(rows, k, device="cuda").bfloat16() * (coord.rank + 1) / 4
+    gemm = dict(input=x, weight=weight, block_size=[GROUP, GROUP])
+    gemm["weight_scale"] = weight_scale
+    partial = deepgemm_w8a8_block_fp8_linear_with_fallback(**gemm)
+    row0, mine = _rows(rows, coord.rank, coord.world_size)
+    residual = residual_all[row0 : row0 + mine].clone()
+
+    staged = partial_buf.tensor[:rows]
+    staged.fill_(float("nan"))
+    with mock.patch.object(torch.Tensor, "copy_", side_effect=AssertionError("copied")):
+        written = deepgemm_w8a8_block_fp8_linear_with_fallback(**gemm, output=staged)
+    wrote_in_place = written.data_ptr() == staged.data_ptr()
+    same_as_gemm = torch.equal(staged, partial)
+    gemma4_ar_fusion.site(
+        staged,
+        partial_buf.mc,
+        out_buf.tensor[:rows],
+        out_buf.mc,
+        scales_buf.tensor[:rows],
+        scales_buf.mc,
+        residual,
+        w_a,
+        w_b,
+        scalar,
+        EPS,
+        row0,
+        mine,
+        True,
+        world_size=coord.world_size,
+    )
+    torch.cuda.synchronize()
+    out, scales = out_buf.tensor[:rows].clone(), scales_buf.tensor[:rows].clone()
+    ref_res, ref_y = _reference(_gather(partial), residual_all, w_a, w_b, scalar, True)
+    # gather before any assert: a rank that fails alone would hang its peers
+    all_out = _gather(out)
+    assert wrote_in_place and same_as_gemm
+    torch.testing.assert_close(
+        residual.float(), ref_res[row0 : row0 + mine].float(), rtol=2e-2, atol=5e-2
+    )
+    deq = out.float() * scales.repeat_interleave(GROUP, dim=1)
+    torch.testing.assert_close(deq, ref_y, rtol=7e-2, atol=4e-2)
+    for i, other in enumerate(all_out):
+        assert torch.equal(other, out), f"out differs on rank {i}"
+
+
+def test_stage_skips_the_copy_for_its_own_buffer():
+    """Gemma4ArFusion stages a foreign partial by copy and takes one already in
+    its buffer (``partial_out``) as is."""
+    hidden, rows = HIDDENS[0], 8
+    _init()
+    partial_buf, _, _ = _buffers(hidden)
+    fusion = object.__new__(fusion_glue.Gemma4ArFusion)
+    fusion.partial = fusion_glue._Symm(partial_buf.tensor, partial_buf.mc)
+    own = fusion.partial_out(rows)
+    assert own.data_ptr() == partial_buf.tensor.data_ptr() and own.shape[0] == rows
+    with mock.patch.object(torch.Tensor, "copy_", side_effect=AssertionError("copied")):
+        assert fusion._stage(own).data_ptr() == own.data_ptr()
+    foreign = torch.randn(rows, hidden, device="cuda").bfloat16()
+    staged = fusion._stage(foreign)
+    assert staged.data_ptr() == own.data_ptr() and torch.equal(staged, foreign)
 
 
 if __name__ == "__main__":

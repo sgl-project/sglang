@@ -475,8 +475,10 @@ class Gemma4Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        output_tensor: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        """``output_tensor``: optional caller-owned storage for o_proj's result."""
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -573,7 +575,7 @@ class Gemma4Attention(nn.Module):
         )
         if attn_output.dim() == 3:
             attn_output = attn_output.flatten(-2, -1)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, output_tensor=output_tensor)
 
         return output
 
@@ -1057,7 +1059,8 @@ class Gemma4TextModel(PreTrainedModel):
         """The layer stack with every TP all-reduce + epilogue as one fused site.
 
         This rank keeps only its own rows of the residual stream; each site
-        returns the next GEMM's FP8 input for all rows. Same math as
+        returns the next GEMM's FP8 input for all rows. o_proj and down_proj
+        write their partial sums straight into the site's symmetric buffer. Same math as
         Gemma4DecoderLayer.forward: the attention site rounds the
         post-attention norm to bf16 before the add, the MLP site adds in fp32
         and scales.
@@ -1069,13 +1072,20 @@ class Gemma4TextModel(PreTrainedModel):
                 "gemma4 all-reduce fusion: first fused forward (%d tokens)",
                 input_embeds.shape[0],
             )
-        row0, rows = fusion.rows(input_embeds.shape[0])
+        num_tokens = input_embeds.shape[0]
+        row0, rows = fusion.rows(num_tokens)
+        # Safe to overwrite between sites: a site returns only after every rank
+        # has read this buffer (the kernel's closing barrier).
+        partial_out = fusion.partial_out(num_tokens)
         residual = input_embeds[row0 : row0 + rows].clone()
         x = self.layers[self.start_layer].input_layernorm(input_embeds)
         for idx in range(self.start_layer, self.end_layer):
             layer = self.layers[idx]
             h = layer.self_attn(
-                positions=positions, hidden_states=x, forward_batch=forward_batch
+                positions=positions,
+                hidden_states=x,
+                forward_batch=forward_batch,
+                output_tensor=partial_out,
             )
             x = fusion.site(
                 h,
@@ -1085,7 +1095,7 @@ class Gemma4TextModel(PreTrainedModel):
                 None,
                 round_a=True,
             )
-            h = layer.mlp(x)
+            h = layer.mlp(x, output_tensor=partial_out)
             if idx + 1 < self.end_layer:
                 x = fusion.site(
                     h,
