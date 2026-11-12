@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -20,6 +21,12 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
     cached_vae_encode,
     invalidate_conditioning_caches,
     prefer_conditioning_cache,
+)
+from sglang.multimodal_gen.runtime.cache.gpu_hash import (
+    NH_BLOCK_WORDS,
+    NH_LANES,
+    _key,
+    nh_block_sums,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
@@ -167,6 +174,32 @@ def test_lru_budget_and_oversized_outputs():
     assert cache.evictions == 2
     assert cache.bytes == before == 32
     assert cache.bypasses == 1
+
+
+def _nh_reference(data, key):
+    words = np.frombuffer(data[: data.size // 4 * 4].tobytes(), dtype=np.uint32)
+    padded = -words.size % NH_BLOCK_WORDS
+    blocks = np.concatenate([words, np.zeros(padded, np.uint32)])
+    blocks = blocks.reshape(-1, NH_BLOCK_WORDS)
+    lanes = []
+    for lane in range(NH_LANES):
+        lane_key = key[4 * lane : 4 * lane + NH_BLOCK_WORDS]
+        summed = (blocks + lane_key).astype(np.uint64)  # uint32 add wraps
+        lanes.append((summed[:, 0::2] * summed[:, 1::2]).sum(axis=1, dtype=np.uint64))
+    return np.stack(lanes, axis=1).tobytes(), data[words.size * 4 :].tobytes()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_gpu_nh_sums_match_the_wrapping_reference():
+    pytest.importorskip("triton")
+    # A ragged last block, a 3-byte tail, and a misaligned start all keep NH exact.
+    size = 3 * NH_BLOCK_WORDS * 4 + 1000 + 3
+    host = np.random.default_rng(0).integers(0, 256, size + 1, dtype=np.uint8)
+    device = torch.from_numpy(host).cuda()
+    key = _key(device.device).cpu().numpy().view(np.uint32)
+    for start in (0, 1):
+        expected = _nh_reference(host[start : start + size], key)
+        assert nh_block_sums(device[start : start + size]) == expected, start
 
 
 @torch.no_grad()

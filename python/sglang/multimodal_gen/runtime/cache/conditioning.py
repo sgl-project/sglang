@@ -4,6 +4,7 @@
 import copy
 import hashlib
 import pickle
+import struct
 import weakref
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -18,6 +19,10 @@ import torch.distributed as dist
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from PIL import Image
 
+from sglang.multimodal_gen.runtime.cache.gpu_hash import (
+    gpu_hash_available,
+    nh_block_sums,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_replica_group,
     get_tp_group,
@@ -95,10 +100,16 @@ def prefer_conditioning_cache():
 # those blocks still identifies every byte, without copying the zeros to host.
 _SPARSE_HASH_BLOCK_BYTES = 64 * 1024
 _SPARSE_HASH_MIN_BYTES = 16 * 1024 * 1024
+# Arbitrary; below this a plain copy costs about as much as the kernel launch.
+_GPU_HASH_MIN_BYTES = 64 * 1024
 
 
 def _tensor_digest(tensor):
     data = tensor.reshape(-1).view(torch.uint8)
+    if gpu_hash_available(data) and data.numel() >= _GPU_HASH_MIN_BYTES:
+        sums, tail = nh_block_sums(data)
+        framing = struct.pack("<Q", data.numel())
+        return hashlib.sha256(b"nh" + framing + sums + tail).digest()
     if not data.is_cuda or data.numel() < _SPARSE_HASH_MIN_BYTES:
         return hashlib.sha256(data.cpu().numpy()).digest()
     num_blocks = data.numel() // _SPARSE_HASH_BLOCK_BYTES
