@@ -1184,7 +1184,10 @@ class KVStorage:
         if self._allocator.mamba_allocator is not None and not state_writes_unknown:
             written = [self.requests.get_mamba_indices(req_pool_indices)]
             written += [slots for slots in state_slots if slots is not None]
-            state = torch.cat([slots.reshape(-1).to(torch.int64) for slots in written])
+            pieces = [slots.reshape(-1).to(torch.int64) for slots in written]
+            # The table gather is a fresh tensor, and so is a cat: the state
+            # band's ledger keeps it without a copy of its own.
+            state = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
         self._allocator.set_latest_forward_done_event(forward_done)
         self._allocator.set_inflight_forward(
             forward_done,
@@ -1192,6 +1195,7 @@ class KVStorage:
             state,
             token_writes_unknown=token_writes_unknown,
             state_writes_unknown=state_writes_unknown,
+            state_slots_owned=True,
         )
 
     def move_epoch(self) -> int:

@@ -2,12 +2,13 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 from test_unified_mamba_views import _make_pool
 
 from sglang.srt.environ import InvariantCheckLevel, envs
+from sglang.srt.mem_cache.kv.alloc import page_usage
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.page_usage import Consumer
 from sglang.srt.mem_cache.kv.layout.state import StateView
@@ -519,19 +520,25 @@ class TestForwardWriteSets(CustomTestCase):
             torch.tensor([5, 6], dtype=torch.int32)
         )
         tokens = torch.tensor([10, 11])
-        storage.record_forward(
-            _Event(),
-            written_tokens=tokens,
-            token_writes_unknown=False,
-            req_pool_indices=torch.tensor([1, 2]),
-            state_slots=(torch.tensor([7, -1]), None),
-        )
+        track = torch.tensor([7, -1])
+        with patch.object(page_usage, "_owned", wraps=page_usage._owned) as owned:
+            storage.record_forward(
+                _Event(),
+                written_tokens=tokens,
+                token_writes_unknown=False,
+                req_pool_indices=torch.tensor([1, 2]),
+                state_slots=(track, None),
+            )
+        # The state ids are built fresh for the ledger, so only the token ids
+        # the caller keeps are copied.
+        self.assertEqual(owned.call_count, 1)
+        tokens.fill_(0)
+        track.fill_(0)
         state = allocator.mamba_allocator.usage.forwards()
         self.assertEqual(state[-1].ids.tolist(), [5, 6, 7, -1])
         owner = allocator.full_attn_allocator.usage.forwards()
         # The ledger keeps its own copy of the ids it is handed.
-        self.assertEqual(owner[-1].ids.tolist(), tokens.tolist())
-        self.assertIsNot(owner[-1].ids, tokens)
+        self.assertEqual(owner[-1].ids.tolist(), [10, 11])
 
     def test_host_copies_are_recorded_on_the_members_they_touch(self):
         # A submitted host copy names its rows per sub-pool view; a move then

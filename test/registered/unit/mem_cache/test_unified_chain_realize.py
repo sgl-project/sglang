@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.kv.decl import (
     WindowLayers,
     kv_layer_decls,
 )
+from sglang.srt.mem_cache.kv.memory import arena as arena_module
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
 from sglang.srt.runtime_context import mamba_cache_chunk_size
@@ -686,22 +687,33 @@ class TestChainRealize(CustomTestCase):
 
 class TestFrontierTakesBindInOneKernel(CustomTestCase):
     """A take that only extends an end's frontier binds in the fused kernel,
-    one launch per band; a take that fills holes, or a float's, binds apart."""
+    one launch per band (which also zeroes the pages of a band that zeroes);
+    a take that fills holes, or a float's, binds apart."""
 
     def setUp(self):
         setup_allocator_context()
 
     def _fused_calls(self):
         calls = []
-        real = band_module.alloc_bind_inplace
+        real_bind = band_module.alloc_bind_inplace
+        real_bind_zero = arena_module.bind_zero_pages
 
-        def counting(*args, **kwargs):
+        def counting_bind(*args, **kwargs):
             calls.append(args[0].numel())
-            return real(*args, **kwargs)
+            return real_bind(*args, **kwargs)
 
-        patcher = patch.object(band_module, "alloc_bind_inplace", counting)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        def counting_bind_zero(*args, **kwargs):
+            if kwargs["start_page"] is not None:
+                calls.append(args[1].numel())
+            return real_bind_zero(*args, **kwargs)
+
+        for module, name, counting in (
+            (band_module, "alloc_bind_inplace", counting_bind),
+            (arena_module, "bind_zero_pages", counting_bind_zero),
+        ):
+            patcher = patch.object(module, name, counting)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         return calls
 
     def _assert_bound(self, allocator, virtual_pages):

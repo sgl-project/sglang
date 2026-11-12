@@ -257,6 +257,40 @@ class TestUnifiedHandoutZeroing(unittest.TestCase):
         pages2 = self._phys_pages(allocator, out2)
         self.assertTrue((env[pages2] == 0).all().item())
 
+    def test_a_hand_out_binds_and_zeroes_in_one_launch(self):
+        """A hand-out, fresh (the frontier) or recycled (holes), binds its pages
+        and zeroes them in one kernel launch: no zeroing launch follows the bind,
+        and the pages still leave zeroed."""
+        from torch.profiler import ProfilerActivity, profile
+
+        buf, kvcache, allocator = self.build("cuda")
+        env = self._env(buf, kvcache)
+        # Warm both hand-outs, so the profiled ones only launch: a frontier
+        # take, and one that refills the holes a free left behind live pages.
+        held = allocator.alloc(16)
+        allocator.alloc(16)
+        allocator.free(held)
+        held = allocator.alloc(16)
+        for kind in ("fresh", "recycled"):
+            with self.subTest(kind=kind):
+                if kind == "recycled":
+                    allocator.free(held)
+                self._poison(buf)
+                torch.cuda.synchronize()
+                with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                    out = allocator.alloc(16)
+                    torch.cuda.synchronize()
+                self.assertIsNotNone(out)
+                launches = [
+                    e.name
+                    for e in prof.events()
+                    if e.device_type.name == "CUDA"
+                    and ("bind" in e.name or "zero_pages" in e.name)
+                ]
+                self.assertEqual(launches, ["_bind_zero_pages_kernel"])
+                pages = self._phys_pages(allocator, out)
+                self.assertTrue((env[pages] == 0).all().item())
+
     def test_zeroing_keys_on_pool_type(self):
         # The MLA view has NaN-unsafe partial-page reads whatever
         # its geometry; zeroing must key on the pool type, not on any

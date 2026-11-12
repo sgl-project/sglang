@@ -429,7 +429,7 @@ class Band:
         self.entry_bytes = band.entry_bytes
         self.min_slot_index = arena.first_entry(sub_pool_name)
         self.is_id_owner = is_id_owner
-        # Zero page envelopes on hand-out -- see _maybe_zero_pages.
+        # Zero page envelopes on hand-out -- see _bind_pages.
         self._zero_pages_on_alloc = band.zero_on_handout
         self.forward_stream = forward_stream
 
@@ -1128,7 +1128,7 @@ class Band:
 
     def _consumers(self, consumer: Consumer) -> Tuple[Consumer, ...]:
         """Who writes a page handed out to ``consumer``: every hand-out but a
-        host load's is zeroed first on a band that zeroes (`_maybe_zero_pages`)."""
+        host load's is zeroed first on a band that zeroes (`_bind_pages`)."""
         if self._zero_pages_on_alloc and consumer is not Consumer.HOST_LOAD:
             return (consumer, Consumer.ZERO)
         return (consumer,)
@@ -1166,9 +1166,11 @@ class Band:
         (`page_usage.CLEARANCE`). Counts decide every check, never whether an
         event fired.
 
-        With ``bind`` (virtual pages) and no hole to take, the frontier pages
-        are taken and bound in one kernel. ``placement``: a float's planned
-        extension block; a ``planned`` take extends only into it."""
+        With ``bind`` (virtual pages) the pages are bound to them, and zeroed
+        on a band that zeroes (`_bind_pages`); with no hole to take, the
+        frontier pages are taken, bound and zeroed in one kernel.
+        ``placement``: a float's planned extension block; a ``planned`` take
+        extends only into it."""
         with record_function("Band.acquire"):
             if num_pages <= 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
@@ -1228,6 +1230,14 @@ class Band:
             self._wait_clearance(clearance)
             if holes is None and bind is not None:
                 first, _ = extension
+                if self._zero_pages_on_alloc:
+                    return self.arena.bind_zero_units(
+                        self.sub_pool_name,
+                        bind,
+                        self.ids.virtual_to_physical,
+                        self.ids.physical_to_virtual,
+                        start=first,
+                    )
                 return alloc_bind_inplace(
                     bind,
                     self.ids.virtual_to_physical,
@@ -1241,7 +1251,7 @@ class Band:
             if holes is not None and fresh is not None:
                 pages = torch.cat([holes, fresh])
             if bind is not None:
-                self.ids.bind(bind, pages)
+                self._bind_pages(bind, pages)
             return pages
 
     def _count_taken(self, num_pages: int) -> None:
@@ -1560,36 +1570,40 @@ class Band:
         self, v_pages: torch.Tensor, N: int, consumer: Consumer = Consumer.FORWARD
     ) -> Optional[torch.Tensor]:
         """Acquire ``N`` pages for ``consumer`` and bind them to virtual pages
-        ``v_pages``; with no hole to take, one Triton kernel does both. Returns
-        physical page ids [N], or None on shortfall."""
+        ``v_pages`` (`_bind_pages`); with no hole to take, one Triton kernel
+        takes, binds and zeroes them. Returns physical page ids [N], or None on
+        shortfall."""
         with record_function("Band.place_pages"):
             if self._physical_take_scope is not None:
                 physical = self.take_physical_pages(N, consumer)
                 if physical is not None:
-                    self.ids.bind(v_pages, physical)
-                    self._maybe_zero_pages(physical)
+                    self._bind_pages(v_pages, physical)
                 return physical
             if N * self.page_size > self.cap_available(N * self.page_size):
                 return None
             if N == 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
-            phys_pages = self.acquire(N, consumer, bind=v_pages)
-            if phys_pages is None:
-                return None
-            self._maybe_zero_pages(phys_pages)
-            return phys_pages
+            return self.acquire(N, consumer, bind=v_pages)
 
-    def _maybe_zero_pages(self, phys_pages: torch.Tensor) -> None:
-        """Zero the page ENVELOPES on hand-out (MHA and MLA pools): the MLA
-        kernels and trtllm_mha's fmha_v2 prefill (and fp8 XQA decode) load whole
-        pages and give the rows past seq_len a zero weight, so a NaN there still
-        reaches the output. Never-written bytes must read as finite values; a
-        mamba neighbour's fp32 state, read as bf16, may not.
+    def _bind_pages(self, v_pages: torch.Tensor, phys_pages: torch.Tensor) -> None:
+        """Bind ``v_pages`` to ``phys_pages``, zeroing the page ENVELOPES in the
+        same launch on hand-out (MHA and MLA pools): the MLA kernels and
+        trtllm_mha's fmha_v2 prefill (and fp8 XQA decode) load whole pages and
+        give the rows past seq_len a zero weight, so a NaN there still reaches
+        the output. Never-written bytes must read as finite values; a mamba
+        neighbour's fp32 state, read as bf16, may not.
         """
-        if not self._zero_pages_on_alloc or phys_pages.numel() == 0:
+        if not self._zero_pages_on_alloc:
+            self.ids.bind(v_pages, phys_pages)
             return
-        with record_function("Band._maybe_zero_pages"):
-            self.arena.zero_units(self.sub_pool_name, phys_pages)
+        with record_function("Band._bind_pages"):
+            self.arena.bind_zero_units(
+                self.sub_pool_name,
+                v_pages,
+                self.ids.virtual_to_physical,
+                self.ids.physical_to_virtual,
+                units=phys_pages,
+            )
 
     # -- alloc --
 
@@ -2018,6 +2032,7 @@ class Band:
         written_virtual: Optional[torch.Tensor],
         *,
         writes_unknown: bool = False,
+        copy: bool = True,
     ) -> None:
         """Record a just-launched forward's `forward_done` event and the virtual
         ids it writes in this band, for `_flush`'s write-race check. The ledger
@@ -2027,11 +2042,15 @@ class Band:
         launches the next microbatch before the previous one ends. Pass
         `written_virtual=None` when the forward writes nothing here, and
         ``writes_unknown`` when its write ids cannot be read before it ends:
-        nothing then moves until it retires.
+        nothing then moves until it retires. Without ``copy`` the caller hands
+        ``written_virtual`` over as the ledger's copy, and never writes it again.
         """
         with record_function("Band.set_inflight_forward"):
             self.usage.record_forward(
-                forward_done, written_virtual, writes_unknown=writes_unknown
+                forward_done,
+                written_virtual,
+                writes_unknown=writes_unknown,
+                copy=copy,
             )
 
     def _physical_pages_of(self, ids: torch.Tensor, *, widened: bool) -> Set[int]:
@@ -3387,8 +3406,7 @@ class FloatBand(Band):
         phys_pages = self.take_physical_pages(N, consumer)
         if phys_pages is None:
             return None
-        self.ids.bind(v_pages, phys_pages)
-        self._maybe_zero_pages(phys_pages)
+        self._bind_pages(v_pages, phys_pages)
         return phys_pages
 
     # -- free: hole-marking, boundary absorption, park-on-empty --
