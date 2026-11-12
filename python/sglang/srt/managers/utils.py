@@ -83,8 +83,9 @@ def _async_d2h_rows(rows: List[Any]) -> List[Any]:
     are not tensors pass through.
     """
     tensors = [row for row in rows if torch.is_tensor(row)]
-    if len(tensors) < 2 or len({row.dtype for row in tensors}) > 1:
-        return [_async_d2h(row) if torch.is_tensor(row) else row for row in rows]
+    if not tensors:
+        return rows
+    # The rows of a list are slices of one tensor, so they share a dtype.
     host = _async_d2h(torch.cat([row.reshape(-1) for row in tensors]))
     host_rows = iter(
         chunk.view(row.shape)

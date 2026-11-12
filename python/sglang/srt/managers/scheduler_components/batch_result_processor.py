@@ -133,12 +133,7 @@ def _record_token_values(
 def _rows_to_lists(rows: List[torch.Tensor]) -> List[list]:
     # Without overlap scheduling the rows are still on the device, where every
     # `.tolist()` is a blocking device-to-host copy; read them back together.
-    if (
-        len(rows) < 2
-        or any(row.dim() != 1 for row in rows)
-        or len({row.dtype for row in rows}) > 1
-    ):
-        return [row.tolist() for row in rows]
+    # The rows of a list are 1-D slices of one tensor, so they share a dtype.
     flat = torch.cat(rows).tolist()
     lists = []
     start = 0
