@@ -494,14 +494,39 @@ class SupportsDraftEmbed(Protocol):
     def attach_draft_embed(self, **kwargs: Any) -> None: ...
 
 
-@runtime_checkable
-class SupportsKdaCommit(Protocol):
-    """A target spec that commits the KDA state after a chain verify in one launch.
+class RecurrentCommitIO(msgspec.Struct, frozen=True):
+    """One chain verify's accepted recurrent state to commit, per request row."""
 
-    kda_commit returns False, launching nothing, when off; SGLang then commits itself.
+    # [bs] the verify forward's resolved state slots (the request table may already
+    # name other slots), and its prefix-cache checkpoint slots when it tracks
+    state_slots: torch.Tensor
+    track_slots: Optional[torch.Tensor]
+    request_rows: torch.Tensor  # [bs] request-table rows
+    accept_lens: torch.Tensor  # [bs] accepted tokens, including the bonus token
+    last_step: torch.Tensor  # [bs] the last accepted step
+    # [bs] the step whose state each tracked request checkpoints, when it tracks
+    track_steps: Optional[torch.Tensor]
+    draft_token_num: int  # verify rows per request
+    # [bs] the rows the verify wrote its per-step state at, when pipeline-stable
+    # rows keep them per request rather than per batch row
+    src_indices_raw: Optional[torch.Tensor]
+
+
+@runtime_checkable
+class SupportsRecurrentCommit(Protocol):
+    """A target build that commits the recurrent state of a chain verify itself.
+
+    SGLang calls commit_recurrent_state after each target verify, where it would
+    commit the state of the linear-attention layers. It launches the commit on the
+    current stream and returns True; SGLang then commits only the side states it
+    keeps per request (PLE). False launches nothing, and SGLang commits as without
+    it. The call may be captured in a CUDA graph: it runs no collective and no host
+    sync, and while capturing allocates only per-capture temporaries from the
+    graph's pool (a small arange, an int32 cast); every buffer it keeps across
+    calls exists before the capture (allocate it in prepare).
     """
 
-    def kda_commit(self, **kwargs: Any) -> bool: ...
+    def commit_recurrent_state(self, io: RecurrentCommitIO) -> bool: ...
 
 
 @runtime_checkable

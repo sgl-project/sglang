@@ -3,7 +3,7 @@ that reused its rows after its shared reads ended."""
 
 import unittest
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 from test_declared_parts import _build
@@ -300,7 +300,7 @@ class TestLateReadsUseTheForwardSlots(CustomTestCase):
         return SimpleNamespace(
             model_runner=SimpleNamespace(
                 model_config=None,
-                model=None,
+                model=torch.nn.Module(),
                 attn_backend=f.hybrid,
                 req_to_token_pool=f.req,
                 runner_ids=f.reader,
@@ -407,6 +407,52 @@ class TestLateReadsUseTheForwardSlots(CustomTestCase):
                             call.args[2].tolist(),
                             (f.working_physical.tolist(), f.track_physical.tolist()),
                         )
+
+    def test_megakernel_recurrent_commit(self):
+        """A megakernel that commits the recurrent state itself gets the verify's
+        resolved slots, and SGLang then commits only the PLE side states; when it
+        declines, SGLang commits as without it."""
+        accept_lens = torch.tensor([2, 1])
+        accept_index = torch.tensor([[0, 1], [2, -1]])
+        for graph in self._cases():
+            for taken in (True, False):
+                with self.subTest(taken=taken):
+                    f = _Forward(mode=ForwardMode.TARGET_VERIFY, graph=graph)
+                    commit = MagicMock(return_value=taken)
+                    built = SimpleNamespace(commit_recurrent_state=commit)
+                    f.reuse_rows()
+                    with (
+                        patch.object(spec_utils, "mambaish_config", return_value=True),
+                        patch.object(spec_utils, "mamba_track_grid", return_value=8),
+                        patch.object(
+                            spec_utils, "built_megakernel", return_value=built
+                        ),
+                        patch.object(
+                            HybridLinearAttnBackend,
+                            "update_mamba_state_after_mtp_verify",
+                        ) as stock,
+                        patch(_HLA + ".commit_ple_states_after_verify") as ple,
+                    ):
+                        spec_utils.commit_mamba_states_after_verify(
+                            self._target_worker(f, None),
+                            self._verify_batch(f),
+                            accept_lens,
+                            accept_index,
+                            _DRAFT_TOKENS,
+                        )
+                    (io,) = commit.call_args.args
+                    self.assertEqual(
+                        io.state_slots.tolist(), f.working_physical.tolist()
+                    )
+                    self.assertEqual(io.track_slots.tolist(), f.track_physical.tolist())
+                    self.assertEqual(io.request_rows.tolist(), f.rows.tolist())
+                    self.assertIs(io.accept_lens, accept_lens)
+                    self.assertEqual(io.draft_token_num, _DRAFT_TOKENS)
+                    self.assertEqual(stock.called, not taken)
+                    self.assertEqual(ple.called, taken)
+                    if taken:
+                        self.assertIs(ple.call_args.args[1], io.state_slots)
+                        self.assertIs(ple.call_args.args[3], io.track_slots)
 
     def test_post_verify_graph_commit(self):
         """The post-verify graphs' side-stream commit writes the slots staged
