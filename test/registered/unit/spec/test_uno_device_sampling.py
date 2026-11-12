@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.speculative.uno_cuda_graph_runner import UnoDecodeCudaGraphRunner
 from sglang.srt.speculative.uno_utils import (
+    _build_sparse_target_support_tensors,
     _dense_rejection_torch,
     _sparse_rejection_from_support,
     _top_k,
@@ -21,6 +22,42 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestUnoDeviceSampling(CustomTestCase):
+    def test_sparse_topk_stays_outside_compiled_tensor_math(self):
+        module = "sglang.srt.speculative.uno_utils"
+        logits, values, indices, temperatures, top_ks, top_ps = (
+            object() for _ in range(6)
+        )
+        expected = object()
+
+        def topk(tensor, k):
+            self.assertFalse(torch.compiler.is_compiling())
+            self.assertIs(tensor, logits)
+            self.assertEqual(k, 3)
+            return values, indices
+
+        with (
+            patch(module + "._top_k", side_effect=topk) as select,
+            patch(
+                module + "._sparse_target_support_from_topk", return_value=expected
+            ) as normalize,
+        ):
+            actual = _build_sparse_target_support_tensors(
+                logits, temperatures, top_ks, top_ps, 2, 4, 3
+            )
+        self.assertIs(actual, expected)
+        select.assert_called_once()
+        normalize.assert_called_once_with(
+            topk_logits=values,
+            topk_ids=indices,
+            next_token_logits=logits,
+            temperatures=temperatures,
+            top_ks=top_ks,
+            top_ps=top_ps,
+            batch_size=2,
+            forward_width=4,
+            max_top_k=3,
+        )
+
     def test_npu_capture_resets_prefix_for_each_variant_and_bucket(self):
         runner = UnoDecodeCudaGraphRunner.__new__(UnoDecodeCudaGraphRunner)
         runner.model_runner = SimpleNamespace(device="npu")
