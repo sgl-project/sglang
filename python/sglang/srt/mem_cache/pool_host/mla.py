@@ -78,6 +78,102 @@ if _is_npu:
         transfer_kv_per_layer_kv_split_pf_lf,
     )
 
+    # (is_host_pf, is_d2h) -> kv_exchange operator
+    _NPU_KV_SPLIT_IMPLS = {
+        (True, False): transfer_kv_per_layer_kv_split_pf_lf,
+        (False, False): transfer_kv_per_layer_kv_split,
+        (True, True): transfer_kv_all_layer_kv_split_lf_pf,
+        (False, True): transfer_kv_all_layer_kv_split,
+    }
+
+    def transfer_kv_split_npu(
+        device_indices,
+        host_indices,
+        device_k,
+        host_k,
+        device_v,
+        host_v,
+        device_index_k=None,
+        host_index_k=None,
+        device_index_k_scale=None,
+        host_index_k_scale=None,
+        page_size=128,
+        *,
+        is_host_pf,
+        is_d2h,
+        device_layer_id=None,
+        host_layer_id=None,
+        device_index_layer_id=None,
+        host_index_layer_id=None,
+        host_layer_start=0,
+        impl="auto",
+    ):
+        """Dispatches to one of the four split operators by (is_host_pf, is_d2h)
+
+        Compressed pools exchange KV and Indexer in two calls.
+        """
+        impl_op = _NPU_KV_SPLIT_IMPLS[(is_host_pf, is_d2h)]
+        # compressed indexer pages
+        compressed = device_index_k is not None and device_index_k.shape[2] != page_size
+        if is_d2h:
+            layer_kwargs = dict(host_layer_start=host_layer_start)
+            index_layer_kwargs = dict(host_layer_start=0)
+        elif compressed:
+            # Native operators require one page_size for every component:
+            # compressed Indexer pages are exchanged by the second call below.
+            layer_kwargs = dict(
+                device_layer_id=device_layer_id,
+                host_layer_id=host_layer_id,
+            )
+            index_layer_kwargs = dict(
+                device_layer_id=device_index_layer_id,
+                host_layer_id=host_index_layer_id,
+            )
+        else:
+            layer_kwargs = dict(
+                device_layer_id=device_layer_id,
+                host_layer_id=host_layer_id,
+                device_index_layer_id=device_index_layer_id,
+                host_index_layer_id=host_index_layer_id,
+            )
+            index_layer_kwargs = dict(
+                device_layer_id=device_index_layer_id,
+                host_layer_id=host_index_layer_id,
+            )
+        impl_op(
+            device_indices=device_indices,
+            host_indices=host_indices,
+            device_k=device_k,
+            host_k=host_k,
+            device_v=device_v,
+            host_v=host_v,
+            device_index_k=None if compressed else device_index_k,
+            host_index_k=None if compressed else host_index_k,
+            device_index_k_scale=None if compressed else device_index_k_scale,
+            host_index_k_scale=None if compressed else host_index_k_scale,
+            page_size=page_size,
+            **layer_kwargs,
+            impl=impl,
+        )
+        if not compressed or (host_index_k is None and host_index_k_scale is None):
+            return
+        # Indexer only transfer in compressed layout
+        ratio = page_size // device_index_k.shape[2]
+        impl_op(
+            device_indices=device_indices[::ratio] // ratio,
+            host_indices=host_indices[::ratio] // ratio,
+            device_k=device_index_k,
+            host_k=host_index_k,
+            device_v=device_index_k.new_empty(0),
+            host_v=host_k.new_empty(0),
+            device_index_k=device_index_k_scale,
+            host_index_k=host_index_k_scale,
+            page_size=device_index_k.shape[2],
+            **index_layer_kwargs,
+            impl=impl,
+        )
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -211,11 +307,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     layout in ("page_first_kv_split", "layer_first_kv_split")
                     and native.index_k is not None
                 ):
+                    index_page_size = native.index_k.shape[2]
+                    index_compress_ratio = self.page_size // index_page_size
                     self._size_per_token += (
-                        native.index_width * self.dtype.itemsize * index_layers
+                        native.index_width
+                        * self.dtype.itemsize
+                        * index_layers
+                        // index_compress_ratio
                     )
                     if native.index_scales is not None:
-                        self._size_per_token += 4 * index_layers
+                        self._size_per_token += 4 * index_layers // index_compress_ratio
                 self.device_kv_buffers = ()
                 self.device_data_ptrs = None
             else:
@@ -416,10 +517,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             # mirror uses (page, num_indexer_layers, ...).
             native = self._native_buffers
             base_dims = (self.page_num, self.layer_num, self.page_size, 1)
+            index_page_size = (
+                native.index_k.shape[2]
+                if native.index_k is not None
+                else self.page_size
+            )
             indexer_dims = (
                 self.page_num,
                 len(native.index_layer_indices),
-                self.page_size,
+                index_page_size,
                 1,
             )
             return self._init_kv_split_buffer(
@@ -659,18 +765,16 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
-            if self.layout == "page_first_kv_split":
-                transfer = transfer_kv_per_layer_kv_split_pf_lf
-            elif self.layout == "layer_first_kv_split":
-                transfer = transfer_kv_per_layer_kv_split
-            else:
+            if self.layout not in ("page_first_kv_split", "layer_first_kv_split"):
                 raise ValueError(f"Unsupported layout: {self.layout}")
             binding = self._npu_layer_bindings[layer_id]
             if binding is None:
                 return
-            transfer(
+            transfer_kv_split_npu(
                 device_indices=device_indices,
                 host_indices=host_indices,
+                is_host_pf=self.layout == "page_first_kv_split",
+                is_d2h=False,
                 **binding,
                 impl="auto",
             )
@@ -998,16 +1102,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
-            if self.layout == "page_first_kv_split":
-                transfer = transfer_kv_all_layer_kv_split_lf_pf
-            elif self.layout == "layer_first_kv_split":
-                transfer = transfer_kv_all_layer_kv_split
-            else:
+            if self.layout not in ("page_first_kv_split", "layer_first_kv_split"):
                 raise ValueError(f"Unsupported layout: {self.layout}")
             for native, host_k, host_v, is_target in self._npu_pool_bindings:
-                transfer(
+                transfer_kv_split_npu(
                     device_indices=device_indices,
                     host_indices=host_indices,
+                    is_host_pf=self.layout == "page_first_kv_split",
+                    is_d2h=True,
                     device_k=native.k,
                     host_k=host_k,
                     device_v=native.v,
@@ -1118,6 +1220,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             index_k_width = (
                 index_k_buffer.shape[-1] if index_k_buffer is not None else 0
             )
+            index_page_size = (
+                index_k_buffer.shape[2]
+                if index_k_buffer is not None
+                else self.page_size
+            )
             index_k_item_size = (
                 index_k_buffer.element_size() if index_k_buffer is not None else 0
             )
@@ -1142,20 +1249,25 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     ptr_list.append(v_ptr)
                 if index_k_buffer_data_ptr is not None:
                     # Host index_k layout is (page_num, num_indexer_layers,
-                    # page_size, 1, index_head_dim).
+                    # index_page_size, 1, index_head_dim).
                     ptr_list.append(
                         index_k_buffer_data_ptr
-                        + indices[index]
+                        + (indices[index] // self.page_size)
+                        * index_page_size
                         * num_indexer_layers
                         * index_k_width
                         * index_k_item_size
                     )
                 if scale_buffer_data_ptr is not None:
                     # Host scale layout is (page_num, num_indexer_layers,
-                    # page_size, 1, 1) FP32: one scale value per token per
+                    # index_page_size, 1, 1) FP32: one scale value per entry per
                     # indexer layer.
                     ptr_list.append(
-                        scale_buffer_data_ptr + indices[index] * num_indexer_layers * 4
+                        scale_buffer_data_ptr
+                        + (indices[index] // self.page_size)
+                        * index_page_size
+                        * num_indexer_layers
+                        * 4
                     )
             k_element_size = self.layer_num * k_item_size * self.page_size * k_width
             v_element_size = (
@@ -1165,9 +1277,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 * self.qk_rope_head_dim
             )
             index_k_element_size = (
-                num_indexer_layers * index_k_item_size * self.page_size * index_k_width
+                num_indexer_layers * index_k_item_size * index_page_size * index_k_width
             )
-            scale_element_size = num_indexer_layers * 4 * self.page_size
+            scale_element_size = num_indexer_layers * 4 * index_page_size
             element_size_list = []
             for _ in range(0, len(indices), self.page_size):
                 element_size_list.append(k_element_size)
