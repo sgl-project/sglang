@@ -4,6 +4,12 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "MiniMax-H3-Image",
+      modelIds: ["MiniMaxAI/MiniMax-H3-Image"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3-Image",
+      note: "Six-step PDD text-to-image and image editing.",
+    },
+    {
       name: "MOSS-Image",
       modelIds: ["OpenMOSS-Team/MOSS-Image-Base", "OpenMOSS-Team/MOSS-Image-SFT"],
       cookbook: "/cookbook/diffusion/OpenMOSS/MOSS-Image",
@@ -143,6 +149,12 @@ export const DiffusionModelCatalog = ({ category }) => {
       name: "GLM-Image",
       modelIds: ["zai-org/GLM-Image"],
       note: "Resolved by the GLM-Image family detector.",
+    },
+    {
+      name: "HiDream-O1-Image",
+      modelIds: ["HiDream-ai/HiDream-O1-Image"],
+      cookbook: "/cookbook/diffusion/HiDream/HiDream-O1-Image",
+      note: "Pixel-space unified transformer: no VAE, single monolithic role, sequence parallelism unsupported.",
     },
     {
       name: "Hunyuan3D 2",
@@ -344,6 +356,14 @@ export const DiffusionModelCatalog = ({ category }) => {
       name: "FLUX 3 Action",
       modelIds: ["black-forest-labs/flux-3-action-droid"],
       cookbook: "/cookbook/vla/FLUX/FLUX-3-Action",
+    },
+    {
+      name: "Praxis-1",
+      modelIds: [
+        "runwayml/praxis-1-droid-lerobot",
+        "runwayml/praxis-1-yam-lerobot",
+      ],
+      cookbook: "/cookbook/vla/Runway/Praxis-1",
     },
     {
       name: "LingBotWorld",
