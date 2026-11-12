@@ -5,7 +5,6 @@ from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 import torch
-import torch_mlu  # noqa: F401
 import torch_mlu_ops
 
 from sglang.srt.hardware_backend.mlu.attention.mha_backend import MLUMHABackend

@@ -4,7 +4,6 @@ import unittest
 from types import SimpleNamespace as NS
 
 import torch
-import torch_mlu  # noqa: F401
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlu.attention.mla_backend import MLUMLABackend

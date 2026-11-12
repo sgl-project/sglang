@@ -3,7 +3,6 @@
 import unittest
 
 import torch
-import torch_mlu  # noqa: F401
 
 from sglang.kernels.ops.kvcache.mla_buffer_mlu import get_mla_kv_buffer_mlu
 from sglang.test.ci.ci_register import register_mlu_ci
