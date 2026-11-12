@@ -689,18 +689,6 @@ def handle_missing_default_values(server_args: Any):
     if envs.SGLANG_USE_MODELSCOPE.get():
         handle_modelscope_paths(server_args)
 
-    # Model-specific defaults replace the eviction policy only when it was left unset.
-    if cfg._radix_eviction_policy_explicitly_set is None:
-        declare_resolution(
-            server_args,
-            "_handle_missing_default_values",
-            _radix_eviction_policy_explicitly_set=cfg.radix_eviction_policy is not None,
-        )
-    if cfg.radix_eviction_policy is None:
-        declare_resolution(
-            server_args, "_handle_missing_default_values", radix_eviction_policy="lru"
-        )
-
     # In speculative scenario:
     # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
     # - Otherwise, the draft model defaults to the same quantization as the target model.
