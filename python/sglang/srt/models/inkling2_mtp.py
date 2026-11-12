@@ -17,6 +17,7 @@ from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models import inkling2_mtp_hip
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.models.dspark import (
     BaseDSparkMarkovHead,
@@ -48,6 +49,8 @@ class Inkling2MTPHead(BaseDSparkMarkovHead):
         assert weight.ndim == 2 and weight.shape[1] == self.hidden_size
         self._fold_weight = weight.new_empty((weight.shape[0], self.markov_rank))
         self._fold_bias = weight.new_empty((weight.shape[0],))
+        if get_platform().is_hip:
+            inkling2_mtp_hip.attach_zero_state(self, weight)
         self.refresh_fold(weight, multiplier)
 
     @torch.no_grad()
@@ -70,6 +73,10 @@ class Inkling2MTPHead(BaseDSparkMarkovHead):
         return self.markov_w1(token_ids.long())
 
     def _rnn_step(self, state, prev_tokens, hidden, f_rnn):
+        if get_platform().is_hip:
+            out = inkling2_mtp_hip.run_rnn_step(self, state, prev_tokens, hidden, f_rnn)
+            if out is not None:
+                return out
         inputs = rnn_inputs(state, prev_tokens, self.markov_w1.weight, hidden, f_rnn)
         return rnn_gates(self.rnn_proj(inputs), state)
 
@@ -79,14 +86,27 @@ class Inkling2MTPHead(BaseDSparkMarkovHead):
         f_rnn = self._get_staged_f()
         assert f_rnn is not None and f_rnn.shape[0] >= batch_size
         assert f_rnn.shape[1] == self.hidden_size
-        return (
-            hidden_states.new_zeros(batch_size, self.markov_rank),
-            f_rnn[:batch_size].to(hidden_states.dtype),
-        )
+        zeros = None
+        if get_platform().is_hip:
+            zeros = inkling2_mtp_hip.zero_state(self, hidden_states)
+        if zeros is None:
+            zeros = hidden_states.new_zeros(batch_size, self.markov_rank)
+        return zeros, f_rnn[:batch_size].to(hidden_states.dtype)
 
-    def step_bias(self, prev_tokens, *, hidden_states, state):
+    def step_latent(self, prev_tokens, *, hidden_states, state):
         state, f_rnn = state
         state, latent = self._rnn_step(state, prev_tokens, hidden_states, f_rnn)
+        return latent, (state, f_rnn)
+
+    def step_fold(self):
+        if self.vocab_shard is None or self._fold_weight is None:
+            return None
+        return self._fold_weight, self._fold_bias
+
+    def step_bias(self, prev_tokens, *, hidden_states, state):
+        latent, state = self.step_latent(
+            prev_tokens, hidden_states=hidden_states, state=state
+        )
         assert self._fold_weight is not None and self._fold_bias is not None
         assert self._gather_logits is not None
         bias = torch.addmm(
@@ -94,7 +114,7 @@ class Inkling2MTPHead(BaseDSparkMarkovHead):
         )
         if self.vocab_shard is None:
             bias = self._gather_logits(bias)
-        return bias, (state, f_rnn)
+        return bias, state
 
     def step_logits_dtype(self, base_dtype):
         return torch.promote_types(base_dtype, self._fold_weight.dtype)
@@ -157,6 +177,8 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
             )
             attn.k_norm_ctx = RMSNorm(attn.head_dim, eps=eps)
             layer.dflare_norm = RMSNorm(hidden, eps=eps)
+        if get_platform().is_hip:
+            inkling2_mtp_hip.use_triton_norms(self)
 
     def set_block_size(self, block_size):
         if block_size != self.block_size:
@@ -249,11 +271,16 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
         self, *, req_pool_indices, verify_hidden, commit_lens, stride, valid=None
     ):
         bs = commit_lens.shape[0]
-        rows = torch.arange(bs, device=verify_hidden.device)
-        last_hidden = verify_hidden.view(bs, stride, -1)[rows, commit_lens.long() - 1]
         indices = req_pool_indices[:bs].view(-1).long()
         if valid is not None:
             indices = torch.where(valid, indices, self._f_rnn_buf.shape[0] - 1)
+        if get_platform().is_hip:
+            inkling2_mtp_hip.store_last_f_rnn(
+                self, indices, verify_hidden.view(bs, stride, -1), commit_lens
+            )
+            return
+        rows = torch.arange(bs, device=verify_hidden.device)
+        last_hidden = verify_hidden.view(bs, stride, -1)[rows, commit_lens.long() - 1]
         self.store_f_rnn(indices, last_hidden)
 
     @torch.no_grad()
@@ -303,6 +330,15 @@ class Inkling2ForConditionalGenerationMTP(DSparkDraftModel):
             attn = layer.self_attn
             context = self._mix_norm(targets, i, layer.dflare_norm)
             kv, _ = attn.kv_proj_ctx(context.to(attn.kv_proj_ctx.weight.dtype))
+            if (
+                get_platform().is_hip
+                and cache_loc_2d is not None
+                and commit_lens is not None
+                and inkling2_mtp_hip.store_context_kv(
+                    pool, attn, kv, positions, cache_loc_2d, swa_loc, commit_lens
+                )
+            ):
+                continue
             k, v = kv.split([attn.kv_size, attn.kv_size], dim=-1)
             k = attn.k_norm_ctx(k.reshape(-1, attn.head_dim)).view_as(k)
             k = attn.apply_k_rope(positions, k)

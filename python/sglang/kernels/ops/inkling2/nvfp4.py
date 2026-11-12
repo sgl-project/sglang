@@ -4,7 +4,6 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
-from sglang.kernels.ops.inkling2.cute_grouped_nvfp4 import routed_swap_matmul
 
 PDL = is_arch_support_pdl()
 SWAP_AB_MAX_ROWS = 20480
@@ -388,6 +387,8 @@ def routed_expert_matmul(x, dst2src, top_k, weight, scales, counts, offsets, sch
             values, weight, scales, counts, offsets, accumulator, workspace, sm_count
         )
     else:
+        from sglang.kernels.ops.inkling2.cute_grouped_nvfp4 import routed_swap_matmul
+
         routed_swap_matmul(
             values, x_scales, weight, scales, counts, offsets, schedule, accumulator
         )
@@ -448,6 +449,8 @@ def routed_swiglu_expert_matmul(
             values, weight, scales, counts, offsets, out, workspace, sm_count
         )
     else:
+        from sglang.kernels.ops.inkling2.cute_grouped_nvfp4 import routed_swap_matmul
+
         routed_swap_matmul(
             values, x_scales, weight, scales, counts, offsets, schedule, out
         )

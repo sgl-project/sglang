@@ -561,7 +561,10 @@ def test_nvfp4_reload_reaches_captured_cuda_graph(monkeypatch):
     assert torch.equal(captured.view(torch.uint8), expected.view(torch.uint8))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.skipif(
+    torch.version.hip is not None or not torch.cuda.is_available(),
+    reason="Requires a CUDA GPU",
+)
 def test_domain_paged_empty():
     from cuda.bindings import driver as cu
 

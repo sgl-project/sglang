@@ -7,6 +7,12 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.inkling2.portability import (
+    gdc_launch_dependents,
+    gdc_wait,
+    pdl_launch,
+)
+
 MAX_SPLITS = 64
 
 
@@ -41,8 +47,8 @@ def _decode_partials(
     WINDOW: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    gdc_wait()
+    gdc_launch_dependents()
     b = tl.program_id(0) // HEADS_K
     hk = tl.program_id(0) % HEADS_K
     split = tl.program_id(1)
@@ -170,7 +176,7 @@ def decode_partials(
         block_n,
         num_warps=4,
         num_stages=2 if qlen == 1 else 3,
-        launch_pdl=True,
+        **pdl_launch(),
     )
     return o, m, l
 

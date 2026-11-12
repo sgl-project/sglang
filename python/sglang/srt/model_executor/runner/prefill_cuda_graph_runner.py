@@ -53,7 +53,7 @@ from sglang.kernels.ops.attention.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.configs.model_config import is_qwen4_exp
-from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.distributed.parallel_state import aiter_copy_in_capture, graph_capture
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
@@ -1804,7 +1804,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         dp_flags = get_flags().dp
         dp_flags.capturing_prefill_graph = True
         try:
-            with freeze_gc(get_exec().graph.enable_cudagraph_gc):
+            # the decode graphs captured after these share the graph pool
+            with (
+                freeze_gc(get_exec().graph.enable_cudagraph_gc),
+                aiter_copy_in_capture(),
+            ):
                 with graph_capture(
                     stream=get_or_create_global_graph_capture_stream()
                 ) as graph_capture_context:

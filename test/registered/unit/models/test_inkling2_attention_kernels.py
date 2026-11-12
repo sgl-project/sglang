@@ -14,13 +14,17 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-gb300")
 
 hopper_or_blackwell = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+    torch.version.hip is not None
+    or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] < 9,
     reason="Requires a Hopper or Blackwell GPU",
 )
 
 
 blackwell = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    torch.version.hip is not None
+    or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] < 10,
     reason="Requires a Blackwell GPU",
 )
 
@@ -546,7 +550,7 @@ def test_markov_rnn_gates_and_softcap():
 
 
 requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(),
+    torch.version.hip is not None or not torch.cuda.is_available(),
     reason="Requires the compiled CUDA attention backend",
 )
 

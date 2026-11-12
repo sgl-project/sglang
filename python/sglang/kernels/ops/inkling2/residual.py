@@ -3,14 +3,19 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.inkling2.portability import (
+    gdc_launch_dependents,
+    gdc_wait,
+    pdl_launch,
+)
 
 PDL = is_arch_support_pdl()
 
 
 @triton.jit
 def _residual_add_kernel(output, inputs, size, BLOCK: tl.constexpr):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    gdc_wait()
+    gdc_launch_dependents()
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     result = tl.zeros((BLOCK,), dtype=tl.float32)
     for index in tl.static_range(len(inputs)):
@@ -28,6 +33,6 @@ def residual_add(*inputs: torch.Tensor) -> torch.Tensor:
     result = torch.empty_like(inputs[0])
     if result.numel():
         _residual_add_kernel[(triton.cdiv(result.numel(), 1024),)](
-            result, inputs, result.numel(), BLOCK=1024, launch_pdl=PDL
+            result, inputs, result.numel(), BLOCK=1024, **pdl_launch(PDL)
         )
     return result

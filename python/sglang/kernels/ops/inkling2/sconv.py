@@ -3,6 +3,12 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.kernels.ops.inkling2.portability import (
+    IS_HIP,
+    gdc_launch_dependents,
+    gdc_wait,
+    pdl_launch,
+)
 
 PDL = is_arch_support_pdl()
 _CUDA_TYPES = {torch.float32: "float", torch.bfloat16: "__nv_bfloat16"}
@@ -61,8 +67,8 @@ def _sconv_kernel(
     WINDOW: tl.constexpr = False,
     ROUND_BF16: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    gdc_wait()
+    gdc_launch_dependents()
     row = tl.program_id(0)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     valid = col < D
@@ -206,8 +212,8 @@ def _sconv_prefill_kernel(
     BN: tl.constexpr,
 ):
     """_sconv_kernel for extend batches over (BM rows, BN columns) tiles."""
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    gdc_wait()
+    gdc_launch_dependents()
     rows = tl.program_id(0) * BM + tl.arange(0, BM)
     col = tl.program_id(1) * BN + tl.arange(0, BN)
     valid = (rows < n_rows)[:, None] & (col < D)[None, :]
@@ -308,6 +314,8 @@ def _cuda_sconv(
     """_sconv_kernel in CUDA; False when an operand layout or dtype is unsupported.
     FP32 x only in the routed epilogue, and with top-k rows only under round_bf16
     (the CUDA gather rounds the sum to bf16)."""
+    if IS_HIP:
+        return False
     rows, d = (attention if attention is not None else x).shape
     ints = (
         metadata["safe_idx"],
@@ -453,7 +461,7 @@ def short_convolution(
                 16,
                 128,
                 enable_fp_fusion=False,
-                launch_pdl=PDL,
+                **pdl_launch(PDL),
             )
             return output
         if _cuda_sconv(
@@ -507,7 +515,7 @@ def short_convolution(
             SWW=window.stride(2) if window is not None else 0,
             WINDOW=window is not None,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            **pdl_launch(PDL),
         )
     return output
 
@@ -598,6 +606,6 @@ def routed_sconv_epilogue(
             SWW=window.stride(2) if window is not None else 0,
             WINDOW=window is not None,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            **pdl_launch(PDL),
         )
     return out

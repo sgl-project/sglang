@@ -4,6 +4,13 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.kernels.ops.inkling2.portability import (
+    IS_HIP,
+    approx_f32,
+    gdc_launch_dependents,
+    gdc_wait,
+    pdl_launch,
+)
 
 PDL = is_arch_support_pdl()
 REL_WORKERS = 4
@@ -11,14 +18,7 @@ REL_WORKERS = 4
 
 @triton.jit
 def _rsqrt_approx(x):
-    return tl.inline_asm_elementwise(
-        "rsqrt.approx.f32 $0, $1;",
-        "=f,f",
-        [x],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    return approx_f32(x, "rsqrt.approx.f32")
 
 
 @triton.jit
@@ -279,6 +279,20 @@ def _verify_sconv(
 
 
 @triton.jit
+def _store_pool(KPool, VPool, PoolLoc, pool_stride, row, k, v, KV_HEADS: tl.constexpr):
+    """The row's K and V into the KV cache pool at its write loc, as the attention
+    backend's save would store them (padding rows included)."""
+    slot = tl.load(PoolLoc + row).to(tl.int64)
+    offs = (
+        slot * pool_stride
+        + tl.arange(0, KV_HEADS)[:, None] * 128
+        + tl.arange(0, 128)[None, :]
+    )
+    tl.store(KPool + offs, k.to(KPool.dtype.element_ty))
+    tl.store(VPool + offs, v.to(VPool.dtype.element_ty))
+
+
+@triton.jit
 def _attention_prologue(
     QX,
     KX,
@@ -343,9 +357,14 @@ def _attention_prologue(
     VERIFY: tl.constexpr = False,
     dyn_rows=0,
     DYN_GROUPS: tl.constexpr = 0,
+    KPool=None,
+    VPool=None,
+    PoolLoc=None,
+    pool_stride=0,
+    STORE_POOL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    gdc_wait()
+    gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64)
     part = tl.program_id(1)
     tau = 1.0
@@ -497,6 +516,8 @@ def _attention_prologue(
         tl.store(K + row * KV_WIDTH + heads_kv[:, None] * 128 + cols_kv[None, :], k)
         v = _rms_norm128(VConv + row * KV_WIDTH, norm_eps, KV_HEADS)
         tl.store(V + row * KV_WIDTH + heads_kv[:, None] * 128 + cols_kv[None, :], v)
+        if STORE_POOL:
+            _store_pool(KPool, VPool, PoolLoc, pool_stride, row, k, v, KV_HEADS)
     elif part == 1:
         heads_q = tl.arange(0, HEADS_P)
         cols_q = tl.arange(0, 128)
@@ -658,6 +679,8 @@ def _cuda_prologue(
     (else decode, with track = (track_mask, track_indices) or None); False when
     unsupported. With shear = (seqlens_k, window_left, left_pad), verify writes
     the rel rows sheared as FA4's ShearingBias would."""
+    if IS_HIP:
+        return False
     q, k, v, rel = outputs
     decode = windows is None
     k_window, v_window = (k_cache, v_cache) if decode else windows
@@ -814,6 +837,7 @@ def attention_prologue(
     track_indices=None,
     verify_windows=None,
     shear=None,
+    kv_pool=None,
 ):
     """Decode attention prologue in one launch: K/V short convolutions (with cache
     update), Q/K/rel L2 clips (with log-scaling tau when positions is given), and
@@ -828,7 +852,9 @@ def attention_prologue(
     (seqlens_k, window_left) (verify only), the rel bias is written sheared as
     FA4's ShearingBias builds it from the compact one for that verify attention
     call: seqlens_k its cache_seqlens, window_left its left window or None (a
-    window must be rel_extent - 1, as FA4 requires)."""
+    window must be rel_extent - 1, as FA4 requires). kv_pool (k_buffer, v_buffer,
+    loc) also stores each row's K and V into the KV cache (the Triton prologue only;
+    the attention then skips its own save)."""
     tokens = q_in.shape[0]
     kv_width = kv_heads * 128
     device = q_in.device
@@ -867,6 +893,7 @@ def attention_prologue(
     assert shear is None or verify
     if (
         tokens
+        and kv_pool is None
         and _cuda_prologue(
             q_in,
             k_in,
@@ -964,8 +991,13 @@ def attention_prologue(
             verify,
             tokens,
             k_dynamic.shape[0] if dynamic and k_dynamic.ndim == 3 else 0,
+            *(
+                (kv_pool[0], kv_pool[1], kv_pool[2], kv_pool[0].stride(0), True)
+                if kv_pool is not None
+                else ()
+            ),
             num_warps=4,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            **pdl_launch(PDL),
         )
     return q, k, v, rel

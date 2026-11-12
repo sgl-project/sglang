@@ -1,6 +1,7 @@
 """Config-time override declarations for inkling."""
 
 import logging
+import os
 from typing import Any, Dict
 
 from sglang.srt.arg_groups.model_override_base import (
@@ -8,7 +9,9 @@ from sglang.srt.arg_groups.model_override_base import (
     is_attention_backend_not_set,
     resolving_view,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.common import is_gfx95_supported
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,41 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["tool_call_parser"] = "inkling2"
         if cfg.reasoning_parser is None:
             overrides["reasoning_parser"] = "inkling"
+        # ROCm decode: KV splits of 32 keys, up to 128 per request (swept on MI350X)
+        if get_platform().is_hip:
+            if (
+                not is_gfx95_supported()
+                and not envs.SGLANG_INKLING2_ALLOW_UNVALIDATED_ROCM.get()
+            ):
+                raise ValueError(
+                    "Inkling2 on ROCm is validated on gfx950 (MI350X / MI355X) only; its "
+                    "kernels are sized and tuned there. Set "
+                    "SGLANG_INKLING2_ALLOW_UNVALIDATED_ROCM=1 to run it anyway."
+                )
+            if "megamoe" in (cfg.moe_a2a_backend, cfg.moe_runner_backend):
+                raise ValueError(
+                    "Inkling2's MegaMoE runs DeepGEMM kernels over CUDA symmetric "
+                    "memory; on ROCm its experts run their own kernels with an "
+                    "expert-parallel all-reduce. Drop --moe-a2a-backend / "
+                    "--moe-runner-backend megamoe."
+                )
+            if not envs.SGLANG_TRITON_DECODE_SPLIT_MIN_TOKENS.is_set():
+                envs.SGLANG_TRITON_DECODE_SPLIT_MIN_TOKENS.set("32")
+            if not envs.SGLANG_TRITON_DECODE_SPLIT_MAX.is_set():
+                envs.SGLANG_TRITON_DECODE_SPLIT_MAX.set("128")
+            # the image's INT8 quick reduce quantizes prefill all-reduces, which moves
+            # outputs off the exact-reduction reference
+            quick_reduce = os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")
+            if (
+                quick_reduce != "NONE"
+                and not envs.SGLANG_INKLING2_ALLOW_QUICK_REDUCE.get()
+            ):
+                logger.info(
+                    "Inkling2 keeps exact all-reduces on ROCm: ignoring "
+                    f"ROCM_QUICK_REDUCE_QUANTIZATION={quick_reduce} (set "
+                    "SGLANG_INKLING2_ALLOW_QUICK_REDUCE=1 to keep it)."
+                )
+                os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] = "NONE"
         # Inkling2's MegaMoE path slices the replicated attention-TP tokens itself;
         # the scheduler-side attn-TP gather would only pad batches to attn_tp_size.
         if cfg.moe_a2a_backend == "megamoe" and not cfg.enable_dp_attention:

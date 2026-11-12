@@ -22,6 +22,7 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models import inkling2_hip
 from sglang.srt.models.inkling_common.inkling2_attn import (
     AttentionSources,
     Inkling2Attention,
@@ -44,6 +45,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
     get_parallel,
+    get_platform,
     get_spec,
 )
 from sglang.srt.utils import add_prefix
@@ -56,6 +58,7 @@ class Inkling2DecoderLayer(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.is_local = layer_id in config.local_layer_ids
+        self.fused_norms = get_platform().is_hip
         self.attn = Inkling2Attention(
             config, layer_id, self.is_local, prefix=add_prefix("attn", prefix)
         )
@@ -96,8 +99,10 @@ class Inkling2DecoderLayer(nn.Module):
         )
 
     def forward(self, state, positions, forward_batch):
-        streams = state.attention_input(self.layer_id)
-        if self.is_local:
+        streams = None if self.fused_norms else state.attention_input(self.layer_id)
+        if self.fused_norms:
+            attn_input = inkling2_hip.attention_input(self, state)
+        elif self.is_local:
             attn_input = self.attn_norm(streams[0])
         else:
             stacked = streams[0].new_empty(
@@ -111,7 +116,10 @@ class Inkling2DecoderLayer(nn.Module):
             )
         attention = self.attn(attn_input, positions, forward_batch)
         attention = self.attn_sconv(attention, positions, forward_batch)
-        mlp_input = self.mlp_norm(state.mlp_input(self.layer_id, attention))
+        if self.fused_norms:
+            mlp_input = inkling2_hip.mlp_input(self, state, attention)
+        else:
+            mlp_input = self.mlp_norm(state.mlp_input(self.layer_id, attention))
         routed = forward_batch.forward_mode.is_decode() or (
             forward_batch.forward_mode.is_target_verify()
             and attention.shape[0] <= VERIFY_ROUTED_EPILOGUE_MAX_TOKENS

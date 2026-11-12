@@ -4,6 +4,12 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.inkling2.portability import (
+    IS_HIP,
+    gdc_launch_dependents,
+    gdc_wait,
+    pdl_launch,
+)
 
 PDL = is_arch_support_pdl()
 
@@ -74,8 +80,8 @@ def _linear_k_group_partials(
 ):
     """With X2 and W2, groups past the first cdiv(K, 1024) compute X2 @ W2.T
     into the next (groups, M, N) block of P."""
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    gdc_wait()
+    gdc_launch_dependents()
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     group = tl.program_id(2)
@@ -112,8 +118,8 @@ def _linear_k_group_partials(
 def _linear_k_group_sum(
     P, B, Y, M, N: tl.constexpr, GROUPS: tl.constexpr, HAS_BIAS: tl.constexpr
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    gdc_wait()
+    gdc_launch_dependents()
     offsets = tl.program_id(0) * 256 + tl.arange(0, 256)
     mask = offsets < M * N
     total = tl.load(P + offsets, mask, other=0)
@@ -164,7 +170,7 @@ def linear_k_group_partials(flat, weight, block_k=256, num_stages=3):
         num_warps=8 if wide else 4,
         num_stages=min(num_stages, 2) if wide else num_stages,
         enable_fp_fusion=False,
-        launch_pdl=PDL,
+        **pdl_launch(PDL),
     )
     return partials
 
@@ -198,7 +204,7 @@ def linear_k_group_partials_pair(x, weight, x2, weight2):
         num_warps=8 if wide else 4,
         num_stages=2 if wide else 3,
         enable_fp_fusion=False,
-        launch_pdl=PDL,
+        **pdl_launch(PDL),
     )
     return partials
 
@@ -216,18 +222,32 @@ def _linear_k_groups_split(flat, weight, bias, out, block_k=256, num_stages=3):
         groups,
         bias is not None,
         enable_fp_fusion=False,
-        launch_pdl=PDL,
+        **pdl_launch(PDL),
     )
 
 
-def uses_k_groups(x: torch.Tensor, weight: torch.Tensor) -> bool:
+def _k_group_tiles(x: torch.Tensor, weight: torch.Tensor) -> int:
+    rows = x.numel() // x.shape[-1] if x.shape[-1] else 0
+    return triton.cdiv(rows, 16) * triton.cdiv(weight.shape[0], 32)
+
+
+def uses_k_groups(
+    x: torch.Tensor, weight: torch.Tensor, *, partials: bool = False
+) -> bool:
+    # gfx950's 160 KB LDS fits the split-K partials path only up to 128 rows; with
+    # partials (the caller sums them) ROCm also takes the 1-, 2- and 4-output weights
     return (
         x.is_cuda
         and torch.cuda.get_device_capability(x.device)[0] in (9, 10)
+        and (
+            not IS_HIP
+            or x.numel() <= 128 * x.shape[-1]
+            and _k_group_tiles(x, weight) < 256
+        )
         and x.dtype == weight.dtype == torch.bfloat16
         and x.stride(-1) == weight.stride(-1) == 1
         and weight.shape[1] >= 2560
-        and weight.shape[0] not in (1, 2, 4)
+        and (weight.shape[0] not in (1, 2, 4) or partials and bool(IS_HIP))
     )
 
 
