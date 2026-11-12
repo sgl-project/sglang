@@ -36,10 +36,11 @@ _SRC = os.path.join(_DIR, "smallm_moe.hip")
 DIM = 4096
 MAX_TOK = 64  # kernel list capacity (tokens per expert) and workspace size
 # Dispatch cap per per-rank intermediate: above it aiter's flydsl path is faster
-# (crossover ~44 tokens at 256 / TP4). At 128 (TP8) the kernel stays ahead of aiter up
-# to its MAX_TOK capacity (0.92x of aiter's time at 64 tokens). The TP2 shape
-# (intermediate 512) has a lower crossover and is left to a follow-up.
-MAX_TOK_DISPATCH = {256: 40, 128: 64}
+# (crossover ~44 tokens at 256 / TP4). At 128 (TP8), on topk_ids captured from a
+# serving run, the crossover lies between 56 and 64 tokens (at most 0.96x of aiter's
+# time at 56, 1.03x at 64 MTP-verify tokens). The TP2 shape (intermediate 512) has a
+# lower crossover and is left to a follow-up.
+MAX_TOK_DISPATCH = {256: 40, 128: 56}
 MAX_TOK_DISPATCH_FP8 = {256: 20, 128: 48}  # crossover vs aiter's per_128x128 asm/CK
 
 _kernels: dict = {}

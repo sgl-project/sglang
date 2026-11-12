@@ -179,7 +179,7 @@ class TestSmallMMoeGfx950(CustomTestCase):
 class TestSmallMMoeGfx950I128(TestSmallMMoeGfx950):
     """MXFP4 at the TP8 per-rank intermediate 128 (4 scale columns, which e8m0_shuffle pads to 8)."""
 
-    INTER, CAP = 128, 64
+    INTER, CAP = 128, 56
 
 
 @unittest.skipUnless(_gfx950(), "gfx950 (MI35x) only")
