@@ -1,22 +1,9 @@
-"""Generic deterministic weight source for NPU RL weight-transfer tests.
+"""Deterministic reduced-model payloads for NPU RL weight-transfer tests.
 
-The published checkpoints used by these tests are far too large to read (GLM-5.2
-is ~1.4 TB). Instead a case describes a layer-reduced, expert-reduced variant of
-a HuggingFace model, and this module builds it from ``config.json`` alone:
-
-* a meta-device Transformers model enumerates the exact checkpoint-facing
-  parameter names, shapes and dtypes of the reduced model;
-* every tensor is regenerated from a per-name seed, so the payload is identical
-  across processes and runs;
-* ``write_checkpoint`` materializes the same payload as a normally loadable
-  checkpoint, which is the startup-load oracle for the tests.
-
-The case/adapter layout mirrors vLLM-Ascend's weight-transfer tests so another
-model can be added by declaring a ``WeightUpdateModelCase`` plus, where needed,
-a checkpoint name map / expert-shape adapter.
-
-Tensors are serialized as NPU IPC handles by the callers, so their bytes move
-through NPU shared memory rather than the HTTP request body.
+Each case describes a layer-reduced model. Names, shapes and dtypes come from a
+meta-device HuggingFace model built from the local ``config.json``; every tensor
+is regenerated from a per-name seed. ``write_checkpoint`` writes the same
+payload as a normally loadable checkpoint, used as the startup-load oracle.
 """
 
 from __future__ import annotations
@@ -51,8 +38,7 @@ TOKENIZER_FILES = (
     "merges.txt",
 )
 
-# Per-layer config lists whose length must match num_hidden_layers once the
-# model is reduced (transformers validates this for GlmMoeDsaConfig).
+# Per-layer lists that must match num_hidden_layers once the model is reduced.
 PER_LAYER_CONFIG_LISTS = ("mlp_layer_types", "indexer_types")
 
 SIGNATURE_PROMPTS = (
@@ -64,47 +50,29 @@ SIGNATURE_PROMPTS = (
 
 @dataclass(frozen=True)
 class WeightUpdateModelCase:
-    """A layer-reduced model whose complete parameter set is reloaded."""
+    """A reduced model whose complete parameter set is reloaded."""
 
     id: str
     model: str
     hf_overrides: Dict[str, Any]
-    # Local checkpoint directory. ``local_path_env`` overrides it so the same
-    # case runs on hosts that keep the model elsewhere.
     local_path: Optional[str] = None
-    local_path_env: Optional[str] = None
-    # HF attribute holding the text config (VLMs expose a nested one).
     meta_config_attribute: Optional[str] = None
-    # Namespace prefix applied to raw meta-model names (e.g. "model.language_model.").
     checkpoint_model_prefix: Optional[str] = None
-    # Rename map applied to the expanded (per-expert) checkpoint-facing names.
     checkpoint_name_map: Optional[Callable[[str], str]] = None
-    # Checkpoint expert MLP width when it differs from HF's from_config default.
     expert_intermediate_size: Optional[int] = None
-    # Floating buffers that are checkpoint tensors (routers keep them as buffers
-    # in HF). They are promoted to parameters before the payload is enumerated.
+    # Floating buffers that are checkpoint tensors, promoted to parameters.
     buffer_to_parameter: Tuple[str, ...] = ()
-    # Override for architectures without an AutoModelForCausalLM entry; the
-    # factory receives the (text) config and must build on the meta device.
     meta_model_factory: Optional[Callable[[Any], torch.nn.Module]] = None
     extra_server_args: Tuple[str, ...] = ()
     tags: Tuple[str, ...] = ()
 
 
 def model_path(case: WeightUpdateModelCase) -> str:
-    """Return the local checkpoint directory that provides config + tokenizer."""
-    candidates = []
-    if case.local_path_env:
-        candidates.append(os.environ.get(case.local_path_env))
-    candidates.append(case.local_path)
-    candidates.append(case.model)
-    for path in candidates:
+    """Local directory providing ``config.json`` and the tokenizer."""
+    for path in (case.local_path, case.model):
         if path and os.path.isfile(os.path.join(path, "config.json")):
             return path
-    raise RuntimeError(
-        f"{case.id}: config.json not found; set {case.local_path_env or 'the local path'} "
-        f"or provision one of {candidates}"
-    )
+    raise RuntimeError(f"{case.id}: config.json not found")
 
 
 @lru_cache(maxsize=None)
@@ -128,7 +96,6 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 
 
 def _slice_per_layer_lists(config: Dict[str, Any], layers: Optional[int]) -> None:
-    """Trim per-layer lists to ``num_hidden_layers`` at every nesting level."""
     for key, value in list(config.items()):
         if isinstance(value, dict):
             _slice_per_layer_lists(value, value.get("num_hidden_layers", layers))
@@ -139,7 +106,6 @@ def _slice_per_layer_lists(config: Dict[str, Any], layers: Optional[int]) -> Non
 def _fill_and_slice_overrides(
     raw_config: Dict[str, Any], overrides: Dict[str, Any]
 ) -> None:
-    """Add the source's per-layer lists (sliced) at each reduced level."""
     layers = overrides.get("num_hidden_layers")
     if isinstance(layers, int):
         for key in PER_LAYER_CONFIG_LISTS:
@@ -221,7 +187,6 @@ def expand_fused_expert_params(
 def resize_expert_shape(
     name: str, shape: Tuple[int, ...], intermediate_size: Optional[int]
 ) -> Tuple[int, ...]:
-    """Force expert MLP tensors to the checkpoint's intermediate dimension."""
     if intermediate_size is None:
         return shape
     for suffix in (
@@ -416,7 +381,6 @@ def _cache_key(case: WeightUpdateModelCase) -> str:
 
 
 def ensure_checkpoint(case: WeightUpdateModelCase) -> str:
-    """Return a cached reference checkpoint, building it on first use."""
     target = os.path.join(CACHE_ROOT, f"{case.id}-{_cache_key(case)}")
     checkpoint = os.path.join(target, "model.safetensors")
     config_path = os.path.join(target, "config.json")
@@ -439,7 +403,6 @@ GLM52_CASE = WeightUpdateModelCase(
     id="glm52-6l8e",
     model="zai-org/GLM-5.2",
     local_path=GLM_5_2_BF16_MODEL_PATH,
-    local_path_env="SGLANG_TEST_GLM52_PATH",
     hf_overrides={
         "num_hidden_layers": 6,
         "n_routed_experts": 8,
