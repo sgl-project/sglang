@@ -13,11 +13,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
-from sglang.multimodal_gen.configs.task_type import ModelTaskType
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 
 COSMOS3_DEFAULT_GUIDANCE_SCALE = 4.0
 COSMOS3_EDGE_T2I_GUIDANCE_SCALE = 7.0
@@ -72,6 +69,8 @@ class Cosmos3SamplingParams(SamplingParams):
     pick the right resolution at request time in
     :meth:`_resolve_variant_defaults`.
     """
+
+    _explicit_fields: ClassVar[set[str] | None] = None
 
     height: int | None = None
     width: int | None = None
@@ -183,6 +182,9 @@ class Cosmos3SamplingParams(SamplingParams):
     # into physical units with ``action_normalization``.
     action_stats_path: str | None = None
     action_normalization: str = "quantile"
+
+    def is_explicit(self, name: str) -> bool:
+        return self._explicit_fields is not None and name in self._explicit_fields
 
     @classmethod
     def image_request_extra_fields(cls) -> frozenset[str]:
@@ -442,6 +444,11 @@ class Cosmos3SamplingParams(SamplingParams):
                     "'policy', 'forward_dynamics', or 'inverse_dynamics'."
                 )
             action_output = self.action_mode != "forward_dynamics"
+            if action_output and self.num_outputs_per_prompt > 1:
+                raise ValueError(
+                    "Cosmos3 policy and inverse-dynamics requests return one "
+                    "prediction per input; num_outputs_per_prompt must be 1"
+                )
 
         # Apply transfer per-hint defaults before the base resolves remaining
         # fields (e.g. flow_shift per mode), so an unset flow_shift can pick up

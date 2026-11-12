@@ -6,10 +6,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import (
-    resolving_view,
-    supports_mamba_cache_extra_buffer,
-)
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -96,20 +95,35 @@ def handle_int8_mamba_checkpoint(server_args: Any):
             "--enable-int8-mamba-checkpoint is not supported together with "
             "--enable-lmcache: LMCache is not int8-aware. Disable one of them."
         )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "--enable-int8-mamba-checkpoint is not supported together with "
+            "--enable-unified-memory: the unified pool keeps no int8 checkpoint "
+            "pool, so the flag would have no effect. Disable one of them."
+        )
 
 
-def validate_mamba_extra_buffer(view, model_arch: str, *, mamba_cache_chunk_size_of):
-
-    assert supports_mamba_cache_extra_buffer(view, model_arch), (
-        f"extra_buffer is not supported for {model_arch}; use no_buffer."
+def _platform_supports_mamba_cache_extra_buffer() -> bool:
+    if current_platform.is_out_of_tree():
+        return current_platform.support_mamba_cache_extra_buffer()
+    platform = get_platform()
+    return (
+        platform.is_cuda
+        or platform.is_musa
+        or platform.is_npu
+        or platform.is_hip
+        or platform.is_xpu
     )
-    assert (
-        get_platform().is_cuda
-        or get_platform().is_musa
-        or get_platform().is_npu
-        or get_platform().is_hip
-        or get_platform().is_xpu
-    ), "extra_buffer needs CUDA/MUSA/NPU/ROCm/XPU (FLA)."
+
+
+def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_of):
+
+    assert supports_mamba_cache_extra_buffer(view, hf_config), (
+        f"extra_buffer is not supported for {hf_config.architectures[0]}; use no_buffer."
+    )
+    assert _platform_supports_mamba_cache_extra_buffer(), (
+        "extra_buffer requires platform support for Mamba cache state snapshots."
+    )
     if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
         # The PD-disagg decode pool is not wired for lazy slots.
         assert view.disaggregation_mode == "null", (

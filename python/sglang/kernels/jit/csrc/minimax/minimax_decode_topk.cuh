@@ -42,10 +42,11 @@ struct TopKTraitImpl {
   static constexpr uint32_t kCTASize = kNumThreads;
   static constexpr uint32_t kNumWarps = kCTASize / device::kWarpThreads;
   // Must match _MAX_NUM_BLOCKS in ops/attention/minimax_decode_topk.py.
-#ifdef USE_ROCM
   static constexpr uint32_t kMaxNumBlocks = 16384;  // block topk
-#else
-  static constexpr uint32_t kMaxNumBlocks = 4096;  // block topk
+#ifndef USE_ROCM
+  // Smallest register bucket for the multi-element radix path; the launchers
+  // instantiate larger ones on demand up to kMaxNumBlocks.
+  static constexpr uint32_t kMinNumBlocksBucket = 4096;
 #endif
   static constexpr uint32_t kSmallThreshold = 8 * kNumWarps;
   static constexpr uint32_t kRadixBits = 8;
@@ -61,7 +62,6 @@ struct TopKTraitImpl {
   struct Smem {
     uint32_t warp_sum[kNumWarps];
     alignas(128) uint32_t counter;
-    alignas(128) uint32_t counter_final;
     alignas(128) uint32_t threshold_bin;
     uint32_t equal_count;
     uint32_t above_count;
@@ -301,6 +301,9 @@ struct TopKTraitImpl {
   }
 #endif  // USE_ROCM
 
+  // kMaxBlocks is the CUDA register bucket; ROCm sizes its slots from
+  // num_blocks at run time instead.
+  template <uint32_t kMaxBlocks = kMaxNumBlocks>
   SGL_DEVICE static void forward(
       const float* __restrict__ scores,
       const uint32_t num_blocks,
@@ -368,6 +371,20 @@ struct TopKTraitImpl {
       }
       __syncthreads();
     };
+    // Number of threads with a lower tx whose `flag` is set; called by the whole
+    // CTA. Final-round ties are exactly equal scores; ranking them by block id
+    // makes the selection deterministic (lower id wins, as in the small path).
+    const auto block_rank = [&](bool flag) -> uint32_t {
+      using namespace device;
+      const uint32_t ballot = __ballot_sync(kWarpSyncMask, flag);
+      if (lane_id == 0) smem->warp_sum[warp_id] = __popc(ballot);
+      __syncthreads();
+      uint32_t base = 0;
+      for (uint32_t w = 0; w < warp_id; ++w)
+        base += smem->warp_sum[w];
+      __syncthreads();  // warp_sum is reused by the next call
+      return base + __popc(ballot & ((1u << lane_id) - 1u));
+    };
 
     if (num_blocks <= kSmallThreshold) {
       // O(n^2) compare: each block's rank = #blocks that outrank it; the ones
@@ -413,7 +430,7 @@ struct TopKTraitImpl {
       uint32_t topk_remain = topk;
       uint32_t write_pos = topk;  // sentinel: not selected
       if (tx < kRadixSize) smem->histogram[0][tx] = 0;
-      if (tx == kRadixSize) smem->counter = smem->counter_final = 0;
+      if (tx == kRadixSize) smem->counter = 0;
       __syncthreads();
       uint32_t total_active = num_blocks;
 
@@ -437,17 +454,24 @@ struct TopKTraitImpl {
         if (round < 3) total_active = equal_count;
         topk_remain -= above_count;
 
-        // scatter: above -> selected now; equal at the last pass -> keep the rest
+        // scatter: above -> selected now; equal at the last pass -> lowest ids first
         if (active) {
           if (bin > threshold_bin) {
             write_pos = atomicAdd(&smem->counter, 1);
             active = false;
           } else if (bin < threshold_bin) {
             active = false;
-          } else if (round == 3) {
-            write_pos = topk - topk_remain + atomicAdd(&smem->counter_final, 1);
           }
-          // bin == threshold && round < 3: stay active for the next pass
+          // bin == threshold: stays active (for the next pass, or as a tie below)
+        }
+        if (round == 3) {
+          if (equal_count <= topk_remain) {
+            // Every tie is selected, so slot order is free (the output is sorted).
+            if (active) write_pos = atomicAdd(&smem->counter, 1);
+          } else {
+            const auto rank = block_rank(active);
+            if (active && rank < topk_remain) write_pos = topk - topk_remain + rank;
+          }
         }
 
         if (round == 3 || topk_remain == 0) break;
@@ -455,15 +479,16 @@ struct TopKTraitImpl {
 
       if (write_pos < topk) topk_out[write_pos] = tx;
     } else {
-      // num_blocks in (kCTASize, kMaxNumBlocks]: each thread caches its (up to
+      // num_blocks in (kCTASize, kMaxBlocks]: each thread caches its (up to
       // kIters) slice of the row in registers -- read from global exactly ONCE --
       // then runs the same 4-pass radix select as the single-element path looped
       // over those slots. Liveness is a uint32_t bitmask (bit i = slot i still in
       // the running set), so there is no per-element flag array; selection is an
       // in-loop scatter, so there is no per-element position array. Nothing is
       // cached in shared memory beyond the histogram.
-      constexpr uint32_t kIters = kMaxNumBlocks / kCTASize;
+      constexpr uint32_t kIters = kMaxBlocks / kCTASize;
       static_assert(kIters <= 32, "active liveness is packed into a uint32_t");
+      static_assert(kMaxBlocks % kCTASize == 0, "bucket must be a multiple of kCTASize");
       uint32_t key[kIters];
       uint32_t active = 0;
 #pragma unroll
@@ -475,7 +500,7 @@ struct TopKTraitImpl {
         }
       }
       if (tx < kRadixSize) smem->histogram[0][tx] = 0;
-      if (tx == kRadixSize) smem->counter = smem->counter_final = 0;
+      if (tx == kRadixSize) smem->counter = 0;
       __syncthreads();
 
       uint32_t topk_remain = topk;
@@ -509,11 +534,26 @@ struct TopKTraitImpl {
               active &= ~(1u << i);
             } else if (bin < threshold_bin) {
               active &= ~(1u << i);
-            } else if (round == 3) {
-              const auto pos = topk - topk_remain + atomicAdd(&smem->counter_final, 1);
-              if (pos < topk) topk_out[pos] = i * kCTASize + tx;
             }
-            // bin == threshold && round < 3: slot stays live for the next pass
+            // bin == threshold: slot stays live (for the next pass, or as a tie below)
+          }
+        }
+        if (round == 3 && equal_count <= topk_remain) {
+          // Every tie is selected, so slot order is free (the output is sorted).
+#pragma unroll
+          for (uint32_t i = 0; i < kIters; ++i)
+            if (active & (1u << i)) topk_out[atomicAdd(&smem->counter, 1)] = i * kCTASize + tx;
+        } else if (round == 3) {
+          // Ties in block-id order: slot i holds ids i * kCTASize + tx, so slots
+          // are ranked in turn and each slot's ties by tx.
+          uint32_t taken = 0;
+          for (uint32_t i = 0; i < kIters && taken < topk_remain; ++i) {
+            const bool tie = (active >> i) & 1u;
+            const uint32_t num_ties = __syncthreads_count(tie);
+            if (num_ties == 0) continue;
+            const auto rank = taken + block_rank(tie);
+            if (tie && rank < topk_remain) topk_out[topk - topk_remain + rank] = i * kCTASize + tx;
+            taken += num_ties;
           }
         }
 
@@ -529,6 +569,15 @@ struct TopKTraitImpl {
 using TopKTrait = TopKTraitImpl<512>;
 #ifdef USE_ROCM
 using TopKTraitWide = TopKTraitImpl<1024>;
+#else
+// Smallest instantiated bucket covering max_seqblock, so a short row is not
+// charged the register footprint of the largest one.
+inline uint32_t topk_bucket_for(int max_seqblock) {
+  const auto n = static_cast<uint32_t>(max_seqblock);
+  if (n <= TopKTrait::kMinNumBlocksBucket) return TopKTrait::kMinNumBlocksBucket;          // 4096
+  if (n <= 2 * TopKTrait::kMinNumBlocksBucket) return 2 * TopKTrait::kMinNumBlocksBucket;  // 8192
+  return TopKTrait::kMaxNumBlocks;                                                         // 16384
+}
 #endif
 
 // -------------------------------------------------------------------------
@@ -541,7 +590,7 @@ using TopKTraitWide = TopKTraitImpl<1024>;
 // ascending), [k_eff:topk) = -1. Ascending order is a hard requirement of the
 // MSA fmha_sm100 consumer (kv_block_indexes must be strictly ascending; its
 // sorted-order early-exit otherwise mis-masks the partial last block).
-template <typename SeqLenT, bool kUsePDL, typename TopKTrait>
+template <typename SeqLenT, bool kUsePDL, typename TopKTrait, uint32_t kMaxBlocks = TopKTrait::kMaxNumBlocks>
 __global__ void minimax_decode_topk_block_kernel(
     const float* __restrict__ score,
     const SeqLenT* __restrict__ seq_lens,
@@ -573,7 +622,8 @@ __global__ void minimax_decode_topk_block_kernel(
   const float* __restrict__ row = score + (static_cast<int64_t>(h) * batch + b) * max_seqblock;
   __shared__ typename TopKTrait::Smem smem;
   __shared__ int32_t s_topk[TopKTrait::kMaxTopK];
-  TopKTrait::forward(row, static_cast<uint32_t>(num_blocks), s_topk, static_cast<uint32_t>(topk), &smem);
+  TopKTrait::template forward<kMaxBlocks>(
+      row, static_cast<uint32_t>(num_blocks), s_topk, static_cast<uint32_t>(topk), &smem);
   __syncthreads();  // s_topk fully written before the sort reads it
 
   // Emit ascending: num_blocks > topk here, so all topk slots hold distinct
@@ -636,7 +686,7 @@ __global__ void minimax_decode_topk_block_kernel(
 // [num_pages, nkv, page_size, D] reshaped to [num_pages*nkv, 1, page_size, D] (a
 // free view when the cache is contiguous HND). num_heads == 1 (h == 0) reproduces
 // the single-kv-head TP>=4 behavior (page index == base_page).
-template <typename SeqLenT, bool kUsePDL, typename TopKTrait>
+template <typename SeqLenT, bool kUsePDL, typename TopKTrait, uint32_t kMaxBlocks = TopKTrait::kMaxNumBlocks>
 __global__ void minimax_decode_topk_page_table_kernel(
     const float* __restrict__ score,
     const SeqLenT* __restrict__ seq_lens,
@@ -686,7 +736,8 @@ __global__ void minimax_decode_topk_page_table_kernel(
   const float* __restrict__ row = score + (static_cast<int64_t>(h) * batch + b) * max_seqblock;  // head-major score
   __shared__ typename TopKTrait::Smem smem;
   __shared__ int32_t s_topk[TopKTrait::kMaxTopK];
-  TopKTrait::forward(row, static_cast<uint32_t>(num_blocks), s_topk, static_cast<uint32_t>(topk), &smem);
+  TopKTrait::template forward<kMaxBlocks>(
+      row, static_cast<uint32_t>(num_blocks), s_topk, static_cast<uint32_t>(topk), &smem);
   __syncthreads();  // s_topk fully written before the transform reads it
 
   // Sort the selected block ids ascending (k_eff <= kMaxTopK is tiny) so the
@@ -737,7 +788,7 @@ void minimax_decode_topk(
   SymbolicSize S = {"max_seqblock"};
   SymbolicSize T = {"topk"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({H, B, S}).with_dtype<fp32_t>().with_device(device_).verify(score);
   TensorMatcher({B}).with_dtype<SeqLenT>().with_device(device_).verify(seq_lens);
@@ -786,17 +837,34 @@ void minimax_decode_topk(
     return;
   }
 #endif
-  LaunchKernel(grid, TopKTrait::kCTASize, device, 0)
-      .enable_pdl(kUsePDL)(
-          minimax_decode_topk_block_kernel<SeqLenT, kUsePDL, TopKTrait>,
-          static_cast<const float*>(score.data_ptr()),
-          static_cast<const SeqLenT*>(seq_lens.data_ptr()),
-          static_cast<int32_t*>(topk_idx.data_ptr()),
-          batch,
-          num_heads,
-          max_seqblock,
-          static_cast<int>(block_size),
-          topk_i);
+  auto launch = [&](auto kernel) {
+    LaunchKernel(grid, TopKTrait::kCTASize, device, 0)
+        .enable_pdl(kUsePDL)(
+            kernel,
+            static_cast<const float*>(score.data_ptr()),
+            static_cast<const SeqLenT*>(seq_lens.data_ptr()),
+            static_cast<int32_t*>(topk_idx.data_ptr()),
+            batch,
+            num_heads,
+            max_seqblock,
+            static_cast<int>(block_size),
+            topk_i);
+  };
+#ifdef USE_ROCM
+  launch(minimax_decode_topk_block_kernel<SeqLenT, kUsePDL, TopKTrait>);
+#else
+  switch (topk_bucket_for(max_seqblock)) {
+    case TopKTrait::kMinNumBlocksBucket:
+      launch(minimax_decode_topk_block_kernel<SeqLenT, kUsePDL, TopKTrait, TopKTrait::kMinNumBlocksBucket>);
+      break;
+    case 2 * TopKTrait::kMinNumBlocksBucket:
+      launch(minimax_decode_topk_block_kernel<SeqLenT, kUsePDL, TopKTrait, 2 * TopKTrait::kMinNumBlocksBucket>);
+      break;
+    default:
+      launch(minimax_decode_topk_block_kernel<SeqLenT, kUsePDL, TopKTrait, TopKTrait::kMaxNumBlocks>);
+      break;
+  }
+#endif
 }
 
 // Page-table variant: emit the per-(batch, kv-head) paged page table consumed by
@@ -828,7 +896,7 @@ void minimax_decode_topk_page_table(
   SymbolicSize BH = {"batch_heads"};
   SymbolicSize P = {"max_sparse_pages"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({H, B, S}).with_dtype<fp32_t>().with_device(device_).verify(score);
   TensorMatcher({B}).with_dtype<SeqLenT>().with_device(device_).verify(seq_lens);
@@ -891,24 +959,41 @@ void minimax_decode_topk_page_table(
     return;
   }
 #endif
-  LaunchKernel(grid, TopKTrait::kCTASize, device, 0)
-      .enable_pdl(kUsePDL)(
-          minimax_decode_topk_page_table_kernel<SeqLenT, kUsePDL, TopKTrait>,
-          static_cast<const float*>(score.data_ptr()),
-          static_cast<const SeqLenT*>(seq_lens.data_ptr()),
-          static_cast<const int32_t*>(req_to_token.data_ptr()),
-          static_cast<const int64_t*>(slot_ids.data_ptr()),
-          static_cast<int32_t*>(page_table.data_ptr()),
-          static_cast<int32_t*>(seq_lens_out.data_ptr()),
-          batch,
-          num_heads,
-          max_seqblock,
-          static_cast<int>(block_size),
-          static_cast<int>(topk),
-          static_cast<int>(page_size),
-          r2t_stride,
-          max_kv_len,
-          max_sparse_pages);
+  auto launch = [&](auto kernel) {
+    LaunchKernel(grid, TopKTrait::kCTASize, device, 0)
+        .enable_pdl(kUsePDL)(
+            kernel,
+            static_cast<const float*>(score.data_ptr()),
+            static_cast<const SeqLenT*>(seq_lens.data_ptr()),
+            static_cast<const int32_t*>(req_to_token.data_ptr()),
+            static_cast<const int64_t*>(slot_ids.data_ptr()),
+            static_cast<int32_t*>(page_table.data_ptr()),
+            static_cast<int32_t*>(seq_lens_out.data_ptr()),
+            batch,
+            num_heads,
+            max_seqblock,
+            static_cast<int>(block_size),
+            static_cast<int>(topk),
+            static_cast<int>(page_size),
+            r2t_stride,
+            max_kv_len,
+            max_sparse_pages);
+  };
+#ifdef USE_ROCM
+  launch(minimax_decode_topk_page_table_kernel<SeqLenT, kUsePDL, TopKTrait>);
+#else
+  switch (topk_bucket_for(max_seqblock)) {
+    case TopKTrait::kMinNumBlocksBucket:
+      launch(minimax_decode_topk_page_table_kernel<SeqLenT, kUsePDL, TopKTrait, TopKTrait::kMinNumBlocksBucket>);
+      break;
+    case 2 * TopKTrait::kMinNumBlocksBucket:
+      launch(minimax_decode_topk_page_table_kernel<SeqLenT, kUsePDL, TopKTrait, 2 * TopKTrait::kMinNumBlocksBucket>);
+      break;
+    default:
+      launch(minimax_decode_topk_page_table_kernel<SeqLenT, kUsePDL, TopKTrait, TopKTrait::kMaxNumBlocks>);
+      break;
+  }
+#endif
 }
 
 }  // namespace sglang

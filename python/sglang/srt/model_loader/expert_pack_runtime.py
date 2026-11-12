@@ -15,10 +15,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 
 METADATA_FORMAT_VERSION = 3
 GGUF_SHARD_SUFFIX_RE = re.compile(r"-\d{5}-of-\d{5}\.gguf$")
@@ -335,8 +333,16 @@ def _deepseek_model_config_from_gguf(reader: object) -> dict[str, Any]:
 def _write_deepseek_tokenizer_from_gguf(
     reader: object, output_dir: Path, config: dict[str, Any]
 ) -> None:
-    from tokenizers import AddedToken, Regex, normalizers, pre_tokenizers
-    from transformers.integrations.ggml import convert_gguf_tokenizer
+    from tokenizers import (
+        AddedToken,
+        Regex,
+        Tokenizer,
+        decoders,
+        models,
+        normalizers,
+        pre_tokenizers,
+        processors,
+    )
 
     tokenizer_type = _deepseek_gguf_value(reader, "tokenizer.ggml.model")
     pre_tokenizer_type = _deepseek_gguf_value(reader, "tokenizer.ggml.pre")
@@ -347,18 +353,21 @@ def _write_deepseek_tokenizer_from_gguf(
         )
     tokens = list(_deepseek_gguf_value(reader, "tokenizer.ggml.tokens"))
     token_types = list(_deepseek_gguf_value(reader, "tokenizer.ggml.token_type"))
-    tokenizer_data = {
-        "tokenizer_type": tokenizer_type,
-        "tokens": tokens,
-        "token_type": token_types,
-        "merges": list(_deepseek_gguf_value(reader, "tokenizer.ggml.merges")),
-        "bos_token_id": config["bos_token_id"],
-        "eos_token_id": config["eos_token_id"],
-        "pad_token_id": int(
-            _deepseek_gguf_value(reader, "tokenizer.ggml.padding_token_id")
-        ),
-    }
-    tokenizer, _ = convert_gguf_tokenizer("gpt2", tokenizer_data)
+    tokenizer = Tokenizer(
+        models.BPE(
+            vocab={token: index for index, token in enumerate(tokens)},
+            merges=[
+                tuple(merge.split(" "))
+                for merge in _deepseek_gguf_value(reader, "tokenizer.ggml.merges")
+            ],
+            dropout=None,
+            continuing_subword_prefix="",
+            end_of_word_suffix="",
+            fuse_unk=False,
+        )
+    )
+    tokenizer.decoder = decoders.ByteLevel()
+    tokenizer.post_processor = processors.ByteLevel(trim_offsets=False)
     tokenizer.add_special_tokens(
         [
             AddedToken(token, normalized=False, special=True)

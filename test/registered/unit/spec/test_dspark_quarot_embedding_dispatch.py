@@ -28,7 +28,7 @@ class _ForwardBoundaryReached(Exception):
 
 
 class _CaptureLayer(nn.Module):
-    def forward(self, positions, hidden_states, forward_batch, residual):
+    def forward(self, positions, hidden_states, forward_batch, residual, output_conv):
         self.hidden_states = hidden_states.detach().clone()
         raise _ForwardBoundaryReached
 
@@ -118,6 +118,7 @@ class TestDSparkQuaRotEmbeddingDispatch(CustomTestCase):
                 with torch.no_grad():
                     model.embed_tokens.weight.copy_(torch.arange(32).reshape(8, 4))
                 model._glm_dspark_quarot_config = object()
+                model.draft_config = SimpleNamespace(is_mla=False)
                 capture = _CaptureLayer()
                 model.layers = nn.ModuleList([capture])
                 forwarded = []
@@ -137,7 +138,9 @@ class TestDSparkQuaRotEmbeddingDispatch(CustomTestCase):
                 proposer.draft_model = model
                 proposer.draft_model_runner = SimpleNamespace(
                     device=torch.device("cpu"),
+                    attn_backend=SimpleNamespace(needs_cpu_seq_lens=True),
                     decode_cuda_graph_runner=None,
+                    runner_ids=object(),
                     forward=forward,
                 )
                 proposer.sample_from_anchor = True
@@ -160,11 +163,14 @@ class TestDSparkQuaRotEmbeddingDispatch(CustomTestCase):
                             seq_lens_cpu=torch.tensor([5, 9]),
                             req_pool_indices=torch.tensor([0, 1]),
                             can_run_decode_cuda_graph=False,
+                            is_extend_in_batch=False,
+                            dp_spec_prefill_coordination_applied=False,
                         ),
                         draft_input=SimpleNamespace(bonus_tokens=torch.tensor([1, 2])),
                         verify_window=SimpleNamespace(
                             positions_2d=torch.tensor([[5, 6, 7], [9, 10, 11]]),
                             verify_cache_loc_2d=torch.arange(6).reshape(2, 3),
+                            iteration_ids=SimpleNamespace(bind=Mock()),
                         ),
                         bs=2,
                         device="cpu",

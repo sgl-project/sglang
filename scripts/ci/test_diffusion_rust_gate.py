@@ -64,9 +64,11 @@ class TestDiffusionRustGate(unittest.TestCase):
         caller = jobs["call-multimodal-gen-tests"]
         self.assertNotIn("rust-ext-build", caller["needs"])
         self.assertNotIn("rust_ext_artifact", caller["with"])
-        callee = (ROOT / ".github/workflows/pr-test-multimodal-gen.yml").read_text()
-        self.assertNotIn("download-rust-ext", callee)
-        self.assertNotIn("rust_ext_artifact", callee)
+        for workflow in ("pr-test-multimodal-gen.yml", "_diffusion-pr-test-stage.yml"):
+            with self.subTest(workflow=workflow):
+                callee = (ROOT / ".github/workflows" / workflow).read_text()
+                self.assertNotIn("download-rust-ext", callee)
+                self.assertNotIn("rust_ext_artifact", callee)
 
     def test_installer_preserves_srt_fallback(self):
         source = (ROOT / "scripts/ci/cuda/ci_install_dependency.sh").read_text()
@@ -85,19 +87,33 @@ class TestDiffusionRustGate(unittest.TestCase):
                     functions
                     + """
 mark_step_done() { :; }
-python3() { if [ "$1" = "-c" ]; then echo .test.so; fi; }
-uv() { :; }
+# python3 must be a file, not a function, so the venv's copy wins on PATH.
+mkdir bin
+printf '#!/bin/sh\\nif [ "$1" = "-c" ]; then echo .test.so; fi\\n' > bin/python3
+chmod +x bin/python3
+PATH="$PWD/bin:$PATH"
+uv() {
+    if [ "$1" = venv ]; then
+        mkdir -p "$2/bin"
+        cp bin/python3 "$2/bin/python3"
+        printf 'VIRTUAL_ENV=%s\\nPATH=%s/bin:$PATH\\n' "$2" "$2" > "$2/bin/activate"
+    fi
+}
 pip() { :; }
 configure_environment "$1"
 require_prebuilt_rust_exts
 if [ "$1" = diffusion ]; then setup_cargo_cache; fi
 printf 'RESULT=%s:%s\n' "$SGLANG_BUILD_RUST_EXTS" "$SGLANG_RUST_BUILD_MODE"
+rm -rf "$UV_VENV"
 """
                 )
                 env = dict(
                     os.environ,
                     GITHUB_ENV=f"{tmp}/env",
-                    USE_VENV="0",
+                    GITHUB_PATH=f"{tmp}/path",
+                    # The per-job venv lives under /tmp; the persistent one is the
+                    # runner's real /opt/sglang-ci-py*, which this test must not touch.
+                    USE_VENV="1",
                     SGLANG_BUILD_RUST_EXTS="none",
                     SGLANG_RUST_BUILD_MODE="never",
                 )

@@ -6,12 +6,15 @@
 # salloc's (prefill_workers + decode_workers) nodes -- one server per node --
 # and runs the Docker harness: prefill server(s) on the first nodes, decode
 # server(s) on the rest, a standalone load balancer on the prefill node, then an
-# sglang.bench_serving concurrency sweep over MORI. Default recipe is 1P1D (2
+# sglang.benchmark.serving concurrency sweep over MORI. Default recipe is 1P1D (2
 # nodes); see the drive.sh note on reserving 2P2D / 1P3D / 3P1D.
 #
 # Required environment variables (set by the GitHub Actions workflow):
-#   MODEL              - HuggingFace model id (table label / served model)
-#   MODEL_PREFIX       - short prefix, e.g. dsv4flash
+#   MODEL              - HF repo id of the checkpoint to load
+#   HF_CACHE           - HF hub cache root on every compute node (same path on
+#                        each, holding models--<org>--<name>); mounted read-only
+#                        into the containers at the same path
+#   IMAGE              - ROCm SGLang Docker image for every container
 #   PRECISION          - fp8 / fp4
 #   ISL, OSL           - input / output sequence lengths for the sweep
 #   CONFIG_FILE        - path to the recipe YAML (relative to repo root)
@@ -19,7 +22,6 @@
 #   MATRIX_CONFIG_NAME - matrix entry name (used in filenames/tags)
 #   GITHUB_WORKSPACE   - set by GitHub Actions; where result JSONs are written
 # Optional:
-#   MODEL_PATH         - local snapshot dir (preferred over downloading MODEL)
 #   SLURM_PARTITION    - default: amd-sglang
 #   SLURM_NODELIST     - optional explicit node pin (else scheduler chooses)
 #   SLURM_EXCLUDE      - optional comma-separated nodes to keep the scheduler
@@ -46,7 +48,9 @@
 set -euo pipefail
 set -x
 
-: "${MODEL_PREFIX:?}"
+: "${MODEL:?}"
+: "${HF_CACHE:?}"
+: "${IMAGE:?}"
 : "${PRECISION:?}"
 : "${ISL:?}"
 : "${OSL:?}"
@@ -57,7 +61,6 @@ set -x
 
 SLURM_PARTITION="${SLURM_PARTITION:-amd-sglang}"
 TIME_LIMIT="${TIME_LIMIT:-02:30:00}"
-MODEL_PATH="${MODEL_PATH:-${MODEL:-}}"
 
 # Scheduler profile. `slurm` (default) is the amd-sglang MI355X cluster and is
 # the original code path, unchanged. `spur` is the TW PIT cluster, which runs
@@ -86,83 +89,22 @@ fi
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-}"
 SLURM_QOS="${SLURM_QOS:-}"
 
-# Relocate the shared HuggingFace cache root. nightly-configs.yaml pins
-# model_path under /it-share/model_coverage (the mi355x cluster's NFS); a
-# cluster that mirrors the same models elsewhere sets MODEL_ROOT and every
-# recipe/config path is rewritten, so no recipe or config file needs editing.
-MODEL_ROOT="${MODEL_ROOT:-}"
-# Root used to RESOLVE the snapshot hash; defaults to MODEL_ROOT. Set it when
-# MODEL_ROOT is node-local and therefore unreadable from the driver node.
-MODEL_RESOLVE_ROOT="${MODEL_RESOLVE_ROOT:-$MODEL_ROOT}"
-# Optional node-local mirror of the model cache, for clusters where shared
-# storage cannot serve every rank at once. Resolution stays on the shared root:
-# resolve_snapshot runs on the driver node, which has no mirror. Must be assigned
-# after MODEL_RESOLVE_ROOT, which keeps the readable root.
-MODEL_LOCAL_ROOT="${MODEL_LOCAL_ROOT:-}"
-if [[ -n "$MODEL_LOCAL_ROOT" ]]; then
-    if [[ -z "$MODEL_RESOLVE_ROOT" ]]; then
-        echo "ERROR: MODEL_LOCAL_ROOT is set but MODEL_ROOT/MODEL_RESOLVE_ROOT is empty;" >&2
-        echo "       the snapshot hash has to be resolved against a root the driver can read." >&2
-        exit 1
-    fi
-    MODEL_ROOT="$MODEL_LOCAL_ROOT"
-fi
-MODEL_ROOT_FROM="${MODEL_ROOT_FROM:-/it-share/model_coverage}"
-relocate_model_root() {
-    local p="$1"
-    if [[ -n "$MODEL_ROOT" && "$p" == "$MODEL_ROOT_FROM"/* ]]; then
-        printf '%s\n' "$MODEL_ROOT/${p#"$MODEL_ROOT_FROM"/}"
-    else
-        printf '%s\n' "$p"
-    fi
-}
+# A checkpoint is named by its HF repo id and lives in the HF hub layout under
+# $HF_CACHE. drive.sh resolves the snapshot from refs/main on the compute nodes,
+# which are the only hosts that can read a node-local cache.
+hf_cache_dir() { printf '%s/models--%s\n' "$HF_CACHE" "${1//\//--}"; }
+MODEL_DIR="$(hf_cache_dir "$MODEL")"
+DRAFT_DIR=""
+
 SGLANG_USE_CHECKOUT_RUNTIME="${SGLANG_USE_CHECKOUT_RUNTIME:-1}"
 case "${SGLANG_USE_CHECKOUT_RUNTIME,,}" in
     0|false|no|off) SGLANG_USE_CHECKOUT_RUNTIME=0 ;;
     *) SGLANG_USE_CHECKOUT_RUNTIME=1 ;;
 esac
 
-if [[ -z "$MODEL_PATH" ]]; then
-    echo "ERROR: set MODEL_PATH (local snapshot) or MODEL" >&2
-    exit 1
-fi
-
-# Resolve a HuggingFace cache dir (models--org--name) to its live snapshot dir.
-# Lets nightly-configs / recipes point at the shared cache without hardcoding a
-# snapshot hash; a concrete snapshot dir (or plain dir) is returned unchanged.
-# Used for both MODEL_PATH and an optional speculative draft model path.
-resolve_snapshot() {
-    local p="$1"
-    if [[ -f "$p/refs/main" && -d "$p/snapshots" ]]; then
-        local hash resolved
-        hash="$(cat "$p/refs/main")"
-        resolved="$p/snapshots/$hash"
-        if [[ -n "$hash" && -d "$resolved" ]]; then
-            echo "resolved snapshot: $p -> $resolved" >&2
-            echo "$resolved"
-            return 0
-        fi
-        echo "ERROR: refs/main=$hash but $resolved missing" >&2
-        return 1
-    fi
-    echo "$p"
-}
-# Resolve the snapshot against the shared cache first, then relocate. MODEL_ROOT
-# may name a node-local copy that does not exist on the node running this
-# script; resolve_snapshot would then find no refs/main and pass the bare cache
-# dir to the container. Three steps, since the resolve root and the destination
-# root can differ: rewrite onto a readable root, resolve refs/main, then rewrite
-# onto the root the container will see.
-MODEL_PATH="$(MODEL_ROOT="$MODEL_RESOLVE_ROOT" relocate_model_root "$MODEL_PATH")"
-MODEL_PATH="$(resolve_snapshot "$MODEL_PATH")" || exit 1
-MODEL_PATH="$(MODEL_ROOT_FROM="$MODEL_RESOLVE_ROOT" relocate_model_root "$MODEL_PATH")"
-
 # ---------------------------------------------------------------------------
 # Parse the recipe (runtime + bench + topology) into shell vars.
 # ---------------------------------------------------------------------------
-# Ensure PyYAML is available to the host python used for parsing.
-python3 -c 'import yaml' 2>/dev/null || pip install pyyaml -q 2>/dev/null \
-    || pip install --user pyyaml -q 2>/dev/null || true
 
 # Emit KEY=value lines and eval them (robust single-level command substitution;
 # avoids a nested read<<EOF/$(<<PY) heredoc that misparses on some shells).
@@ -176,7 +118,6 @@ def emit(k, v): print(f"{k}={v}")
 # strings). eval treats the RHS as a single shell word. Existing emits stay
 # space-free so the EP<=8 recipes are byte-identical.
 def emitq(k, v): print(f"{k}={shlex.quote(str(v))}")
-emit("IMAGE", rt["image"])
 # Attention backend: single (`attention_backend`) or split
 # (`prefill_attention_backend`/`decode_attention_backend`). Empty when absent so
 # the flag is dropped for a model that omits it.
@@ -194,6 +135,7 @@ emit("DIST_SOCK", rt.get("dist_socket_ifname", ""))
 # hardcoded value) so EP<=8 recipes stay byte-identical; wide-EP spur recipes
 # set mooncake, which is the validated cross-node KV path there.
 emit("XFER", rt.get("kv_transfer_backend", "mori"))
+emit("MC_DISABLE_HIP", rt.get("mc_disable_hip", 0))
 # SGLANG_USE_ROCM700A toggles the ROCm-7.0.0-alpha codepath. Default 1 (the
 # pre-wide hardcoded value) keeps EP<=8 recipes byte-identical; the validated
 # wide-EP run on the rocm720 0715 image needs 0, set via runtime.rocm700a.
@@ -246,8 +188,9 @@ emit("MTP_ALGO", m.get("algorithm", "EAGLE"))
 emit("MTP_STEPS", m.get("num_steps", 3))
 emit("MTP_TOPK", m.get("eagle_topk", 1))
 emit("MTP_DRAFT", m.get("num_draft_tokens", 4))
-# External draft checkpoint (EAGLE3 etc.); empty for DSV4's built-in EAGLE head.
-emit("MTP_DRAFT_PATH", m.get("draft_model_path", ""))
+# External draft checkpoint as an HF repo id (EAGLE3 etc.); empty for DSV4's
+# built-in EAGLE head.
+emit("MTP_DRAFT_MODEL", m.get("draft_model", ""))
 # Worker counts double as node counts here: one server per node (TP == GPUs/node).
 # 1P1D today; bumping these reserves 2P2D / 1P3D / 3P1D. Multi-node-per-worker
 # (TP > GPUs/node, needs --dist-init-addr/--nnodes/--node-rank) is out of scope.
@@ -268,10 +211,6 @@ if [[ -z "$RECIPE_VARS" ]]; then
     exit 1
 fi
 eval "$RECIPE_VARS"
-# Optional image override from workflow_dispatch input.
-if [[ -n "${IMAGE_OVERRIDE:-}" ]]; then
-    IMAGE="$IMAGE_OVERRIDE"
-fi
 
 # Nodes per engine: an engine whose TP exceeds one node's GPU count spans
 # ceil(TP/GPUS_PER_NODE) nodes and needs torch-dist multi-node init. EP<=8
@@ -292,7 +231,7 @@ if (( (PN_PER > 1 && PW > 1) || (DN_PER > 1 && DW > 1) )); then
     echo "ERROR: a wide engine (nodes/engine>1) cannot have >1 worker of that role (got PW=$PW PN_PER=$PN_PER DW=$DW DN_PER=$DN_PER)" >&2
     exit 1
 fi
-echo "recipe: image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP pn_per=$PN_PER dn_per=$DN_PER a2a=${A2A:-<none>} concs=$CONCS isl=$ISL osl=$OSL"
+echo "recipe: xfer=$XFER image=$IMAGE attn=${ATTN:-$PATTN/$DATTN} ib=$IB ptp=$PTP dtp=$DTP pn_per=$PN_PER dn_per=$DN_PER a2a=${A2A:-<none>} concs=$CONCS isl=$ISL osl=$OSL"
 
 # ---------------------------------------------------------------------------
 # Shared NFS scratch (visible to login node + compute nodes). Raw bench output
@@ -326,6 +265,9 @@ if [[ "$CLUSTER" == "spur" ]]; then
 else
 rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
 fi
+# Lets runner_disk_preflight.py reclaim this dir if the leg dies before the
+# workflow's cleanup step runs.
+printf '%s\n' "${RUNNER_NAME:-}" > "$WORKDIR/.runner_name"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Stage the workflow checkout on shared NFS so Slurm compute-node containers can
@@ -393,7 +335,6 @@ DSV4_ENV=(
   -e SGLANG_USE_ROCM700A=$ROCM700A
   -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton
   -e SGLANG_OPT_FP8_WO_A_GEMM=false -e SGLANG_OPT_USE_JIT_INDEXER_METADATA=false
-  -e SGLANG_OPT_USE_TOPK_V2=false -e SGLANG_OPT_USE_AITER_INDEXER=true
   -e SGLANG_OPT_USE_TILELANG_INDEXER=false -e SGLANG_OPT_USE_TILELANG_MHC_PRE=false
   -e SGLANG_OPT_USE_TILELANG_MHC_POST=false -e SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
   -e SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false -e SGLANG_ROCM_USE_MULTI_STREAM=false
@@ -467,6 +408,22 @@ if (( PN_PER > 1 || DN_PER > 1 )); then
     if [[ -n "$DIST_SOCK" ]]; then
         MORI_ENV="$MORI_ENV -e GLOO_SOCKET_IFNAME=$DIST_SOCK -e NCCL_SOCKET_IFNAME=$DIST_SOCK -e MORI_SOCKET_IFNAME=$DIST_SOCK"
     fi
+    # sglang hands --disaggregation-ib-device to mori only for the KV transfer
+    # engine; the MoE all-to-all picks its own NICs. On spur drive.sh may drop
+    # dead ports from $IB, so name the list here too or the a2a can still land
+    # on a port that never linked.
+    if [[ "$CLUSTER" == "spur" ]]; then
+        MORI_ENV="$MORI_ENV -e MORI_RDMA_DEVICES=$IB"
+    fi
+fi
+
+# Mooncake KV transfer: it moves KV over its own RDMA engine, so the mori env above
+# is irrelevant to it. MC_GID_INDEX=1 picks the routable RoCEv2 IPv4 GID on the
+# routed L3 fabric; MC_DISABLE_HIP (when the recipe sets runtime.mc_disable_hip=1)
+# keeps cross-node requests off the intra-node-only hip transport.
+if [[ "$XFER" == "mooncake" ]]; then
+    MORI_ENV="$MORI_ENV -e MC_GID_INDEX=1"
+    [[ "$MC_DISABLE_HIP" == "1" ]] && MORI_ENV="$MORI_ENV -e MC_DISABLE_HIP=1"
 fi
 
 # Model-specific docker `-e` env + sglang server args from the recipe's optional
@@ -525,12 +482,25 @@ if [ -n "$_ionic_provider" ] && [ -e "$_ionic_provider" ]; then
 fi
 IONIC_EOF
 
-# drive.sh is a quoted heredoc and expands nothing, so its staging check gets the
-# resolved paths through a file, as model_flags.sh does. Empty path = no check.
+# drive.sh is a quoted heredoc and expands nothing, so it gets the cache dirs of
+# the checkpoints to resolve through a file, as model_flags.sh does.
+if [[ "$MTP_ENABLED" == "1" && -n "$MTP_DRAFT_MODEL" ]]; then
+    DRAFT_DIR="$(hf_cache_dir "$MTP_DRAFT_MODEL")"
+fi
 {
-    printf 'STAGE_LOCAL_PATH=%q\n' "${MODEL_LOCAL_ROOT:+$MODEL_PATH}"
-    printf 'STAGE_SHARED_ROOT=%q\n' "$MODEL_RESOLVE_ROOT"
-} > "$WORKDIR/stage_check.sh"
+    printf 'MODEL_DIR=%q\n' "$MODEL_DIR"
+    printf 'DRAFT_DIR=%q\n' "$DRAFT_DIR"
+} > "$WORKDIR/model_dirs.sh"
+# Same channel for the recipe's RDMA device list, which drive.sh narrows on spur
+# to the ports that are actually up (see the PORT_ACTIVE check there). That
+# check rewrites the list in place with sed, using it as the pattern, so a stray
+# "/" or regex character from a recipe typo would break the edit halfway
+# through the generated scripts. Reject it here, before anything is allocated.
+if [[ -n "$IB" && ! "$IB" =~ ^[A-Za-z0-9_,]+$ ]]; then
+    echo "ERROR: runtime.ib_devices '$IB' must be a comma-separated list of device names" >&2
+    exit 1
+fi
+printf 'IB_RECIPE=%q\n' "$IB" > "$WORKDIR/ib_check.sh"
 
 # Optional topology / speculative-decode flags driven by the recipe. Base recipes
 # (EP1/DP1, no mtp) leave the extra strings empty, preserving prior behavior.
@@ -541,10 +511,10 @@ IONIC_EOF
 # and the generated argv is byte-identical. Oren's wide-EP recipes set decode
 # EP/DP=16 while prefill stays EP8.
 PREFILL_DPEP=""
-(( PDP > 1 )) && PREFILL_DPEP="$PREFILL_DPEP --enable-dp-attention --dp-size $PDP"
+(( PDP > 1 )) && PREFILL_DPEP="$PREFILL_DPEP --attn-dp-size $PDP"
 (( PEP > 1 )) && PREFILL_DPEP="$PREFILL_DPEP --ep-size $PEP"
 DECODE_DPEP=""
-(( DDP > 1 )) && DECODE_DPEP="$DECODE_DPEP --enable-dp-attention --dp-size $DDP"
+(( DDP > 1 )) && DECODE_DPEP="$DECODE_DPEP --attn-dp-size $DDP"
 (( DEP > 1 )) && DECODE_DPEP="$DECODE_DPEP --ep-size $DEP"
 # Flags shared by both roles (a2a backend, mtp). --max-total-tokens stays here for
 # non-wide recipes; wide recipes carry a per-role prefill_max_total via wide_ep.
@@ -556,12 +526,10 @@ if [[ "$MTP_ENABLED" == "1" ]]; then
 --speculative-num-steps $MTP_STEPS --speculative-eagle-topk $MTP_TOPK \
 --speculative-num-draft-tokens $MTP_DRAFT"
     # EAGLE3 (and other draft-model algos) need an external draft checkpoint;
-    # built-in EAGLE (DSV4) omits draft_model_path and this stays unset.
-    if [[ -n "$MTP_DRAFT_PATH" ]]; then
-        _d="$(MODEL_ROOT="$MODEL_RESOLVE_ROOT" relocate_model_root "$MTP_DRAFT_PATH")"
-        _d="$(resolve_snapshot "$_d")" || exit 1
-        DRAFT_RESOLVED="$(MODEL_ROOT_FROM="$MODEL_RESOLVE_ROOT" relocate_model_root "$_d")"
-        EXTRA_COMMON="$EXTRA_COMMON --speculative-draft-model-path $DRAFT_RESOLVED"
+    # built-in EAGLE (DSV4) has none. Single-quoted so it stays literal in the
+    # generated scripts: model_paths.sh, written by drive.sh, sets it at runtime.
+    if [[ -n "$DRAFT_DIR" ]]; then
+        EXTRA_COMMON="$EXTRA_COMMON --speculative-draft-model-path "'$DRAFT_MODEL_PATH'
     fi
 fi
 # Prefix a leading space only when the arg is non-empty (keeps EP<=8 argv byte-
@@ -615,19 +583,13 @@ else
 --disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$DECODE_TAIL"
 fi
 
-# /it-share is the mi355x cluster's model NFS. Mount it only where it exists --
-# docker would otherwise silently create a root-owned empty /it-share on every
-# node of a cluster that keeps its models elsewhere (see MODEL_ROOT).
-IT_SHARE_MOUNT="-v /it-share:/it-share:ro "
-[[ -d /it-share ]] || IT_SHARE_MOUNT=""
-# A cluster that relocates the model cache must bind that root in too, at the
-# same path: --model-path is resolved inside the container, and a missing
-# directory does not fail as "no such file" -- transformers falls back to
+# Mounted at the same path: --model-path is resolved inside the container, and a
+# missing directory does not fail as "no such file" -- transformers falls back to
 # treating it as a HuggingFace repo id and dies with a confusing
 # "Repo id must be in the form 'repo_name' or 'namespace/repo_name'".
-if [[ -n "$MODEL_ROOT" && "$MODEL_ROOT" != /it-share/* ]]; then
-    IT_SHARE_MOUNT="$IT_SHARE_MOUNT-v $MODEL_ROOT:$MODEL_ROOT:ro "
-fi
+# The source may be a symlink, but not one in a sticky world-writable directory
+# such as /tmp: with fs.protected_symlinks=1 dockerd will not follow it.
+HF_CACHE_MOUNT="-v $HF_CACHE:$HF_CACHE:ro"
 # Slurm hosts each server as a long-lived job step and reaps the container when
 # the step ends, so --rm is right there. Spur has no equivalent step (its
 # --overlap path is an interactive exec-into-job), so the container runs
@@ -649,7 +611,7 @@ fi
 DOCKER_COMMON="$DOCKER_LIFECYCLE --network host --ipc host --shm-size 32g $PRIV_ARGS \
 --security-opt seccomp=unconfined \
 --device /dev/kfd --device /dev/dri --device /dev/infiniband \
-${IT_SHARE_MOUNT}-v $HOME:/host_home $CHECKOUT_DOCKER_ARGS"
+$HF_CACHE_MOUNT -v $HOME:/host_home $CHECKOUT_DOCKER_ARGS"
 # Optional extra docker args (e.g. bind-mounting a locally-built lib for
 # validation). Empty by default so the docker argv is byte-identical otherwise.
 [[ -n "${EXTRA_DOCKER_ARGS:-}" ]] && DOCKER_COMMON="$DOCKER_COMMON ${EXTRA_DOCKER_ARGS}"
@@ -681,10 +643,10 @@ DENV_ARG=""; [[ -n "$DENV" ]] && DENV_ARG=" $DENV"
 # port and stays under the 32768 ephemeral floor. These recipes place at most
 # one single-node engine per node, so two engines cannot collide.
 #
-# Pinning is safe here because --dp-size is only emitted together with
-# --enable-dp-attention, and that path gives every DP rank the same nccl port.
-# launch_dp_schedulers(), which needs a distinct port per worker, is never
-# reached by these recipes.
+# Pinning is safe here because these recipes only emit attention DP
+# (--attn-dp-size), never --dp-size replicas, and the attention-DP path gives
+# every DP rank the same nccl port. launch_dp_schedulers(), which needs a
+# distinct port per worker, is never reached by these recipes.
 PNCCL_ARG=""
 DNCCL_ARG=""
 if [[ "$CLUSTER" == "spur" ]]; then
@@ -700,10 +662,10 @@ DENV_ARG="$DENV_ARG$SPUR_DNCCL"
 # Write per-role scripts that srun dispatches to each compute node.
 # ---------------------------------------------------------------------------
 # These are UNQUOTED `<<EOF` heredocs, so $MORI_ENV/$DSV4_ENV_STR/$COMMON_FLAGS/
-# $IMAGE/$MODEL_PATH expand now (at generation). model_flags.sh is sourced at
-# runtime for the model's env/server arrays, so the `${MODEL_ENV_ARGS[@]}` /
-# `${MODEL_SERVER_ARGS[@]}` refs are backslash-escaped to survive into the script
-# and expand after `source`. For DSV4 those arrays are empty and $DSV4_ENV_STR is
+# $IMAGE expand now (at generation). model_flags.sh and model_paths.sh are
+# sourced at runtime, so the `${MODEL_ENV_ARGS[@]}` / `${MODEL_SERVER_ARGS[@]}` /
+# `$MODEL_PATH` refs are backslash-escaped to survive into the script and expand
+# after `source`. For DSV4 those arrays are empty and $DSV4_ENV_STR is
 # set, so the resulting docker argv is byte-identical to the pre-Kimi launcher.
 cat > "$WORKDIR/install_checkout_sglang.sh" <<'EOF'
 #!/bin/bash
@@ -755,7 +717,11 @@ for f in README.md LICENSE; do
 done
 
 python3 -m pip uninstall -y sglang || true
-python3 -m pip install --no-deps --no-build-isolation -e "$RUNTIME_CHECKOUT/python"
+# Install with runtime_base (the torch-free deps) instead of --no-deps: the
+# image can predate a dependency the checkout imports (blake3 from #47120
+# failed every 11-05 job on image 20261104). pip's default only-if-needed
+# strategy leaves already-satisfied packages, including torch/aiter, alone.
+python3 -m pip install --no-build-isolation -e "$RUNTIME_CHECKOUT/python[runtime_base]"
 
 export RUNTIME_CHECKOUT
 export PYTHONPATH="$RUNTIME_CHECKOUT/python:${PYTHONPATH:-}"
@@ -780,6 +746,101 @@ print(f"[checkout-sglang] sglang_file={sglang.__file__}")
 print(f"[checkout-sglang] sglang_version={importlib.metadata.version('sglang')}")
 if not actual.startswith(expected):
     raise SystemExit(f"sglang did not import from checkout: {sglang.__file__}")
+PY
+EOF
+
+# Pre-populate the HuggingFace dynamic-module cache.
+#
+# transformers copies a trust_remote_code checkpoint's .py files into
+# HF_MODULES_CACHE and then imports them. The copy is a plain shutil.copy,
+# which truncates the destination before writing, and every scheduler on the
+# node does it concurrently against one cache. A scheduler that imports while
+# another is mid-copy sees a partial module and dies on a class that is
+# plainly there:
+#
+#   AttributeError: module 'transformers_modules...tokenization_kimi'
+#   has no attribute 'TikTokenTokenizer'
+#
+# On Kimi-K2.6 EP16 that took down two ranks of sixteen during init. Doing it
+# once here, before launch_server starts, leaves the schedulers nothing to
+# copy: transformers guards the copy with filecmp, so a cache that is already
+# correct turns every later call into a read. Measured on the Kimi checkpoint
+# with 16 concurrent loaders over 5 trials: 10 copies from a cold cache, 0
+# after this script has run.
+#
+# Best effort. A failure here is not fatal -- the schedulers still do their own
+# load and will report a real problem with their own traceback.
+cat > "$WORKDIR/warm_remote_code.sh" <<'EOF'
+#!/bin/bash
+# Never abort the server on a warm-up failure.
+set -uo pipefail
+
+if [[ -z "${WARM_MODEL_PATHS:-}" ]]; then
+  exit 0
+fi
+
+python3 - <<'PY' || echo "[warm-remote-code] skipped (non-fatal)"
+import json
+import os
+
+paths = [p for p in os.environ.get("WARM_MODEL_PATHS", "").split(":") if p]
+
+try:
+    # The function that does the copying, so it is the one to pre-run. Warming
+    # the class instead would also import it, which can fail on a checkpoint
+    # that ships modules the installed transformers cannot import -- a copy
+    # that succeeded would still be reported as an error.
+    from transformers.dynamic_module_utils import get_cached_module_file
+except Exception as e:
+    print(f"[warm-remote-code] transformers unavailable: {e}")
+    raise SystemExit(0)
+
+# auto_map lives in more than one file: the model classes are in config.json,
+# while the tokenizer and processor declare their own in tokenizer_config.json
+# and preprocessor_config.json. Kimi-K2.6 raced on the tokenizer, reached
+# through the processor's entry.
+CONFIGS = (
+    "config.json",
+    "tokenizer_config.json",
+    "preprocessor_config.json",
+    "processor_config.json",
+)
+
+warmed = missing = 0
+for path in paths:
+    done = set()
+    for name in CONFIGS:
+        try:
+            with open(os.path.join(path, name)) as f:
+                auto_map = json.load(f).get("auto_map") or {}
+        except (OSError, ValueError):
+            continue
+        for ref in auto_map.values():
+            for one in ref if isinstance(ref, (list, tuple)) else [ref]:
+                # "repo--module.Class" resolves against a different repo; leave
+                # those to the normal path rather than guessing where it lives.
+                if not one or "--" in one:
+                    continue
+                module_file = one.rsplit(".", 1)[0] + ".py"
+                if not os.path.exists(os.path.join(path, module_file)):
+                    # A checkpoint can list auto_map entries whose source is
+                    # not shipped -- Kimi-K2.6 still points at K2.5 files.
+                    # Nothing to warm, and not a problem.
+                    missing += 1
+                    continue
+                if module_file in done:
+                    continue
+                done.add(module_file)
+                try:
+                    get_cached_module_file(path, module_file)
+                    warmed += 1
+                except Exception as e:
+                    print(f"[warm-remote-code] could not pre-load {module_file}: {e}")
+
+print(
+    f"[warm-remote-code] warmed {warmed} module(s) from {len(paths)} path(s)"
+    + (f"; {missing} auto_map entr(ies) had no source file" if missing else "")
+)
 PY
 EOF
 
@@ -867,10 +928,12 @@ if (( PN_PER > 1 || DN_PER > 1 )); then
 set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
 source "\$CIDIR/model_flags.sh"
+source "\$CIDIR/model_paths.sh"
 bash "\$CIDIR/install_checkout_sglang.sh"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
+bash "\$CIDIR/warm_remote_code.sh"
 DIST_ARGS=""
 if [[ "\${NNODES:-1}" != "1" ]]; then
   DIST_ARGS="--nnodes \$NNODES --node-rank \$NODE_RANK --dist-init-addr \$DIST_ADDR:\${DIST_PORT:-29500}"
@@ -880,7 +943,7 @@ else
   DIST_ARGS="$PNCCL_ARG"
 fi
 exec python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
+  --model-path \$MODEL_PATH --host 0.0.0.0 --port $PPORT \
   $PREFILL_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \$DIST_ARGS \
   --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
 EOF
@@ -890,10 +953,12 @@ EOF
 set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
 source "\$CIDIR/model_flags.sh"
+source "\$CIDIR/model_paths.sh"
 bash "\$CIDIR/install_checkout_sglang.sh"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
+bash "\$CIDIR/warm_remote_code.sh"
 DIST_ARGS=""
 if [[ "\${NNODES:-1}" != "1" ]]; then
   DIST_ARGS="--nnodes \$NNODES --node-rank \$NODE_RANK --dist-init-addr \$DIST_ADDR:\${DIST_PORT:-29500}"
@@ -903,7 +968,7 @@ else
   DIST_ARGS="$DNCCL_ARG"
 fi
 exec python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
+  --model-path \$MODEL_PATH --host 0.0.0.0 --port $DPORT \
   $DECODE_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \$DIST_ARGS \
   --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
 EOF
@@ -944,12 +1009,14 @@ else
 set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
 source "\$CIDIR/model_flags.sh"
+source "\$CIDIR/model_paths.sh"
 bash "\$CIDIR/install_checkout_sglang.sh"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
+bash "\$CIDIR/warm_remote_code.sh"
 exec python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
+  --model-path \$MODEL_PATH --host 0.0.0.0 --port $PPORT \
   $PREFILL_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
   --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT$PNCCL_ARG
 EOF
@@ -959,12 +1026,14 @@ EOF
 set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
 source "\$CIDIR/model_flags.sh"
+source "\$CIDIR/model_paths.sh"
 bash "\$CIDIR/install_checkout_sglang.sh"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
+bash "\$CIDIR/warm_remote_code.sh"
 exec python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
+  --model-path \$MODEL_PATH --host 0.0.0.0 --port $DPORT \
   $DECODE_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
   --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT$DNCCL_ARG
 EOF
@@ -1041,6 +1110,7 @@ docker run $DOCKER_COMMON "\${IONIC_MOUNTS[@]}" --name mi355x_bench \
   -e PIP=\$PIP -e DIP=\$DIP -e PCSV=\$PCSV \
   $IMAGE bash -lc '
     CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+    source \$CIDIR/model_paths.sh
     bash \$CIDIR/install_checkout_sglang.sh
     if [ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]; then
       export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
@@ -1075,8 +1145,8 @@ $PREFILL_WAIT_ROUTER
       echo "=== concurrency=\$C ==="
       OUT=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/raw_conc\${C}.json
       rm -f \$OUT
-      python3 -m sglang.bench_serving --backend sglang \
-        --host 127.0.0.1 --port $LBPORT --model $MODEL_PATH \
+      python3 -m sglang.benchmark.serving --backend sglang \
+        --host 127.0.0.1 --port $LBPORT --model \$MODEL_PATH \
         --dataset-name random --random-input-len $ISL --random-output-len $OSL \
         --random-range-ratio $RRR --max-concurrency \$C \
         --num-prompts \$((C*$NPF)) --warmup-requests \$C \
@@ -1190,7 +1260,18 @@ container_log() {  # <node> <name> <logfile>
   # flaky step that produced the false "missing" also truncated the 5-line
   # prefill log to 0 bytes, destroying the only evidence of what happened.
   local tmp="$3.fetch"
-  srun_local_or_step "$1" docker logs "$2" > "$tmp" 2>/dev/null || true
+  # `docker logs` writes the container's stdout and stderr to its own stdout and
+  # stderr, so merge them on the target host -- hence bash -c rather than passing
+  # `docker logs` straight through. Without it only the remote branch of
+  # srun_local_or_step kept stderr; the local branch runs docker directly and the
+  # 2>/dev/null below swallowed it. Every sglang scheduler line goes to stderr and
+  # only uvicorn's access log goes to stdout, so the engine sitting on the node
+  # that runs drive.sh -- always decode node 0 -- logged nothing but
+  # "POST /generate 200 OK" for the whole run, with no trace of the crash that
+  # ended it. Visible in 2p1d-ep16, where decode node 1 is fetched remotely and
+  # has the full log while node 0 has none of it. The outer 2>/dev/null still
+  # drops srun's own dispatch noise.
+  srun_local_or_step "$1" bash -c "docker logs $2 2>&1" > "$tmp" 2>/dev/null || true
   # Publish in place (truncate + rewrite the SAME inode), never by renaming over
   # the target. drive.sh keeps a `tail -F` on bench.log, and swapping the inode
   # every 10s made tail reopen and re-emit the whole file each poll -- the
@@ -1347,24 +1428,156 @@ PIP=$(resolve_ip "$PNODE") || exit 1
 DIP=$(resolve_ip "$DNODE") || exit 1
 echo "[drive] prefill nodes: ${PNODES[*]} ; decode nodes: ${DNODES[*]}"
 echo "[drive] bench targets prefill=$PNODE($PIP) decode=$DNODE($DIP)"
-# The local copy is staged out of band and does not survive a reboot. Without
-# this the container falls back to the shared root and the only symptom is a
-# health-wait timeout 50 minutes later.
-source "$WORKDIR/stage_check.sh"
-if [[ -n "$STAGE_LOCAL_PATH" ]]; then
-  _stage_bad=0
+# The node-local HF caches are staged out of band, so a node can be missing a
+# checkpoint (never staged, or wiped) or hold a different revision. Resolve the
+# snapshot from refs/main on every allocated node and require the same hash on
+# all of them; otherwise the first symptom is a health-wait timeout 50 minutes
+# later, or prefill and decode silently serving different weights.
+source "$WORKDIR/model_dirs.sh"
+resolve_snapshot() {  # <cache dir> -> snapshot dir, identical on every node
+  local dir="$1" want="" n out _try
   for n in "${NODES[@]}"; do
-    if ! srun_local_or_step "$n" test -d "$STAGE_LOCAL_PATH" >/dev/null 2>&1; then
-      echo "ERROR: $n is missing the node-local snapshot $STAGE_LOCAL_PATH" >&2
-      _stage_bad=1
+    # __ok__ separates "the step ran" from a flaky srun dispatch, as in
+    # container_state().
+    out=""
+    for _try in 1 2 3; do
+      out="$(srun_local_or_step "$n" bash -c \
+          "h=\$(cat $dir/refs/main 2>/dev/null); if [ -n \"\$h\" ] && [ -d $dir/snapshots/\$h ]; then echo hash=\$h; else echo missing; fi; echo __ok__" \
+          2>/dev/null | tr -d '\r')"
+      [[ "$out" == *__ok__* ]] && break
+      out=""
+      sleep 2
+    done
+    if [[ -z "$out" ]]; then
+      echo "ERROR: could not check $dir on $n (srun failed 3 times)" >&2
+      return 1
+    fi
+    out="$(sed -n 's/^hash=//p' <<< "$out")"
+    if [[ -z "$out" ]]; then
+      echo "ERROR: $n has no snapshot of $dir (refs/main or its snapshot dir is missing)" >&2
+      return 1
+    fi
+    if [[ -n "$want" && "$out" != "$want" ]]; then
+      echo "ERROR: $n has snapshot $out of $dir, but ${NODES[0]} has $want" >&2
+      return 1
+    fi
+    want="$out"
+  done
+  printf '%s/snapshots/%s\n' "$dir" "$want"
+}
+MODEL_PATH=$(resolve_snapshot "$MODEL_DIR") || { echo "ERROR: stage the checkpoint into HF_CACHE on every node" >&2; exit 1; }
+DRAFT_MODEL_PATH=""
+if [[ -n "$DRAFT_DIR" ]]; then
+  DRAFT_MODEL_PATH=$(resolve_snapshot "$DRAFT_DIR") || { echo "ERROR: stage the draft checkpoint into HF_CACHE on every node" >&2; exit 1; }
+fi
+# Sourced by the entry scripts and bench.sh inside the containers, which mount
+# HF_CACHE at the same path. WARM_MODEL_PATHS feeds warm_remote_code.sh.
+{
+  printf 'export MODEL_PATH=%q\n' "$MODEL_PATH"
+  printf 'export DRAFT_MODEL_PATH=%q\n' "$DRAFT_MODEL_PATH"
+  printf 'export WARM_MODEL_PATHS=%q\n' "$MODEL_PATH${DRAFT_MODEL_PATH:+:$DRAFT_MODEL_PATH}"
+} > "$WORKDIR/model_paths.sh"
+echo "[drive] same snapshot on all ${#NODES[@]} nodes: $MODEL_PATH${DRAFT_MODEL_PATH:+ (draft $DRAFT_MODEL_PATH)}"
+# The recipe's ib_devices is a fixed list, but a pit2 port can stay down for
+# days (some never link after a reboot). Handing a dead port to NCCL or mori
+# fails init with a network error that names neither the node nor the port.
+# Keep only the devices whose port is ACTIVE on EVERY allocated node -- the
+# same set on both ends, so no transfer has to cross rails -- and patch that
+# list into the generated server scripts before anything is launched.
+#
+# If that leaves fewer devices than the recipe asked for, top the list back up
+# with other ports that are ACTIVE on every node. The 1p1d recipes name
+# rdma0..3, and a node can lose exactly those: on 2026-10-02 g02 had only
+# rdma4..7 up (its rdma0..3 had come back as unrenamed rocep* devices, DOWN),
+# so every pair that included it had no usable recipe port at all. A port off
+# the recipe's list may sit further from the GPU, but it works; a dead one
+# does not. Candidates are picked by state, not name: rdmaN vs rocep* reflects
+# whether the port was up at boot, so a rocep* port that links later is just
+# as usable. It still has to carry the same name on every node, though, and
+# the same slot is usually rdmaN elsewhere; pairing ports by PCI slot across
+# nodes would need a different list per node, which this does not do.
+#
+# A list that is still short changes the numbers (KV throughput scales with
+# HCA count), so that case is written to ib_warn for the launcher to put in
+# the job summary -- this log is only read when the leg fails.
+source "$WORKDIR/ib_check.sh"
+if [[ "$CLUSTER" == "spur" && -n "$IB_RECIPE" ]]; then
+  IFS=',' read -ra _ib_want <<< "$IB_RECIPE"
+  _ib_live=("${_ib_want[@]}")
+  _ib_spare=()       # non-recipe ports ACTIVE on every node checked so far
+  _ib_spare_init=0
+  # Every port on the node, not just the recipe's, so there is something to
+  # fall back to. __ok__ separates "the step ran" from a flaky srun dispatch,
+  # as in container_state(); sysfs reads e.g. "4: ACTIVE" or "1: DOWN".
+  _ib_probe='for p in /sys/class/infiniband/*/ports/1/state; do [ -e "$p" ] || continue; d=${p#/sys/class/infiniband/}; echo "${d%%/*} $(cat "$p" 2>/dev/null)"; done; echo __ok__'
+  _ib_unchecked=()
+  for n in "${NODES[@]}"; do
+    _ib_out=""
+    for _try in 1 2 3; do
+      _ib_out="$(srun_local_or_step "$n" bash -c "$_ib_probe" 2>/dev/null | tr -d '\r')"
+      [[ "$_ib_out" == *__ok__* ]] && break
+      _ib_out=""
+      sleep 2
+    done
+    if [[ -z "$_ib_out" ]]; then
+      echo "[drive] WARN: could not read RDMA port state on $n; not filtering on it" >&2
+      _ib_unchecked+=("$n")
+      continue
+    fi
+    _ib_keep=()
+    for d in "${_ib_live[@]}"; do
+      if grep -qxE "$d [0-9]+: ACTIVE" <<< "$_ib_out"; then
+        _ib_keep+=("$d")
+      else
+        _st="$(grep -m1 "^$d " <<< "$_ib_out" | cut -d' ' -f2-)"
+        echo "[drive] $n: dropping $d (${_st:-missing})" >&2
+      fi
+    done
+    _ib_live=("${_ib_keep[@]}")
+    mapfile -t _ib_active < <(sed -nE 's/^([^ ]+) [0-9]+: ACTIVE$/\1/p' <<< "$_ib_out")
+    if (( ! _ib_spare_init )); then
+      _ib_spare=()
+      for d in "${_ib_active[@]}"; do
+        [[ ",$IB_RECIPE," == *",$d,"* ]] || _ib_spare+=("$d")
+      done
+      _ib_spare_init=1
+    else
+      _ib_keep=()
+      for d in "${_ib_spare[@]}"; do
+        printf '%s\n' "${_ib_active[@]}" | grep -qx "$d" && _ib_keep+=("$d")
+      done
+      _ib_spare=("${_ib_keep[@]}")
     fi
   done
-  if (( _stage_bad )); then
-    echo "ERROR: re-stage the model onto every allocated node, or unset MODEL_LOCAL_ROOT" >&2
-    echo "       to read from $STAGE_SHARED_ROOT (slow: large checkpoints will time out)." >&2
+  _ib_added=()
+  if (( ${#_ib_live[@]} < ${#_ib_want[@]} && ${#_ib_spare[@]} )); then
+    mapfile -t _ib_spare < <(printf '%s\n' "${_ib_spare[@]}" | sort -V)
+    for d in "${_ib_spare[@]}"; do
+      (( ${#_ib_live[@]} < ${#_ib_want[@]} )) || break
+      _ib_live+=("$d"); _ib_added+=("$d")
+    done
+  fi
+  IB_LIVE="$(IFS=,; echo "${_ib_live[*]}")"
+  if [[ -z "$IB_LIVE" ]]; then
+    echo "ERROR: no RDMA port is PORT_ACTIVE on all of: ${NODES[*]}" >&2
     exit 1
   fi
-  echo "[drive] node-local snapshot present on all ${#NODES[@]} nodes"
+  _ib_note=""
+  (( ${#_ib_added[@]} )) && _ib_note=" (off-recipe fallback: ${_ib_added[*]})"
+  (( ${#_ib_unchecked[@]} )) && _ib_note="$_ib_note (unchecked: ${_ib_unchecked[*]})"
+  if (( ${#_ib_live[@]} < ${#_ib_want[@]} )); then
+    echo "WARN: running on ${#_ib_live[@]} of ${#_ib_want[@]} requested RDMA devices ($IB_LIVE; recipe $IB_RECIPE)$_ib_note -- throughput is not comparable to a full-rail run" \
+      | tee "$WORKDIR/ib_warn" >&2
+  fi
+  if [[ "$IB_LIVE" != "$IB_RECIPE" ]]; then
+    echo "[drive] RDMA devices changed to ports active on all nodes: $IB_RECIPE -> $IB_LIVE$_ib_note"
+    # The list appears only as a whole flag/env value, after a space or "=".
+    for f in prefill.sh decode.sh prefill_entry.sh decode_entry.sh; do
+      sed -i -E "s/(^|[ =])$IB_RECIPE( |$)/\1$IB_LIVE\2/g" "$WORKDIR/$f"
+    done
+  else
+    echo "[drive] RDMA devices $IB_RECIPE are PORT_ACTIVE on all nodes$_ib_note"
+  fi
 fi
 if (( DW > 1 )); then
   echo "[drive] NOTE: router + bench use the first decode engine only;"
@@ -1560,12 +1773,15 @@ echo "[drive_batch] \$(hostname) rank \${SPUR_NODEID:-?} elected driver"
 # records: a leg that failed in the monitor loop left an sbatch.out that simply
 # stopped mid-run, with the teardown lines never visible.
 #
-# A plain redirect, deliberately NOT `| tee`. With a pipeline, drive_batch waits
-# for the whole pipeline, and that does not finish when drive.sh does -- the
-# backgrounded `tail -F` on bench.log inherits drive.sh's stdout and holds the
-# pipe's write end open. drive.sh exited 0 and drive_exit was still unwritten
-# 11 minutes later, so the standby tasks kept the allocation alive and the leg
-# looked hung after it had actually passed.
+# A plain redirect, deliberately not a tee pipeline. With a pipeline,
+# drive_batch waits for the whole pipeline, and that does not finish when
+# drive.sh does -- the backgrounded tail on bench.log inherits drive.sh's
+# stdout and holds the pipe's write end open. drive.sh exited 0 and drive_exit
+# was still unwritten 11 minutes later, so the standby tasks kept the
+# allocation alive and the leg looked hung after it had actually passed.
+# No backticks anywhere in this heredoc: it is unquoted, so bash runs them at
+# generation time. The pair that used to be here printed a syntax error on
+# every launch and ran a stray tail on the submitting host.
 bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW" "$PN_PER" "$DN_PER" "$DIST_SOCK" "$ADDR_NIC" \
   > "$WORKDIR/drive_\$(hostname).log" 2>&1
 echo \$? > "$WORKDIR/drive_exit"
@@ -1589,29 +1805,100 @@ EOF
     # glance, from a model bug. Observed on glm52-fp4-1k1k-2p1d-ep16 2026-09-17.
     # Retry only on that signature; a genuinely bad sbatch request must still
     # fail immediately rather than being retried six times.
-    SPUR_LEG_JOB_ID=""
-    for _attempt in 1 2 3 4 5 6; do
-        SBATCH_MSG=$(sbatch -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" \
-            "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" "${ACCT_ARG[@]}" \
-            --job-name "$JOB_NAME" -t "$TIME_LIMIT" \
-            --output "$SBATCH_OUT" --error "$SBATCH_OUT" \
-            "$WORKDIR/drive_batch.sh" 2>&1)
-        echo "$SBATCH_MSG"
-        SPUR_LEG_JOB_ID="${SBATCH_MSG##* }"
-        [[ "$SPUR_LEG_JOB_ID" =~ ^[0-9]+$ ]] && break
-        if [[ "$SBATCH_MSG" == *"not the Raft leader"* \
-           || "$SBATCH_MSG" == *"service is currently unavailable"* ]]; then
-            echo "[launch] spur controller unavailable (attempt $_attempt/6); retrying in 20s" >&2
-            SPUR_LEG_JOB_ID=""
-            sleep 20
-            continue
-        fi
-        break
-    done
+    spur_submit_leg() {
+        SPUR_LEG_JOB_ID=""
+        : > "$SBATCH_OUT"
+        for _attempt in 1 2 3 4 5 6; do
+            SBATCH_MSG=$(sbatch -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" \
+                "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" "${ACCT_ARG[@]}" \
+                --job-name "$JOB_NAME" -t "$TIME_LIMIT" \
+                --output "$SBATCH_OUT" --error "$SBATCH_OUT" \
+                "$WORKDIR/drive_batch.sh" 2>&1)
+            echo "$SBATCH_MSG"
+            SPUR_LEG_JOB_ID="${SBATCH_MSG##* }"
+            [[ "$SPUR_LEG_JOB_ID" =~ ^[0-9]+$ ]] && break
+            if [[ "$SBATCH_MSG" == *"not the Raft leader"* \
+               || "$SBATCH_MSG" == *"service is currently unavailable"* ]]; then
+                echo "[launch] spur controller unavailable (attempt $_attempt/6); retrying in 20s" >&2
+                SPUR_LEG_JOB_ID=""
+                sleep 20
+                continue
+            fi
+            break
+        done
+    }
+
+    # Spur does not hold a job it cannot place. When the partition is full it
+    # cancels the submission within seconds -- JobState=CANCELLED,
+    # Reason=QOSGrpNodeLimit, StartTime=N/A -- and the monitor below then sees the
+    # job leave the queue having produced nothing, which it reports as an
+    # incomplete sweep. That is a red result for a test that never ran. Observed
+    # 2026-09-23 on jobs 4124 and 4125, both cancelled inside 40s while the four
+    # amd-sglang nodes were held by another run.
+    #
+    # A job can also be cancelled just after it is placed: job 4147 on 2026-09-24
+    # had StartTime set and RunTime=00:00:05, long enough to start the containers
+    # and nothing else. Keying on StartTime=N/A alone misses that, so also accept
+    # a cancelled job that produced no bench results -- a real sweep writes
+    # raw_conc*.json and bench_exit, and neither can appear in five seconds.
+    spur_never_started() {
+        local _info
+        _info=$(scontrol show job "$1" 2>/dev/null) || return 1
+        [[ "$_info" == *"JobState=CANCELLED"* ]] || return 1
+        [[ "$_info" == *"StartTime=N/A"* ]] && return 0
+        [[ -f "$WORKDIR/bench_exit" ]] && return 1
+        ! compgen -G "$WORKDIR/raw_conc*.json" > /dev/null
+    }
+    # squeue is not authoritative for "has this job left the queue". It asks the
+    # spur controller for the whole queue, and a controller hiccup -- the same
+    # Raft leader election spur_submit_leg already retries around -- answers with
+    # an empty list, the error swallowed by 2>/dev/null. A single miss is enough
+    # to end the leg.
+    #
+    # That is what happened to job 4177 on 2026-09-24. The monitor decided the
+    # job was gone 21 minutes into a healthy sweep, waited 90s for a drive_exit
+    # that could not arrive because the job was still benchmarking, reported
+    # "incomplete sweep: 3/7", and then scancelled the run it had just given up
+    # on -- the teardown below found the job in squeue, because it had never
+    # left. scontrol, which answers per job, still had it RUNNING throughout.
+    # Ask scontrol before believing the queue listing.
+    spur_job_alive() {
+        squeue -h -o "%i" 2>/dev/null | grep -qx "$1" && return 0
+        local _info
+        _info=$(scontrol show job "$1" 2>/dev/null) || return 1
+        [[ "$_info" == *"JobState=RUNNING"* \
+           || "$_info" == *"JobState=PENDING"* \
+           || "$_info" == *"JobState=CONFIGURING"* \
+           || "$_info" == *"JobState=COMPLETING"* ]]
+    }
+    SPUR_RESUBMITS_LEFT=${SPUR_RESUBMITS_LEFT:-20}
+
+    # Containers are started -d (detached) on spur, so killing this script does
+    # not kill them -- only the explicit teardown below does, and only if the
+    # script is still alive to reach it. A killed/disconnected runner otherwise
+    # leaves the job (and its containers) running until TIME_LIMIT. This trap
+    # covers that case the same way the normal path already covers a clean
+    # finish; it does not cover a hard SIGKILL or a severed connection.
+    spur_cleanup_on_exit() {
+        [[ "${SPUR_LEG_JOB_ID:-}" =~ ^[0-9]+$ ]] || return 0
+        local _nodes
+        _nodes=$(scontrol show job "$SPUR_LEG_JOB_ID" 2>/dev/null \
+            | tr ' ' '\n' | sed -n 's/^NodeList=//p' | tr ',' '\n' | grep -vx '(null)' || true)
+        for _n in $_nodes; do
+            echo "[launch] reaping containers on $_n for spur job $SPUR_LEG_JOB_ID" >&2
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -n "$_n" \
+                'docker rm -f mi355x_prefill mi355x_decode mi355x_bench' \
+                >/dev/null 2>&1 || true
+        done
+        scancel "$SPUR_LEG_JOB_ID" 2>/dev/null || true
+    }
+
+    spur_submit_leg
     if [[ ! "$SPUR_LEG_JOB_ID" =~ ^[0-9]+$ ]]; then
         echo "ERROR: could not parse a job id out of: $SBATCH_MSG" >&2
         SALLOC_RC=1
     else
+        trap spur_cleanup_on_exit EXIT INT TERM
         echo "[launch] spur job $SPUR_LEG_JOB_ID submitted; streaming $SBATCH_OUT"
         tail -F "$SBATCH_OUT" 2>/dev/null &
         SPUR_TAIL_PID=$!
@@ -1620,7 +1907,25 @@ EOF
         # ever running it (node failure, scheduler kill, time limit).
         while :; do
             [[ -f "$WORKDIR/drive_exit" ]] && break
-            if ! squeue -h -o "%i" 2>/dev/null | grep -qx "$SPUR_LEG_JOB_ID"; then
+            if ! spur_job_alive "$SPUR_LEG_JOB_ID"; then
+                # Cancelled before it ever ran: wait for the nodes and submit
+                # again rather than reporting a result we never measured.
+                if spur_never_started "$SPUR_LEG_JOB_ID" && (( SPUR_RESUBMITS_LEFT > 0 )); then
+                    SPUR_RESUBMITS_LEFT=$((SPUR_RESUBMITS_LEFT - 1))
+                    echo "[launch] spur job $SPUR_LEG_JOB_ID cancelled before start;" \
+                         "resubmitting in 5m ($SPUR_RESUBMITS_LEFT left)" >&2
+                    kill "$SPUR_TAIL_PID" 2>/dev/null || true
+                    sleep 300
+                    spur_submit_leg
+                    if [[ ! "$SPUR_LEG_JOB_ID" =~ ^[0-9]+$ ]]; then
+                        echo 1 > "$WORKDIR/drive_exit"
+                        break
+                    fi
+                    echo "[launch] spur job $SPUR_LEG_JOB_ID submitted; streaming $SBATCH_OUT"
+                    tail -F "$SBATCH_OUT" 2>/dev/null &
+                    SPUR_TAIL_PID=$!
+                    continue
+                fi
                 # The job has left the queue. drive_exit is written on a compute
                 # node and read here on the login node, so NFS close-to-open
                 # visibility can delay it well past a single short sleep. A five
@@ -1683,10 +1988,9 @@ EOF
         # 1774/1775 held all four nodes long after their legs had been recorded
         # rc=1. Unconditional, because reaching here means this leg is done with
         # its nodes either way.
-        if squeue -h -o "%i" 2>/dev/null | grep -qx "$SPUR_LEG_JOB_ID"; then
-            echo "[launch] releasing spur job $SPUR_LEG_JOB_ID"
-            scancel "$SPUR_LEG_JOB_ID" 2>/dev/null || true
-        fi
+        echo "[launch] releasing spur job $SPUR_LEG_JOB_ID"
+        trap - EXIT INT TERM
+        spur_cleanup_on_exit
     fi
 else
     salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \
@@ -1703,11 +2007,54 @@ set -e
 # whatever raw results the completed concurrencies produced -- partial perf data
 # is worth uploading -- and propagate the failure via the exit code at the end.
 if [[ "$SALLOC_RC" -ne 0 ]]; then
-    echo "ERROR: allocation/bench failed (rc=$SALLOC_RC); bench + server logs:" >&2
+    echo "ERROR: allocation/bench failed (rc=$SALLOC_RC); bench + driver + server logs:" >&2
     echo "--- bench.log (tail) ---"; tail -40 "$WORKDIR/bench.log" 2>/dev/null || true
-    for f in "$WORKDIR"/prefill_*.log "$WORKDIR"/decode_*.log; do
-        [[ -f "$f" ]] && { echo "--- $f (tail) ---"; tail -30 "$f"; }
+    # On spur drive.sh's own output goes only to drive_<host>.log, so a leg that
+    # fails before any server starts (a missing snapshot, no live RDMA port)
+    # otherwise reports nothing at all. It runs under set -x; drop the trace
+    # lines so the tail is the messages, not the commands.
+    for f in "$WORKDIR"/drive_*.log; do
+        [[ -f "$f" ]] || continue
+        echo "--- $f (tail, xtrace removed) ---"
+        grep -av '^+' "$f" | tail -60 || true
     done
+    # 30 lines was not enough: a scheduler traceback plus the shutdown that
+    # follows it pushed the line naming the cause out of the window. Lead with
+    # the first error lines, then print the log from the first of them -- the
+    # traceback and what follows it -- rather than a fixed tail, which is
+    # mostly teardown noise. Capped, since an early harmless match would
+    # otherwise print the whole log; the last lines are kept either way.
+    for f in "$WORKDIR"/prefill_*.log "$WORKDIR"/decode_*.log; do
+        [[ -f "$f" ]] || continue
+        echo "--- $f (first errors) ---"
+        grep -anE 'Traceback|Error|FATAL|Killed' "$f" | head -20 || true
+        _first=$(grep -anm1 -E 'Traceback|Error|FATAL|Killed' "$f" | cut -d: -f1 || true)
+        _total=$(wc -l < "$f")
+        if [[ -z "$_first" ]]; then
+            echo "--- $f (tail; no error lines) ---"; tail -60 "$f"
+        elif (( _total - _first < 150 )); then
+            echo "--- $f (from line $_first, first error) ---"; sed -n "${_first},\$p" "$f"
+        else
+            echo "--- $f (lines $_first-$((_first + 119)), from first error) ---"
+            sed -n "${_first},$((_first + 119))p" "$f"
+            echo "--- $f (last 30 of $_total lines) ---"; tail -30 "$f"
+        fi
+    done
+fi
+
+# drive.sh leaves ib_warn when fewer RDMA devices were up on every node than
+# the recipe asked for. The leg can still pass, so put it where a green run's
+# numbers are read, not just in a log nobody opens.
+if [[ -s "$WORKDIR/ib_warn" ]]; then
+    echo "::warning title=RDMA devices reduced (${MATRIX_CONFIG_NAME})::$(cat "$WORKDIR/ib_warn")"
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        {
+            echo "### RDMA devices reduced — ${MATRIX_CONFIG_NAME}"
+            echo '```'
+            cat "$WORKDIR/ib_warn"
+            echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+    fi
 fi
 
 # Surface the GSM8K accuracy in the job summary -- it scrolls past in the live
@@ -1738,7 +2085,7 @@ fi
 #   median_ttft_ms             ->  median_ttft_ms              (TTFT; /1000 -> s)
 #   median_tpot_ms             ->  median_tpot_ms              (TPOT; -> interactivity)
 #   median_e2e_latency_ms      ->  median_e2el_ms              (E2E latency; /1000 -> s)
-#   (none; injected here)      ->  model_id                    (served model, from $MODEL_PATH)
+#   (none; injected here)      ->  model_id                    (served model: the HF repo id $MODEL)
 # ---------------------------------------------------------------------------
 # GPU counts are per-ROLE totals across all engines: PW prefill engines of PTP
 # GPUs each, DW decode engines of DTP each. For EP<=8 (PW=DW=1) this is PTP/DTP
@@ -1769,7 +2116,7 @@ for C in ${CONCS//,/ }; do
     done
     [[ -f "$RAW" ]] || { echo "WARN: missing $RAW (not visible after 60s)"; continue; }
     DEST="$GITHUB_WORKSPACE/${RESULT_FILENAME}_${MATRIX_CONFIG_NAME}_conc${C}_gpus_${TOTAL_GPUS}_ctx_${PREFILL_GPUS_TOTAL}_gen_${DECODE_GPUS_TOTAL}.json"
-    MODEL_ID="$MODEL_PATH" python3 - "$RAW" "$DEST" "$C" <<'PY'
+    MODEL_ID="$MODEL" python3 - "$RAW" "$DEST" "$C" <<'PY'
 import json, os, sys
 raw_path, dest, conc = sys.argv[1], sys.argv[2], int(sys.argv[3])
 line = [l for l in open(raw_path).read().splitlines() if l.strip()][-1]

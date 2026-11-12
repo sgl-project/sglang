@@ -26,24 +26,46 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
     deduplicated_tensor_tree_output_fields = ("timesteps", "sigmas")
     deduplicated_extra_tensor_tree_output_keys = (MINIMAX_H3_SIGMAS_EXTRA_KEY,)
 
-    def __init__(self, sigma_shift_scales=None) -> None:
+    def __init__(
+        self,
+        sigma_shift_scales=None,
+        dmd_denoising_steps: tuple[int, ...] | None = None,
+        pdd_heads: str | None = None,
+    ) -> None:
         super().__init__()
         # Per-model sigma shift override (model_index.json "_minimax_h3" release
         # block, sigma_shift_scales): the schedule constants are a MODEL
         # serving contract — fl2va and ref2va use video 12 / audio 3 by default.
         self.sigma_shift_scales = sigma_shift_scales
+        self.dmd_denoising_steps = dmd_denoising_steps
         self._pdd_config = None
-        pdd_heads = envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
+        self._pdd_image_sigmas: tuple[float, ...] | None = None
+        # The pipeline resolves the release's fused heads; the env var serves
+        # stages built without a pipeline.
+        pdd_heads = pdd_heads or envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
         if pdd_heads:
             from safetensors import safe_open
+
+            from ..time_request import minimax_h3_image_pdd_grid
 
             self._pdd_config = json.loads(
                 Path(pdd_heads).with_name("pdd_config.json").read_text()
             )
             with safe_open(pdd_heads, "pt") as f:
                 steps = f.get_slice("video_out.weight").get_shape()[0]
-            if self._pdd_config["num_inference_steps"] != steps + 1:
+            if self._pdd_config["num_inference_steps"] != steps:
                 raise ValueError("MiniMax-H3 PDD config does not match the fused heads")
+            sigma_max = float(self._pdd_config.get("sigma_max", 1.0))
+            if not 0.0 < sigma_max <= 1.0:
+                raise ValueError("MiniMax-H3 PDD sigma_max must be in (0, 1]")
+            # An image release lists its distillation grid; a video release
+            # derives it from num_inference_steps, the shifts and sigma_max.
+            if "sigmas" in self._pdd_config:
+                if "sigma_max" in self._pdd_config:
+                    raise ValueError(
+                        "MiniMax-H3 pdd_config.json takes sigmas or sigma_max, not both"
+                    )
+                self._pdd_image_sigmas = minimax_h3_image_pdd_grid(self._pdd_config)
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
@@ -56,8 +78,47 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 f"{self.__class__.__name__} is a MiniMax H3 contract stage "
                 "and has no implementation yet."
             )
-        self._generate_sigmas_from_plan(batch, plan)
-        self._apply_pdd_schedule(batch)
+        if plan.output_modality == "image":
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+                minimax_h3_image_pdd_sigmas,
+            )
+
+            # Image releases are PDD checkpoints: the grid comes from their
+            # pdd_config.json.
+            if self._pdd_image_sigmas is None:
+                raise ValueError(
+                    "MiniMax H3 image serves PDD releases only: the fused heads' "
+                    "pdd_config.json must list the sigma grid as sigmas"
+                )
+            sigmas = minimax_h3_image_pdd_sigmas(
+                self._pdd_image_sigmas,
+                task=plan.task,
+                num_steps=batch.num_inference_steps,
+                is_warmup=batch.is_warmup,
+            )
+            # No audio stream; the audio entry mirrors video so consumers that
+            # expect both keys see equal-length plans.
+            batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = {
+                "video": sigmas,
+                "audio": sigmas,
+            }
+            if batch.is_warmup:
+                batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY]["full"] = (
+                    minimax_h3_image_pdd_sigmas(
+                        self._pdd_image_sigmas,
+                        task=plan.task,
+                        num_steps=len(self._pdd_image_sigmas) - 1,
+                        is_warmup=False,
+                    )
+                )
+        else:
+            if self._pdd_config is not None and self._pdd_image_sigmas is not None:
+                raise NotImplementedError(
+                    "an explicit PDD sigma grid (pdd_config.json sigmas) is "
+                    "supported for MiniMax H3 image releases only"
+                )
+            self._generate_sigmas_from_plan(batch, plan)
+            self._apply_pdd_schedule(batch)
         self._publish_native_timestep_state(batch)
         return batch
 
@@ -73,6 +134,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 "and has no implementation yet."
             )
         return (
+            plan.task,
             batch.num_inference_steps,
             batch.is_warmup,
             plan.flow_shift,
@@ -90,6 +152,10 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         )
 
         config = self._pdd_config
+        # Students trained on a grid ending at sigma_max < 1 (FastGen's
+        # max_t) sample the [1, 0] grid scaled by it. The scale is shared by
+        # every interval, so the fused heads' in-block weights are unchanged.
+        sigma_max = float(config.get("sigma_max", 1.0))
         sigmas = batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY]
         for modality in ("video", "audio"):
             expected = minimax_h3_time_shift_sigmas(
@@ -99,18 +165,20 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             if batch.is_warmup:
                 # Warmup may run fewer steps, but must use the same intervals
                 # as serving rather than rescaling a shorter grid to [1, 0].
-                sigmas[modality] = expected[: max(2, batch.num_inference_steps)]
-                continue
-            actual = sigmas[modality]
-            if len(actual) != len(expected) or any(
-                not math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-7)
-                for a, b in zip(actual, expected)
-            ):
-                raise ValueError(
-                    f"MiniMax-H3 PDD requires num_inference_steps="
-                    f"{config['num_inference_steps']} and {modality} shift="
-                    f"{config[f'{modality}_shift']} to match the fused heads"
-                )
+                expected = expected[: batch.num_inference_steps + 1]
+            else:
+                actual = sigmas[modality]
+                if len(actual) != len(expected) or any(
+                    not math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-7)
+                    for a, b in zip(actual, expected)
+                ):
+                    raise ValueError(
+                        f"MiniMax-H3 PDD requires num_inference_steps="
+                        f"{config['num_inference_steps']} and {modality} shift="
+                        f"{config[f'{modality}_shift']} to match the fused heads"
+                    )
+            if batch.is_warmup or sigma_max != 1.0:
+                sigmas[modality] = [sigma * sigma_max for sigma in expected]
 
     @staticmethod
     def _publish_native_timestep_state(batch: Req) -> None:
@@ -197,12 +265,20 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 task_default=plan.default_audio_flow_shift,
             ),
         }
+        dmd_steps = self.dmd_denoising_steps
+        num_steps = requested_num_steps
+        if dmd_steps is not None and batch.is_warmup:
+            # warmup truncates the trained rungs instead of rescaling a shorter grid
+            num_steps = len(dmd_steps)
         sigmas: dict[str, list[float]] = {}
         for modality in ("video", "audio"):
             sigmas[modality] = minimax_h3_time_shift_sigmas(
-                num_steps=requested_num_steps,
+                num_steps=num_steps,
                 shift_scale=scales[modality],
+                dmd_steps=dmd_steps,
             )
+            if num_steps != requested_num_steps:
+                sigmas[modality] = sigmas[modality][: requested_num_steps + 1]
         batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = sigmas
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

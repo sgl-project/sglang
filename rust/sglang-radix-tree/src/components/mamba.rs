@@ -2,17 +2,20 @@
 //! and inherits the rest from the `TreeComponent` defaults.
 //! Mamba data is per-leaf single-slot state; sizes count slots, not tokens.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use tch::Tensor;
 
+use crate::cache_action::{FreeComponentHostSlot, MambaEvictExcessPathStates};
 use crate::components::TreeComponent;
-use crate::components::{ComponentType, MAMBA};
+use crate::components::{ComponentType, FULL, Family, MAMBA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
+use crate::unified_lru_list::GdsPriority;
 use crate::unified_tree_core::{
-    CacheAction, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
+    CacheActions, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
     IncLockRefResult, InsertParams, InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult,
     PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
 };
@@ -23,6 +26,10 @@ pub struct MambaComponent {
     mamba_checkpoint_grid: usize,
     /// Per-root-path cap on cached Mamba states; None means unlimited.
     mamba_max_states_per_path: Option<usize>,
+    /// Host checkpoints count as a device-prefix match.
+    mamba_host_only_checkpoint: bool,
+    /// GDS prefill cost coefficients (d, e); None keeps the LRU walk.
+    gds_cost: Option<(f64, f64)>,
 }
 
 impl MambaComponent {
@@ -43,7 +50,224 @@ impl MambaComponent {
             // a radix-node boundary. `params.page_size` is already widened by DCP.
             mamba_checkpoint_grid: least_common_multiple(mamba_cache_chunk_size, params.page_size),
             mamba_max_states_per_path: params.mamba_max_states_per_path,
+            mamba_host_only_checkpoint: params.mamba_host_only_checkpoint,
+            gds_cost: params.gds_cost,
         }
+    }
+
+    /// Stamp a state at the watermark: cached, resumed, or released by its
+    /// last request.
+    fn gds_mark_used_<K: ChildKeyType>(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) {
+        if self.gds_cost.is_some() {
+            let watermark = tree_core.mamba_gds_watermark;
+            tree_core.arena.node_mut(node_id).gds_stamp = watermark;
+        }
+    }
+
+    /// Zero the cached gains a state set on `node_id` can make too high: its
+    /// own, which may predate a shallower state, and those of the nearest
+    /// states below it. Their seeds fall to their stamps, a lower bound, so the
+    /// walk recomputes them before trusting the order.
+    fn gds_forget_gains_<K: ChildKeyType>(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) {
+        if self.gds_cost.is_none() {
+            return;
+        }
+        tree_core.arena.node_mut(node_id).gds_gain = 0.0;
+        let mut stack: Vec<NodeIdx_> = tree_core
+            .arena
+            .node(node_id)
+            .children
+            .values()
+            .copied()
+            .collect();
+        while let Some(x) = stack.pop() {
+            if tree_core.arena.has_device_value(x, MAMBA) {
+                tree_core.arena.node_mut(x).gds_gain = 0.0;
+            } else {
+                stack.extend(tree_core.arena.node(x).children.values().copied());
+            }
+        }
+    }
+
+    /// A state's priority from its last known gain.
+    fn gds_priority_<K: ChildKeyType>(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> f64 {
+        let node = tree_core.arena.node(node_id);
+        let stamp = if node.gds_stamp.is_nan() {
+            tree_core.mamba_gds_watermark
+        } else {
+            node.gds_stamp
+        };
+        stamp + node.gds_gain
+    }
+
+    /// Recompute the prefill to rebuild a state from the nearest shallower
+    /// device state, or from token 0 without one, and return its priority.
+    fn gds_refresh_priority_<K: ChildKeyType>(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+        (d, e): (f64, f64),
+    ) -> f64 {
+        let mut depth = 0usize;
+        let mut gap = None;
+        let mut x = node_id;
+        while let Some(parent) = tree_core.arena.node(x).try_parent() {
+            depth += tree_core.arena.node(x).key.atom_len();
+            if gap.is_none() && tree_core.arena.has_device_value(parent, MAMBA) {
+                gap = Some(depth);
+            }
+            x = parent;
+        }
+        let fallback = gap.map_or(0, |gap| depth - gap);
+        let span = (depth - fallback) as f64;
+        let quadratic = (depth * depth - fallback * fallback) as f64;
+        tree_core.arena.node_mut(node_id).gds_gain = d * span + e * quadratic / 2e5;
+        self.gds_priority_(tree_core, node_id)
+    }
+
+    /// Seed the walk with the last known gains; a popped entry is rechecked,
+    /// since evicting a shallower state during the walk raises its gain.
+    fn gds_begin_walk_<K: ChildKeyType>(&self, tree_core: &mut UnifiedTreeCore<K>) {
+        tree_core.mamba_gds_heap.clear();
+        let mut cursor = tree_core
+            .device_lru_list(MAMBA)
+            .get_lru_no_lock(&tree_core.arena);
+        while let Some(x) = cursor {
+            let priority = self.gds_priority_(tree_core, x);
+            tree_core
+                .mamba_gds_heap
+                .push(Reverse((GdsPriority(priority), x)));
+            cursor = tree_core
+                .device_lru_list(MAMBA)
+                .get_prev_no_lock(x, &tree_core.arena);
+        }
+    }
+
+    fn gds_is_candidate_<K: ChildKeyType>(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> bool {
+        tree_core.device_lru_list(MAMBA).in_list(Some(node_id))
+            && tree_core.arena.has_device_value(node_id, MAMBA)
+            && tree_core.arena.node(node_id).device_lock_ref(MAMBA) == 0
+    }
+
+    fn gds_pop_<K: ChildKeyType>(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        cost: (f64, f64),
+    ) -> Option<NodeIdx_> {
+        while let Some(Reverse((GdsPriority(priority), x))) = tree_core.mamba_gds_heap.pop() {
+            if !self.gds_is_candidate_(tree_core, x) {
+                continue;
+            }
+            let current = self.gds_refresh_priority_(tree_core, x, cost);
+            if current > priority {
+                tree_core
+                    .mamba_gds_heap
+                    .push(Reverse((GdsPriority(current), x)));
+                continue;
+            }
+            tree_core.mamba_gds_watermark = tree_core.mamba_gds_watermark.max(current);
+            return Some(x);
+        }
+        None
+    }
+
+    /// One eviction step in priority order, with the LRU walk's contract.
+    fn gds_next_node_<K: ChildKeyType>(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        cost: (f64, f64),
+        tracker: &mut HashMap<ComponentType, usize>,
+        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
+    ) -> Option<NodeIdx_> {
+        if tracker[&MAMBA] >= tree_core.component_state(MAMBA).evict_device_request_cnt {
+            return None;
+        }
+        // A resumed backup that found its victim changed re-selects it here.
+        let reselect = tree_core
+            .component_state_mut(MAMBA)
+            .evict_device_cursor
+            .take()
+            .filter(|&x| self.gds_is_candidate_(tree_core, x));
+        let x = match reselect {
+            Some(x) => x,
+            None => self.gds_pop_(tree_core, cost)?,
+        };
+        if tree_core.evictable_device_leaves.contains(x) {
+            return Some(x);
+        }
+        self.evict_internal_state_(
+            tree_core,
+            x,
+            tracker,
+            device_frees,
+            host_frees,
+            cache_actions,
+        );
+        None
+    }
+
+    /// Tombstone one internal state, or queue its host backup first.
+    fn evict_internal_state_<K: ChildKeyType>(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        x: NodeIdx_,
+        tracker: &mut HashMap<ComponentType, usize>,
+        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
+    ) {
+        let node = tree_core.arena.node(x);
+        if tree_core.enable_hicache
+            && tree_core.is_write_back
+            && !node.has_host_value(MAMBA)
+            && !node.backuped()
+            && node.has_device_value(FULL)
+        {
+            // Keep the state live until the controller finishes D->H I/O.
+            // Native code never calls Python while holding the tree lock.
+            let node_id = node.id;
+            tree_core
+                .component_state_mut(MAMBA)
+                .evict_device_pending_node = Some(node_id);
+            return;
+        }
+        // Other policies and already-backed states need no I/O.
+        tree_core.evict_component_and_detach_lru_(
+            x,
+            MAMBA,
+            device_frees,
+            host_frees,
+            cache_actions,
+            EvictLayer::Device,
+            Some(tracker),
+        );
+        tree_core.cascade_evict_(
+            x,
+            MAMBA,
+            tracker,
+            device_frees,
+            host_frees,
+            cache_actions,
+            EvictLayer::Device,
+        );
     }
 }
 
@@ -70,18 +294,53 @@ impl MambaComponent {
     fn emit_excess_path_states_eviction_(
         &self,
         tail_node_id: NodeId,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
         if self.mamba_max_states_per_path.is_none() {
             return;
         }
-        cache_actions.push(CacheAction::MambaEvictExcessPathStates { tail_node_id });
+        cache_actions.push(Box::new(MambaEvictExcessPathStates { tail_node_id }));
+    }
+
+    /// Store a hicache host index and leave the node without a GPU mamba slot.
+    fn commit_host_only_checkpoint<K: ChildKeyType>(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+        host_value: &Tensor,
+        result: &mut InsertResult,
+        cache_actions: &mut CacheActions,
+    ) {
+        if tree_core.arena.has_device_value(node_id, MAMBA)
+            || tree_core.arena.has_host_value(node_id, MAMBA)
+        {
+            result.mamba_exist = true;
+            return;
+        }
+        tree_core
+            .arena
+            .set_host_value(node_id, MAMBA, host_value.shallow_clone());
+        if !tree_core.host_lru_list(MAMBA).in_list(Some(node_id)) {
+            tree_core.host_lru_list_mut(MAMBA).insert_mru(node_id);
+        }
+        let tick = tree_core.arena.get_and_bump_access_counter();
+        tree_core.arena.node_mut(node_id).last_access_counter = tick;
+        result.mamba_exist = false;
+        self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
     }
 }
 
 impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
+    fn host_only_checkpoint_counts_as_device(&self) -> bool {
+        self.mamba_host_only_checkpoint
+    }
+
     fn component_type(&self) -> ComponentType {
         MAMBA
+    }
+
+    fn family(&self) -> Family {
+        Family::State
     }
 
     fn needs_incremental_backup(&self, tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_) -> bool {
@@ -103,6 +362,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             LRURefreshPhase::MatchEnd => {
                 if tree_core.arena.has_device_value(node_id, MAMBA) {
                     tree_core.device_lru_list_mut(MAMBA).reset_node_mru(node_id);
+                    self.gds_mark_used_(tree_core, node_id);
                 }
             }
             LRURefreshPhase::InsertEnd => {}
@@ -116,9 +376,13 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         match_device_only: bool,
     ) -> Box<dyn FnMut(&UnifiedTreeCore<K>, NodeIdx_) -> bool> {
         // HiCache: evicted + backuped (host_value present) is also a valid match.
+        // Host-only mode never puts the checkpoint on a GPU slot, so that host
+        // value must also keep the Full KV device prefix reachable.
+        let host_counts_as_device = self.mamba_host_only_checkpoint;
         Box::new(move |tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_| {
             let node = tree_core.arena.node(node_id);
-            node.has_device_value(MAMBA) || (!match_device_only && node.has_host_value(MAMBA))
+            node.has_device_value(MAMBA)
+                || ((host_counts_as_device || !match_device_only) && node.has_host_value(MAMBA))
         })
     }
 
@@ -133,7 +397,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         _value_chunks: &[Tensor],
         _best_value_len: usize,
     ) -> MatchResult {
-        let mamba_boundary_len = result.device_indices.size()[0] as usize + result.host_hit_length;
+        let mamba_boundary_len = result.device_prefix_len + result.host_hit_length;
 
         // Full KV may extend beyond the latest reusable Mamba state. The branching
         // point is the last checkpoint-grid-aligned position within the Full-KV hit
@@ -160,20 +424,36 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         is_new_leaf: bool,
         params: &InsertParams<'_, K>,
         result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
     ) {
+        assert!(
+            params.mamba_value.is_none() || params.mamba_host_value.is_none(),
+            "mamba insert sets both a device slot and a host checkpoint"
+        );
+        if params.mamba_value.is_none() && params.mamba_host_value.is_none() {
+            if params.allow_missing_mamba {
+                result.mamba_exist = true;
+                return;
+            }
+        } else if params.mamba_value.is_none()
+            && let Some(host_value) = params.mamba_host_value.as_ref()
+        {
+            self.commit_host_only_checkpoint(tree_core, node_id, host_value, result, cache_actions);
+            return;
+        }
         let mamba_value = params
             .mamba_value
             .as_ref()
             .expect("mamba insert requires a donated mamba_value");
-        let slot_len = mamba_value.size()[0] as usize;
 
         if is_new_leaf {
             tree_core
                 .arena
                 .set_device_value(node_id, MAMBA, mamba_value.shallow_clone());
             tree_core.device_lru_list_mut(MAMBA).insert_mru(node_id);
-            tree_core.inc_evictable_size(MAMBA, slot_len);
+            let tokens = tree_core.component_reclaimable_value_len_(node_id, MAMBA);
+            tree_core.inc_evictable_size(MAMBA, tokens);
+            self.gds_mark_used_(tree_core, node_id);
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
             return;
         }
@@ -181,12 +461,15 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             tree_core.set_component_device_value_(node_id, MAMBA, mamba_value.shallow_clone());
             let tick = tree_core.arena.get_and_bump_access_counter();
             tree_core.arena.node_mut(node_id).last_access_counter = tick;
+            self.gds_mark_used_(tree_core, node_id);
+            self.gds_forget_gains_(tree_core, node_id);
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
             return;
         }
         tree_core.device_lru_list_mut(MAMBA).reset_node_mru(node_id);
         let tick = tree_core.arena.get_and_bump_access_counter();
         tree_core.arena.node_mut(node_id).last_access_counter = tick;
+        self.gds_mark_used_(tree_core, node_id);
         result.mamba_exist = true;
     }
 
@@ -200,6 +483,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         tail_node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
     ) {
         let Some(cap) = self.mamba_max_states_per_path else {
             return;
@@ -212,7 +496,10 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             if node.is_root() {
                 break;
             }
-            if node.has_device_value(MAMBA) {
+            let host_only_holder = self.mamba_host_only_checkpoint
+                && !node.has_device_value(MAMBA)
+                && node.has_host_value(MAMBA);
+            if node.has_device_value(MAMBA) || host_only_holder {
                 holders.push(node_id);
             }
             cursor = node.parent;
@@ -228,18 +515,28 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 break;
             }
             let node = tree_core.arena.node(node_id);
+            let host_only_holder = !node.has_device_value(MAMBA) && node.has_host_value(MAMBA);
             if node.device_lock_ref(MAMBA) > 0 || node.children.len() != 1 {
+                continue;
+            }
+            if host_only_holder && node.host_lock_ref(MAMBA) > 0 {
                 continue;
             }
             if tree_core.evictable_device_leaves.contains(node_id) {
                 continue;
             }
+            let layer = if host_only_holder {
+                EvictLayer::Host
+            } else {
+                EvictLayer::Device
+            };
             tree_core.evict_component_and_detach_lru_(
                 node_id,
                 MAMBA,
                 device_frees,
                 host_frees,
-                EvictLayer::Device,
+                cache_actions,
+                layer,
                 Some(&mut tracker),
             );
             tree_core.cascade_evict_(
@@ -248,7 +545,8 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 &mut tracker,
                 device_frees,
                 host_frees,
-                EvictLayer::Device,
+                cache_actions,
+                layer,
             );
             excess -= 1;
         }
@@ -279,20 +577,21 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         node_id: NodeIdx_,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
         target: EvictLayer,
     ) -> (usize, usize) {
         let ct = MAMBA;
-        let node = tree_core.arena.node_mut(node_id);
+        let node = tree_core.arena.node(node_id);
         let mut freed = 0;
         let mut host_freed = 0;
 
         // Device layer
         if target.contains(EvictLayer::Device) && node.has_device_value(MAMBA) {
-            freed = node.device_value_len(MAMBA);
+            freed = tree_core.component_reclaimable_value_len_(node_id, MAMBA);
             device_frees
                 .entry(ct)
                 .or_default()
-                .push(node.take_device_value(MAMBA));
+                .push(tree_core.arena.node_mut(node_id).take_device_value(MAMBA));
             tree_core.dec_evictable_size(MAMBA, freed);
         }
 
@@ -328,6 +627,11 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
     /// Begin the device-eviction walk from this component's LRU cursor.
     fn evict_device_start(&self, tree_core: &mut UnifiedTreeCore<K>, request_cnt: usize) {
         tree_core.set_evict_device_start(MAMBA, request_cnt);
+        if self.gds_cost.is_some() {
+            self.gds_begin_walk_(tree_core);
+            tree_core.component_state_mut(MAMBA).evict_device_cursor = None;
+            return;
+        }
         let cursor = tree_core
             .device_lru_list(MAMBA)
             .get_lru_no_lock(&tree_core.arena);
@@ -344,12 +648,30 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
     ) -> Option<NodeIdx_> {
         let ct = MAMBA;
         assert!(
             tree_core.component_state(MAMBA).is_evict_device_ongoing,
             "Mamba device eviction not started"
         );
+        assert!(
+            tree_core
+                .component_state(MAMBA)
+                .evict_device_pending_node
+                .is_none(),
+            "finish the pending internal Mamba eviction before advancing"
+        );
+        if let Some(cost) = self.gds_cost {
+            return self.gds_next_node_(
+                tree_core,
+                cost,
+                tracker,
+                device_frees,
+                host_frees,
+                cache_actions,
+            );
+        }
         let mut cursor = tree_core.component_state(MAMBA).evict_device_cursor;
         // The cursor is re-validated (reset to LRU head) if the previous
         // node's eviction removed it.
@@ -358,15 +680,15 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 .device_lru_list(MAMBA)
                 .get_lru_no_lock(&tree_core.arena);
         }
-        let next = loop {
+        let next = 'step: {
             if tracker[&ct] >= tree_core.component_state(MAMBA).evict_device_request_cnt {
-                break None;
+                break 'step None;
             }
             let Some(x) = cursor else {
-                break None;
+                break 'step None;
             };
             if !tree_core.device_lru_list(MAMBA).in_list(Some(x)) {
-                break None;
+                break 'step None;
             }
             assert!(
                 tree_core.arena.has_device_value(x, MAMBA),
@@ -375,24 +697,21 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             cursor = tree_core
                 .device_lru_list(MAMBA)
                 .get_prev_no_lock(x, &tree_core.arena);
-            // A load-back pin means an in-flight DMA targets this node's slices.
-            if tree_core.arena.node(x).is_load_back_pending() {
-                continue;
-            }
+            // The Mamba LRU filters its own transfer/request locks. Full load
+            // pins and expanded SWA backups can cover unrelated Mamba state
+            // restored by a later request, which remains independently evictable.
             if tree_core.evictable_device_leaves.contains(x) {
-                break Some(x);
+                break 'step Some(x);
             }
-            // Internal nodes are tombstoned inline (no IO).
-            tree_core.evict_component_and_detach_lru_(
+            self.evict_internal_state_(
+                tree_core,
                 x,
-                ct,
+                tracker,
                 device_frees,
                 host_frees,
-                EvictLayer::Device,
-                Some(tracker),
+                cache_actions,
             );
-            tree_core.cascade_evict_(x, ct, tracker, device_frees, host_frees, EvictLayer::Device);
-            break None;
+            None
         };
         tree_core.component_state_mut(MAMBA).evict_device_cursor = cursor;
         next
@@ -428,8 +747,8 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             }
             tree_core.arena.inc_host_lock_ref(node_id, MAMBA);
         } else {
-            let value_len = node.device_value_len(MAMBA);
-            if node.device_lock_ref(MAMBA) == 0 && has_value {
+            let value_len = tree_core.component_reclaimable_value_len_(node_id, MAMBA);
+            if node.device_lock_ref(MAMBA) == 0 {
                 tree_core.dec_evictable_size(MAMBA, value_len);
                 tree_core.inc_protected_size(MAMBA, value_len);
             }
@@ -473,13 +792,16 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             device_lock_ref > 0,
             "Mamba release hit lock_ref=0 on node {node_id}"
         );
-        if device_lock_ref == 1 && node.has_device_value(MAMBA) {
-            let value_len = node.device_value_len(MAMBA);
+        if device_lock_ref == 1 {
+            let value_len = tree_core.component_reclaimable_value_len_(node_id, MAMBA);
             tree_core.inc_evictable_size(MAMBA, value_len);
             tree_core.dec_protected_size(MAMBA, value_len);
         }
         tree_core.arena.dec_device_lock_ref(node_id, MAMBA);
         if device_lock_ref == 1 {
+            if tree_core.arena.has_device_value(node_id, MAMBA) {
+                self.gds_mark_used_(tree_core, node_id);
+            }
             tree_core.update_evictable_leaf_sets_(node_id);
         }
     }
@@ -517,8 +839,12 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     return Ok(None);
                 }
                 let mut transfers = Vec::new();
-                // restore single node if host_value exists
-                if let Some(host_value) = node.try_host_value(MAMBA) {
+                // restore single node if host_value exists. A host-only
+                // checkpoint keeps no GPU slot on the node, so the request copy
+                // below is the only H->D.
+                if !self.mamba_host_only_checkpoint
+                    && let Some(host_value) = node.try_host_value(MAMBA)
+                {
                     transfers.push(PoolTransfer {
                         name: PoolName::Mamba,
                         host_indices: Some(host_value.shallow_clone()),
@@ -576,6 +902,24 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         })
     }
 
+    fn build_external_linker_offload_transfer(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> Option<PoolTransfer> {
+        let node = tree_core.arena.node(node_id);
+        let hash_value = node.hash_value.as_ref().filter(|h| !h.is_empty())?;
+        let device_indices = node.try_device_value(MAMBA)?;
+        // One state per node, valid only at the node's end boundary.
+        Some(PoolTransfer {
+            name: PoolName::Mamba,
+            device_indices: Some(device_indices.shallow_clone()),
+            keys: Some(vec![hash_value[hash_value.len() - 1].clone()]),
+            hit_policy: PoolHitPolicy::TrailingPages,
+            ..Default::default()
+        })
+    }
+
     /// Post-transfer mamba bookkeeping for the given phase.
     fn commit_hicache_transfer(
         &self,
@@ -583,7 +927,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
         transfers: Vec<PoolTransfer>,
-        cache_actions: &mut Vec<CacheAction>,
+        cache_actions: &mut CacheActions,
         insert_result: Option<&mut InsertResult>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) {
@@ -599,6 +943,11 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 }
             }
             CacheTransferPhase::LoadBack => {
+                // Host-only: the only transfer targets the request's slot,
+                // which must not become the node's value.
+                if self.mamba_host_only_checkpoint {
+                    return;
+                }
                 let Some(transfer) = transfers.first() else {
                     return;
                 };
@@ -606,6 +955,8 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     // The materialization primitive owns the ledger/LRU moves,
                     // including crediting protected when restored under lock.
                     tree_core.set_component_device_value_(node_id, MAMBA, device_indices.copy());
+                    self.gds_mark_used_(tree_core, node_id);
+                    self.gds_forget_gains_(tree_core, node_id);
                 }
             }
             // The python elif chain has no BACKUP_STORAGE arm.
@@ -643,12 +994,12 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                 let Some(target) = attach_target else {
                     // The buffer cannot attach: free it and let the caller keep
                     // its own donated slot bookkeeping.
-                    cache_actions.push(CacheAction::FreeComponentHostSlot {
+                    cache_actions.push(Box::new(FreeComponentHostSlot {
                         component_type: MAMBA,
                         host_indices: host_indices
                             .map(|host| vec![host.shallow_clone()])
                             .unwrap_or_default(),
-                    });
+                    }));
                     if let Some(insert_result) = insert_result {
                         insert_result.mamba_exist = true;
                     }
@@ -680,6 +1031,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         tracker: &mut HashMap<ComponentType, usize>,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        cache_actions: &mut CacheActions,
     ) {
         let ct = MAMBA;
         let mut x = tree_core
@@ -698,14 +1050,11 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             let x_next = tree_core
                 .host_lru_list(MAMBA)
                 .get_prev_no_lock(cur, &tree_core.arena);
-            // A load-back pin means an in-flight DMA reads this node's host slices.
-            if tree_core.arena.node(cur).is_load_back_pending() {
-                x = x_next;
-                continue;
-            }
+            // The host LRU filters Mamba's own locks. A Full load-back pin may
+            // cover an ancestor whose Mamba state is not being transferred.
             if tree_core.evictable_host_leaves.contains(cur) {
                 // Host leaf: atomic eviction (all components host + delete)
-                tree_core.evict_host_leaf_(cur, tracker, device_frees, host_frees);
+                tree_core.evict_host_leaf_(cur, tracker, device_frees, host_frees, cache_actions);
             } else {
                 // Internal: tombstone Mamba + cascade
                 assert!(
@@ -717,6 +1066,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     ct,
                     device_frees,
                     host_frees,
+                    cache_actions,
                     EvictLayer::Host,
                     Some(tracker),
                 );
@@ -726,6 +1076,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     tracker,
                     device_frees,
                     host_frees,
+                    cache_actions,
                     EvictLayer::Host,
                 );
             }

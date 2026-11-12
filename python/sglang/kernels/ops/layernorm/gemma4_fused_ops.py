@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_sm100_supported
+
 
 @triton.jit
 def _gemma_rmsnorm_residual_kernel(
@@ -277,7 +279,7 @@ def gemma_qkv_rmsnorm(
         assert k.stride(-1) == 1 and v.stride(-1) == 1
         assert k_weight is not None and k_weight.shape[-1] == head_dim
 
-    if M <= 256:
+    if M <= 256 or (M == 512 and is_sm100_supported()):
         total_heads = num_q_heads + (2 * num_kv_heads if has_kv else 0)
         _gemma_qkv_rmsnorm_kernel[(M, total_heads)](
             q,

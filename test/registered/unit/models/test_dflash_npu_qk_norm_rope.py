@@ -7,7 +7,7 @@ caller compatibility, not real accelerator execution or NPU 192 support.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 import torch.nn.functional as F
@@ -18,6 +18,7 @@ from sglang.srt.layers.rotary_embedding.base import (
     LinearScalingRotaryEmbedding,
     RotaryEmbedding,
 )
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.models import dflash
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -78,6 +79,7 @@ def _make_attention(head_dim, *, dtype=torch.float32, neox=True, scaling=1.0):
     attn.v_scale = None
     attn.attention_sink_bias = None
     attn.use_table_qk_norm_rope = False
+    attn.use_gemma_norm = False
     return attn
 
 
@@ -221,7 +223,9 @@ class TestDFlashNpuQkNormRope(CustomTestCase):
                 for attn in attentions:
                     attn.attn.k_scale = None
                     attn.attn.v_scale = None
-                pool = SimpleNamespace(set_kv_buffer=Mock())
+                layer_router = Mock()
+                store = layer_router.layer.return_value.store
+                pool = SimpleNamespace(layer_router=layer_router)
                 worker = SimpleNamespace(
                     draft_model=SimpleNamespace(
                         layers=layers,
@@ -254,25 +258,34 @@ class TestDFlashNpuQkNormRope(CustomTestCase):
                     )
 
                 self.assertEqual(fused.call_count, len(layers))
-                self.assertEqual(pool.set_kv_buffer.call_count, len(layers))
-                for layer, call in zip(layers, pool.set_kv_buffer.call_args_list):
+                self.assertEqual(
+                    layer_router.layer.call_args_list,
+                    [call(layer.self_attn.attn.layer_id) for layer in layers],
+                )
+                self.assertEqual(store.call_count, len(layers))
+                for layer, write in zip(layers, store.call_args_list):
                     attn = layer.self_attn
                     expected = F.linear(hidden + layer.offset, attn.qkv_proj.weight)
                     _, expected_k, expected_v = expected.split(
                         [attn.q_size, attn.kv_size, attn.kv_size], dim=-1
                     )
                     self.assertEqual(attn.qkv_proj.calls, 1)
-                    self.assertIs(call.args[0], attn.attn)
-                    torch.testing.assert_close(call.args[1], cache_loc)
+                    self.assertIs(write.args[0], attn.attn)
+                    loc = write.args[1]
+                    self.assertIsInstance(loc, KVWriteLoc)
+                    self.assertTrue(loc.physical)
+                    torch.testing.assert_close(loc.loc, cache_loc)
                     torch.testing.assert_close(
-                        call.args[2], expected_k.reshape(3, attn.num_kv_heads, head_dim)
+                        write.args[2],
+                        expected_k.reshape(3, attn.num_kv_heads, head_dim),
                     )
                     torch.testing.assert_close(
-                        call.args[3], expected_v.reshape(3, attn.num_kv_heads, head_dim)
+                        write.args[3],
+                        expected_v.reshape(3, attn.num_kv_heads, head_dim),
                     )
 
     def test_non_npu_bf16_keeps_table_dispatch(self):
-        from sglang.srt.speculative import dflash_utils
+        from sglang.kernels.ops.attention import table_qk_norm_rope
 
         torch.manual_seed(2026)
         attn = _make_attention(128, dtype=torch.bfloat16)
@@ -282,7 +295,7 @@ class TestDFlashNpuQkNormRope(CustomTestCase):
         projected = F.linear(hidden, attn.qkv_proj.weight)
         with (
             patch.object(dflash, "_is_npu", False),
-            patch.object(dflash_utils, "table_qk_norm_rope_") as table,
+            patch.object(table_qk_norm_rope, "table_qk_norm_rope_") as table,
             patch.object(
                 dflash,
                 "apply_qk_norm",

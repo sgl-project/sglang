@@ -10,7 +10,6 @@ Only the constructor's NPU eligibility query is mocked; tensors stay on CPU.
 import tempfile
 import time
 import unittest
-from contextlib import nullcontext
 from unittest.mock import patch
 
 import torch
@@ -33,10 +32,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.models.dspark import DSparkDraftModel
-from sglang.srt.runtime_context import get_context, get_flags, get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel, reset_context
+from sglang.srt.speculative.draft_parallel import (
+    legacy_draft_parallel_spec,
+    resolve_draft_parallel_layout,
+)
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -73,13 +77,11 @@ def _check_vocab_case(rank, *, dp_enabled, replicate):
     parallel = get_parallel()
     original_tp_group = parallel.tp_group
     expected_tp = parallel.attn_tp_size if dp_enabled else parallel.tp_size
-    context = (
-        draft_tp_context(parallel.attn_tp_group, owns_attention=True)
-        if dp_enabled
-        else nullcontext()
+    layout = resolve_draft_parallel_layout(
+        legacy_draft_parallel_spec(SpeculativeAlgorithm.DSPARK)
     )
     with (
-        context,
+        draft_tp_context(layout),
         envs.SGLANG_ENABLE_EMBED_REPLICATION.override(replicate),
         envs.SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT.override(True),
         glm_dspark_quarot_scope(plan),
@@ -136,14 +138,14 @@ def _run_vocab_worker(rank, world_size, init_path):
     try:
         for dp_size in (1, 2) if world_size == 2 else (1,):
             dp_enabled = dp_size > 1
+            publish_build_topology(
+                world_rank=rank,
+                speculative_algorithm="DSpark",
+                device="cpu",
+                tp_size=world_size,
+                attn_dp_size=dp_size,
+            )
             with (
-                get_context().override_server_args(
-                    speculative_algorithm="DSpark",
-                    device="cpu",
-                    tp_size=world_size,
-                    dp_size=dp_size,
-                    enable_dp_attention=dp_enabled,
-                ),
                 get_flags().dp.override(enabled=dp_enabled),
                 envs.SGLANG_RAGGED_VERIFY_MODE.override("static"),
                 # These tests use tensor collectives, not the scheduler's
@@ -160,6 +162,7 @@ def _run_vocab_worker(rank, world_size, init_path):
                     destroy_model_parallel()
     finally:
         destroy_distributed_environment()
+        reset_context()
 
 
 class TestDSparkQuaRotVocabParallel(CustomTestCase):
