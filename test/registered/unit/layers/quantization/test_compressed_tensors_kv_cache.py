@@ -6,11 +6,15 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
 
+import torch
+from torch import nn
+
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
     CompressedTensorsKVCacheMethod,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 from sglang.test.test_utils import CustomTestCase
 
 _FP8_TENSOR_KV_SCHEME = {
@@ -92,6 +96,46 @@ class TestCompressedTensorsKVCacheMethod(CustomTestCase):
             self.assertIsNone(
                 _config(bad).get_quant_method(_attn(), "model.layers.0.attn")
             )
+
+
+def _model_with_loaded_kv_scales(k_scale: float, v_scale: float) -> nn.Module:
+    attn = _attn()
+    nn.Module.__init__(attn)
+    attn.k_scale = nn.Parameter(torch.tensor(k_scale), requires_grad=False)
+    attn.v_scale = nn.Parameter(torch.tensor(v_scale), requires_grad=False)
+    attn.k_scale_float, attn.v_scale_float = k_scale, v_scale
+    return nn.Sequential(attn)
+
+
+def _configure(kv_cache_dtype: str, model: nn.Module) -> torch.dtype:
+    _, dtype = configure_kv_cache_dtype(
+        server_args_kv_cache_dtype=kv_cache_dtype,
+        model=model,
+        model_dtype=torch.bfloat16,
+        is_draft_worker=False,
+        is_dflash=False,
+        speculative_draft_attention_backend=None,
+    )
+    return dtype
+
+
+class TestKVScalesFollowCacheDtype(CustomTestCase):
+    def test_bf16_cache_ignores_checkpoint_scales(self):
+        """A bf16 cache stores K/V unscaled while attention backends multiply the
+        checkpoint's fp8 calibration scales back on read; keeping ~0.03 scales
+        flattened attention and produced incoherent long-context output."""
+        model = _model_with_loaded_kv_scales(0.035, 0.025)
+        self.assertEqual(_configure("bf16", model), torch.bfloat16)
+        attn = model[0]
+        self.assertEqual((attn.k_scale_float, attn.v_scale_float), (1.0, 1.0))
+        self.assertEqual((attn.k_scale.item(), attn.v_scale.item()), (1.0, 1.0))
+
+    def test_fp8_cache_keeps_checkpoint_scales(self):
+        model = _model_with_loaded_kv_scales(0.035, 0.025)
+        self.assertEqual(_configure("fp8_e4m3", model), torch.float8_e4m3fn)
+        self.assertEqual(
+            (model[0].k_scale_float, model[0].v_scale_float), (0.035, 0.025)
+        )
 
 
 if __name__ == "__main__":

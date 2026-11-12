@@ -96,4 +96,29 @@ def configure_kv_cache_dtype(
         # "auto" is the tag for an unquantized pool; backends gate descale on it.
         resolved_kv_cache_dtype = "auto"
 
+    if model is not None and kv_cache_dtype.itemsize >= 2:
+        _reset_kv_scales_for_unquantized_cache(model)
     return resolved_kv_cache_dtype, kv_cache_dtype
+
+
+def _reset_kv_scales_for_unquantized_cache(model: nn.Module) -> None:
+    # Checkpoint k/v scales calibrate an fp8 cache: the write path divides by them only
+    # when it casts to fp8, but attention backends always multiply them back on read.
+    # A 16-bit cache stores K/V unscaled, so its scales must be 1.0.
+    from sglang.srt.layers.radix_attention import RadixAttention
+
+    num_reset = 0
+    for module in model.modules():
+        if not isinstance(module, RadixAttention) or module.k_scale_float is None:
+            continue
+        if module.k_scale_float != 1.0 or module.v_scale_float != 1.0:
+            module.k_scale.fill_(1.0)
+            module.v_scale.fill_(1.0)
+            module.k_scale_float = 1.0
+            module.v_scale_float = 1.0
+            num_reset += 1
+    if num_reset:
+        logger.info(
+            "Unquantized KV cache: ignoring checkpoint k/v scales on %d attention layers.",
+            num_reset,
+        )
