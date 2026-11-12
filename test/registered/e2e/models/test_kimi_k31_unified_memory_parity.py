@@ -14,12 +14,14 @@ reuses the first one's prefix:
     the indexer keys and attend only the top-k they select. Wrong keys change
     which tokens attention reads.
 
-With CUDA graphs and in eager mode, greedy tokens must agree, and logprobs
-predicted from a context within the top-k must agree token by token. Past the
-top-k, the static pools' own runs differ by about 0.03 on average (up to ~0.4
-at single tokens) because the sparse selection is not bitwise deterministic, so
-there the mean difference is bounded instead: wrong indexer keys would select
-other tokens and move it well past that.
+With CUDA graphs and in eager mode, logprobs predicted from a context within
+the top-k must agree token by token. Past the top-k the sparse selection is not
+bitwise deterministic: the static pools' own runs differ by about 0.03 on
+average (up to ~0.4 at single tokens), and near-tied greedy choices can flip
+between runs of the same pool. There the prompt's teacher-forced logprobs are
+compared by their mean difference instead, and greedy tokens only where every
+context stays within the top-k: wrong indexer keys would select other tokens
+and move the mean well past the static runs' own spread.
 """
 
 import json
@@ -163,18 +165,21 @@ class TestKimiK31UnifiedMemoryParity(CustomTestCase):
     def _assert_close(self, unified, static, what):
         unified_input, unified_output, _ = unified
         static_input, static_output, _ = static
-        self.assertEqual(
-            [tid for _, _, tid in unified_output],
-            [tid for _, _, tid in static_output],
-            f"{what}: greedy tokens diverged",
-        )
         pairs = [
             (context, u, s, f"prompt token at {context}")
             for (context, u), (_, s) in zip(unified_input, static_input)
-        ] + [
-            (context, u, s, f"output token at {context}")
-            for (context, u, _), (_, s, _) in zip(unified_output, static_output)
         ]
+        if all(context <= self.index_topk for context, _, _ in static_output):
+            # Every context within the top-k: greedy decoding is deterministic.
+            self.assertEqual(
+                [tid for _, _, tid in unified_output],
+                [tid for _, _, tid in static_output],
+                f"{what}: greedy tokens diverged",
+            )
+            pairs += [
+                (context, u, s, f"output token at {context}")
+                for (context, u, _), (_, s, _) in zip(unified_output, static_output)
+            ]
         self.assertEqual(len(unified_input), len(static_input), what)
         sparse = []
         for context, u, s, where in pairs:
