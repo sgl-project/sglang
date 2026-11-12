@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Type
 import msgspec
 
 from sglang.srt.mem_cache.kv.decl import (
+    FP8_DS_MLA,
     INDEX_K_PART,
     KV_PART,
     STATE_PART,
@@ -498,7 +499,10 @@ def _has_unit_view(geometry: PartGeometry) -> bool:
     """Whether a view reads the geometry's part from a composite unit: what
     `build._unit_view` builds. Token-major MHA and MLA rows have none yet."""
     return isinstance(geometry, (UnitPartGeometry, IndexKeyGeometry)) or (
-        isinstance(geometry, MLAGeometry) and geometry.layer_major
+        isinstance(geometry, MLAGeometry)
+        and geometry.layer_major
+        and geometry.row_format is not None
+        and geometry.row_format.name == FP8_DS_MLA
     )
 
 
@@ -539,7 +543,19 @@ def _planned_parts(
             "one KV layout, beside which its layers may keep other parts"
         )
     for part in parts:
-        if not _has_unit_view(part.geometry):
+        geometry = part.geometry
+        if (
+            isinstance(geometry, MLAGeometry)
+            and geometry.layer_major
+            and not _has_unit_view(geometry)
+        ):
+            fmt = geometry.row_format
+            raise ValueError(
+                f"layers {list(part.layer_ids)} declare layer-major latent rows "
+                f"as {'plain rows' if fmt is None else repr(fmt.name)}; they are "
+                f"stored only in the {FP8_DS_MLA!r} row format"
+            )
+        if not _has_unit_view(geometry):
             raise ValueError(
                 f"layers {list(part.layer_ids)} keep {type(part.geometry).__name__} "
                 "KV, which no view reads from a composite unit yet; they cannot "

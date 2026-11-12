@@ -10,13 +10,16 @@ import torch
 
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import (
+    FP8_DS_MLA,
     KV_PART,
     FullLayerParts,
     FullLifetime,
+    IndexKeyGeometry,
     KVLayerDecl,
     KVPartDecl,
     MHAGeometry,
     MLAGeometry,
+    MLARowFormat,
     StateGeometry,
     WindowLifetime,
     kv_layer_decls,
@@ -334,11 +337,25 @@ _KV_GEOMETRIES = {
     "layer_major_rows": _PagedRows(row_bytes=32),
     "rows_read_by_page": _TokenRows(row_bytes=32),
     "rows_read_flat": _TokenRows(row_bytes=32, page_address=False),
+    "layer_major_latent": MLAGeometry(
+        kv_lora_rank=8,
+        qk_rope_head_dim=8,
+        kv_cache_dtype=torch.float8_e4m3fn,
+        row_format=MLARowFormat(name=FP8_DS_MLA, row_bytes=32, scale_ue8m0=True),
+        layer_major=True,
+    ),
+    "layer_major_plain_latent": MLAGeometry(
+        kv_lora_rank=8,
+        qk_rope_head_dim=8,
+        kv_cache_dtype=torch.bfloat16,
+        layer_major=True,
+    ),
 }
 _EXTRA_PARTS = {
     "rows_read_by_page": _TokenRows(row_bytes=16, part_name="paged"),
     "rows_read_flat": _TokenRows(row_bytes=16, page_address=False, part_name="flat"),
     "blobs": _Blobs(bytes_per_token=12),
+    "index_keys": IndexKeyGeometry(index_head_dim=128),
     "state": _state(),
 }
 
@@ -348,11 +365,12 @@ def _accepted(kv: str, extras) -> bool:
     if kv in ("mha", "mla"):
         # Token-major KV: its own layout, alone.
         return not extras
-    if "state" in extras:
+    if kv == "layer_major_plain_latent" or "state" in extras:
         return False
     flat = kv == "rows_read_flat" or "rows_read_flat" in extras
     # Rows read at one token stride need pages of plain token entries.
-    return not (flat and (kv == "layer_major_rows" or "blobs" in extras))
+    by_page = {"layer_major_rows", "layer_major_latent", "blobs", "index_keys"}
+    return not (flat and by_page & {kv, *extras})
 
 
 class TestPlannedIsBuildable(CustomTestCase):
@@ -393,7 +411,7 @@ class TestPlannedIsBuildable(CustomTestCase):
                 layer = router.layer(layer_id, part.name)
                 self.assertEqual(layer.route.sub_pool, owner.name)
                 self.assertEqual(layer.view_layer_id, i)
-                if owner.parts:
+                if isinstance(layer.view, _PartView):
                     self.assertEqual(len(layer.view.buffers), len(part.layer_ids))
 
 

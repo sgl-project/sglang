@@ -527,9 +527,9 @@ class LayerMajorMLAView(MLAView):
     layer a paged ``(pages, page_size, 1, row_bytes)`` buffer whose pages lie a
     unit apart, addressed by the physical token id through its page and row
     strides (FlashMLA's sparse kernel and the paged row writers and gathers
-    take them). With the ``fp8_ds_mla`` row format, rows are quantized to FP8
-    with per-block scales on write and read only by the kernels that
-    dequantize them.
+    take them). Rows are stored in the ``fp8_ds_mla`` row format: quantized to
+    FP8 with per-block scales on write, and read only by the kernels that
+    dequantize them. Plain latent rows have no layer-major reader yet.
 
     Its pages also hold the unit's other parts, so retraction, host transfers
     and PD move whole units (the page envelope)."""
@@ -547,9 +547,12 @@ class LayerMajorMLAView(MLAView):
 
         assert spec.page_size == page_size
         row_format = geometry.row_format
-        assert row_format is None or row_format.name == FP8_DS_MLA, (
-            f"no layer-major reader for latent rows stored as {row_format.name!r}"
-        )
+        if row_format is None or row_format.name != FP8_DS_MLA:
+            raise ValueError(
+                "layer-major latent rows are stored only in the "
+                f"{FP8_DS_MLA!r} row format; got "
+                f"{'plain rows' if row_format is None else repr(row_format.name)}"
+            )
         self._has_draft_parts = False
         self.storage_rank_replicated = True
         self._arena = arena
@@ -560,9 +563,7 @@ class LayerMajorMLAView(MLAView):
         self.size = self.num_pages * page_size - page_size
         self.page_size = page_size
         self.dtype = geometry.kv_cache_dtype
-        self.store_dtype = (
-            torch.uint8 if row_format is not None else _store_dtype_for(self.dtype)
-        )
+        self.store_dtype = torch.uint8
         self.device = arena.device
         self.kv_lora_rank = geometry.kv_lora_rank
         self.qk_rope_head_dim = geometry.qk_rope_head_dim
@@ -578,17 +579,15 @@ class LayerMajorMLAView(MLAView):
             dtype=torch.uint64,
             device=self.device,
         )
-        self.dsa_kv_cache_store_fp8 = row_format is not None
-        self.kv_scale_ue8m0 = row_format is not None and row_format.scale_ue8m0
+        self.dsa_kv_cache_store_fp8 = True
+        self.kv_scale_ue8m0 = row_format.scale_ue8m0
         self.quant_block_size = 128
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
-        if self.dsa_kv_cache_store_fp8:
-            raise NotImplementedError(
-                "block-quantized latent rows have no value slice; read them "
-                "through the kernels that dequantize them"
-            )
-        return super().get_value_buffer(layer_id)
+        raise NotImplementedError(
+            "block-quantized latent rows have no value slice; read them "
+            "through the kernels that dequantize them"
+        )
 
     def get_mla_kv_buffer(self, *args, **kwargs):
         raise NotImplementedError(
@@ -609,14 +608,6 @@ class LayerMajorMLAView(MLAView):
         cache_k_rope: torch.Tensor,
         layer_id_override: Optional[int] = None,
     ) -> None:
-        if not self.dsa_kv_cache_store_fp8:
-            return super().set_mla_kv_buffer(
-                layer,
-                loc_info,
-                cache_k_nope,
-                cache_k_rope,
-                layer_id_override=layer_id_override,
-            )
         from sglang.kernels.ops.quantization.dsa_quant_k_cache import (
             quantize_k_cache_separate,
         )

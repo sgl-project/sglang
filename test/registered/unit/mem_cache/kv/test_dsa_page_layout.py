@@ -132,6 +132,28 @@ class TestPageArithmetic(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "layer_major"):
             plan_kv_storage(decls, page_size=_PAGE)
 
+    def test_layer_major_rows_need_the_packed_format(self):
+        """Only packed FP8 rows with block scales have a layer-major reader:
+        the planner and the view both refuse plain latent rows."""
+        plain = MLAGeometry(
+            kv_lora_rank=8,
+            qk_rope_head_dim=8,
+            kv_cache_dtype=torch.bfloat16,
+            layer_major=True,
+        )
+        refused = "stored only in the 'fp8_ds_mla' row format"
+        with self.assertRaisesRegex(ValueError, refused):
+            plan_kv_storage(_decls(rows=plain), page_size=_PAGE)
+        spec = plan_kv_storage(_decls(), page_size=_PAGE).owner().spec
+        with self.assertRaisesRegex(ValueError, refused):
+            LayerMajorMLAView(
+                arena=None,
+                spec=spec,
+                geometry=plain,
+                page_size=_PAGE,
+                model_layer_ids=(0, 2, 4),
+            )
+
 
 class TestViewsOverTheArena(CustomTestCase):
     def _storage(self):
