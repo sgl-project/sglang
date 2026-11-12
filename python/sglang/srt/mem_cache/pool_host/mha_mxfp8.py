@@ -310,8 +310,6 @@ class NPUModelSlimMXFP8KDynamicVPerChannelHost(MHATokenToKVPoolHost):
     Pages carry K/V and dynamic K scales. Static V scales come from the weights.
     """
 
-    supports_l3 = False
-
     def get_size_per_token(self):
         k_scale_bytes = self.layer_num * self.head_num * (self.head_dim // 32)
         return super().get_size_per_token() + k_scale_bytes

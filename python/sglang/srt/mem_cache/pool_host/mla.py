@@ -147,7 +147,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         write_back_staging: torch.Tensor | None = None,
         page_unified_layout: PageUnifiedLayout | None = None,
         host_token_capacity: int | None = None,
-        memfabric_sidecar_bytes_per_token: int = 0,
     ):
         self._is_dummy = isinstance(buffer_info, MLAHostAllocation)
         self.override_kv_cache_dim = override_kv_cache_dim
@@ -234,15 +233,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         buffer_info, self.layer_num
                     )
                     self._v_dtype = _split_v_dtype(buffer_info)
-                    self._memfabric_sidecar_bytes_per_token = (
-                        memfabric_sidecar_bytes_per_token
-                    )
                     if (
                         self.dtype == torch.float8_e4m3fn
                         and self._v_dtype == torch.bfloat16
                     ):
                         self._size_per_token = sum(self._split_row_bytes)
-                        self.supports_l3 = False
                     else:
                         # Keep the existing capacity policy for ordinary and packed DSA KV.
                         self._size_per_token += sum(self._split_row_bytes[2:])
@@ -424,9 +419,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 # AIV sparse-copy IO path and usable by the legacy memcpy2d
                 # path unchanged.  Size the GB-aligned reserve with the
                 # combined bytes of all buffers allocated below.
-                total_bytes = self.size * (
-                    sum(self._split_row_bytes) + self._memfabric_sidecar_bytes_per_token
-                )
+                total_bytes = self.size * sum(self._split_row_bytes)
                 ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
                 alloc_func = alloc_with_memfabric
             self.k_buffer = alloc_func(
