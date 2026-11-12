@@ -628,6 +628,11 @@ class Envs:
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # DSpark static verify: the fused greedy accept tail also runs what follows it,
+    # the FutureMap relay scatter, the engram history commit and the draft KV staging.
+    SGLANG_OPT_DSV41_DSPARK_GREEDY_COMMIT_TAIL = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Memory pools and KV-cache sizing

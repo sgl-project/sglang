@@ -35,7 +35,10 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_partials_graph,
     simulated_bonus_sample_graph,
 )
-from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
+from sglang.kernels.ops.speculative.dspark.static_accept_tail import (
+    CommitTail,
+    static_accept_tail,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import (
@@ -604,11 +607,15 @@ class DsparkVerifyEpilogue:
         accept_tail_max_bs: int = 0,
         deferred_draft_kv: Optional[DeferredDraftKVStore] = None,
         post_fold: bool = False,
+        greedy_commit_tail: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
         # SGLANG_OPT_DSV41_DSPARK_POST_FOLD: static graphs also scatter new seq lens
         # and the bonus into the FutureMap's slots; built at the first warmup.
         self._post_fold = bool(post_fold)
+        # SGLANG_OPT_DSV41_DSPARK_GREEDY_COMMIT_TAIL: the fused greedy accept tail also
+        # runs run_static's relay scatter, engram history commit and draft KV staging.
+        self._greedy_commit_tail = bool(greedy_commit_tail)
         self.future_relay: Optional[FutureRelayBuffers] = None
         # SGLANG_DSPARK_DEFER_CONTEXT_KV: static graphs join its forked projection and
         # stage its stores; the next draft forward runs them.
@@ -762,6 +769,24 @@ class DsparkVerifyEpilogue:
         bs = io.candidates.shape[0]
         verify_lens = self.verify_lens_buf[:bs]
         folds = self.folds_commit
+        commit_tail = (
+            self._commit_tail_plan(io, folds=folds, kv_projected=kv_projected)
+            if accept == self._accept_static_greedy and self._serves_commit_tail(bs)
+            else None
+        )
+        if commit_tail is not None:
+            self._accept_static_greedy(
+                io,
+                verify_lens=verify_lens,
+                gate=gate,
+                gated=folds,
+                commit_tail=commit_tail,
+            )
+            if folds and not kv_projected:
+                # The tail staged the commit; the next draft forward's write reads
+                # the projection this graph forked.
+                assert self.deferred_draft_kv.join_projection()
+            return commit_tail.history is not None
         gated_commit_lens = accept(io, verify_lens=verify_lens, gate=gate, gated=folds)
         # Both accept branches leave the ungated commit lengths in commit_lens_buf.
         committed_engram = self._commit_engram_history(
@@ -805,17 +830,50 @@ class DsparkVerifyEpilogue:
         )
         return committed_engram
 
+    def _commit_tail_plan(
+        self, io: StaticVerifyIO, *, folds: bool, kv_projected: bool
+    ) -> Optional[CommitTail]:
+        """run_static's commits for the greedy accept tail to run, or None when they
+        stay separate (the draft KV is injected rather than staged)."""
+        stage = None
+        if folds:
+            store = self.deferred_draft_kv
+            if store is None or not (kv_projected or store.will_join_projection()):
+                return None
+            stage = store.stage_targets(
+                cache_loc=io.out_cache_loc,
+                positions=io.positions,
+                with_state_slot=self.commit_ctx.kv_injector.swa_ring_size is not None,
+            )
+        return CommitTail(
+            req_slots=io.req_pool_indices, history=self.engram_history(), stage=stage
+        )
+
+    def _serves_commit_tail(self, bs: int) -> bool:
+        return self._greedy_commit_tail and self._serves_accept_tail(bs)
+
     def _accept_static_greedy(
-        self, io: StaticVerifyIO, *, verify_lens, gate, gated: bool
+        self,
+        io: StaticVerifyIO,
+        *,
+        verify_lens,
+        gate,
+        gated: bool,
+        commit_tail: Optional[CommitTail] = None,
     ) -> Optional[torch.Tensor]:
         bs = io.candidates.shape[0]
         if self._serves_accept_tail(bs):
+            relay = None
+            if commit_tail is not None and self._post_fold:
+                relay = self._future_relay_targets(io.req_pool_indices)
             gated_commit_lens = self._static_accept_tail(
                 candidates=io.candidates,
                 logits=io.logits,
                 seq_lens=io.seq_lens,
                 verify_lens=verify_lens,
                 gated=gated,
+                relay=relay,
+                commit_tail=commit_tail,
             )
             block = self.read_block_accept_lens(bs)
             if block is not None:
@@ -847,11 +905,22 @@ class DsparkVerifyEpilogue:
         return self._fused_accept_tail and low <= bs and (high == 0 or bs <= high)
 
     def _static_accept_tail(
-        self, *, candidates, logits, seq_lens, verify_lens, gated: bool
+        self,
+        *,
+        candidates,
+        logits,
+        seq_lens,
+        verify_lens,
+        gated: bool,
+        relay: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        commit_tail: Optional[CommitTail] = None,
     ) -> Optional[torch.Tensor]:
         """The greedy ``_accept`` and gated commit lengths in one launch; under
-        simulate_fold the bonus select runs in the tail."""
+        simulate_fold the bonus select runs in the tail. ``relay`` and
+        ``commit_tail`` add run_static's relay scatter and commits to the launch."""
         bs = candidates.shape[0]
+        # The staging stores the gated lengths: a staged commit implies a gated one.
+        assert commit_tail is None or commit_tail.stage is None or gated
         # Under simulate_fold the tail does not read the argmax; it still runs as served.
         target_predict = sampling_argmax(logits).view(-1)
         bonus_parts = None
@@ -876,6 +945,8 @@ class DsparkVerifyEpilogue:
             simulated_correct_len=self.simulated_correct_len,
             bonus_parts=bonus_parts,
             gated_commit_lens_out=self.gated_commit_lens_buf if gated else None,
+            relay=relay,
+            commit_tail=commit_tail,
         )
         return self.gated_commit_lens_buf[:bs] if gated else None
 
@@ -930,8 +1001,20 @@ class DsparkVerifyEpilogue:
     def _scatter_future_relay(self, req_pool_indices: torch.Tensor, bs: int) -> None:
         """Unconditional: a step that takes another accept publishes and stashes on
         the host afterwards. Padded rows index slot 0, every pool's dummy row."""
-        if self.commit_ctx is None:
+        relay = self._future_relay_targets(req_pool_indices)
+        if relay is None:
             return
+        rows = req_pool_indices[:bs].to(torch.int64)
+        relay[1][rows] = self.new_seq_lens_buf[:bs]
+        relay[2][rows] = self.bonus_buf[:bs]
+
+    def _future_relay_targets(
+        self, req_pool_indices: torch.Tensor
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """(request slots, new seq lens table, bonus table) the relay scatter writes,
+        or None without a commit context; the tables are built at a warmup."""
+        if self.commit_ctx is None:
+            return None
         if self.future_relay is None:
             assert not (
                 torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
@@ -941,9 +1024,11 @@ class DsparkVerifyEpilogue:
                 device=req_pool_indices.device,
             )
             offer_future_relay_buffers(self.future_relay)
-        rows = req_pool_indices[:bs].to(torch.int64)
-        self.future_relay.new_seq_lens[rows] = self.new_seq_lens_buf[:bs]
-        self.future_relay.output_tokens[rows] = self.bonus_buf[:bs]
+        return (
+            req_pool_indices,
+            self.future_relay.new_seq_lens,
+            self.future_relay.output_tokens,
+        )
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(

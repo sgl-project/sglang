@@ -462,6 +462,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     static_epilogue_supported
                     and envs.SGLANG_OPT_DSV41_DSPARK_POST_FOLD.get()
                 ),
+                greedy_commit_tail=envs.SGLANG_OPT_DSV41_DSPARK_GREEDY_COMMIT_TAIL.get(),
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
