@@ -28,6 +28,9 @@ class TestMegakernelGuards(CustomTestCase):
         registry_patch = patch.dict(registry._REGISTRY, clear=True)
         registry_patch.start()
         self.addCleanup(registry_patch.stop)
+        overrides_patch = patch.dict(registry._OVERRIDES, clear=True)
+        overrides_patch.start()
+        self.addCleanup(overrides_patch.stop)
 
     def test_a_disabled_flag_looks_nothing_up_and_keeps_the_forward(self):
         cfg = server_args()
@@ -45,23 +48,38 @@ class TestMegakernelGuards(CustomTestCase):
             )
         self.assertEqual(vars(model), {})
 
-    def test_builtin_registration_is_lazy_and_preserves_other_plugin_specs(self):
+    def test_builtin_registration_is_lazy_and_reports_external_collisions(self):
         external_specs = (
             ("DeepseekV4ForCausalLM", "external.deepseek:SPEC"),
-            (KIMI_ARCH, "sgl_nvidia_mega.kimi_k3.spec:SPEC"),
             ("Qwen3_5MoeForConditionalGeneration", "external.qwen:SPEC"),
         )
         with patch.object(registry.importlib, "import_module") as import_module:
             for architecture, path in external_specs:
-                registry.register(architecture=architecture, path=path)
+                self.assertTrue(registry.register(architecture=architecture, path=path))
+            # Built-in ownership stays the intentional default: the external
+            # entry point still registers harmlessly (no startup-breaking
+            # exception), but the ineffective registration is now observable.
+            with patch.object(registry, "logger") as logger:
+                result = registry.register(
+                    architecture=KIMI_ARCH,
+                    path="sgl_nvidia_mega.kimi_k3.spec:SPEC",
+                )
+            self.assertFalse(result)
+            logger.warning.assert_called_once()
+            message = " ".join(str(a) for a in logger.warning.call_args.args)
+            self.assertIn("did NOT take effect", message)
+            self.assertIn(registry._BUILTIN_SPECS[KIMI_ARCH], message)
+            self.assertIn("sgl_nvidia_mega.kimi_k3.spec:SPEC", message)
+            self.assertIn("override=True", message)
             self.assertEqual(
                 registry.registered_architectures(),
-                sorted(architecture for architecture, _ in external_specs),
+                sorted([a for a, _ in external_specs] + [KIMI_ARCH]),
             )
             self.assertTrue(registry.builtin_spec_registered([KIMI_ARCH]))
             self.assertTrue(registry.spec_registered([KIMI_ARCH]))
             self.assertFalse(registry.builtin_spec_registered([ARCH]))
             self.assertNotIn(KIMI_ARCH, registry._REGISTRY)
+            self.assertNotIn(KIMI_ARCH, registry._OVERRIDES)
             import_module.assert_not_called()
 
             import_module.return_value = SimpleNamespace(SPEC=SPEC)
@@ -87,6 +105,29 @@ class TestMegakernelGuards(CustomTestCase):
             registry.register(
                 architecture="DeepseekV4ForCausalLM", path="different.deepseek:SPEC"
             )
+
+    def test_an_explicit_override_replaces_the_builtin_in_find_spec(self):
+        """override=True is the documented escape hatch and must take effect."""
+        override_path = "sgl_nvidia_mega.kimi_k3.spec:SPEC"
+        with patch.object(registry, "logger") as logger:
+            result = registry.register(
+                architecture=KIMI_ARCH, path=override_path, override=True
+            )
+        self.assertTrue(result)
+        logger.warning.assert_called_once()
+        self.assertEqual(registry._OVERRIDES[KIMI_ARCH], override_path)
+        self.assertNotIn(KIMI_ARCH, registry._REGISTRY)
+        # built-in ownership stays discoverable for startup gating
+        self.assertTrue(registry.builtin_spec_registered([KIMI_ARCH]))
+        with patch.object(
+            registry.importlib,
+            "import_module",
+            return_value=SimpleNamespace(SPEC=SPEC),
+        ) as import_module:
+            self.assertEqual(
+                registry.find_spec(architectures=[KIMI_ARCH], isa=ISA), (SPEC, "")
+            )
+            import_module.assert_called_once_with("sgl_nvidia_mega.kimi_k3.spec")
 
     def test_builtin_setup_needs_no_plugin_and_still_checks_requirements(self):
         model_config = SimpleNamespace(
