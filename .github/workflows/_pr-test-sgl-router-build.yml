@@ -15,10 +15,6 @@ on:
         description: 'Artifact name. Suffix it per caller: artifacts are immutable per name per run, so two callers sharing a run would collide.'
         type: string
         default: sgl-router-x86_64
-      cache_key_prefix:
-        description: 'Cache key prefix. Encodes the arch; callers share it to reuse each other''s build.'
-        type: string
-        default: sgl-router-x86_64
       git_ref:
         type: string
         default: ''
@@ -55,15 +51,13 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
-      - name: Ensure zstd so the saved entry is readable
-        run: bash scripts/ci/utils/ensure_zstd.sh
-
       - name: Restore built binary
         id: cache
         uses: actions/cache/restore@v4
         with:
           path: sgl-router-bin/sgl-router
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('sgl-router/**', 'rust/**', '.github/workflows/_pr-test-sgl-router-build.yml', 'scripts/ci/utils/build_sgl_router.sh') }}
+          # The arch is the compile runner's, as download-sgl-router reads it.
+          key: sgl-router-${{ contains(inputs.runs_on, '-arm') && 'aarch64' || 'x86_64' }}-${{ hashFiles('sgl-router/**', 'rust/**', '.github/workflows/_pr-test-sgl-router-build.yml', 'scripts/ci/utils/build_sgl_router.sh') }}
 
       - name: Upload binary
         if: steps.cache.outputs.cache-hit == 'true'

@@ -268,7 +268,6 @@ jobs:
     with:
       runs_on: ubuntu-22.04-arm
       artifact_name: sgl-router-aarch64
-      cache_key_prefix: sgl-router-aarch64
       git_ref: ${{ inputs.git_ref || '' }}
     secrets: inherit
 

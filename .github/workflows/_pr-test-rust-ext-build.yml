@@ -23,15 +23,9 @@ on:
   workflow_call:
     inputs:
       runs_on:
-        description: 'Runner label for the compile job. Its glibc has to satisfy max_glibc.'
+        description: 'Runner label for the compile job.'
         type: string
         required: true
-      restore_runs_on:
-        description: >
-          Runner label for the cache-hit path. Only republishes bytes, so it wants
-          free capacity and is the one job here with no architecture requirement.
-        type: string
-        default: ubuntu-latest
       collect_runs_on:
         description: >
           Runner label for the collect job. Must be runs_on's ARCHITECTURE: its GLIBC
@@ -47,13 +41,6 @@ on:
         description: 'Cache key prefix. Callers share it on purpose to reuse each other''s build; it encodes the arch and the interpreter ABI set, since the modules are portable across neither.'
         type: string
         default: rust-ext-x86_64-cp312
-      max_glibc:
-        description: >
-          Highest GLIBC symbol version the built .so files may require. A ceiling set
-          by the oldest image that has to LOAD them, not by whoever builds them; the
-          pools are not all on one image, and x86_64's oldest is jammy at 2.35.
-        type: string
-        default: '2.35'
       git_ref:
         type: string
         default: ''
@@ -70,7 +57,7 @@ env:
 
 jobs:
   restore:
-    runs-on: ${{ inputs.restore_runs_on }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     name: Restore Rust Ext
     outputs:
@@ -98,11 +85,6 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - uses: ./.github/actions/check-maintenance
-
-      # A no-op on the hosted default, which ships zstd; here for whatever
-      # restore_runs_on is pointed at, since a reader without it sees no entry.
-      - name: Ensure zstd so the saved entry is readable
-        run: bash scripts/ci/utils/ensure_zstd.sh
 
       # The setup hook and torch helper select and configure what gets built;
       # pyproject.toml pins the libtorch ABI used by sglang-radix-tree.
@@ -335,10 +317,11 @@ jobs:
 
       # First point that sees every interpreter, which is what the suffix-set check
       # compares. MAX_GLIBC belongs here rather than in the restore job: these are
-      # freshly compiled bytes, not ones that already passed under this key.
+      # freshly compiled bytes, not ones that already passed under this key. The
+      # ceiling is the oldest image that loads them (jammy).
       - name: Verify modules and stage for upload
         env:
-          MAX_GLIBC: ${{ inputs.max_glibc }}
+          MAX_GLIBC: '2.35'
         run: bash scripts/ci/utils/stage_rust_ext_modules.sh
 
       # Without it the entry saved below lands under a version no reader with zstd

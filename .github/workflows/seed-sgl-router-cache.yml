@@ -13,8 +13,8 @@ on:
       - 'rust/**'
       - '.github/workflows/_pr-test-sgl-router-build.yml'
       - 'scripts/ci/utils/build_sgl_router.sh'
-      # Not hashed into the key, but they carry the prefix each side uses: the one
-      # seeded per arch here, and the one consumers restore with there.
+      # Not hashed into the key, but they set its arch part: by the runner each job
+      # here builds on, and by the runner consumers restore on there.
       - '.github/workflows/seed-sgl-router-cache.yml'
       - '.github/actions/download-sgl-router/action.yml'
   workflow_dispatch:
@@ -42,5 +42,4 @@ jobs:
     with:
       runs_on: ubuntu-22.04-arm
       artifact_name: sgl-router-aarch64
-      cache_key_prefix: sgl-router-aarch64
     secrets: inherit
