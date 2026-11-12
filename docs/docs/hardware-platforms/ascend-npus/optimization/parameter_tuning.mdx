@@ -146,6 +146,13 @@ Also consider: [`--ep-size`](#parallelism) (distribute experts across devices) a
 
 ### Resolve out-of-memory errors
 
+First decide whether the hardware can hold the model at all. Get the checkpoint's total size from its download page,
+or run `du -sh` on the weights directory, and compare it against your total device memory. If your cards and machines
+should be able to hold the weights with room to spare, the shortage is in the memory budget rather than the hardware:
+adjust `--mem-fraction-static` (up when startup reports the KV pool too small, down when serving or graph capture runs
+out of memory), then address fragmentation (the note after the table). If the weights cannot fit the hardware, load
+quantized weights (the row below) or scale out to more cards or machines (a wider TP or EP).
+
 | Parameter | Why it helps | Cost / constraint |
 | --- | --- | --- |
 | Lower [`--mem-fraction-static`](#memory-and-device-configuration) | Leaves room for activations and graph buffers | Lowering it: less KV cache, so fewer concurrent requests. Raising it: more KV cache, until out-of-memory errors return |
@@ -233,8 +240,8 @@ on the decode side; the per-role table above shows most of it; TP is `32` and bo
 
 | Symptom | Likely Cause | Fix |
 | ------- | ------------ | --- |
-| Startup fails with `Not enough memory. Please try to increase --mem-fraction-static.` | The KV pool computed to zero (or negative) capacity once weights were loaded | Raise `--mem-fraction-static` in small steps; if the weights alone consume the budget (e.g., BF16), load a ModelSlim checkpoint instead |
-| Out of memory during serving or graph capture | `--mem-fraction-static` leaves no headroom for activations or graph buffers, or the weights are BF16 | Lower `--mem-fraction-static`; if the model is BF16, load a ModelSlim W8A8/W4A4 checkpoint (`--quantization modelslim` loads pre-quantized checkpoints only; quantize your own with msModelSlim, see [Quantization on Ascend](/docs/hardware-platforms/ascend-npus/optimization/quantization)) |
+| Startup fails with `Not enough memory. Please try to increase --mem-fraction-static.` | The KV pool computed to zero (or negative) capacity once weights were loaded | Raise `--mem-fraction-static` in small steps; if the weights alone consume the budget (e.g., BF16), the hardware is the limit — scale out or load a ModelSlim checkpoint |
+| Out of memory during serving or graph capture | `--mem-fraction-static` leaves no headroom for activations or graph buffers, or the weights are BF16 | Lower `--mem-fraction-static`; if the model is BF16, the hardware itself is the limit — load a ModelSlim W8A8/W4A4 checkpoint (`--quantization modelslim` loads pre-quantized checkpoints only; quantize your own with msModelSlim, see [Quantization on Ascend](/docs/hardware-platforms/ascend-npus/optimization/quantization)) or scale out |
 | NPU Graph capture aborts with `Do not support TASK_QUEUE_ENABLE = 2 during NPU graph capture` | Level-2 task queue is incompatible with graph capture | Set `TASK_QUEUE_ENABLE=0` (or `1`) on the role that captures graphs |
 | NPU Graph capture aborts with an `AssertionError` whose message is `capture_bs=[]` | Every decode bucket missed the batch-size alignment, so the capture list is empty | Raise `--cuda-graph-max-bs-decode` to at least the alignment width and to a multiple of it, or narrow the alignment by removing attention DP or the MoE all-to-all backend; see [Decode Tuning](#decode-tuning) |
 | DeepEP dispatch fails at runtime | Per-rank dispatch tokens exceed the buffer | Size `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` to the actual per-iteration maximum; see [Sizing the DeepEP dispatch buffer](#sizing-the-deepep-dispatch-buffer) |
