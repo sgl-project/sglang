@@ -467,6 +467,8 @@ class Engine(EngineScoreMixin, EngineBase):
         video_data: Optional[MultimodalDataInputFormat] = None,
         # See GenerateReqInput.mm_hashes / async_generate for the contract.
         mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
+        # See GenerateReqInput.mm_routing_labels.
+        mm_routing_labels: Optional[Union[List[str], List[List[str]]]] = None,
         # SHA-256 identities for the original media contents. See
         # GenerateReqInput.mm_content_hashes.
         mm_content_hashes: Optional[
@@ -517,6 +519,7 @@ class Engine(EngineScoreMixin, EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             mm_hashes=mm_hashes,
+            mm_routing_labels=mm_routing_labels,
             mm_content_hashes=mm_content_hashes,
             cache_salt=cache_salt,
             return_logprob=return_logprob,
@@ -581,6 +584,8 @@ class Engine(EngineScoreMixin, EngineBase):
         # the server-computed full content/configuration identity and cannot
         # force cache sharing. See GenerateReqInput.mm_hashes.
         mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
+        # See GenerateReqInput.mm_routing_labels.
+        mm_routing_labels: Optional[Union[List[str], List[List[str]]]] = None,
         mm_content_hashes: Optional[
             Union[List[Optional[str]], List[List[Optional[str]]]]
         ] = None,
@@ -629,6 +634,7 @@ class Engine(EngineScoreMixin, EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             mm_hashes=mm_hashes,
+            mm_routing_labels=mm_routing_labels,
             mm_content_hashes=mm_content_hashes,
             cache_salt=cache_salt,
             return_logprob=return_logprob,
@@ -1972,27 +1978,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     if cfg.nnodes > 1 and is_mnnvl_fabric_device():
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         os.environ.setdefault("NCCL_MNNVL_ENABLE", "1")
-    # The KV-shard gather registers its scratch as an NCCL symmetric
-    # window, which requires cuMem-backed NCCL memory. The pool keeps torch
-    # memory under the memory saver or a custom mem pool. Multi-node
-    # deployments keep NCCL's setting (MNNVL fabrics default it on above).
-    kv_shard_symmetric_scratch = (
-        cfg.enable_kv_cache_sharding
-        and cfg.nnodes == 1
-        and envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.get()
-        and not cfg.enable_memory_saver
-        and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
-    )
     if "NCCL_CUMEM_ENABLE" not in os.environ or cfg.enable_symm_mem:
-        if kv_shard_symmetric_scratch and not cfg.enable_symm_mem:
-            logger.info(
-                "Setting NCCL_CUMEM_ENABLE=1 for every NCCL communicator so the "
-                "KV-shard prefix gather can use a symmetric window. Set "
-                "SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER=0 to keep it off."
-            )
-        os.environ["NCCL_CUMEM_ENABLE"] = str(
-            int(cfg.enable_symm_mem or kv_shard_symmetric_scratch)
-        )
+        os.environ["NCCL_CUMEM_ENABLE"] = str(int(cfg.enable_symm_mem))
     if (
         "NCCL_NVLS_ENABLE" not in os.environ
         or cfg.enable_nccl_nvls
@@ -2041,7 +2028,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.7.3",
+                "0.7.4",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",

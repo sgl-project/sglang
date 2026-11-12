@@ -64,11 +64,10 @@ def _impl(allow_cudnn_sdp: bool) -> SDPAImpl:
 
 def test_allow_cudnn_sdp_beats_the_backend_torch_would_pick():
     q, k, v = _qkv()
-    try:
-        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
-            F.scaled_dot_product_attention(q, k, v)
-    except RuntimeError:
-        pytest.skip("no cuDNN attention kernel for this shape on this GPU")
+    params = torch.backends.cuda.SDPAParams(q, k, v, None, 0.0, False, False)
+    with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+        if not torch.backends.cuda.can_use_cudnn_attention(params):
+            pytest.skip("no cuDNN attention kernel for this shape on this GPU")
 
     flash_first = [
         SDPBackend.FLASH_ATTENTION,
@@ -95,12 +94,12 @@ def test_cpu_tensors_do_not_get_a_cuda_context():
 
 def test_reference_sdpa_does_not_inherit_a_previous_attention_priority():
     q, k, v = _qkv()
+    params = torch.backends.cuda.SDPAParams(q, k, v, None, 0.0, False, False)
     with sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True):
         with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
-            try:
-                F.scaled_dot_product_attention(q, k, v)
-            except RuntimeError:
-                pytest.skip("no cuDNN attention kernel for this shape")
+            if not torch.backends.cuda.can_use_cudnn_attention(params):
+                pytest.skip("no cuDNN attention kernel for this shape on this GPU")
+            F.scaled_dot_product_attention(q, k, v)
         for priority in (
             _PYTORCH_DEFAULT_CUDA_SDP_BACKENDS,
             list(reversed(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)),
