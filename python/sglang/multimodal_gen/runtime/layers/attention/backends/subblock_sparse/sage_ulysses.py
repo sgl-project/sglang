@@ -196,6 +196,7 @@ class _PreparedSageTransport:
         )
         # 3 * Q bytes conservatively covers the complete combined lowp operand,
         # including the received payload and scales, not just one source shard.
+        # Keep both QKV exchange and output gather on the validated NCCL path.
         self.comm = UlyssesCommunicator(
             group,
             max_bytes=3 * query.numel() * query.element_size(),
@@ -203,13 +204,19 @@ class _PreparedSageTransport:
             device=query.device,
             backend="nccl",
         )
-        self.workspace = self.comm.prepare_qkv(
-            (1, *query.shape), quantization="sage2", used_sequence=used
-        )
+        self.workspace = None
         self.encoded = None
-        self.gathered = torch.empty(
-            (1, *query.shape), dtype=query.dtype, device=query.device
-        )
+        self.gathered = None
+        try:
+            self.workspace = self.comm.prepare_qkv(
+                (1, *query.shape), quantization="sage2", used_sequence=used
+            )
+            self.gathered = torch.empty(
+                (1, *query.shape), dtype=query.dtype, device=query.device
+            )
+        except BaseException:
+            self.close()
+            raise
 
     def exchange(self, q, k, v):
         # prepare_qkv requires zero input rows beyond the global live prefix.
@@ -230,12 +237,21 @@ class _PreparedSageTransport:
         return self.comm.gather_heads(output, out=self.gathered)
 
     def close(self):
-        self.comm.close()
+        comm, self.comm = self.comm, None
+        try:
+            if comm is not None:
+                comm.close()
+        finally:
+            # Pure NCCL close is local and owns no prepared buffers. Drop our
+            # references before allocating a replacement geometry. Returned
+            # output views retain their own storage through PyTorch.
+            self.workspace = None
+            self.encoded = None
+            self.gathered = None
 
 
-_TRANSPORTS: dict[tuple, _PreparedSageTransport] = {}
+_TRANSPORTS: dict[tuple, tuple[tuple, _PreparedSageTransport]] = {}
 _HARDWARE_SUPPORT: dict[tuple, bool] = {}
-_MAX_GEOMETRIES = 8
 
 
 def _hardware_supported_by_all_ranks(group, device):
@@ -255,21 +271,32 @@ def _hardware_supported_by_all_ranks(group, device):
 
 
 def _get_transport(group, query, used):
-    # Geometry and request order must agree on all ranks, as for ordinary
-    # Ulysses. No rank-local fallback is attempted after collective preparation.
-    key = (group, tuple(query.shape), query.dtype, query.device, used)
-    if key not in _TRANSPORTS:
-        if len(_TRANSPORTS) >= _MAX_GEOMETRIES:
-            raise RuntimeError("prepared Sage QKV geometry budget exhausted")
-        _TRANSPORTS[key] = _PreparedSageTransport(group, query, used)
-    return _TRANSPORTS[key]
+    # Serialized H3 inference reuses a geometry across layers and steps. Keep
+    # only the current geometry for each group/device, releasing its buffers
+    # before preparing a different shape, dtype or live prefix. Request order
+    # and geometry must agree on all ranks, as for ordinary Ulysses.
+    key = (group, query.device)
+    geometry = (tuple(query.shape), query.dtype, used)
+    cached = _TRANSPORTS.get(key)
+    if cached is not None:
+        cached_geometry, transport = cached
+        if cached_geometry == geometry:
+            return transport
+        del _TRANSPORTS[key]
+        transport.close()
+    # Publish only a fully initialized transport. A preparation failure leaves
+    # no stale entry, so a later call can retry the collective consistently.
+    transport = _PreparedSageTransport(group, query, used)
+    _TRANSPORTS[key] = (geometry, transport)
+    return transport
 
 
 def shutdown_prepared_sage_ulysses():
-    for transport in _TRANSPORTS.values():
-        transport.close()
+    transports = list(_TRANSPORTS.values())
     _TRANSPORTS.clear()
     _HARDWARE_SUPPORT.clear()
+    for _, transport in transports:
+        transport.close()
 
 
 def prepared_sage_ulysses_forward(
@@ -285,7 +312,7 @@ def prepared_sage_ulysses_forward(
     query_block_mask=None,
     transport=None,
 ):
-    """Return rank-local output, or decline before any communication.
+    """Return rank-local output, or decline before prepared QKV exchange.
 
     Dense warmup steps and disabled layers retain the existing BF16 path.
     Once prepare/scatter starts, errors propagate on this path.

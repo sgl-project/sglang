@@ -19,6 +19,7 @@ import torch.distributed as dist
 def main():
     import os
 
+    from sglang.multimodal_gen.runtime.distributed import parallel_state
     from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
         sage_ulysses as adapter,
     )
@@ -50,8 +51,11 @@ def main():
         _step_enabled=lambda: True,
         softmax_scale=128**-0.5,
     )
+    retained = []
     try:
-        for used in (130, 4097):
+        # More shapes/live prefixes than the former lifetime cache limit,
+        # including an aligned tail and a return to the initial geometry.
+        for used in (130, 4097, *range(131, 142), 130):
             total = (used + world - 1) // world * world
             torch.manual_seed(1234 + rank)
             packed_qkv = torch.randn(
@@ -59,54 +63,74 @@ def main():
             )
             q, k, v = packed_qkv.unbind(dim=2)
             mask = torch.arange((used + 63) // 64, device="cuda") % 3 != 0
-            transport = adapter._PreparedSageTransport(dist.group.WORLD, q, used)
-            try:
-                with (
-                    torch.inference_mode(),
-                    patch.object(
-                        route,
-                        "get_sp_group",
-                        lambda: SimpleNamespace(ulysses_group=dist.group.WORLD),
-                    ),
-                    patch.object(
-                        route, "get_ulysses_parallel_world_size", lambda: world
-                    ),
+            with (
+                patch.object(
+                    parallel_state,
+                    "get_sp_group",
+                    lambda: SimpleNamespace(ulysses_group=dist.group.WORLD),
+                ),
+                patch.object(
+                    route,
+                    "get_sp_group",
+                    lambda: SimpleNamespace(ulysses_group=dist.group.WORLD),
+                ),
+                patch.object(route, "get_ulysses_parallel_world_size", lambda: world),
+            ):
+                kwargs = dict(
+                    impl=impl,
+                    cu_seqlens_host=(0, used, total),
+                    max_seqlen=used,
+                    ulysses_active=True,
+                    ring_active=False,
+                    query_block_mask=mask,
+                )
+                with patch.dict(
+                    os.environ, {"SGLANG_DIFFUSION_H3_SAGE_FUSED_PREPOST": "0"}
                 ):
-                    kwargs = dict(
-                        impl=impl,
-                        cu_seqlens_host=(0, used, total),
-                        max_seqlen=used,
-                        ulysses_active=True,
-                        ring_active=False,
-                        query_block_mask=mask,
-                        transport=transport,
-                    )
-                    with patch.dict(
-                        os.environ, {"SGLANG_DIFFUSION_H3_SAGE_FUSED_PREPOST": "0"}
-                    ):
-                        reference = adapter.prepared_sage_ulysses_forward(
-                            q, k, v, **kwargs
-                        ).clone()
-                    with patch.dict(
-                        os.environ, {"SGLANG_DIFFUSION_H3_SAGE_FUSED_PREPOST": "1"}
-                    ):
-                        actual = adapter.prepared_sage_ulysses_forward(
-                            q, k, v, **kwargs
-                        )
-                    assert actual is not None and actual.shape == q.shape
-                    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-                    assert torch.isfinite(actual).all()
-                    if rank == world - 1:
-                        assert not actual[-(total - used) :].count_nonzero().item()
-                dist.barrier()
-                if rank == 0:
-                    print(
-                        f"PASS world={world} used={used}: fused/unfused output exact",
-                        flush=True,
-                    )
-            finally:
-                transport.close()
+                    reference = adapter.prepared_sage_ulysses_forward(
+                        q, k, v, **kwargs
+                    ).clone()
+                transport = adapter._get_transport(dist.group.WORLD, q, used)
+                received = transport.encoded
+                assert received.used_sequence == used
+                with patch.dict(
+                    os.environ, {"SGLANG_DIFFUSION_H3_SAGE_FUSED_PREPOST": "1"}
+                ):
+                    actual = adapter.prepared_sage_ulysses_forward(q, k, v, **kwargs)
+                assert adapter._get_transport(dist.group.WORLD, q, used) is transport
+                assert transport.encoded is received
+                assert len(adapter._TRANSPORTS) == 1
+                assert actual is not None and actual.shape == q.shape
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+                assert torch.isfinite(actual).all()
+                if rank == world - 1 and total > used:
+                    assert not actual[-(total - used) :].count_nonzero().item()
+                retained.append((actual, reference))
+                if len(retained) == 1:
+                    # Exercise FlashInfer's collective preparation failure,
+                    # then let the next geometry prove the group can retry.
+                    try:
+                        adapter._get_transport(dist.group.WORLD, q, total + 1)
+                    except (ValueError, RuntimeError) as error:
+                        assert "used_sequence" in str(error), str(error)
+                    else:
+                        raise AssertionError("invalid live prefix was accepted")
+                    assert not adapter._TRANSPORTS and transport.comm is None
+                del received, transport
+            dist.barrier()
+            if rank == 0:
+                print(
+                    f"PASS world={world} used={used}: fused/unfused output exact; current workspace reused",
+                    flush=True,
+                )
+        # Replacing a workspace must not invalidate already returned tensors.
+        for actual, reference in retained:
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        torch.testing.assert_close(retained[0][0], retained[-1][0], rtol=0, atol=0)
+        if rank == 0:
+            print("PASS geometry turnover and retained output lifetimes", flush=True)
     finally:
+        adapter.shutdown_prepared_sage_ulysses()
         dist.destroy_process_group()
 
 

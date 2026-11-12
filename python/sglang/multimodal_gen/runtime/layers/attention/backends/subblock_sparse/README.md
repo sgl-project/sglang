@@ -233,6 +233,11 @@ before this becomes ready to merge. Prepared exchange uses **NCCL**; the public 
 prepared PCIe/RDMA communicators, so ordinary PCIe transport support does not
 make prepared low-precision RDMA available.
 
+`backend="nccl"` chooses the communicator backend. The low-precision pipeline
+is selected separately by `prepare_qkv(..., quantization="sage2")` and executed
+by `scatter_qkv()`: local statistics, FP32 statistics AllGather, quantize/pack,
+then the low-precision QKV AllToAll. Ordinary `scatter_heads()` is unchanged.
+
 Supported calls are inference on SM120, head dimension 128, Ulysses degree 4
 or 8, and one live packed H3 document followed by padding. Ring, training,
 graph capture, unsupported geometry and oversized routing metadata decline
@@ -243,6 +248,15 @@ does not change the existing `quality=high` admission rules.
 Before exchange, the transport clears disposable padded Q/K/V projection rows
 in place as required by the prepared API. Live rows and projection-view strides
 are preserved; this keeps global K statistics independent of padding.
+
+Serialized inference retains only the current prepared geometry for each
+process group/device. Matching shapes, dtypes and live lengths reuse the same
+workspace and receive/output buffers across layers, steps and requests. A
+change releases the old buffers before preparing a replacement, so serving
+many resolutions or prompt lengths does not accumulate workspaces or hit a
+lifetime entry limit. Failed initialization is not cached, and group teardown
+releases the current transport. Returned output tensors keep their storage
+valid after a replacement through PyTorch ownership.
 
 Routing uses a **quantized-operand estimator**, including K tile scales but
 omitting Q scales and K channel means. It can select different blocks from the

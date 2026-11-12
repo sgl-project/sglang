@@ -364,7 +364,41 @@ def test_geometry_guards_precede_collectives(monkeypatch, case):
     assert result.enabled is (case == "valid")
 
 
-def test_transport_cache_budget_and_cleanup(monkeypatch):
+def test_transport_cache_replaces_geometries_without_a_lifetime_limit(monkeypatch):
+    calls = []
+    created = []
+
+    class Transport:
+        def __init__(self, group, query, used):
+            self.used = used
+            self.closed = False
+            calls.append(("prepare", used))
+            created.append(self)
+
+        def close(self):
+            self.closed = True
+            calls.append(("close", self.used))
+
+    monkeypatch.setattr(adapter, "_TRANSPORTS", {})
+    monkeypatch.setattr(adapter, "_PreparedSageTransport", Transport)
+    q = torch.zeros(64, 8, 128)
+    previous = None
+    # More distinct live prefixes than the former eight-entry limit, even
+    # though every call has the same padded tensor shape.
+    for used in range(130, 142):
+        current = adapter._get_transport("group", q, used)
+        assert adapter._get_transport("group", q, used) is current
+        previous = current
+    assert len(adapter._TRANSPORTS) == 1
+    assert all(transport.closed for transport in created[:-1])
+    assert not previous.closed
+    adapter.shutdown_prepared_sage_ulysses()
+    assert not adapter._TRANSPORTS and previous.closed
+    assert sum(kind == "prepare" for kind, _ in calls) == 12
+
+
+@pytest.mark.parametrize("change", ["shape", "dtype"])
+def test_transport_cache_replaces_changed_tensor_geometry(monkeypatch, change):
     calls = []
 
     class Transport:
@@ -375,15 +409,134 @@ def test_transport_cache_budget_and_cleanup(monkeypatch):
             calls.append("close")
 
     monkeypatch.setattr(adapter, "_TRANSPORTS", {})
-    monkeypatch.setattr(adapter, "_MAX_GEOMETRIES", 1)
+    monkeypatch.setattr(adapter, "_PreparedSageTransport", Transport)
+    q = torch.zeros(64, 8, 128, dtype=torch.bfloat16)
+    first = adapter._get_transport("group", q, 130)
+    changed = (
+        torch.zeros(128, 8, 128, dtype=q.dtype)
+        if change == "shape"
+        else q.to(torch.float16)
+    )
+    second = adapter._get_transport("group", changed, 130)
+    assert second is not first
+    assert adapter._get_transport("group", changed, 130) is second
+    assert calls == ["prepare", "close", "prepare"]
+    adapter.shutdown_prepared_sage_ulysses()
+
+
+def test_transport_replacement_is_scoped_to_group_and_device(monkeypatch):
+    class Transport:
+        def __init__(self, *args):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(adapter, "_TRANSPORTS", {})
     monkeypatch.setattr(adapter, "_PreparedSageTransport", Transport)
     q = torch.zeros(64, 8, 128)
-    first = adapter._get_transport("group", q, 130)
-    assert adapter._get_transport("group", q, 130) is first
-    with pytest.raises(RuntimeError, match="budget"):
-        adapter._get_transport("group", q, 131)
+    on_meta = q.to("meta")
+    first = adapter._get_transport("first", q, 130)
+    other_group = adapter._get_transport("second", q, 130)
+    other_device = adapter._get_transport("first", on_meta, 130)
+    replacement = adapter._get_transport("first", q, 131)
+    assert first.closed and replacement is not first
+    assert not other_group.closed and not other_device.closed
+    assert adapter._get_transport("second", q, 130) is other_group
+    assert adapter._get_transport("first", on_meta, 130) is other_device
     adapter.shutdown_prepared_sage_ulysses()
-    assert not adapter._TRANSPORTS and calls == ["prepare", "close"]
+    assert other_group.closed and other_device.closed and replacement.closed
+
+
+def test_failed_transport_replacement_can_be_retried(monkeypatch):
+    fail = True
+    closed = []
+
+    class Transport:
+        def __init__(self, group, query, used):
+            self.used = used
+            if used == 131 and fail:
+                raise RuntimeError("prepare failed")
+
+        def close(self):
+            closed.append(self.used)
+
+    monkeypatch.setattr(adapter, "_TRANSPORTS", {})
+    monkeypatch.setattr(adapter, "_PreparedSageTransport", Transport)
+    q = torch.zeros(64, 8, 128)
+    adapter._get_transport("group", q, 130)
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        adapter._get_transport("group", q, 131)
+    assert closed == [130] and not adapter._TRANSPORTS
+    fail = False
+    recovered = adapter._get_transport("group", q, 131)
+    assert adapter._get_transport("group", q, 131) is recovered
+    adapter.shutdown_prepared_sage_ulysses()
+
+
+@pytest.mark.parametrize("stage", ["prepare", "gather"])
+def test_transport_initialization_closes_communicator_on_failure(monkeypatch, stage):
+    import flashinfer.comm
+    import torch.distributed as dist
+
+    calls = []
+
+    class Communicator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def prepare_qkv(self, *args, **kwargs):
+            if stage == "prepare":
+                raise RuntimeError("allocation failed")
+            return "workspace"
+
+        def close(self):
+            calls.append("close")
+
+    q = torch.zeros(64, 8, 128)
+    monkeypatch.setattr(flashinfer.comm, "UlyssesCommunicator", Communicator)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+    if stage == "gather":
+
+        def fail_allocation(*args, **kwargs):
+            raise RuntimeError("allocation failed")
+
+        monkeypatch.setattr(torch, "empty", fail_allocation)
+    with pytest.raises(RuntimeError, match="allocation failed"):
+        adapter._PreparedSageTransport("group", q, 130)
+    assert calls == ["close"]
+
+
+def test_transport_close_releases_owned_buffers_and_is_idempotent(monkeypatch):
+    import weakref
+
+    import flashinfer.comm
+    import torch.distributed as dist
+
+    calls = []
+
+    class Communicator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def prepare_qkv(self, *args, **kwargs):
+            return torch.empty(1)
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(flashinfer.comm, "UlyssesCommunicator", Communicator)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+    transport = adapter._PreparedSageTransport("group", torch.zeros(64, 8, 128), 130)
+    transport.encoded = torch.empty(1)
+    refs = [
+        weakref.ref(getattr(transport, name))
+        for name in ("workspace", "encoded", "gathered")
+    ]
+    transport.close()
+    transport.close()
+    assert calls == ["close"]
+    assert all(ref() is None for ref in refs)
 
 
 @pytest.mark.parametrize(
