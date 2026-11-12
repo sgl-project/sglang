@@ -19,6 +19,7 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -34,7 +35,7 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_xpu_ci,
 )
-from sglang.test.scheduler_test_utils import FakeReq
+from sglang.test.scheduler_test_utils import FakeReq, leaving_retirer
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
@@ -197,7 +198,9 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.req_device_buffer_tokens.fill_(-1)
         self.coordinator.req_device_buffer_token_locs.fill_(-1)
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
-        self.coordinator.ack_staging_queue.clear()
+        # A failed test may leave requests staged; retire them.
+        for req in list(self.coordinator.ack_staging_queue):
+            leaving_retirer().release(req, checkpoint=False)
         self.coordinator._has_pending_backup = False
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False
@@ -642,7 +645,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self._write_device_patterns(kv_loc, fill_len)
 
         launched = KeyedReqList(ListKind.PREFILL_LAUNCHED)
-        launched.join([req])
+        move([req], launched)
         self.coordinator.admit_request_into_staging(req)
         self.assertTrue(req.hisparse_staging)
 
@@ -682,7 +685,7 @@ class TestHiSparseUnit(unittest.TestCase):
         self._write_device_patterns(kv_loc, fill_len)
 
         launched = KeyedReqList(ListKind.PREFILL_LAUNCHED)
-        launched.join([req])
+        move([req], launched)
         self.coordinator.admit_request_into_staging(req)
         get_device_module().synchronize()
         ready = self.coordinator.move_ready_reqs(KeyedReqList(ListKind.DECODING))

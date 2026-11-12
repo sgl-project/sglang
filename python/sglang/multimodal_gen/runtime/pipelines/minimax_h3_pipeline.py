@@ -5,6 +5,8 @@ import os
 import shutil
 from dataclasses import replace
 
+import torch
+
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
@@ -218,6 +220,15 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             self.add_stage(InputValidationStage())
         if release_metadata is not None:
             self.add_stage(MiniMaxH3PartitionAdmissionStage(release_metadata))
+        text_encoder = self.get_module("text_encoder")
+        visual = getattr(getattr(text_encoder, "model", None), "visual", None)
+        if not self.is_video_pipeline and visual is not None:
+            # CPU initialization computes pow differently from CUDA. Image
+            # releases rebuild the small vision frequency table after offload
+            # transfers so conditioning matches the GPU-resident encoder, as in
+            # the native Qwen-Image path. Video releases keep the table their
+            # consistency references were generated with.
+            visual.rotary_pos_emb.recompute_on_device_change = True
         self.add_stage(
             MiniMaxH3TextEncodingStage(
                 text_encoder=self.get_module("text_encoder"),
@@ -303,6 +314,28 @@ class PikaH3FlexPipeline(MiniMaxH3Pipeline):
     """
 
     pipeline_name = "PikaH3FlexPipeline"
+
+    def _load_config(self):
+        # The released adapters require FP32 matmuls at FP32 module boundaries.
+        torch.set_float32_matmul_precision("highest")
+        return super()._load_config()
+
+    def load_lora_adapter(
+        self,
+        lora_path: str,
+        lora_nickname: str,
+        rank: int,
+        weight_name: str | None = None,
+        lora_alpha: int | None = None,
+    ) -> None:
+        super().load_lora_adapter(
+            lora_path, lora_nickname, rank, weight_name, lora_alpha
+        )
+        # Release files store FP32 masters; inference uses BF16 adapter factors.
+        self.lora_adapters[lora_nickname] = {
+            name: weight.to(torch.bfloat16)
+            for name, weight in self.lora_adapters[lora_nickname].items()
+        }
 
 
 class MiniMaxH3ImagePipeline(MiniMaxH3Pipeline):
