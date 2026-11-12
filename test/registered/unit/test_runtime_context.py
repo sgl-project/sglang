@@ -1415,6 +1415,29 @@ class TestForwardFlags(_IsolatedServerArgs):
 
             self.assertEqual(probe(torch.zeros(())).item(), 6)
 
+    def test_platform_facts_trace_under_torch_compile(self):
+        # Regression: compiled model forwards read platform facts (the DeepSeek-V4
+        # C4 indexer reads ``is_sm120``). Dynamo can't trace
+        # ``object.__getattribute__`` in ``PlatformContext.__getattr__``, and
+        # can't call a probe built as ``lru_cache(partial(...))``.
+        import torch
+
+        from sglang.srt.runtime_context import get_platform
+
+        reset_context()
+        facts = ("is_cuda", "is_hip", "is_sm90", "is_sm100", "is_sm120", "is_blackwell")
+        expected = sum(bool(getattr(get_platform(), fact)) for fact in facts)
+
+        @torch.compile(fullgraph=True, backend="eager", dynamic=False)
+        def probe(x):
+            platform = get_platform()
+            for fact in facts:
+                if getattr(platform, fact):
+                    x = x + 1
+            return x
+
+        self.assertEqual(probe(torch.zeros(())).item(), expected)
+
     def test_graph_visible_flags_are_process_visible_across_threads(self):
         # Documented divergence from the contextvar-backed flags: plain slots
         # are process-global (the storage form these flags had before the
