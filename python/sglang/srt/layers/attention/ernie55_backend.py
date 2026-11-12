@@ -168,6 +168,7 @@ class Ernie5_5MlaAttnBackend(DeepseekSparseAttnBackend):
         sm_scale: float,
         topk_length: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
+        allow_small_heads: bool = False,
     ) -> torch.Tensor:
         """Attention reads ``top-k plus the last window``; a bf16 cache here is
         a bf16 pool or prefill's dequantized copy, and takes the parent's kernel."""
@@ -212,10 +213,13 @@ class Ernie5_5MlaAttnBackend(DeepseekSparseAttnBackend):
                 sm_scale=sm_scale,
                 topk_length=topk_length,
                 attn_sink=attn_sink,
+                allow_small_heads=allow_small_heads,
             )
         # The sched-meta API is the only FlashMLA entry that reads the packed fp8
         # cache and takes a sink; it runs flashmla_kv_num_q_heads heads.
-        from sgl_kernel.flash_mla import flash_mla_with_kvcache
+        from sglang.kernels.ops.attention.flash_mla_interface import (
+            flash_mla_with_kvcache,
+        )
 
         if attn_sink is None:
             raise RuntimeError("ERNIE 5.5 Flash MLA layers always carry a sink")
@@ -252,7 +256,7 @@ class Ernie5_5MlaAttnBackend(DeepseekSparseAttnBackend):
         The kernel builds only into an empty metadata from per-row lengths,
         so it is reset every step; a captured graph keeps its own objects.
         """
-        from sgl_kernel.flash_mla import get_mla_metadata
+        from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
 
         key = (num_rows, width)
         if torch.cuda.is_current_stream_capturing():

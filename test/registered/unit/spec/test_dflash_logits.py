@@ -78,18 +78,10 @@ def test_selector_rejects_a_quantized_target_lm_head():
     model = SimpleNamespace(
         lm_head=SimpleNamespace(weight=torch.empty(8, 4, dtype=torch.int8)),
         candidate_selector=SimpleNamespace(top_k=4),
+        merge_candidates_fused=False,
     )
     with pytest.raises(RuntimeError, match="requires a dense"):
         DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
-
-
-def _flashinfer_contract_topk(scores, k, sorted=False, deterministic=False):
-    """Stand-in for flashinfer.top_k pinning its call contract: contiguous
-    input (its CHECK_INPUT) and the explicit sorted/deterministic flags
-    _radix_topk relies on (the real kernel defaults both to False)."""
-    assert scores.is_contiguous()
-    assert sorted and deterministic
-    return torch.topk(scores, k, dim=-1)
 
 
 class _FakeQuantMethod:
@@ -119,8 +111,8 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
 ):
     """Packed head weights must be projected through their quantization method,
     with the padded-vocab tail masked out of the top-k on contiguous logits:
-    flashinfer's radix top-k rejects non-contiguous input, so a plain crop view
-    would fail at capture on any padded vocab."""
+    flashinfer's radix top-k only reads dense rows, so a plain crop view would
+    be copied on any padded vocab."""
     torch.manual_seed(0)
     hidden = torch.randn(2, 4)
     dense_weight = torch.randn(6, 4)
@@ -136,13 +128,11 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
         lm_head=lm_head,
         candidate_selector=SimpleNamespace(top_k=4),
         _transform_unary_logits=lambda logits: logits.float(),
+        merge_candidates_fused=False,
     )
     monkeypatch.setattr(
         "sglang.srt.models.dflash.get_parallel",
         lambda: SimpleNamespace(tp_size=1),
-    )
-    monkeypatch.setattr(
-        "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
     )
 
     candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)
@@ -179,6 +169,7 @@ def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
         lm_head=lm_head,
         candidate_selector=SimpleNamespace(top_k=k),
         _transform_unary_logits=lambda logits: logits.float(),
+        merge_candidates_fused=False,
     )
 
     # Rank 0's gathered contribution, synthesized from the reference weights.
@@ -198,9 +189,6 @@ def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
     )
     monkeypatch.setattr(
         "sglang.srt.models.dflash.tensor_model_parallel_all_gather", fake_all_gather
-    )
-    monkeypatch.setattr(
-        "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
     )
 
     candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)

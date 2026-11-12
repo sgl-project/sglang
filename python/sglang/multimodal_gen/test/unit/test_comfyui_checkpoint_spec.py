@@ -103,12 +103,26 @@ def test_spec_quant_markers_and_key_filter(monkeypatch, markers):
     assert not key_filter("blocks.0.attn.to_q.comfy_quant")
 
 
-def test_h3_spec_still_rejects_non_int8_markers(monkeypatch):
+@pytest.mark.parametrize("fmt", ["nvfp4", "w6a8_int8"])
+def test_h3_spec_rejects_unverified_markers(monkeypatch, fmt):
     h3 = spec_mod.ComfyUICheckpointSpec(
         dit_cls_name="MiniMaxH3DiTModel", build_dit_config=_spec().build_dit_config
     )
-    with pytest.raises(ValueError, match="INT8 ConvRot"):
-        _load(monkeypatch, h3, h3_markers={"x": {"format": "nvfp4"}})
+    with pytest.raises(ValueError, match=f"not {fmt}"):
+        _load(monkeypatch, h3, h3_markers={"x": {"format": fmt}})
+
+
+def test_h3_spec_accepts_fp8_scaled_markers(monkeypatch):
+    """Comfy-Org's minimax_h3_*_fp8_scaled files, the RTX 40 default."""
+    h3 = spec_mod.ComfyUICheckpointSpec(
+        dit_cls_name="MiniMaxH3DiTModel", build_dit_config=_spec().build_dit_config
+    )
+    seen = _load(monkeypatch, h3, h3_markers={"x": {"format": "float8_e4m3fn"}})
+    # The real resolver maps float8_e4m3fn to ComfyFp8Config.
+    assert seen["init_params"]["quant_config"] == (
+        "quant-config",
+        {"x": {"format": "float8_e4m3fn"}},
+    )
 
 
 def _write_gguf(path, names):

@@ -27,11 +27,13 @@ from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_allocation_size,
     get_cp_sharded_padded_cache_transfer_indices,
 )
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
     available_and_evictable_str,
     evict_from_tree_cache,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import attention_backends, get_parallel, get_schedule
@@ -251,6 +253,7 @@ def alloc_paged_token_slots_extend(
     return out_cache_loc
 
 
+@capacity_decision
 def ensure_mamba_capacity(
     req_to_token_pool: ReqToTokenPool,
     state: Optional[StateStorage],
@@ -266,14 +269,14 @@ def ensure_mamba_capacity(
     # Byte-coordinated for the shared allocator; plain free slots otherwise.
     allocator = state.slots
     supports_mamba = tree_cache is not None and tree_cache.supports_mamba()
-    available = allocator.schedulable_available_size()
-    if available < needed and supports_mamba:
-        tree_cache.evict_for_alloc(
-            EvictParams(num_tokens=0, mamba_num=needed - available)
-        )
-    return allocator.schedulable_available_size() >= needed
+    if allocator.slots_fit(needed):
+        return True
+    if supports_mamba:
+        tree_cache.evict_for_alloc(KVDemand(state_slots=needed))
+    return allocator.slots_fit(needed)
 
 
+@capacity_decision
 def alloc_tracking_slots(
     storage: KVStorage | StaticKVStorage,
     state: StateStorage,
@@ -285,12 +288,14 @@ def alloc_tracking_slots(
     A shortfall evicts cached states from the tree once; a candidate that still
     gets no slot is False, and its boundary writes no snapshot.
     """
-    available = state.slots.schedulable_available_size()
-    if envs.SGLANG_TEST_MAMBA_LAZY_POOL_FULL.get():
-        available = 0
-    shortfall = len(candidates) - available
-    if shortfall > 0 and tree_cache is not None and tree_cache.supports_mamba():
-        tree_cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=shortfall))
+    short = bool(candidates) and (
+        envs.SGLANG_TEST_MAMBA_LAZY_POOL_FULL.get()
+        or not state.slots.slots_fit(len(candidates))
+    )
+    if short and tree_cache is not None and tree_cache.supports_mamba():
+        # A demand is what the allocation takes in all, not its shortfall:
+        # the cache reclaims what is missing of it.
+        tree_cache.evict_for_alloc(KVDemand(state_slots=len(candidates)))
     return [storage.take_tracking_slot(req, pos) for req, pos in candidates]
 
 
