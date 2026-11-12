@@ -223,10 +223,11 @@ class GraphSlot:
 
     # runtime
     buffer: Optional[torch.Tensor] = field(default=None, repr=False)
-    # (buffer, {n: head view}): the views fill_from / copy_slots write, kept while
-    # ``buffer`` stays bound (views of a static buffer are the same every replay).
-    _head_views: Optional[Tuple[torch.Tensor, Dict[int, torch.Tensor]]] = field(
-        default=None, repr=False, compare=False
+    # (buffer, n, view): the last head view, reused while the buffer and the row
+    # count repeat (steady-state decode). One entry, so a slot whose count varies
+    # every step (eager or prefill) does not accumulate views.
+    _last_head: Optional[Tuple[torch.Tensor, int, torch.Tensor]] = field(
+        default=None, init=False, repr=False, compare=False
     )
 
     def __post_init__(self) -> None:
@@ -254,18 +255,16 @@ class GraphSlot:
     def head(self, n: int) -> torch.Tensor:
         """The buffer's leading ``n`` rows as ``fill_from`` writes them
         (``slice_fn`` when set; the whole buffer for axis ``"none"``)."""
-        cache = self._head_views
-        if cache is None or cache[0] is not self.buffer:
-            cache = self._head_views = (self.buffer, {})
-        view = cache[1].get(n)
-        if view is None:
-            if self.slice_fn is not None:
-                view = self.slice_fn(self.buffer, n)
-            elif self.axis == "none":
-                view = self.buffer
-            else:
-                view = self.buffer[:n]
-            cache[1][n] = view
+        last = self._last_head
+        if last is not None and last[0] is self.buffer and last[1] == n:
+            return last[2]
+        if self.slice_fn is not None:
+            view = self.slice_fn(self.buffer, n)
+        elif self.axis == "none":
+            view = self.buffer
+        else:
+            view = self.buffer[:n]
+        self._last_head = (self.buffer, n, view)
         return view
 
     def slice_for(self, padded_bs: int, padded_num_tokens: int) -> torch.Tensor:
@@ -737,8 +736,6 @@ def build_decode_registry(
             compute_local_num_token_non_padded_cpu,
         )
 
-        host_fill = envs.SGLANG_OPT_HOST_NUM_TOKEN_NON_PADDED_FILL.get()
-
         def _num_token_non_padded_post_fill(buf, fb, ctx):
             # init_new batches localize from the invariant GLOBAL scalar (a
             # replicated / CP forward keeps the full count; sharded=False is a
@@ -755,8 +752,9 @@ def build_decode_registry(
             sharded = not enable_prefill_cp and attn_tp_sharded_fn(
                 ctx.padded_num_tokens
             )
-            if host_fill and fb.global_num_token_non_padded_cpu is not None:
-                # Every writer of the device scalar sets the host count with it.
+            if fb.global_num_token_non_padded_cpu is not None:
+                # Every writer of the device scalar sets the host count with it,
+                # so one fill replaces the subtract, clamp and copy launches.
                 buf.fill_(
                     compute_local_num_token_non_padded_cpu(
                         global_num_token_non_padded=fb.global_num_token_non_padded_cpu,

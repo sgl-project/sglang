@@ -46,18 +46,18 @@ def _default_on_in_ci() -> bool:
 _frozen_reads: Optional[Dict[str, Any]] = None
 
 
-def freeze_env_reads() -> bool:
+def freeze_env_reads() -> None:
     """Serve every later ``EnvField.get`` from a per-process memo.
 
-    Gated by SGLANG_OPT_FREEZE_ENV_READS, for a process whose hot loop reads the same
-    variables every step, once its startup is over. Writes through ``set`` /
-    ``override`` / ``clear`` drop the memo; a direct ``os.environ`` write after this
-    call is no longer seen. Returns whether reads are frozen.
+    For a process whose hot loop reads the same variables every step, once its
+    startup is over (the scheduler calls it when its event loop starts). Writes
+    through ``set`` / ``override`` / ``clear`` drop the memo; a raw ``os.environ``
+    write after this call is not seen, which is why sglang-owned variables are
+    written only through the ``EnvField`` API.
     """
     global _frozen_reads
-    if _frozen_reads is None and envs.SGLANG_OPT_FREEZE_ENV_READS.get():
+    if _frozen_reads is None:
         _frozen_reads = {}
-    return _frozen_reads is not None
 
 
 def _drop_frozen_reads() -> None:
@@ -1753,17 +1753,6 @@ class Envs:
     # Let an unchanged top-k-1 EAGLE round read the previous round's top-1 and hidden
     # rows where the draft-extend graph left them instead of relaying copies.
     SGLANG_OPT_SPEC_RELAY_IN_PLACE = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # Once the scheduler's event loop starts, serve EnvField reads from a memo
-    # (freeze_env_reads): the step loop reads dozens of variables per step. A raw
-    # os.environ write after that point is not seen; EnvField writes are.
-    SGLANG_OPT_FREEZE_ENV_READS = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # Decode graph replay writes the local num_token_non_padded slot from the host
-    # count in one fill, not from the device scalar (subtract, clamp and copy).
-    SGLANG_OPT_HOST_NUM_TOKEN_NON_PADDED_FILL = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION. Each
