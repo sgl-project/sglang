@@ -20,6 +20,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.layernorm_sp import is_muse_spark_architecture
 from sglang.srt.layers.logits_processor import (
     LogitsProcessor,
     LogitsProcessorOutput,
@@ -453,7 +454,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_compact_page_size = self._compact_draft_alignment_for_backend(
-            self.page_size, bundle.resolved_attention_backend
+            self.page_size,
+            bundle.resolved_attention_backend,
+            target_worker.model_runner.model_config.hf_config.architectures,
         )
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
@@ -1234,13 +1237,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     @staticmethod
-    def _compact_draft_alignment_for_backend(page_size: int, backend: str) -> int:
-        # Triton reads individual token slots, so the compact suffix need not
-        # start at a physical page boundary. Keep the 16-token logical origin
-        # that defines the existing draft softmax and reduction partitions.
-        # Backends that construct physical page tables keep their alignment.
+    def _compact_draft_alignment_for_backend(
+        page_size: int, backend: str, architectures: Optional[List[str]] = None
+    ) -> int:
+        # Muse Spark on ROCm: Triton reads individual token slots, so the compact
+        # suffix need not start at a physical page boundary. Keep the 16-token
+        # logical origin that defines the existing draft softmax and reduction
+        # partitions. Other models and backends keep the page alignment.
         if (
             torch.version.hip is not None
+            and architectures
+            and is_muse_spark_architecture(architectures[0])
             and backend == "triton"
             and page_size in (32, 64, 128)
         ):

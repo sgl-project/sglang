@@ -5830,8 +5830,13 @@ class AiterIndicesUpdaterPrefill:
                 self.req_to_token.shape[1],
             )
 
-            # kv_indptr[-1] == paged_kernel_lens_sum; the host int avoids a sync.
-            kv_indices[paged_kernel_lens_sum:] = kv_indices[0]
+            # Pad past the real total kv_indptr[bs] (seq_lens_sum may be an upper bound)
+            # without reading it on the host.
+            kv_indices.masked_fill_(
+                torch.arange(kv_indices.numel(), device=kv_indices.device)
+                >= kv_indptr[bs],
+                kv_indices[0].clone(),
+            )
 
             extend_lens = seq_lens - prefix_lens
 

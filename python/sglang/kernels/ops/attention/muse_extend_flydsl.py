@@ -132,18 +132,14 @@ def _launcher(
     rescale,
     nbuf,
     sub,
-    abl=0,
+    scheck=False,
     sc_th=SC_TH,
     sc_tgt=SC_TGT,
     ppb=1,
 ):
     # ppb: 16-row blocks per physical page (physical page = 16 ppb tokens; kv_s0 = physical page stride)
-    vsum = bool(abl & 512)
-    scheck = bool(
-        abl & 1024
-    )  # sum-checked lazy softmax (no per-tile max)  # row sums on the VALU (packed adds) instead of the ones-MFMA
-    # abl (timing ablations, wrong results): 1 no s_barrier, 2 no DMA, 4 no max / rescale check, 8 no v_exp,
-    # 16 no fp8 pack, 32 no PV MFMAs, 64 no QK MFMAs (S = K bits)
+    # scheck: sum-checked lazy softmax (no per-tile max)
+    vsum = False  # row sums on the ones-MFMA (True: on the VALU, packed adds)
     exp_scale = float(scale) * LOG2E
     s1w = kv_s1 // 4
     nsub = TILE // sub  # softmax steps per tile
@@ -295,8 +291,6 @@ def _launcher(
         wave_lds = _uniform(wave * 2048)
 
         def issue_dma(tile, stage_off, ids, sc):
-            if fx.const_expr(abl & 2):
-                return
             # LDS DMA: lane l of instruction (tensor ui, page n) lands at M0 + 16 l. Per-page descriptor: 64-bit page
             # base, num_records = valid rows * row stride (rows past the request read as zero: no stale NaN bytes
             # reach P.V, no 2^31 offset limit)
@@ -386,26 +380,8 @@ def _launcher(
                     )
                     for u in range_constexpr(2)
                 ]
-                if fx.const_expr(abl & 128):
-                    # loop-variant stand-in without the LDS read (keeps the MFMAs in the loop)
-                    kfr.append(
-                        _to_raw(
-                            _vec(qf, 8, fx.Int32)
-                            + _vec(_to_raw(fx.full(8, 0, fx.Int32)), 8, fx.Int32)
-                            + fx.Int32(j * 4 + mt)
-                        )
-                    )
-                else:
-                    kfr.append(_cat(parts[0], parts[1], 4))
-            if fx.const_expr(abl & 64):
-                s = [
-                    _to_raw(
-                        _vec(_cat(kfr[t], kfr[t], 8), 16, fx.Int32).bitcast(fx.Float32)
-                    )
-                    for t in range_constexpr(mts)
-                ]
-            else:
-                s = [mfma(kfr[t], qf, zero16) for t in range_constexpr(mts)]
+                kfr.append(_cat(parts[0], parts[1], 4))
+            s = [mfma(kfr[t], qf, zero16) for t in range_constexpr(mts)]
             ninf = fx.Float32(float("-inf"))
             flat = []
             for t in range_constexpr(mts):
@@ -423,10 +399,8 @@ def _launcher(
                     )
                 else:
                     flat.extend(_to_raw(x[r]) for r in range(16))
-            mx = _tree_max(flat) if not (abl & 4) else flat[0]
+            mx = _tree_max(flat)
             need = arith.cmpf(arith.CmpFPredicate.OGT, mx, _to_raw(thr))
-            if fx.const_expr(abl & 4):
-                need = arith.cmpf(arith.CmpFPredicate.OGT, mx, _f32(3e38))
             vote = fx.Int64(_rocdl.ballot(T.i64, need))
             # rare: llvm.expect(false) lets block placement move the rescale out of line (the common path falls
             # through instead of taking a branch per check)
@@ -465,21 +439,14 @@ def _launcher(
                 ps = []
                 for r in range_constexpr(0, 16, 2):
                     z = zs[t * 8 + r // 2]
-                    if fx.const_expr(abl & 8):
-                        ps.append(_to_raw(z[0]))
-                        ps.append(_to_raw(z[1]))
-                    else:
-                        ps.append(_to_raw(fx.rocdl.exp2(T.f32, _to_raw(z[0]))))
-                        ps.append(_to_raw(fx.rocdl.exp2(T.f32, _to_raw(z[1]))))
+                    ps.append(_to_raw(fx.rocdl.exp2(T.f32, _to_raw(z[0]))))
+                    ps.append(_to_raw(fx.rocdl.exp2(T.f32, _to_raw(z[1]))))
                     if fx.const_expr(vsum):
                         pp = fx.Vector.from_elements(
                             [fx.Float32(ps[-2]), fx.Float32(ps[-1])], fx.Float32
                         )
                         psum = pp if psum is None else psum + pp
                 for w4 in range_constexpr(4):
-                    if fx.const_expr(abl & 16):
-                        words.append(arith.bitcast(T.i32, ps[4 * w4 + (t + w4) % 4]))
-                        continue
                     lo_w = _rocdl.cvt_pk_fp8_f32(
                         T.i32,
                         ps[4 * w4],
@@ -519,18 +486,8 @@ def _launcher(
                             **_scope_kw(sc),
                         ).result
                         rd.append(raw)
-                    va = (
-                        pb
-                        if (abl & 256)
-                        else _cat(_cat(rd[0], rd[1], 2), _cat(rd[2], rd[3], 2), 4)
-                    )
-                    if fx.const_expr(abl & 32):
-                        o_new[dt] = _to_raw(
-                            _vec(o_new[dt], 16)
-                            + _vec(_cat(va, va, 8), 16, fx.Int32).bitcast(fx.Float32)
-                        )
-                    else:
-                        o_new[dt] = mfma(va, pb, o_new[dt])
+                    va = _cat(_cat(rd[0], rd[1], 2), _cat(rd[2], rd[3], 2), 4)
+                    o_new[dt] = mfma(va, pb, o_new[dt])
             if fx.const_expr(vsum):
                 l_run = _to_raw(_vec(l_run, 2) + psum)
             else:
@@ -700,8 +657,7 @@ def _launcher(
             # (gpu.barrier's release fence would wait for every DMA in flight)
             fx.rocdl.sched_barrier(0)
             fx.rocdl.s_waitcnt(vmcnt=vm_wait)
-            if fx.const_expr(not (abl & 1)):
-                _rocdl.s_barrier()
+            _rocdl.s_barrier()
             fx.rocdl.sched_barrier(0)
 
         def step(j, st, stage, masked):
@@ -843,7 +799,6 @@ def muse_extend_attention_fly(
     rescale=0.0,
     nbuf=2,
     sub=128,
-    abl=0,
     sc_th=440.0,
     sc_tgt=400.0,
     sum_check=False,
@@ -854,9 +809,7 @@ def muse_extend_attention_fly(
     Defaults: P = 448 * exp2(s c - m) with m the running max (the rescale runs only when some score exceeds it,
     wave-uniform branch), as accurate as the Gluon kernel. ``sum_check=True``: opt-in faster variant without the
     per-tile max (P range proven by the ones-MFMA tile sum, rescale on overflow); ~3% faster at long prefixes,
-    rel-L2 up to ~5% higher than Gluon on peaky test data. ``abl``: timing ablation bits (wrong results)."""
-    if sum_check:
-        abl |= 1024
+    rel-L2 up to ~5% higher than Gluon on peaky test data."""
     import torch
 
     assert window == 0, "sliding window not implemented in the FlyDSL extend kernel"
@@ -906,7 +859,7 @@ def muse_extend_attention_fly(
             rescale,
             nbuf,
             sub,
-            abl,
+            bool(sum_check),
             sc_th,
             sc_tgt,
             k_cache.shape[1] // PAGE,

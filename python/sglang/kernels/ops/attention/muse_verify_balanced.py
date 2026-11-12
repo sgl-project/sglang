@@ -336,7 +336,8 @@ def swa_verify_flydsl(
 
 
 def use_balanced_full(num_seqs: int, kv_heads: int) -> bool:
-    return num_seqs >= (4 if kv_heads >= 4 else 6)
+    # the plan holds at most MAX_REQUESTS requests; larger batches keep the per-request splits
+    return (4 if kv_heads >= 4 else 6) <= num_seqs <= MAX_REQUESTS
 
 
 def use_flydsl_sliding(num_seqs: int, kv_heads: int) -> bool:
