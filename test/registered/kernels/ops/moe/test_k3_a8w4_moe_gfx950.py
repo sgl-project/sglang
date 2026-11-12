@@ -215,7 +215,7 @@ class TestK3A8W4MoeGfx950(CustomTestCase):
                 activation=ActivationType.Situv2,
                 w1_scale=w13s,
                 w2_scale=w2s,
-                gate_mode=GateMode.SEPARATED.value,
+                gate_mode=GateMode.INTERLEAVE.value,  # w13 is GU-interleaved (#49152)
                 beta=self.BETA,
                 linear_beta=self.LBETA,
             )
