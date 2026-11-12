@@ -40,7 +40,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "USE_NPU_MOE_GATING_TOP_K": "1",
     "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     "SGLANG_DSPARK_QUANT_AUDIT": "1",
@@ -228,6 +227,12 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
     accuracy = 0.874
     datasets = ["gpqa_diamond"]
+    # A single attempt: gsm8k's 3-retry budget would exceed the step timeout.
+    max_retries = 1
+    # Weekday nightly overrides this to gsm8k (baseline is provisional).
+    dataset_baselines = {
+        "gsm8k": 0.90,
+    }
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%

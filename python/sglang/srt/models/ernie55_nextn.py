@@ -34,6 +34,7 @@ from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm, exact_rms_norm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -54,7 +55,7 @@ from sglang.srt.models.ernie55 import (
     scatter_rows,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import BumpAllocator, add_prefix
+from sglang.srt.utils import BumpAllocator
 
 
 class Ernie5_5ModelNextN(nn.Module):

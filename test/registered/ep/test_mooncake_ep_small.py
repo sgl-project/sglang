@@ -37,6 +37,9 @@ class TestTP(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            # Log each Mooncake EP JIT compile and cache event, to debug the
+            # intermittent nvcc exit_code=127 (kvcache-ai/Mooncake#5316).
+            env={"MOONCAKE_EP_JIT_LOG": "1"},
             other_args=[
                 "--trust-remote-code",
                 "--tp",

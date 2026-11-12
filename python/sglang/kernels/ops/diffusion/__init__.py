@@ -878,6 +878,7 @@ _EXPORTS: dict[str, str] = {
     "tensors_equal": "sites.bitexact_gate",
     "FLUX2_NVFP4_SWIGLU_QUANT": "sites.flux2_nvfp4_swiglu_quant_site",
     "FUSED_GATE_RMSNORM": "sites.fused_gate_rmsnorm_site",
+    "WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT": "sites.wan_rocm_flydsl_norm_scale_shift_site",
     "fused_rmsnorm_scale": "sites.fused_gate_rmsnorm_site",
     "fused_rmsnorm_tanh_residual": "sites.fused_gate_rmsnorm_site",
     "FUSED_LINEAR_GELU": "sites.fused_linear_gelu_site",
@@ -901,6 +902,8 @@ _EXPORTS: dict[str, str] = {
     "QWEN_IMAGE_ADDED_QKV": "sites.qwen_image_added_qkv_site",
     "SANA_VIDEO_LINEAR_ATTENTION": "sites.sana_video_linear_attention_site",
     "try_sana_video_linear_attention": "sites.sana_video_linear_attention_site",
+    "SANA_VIDEO2_SOFTMAX_ATTENTION": "sites.sana_video2_softmax_attention_site",
+    "try_sana_video2_softmax_attention": "sites.sana_video2_softmax_attention_site",
     "QualityGatedFusion": "sites.quality_gate",
     # JIT C++/CUDA extensions (not kernels, not in the registry)
     "interpolate": "ext.hunyuan3d_rasterizer",
