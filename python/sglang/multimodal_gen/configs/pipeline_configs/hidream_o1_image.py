@@ -47,6 +47,18 @@ class HiDreamO1ImagePipelineConfig(ImagePipelineConfig):
     generator_device: str = "cpu"
 
     def validate_server_args(self, server_args: Any) -> None:
+        # The pipeline builds its scheduler with the reference flow shift, so
+        # these would otherwise be silently ignored.
+        scheduler_overrides = [
+            f"--{option.replace('_', '-')}"
+            for option in ("flow_shift", "scheduler_class_override")
+            if getattr(self, option) is not None
+        ]
+        if scheduler_overrides:
+            raise ValueError(
+                "HiDream-O1-Image samples with the reference scheduler and flow "
+                f"shift. Drop {', '.join(scheduler_overrides)}."
+            )
         if server_args.sp_degree > 1:
             raise ValueError(
                 "HiDream-O1-Image mixes causal text spans with a bidirectional "

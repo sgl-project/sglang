@@ -29,7 +29,7 @@ from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
 
-from sglang.srt.utils.common import log_info_on_rank0
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     ASCEND_OPS = "ascend_ops"
-    FLASHINFER = "flashinfer"
+    FLASHINFER = "flashinfer_nvlink_one_sided"
     MEGAMOE = "megamoe"
     DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
@@ -53,6 +53,8 @@ class MoeA2ABackend(Enum):
     def _missing_(cls, value):
         if value is None:
             return cls.NONE
+        if value == "flashinfer":  # Deprecated alias for FLASHINFER.
+            return cls.FLASHINFER
         for member in cls:
             if value == member.value:
                 return member
@@ -205,9 +207,6 @@ class _MoeRunnerBackendPredicates:
     def is_ascend(self):
         return self.value == MoeRunnerBackend.ASCEND.value
 
-    def is_triton_kernels(self):
-        return self.value == MoeRunnerBackend.TRITON_KERNELS.value
-
     def is_flashinfer_trtllm(self):
         # experimental_sgl_trtllm shares the TRT-LLM FP8 kernels + layout, so it inherits
         # trtllm weight-prep here; divergent sites check is_experimental_sgl_trtllm() first.
@@ -276,7 +275,6 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
-    TRITON_KERNELS = "triton_kernel"
     ASCEND = "ascend"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     EXPERIMENTAL_SGL_TRTLLM = "experimental_sgl_trtllm"
@@ -1175,3 +1173,11 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
             w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
+
+
+def route_dropped_experts_to_local(
+    topk_weights: torch.Tensor, topk_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map -1 ids (EP-dropped, padded) to expert 0 at weight 0 for sgl-kernel-xpu."""
+    dropped = topk_ids < 0
+    return topk_weights.masked_fill(dropped, 0), topk_ids.masked_fill(dropped, 0)
