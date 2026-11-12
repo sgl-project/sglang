@@ -408,9 +408,28 @@ class TestPublicKVProtocol(CustomTestCase):
         demote["$defs"]["Prefetch"] = transfer
         demote["$ref"] = "#/$defs/Prefetch"
         self.assertEqual(demote, wire(msgspec.json.schema(Prefetch)))
-        for case in json.loads((self.fixtures / "actions.json").read_text()):
+        vectors = json.loads((self.fixtures / "actions.json").read_text())
+        for case in vectors["cases"]:
+            value = copy.deepcopy(vectors["base"])
+            for pointer, replacement in case["replace"].items():
+                parts = [
+                    p.replace("~1", "/").replace("~0", "~")
+                    for p in pointer[1:].split("/")
+                ]
+                parent = value
+                for part in parts[:-1]:
+                    parent = (
+                        parent[int(part)] if isinstance(parent, list) else parent[part]
+                    )
+                key = int(parts[-1]) if isinstance(parent, list) else parts[-1]
+                assert (
+                    key in parent
+                    if isinstance(parent, dict)
+                    else 0 <= key < len(parent)
+                )
+                parent[key] = replacement
             with self.subTest(case=case["name"]):
-                a = msgspec.convert(case["action"], type=KvHintAction)
+                a = msgspec.convert(value, type=KvHintAction)
                 if case["valid"]:
                     parse_action(a)
                 else:
@@ -452,8 +471,8 @@ class TestPublicKVProtocol(CustomTestCase):
 
     @classmethod
     def public_action(cls):
-        case = json.loads((cls.fixtures / "actions.json").read_text())[0]
-        return msgspec.convert(case["action"], type=KvHintAction)
+        value = json.loads((cls.fixtures / "actions.json").read_text())["base"]
+        return msgspec.convert(value, type=KvHintAction)
 
     @staticmethod
     def caps():

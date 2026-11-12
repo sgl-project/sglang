@@ -24,8 +24,7 @@ fn limits() -> SessionLimits {
 fn compatibility() -> Compatibility {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("../fixtures/actions.json")).unwrap();
-    serde_json::from_value(fixture[0]["action"]["payload"]["target"]["compatibility"].clone())
-        .unwrap()
+    serde_json::from_value(fixture["base"]["payload"]["target"]["compatibility"].clone()).unwrap()
 }
 fn key(digest: &str) -> ContentKey {
     ContentKey::new(compatibility(), digest.into()).unwrap()

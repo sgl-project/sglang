@@ -242,8 +242,12 @@ mod tests {
     #[test]
     fn shared_action_vectors() {
         let cases: Value = serde_json::from_str(include_str!("../fixtures/actions.json")).unwrap();
-        for case in cases.as_array().unwrap() {
-            let action: Action = serde_json::from_value(case["action"].clone()).unwrap();
+        for case in cases["cases"].as_array().unwrap() {
+            let mut value = cases["base"].clone();
+            for (pointer, replacement) in case["replace"].as_object().unwrap() {
+                *value.pointer_mut(pointer).expect("existing fixture field") = replacement.clone();
+            }
+            let action: Action = serde_json::from_value(value).unwrap();
             assert_eq!(
                 parse_action(&action).is_ok(),
                 case["valid"].as_bool().unwrap(),

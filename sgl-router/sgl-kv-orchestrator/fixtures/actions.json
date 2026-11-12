@@ -1,12 +1,75 @@
-[
-  {
-    "name": "token_prefix_i64_min",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
+{
+  "base": {
+    "action_id": "a",
+    "action_type": "sglang.prefetch",
+    "action_version": "1.0",
+    "payload": {
+      "target": {
+        "kind": "prefix",
+        "compatibility": {
+          "namespace": "ns",
+          "cache_salt": null,
+          "layout_id": "python:full:p4:w0",
+          "page_size": 4,
+          "components": [
+            "full"
+          ],
+          "hash_scheme": "sglang.sha256.u32le.i64.v1"
+        },
+        "start_token": 0,
+        "end_token": 4,
+        "token_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "blocks": [
+          {
+            "block_hash": "-9223372036854775808",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4
+          }
+        ]
+      },
+      "source": {
+        "tier": "storage",
+        "backend": "file"
+      },
+      "destination": {
+        "tier": "host",
+        "engine_id": "engine"
+      },
+      "allow_partial": false,
+      "timeout_ms": 5000
+    }
+  },
+  "cases": [
+    {
+      "name": "token_prefix_i64_min",
+      "valid": true,
+      "replace": {}
+    },
+    {
+      "name": "i64_max",
+      "valid": true,
+      "replace": {
+        "/payload/target/blocks": [
+          {
+            "block_hash": "9223372036854775807",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4
+          }
+        ]
+      }
+    },
+    {
+      "name": "hash_only_schema_not_executable",
+      "valid": true,
+      "replace": {
+        "/payload/target": {
           "kind": "prefix",
           "compatibility": {
             "namespace": "ns",
@@ -20,12 +83,6 @@
           },
           "start_token": 0,
           "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
           "blocks": [
             {
               "block_hash": "-9223372036854775808",
@@ -34,367 +91,174 @@
               "end_token": 4
             }
           ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
+        }
+      }
+    },
+    {
+      "name": "unicode_salt",
+      "valid": true,
+      "replace": {
+        "/payload/target/compatibility/cache_salt": "租户😀\u0000\"\\"
+      }
+    },
+    {
+      "name": "demote",
+      "valid": true,
+      "replace": {
+        "/action_type": "sglang.demote",
+        "/payload/source": {
           "tier": "host",
           "engine_id": "engine"
         },
-        "allow_partial": false,
-        "timeout_ms": 5000
-      }
-    },
-    "valid": true
-  },
-  {
-    "name": "i64_max",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "9223372036854775807",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
+        "/payload/destination": {
           "tier": "storage",
           "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+        }
       }
     },
-    "valid": true
-  },
-  {
-    "name": "hash_only_schema_not_executable",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
+    {
+      "name": "pin_acquire",
+      "valid": true,
+      "replace": {
+        "/action_type": "sglang.pin",
+        "/payload": {
+          "mode": "acquire",
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            },
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
             ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
           },
-          "start_token": 0,
-          "end_token": 4,
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+          "location": {
+            "tier": "host"
+          },
+          "claim_id": "c",
+          "revision": 3,
+          "required_protection": "eviction_exclusion",
+          "ttl_seconds": 60,
+          "priority": -2147483648
+        }
       }
     },
-    "valid": true
-  },
-  {
-    "name": "unicode_salt",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": "租户😀\u0000\"\\",
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
+    {
+      "name": "pin_renew",
+      "valid": true,
+      "replace": {
+        "/action_type": "sglang.pin",
+        "/payload": {
+          "mode": "renew",
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            },
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
             ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
           },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+          "location": {
+            "tier": "host"
+          },
+          "claim_id": "c",
+          "revision": 3,
+          "required_protection": "eviction_exclusion",
+          "ttl_seconds": 60
+        }
       }
     },
-    "valid": true
-  },
-  {
-    "name": "demote",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.demote",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
+    {
+      "name": "pin_release",
+      "valid": true,
+      "replace": {
+        "/action_type": "sglang.pin",
+        "/payload": {
+          "mode": "release",
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            },
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
             ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
           },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "destination": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+          "location": {
+            "tier": "host"
+          },
+          "claim_id": "c",
+          "revision": 3,
+          "required_protection": "eviction_exclusion"
+        }
       }
     },
-    "valid": true
-  },
-  {
-    "name": "pin_acquire",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.pin",
-      "action_version": "1.0",
-      "payload": {
-        "mode": "acquire",
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "location": {
-          "tier": "host"
-        },
-        "claim_id": "c",
-        "revision": 3,
-        "required_protection": "eviction_exclusion",
-        "ttl_seconds": 60,
-        "priority": -2147483648
-      }
-    },
-    "valid": true
-  },
-  {
-    "name": "pin_renew",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.pin",
-      "action_version": "1.0",
-      "payload": {
-        "mode": "renew",
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "location": {
-          "tier": "host"
-        },
-        "claim_id": "c",
-        "revision": 3,
-        "required_protection": "eviction_exclusion",
-        "ttl_seconds": 60
-      }
-    },
-    "valid": true
-  },
-  {
-    "name": "pin_release",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.pin",
-      "action_version": "1.0",
-      "payload": {
-        "mode": "release",
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "location": {
-          "tier": "host"
-        },
-        "claim_id": "c",
-        "revision": 3,
-        "required_protection": "eviction_exclusion"
-      }
-    },
-    "valid": true
-  },
-  {
-    "name": "legacy_tokens",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
+    {
+      "name": "legacy_tokens",
+      "valid": true,
+      "replace": {
+        "/payload/target": {
           "kind": "tokens",
           "namespace": "ns",
           "token_ids": [
@@ -403,55 +267,25 @@
             3,
             4
           ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+        }
       }
     },
-    "valid": true
-  },
-  {
-    "name": "legacy_session",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
+    {
+      "name": "legacy_session",
+      "valid": false,
+      "replace": {
+        "/payload/target": {
           "kind": "session",
           "namespace": "ns",
           "session_id": "s"
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+        }
       }
     },
-    "valid": false
-  },
-  {
-    "name": "legacy_content",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
+    {
+      "name": "legacy_content",
+      "valid": false,
+      "replace": {
+        "/payload/target": {
           "kind": "content",
           "namespace": "ns",
           "token_count": 4,
@@ -466,1682 +300,553 @@
               "end_token": 4
             }
           ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+        }
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_hash_9223372036854775808",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_hash_9223372036854775808",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks": [
+          {
+            "block_hash": "9223372036854775808",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4
+          }
+        ]
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_hash_-9223372036854775809",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775809",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_hash_-9223372036854775809",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks": [
+          {
+            "block_hash": "-9223372036854775809",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4
+          }
+        ]
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_hash_01",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "01",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_hash_01",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks": [
+          {
+            "block_hash": "01",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4
+          }
+        ]
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_hash_-0",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-0",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_hash_-0",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks": [
+          {
+            "block_hash": "-0",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4
+          }
+        ]
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_hash_+1",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "+1",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_hash_+1",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks": [
+          {
+            "block_hash": "+1",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4
+          }
+        ]
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_hash_1.0",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "1.0",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_hash_1.0",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks": [
+          {
+            "block_hash": "1.0",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4
+          }
+        ]
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_hash_1\n",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "1\n",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_hash_1\n",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks": [
+          {
+            "block_hash": "1\n",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4
+          }
+        ]
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_hash_9007199254740992",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": 9007199254740992,
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_hash_9007199254740992",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks": [
+          {
+            "block_hash": 9007199254740992,
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4
+          }
+        ]
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_start_token1",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 1,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_start_token1",
+      "valid": false,
+      "replace": {
+        "/payload/target/start_token": 1
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_end_token0",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 0,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_end_token0",
+      "valid": false,
+      "replace": {
+        "/payload/target/end_token": 0
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_end_token8",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 8,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_end_token8",
+      "valid": false,
+      "replace": {
+        "/payload/target/end_token": 8
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_end_token9007199254740992",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 9007199254740992,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_end_token9007199254740992",
+      "valid": false,
+      "replace": {
+        "/payload/target/end_token": 9007199254740992
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_start_tokenFalse",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": false,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_start_tokenFalse",
+      "valid": false,
+      "replace": {
+        "/payload/target/start_token": false
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_token_ids[4294967296, 4294967296, 4294967296, 4294967296]",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            4294967296,
-            4294967296,
-            4294967296,
-            4294967296
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_token_ids[4294967296, 4294967296, 4294967296, 4294967296]",
+      "valid": false,
+      "replace": {
+        "/payload/target/token_ids": [
+          4294967296,
+          4294967296,
+          4294967296,
+          4294967296
+        ]
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_compat_page_size",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 0,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_compat_page_size",
+      "valid": false,
+      "replace": {
+        "/payload/target/compatibility/page_size": 0
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_compat_components",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full",
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_compat_components",
+      "valid": false,
+      "replace": {
+        "/payload/target/compatibility/components": [
+          "full",
+          "full"
+        ]
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_compat_namespace",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_compat_namespace",
+      "valid": false,
+      "replace": {
+        "/payload/target/compatibility/namespace": ""
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_compat_layout_id",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_compat_layout_id",
+      "valid": false,
+      "replace": {
+        "/payload/target/compatibility/layout_id": ""
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_compat_cache_salt",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": true,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_compat_cache_salt",
+      "valid": false,
+      "replace": {
+        "/payload/target/compatibility/cache_salt": true
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_block_dependency_start",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4,
-              "dependency_start": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_block_dependency_start",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks": [
+          {
+            "block_hash": "-9223372036854775808",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4,
+            "dependency_start": 4
+          }
+        ]
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_block_component",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "mamba",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_block_component",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks": [
+          {
+            "block_hash": "-9223372036854775808",
+            "component": "mamba",
+            "start_token": 0,
+            "end_token": 4
+          }
+        ]
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_block_end_token",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 8
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+    {
+      "name": "bad_block_end_token",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks": [
+          {
+            "block_hash": "-9223372036854775808",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 8
+          }
+        ]
       }
     },
-    "valid": false
-  },
-  {
-    "name": "overlapping_blocks",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
+    {
+      "name": "overlapping_blocks",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks": [
+          {
+            "block_hash": "-9223372036854775808",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4
           },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
+          {
+            "block_hash": "-9223372036854775808",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4
+          }
+        ]
+      }
+    },
+    {
+      "name": "bad_transfer_timeout_ms",
+      "valid": false,
+      "replace": {
+        "/payload/timeout_ms": 0
+      }
+    },
+    {
+      "name": "bad_transfer_timeout_ms",
+      "valid": false,
+      "replace": {
+        "/payload/timeout_ms": true
+      }
+    },
+    {
+      "name": "bad_transfer_allow_partial",
+      "valid": false,
+      "replace": {
+        "/payload/allow_partial": 1
+      }
+    },
+    {
+      "name": "bad_transfer_deadline",
+      "valid": false,
+      "replace": {
+        "/payload": {
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
             },
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
+          },
+          "source": {
+            "tier": "storage",
+            "backend": "file"
+          },
+          "destination": {
+            "tier": "host",
+            "engine_id": "engine"
+          },
+          "allow_partial": false,
+          "timeout_ms": 5000,
+          "deadline": 10
+        }
       }
     },
-    "valid": false
-  },
-  {
-    "name": "bad_transfer_timeout_ms",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 0
-      }
-    },
-    "valid": false
-  },
-  {
-    "name": "bad_transfer_timeout_ms",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": true
-      }
-    },
-    "valid": false
-  },
-  {
-    "name": "bad_transfer_allow_partial",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": 1,
-        "timeout_ms": 5000
-      }
-    },
-    "valid": false
-  },
-  {
-    "name": "bad_transfer_deadline",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000,
-        "deadline": 10
-      }
-    },
-    "valid": false
-  },
-  {
-    "name": "wrong_prefetch_direction",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
+    {
+      "name": "wrong_prefetch_direction",
+      "valid": false,
+      "replace": {
+        "/payload/source": {
           "tier": "gpu"
-        },
-        "destination": {
-          "tier": "host",
-          "engine_id": "engine"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
+        }
       }
     },
-    "valid": false
-  },
-  {
-    "name": "engine_backend",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.prefetch",
-      "action_version": "1.0",
-      "payload": {
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "source": {
-          "tier": "storage",
-          "backend": "file"
-        },
-        "destination": {
+    {
+      "name": "engine_backend",
+      "valid": false,
+      "replace": {
+        "/payload/destination": {
           "tier": "host",
           "engine_id": "engine",
           "backend": "file"
-        },
-        "allow_partial": false,
-        "timeout_ms": 5000
-      }
-    },
-    "valid": false
-  },
-  {
-    "name": "release_with_ttl",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.pin",
-      "action_version": "1.0",
-      "payload": {
-        "mode": "release",
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "location": {
-          "tier": "host"
-        },
-        "claim_id": "c",
-        "revision": 3,
-        "ttl_seconds": 60
-      }
-    },
-    "valid": false
-  },
-  {
-    "name": "pin_explicit_local_owner",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.pin",
-      "action_version": "1.0",
-      "payload": {
-        "mode": "acquire",
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
-            ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
-          },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "location": {
-          "tier": "host"
-        },
-        "claim_id": "c",
-        "revision": 3,
-        "required_protection": "eviction_exclusion",
-        "ttl_seconds": 60,
-        "owner_task": {
-          "session_id": "task",
-          "incarnation": 7
         }
       }
     },
-    "valid": true
-  },
-  {
-    "name": "pin_owner_incarnation_overflow",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.pin",
-      "action_version": "1.0",
-      "payload": {
-        "mode": "acquire",
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
+    {
+      "name": "release_with_ttl",
+      "valid": false,
+      "replace": {
+        "/action_type": "sglang.pin",
+        "/payload": {
+          "mode": "release",
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            },
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
             ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
           },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "location": {
-          "tier": "host"
-        },
-        "claim_id": "c",
-        "revision": 3,
-        "required_protection": "eviction_exclusion",
-        "ttl_seconds": 60,
-        "owner_task": {
-          "session_id": "task",
-          "incarnation": 9007199254740992
+          "location": {
+            "tier": "host"
+          },
+          "claim_id": "c",
+          "revision": 3,
+          "ttl_seconds": 60
         }
       }
     },
-    "valid": false
-  },
-  {
-    "name": "pin_owner_rejects_unknown_fields",
-    "action": {
-      "action_id": "a",
-      "action_type": "sglang.pin",
-      "action_version": "1.0",
-      "payload": {
-        "mode": "acquire",
-        "target": {
-          "kind": "prefix",
-          "compatibility": {
-            "namespace": "ns",
-            "cache_salt": null,
-            "layout_id": "python:full:p4:w0",
-            "page_size": 4,
-            "components": [
-              "full"
+    {
+      "name": "pin_explicit_local_owner",
+      "valid": true,
+      "replace": {
+        "/action_type": "sglang.pin",
+        "/payload": {
+          "mode": "acquire",
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            },
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
             ],
-            "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
           },
-          "start_token": 0,
-          "end_token": 4,
-          "token_ids": [
-            1,
-            2,
-            3,
-            4
-          ],
-          "blocks": [
-            {
-              "block_hash": "-9223372036854775808",
-              "component": "full",
-              "start_token": 0,
-              "end_token": 4
-            }
-          ]
-        },
-        "location": {
-          "tier": "host"
-        },
-        "claim_id": "c",
-        "revision": 3,
-        "required_protection": "eviction_exclusion",
-        "ttl_seconds": 60,
-        "owner_task": {
-          "session_id": "task",
-          "incarnation": 7,
-          "caller_id": "other"
+          "location": {
+            "tier": "host"
+          },
+          "claim_id": "c",
+          "revision": 3,
+          "required_protection": "eviction_exclusion",
+          "ttl_seconds": 60,
+          "owner_task": {
+            "session_id": "task",
+            "incarnation": 7
+          }
         }
       }
     },
-    "valid": false
-  }
-]
+    {
+      "name": "pin_owner_incarnation_overflow",
+      "valid": false,
+      "replace": {
+        "/action_type": "sglang.pin",
+        "/payload": {
+          "mode": "acquire",
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            },
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
+          },
+          "location": {
+            "tier": "host"
+          },
+          "claim_id": "c",
+          "revision": 3,
+          "required_protection": "eviction_exclusion",
+          "ttl_seconds": 60,
+          "owner_task": {
+            "session_id": "task",
+            "incarnation": 9007199254740992
+          }
+        }
+      }
+    },
+    {
+      "name": "pin_owner_rejects_unknown_fields",
+      "valid": false,
+      "replace": {
+        "/action_type": "sglang.pin",
+        "/payload": {
+          "mode": "acquire",
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            },
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
+          },
+          "location": {
+            "tier": "host"
+          },
+          "claim_id": "c",
+          "revision": 3,
+          "required_protection": "eviction_exclusion",
+          "ttl_seconds": 60,
+          "owner_task": {
+            "session_id": "task",
+            "incarnation": 7,
+            "caller_id": "other"
+          }
+        }
+      }
+    }
+  ]
+}
