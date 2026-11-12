@@ -17,8 +17,8 @@ Tuning then proceeds in two steps, and the page is organized around them:
 2. **Tune the knobs** ([Tuning by Goal](#tuning-by-goal)): parameters whose best value depends on the workload. Pick a
    goal, change one knob at a time, and re-benchmark.
 
-Two reference paths sit alongside: [Feature Descriptions](#feature-descriptions) to look up any switch or knob, and
-[Feature Compatibility](#feature-compatibility) to check a combination before enabling several features together.
+One reference path sits alongside: [Feature Compatibility](#feature-compatibility) to check a combination before
+enabling several features together.
 
 Flag names and values change across releases, and the docs may at times fall out of sync with the code: the
 best-practice pages pin the scripts of the image they were validated on, while this page tracks current builds. If a
@@ -259,51 +259,6 @@ show where a large two-role deployment converged. Raw defaults for most flags ar
 are listed in [Ascend NPU Environment Variables](/docs/hardware-platforms/ascend-npus/reference/environment_variables).
 `—` means do not set the flag, and the Purpose column explains when that changes. A trailing condition narrows when a
 value applies, as in `on (DeepSeek R1)`.
-
-### Feature Descriptions
-
-One row per feature, with its switch, its kind, and the section that documents it. A **switch** is enabled when it
-applies and has no value to size; a **conditional switch** additionally needs its workload condition to hold (the batch-enabled ones appear in
-[Add-On Optimizations](#add-on-optimizations)); a **knob** has no universally good value; a
-**switch + knob** combines both.
-
-| Feature | Switch | Kind | Documented in |
-| --- | --- | --- | --- |
-| Tensor parallelism | `--tp-size` | Knob | [Parallelism](#parallelism) |
-| Attention data parallelism | `--attn-dp-size` (alias `--attention-data-parallel-size`) | Knob | [Parallelism](#parallelism) |
-| Model replication | `--dp-size` | Knob | [Parallelism](#parallelism) |
-| Expert parallelism | `--ep-size` (aliases `--ep`, `--expert-parallel-size`) | Knob | [Parallelism](#parallelism) |
-| Prefill context parallelism | `--enable-prefill-cp`, `--attn-cp-size`, `--cp-strategy` | Switch + knob | [Parallelism](#parallelism) |
-| Decode context parallelism | `--dcp-size` | Knob | [Parallelism](#parallelism) |
-| Dense FFN sharding in MoE models | `--moe-dense-tp-size` | Conditional switch | [Parallelism](#parallelism) |
-| DP LM head | `--enable-dp-lm-head` | Switch | [Parallelism](#parallelism) |
-| Routing across DP ranks | `--load-balance-method` | Knob | [Parallelism](#parallelism) |
-| Scheduler all-gather | `SGLANG_SCHEDULER_SKIP_ALL_GATHER` | Conditional switch | [Parallelism](#parallelism) |
-| MoE all-to-all backend | `--moe-a2a-backend`, `--deepep-mode` | Switch + knob | [MoE Dispatch and Expert Load Balancing](#moe-dispatch-and-expert-load-balancing) |
-| Dispatch activation dtype | `--deepep-dispatcher-output-dtype` (deprecated `DEEP_NORMAL_MODE_USE_INT8_QUANT`) | Conditional switch | [MoE Dispatch and Expert Load Balancing](#moe-dispatch-and-expert-load-balancing) |
-| Dispatch buffer | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | Knob | [MoE Dispatch and Expert Load Balancing](#moe-dispatch-and-expert-load-balancing) |
-| Expert load balancing | `--enable-eplb` | Conditional switch | [MoE Dispatch and Expert Load Balancing](#moe-dispatch-and-expert-load-balancing) |
-| Chunked prefill | `--chunked-prefill-size` | Knob | [Prefill Tuning](#prefill-tuning) |
-| Prefill token budget | `--max-prefill-tokens` | Knob | [Prefill Tuning](#prefill-tuning) |
-| Concurrency cap | `--max-running-requests` | Knob | [Prefill Tuning](#prefill-tuning) |
-| Prefix caching | `--disable-radix-cache` | Conditional switch | [Prefill Tuning](#prefill-tuning) |
-| Host task queue | `TASK_QUEUE_ENABLE` | Conditional switch | [Decode Tuning](#decode-tuning) |
-| NPU Graph | `--cuda-graph-bs-decode`, `--cuda-graph-max-bs-decode` | Switch + knob | [Decode Tuning](#decode-tuning) |
-| Overlap schedule | `--disable-overlap-schedule` | Switch | [Decode Tuning](#decode-tuning) |
-| Speculative decoding | `--speculative-algorithm`, `--speculative-num-steps`, `--speculative-eagle-topk`, `--speculative-num-draft-tokens` | Switch + knob | [Speculative Decoding](#speculative-decoding) |
-| Overlap plan stream | `SGLANG_ENABLE_OVERLAP_PLAN_STREAM` | Switch | [Speculative Decoding](#speculative-decoding) |
-| Quantization | `--quantization` | Knob | [Quantization](#quantization) |
-| Tokenizer workers | `--tokenizer-worker-num` | Knob | [Throughput and Host Tuning](#throughput-and-host-tuning) |
-| MLA pre-processing (MLAPO) | `SGLANG_NPU_USE_MLAPO` | Switch | [DeepSeek-Specific NPU Optimizations](#deepseek-specific-npu-optimizations) |
-| FIA NZ KV layout | `SGLANG_USE_FIA_NZ` | Switch | [DeepSeek-Specific NPU Optimizations](#deepseek-specific-npu-optimizations) |
-| Multistream MoE | `SGLANG_NPU_USE_MULTI_STREAM` | Switch | [DeepSeek-Specific NPU Optimizations](#deepseek-specific-npu-optimizations) |
-| Gather after Q projection | `SGLANG_USE_AG_AFTER_QLORA`, `--enable-attn-tp-input-scattered` | Switch | [DeepSeek-Specific NPU Optimizations](#deepseek-specific-npu-optimizations) |
-| NZ weight layout | `SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT` | Conditional switch | [DeepSeek-Specific NPU Optimizations](#deepseek-specific-npu-optimizations) |
-| Memory fraction | `--mem-fraction-static` | Knob | [Memory and Device Configuration](#memory-and-device-configuration) |
-| Allocator and stream pool | `PYTORCH_NPU_ALLOC_CONF`, `STREAMS_PER_DEVICE` | Switch | [Memory and Device Configuration](#memory-and-device-configuration) |
-| Host CPU settings | CPU governor, `vm.swappiness`, `kernel.numa_balancing`, `kernel.sched_migration_cost_ns`, `SGLANG_SET_CPU_AFFINITY` | Switch | [Throughput and Host Tuning](#throughput-and-host-tuning) |
-| DeepEP HCCL buffers | `DEEPEP_HCCL_BUFFSIZE` | Knob | [Communication Configuration](#communication-configuration) |
-| HCCL op expansion mode | `HCCL_OP_EXPANSION_MODE` | Conditional switch | [Communication Configuration](#communication-configuration) |
 
 ### Parallelism
 
