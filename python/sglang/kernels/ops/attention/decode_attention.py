@@ -262,7 +262,6 @@ def _fwd_kernel_stage1(
     xai_temperature_len: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     SCORE_MOD: tl.constexpr = None,
-    SCORE_MOD_BAND: tl.constexpr = False,
     Aux0=None,
     aux0_stride_t=0,
     aux0_stride_h=0,
@@ -352,10 +351,7 @@ def _fwd_kernel_stage1(
             if xai_temperature_len > 0:
                 qk *= xai_temperature_reg
 
-            in_band = True
-            if SCORE_MOD_BAND:
-                in_band = cur_batch_seq_len - 1 - (start_n + BLOCK_N - 1) < aux0_len
-            if SCORE_MOD is not None and in_band:
+            if SCORE_MOD is not None:
                 qk = SCORE_MOD(
                     qk,
                     cur_batch_seq_len - 1,
@@ -514,7 +510,6 @@ def _decode_att_m_fwd(
         Lv=Lv,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
-        SCORE_MOD_BAND=_is_hip and score_mod_band(score_mod),
         Aux0=aux0,
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
