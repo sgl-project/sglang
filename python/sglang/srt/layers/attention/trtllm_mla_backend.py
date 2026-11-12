@@ -330,7 +330,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
-        # A DFLASH draft's per-request KV ring; see set_draft_kv_ring.
         self._draft_kv_ring = None
 
         # Fused KV-scatter + q-concat on the decode dense-loc path (one launch
