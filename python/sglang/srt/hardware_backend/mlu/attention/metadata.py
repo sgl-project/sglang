@@ -1,7 +1,7 @@
 """Shared forward metadata for MLU attention backends."""
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar, overload
 
 import torch
 
@@ -47,6 +47,29 @@ class ForwardMetadata:
 
     mixed_prefill_reqs: int = -1
     mixed_prefill_tokens: int = 0
+
+
+_MetadataT = TypeVar("_MetadataT", bound=ForwardMetadata)
+
+
+@overload
+def build_forward_metadata(
+    forward_batch: "ForwardBatch",
+    req_to_token: torch.Tensor,
+    page_size: int,
+    max_context_len: int,
+) -> ForwardMetadata: ...
+
+
+@overload
+def build_forward_metadata(
+    forward_batch: "ForwardBatch",
+    req_to_token: torch.Tensor,
+    page_size: int,
+    max_context_len: int,
+    *,
+    metadata_cls: type[_MetadataT],
+) -> _MetadataT: ...
 
 
 def build_forward_metadata(

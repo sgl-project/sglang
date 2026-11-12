@@ -85,7 +85,7 @@ def get_mla_kv_buffer_mlu(
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
     cache_k_rope: Optional[torch.Tensor] = None,
-):
+) -> None:
     """Gather MLA cache rows with a bounded persistent grid on MLU."""
     n_loc = loc.numel()
     if n_loc == 0:
