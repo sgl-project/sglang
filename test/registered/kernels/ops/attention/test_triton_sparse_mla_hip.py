@@ -114,25 +114,7 @@ def test_splitk_workspaces_are_graph_and_stream_safe():
     _splitk_bufs.clear()
 
 
-def _scaled_fp8_ds_mla_kv(pool, seed):
-    """[pool, 1, 656] fp8_ds_mla rows (fp8 NoPE, 4 fp32 scales, bf16 RoPE) and their fp32 keys."""
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    nope = (torch.randn(pool, 512, device="cuda", generator=g) * 0.5).to(
-        torch.float8_e4m3fn
-    )
-    scales = torch.rand(pool, 4, device="cuda", generator=g) / 32 + 1 / 128
-    rope = (torch.randn(pool, 64, device="cuda", generator=g) * 0.5).to(torch.bfloat16)
-    kv = torch.empty(pool, 1, 656, dtype=torch.uint8, device="cuda")
-    kv[:, 0, :512] = nope.view(torch.uint8)
-    kv[:, 0, 512:528] = scales.view(torch.uint8)
-    kv[:, 0, 528:] = rope.view(torch.uint8)
-    keys = torch.cat(
-        [nope.float() * scales.repeat_interleave(128, -1), rope.float()], -1
-    )
-    return kv, keys
-
-
-def _sparse_mla_reference(q, keys, idx, sm_scale, lengths=None):
+def _keys_reference(q, keys, idx, sm_scale, lengths=None):
     if lengths is not None:
         rows, heads, _ = q.shape
         out = torch.zeros(rows, heads, 512, device=_DEVICE)
@@ -177,7 +159,7 @@ def test_long_prefill_scaled_kv_matches_reference(monkeypatch):
     out = triton_sparse_mla_fwd(q_nope, q_rope, kv, idx.unsqueeze(1), sm_scale)
 
     q = torch.cat([q_nope.float(), q_rope.float()], -1)
-    ref, _ = _sparse_mla_reference(q, keys, idx, sm_scale)
+    ref, _ = _keys_reference(q, keys, idx, sm_scale)
     err = ((out[0].float() - ref).norm() / ref.norm()).item()
     assert err < 4e-3, err
 
@@ -303,7 +285,7 @@ def _dcp_decode_table(dcp_size, topk, num_slots):
     return rows.cuda()
 
 
-def _full_kv_reference(q, kv, indices, sm_scale, d_v):
+def _sparse_mla_reference(q, kv, indices, sm_scale, d_v):
     out = torch.zeros(*q.shape[:2], d_v, device=q.device)
     lse = torch.full(q.shape[:2], float("-inf"), device=q.device)
     for row in range(q.shape[0]):
@@ -366,13 +348,27 @@ def test_dcp_owned_count_decode_merges_to_full_kv(fp8, heads, kv_splits):
     merged_lse = lse_max + torch.log2(weights.sum(0))
 
     q_ref = q.to(kv_dtype) if fp8 else q
-    expected, expected_lse = _full_kv_reference(q_ref, kv, indices, sm_scale, d_v)
+    expected, expected_lse = _sparse_mla_reference(q_ref, kv, indices, sm_scale, d_v)
     atol = 3e-2 if fp8 else 1e-2
     torch.testing.assert_close(merged, expected, rtol=0, atol=atol)
     non_empty = (indices >= 0).any(dim=-1)
     torch.testing.assert_close(
         merged_lse[non_empty], expected_lse[non_empty], rtol=0, atol=atol
     )
+
+
+def _scaled_fp8_ds_mla_kv(pool, seed):
+    """[pool, 1, 656] fp8_ds_mla rows from the cache writer Kimi-K3.1 uses, and the
+    fp32 keys they hold (fp8 NoPE x per-128 fp32 scale, bf16 RoPE)."""
+    torch.manual_seed(seed)
+    k = (torch.randn(pool, 1, 576, device="cuda") * 2).bfloat16()
+    kv = quantize_k_cache(k.unsqueeze(1), scale_ue8m0=True).view(pool, 1, -1)
+    raw = kv.view(torch.uint8)[:, 0]
+    nope = raw[:, :512].view(torch.float8_e4m3fn).float()
+    scales = raw[:, 512:528].contiguous().view(torch.float32)
+    rope = raw[:, 528:].contiguous().view(torch.bfloat16).float()
+    keys = torch.cat([nope * scales.repeat_interleave(128, -1), rope], -1)
+    return kv.view(torch.uint8), keys
 
 
 def _scaled_kv_reference(q_nope, q_rope, keys, idx, sm_scale):
@@ -425,22 +421,11 @@ def test_scaled_kv_decode_matches_reference(bs, kv_splits):
     assert _rel_err(out[0], ref) < 4e-3
 
 
-def _pow2_scaled_kv():
-    torch.manual_seed(0)
-    k = (torch.randn(_N, 1, _DV + _DR, device=_DEVICE) * 2).bfloat16()
-    kv = quantize_k_cache(k.unsqueeze(1), scale_ue8m0=True).view(_N, 1, -1)
-    raw = kv.view(torch.uint8).view(_N, 656)
-    nope = raw[:, :512].view(torch.float8_e4m3fn).float().view(_N, 4, 128)
-    scale = raw[:, 512:528].contiguous().view(torch.float32).view(_N, 4, 1)
-    rope = raw[:, 528:].contiguous().view(torch.bfloat16).float()
-    return kv, torch.cat([(nope * scale).view(_N, 512), rope], -1)
-
-
 def _decode_reference(qn, qr, idx, lens, kd, sm, mxfp8_q=True):
     """FP32 attention using the production MXFP8 Q quantizer and dequantized KV."""
     R, H, _ = qn.shape
     if not mxfp8_q:
-        return _sparse_mla_reference(
+        return _keys_reference(
             torch.cat([qn.float(), qr.float()], -1), kd, idx, sm, lens
         )
     q8 = torch.empty(R, H, 512, device=_DEVICE, dtype=torch.float8_e4m3fn)
@@ -463,7 +448,7 @@ def _decode_reference(qn, qr, idx, lens, kd, sm, mxfp8_q=True):
     qd = torch.cat(
         [(q8.float().view(R, H, 16, 32) * scale).view(R, H, 512), qr.float()], -1
     )
-    return _sparse_mla_reference(qd, kd, idx, sm, lens)
+    return _keys_reference(qd, kd, idx, sm, lens)
 
 
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
@@ -476,7 +461,8 @@ def _decode_reference(qn, qr, idx, lens, kd, sm, mxfp8_q=True):
     ],
 )
 def test_decode_matches_reference(H, lens, splits):
-    kv, kd = _pow2_scaled_kv()
+    kv, kd = _scaled_fp8_ds_mla_kv(_N, seed=0)
+    kv = kv.view(torch.float8_e4m3fn)
     R = len(lens)
     qkv = torch.randn(R, H, _DV + _DR, device=_DEVICE).bfloat16()
     qn, qr = qkv[..., :_DV], qkv[..., _DV:]
@@ -499,7 +485,8 @@ def test_decode_matches_reference(H, lens, splits):
 def test_dcp_partial_reads_the_indexer_local_slots():
     """Sharded index-K hands the backend this rank's compact slots and their counts
     (dcp_local_topk); localizing them again reads other requests' KV."""
-    kv, kd = _pow2_scaled_kv()
+    kv, kd = _scaled_fp8_ds_mla_kv(_N, seed=0)
+    kv = kv.view(torch.float8_e4m3fn)
     lens = [256, 0, 1, 255]  # this rank's share of a 2048 top-k under DCP8
     R, H = len(lens) + 2, 16  # two graph-padding rows select nothing
     qkv = torch.randn(R, H, _DV + _DR, device=_DEVICE).bfloat16()
@@ -554,7 +541,7 @@ def test_sparse_mla_prefill_gfx950():
     out, lse = sparse_mla_prefill_gfx950.sparse_mla_prefill_gfx950(
         q_nope, q_rope, kv, idx.unsqueeze(1), sm_scale, _DV, return_lse=True
     )
-    ref_out, ref_lse = _sparse_mla_reference(
+    ref_out, ref_lse = _keys_reference(
         torch.cat([q_nope.float(), q_rope.float()], -1), k, idx, sm_scale
     )
 
