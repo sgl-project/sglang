@@ -289,8 +289,8 @@ We provide SGL kernels for Ascend NPU, check [installation guide](https://github
 <Note>
 Gemma-family models (including Qwen3.5) call `sgl_kernel_npu.norm.gemma_rmsnorm`,
 whose implementation is chosen when the wheel is built: the native `torch_npu`
-operator for A2/A3 series, and ACLNN RMSNorm for 950PR/DT series, which does not
-register that operator. **950PR/DT series must install the `950` release
+operator for A2/A3 Series, and ACLNN RMSNorm for 950PR/DT Series, which does not
+register that operator. **950PR/DT Series must install the `950` release
 package** (`950` appears in the asset name), or build from source with
 `bash build.sh -a kernels Ascend950PR_9599`, the target that package is built
 with. On 950PR/DT, an `a2` or `a3` package fails on the first Gemma forward,
@@ -338,45 +338,45 @@ Ensure sufficient disk space before pulling images. Each Docker image requires a
 
 1. Download SGLang image
 
-<Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version, or a daily build tag (e.g., `main-cann9.1.0-a3`, `main-cann9.1.0-950`) if you need the latest development changes.
+    <Tip>
+    We publish both **stable releases** and **daily builds**. Choose a stable release tag if you prefer a validated version, or a daily build tag (e.g., `main-cann9.1.0-a3`, `main-cann9.1.0-950`) if you need the latest development changes.
 
-CANN 9.1.0 has no stable release yet, so use a validated build for now. The `cann9.1.0-<device>-B<NN>` tags (e.g., `cann9.1.0-a3-B105`, `cann9.1.0-950-B105`) are validated builds rather than stable releases; they stand in until a stable release is published. The exact component versions inside each build are listed in the [image dependency manifest](https://ascend.github.io/sglang/) — see for example the `cann9.1.0-950-B105` entry for the 950PR/DT Series.
+    CANN 9.1.0 has no stable release yet, so use a validated build for now. The `cann9.1.0-<device>-B<NN>` tags (e.g., `cann9.1.0-a3-B105`, `cann9.1.0-950-B105`) are validated builds rather than stable releases; they stand in until a stable release is published. The exact component versions inside each build are listed in the [image dependency manifest](https://ascend.github.io/sglang/) — see for example the `cann9.1.0-950-B105` entry for the 950PR/DT Series.
 
-{/* TODO: Interim explanation (CANN 9.1.0 has no stable release yet). Remove it and switch the tags below to the stable release once it is published. */}
-</Tip>
+    {/* TODO: Interim explanation (CANN 9.1.0 has no stable release yet). Remove it and switch the tags below to the stable release once it is published. */}
+    </Tip>
 
-<Tabs>
-  <Tab title="A3 Series">
+    <Tabs>
+      <Tab title="A3 Series">
 
-```bash Command
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
-```
+    ```bash Command
+    docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
+    ```
 
-  </Tab>
-  <Tab title="950PR/DT Series">
+      </Tab>
+      <Tab title="950PR/DT Series">
 
-```bash Command
-docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B105
-```
+    ```bash Command
+    docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B105
+    ```
 
-  </Tab>
-</Tabs>
+      </Tab>
+    </Tabs>
 
 2. Build an image based on Dockerfile
 
-```bash Command
-# Clone the SGLang repository
-git clone https://github.com/sgl-project/sglang.git
-cd sglang/docker
+    ```bash Command
+    # Clone the SGLang repository
+    git clone https://github.com/sgl-project/sglang.git
+    cd sglang/docker
 
-# Build the docker image
-# Replace <arch_tag> with the target architecture, e.g., amd64, arm64.
-# Optional build arguments:
-#   --build-arg APTMIRROR=<mirror_url>    # Use a custom APT mirror to improve download speed
-# If there are network errors, please modify the Dockerfile to add ARG HTTP_PROXY/HTTPS_PROXY and set them as ENV.
-docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile .
-```
+    # Build the docker image
+    # Replace <arch_tag> with the target architecture, e.g., amd64, arm64.
+    # Optional build arguments:
+    #   --build-arg APTMIRROR=<mirror_url>    # Use a custom APT mirror to improve download speed
+    # If there are network errors, please modify the Dockerfile to add ARG HTTP_PROXY/HTTPS_PROXY and set them as ENV.
+    docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile .
+    ```
 
 #### Create Docker Container
 
@@ -551,131 +551,131 @@ accessible from every node. The example below runs all three on a single machine
 
 1. Launch Prefill Server
 
-Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
-weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
+    Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
+    weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
 
-<Tabs>
-  <Tab title="A3 Series">
+    <Tabs>
+      <Tab title="A3 Series">
 
-```bash Command
-# Enabling CPU Affinity
-export SGLANG_SET_CPU_AFFINITY=1
+    ```bash Command
+    # Enabling CPU Affinity
+    export SGLANG_SET_CPU_AFFINITY=1
 
-# PREFILL_IP: IP address of the first Prefill Server
-# FREE_PORT: any available port
-# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
-export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
-python3 -m sglang.launch_server \
-    --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --disaggregation-mode prefill \
-    --disaggregation-transfer-backend ascend \
-    --disaggregation-bootstrap-port 8995 \
-    --attention-backend ascend \
-    --device npu \
-    --base-gpu-id 0 \
-    --tp-size 1 \
-    --host 127.0.0.1 \
-    --port 30001
-```
+    # PREFILL_IP: IP address of the first Prefill Server
+    # FREE_PORT: any available port
+    # all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+    export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+    python3 -m sglang.launch_server \
+        --model-path meta-llama/Llama-3.1-8B-Instruct \
+        --disaggregation-mode prefill \
+        --disaggregation-transfer-backend ascend \
+        --disaggregation-bootstrap-port 8995 \
+        --attention-backend ascend \
+        --device npu \
+        --base-gpu-id 0 \
+        --tp-size 1 \
+        --host 127.0.0.1 \
+        --port 30001
+    ```
 
-  </Tab>
-  <Tab title="950PR/DT Series">
+      </Tab>
+      <Tab title="950PR/DT Series">
 
-```bash Command
-# Enabling CPU Affinity
-export SGLANG_SET_CPU_AFFINITY=1
-# ASCEND_USE_FIA=1 is required on the 950PR/DT Series
-export ASCEND_USE_FIA=1
-# PD disaggregation transfer protocol on the 950PR/DT Series
-export ASCEND_MF_TRANSFER_PROTOCOL="device_urma"
+    ```bash Command
+    # Enabling CPU Affinity
+    export SGLANG_SET_CPU_AFFINITY=1
+    # ASCEND_USE_FIA=1 is required on the 950PR/DT Series
+    export ASCEND_USE_FIA=1
+    # PD disaggregation transfer protocol on the 950PR/DT Series
+    export ASCEND_MF_TRANSFER_PROTOCOL="device_urma"
 
-# PREFILL_IP: IP address of the first Prefill Server
-# FREE_PORT: any available port
-# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
-export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
-python3 -m sglang.launch_server \
-    --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --disaggregation-mode prefill \
-    --disaggregation-transfer-backend ascend \
-    --disaggregation-bootstrap-port 8995 \
-    --attention-backend ascend \
-    --device npu \
-    --base-gpu-id 0 \
-    --tp-size 1 \
-    --host 127.0.0.1 \
-    --port 30001
-```
+    # PREFILL_IP: IP address of the first Prefill Server
+    # FREE_PORT: any available port
+    # all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+    export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+    python3 -m sglang.launch_server \
+        --model-path meta-llama/Llama-3.1-8B-Instruct \
+        --disaggregation-mode prefill \
+        --disaggregation-transfer-backend ascend \
+        --disaggregation-bootstrap-port 8995 \
+        --attention-backend ascend \
+        --device npu \
+        --base-gpu-id 0 \
+        --tp-size 1 \
+        --host 127.0.0.1 \
+        --port 30001
+    ```
 
-  </Tab>
-</Tabs>
+      </Tab>
+    </Tabs>
 
 2. Launch Decode Server
 
-Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
-weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
+    Model weights: set `HF_TOKEN` to download automatically, or replace the model ID in `--model-path` with a local
+    weights path — see [How do I provide model weights?](#how-do-i-provide-model-weights) in the FAQ.
 
-<Tabs>
-  <Tab title="A3 Series">
+    <Tabs>
+      <Tab title="A3 Series">
 
-```bash Command
-# PREFILL_IP: IP address of the first Prefill Server
-# FREE_PORT: any available port
-# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
-export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
-python3 -m sglang.launch_server \
-    --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --disaggregation-mode decode \
-    --disaggregation-transfer-backend ascend \
-    --attention-backend ascend \
-    --device npu \
-    --base-gpu-id 1 \
-    --tp-size 1 \
-    --host 127.0.0.1 \
-    --port 30002
-```
+    ```bash Command
+    # PREFILL_IP: IP address of the first Prefill Server
+    # FREE_PORT: any available port
+    # all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+    export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+    python3 -m sglang.launch_server \
+        --model-path meta-llama/Llama-3.1-8B-Instruct \
+        --disaggregation-mode decode \
+        --disaggregation-transfer-backend ascend \
+        --attention-backend ascend \
+        --device npu \
+        --base-gpu-id 1 \
+        --tp-size 1 \
+        --host 127.0.0.1 \
+        --port 30002
+    ```
 
-  </Tab>
-  <Tab title="950PR/DT Series">
+      </Tab>
+      <Tab title="950PR/DT Series">
 
-```bash Command
-# ASCEND_USE_FIA=1 is required on the 950PR/DT Series
-export ASCEND_USE_FIA=1
-# PD disaggregation transfer protocol on the 950PR/DT Series
-export ASCEND_MF_TRANSFER_PROTOCOL="device_urma"
+    ```bash Command
+    # ASCEND_USE_FIA=1 is required on the 950PR/DT Series
+    export ASCEND_USE_FIA=1
+    # PD disaggregation transfer protocol on the 950PR/DT Series
+    export ASCEND_MF_TRANSFER_PROTOCOL="device_urma"
 
-# PREFILL_IP: IP address of the first Prefill Server
-# FREE_PORT: any available port
-# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
-export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
-python3 -m sglang.launch_server \
-    --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --disaggregation-mode decode \
-    --disaggregation-transfer-backend ascend \
-    --attention-backend ascend \
-    --device npu \
-    --base-gpu-id 1 \
-    --tp-size 1 \
-    --host 127.0.0.1 \
-    --port 30002
-```
+    # PREFILL_IP: IP address of the first Prefill Server
+    # FREE_PORT: any available port
+    # all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+    export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+    python3 -m sglang.launch_server \
+        --model-path meta-llama/Llama-3.1-8B-Instruct \
+        --disaggregation-mode decode \
+        --disaggregation-transfer-backend ascend \
+        --attention-backend ascend \
+        --device npu \
+        --base-gpu-id 1 \
+        --tp-size 1 \
+        --host 127.0.0.1 \
+        --port 30002
+    ```
 
-  </Tab>
-</Tabs>
+      </Tab>
+    </Tabs>
 
 3. Launch Router
 
-The router command requires the `sglang-router` package. It is pre-installed in the Docker image; if you installed
-SGLang from source and do not have it yet, run `pip install sglang-router` first.
+    The router command requires the `sglang-router` package. It is pre-installed in the Docker image; if you installed
+    SGLang from source and do not have it yet, run `pip install sglang-router` first.
 
-```bash Command
-python3 -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://127.0.0.1:30001 8995 \
-    --decode http://127.0.0.1:30002 \
-    --host 127.0.0.1 \
-    --port 30000
-```
+    ```bash Command
+    python3 -m sglang_router.launch_router \
+        --pd-disaggregation \
+        --policy cache_aware \
+        --prefill http://127.0.0.1:30001 8995 \
+        --decode http://127.0.0.1:30002 \
+        --host 127.0.0.1 \
+        --port 30000
+    ```
 
 <Note>
 The `8995` in command script is the disaggregation bootstrap port. It must match the
