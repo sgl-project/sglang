@@ -1569,6 +1569,21 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
 
+    def lease_checkpoint_state_slots(self, reqs: Sequence[Req]):
+        mamba = self.components.get(ComponentType.MAMBA)
+        if self.disable or mamba is None:
+            return nullcontext()
+        # Only checkpoints that insert into the tree take a state slot; a
+        # streaming turn past its first prompt checkpoints into its session.
+        return mamba.lease_checkpoint_state_slots(
+            [
+                req
+                for req in reqs
+                if not req.skip_radix_cache_insert
+                and self.session.checkpoints_into_tree(req)
+            ]
+        )
+
     def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
         move its tree lock onto the node the insert ended on."""

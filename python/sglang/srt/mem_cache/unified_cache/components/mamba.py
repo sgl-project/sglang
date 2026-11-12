@@ -722,6 +722,30 @@ class MambaComponent(TreeComponent):
             slot = storage.take_state_slots(sub_pool, 1)
         return slot
 
+    def checkpoint_takes_state_slot(self, req: Req) -> bool:
+        """Whether checkpointing the unfinished ``req`` up to its extend end
+        takes a state slot (`prepare_for_caching_req`)."""
+        if self._mamba_host_only_checkpoint():
+            return False
+        token_ids_len = min(len(req.full_untruncated_fill_ids), req.extend_end)
+        if self.cache.enable_mamba_extra_buffer:
+            cache_len = req.kv.mamba_last_track_seqlen
+            if cache_len is None:
+                return False
+        elif self.quantizes_checkpoints:
+            return False
+        else:
+            cache_len = token_ids_len
+        return not self._defers_checkpoint(req, token_ids_len, cache_len)
+
+    def lease_checkpoint_state_slots(self, reqs: Sequence[Req]):
+        """Lease in one take the slots checkpointing ``reqs`` takes one by
+        one (`_try_alloc_mamba_slot`). A count off by a request costs only a
+        slot given back or a take of its own, never a different decision."""
+        storage, sub_pool = self._state()
+        count = sum(1 for req in reqs if self.checkpoint_takes_state_slot(req))
+        return storage.lease_state_slots(sub_pool, count)
+
     def _alloc_mamba_slot(self, req: Optional[Req] = None) -> torch.Tensor:
         """Allocate a slot required for request state or load-back."""
         slot = self._try_alloc_mamba_slot(req)
