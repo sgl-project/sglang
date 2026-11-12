@@ -134,6 +134,8 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 _IS_GFX95 = is_gfx95_supported()
 
 if TYPE_CHECKING:
+    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
@@ -296,6 +298,21 @@ def _restore_live_rows(output: torch.Tensor, plan: Optional[_RowPlan]) -> torch.
             dim=0,
         )
     return output
+
+
+def _flashmla_kv_padded_heads(num_heads: int) -> int:
+    """Use native head counts when the installed SM100 kernel supports them."""
+    if _is_cuda and get_platform().is_sm100 and 1 <= num_heads <= 128:
+        from sglang.kernels.ops.attention import flash_mla_interface
+
+        if flash_mla_interface.supports_native_heads():
+            return num_heads
+    if num_heads <= 64:
+        return 64
+    if num_heads <= 128:
+        return 128
+    # Keep original head count if it exceeds current padded variants.
+    return num_heads
 
 
 @dataclass(frozen=True)
@@ -713,19 +730,10 @@ class DeepseekSparseAttnBackend(
             deterministic=get_exec().deterministic.enable_deterministic_inference,
         )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
-        if self.num_q_heads <= 64:
-            self.flashmla_kv_num_q_heads = 64
-        elif self.num_q_heads <= 128:
-            self.flashmla_kv_num_q_heads = 128
-        else:
-            # Keep original head count if it exceeds current padded variants.
-            self.flashmla_kv_num_q_heads = self.num_q_heads
-        if self.local_num_q_heads <= 64:
-            self.flashmla_kv_num_q_heads_prefill = 64
-        elif self.local_num_q_heads <= 128:
-            self.flashmla_kv_num_q_heads_prefill = 128
-        else:
-            self.flashmla_kv_num_q_heads_prefill = self.local_num_q_heads
+        self.flashmla_kv_num_q_heads = _flashmla_kv_padded_heads(self.num_q_heads)
+        self.flashmla_kv_num_q_heads_prefill = _flashmla_kv_padded_heads(
+            self.local_num_q_heads
+        )
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
         self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
         # Keep graph-captured buffers alive per stream.
@@ -3637,7 +3645,9 @@ class DeepseekSparseAttnBackend(
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
         if dcp_partial:
-            tile_scheduler_metadata = self._call_get_mla_metadata()[0]
+            tile_scheduler_metadata = self._dcp_flashmla_sched_meta(
+                q_input, indices, topk_length
+            )
 
         plan = None
         if not dcp_partial:
@@ -3674,6 +3684,30 @@ class DeepseekSparseAttnBackend(
         o = o.view(-1, num_q_heads, v_head_dim)
         lse = lse.view(-1, lse.shape[1])[:, :num_q_heads]
         return o, lse
+
+    def _dcp_flashmla_sched_meta(
+        self,
+        q: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: Optional[torch.Tensor],
+    ) -> FlashMLASchedMeta:
+        # Depends on topk_length, so it is built per call; left empty where the
+        # scheduler kernel does not apply, and FlashMLA then schedules itself.
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _maybe_precompute_flashmla_sched_meta,
+        )
+
+        sched_meta = self._call_get_mla_metadata()[0]
+        _maybe_precompute_flashmla_sched_meta(
+            sched_meta,
+            q=q,
+            indices=indices,
+            topk_length=topk_length,
+            extra_indices=None,
+            extra_topk_length=None,
+            schedule="windowed",
+        )
+        return sched_meta
 
     def _forward_standard_mha(
         self,
