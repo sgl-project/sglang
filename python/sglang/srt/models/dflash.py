@@ -18,6 +18,7 @@ from sglang.kernels.ops.speculative.dflash import (
     selector_walk_triton,
 )
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
+from sglang.srt.arg_groups.choices import DFLASH_MLA_ONLY_DRAFT_BACKENDS
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
@@ -44,7 +45,7 @@ from sglang.srt.layers.quantization.unquant import (
     get_bf16_gemm_backend,
     register_gfx950_unquantized_gemm_shapes,
 )
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -66,9 +67,11 @@ from sglang.srt.speculative.dflash_utils import (
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import BumpAllocator, is_gfx95_supported, is_hip, is_npu
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import BumpAllocator, is_cuda, is_gfx95_supported, is_hip, is_npu
 from sglang.srt.utils.device import get_compiler_backend
 
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -602,6 +605,39 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         sliding_window_size, attn_type = get_dflash_layer_attention_params(
             config, layer_id
         )
+        if sliding_window_size > -1 or attn_type != AttentionType.DECODER:
+            from sglang.srt.speculative.draft_worker_common import (
+                resolve_draft_worker_attention_backend,
+            )
+
+            # DSPARK builds this layer too; its worker resolves without the DFLASH label.
+            is_dflash = SpeculativeAlgorithm.from_string(
+                get_spec().speculative_algorithm
+            ).is_dflash()
+            draft_attention_backend = resolve_draft_worker_attention_backend(
+                algo_label="DFLASH" if is_dflash else None
+            )
+            # The other MLA backends ignore a layer's sliding window.
+            if sliding_window_size > -1 and draft_attention_backend not in (
+                "triton",
+                *DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+            ):
+                raise ValueError(
+                    "DFLASH mla sliding_attention layers require "
+                    "--speculative-draft-attention-backend triton, trtllm_mla or "
+                    f"cutedsl_mla, got {draft_attention_backend!r}."
+                )
+            if attn_type != AttentionType.DECODER and (
+                draft_attention_backend == "trtllm_mla"
+                or (
+                    sliding_window_size > -1
+                    and draft_attention_backend == "cutedsl_mla"
+                )
+            ):
+                raise ValueError(
+                    f"{draft_attention_backend} runs DFLASH MLA draft attention "
+                    "causally; this draft sets is_causal=False."
+                )
         rope_theta, rope_scaling = get_rope_config(config)
         if rope_scaling is not None and rope_scaling.get(
             "rope_type", rope_scaling.get("type")
@@ -878,14 +914,15 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
-        if hidden_states.is_cuda and hidden_states.dim() == 2:
+        # NVIDIA only: the Triton kernel is not validated on ROCm.
+        if _is_cuda and hidden_states.is_cuda and hidden_states.dim() == 2:
             return dflash_grouped_conv(
-                hidden_states,
-                delta,
-                self.base_kernel[side],
-                self.block_size,
-                self.group_size,
-                self.taps,
+                hidden_states=hidden_states,
+                delta=delta,
+                base=self.base_kernel[side],
+                block_size=self.block_size,
+                group_size=self.group_size,
+                taps=self.taps,
             )
         # Marked here, not inside: by the time the compiled function traces, the dim
         # is symbolic and the group index costs an integer div and mod per element.

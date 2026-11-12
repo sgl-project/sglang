@@ -113,6 +113,7 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
+    trtllm_padded_heads,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import (
@@ -214,11 +215,6 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
         # view — we want (N_total, 1) regardless.
         seqlens_32 = seqlens_32.reshape(-1)
     return seqlens_32.contiguous().view(-1, 1)
-
-
-def _trtllm_padded_heads(num_heads: int) -> int:
-    """Pad the unsupported 65–127 MLA query-head range for trtllm-gen."""
-    return 128 if 64 < num_heads < 128 else num_heads
 
 
 @dataclass(frozen=True)
@@ -715,7 +711,7 @@ class DeepseekSparseAttnBackend(
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.num_q_heads = self.local_num_q_heads * sharded_dcp_size
-        self.num_dcp_q_heads = _trtllm_padded_heads(
+        self.num_dcp_q_heads = trtllm_padded_heads(
             self.local_num_q_heads * self.attn_dcp_size
         )
         self._dcp_page_table_cache = DcpPageTableCache()
@@ -782,7 +778,7 @@ class DeepseekSparseAttnBackend(
         # trtllm (Kimi-K3.1): fp8 q built by one fused concat-cast into a buffer
         # whose pad heads stay zero; under sharded DCP decode attends with the
         # gathered heads over this rank's KV and returns a partial for the merge.
-        self.trtllm_num_q_heads = _trtllm_padded_heads(self.num_q_heads)
+        self.trtllm_num_q_heads = trtllm_padded_heads(self.num_q_heads)
         self._trtllm_fused_q = (
             _is_cuda
             and kimi_k31
@@ -4627,7 +4623,7 @@ class DeepseekSparseAttnBackend(
 
         multi_ctas_kv_counter_buffer = self._multi_ctas_kv_counter_for(batch_size)
 
-        kernel_heads = _trtllm_padded_heads(num_heads)
+        kernel_heads = trtllm_padded_heads(num_heads)
         if kernel_heads != num_heads:
             padded_q = q_all.new_zeros((batch_size, kernel_heads, head_dim))
             padded_q[:, :num_heads].copy_(q_all)
@@ -4745,7 +4741,7 @@ class DeepseekSparseAttnBackend(
         q_rope = q_rope.view(-1, num_heads, self.qk_rope_head_dim)
         rows = q_nope.shape[0]
         # Prims-TS runs any head count natively; trtllm-gen needs the padding.
-        target = _trtllm_padded_heads(num_heads) if pad_heads else num_heads
+        target = trtllm_padded_heads(num_heads) if pad_heads else num_heads
         shape = (rows, target, self.kv_lora_rank + self.qk_rope_head_dim)
         if target == num_heads:
             out = torch.empty(shape, dtype=torch.float8_e4m3fn, device=q_nope.device)
