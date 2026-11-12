@@ -138,12 +138,20 @@ async def async_request_sglang_generate(
 
                         data = json.loads(chunk)
 
-                        # [FIX] Decouple token counting from a non-empty "text" chunk: update the
-                        # output length from meta_info.completion_tokens on ANY chunk that carries
-                        # it (monotonic max). Under high concurrency / long streams some requests
-                        # never hit the "text is non-empty" branch, leaving output_len at 0 while
-                        # the server actually generated tokens -> systematically under-counted TPS.
+                        if "error" in data:
+                            err = data["error"]
+                            output.error = (
+                                err.get("message", str(err))
+                                if isinstance(err, dict)
+                                else str(err)
+                            )
+                            continue
+
+                        # Count tokens from meta_info.completion_tokens; text can be empty for special tokens.
                         meta = data.get("meta_info") or {}
+                        finish = meta.get("finish_reason") or {}
+                        if isinstance(finish, dict) and finish.get("type") == "abort":
+                            output.error = finish.get("message") or "request aborted"
                         cur = meta.get("completion_tokens")
                         text = data.get("text", "")
                         if text:
@@ -166,16 +174,10 @@ async def async_request_sglang_generate(
                                 output.output_len = cur
 
                     output.generated_text = generated_text
-                    # [FIX] A 200 response that yielded no counted tokens must NOT be recorded
-                    # as a successful zero-token request (it silently deflates throughput).
-                    if output.output_len > 0:
-                        output.success = True
-                    else:
-                        output.success = False
-                        output.error = (
-                            output.error
-                            or "stream closed with 0 generated tokens (HTTP 200)"
-                        )
+                    # A 200 stream is a success only if it produced tokens and reported no error.
+                    if output.output_len == 0 and not output.error:
+                        output.error = "stream closed with 0 generated tokens"
+                    output.success = output.output_len > 0 and not output.error
                     output.latency = latency
                 else:
                     output.error = (
