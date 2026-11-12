@@ -315,10 +315,17 @@ def maybe_build_dsv4_verify_bundle(
     # (ascend_dsv4_backend: ``max(1, min(t, t // ratio + bs))``), so the padded
     # result is byte-identical to what they built from the compact tensor.
     t = out_full_loc.numel()
-    c4_upper = min(t, t // 4 + len(req_indices))
-    out_c4_loc = _compact_c4_loc(out_full_loc, c4_upper)
     if query_lens_cpu is not None:
-        out_c4_loc = out_c4_loc[out_c4_loc != 0]
+        # Eager mixed compression needs a dense output. Its exact size is
+        # already known from the host prefixes; filtering a padded device
+        # tensor would run NonzeroV2 and synchronize the draft->target boundary.
+        c4_upper = sum(
+            (int(prefix) + int(query)) // 4 - int(prefix) // 4
+            for prefix, query in zip(live_seq_lens, verify_lens)
+        )
+    else:
+        c4_upper = min(t, t // 4 + len(req_indices))
+    out_c4_loc = _compact_c4_loc(out_full_loc, c4_upper)
     return type(reserve_bundle)(
         out_full_loc=out_full_loc,
         out_swa_loc=batch.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(

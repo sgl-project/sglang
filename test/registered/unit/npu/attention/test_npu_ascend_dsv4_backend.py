@@ -78,6 +78,88 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import DSV4NPUTokenTo
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
     DSV4ReqToTokenTablesMixin,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
+
+
+class TestPrefillCompressHostMirror(unittest.TestCase):
+    def test_mixed_query_offsets_match_host_mirror_without_d2h(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend.device = torch.device("cpu")
+        backend.dense_mla_dcp_target = backend.dsa_dcp_target = False
+        backend.use_mla = backend.use_flash_mla = backend.use_paged_mtp = False
+        backend.use_sliding_window_kv_pool = backend.is_hybrid_swa = False
+        backend.page_size = 4
+        backend.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(3 * 32).reshape(3, 32)
+        )
+        backend._dsv4_compress_ratios = ()
+        backend._dspark_ragged_verify_layout = MagicMock(return_value=None)
+        backend._init_dspark_sparse_metadata = MagicMock()
+        backend._compute_kernel_metadata = MagicMock(return_value={})
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.MIXED,
+            batch_size=2,
+            seq_lens=torch.tensor([10, 17]),
+            seq_lens_cpu=torch.tensor([10, 17]),
+            extend_seq_lens=torch.tensor([3, 6]),
+            extend_seq_lens_cpu=[3, 6],
+            req_pool_indices=torch.tensor([2, 1]),
+            spec_info=None,
+            out_cache_loc=None,
+        )
+        with patch.object(
+            torch.Tensor, "cpu", side_effect=AssertionError("metadata D2H")
+        ):
+            backend.init_forward_metadata(batch)
+        metadata = backend.forward_metadata
+        self.assertEqual(metadata.actual_seq_lengths_q_pa_cpu.tolist(), [0, 3, 9])
+        self.assertEqual(metadata.actual_seq_lengths_q_pa.tolist(), [0, 3, 9])
+        self.assertEqual(metadata.actual_seq_lengths_q.tolist(), [3, 9])
+
+    def test_query_mirror_avoids_d2h_after_drafting(self):
+        for prefixes, queries in (
+            ([0, 127], [129, 6]),
+            ([123, 255], [5, 6]),
+            ([8], [1]),
+        ):
+            with self.subTest(prefixes=prefixes, queries=queries):
+                backend = CompressorAscendBackendMixin.__new__(
+                    CompressorAscendBackendMixin
+                )
+                backend._dsv4_unique_compress_ratios = (4, 128)
+                cu = torch.tensor([0] + queries).cumsum(0).to(torch.int32)
+                backend.forward_metadata = SimpleNamespace(
+                    actual_seq_lengths_q_pa=cu,
+                    actual_seq_lengths_q_pa_cpu=cu.clone(),
+                )
+                batch = SimpleNamespace(
+                    seq_lens=torch.tensor(prefixes) + torch.tensor(queries),
+                    positions=torch.arange(sum(queries)),
+                    batch_size=len(prefixes),
+                    extend_prefix_lens=torch.tensor(prefixes),
+                    extend_prefix_lens_cpu=prefixes,
+                    out_cache_loc_dsv4=None,
+                )
+                with patch.object(
+                    torch.Tensor, "cpu", side_effect=AssertionError("metadata D2H")
+                ):
+                    backend._build_npu_compress_metadata_prefill(batch)
+                metadata = backend.forward_metadata
+                self.assertEqual(metadata.dsv4_max_input_capacity, max(queries))
+                self.assertEqual(metadata.start_pos.tolist(), prefixes)
+                self.assertEqual(metadata.seqused.tolist(), queries)
+                for ratio in (4, 128):
+                    expected = [
+                        group * ratio
+                        for prefix, query in zip(prefixes, queries)
+                        for group in range(prefix // ratio, (prefix + query) // ratio)
+                    ]
+                    size = min(sum(queries), sum(queries) // ratio + len(prefixes))
+                    expected += [0] * (size - len(expected))
+                    self.assertEqual(
+                        getattr(metadata, f"positions_cmp_padding_c{ratio}").tolist(),
+                        expected,
+                    )
 
 
 class TestVerifyCompressPositions(unittest.TestCase):

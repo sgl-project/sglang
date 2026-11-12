@@ -614,7 +614,9 @@ class AscendAttnBackend(AttentionBackend):
         # present, instead of statically gating on needs_cpu_seq_lens. When the
         # mirror is absent (true mirrorless), fall through to the else branch.
         if forward_batch.seq_lens_cpu is not None and not dense_mla_dcp_partial:
-            seq_lens_max = forward_batch.seq_lens.max()
+            # A device scalar used as a Python slice bound synchronizes the
+            # forward stream. The host mirror already bounds the live KV rows.
+            seq_lens_max = int(forward_batch.seq_lens_cpu.max())
             if forward_batch.forward_mode.is_target_verify():
                 if (
                     forward_batch.spec_algorithm is not None
@@ -637,10 +639,7 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_decode_or_idle()
                 and forward_batch.spec_info is not None
             ):
-                seq_lens_max = forward_batch.seq_lens.max()
                 seq_lens_max += self.speculative_step_id + 1
-            else:
-                seq_lens_max = forward_batch.seq_lens.max()
             self.forward_metadata.block_tables = (
                 self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, :seq_lens_max
@@ -669,8 +668,11 @@ class AscendAttnBackend(AttentionBackend):
             )
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
+            query_lens_cpu = forward_batch.extend_seq_lens_cpu
             self.forward_metadata.extend_seq_lens_cpu_int = (
-                forward_batch.extend_seq_lens.cpu().int()
+                torch.as_tensor(query_lens_cpu, dtype=torch.int32, device="cpu")
+                if query_lens_cpu is not None
+                else forward_batch.extend_seq_lens.cpu().int()
             )
         if not dense_mla_dcp_partial:
             if forward_batch.seq_lens is not None:

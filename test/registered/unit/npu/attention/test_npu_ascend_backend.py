@@ -42,6 +42,51 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
 from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
+class TestEagerMetadataHostLengths(unittest.TestCase):
+    def test_mixed_metadata_uses_host_bounds_and_query_mirror(self):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.device = torch.device("cpu")
+        backend.dense_mla_dcp_target = backend.dsa_dcp_target = False
+        backend.use_mla = backend.use_flash_mla = backend.use_paged_mtp = False
+        backend.use_sliding_window_kv_pool = False
+        backend.is_hybrid_swa = True
+        backend.page_size = 4
+        mapping = torch.arange(3 * 32).reshape(3, 32)
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=mapping)
+        backend.full_to_swa_index_mapping = torch.arange(3 * 32) + 128
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.MIXED,
+            batch_size=2,
+            seq_lens=torch.tensor([10, 17]),
+            seq_lens_cpu=torch.tensor([10, 19]),
+            extend_seq_lens=torch.tensor([3, 6]),
+            extend_seq_lens_cpu=[3, 6],
+            req_pool_indices=torch.tensor([2, 1]),
+            spec_info=None,
+            out_cache_loc=None,
+        )
+        original_max = torch.Tensor.max
+
+        def host_max(tensor, *args, **kwargs):
+            self.assertIsNot(tensor, batch.seq_lens, "device length reduction")
+            return original_max(tensor, *args, **kwargs)
+
+        with (
+            patch.object(torch.Tensor, "max", host_max),
+            patch.object(
+                torch.Tensor, "cpu", side_effect=AssertionError("metadata D2H")
+            ),
+        ):
+            backend.init_forward_metadata(batch)
+        metadata = backend.forward_metadata
+        self.assertEqual(metadata.extend_seq_lens_cpu_int.tolist(), [3, 6])
+        expected = mapping[batch.req_pool_indices, :19:4]
+        torch.testing.assert_close(metadata.block_tables, expected // 4)
+        torch.testing.assert_close(
+            metadata.block_tables_swa, ((expected + 128) // 4).int()
+        )
+
+
 class TestExpandDsaSparseIndices(unittest.TestCase):
     def test_2d_input_adds_unsqueeze(self):
         """A [T, K] tensor becomes [T, 1, K]."""

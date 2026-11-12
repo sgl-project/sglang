@@ -29,6 +29,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
+from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -271,8 +272,8 @@ class CompressorAscendBackendMixin:
             # _compute_compress_locs builds positions_cmp_padding / start_pos /
             # seqused only for decode. Every eager prefill uses the fused compressor,
             # so build its global block positions, state metadata, and output locs
-            # here. Exclude speculative modes so the cu.cpu() host read never
-            # runs for target_verify / draft_extend (potentially graph-captured).
+            # here. Exclude speculative modes, which use their own metadata
+            # builders and may run inside graph capture.
             if forward_batch.forward_mode.is_extend_without_speculative():
                 self._build_npu_compress_metadata_prefill(forward_batch)
 
@@ -280,7 +281,7 @@ class CompressorAscendBackendMixin:
             self._build_npu_compress_metadata_verify(forward_batch)
 
     def _build_npu_compress_metadata_prefill(self, forward_batch: ForwardBatch) -> None:
-        # eager-only: prefill is never graph-captured, host reads (cu_cpu) are safe here
+        # Eager prefill/mixed query lengths already have an exact host mirror.
         fm = self.forward_metadata
         device = forward_batch.seq_lens.device
         positions = forward_batch.positions
@@ -288,7 +289,10 @@ class CompressorAscendBackendMixin:
         bs = forward_batch.batch_size
         cu = fm.actual_seq_lengths_q_pa
 
-        cu_cpu = cu.cpu().tolist()
+        cu_cpu = getattr(fm, "actual_seq_lengths_q_pa_cpu", None)
+        if cu_cpu is None:
+            cu_cpu = cu.cpu()
+        cu_cpu = cu_cpu.tolist()
         fm.dsv4_max_input_capacity = max(
             1,
             max(
@@ -2065,12 +2069,6 @@ class DeepseekV4AscendAttnBackend(
                 seq_lens_cpu = torch.tensor(seq_lens_cpu, dtype=torch.int32)
             else:
                 seq_lens_cpu = seq_lens_cpu.int()
-            actual_q = torch.cumsum(seq_lens_cpu, dim=0).int().to(device)
-            fm.actual_seq_lengths_q = actual_q
-            fm.actual_seq_lengths_q_pa = torch.cat(
-                [torch.zeros(1, dtype=torch.int32, device=device), actual_q],
-                dim=0,
-            )
             fm.actual_seq_lengths_q_pa_cpu = torch.cat(
                 [
                     torch.zeros(1, dtype=torch.int32),
@@ -2078,6 +2076,12 @@ class DeepseekV4AscendAttnBackend(
                 ],
                 dim=0,
             )
+            fm.actual_seq_lengths_q_pa = async_h2d(
+                fm.actual_seq_lengths_q_pa_cpu.tolist(),
+                dtype=torch.int32,
+                device=device,
+            )
+            fm.actual_seq_lengths_q = fm.actual_seq_lengths_q_pa[1:]
         elif forward_batch.forward_mode.is_decode():
             B = forward_batch.batch_size
             fm.actual_seq_lengths_q = torch.arange(

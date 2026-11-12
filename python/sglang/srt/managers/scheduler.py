@@ -2105,6 +2105,21 @@ class Scheduler(
                 self.schedule_stream = allocate_distinct_stream(
                     self.device_module, (self.forward_stream,)
                 )
+        if _is_npu and self.enable_overlap:
+            # A pooled NPU stream can alias one already used by the scheduler.
+            # Length D2H must stay off both the WAR wait and the forward's tail.
+            d2h_stream = self.future_map.fwd_prepare_d2h_stream
+            avoid_streams = (
+                self.schedule_stream,
+                self.forward_stream,
+                self.copy_stream,
+            )
+            if d2h_stream is not None and d2h_stream.npu_stream in {
+                stream.npu_stream for stream in avoid_streams
+            }:
+                self.future_map.fwd_prepare_d2h_stream = allocate_distinct_stream(
+                    self.device_module, avoid_streams
+                )
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_war_barrier_enabled()
