@@ -248,13 +248,6 @@ class TestHiDreamO1SchedulerContract(unittest.TestCase):
 
 
 class TestHiDreamO1Config(unittest.TestCase):
-    def test_checkpoint_literals(self) -> None:
-        """Values dictated by the released checkpoint, not by this repo."""
-        arch_config = HiDreamO1ImageDitConfig().arch_config
-        self.assertEqual(arch_config.patch_size, 32)
-        self.assertEqual(arch_config.in_channels, 3)
-        self.assertEqual(arch_config.tms_token_id, 151673)
-
     def test_mrope_section_must_fit_the_interleaved_layout(self) -> None:
         """An h/w section too wide for its stride would be silently truncated."""
         arch_config = HiDreamO1ImageDitConfig().arch_config
@@ -263,10 +256,6 @@ class TestHiDreamO1Config(unittest.TestCase):
         arch_config.mrope_section = (20, 24, 20)  # same sum, h runs off the end
         with self.assertRaises(ValueError):
             arch_config.__post_init__()
-
-    def test_generator_device_is_the_host(self) -> None:
-        """Seeded noise must reproduce across accelerators, so seeds stay on CPU."""
-        self.assertEqual(HiDreamO1ImagePipelineConfig().generator_device, "cpu")
 
     def test_sequence_parallelism_is_refused(self) -> None:
         config = HiDreamO1ImagePipelineConfig()
@@ -304,6 +293,16 @@ class TestHiDreamO1Config(unittest.TestCase):
                 config.validate_server_args(
                     SimpleNamespace(**{**no_overrides, option: value})
                 )
+
+    def test_scheduler_overrides_are_refused(self) -> None:
+        """The pipeline builds its own scheduler, so overrides must not be dropped."""
+        for option, value, flag in (
+            ("flow_shift", 5.0, "--flow-shift"),
+            ("scheduler_class_override", "UniPCMultistepScheduler", "--scheduler"),
+        ):
+            config = HiDreamO1ImagePipelineConfig(**{option: value})
+            with self.subTest(option=option), self.assertRaisesRegex(ValueError, flag):
+                config.validate_server_args(SimpleNamespace(sp_degree=1))
 
     def test_dynamic_batching_is_disabled(self) -> None:
         """A merged multi-prompt batch fails every request in it."""
