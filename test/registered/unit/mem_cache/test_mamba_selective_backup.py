@@ -270,7 +270,7 @@ class TestMambaSelectiveBackup(unittest.TestCase):
                     return_value=SimpleNamespace(disaggregation_mode=mode),
                 ):
                     with self.assertRaises(Captured):
-                        cache._checkpoint_into_tree(req, up_to=length)
+                        cache.checkpoint_into_tree(req, up_to=length)
 
 
 if __name__ == "__main__":
