@@ -34,6 +34,13 @@ class TboAttnBackend(AttentionBackend):
         )
 
     @property
+    def requires_per_shape_decode_graph_warmup(self) -> bool:
+        return any(
+            backend.requires_per_shape_decode_graph_warmup
+            for backend in (self.primary, *self.children)
+        )
+
+    @property
     def supports_prefill_cuda_graph_max_context_size(self) -> bool:
         return self.primary.supports_prefill_cuda_graph_max_context_size
 

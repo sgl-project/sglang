@@ -98,6 +98,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
             )
         self._shared_output_buffer: Optional[Any] = None
         self._precarve = GraphPoolPrecarve()
+        self._group_preparation_enabled = False
+        self._prepared_groups = set()
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
@@ -116,6 +118,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
             self._pool = get_or_create_global_graph_memory_pool(self._device_module)
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
+        # Preparation is scoped to this capture session.
+        self._prepared_groups.clear()
         self._shared_output_buffer = None
         self.begin_cuda_graph_capture()
         try:
@@ -135,11 +139,23 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         warmup_out = None
-        for _ in range(2):
+        # The first eager forward prepares lazy state; size 1 may specialize.
+        warmup_group = (
+            shape_key.variant_label,
+            shape_key.attention_variant,
+            shape_key.size == 1,
+        )
+        eager_forward_count = (
+            int(warmup_group not in self._prepared_groups)
+            if self._group_preparation_enabled
+            else 2
+        )
+        for warmup_step in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
             with self._precarve.measure():
-                warmup_out = forward_fn()
+                if warmup_step < eager_forward_count:
+                    warmup_out = forward_fn()
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
@@ -187,6 +203,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
                 self._copy_output_to_buffer(out, buffer, out_rows)
 
         stored = self._slice_output(buffer, out_rows)
+        # Mark a group only after capture completes successfully.
+        if self._group_preparation_enabled:
+            self._prepared_groups.add(warmup_group)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
